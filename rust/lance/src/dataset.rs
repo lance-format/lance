@@ -4115,6 +4115,10 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
+    /// This commit is a tagged fragment-reuse-index trim derived by
+    /// `cleanup_frag_reuse_index` against the current manifest entry; see
+    /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
+    tagged_frag_reuse_trim: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -4127,6 +4131,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         }
     }
 }
@@ -4140,6 +4145,19 @@ impl ManifestWriteConfig {
     pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
         self.disable_transaction_file = true;
         self
+    }
+
+    /// Mark this commit as a tagged fragment-reuse-index trim derived by the
+    /// maintenance path; required for `build_manifest` to accept the shape.
+    pub(crate) fn with_tagged_frag_reuse_trim(mut self) -> Self {
+        self.tagged_frag_reuse_trim = true;
+        self
+    }
+
+    /// Whether this commit is the tagged fragment reuse trim the maintenance
+    /// path derived against the current entry (`FragReuseUpdate::Trim`).
+    pub(crate) fn tagged_frag_reuse_trim(&self) -> bool {
+        self.tagged_frag_reuse_trim
     }
 
     /// Resolve into the config `Transaction::build_manifest` consumes.

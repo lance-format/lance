@@ -33,6 +33,9 @@ pub enum Admission {
     /// Restore copies an earlier manifest whole; it never reaches
     /// `build_manifest`, classified here so the table is complete.
     RestoresManifest,
+    /// The trim `cleanup_frag_reuse_index` derives against the current
+    /// entry at commit time: exactly the entry replaced or removed.
+    TrimsEntry,
     /// Creates, replaces or drops user indices; the entry is untouched.
     MaintainsUserIndices,
 }
@@ -74,6 +77,63 @@ pub fn classify(
         ));
     }
 
+    // A `CreateIndex` touching a tagged entry is only safe in one shape:
+    // the trim the maintenance path derives against the CURRENT entry at
+    // commit time, exactly the FRI entry replaced (or removed outright),
+    // nothing else mixed in, and the removed identity matching the entry
+    // this manifest actually carries. The in-memory intent
+    // (`config.tagged_frag_reuse_trim`) distinguishes that derivation from
+    // a hand-built entry, whose snapshot may be stale: splicing it would
+    // silently drop records a concurrent writer appended.
+    let trims_tagged_entry = if let Operation::CreateIndex {
+        new_indices,
+        removed_indices,
+        ..
+    } = operation
+    {
+        let touches_fri = new_indices
+            .iter()
+            .chain(removed_indices.iter())
+            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+        let tagged_involved = new_indices.iter().any(is_tagged)
+            || removed_indices.iter().any(is_tagged)
+            || (touches_fri && current_indices.iter().any(is_tagged));
+        if tagged_involved {
+            if !matches!(frag_reuse, FragReuseUpdate::Trim) {
+                return Err(Error::invalid_input(
+                    "a tagged fragment reuse entry may only be replaced or removed by \
+                     the trim `cleanup_frag_reuse_index` derives against the current \
+                     entry at commit time; a hand-built entry may splice away \
+                     concurrent records",
+                ));
+            }
+            let current_entry = current_indices
+                .iter()
+                .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+            let removed_matches_current = matches!(
+                (removed_indices.as_slice(), current_entry),
+                ([removed], Some(current))
+                    if removed.name == FRAG_REUSE_INDEX_NAME && removed.uuid == current.uuid
+            );
+            let new_is_tagged_entry_or_empty = match new_indices.as_slice() {
+                [] => true,
+                [entry] => is_tagged(entry),
+                _ => false,
+            };
+            if !removed_matches_current || !new_is_tagged_entry_or_empty {
+                return Err(Error::invalid_input(
+                    "a tagged fragment reuse trim must replace or remove exactly the \
+                     current FRI entry and carry nothing else; the entry it removes \
+                     no longer matches the current manifest, so it was derived \
+                     against a stale version",
+                ));
+            }
+        }
+        tagged_involved
+    } else {
+        false
+    };
+
     let replaces_entry = matches!(
         operation,
         Operation::Rewrite {
@@ -113,6 +173,27 @@ pub fn classify(
     // The history's own maintenance operation.
     if appends_transitions {
         return Ok(Admission::AppendsTransitions);
+    }
+    if trims_tagged_entry {
+        return Ok(Admission::TrimsEntry);
+    }
+    // Creating, replacing or dropping user indices leaves the tagged entry
+    // untouched (it is carried through unchanged), and draining index
+    // coverage onto a rewrite's destinations is exactly how tagged
+    // histories become trimmable, so this shape is safe and necessary.
+    // Only a `CreateIndex` touching the FRI entry needs the trim rules
+    // above.
+    if let Operation::CreateIndex {
+        new_indices,
+        removed_indices,
+        ..
+    } = operation
+        && new_indices
+            .iter()
+            .chain(removed_indices.iter())
+            .all(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+    {
+        return Ok(Admission::MaintainsUserIndices);
     }
 
     // A rewrite that carries neither an entry nor transition intent is still
@@ -206,18 +287,18 @@ pub fn classify(
         | Operation::Overwrite { .. }
         | Operation::Project { .. }
         | Operation::Merge { .. }
-        | Operation::DataReplacement { .. } => Ok(Admission::MovesNoRows),
+        | Operation::DataReplacement { .. }
+        | Operation::UpdateBases { .. } => Ok(Admission::MovesNoRows),
         Operation::Restore { .. } => Ok(Admission::RestoresManifest),
         // A bare rewrite of covered fragments or a v0 snapshot would
         // misinterpret the history; MemWAL state, overlays, clones and base
         // changes have no tagged semantics yet. A CreateIndex reaching here
-        // touches the entry itself.
+        // touches the entry without being its trim.
         Operation::Rewrite { .. }
         | Operation::CreateIndex { .. }
         | Operation::UpdateMemWalState { .. }
         | Operation::DataOverlay { .. }
-        | Operation::Clone { .. }
-        | Operation::UpdateBases { .. } => Err(Error::not_supported(
+        | Operation::Clone { .. } => Err(Error::not_supported(
             "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
         )),
     }
@@ -352,6 +433,16 @@ mod tests {
                 new_indices: vec![sample_index_metadata("new_idx")],
                 removed_indices: vec![],
             },
+            // Replaces the current entry by a hand-built tagged one: only the
+            // trim intent may do that.
+            "create_index_replacing_entry" => {
+                let mut entry = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+                entry.fields.clear();
+                Operation::CreateIndex {
+                    new_indices: vec![entry],
+                    removed_indices: vec![],
+                }
+            }
             "rewrite_bare_covered" => rewrite(0, None),
             "rewrite_bare_uncovered" => rewrite(7, None),
             "rewrite_appends_transitions" => rewrite(0, Some(appended_entry())),
@@ -458,6 +549,7 @@ mod tests {
     #[case("delete", Table::Untagged, Verdict::Admit(Admission::Untagged))]
     #[case("overwrite", Table::Untagged, Verdict::Admit(Admission::Untagged))]
     #[case("create_index", Table::Untagged, Verdict::Admit(Admission::Untagged))]
+    #[case("create_index_replacing_entry", Table::Untagged, Verdict::InvalidInput)]
     #[case(
         "rewrite_bare_covered",
         Table::Untagged,
@@ -509,6 +601,7 @@ mod tests {
         Table::Tagged,
         Verdict::Admit(Admission::MaintainsUserIndices)
     )]
+    #[case("create_index_replacing_entry", Table::Tagged, Verdict::InvalidInput)]
     #[case("rewrite_bare_covered", Table::Tagged, Verdict::NotSupported)]
     #[case(
         "rewrite_bare_uncovered",
@@ -583,7 +676,7 @@ mod tests {
     #[case("update_config", Table::Tagged, Verdict::Admit(Admission::MovesNoRows))]
     #[case("update_mem_wal_state", Table::Tagged, Verdict::NotSupported)]
     #[case("clone", Table::Tagged, Verdict::NotSupported)]
-    #[case("update_bases", Table::Tagged, Verdict::NotSupported)]
+    #[case("update_bases", Table::Tagged, Verdict::Admit(Admission::MovesNoRows))]
     fn every_operation_has_a_verdict(
         #[case] kind: &str,
         #[case] state: Table,
@@ -599,6 +692,43 @@ mod tests {
             None,
         ));
         assert_eq!(got, expected, "{kind} on {state:?}");
+    }
+
+    /// The trim intent may replace exactly the current entry, and nothing
+    /// else.
+    #[test]
+    fn trim_replaces_exactly_the_current_entry() {
+        let (manifest, indices) = table(Table::Tagged);
+        let mut replacement = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let trim = Operation::CreateIndex {
+            new_indices: vec![replacement.clone()],
+            removed_indices: vec![indices[0].clone()],
+        };
+        assert_eq!(
+            classify(
+                &trim,
+                Some(&manifest),
+                &indices,
+                &FragReuseUpdate::Trim,
+                None
+            )
+            .unwrap(),
+            Admission::TrimsEntry
+        );
+        let stale = Operation::CreateIndex {
+            new_indices: vec![replacement],
+            removed_indices: vec![sample_index_metadata(FRAG_REUSE_INDEX_NAME)],
+        };
+        let error = classify(
+            &stale,
+            Some(&manifest),
+            &indices,
+            &FragReuseUpdate::Trim,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no longer matches"), "{error}");
     }
 
     /// The stable row id migration is a `Merge` with the activation marker.

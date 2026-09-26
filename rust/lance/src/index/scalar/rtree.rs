@@ -25,6 +25,7 @@ fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -44,7 +45,7 @@ pub(in crate::index) async fn merge_segments(
         .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut source_filters = Vec::with_capacity(old_data_filters.len());
@@ -53,8 +54,15 @@ pub(in crate::index) async fn merge_segments(
         if filter_keeps_nothing(filter) && !(all_keep_nothing && position == 0) {
             continue;
         }
-        let scalar_index =
-            super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            &field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         let rtree_index = scalar_index
             .as_any()
             .downcast_ref::<RTreeIndex>()

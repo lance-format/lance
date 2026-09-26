@@ -923,136 +923,136 @@ async fn legacy_scalar_lifecycle_never_enters_new_reader(
     #[case] external: bool,
     #[values(false, true)] defer_index_remap: bool,
 ) {
-    lance_index::scalar::LEGACY_TRAFFIC_ONLY
-        .scope(
-            (),
-            LEGACY_READER_ONLY.scope((), async {
-                let batch = arrow_array::record_batch!(
-                    ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
-                    (
-                        "value",
-                        Int32,
-                        [
-                            Some(0),
-                            None,
-                            Some(2),
-                            Some(3),
-                            None,
-                            Some(2),
-                            Some(6),
-                            Some(7),
-                            None,
-                            Some(2),
-                            Some(10),
-                            Some(11)
-                        ]
-                    )
-                )
-                .unwrap();
-                let mut dataset = Dataset::write(
-                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-                    "memory://",
-                    Some(WriteParams {
-                        max_rows_per_file: 3,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-                dataset
-                    .create_index(
-                        &["value"],
-                        index_type,
-                        Some("value_idx".into()),
-                        &ScalarIndexParams::default(),
-                        true,
-                    )
-                    .await
-                    .unwrap();
-                assert!(assert_legacy_metadata(&dataset).await.is_none());
-                assert_legacy_scalar_queries(&dataset).await;
-                crate::dataset::optimize::compact_files(
-                    &mut dataset,
-                    crate::dataset::optimize::CompactionOptions {
-                        target_rows_per_fragment: 6,
-                        defer_index_remap,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-                assert_eq!(
-                    assert_legacy_metadata(&dataset).await.is_some(),
-                    defer_index_remap
-                );
-                if external && defer_index_remap {
-                    externalize_legacy_history(&mut dataset).await;
-                }
-                assert_legacy_scalar_queries(&dataset).await;
-                let first = dataset.clone();
-                dataset.delete("id = 2").await.unwrap();
-                assert_legacy_scalar_queries(&dataset).await;
-                let appended =
-                    arrow_array::record_batch!(("id", Int32, [12]), ("value", Int32, [Some(2)]))
-                        .unwrap();
-                dataset
-                    .append(
-                        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+    // Boxed for CI clippy `large_futures`: the lifecycle future grew past 16 KiB.
+    Box::pin(lance_index::scalar::LEGACY_TRAFFIC_ONLY.scope(
+        (),
+        LEGACY_READER_ONLY.scope((), async {
+            let batch = arrow_array::record_batch!(
+                ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+                (
+                    "value",
+                    Int32,
+                    [
+                        Some(0),
                         None,
-                    )
-                    .await
+                        Some(2),
+                        Some(3),
+                        None,
+                        Some(2),
+                        Some(6),
+                        Some(7),
+                        None,
+                        Some(2),
+                        Some(10),
+                        Some(11)
+                    ]
+                )
+            )
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset
+                .create_index(
+                    &["value"],
+                    index_type,
+                    Some("value_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(assert_legacy_metadata(&dataset).await.is_none());
+            assert_legacy_scalar_queries(&dataset).await;
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 6,
+                    defer_index_remap,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                assert_legacy_metadata(&dataset).await.is_some(),
+                defer_index_remap
+            );
+            if external && defer_index_remap {
+                externalize_legacy_history(&mut dataset).await;
+            }
+            assert_legacy_scalar_queries(&dataset).await;
+            let first = dataset.clone();
+            dataset.delete("id = 2").await.unwrap();
+            assert_legacy_scalar_queries(&dataset).await;
+            let appended =
+                arrow_array::record_batch!(("id", Int32, [12]), ("value", Int32, [Some(2)]))
                     .unwrap();
-                assert_legacy_scalar_queries(&dataset).await;
-                dataset.optimize_indices(&Default::default()).await.unwrap();
-                assert_legacy_scalar_queries(&dataset).await;
-                crate::dataset::optimize::compact_files(
-                    &mut dataset,
-                    crate::dataset::optimize::CompactionOptions {
-                        target_rows_per_fragment: 100,
-                        defer_index_remap,
-                        ..Default::default()
-                    },
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
                     None,
                 )
                 .await
                 .unwrap();
-                assert_legacy_scalar_queries(&dataset).await;
-                // Checkout shares the session cache, but must use its own FRI history.
-                let historical = dataset.checkout_version(first.version_id()).await.unwrap();
-                assert!(Arc::ptr_eq(&historical.session(), &dataset.session()));
-                assert_legacy_scalar_queries(&historical).await;
-                assert_legacy_scalar_queries(&dataset).await;
-                dataset.index_statistics("value_idx").await.unwrap();
-                if defer_index_remap {
-                    dataset
-                        .index_statistics(FRAG_REUSE_INDEX_NAME)
-                        .await
-                        .unwrap();
-                }
-                let before_remap = dataset.version_id();
-                let result = crate::dataset::optimize::remapping::remap_column_index(
-                    &mut dataset,
-                    &["value"],
-                    Some("value_idx".into()),
-                )
-                .await;
-                if defer_index_remap {
-                    result.unwrap();
-                } else {
-                    let error = result.unwrap_err();
-                    assert!(matches!(error, Error::NotSupported { .. }));
-                    assert!(error.to_string().contains("Fragment reuse index not found"));
-                    assert_eq!(dataset.version_id(), before_remap);
-                }
-                assert_legacy_scalar_queries(&dataset).await;
-                crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            assert_legacy_scalar_queries(&dataset).await;
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+            assert_legacy_scalar_queries(&dataset).await;
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_legacy_scalar_queries(&dataset).await;
+            // Checkout shares the session cache, but must use its own FRI history.
+            let historical = dataset.checkout_version(first.version_id()).await.unwrap();
+            assert!(Arc::ptr_eq(&historical.session(), &dataset.session()));
+            assert_legacy_scalar_queries(&historical).await;
+            assert_legacy_scalar_queries(&dataset).await;
+            dataset.index_statistics("value_idx").await.unwrap();
+            if defer_index_remap {
+                dataset
+                    .index_statistics(FRAG_REUSE_INDEX_NAME)
                     .await
                     .unwrap();
-                assert_legacy_scalar_queries(&dataset).await;
-            }),
-        )
-        .await;
+            }
+            let before_remap = dataset.version_id();
+            let result = crate::dataset::optimize::remapping::remap_column_index(
+                &mut dataset,
+                &["value"],
+                Some("value_idx".into()),
+            )
+            .await;
+            if defer_index_remap {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::NotSupported { .. }));
+                assert!(error.to_string().contains("Fragment reuse index not found"));
+                assert_eq!(dataset.version_id(), before_remap);
+            }
+            assert_legacy_scalar_queries(&dataset).await;
+            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                .await
+                .unwrap();
+            assert_legacy_scalar_queries(&dataset).await;
+        }),
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -1198,128 +1198,128 @@ async fn legacy_vector_lifecycle_never_enters_new_reader(
     #[case] defer_index_remap: bool,
     #[case] external: bool,
 ) {
-    lance_index::scalar::LEGACY_TRAFFIC_ONLY
-        .scope(
-            (),
-            LEGACY_READER_ONLY.scope((), async {
-                let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
-                    arrow_array::types::Float32Type,
-                    _,
-                    _,
-                >((0..12).map(|id| Some(vec![Some(id as f32); 4])), 4);
-                let batch = RecordBatch::try_from_iter([
-                    (
-                        "id",
-                        Arc::new(arrow_array::Int32Array::from_iter_values(0..12))
-                            as arrow_array::ArrayRef,
-                    ),
-                    ("vector", Arc::new(vectors) as arrow_array::ArrayRef),
-                ])
-                .unwrap();
-                let mut dataset = Dataset::write(
-                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-                    "memory://",
-                    Some(WriteParams {
-                        max_rows_per_file: 3,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-                let params = crate::index::vector::VectorIndexParams::ivf_flat(
-                    1,
-                    lance_linalg::distance::DistanceType::L2,
-                );
-                dataset
-                    .create_index(
-                        &["vector"],
-                        IndexType::Vector,
-                        Some("vector_idx".into()),
-                        &params,
-                        true,
-                    )
-                    .await
-                    .unwrap();
-                assert!(assert_legacy_metadata(&dataset).await.is_none());
-                assert_legacy_vector_queries(&dataset).await;
-                crate::dataset::optimize::compact_files(
-                    &mut dataset,
-                    crate::dataset::optimize::CompactionOptions {
-                        target_rows_per_fragment: 6,
-                        defer_index_remap,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-                assert_eq!(
-                    assert_legacy_metadata(&dataset).await.is_some(),
-                    defer_index_remap
-                );
-                if external && defer_index_remap {
-                    externalize_legacy_history(&mut dataset).await;
-                }
-                assert_legacy_vector_queries(&dataset).await;
-                let first = dataset.clone();
-                dataset.delete("id = 5").await.unwrap();
-                assert_legacy_vector_queries(&dataset).await;
-                let appended = batch.slice(11, 1);
-                dataset
-                    .append(
-                        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                assert_legacy_vector_queries(&dataset).await;
-                // Merge-all keeps a single segment, which the query helper
-                // expects when reopening the index by name.
-                dataset
-                    .optimize_indices(&lance_index::optimize::OptimizeOptions::merge(usize::MAX))
-                    .await
-                    .unwrap();
-                assert_legacy_vector_queries(&dataset).await;
-                crate::dataset::optimize::compact_files(
-                    &mut dataset,
-                    crate::dataset::optimize::CompactionOptions {
-                        target_rows_per_fragment: 100,
-                        defer_index_remap,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-                dataset.prewarm_index("vector_idx").await.unwrap();
-                assert_legacy_vector_queries(&dataset).await;
-                let historical = dataset.checkout_version(first.version_id()).await.unwrap();
-                assert!(Arc::ptr_eq(&dataset.session(), &historical.session()));
-                assert_legacy_vector_queries(&historical).await;
-                assert_legacy_vector_queries(&dataset).await;
-                dataset.index_statistics("vector_idx").await.unwrap();
-                let before_remap = dataset.version_id();
-                let result = crate::dataset::optimize::remapping::remap_column_index(
-                    &mut dataset,
+    // Boxed for CI clippy `large_futures`: the lifecycle future grew past 16 KiB.
+    Box::pin(lance_index::scalar::LEGACY_TRAFFIC_ONLY.scope(
+        (),
+        LEGACY_READER_ONLY.scope((), async {
+            let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
+                arrow_array::types::Float32Type,
+                _,
+                _,
+            >((0..12).map(|id| Some(vec![Some(id as f32); 4])), 4);
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(arrow_array::Int32Array::from_iter_values(0..12))
+                        as arrow_array::ArrayRef,
+                ),
+                ("vector", Arc::new(vectors) as arrow_array::ArrayRef),
+            ])
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let params = crate::index::vector::VectorIndexParams::ivf_flat(
+                1,
+                lance_linalg::distance::DistanceType::L2,
+            );
+            dataset
+                .create_index(
                     &["vector"],
+                    IndexType::Vector,
                     Some("vector_idx".into()),
+                    &params,
+                    true,
                 )
-                .await;
-                if defer_index_remap {
-                    result.unwrap();
-                } else {
-                    let error = result.unwrap_err();
-                    assert!(matches!(error, Error::NotSupported { .. }));
-                    assert!(error.to_string().contains("Fragment reuse index not found"));
-                    assert_eq!(dataset.version_id(), before_remap);
-                }
-                crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
-                    .await
-                    .unwrap();
-                assert_legacy_vector_queries(&dataset).await;
-            }),
-        )
-        .await;
+                .await
+                .unwrap();
+            assert!(assert_legacy_metadata(&dataset).await.is_none());
+            assert_legacy_vector_queries(&dataset).await;
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 6,
+                    defer_index_remap,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                assert_legacy_metadata(&dataset).await.is_some(),
+                defer_index_remap
+            );
+            if external && defer_index_remap {
+                externalize_legacy_history(&mut dataset).await;
+            }
+            assert_legacy_vector_queries(&dataset).await;
+            let first = dataset.clone();
+            dataset.delete("id = 5").await.unwrap();
+            assert_legacy_vector_queries(&dataset).await;
+            let appended = batch.slice(11, 1);
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_legacy_vector_queries(&dataset).await;
+            // Merge-all keeps a single segment, which the query helper
+            // expects when reopening the index by name.
+            dataset
+                .optimize_indices(&lance_index::optimize::OptimizeOptions::merge(usize::MAX))
+                .await
+                .unwrap();
+            assert_legacy_vector_queries(&dataset).await;
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            dataset.prewarm_index("vector_idx").await.unwrap();
+            assert_legacy_vector_queries(&dataset).await;
+            let historical = dataset.checkout_version(first.version_id()).await.unwrap();
+            assert!(Arc::ptr_eq(&dataset.session(), &historical.session()));
+            assert_legacy_vector_queries(&historical).await;
+            assert_legacy_vector_queries(&dataset).await;
+            dataset.index_statistics("vector_idx").await.unwrap();
+            let before_remap = dataset.version_id();
+            let result = crate::dataset::optimize::remapping::remap_column_index(
+                &mut dataset,
+                &["vector"],
+                Some("vector_idx".into()),
+            )
+            .await;
+            if defer_index_remap {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::NotSupported { .. }));
+                assert!(error.to_string().contains("Fragment reuse index not found"));
+                assert_eq!(dataset.version_id(), before_remap);
+            }
+            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                .await
+                .unwrap();
+            assert_legacy_vector_queries(&dataset).await;
+        }),
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -1678,7 +1678,10 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
 
 #[tokio::test]
 async fn tagged_remapping_plans_coverage_once_per_snapshot() {
-    use crate::index::frag_reuse::{FriQueryPlanKey, ResolvedRemapping, open_row_id_remapping};
+    use crate::index::frag_reuse::{
+        FriQueryPlanKey, OpenPurpose, ResolvedRemapping, open_row_id_remapping,
+        open_row_id_remapping_with_plan,
+    };
 
     let mut dataset = fixture().await;
     let params = ScalarIndexParams::default();
@@ -1750,19 +1753,47 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
 
     // Later opens must resolve from the published plan instead of re-running
     // the whole-dataset sibling scan: with the sibling dropped from the cached
-    // plan, its open must fail with the plan-miss error.
+    // plan, it is a registered segment the plan derives no coverage for. A
+    // query refuses it (the listing excludes it, no scan covers its rows);
+    // maintenance opens it as an empty translation, not with the coverage a
+    // fresh scan would find.
     let mut pruned = plan.as_ref().clone();
     pruned.segments.remove(&siblings[1].uuid);
     plan_cache.insert_with_key(&key, Arc::new(pruned)).await;
-    let error = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+    let mapping = FragmentReuseIndex::open(&dataset, fri).await.unwrap();
+    let empty = RoaringBitmap::new();
+    let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
+    let planned = match &plan.segments[&siblings[1].uuid] {
+        crate::index::frag_reuse::SegmentRemappingPlan::Translate { fingerprint, .. } => {
+            *fingerprint
+        }
+        other => panic!("the sibling translates: {other:?}"),
+    };
+    assert_ne!(planned, no_coverage);
+    let refused = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
         .await
         .unwrap_err();
     assert!(
-        error
+        refused
             .to_string()
-            .contains("requires committed segment metadata"),
-        "{error}"
+            .contains("excludes it from the index listing"),
+        "{refused}"
     );
+    match open_row_id_remapping_with_plan(
+        &dataset,
+        &siblings[1],
+        None,
+        OpenPurpose::Maintenance,
+        &NoOpMetricsCollector,
+    )
+    .await
+    .unwrap()
+    {
+        Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
+            assert_eq!(fingerprint, no_coverage, "the pruned plan was recomputed");
+        }
+        other => panic!("expected an empty translation, got {other:?}"),
+    }
 
     // With the real plan restored, the sibling opens as a cache hit on the
     // same plan entry; nothing is recomputed or re-published.
@@ -3309,4 +3340,725 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(actual, expected);
     }
+}
+
+// Vector merge on a tagged table: the merge reads the existing IVF segment
+// through the translating storage loader, so the merged segment holds live
+// addresses, and it commits the union of the selected segments' stored bitmaps
+// (provenance). The reader keeps deriving coverage of both destinations from
+// that provenance, the merged segment answers ANN queries for them together
+// with the newly appended rows, and trim retains the transition the provenance
+// still names. (Segments trained separately do not share IVF centroids and are
+// not mergeable, so the merge folds new data into one translated segment.)
+#[tokio::test]
+async fn vector_merge_keeps_translated_coverage_on_tagged_tables() {
+    use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+    use arrow_array::types::Float32Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array};
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let params = crate::index::vector::VectorIndexParams::ivf_flat(
+        1,
+        lance_linalg::distance::DistanceType::L2,
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query.as_primitive::<Float32Type>().clone();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+
+    // New rows to fold into the translated segment; their vectors sit far from
+    // the query so the nearest row stays i = 6.
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        (0..4).map(|_| {
+            Some(vec![
+                Some(1000.0f32),
+                Some(1000.0),
+                Some(1000.0),
+                Some(1000.0),
+            ])
+        }),
+        4,
+    );
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        ("vector", Arc::new(vectors) as ArrayRef),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let nearest = |dataset: Dataset, use_index: bool| {
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &query, 1).unwrap();
+            scan.use_index(use_index);
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            (plan, batch["i"].as_primitive::<Int32Type>().value(0))
+        }
+    };
+    let (_, truth) = nearest(dataset.clone(), false).await;
+    assert_eq!(truth, 6);
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+
+    // One merged segment whose stored bitmap keeps the retired provenance and
+    // adds the appended fragment.
+    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .cloned()
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let provenance = stored[0].fragment_bitmap.clone().unwrap();
+    assert!(
+        provenance.contains(0) && provenance.contains(1),
+        "{provenance:?}"
+    );
+
+    // Derived coverage spans every live fragment and the ANN path serves the
+    // query with the right row.
+    let derived = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .filter_map(|index| index.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |acc, b| acc | b);
+    assert_eq!(derived, dataset.fragment_bitmap.as_ref().clone());
+    let (plan, found) = nearest(dataset.clone(), true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, truth);
+
+    // Trim retains the transition the merged segment's provenance still names.
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let (plan, found) = nearest(dataset.clone(), true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, truth);
+}
+
+// The default optimize's steady-state rebalance of a translated vector
+// segment: the rebalanced file is read through the translating loader, so
+// its bitmap is the stored provenance (as a merge publishes), not stored ∩
+// live, which is empty for the retired sources and would turn every indexed
+// row of the partition's destinations into a scan.
+#[tokio::test]
+async fn vector_rebalance_keeps_translated_coverage_on_tagged_tables() {
+    use arrow_array::types::Float32Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array};
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let mut ivf = lance_index::vector::ivf::IvfBuildParams::new(1);
+    ivf.target_partition_size = Some(1);
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        ivf,
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query.as_primitive::<Float32Type>().clone();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        (0..4).map(|_| Some(vec![Some(1000.0f32); 4])),
+        4,
+    );
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        ("vector", Arc::new(vectors) as ArrayRef),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let derived = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "vector_idx")
+                .filter_map(|index| index.fragment_bitmap.clone())
+                .fold(RoaringBitmap::new(), |acc, b| acc | b)
+        }
+    };
+    let nearest = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &query, 1).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            (plan, batch["i"].as_primitive::<Int32Type>().value(0))
+        }
+    };
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone()
+    );
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone(),
+        "the rebalance keeps the translated coverage"
+    );
+    let (plan, found) = nearest(&dataset).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(found, 6);
+}
+
+// Inverted append then merge on a tagged table: the merged segment's old
+// data is the coverage the reader derives for the translated segment and it
+// keeps the stored provenance, so the full-text index still covers the
+// partition's destinations after both optimizations.
+#[tokio::test]
+async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
+    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("text", lance_datagen::array::fill_utf8("hit".to_string()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["hit"; 4])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let derived = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "text_idx")
+                .filter_map(|index| index.fragment_bitmap.clone())
+                .fold(RoaringBitmap::new(), |acc, b| acc | b)
+        }
+    };
+    let hits = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+    };
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone()
+    );
+    assert_eq!(hits(&dataset).await, 12);
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "text_idx")
+        .cloned()
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let provenance = stored[0].fragment_bitmap.clone().unwrap();
+    assert!(
+        provenance.contains(0) && provenance.contains(1),
+        "the merge keeps the provenance: {provenance:?}"
+    );
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone(),
+        "the merge keeps the translated coverage"
+    );
+    assert_eq!(hits(&dataset).await, 12);
+}
+
+// Under a history this build cannot interpret the reader lists no user
+// segment, so every fragment looks unindexed; optimize must not rebuild the
+// table over and over (each result would be excluded again) but leave it
+// alone like trim, superseded pruning and remap do.
+#[tokio::test]
+async fn optimize_is_a_no_op_under_an_unsupported_history() {
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = fixture().await;
+    let (mut transition, destinations) = prepare(&dataset).await;
+    transition.mapping = None;
+    let mut raw = transition.encode_to_vec();
+    raw.extend(field(17, b"future mapping"));
+    install(&mut dataset, field(2, &raw), destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let version = dataset.manifest.version;
+    let before: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| index.uuid)
+        .collect();
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.name != "i_idx")
+    );
+    for _ in 0..2 {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, version, "nothing committed");
+        let after: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect();
+        assert_eq!(after, before, "no segment written");
+    }
+}
+
+// The segment state matrix at the open layer. On one tagged snapshot
+// (F0, F1 partitioned into F10, F11; F12 appended) a segment of every state:
+//
+// | state                | listing         | query open by uuid | maintenance open        |
+// |----------------------|-----------------|--------------------|-------------------------|
+// | identity (live only) | served, {12}    | serves             | serves (identity)       |
+// | translating          | served, {10,11} | serves             | serves (translation)    |
+// | partially withdrawn  | excluded        | error              | empty translation       |
+// | empty last (files)   | excluded        | error              | empty translation       |
+// | superseded           | excluded        | error              | empty translation       |
+// | bitmap None          | excluded        | error              | skip (NotSupported)     |
+// | corrupt details      | excluded        | error              | error                   |
+//
+// A query never opens an excluded segment (no scan was scheduled for its
+// rows); maintenance replaces what it reads as empty, skips what it cannot
+// translate and fails on what it cannot interpret. The deferred definition
+// (no files) never reaches an open: the optimizer trains it from its
+// definition (`awaits_training`); the withdrawn-to-empty scalar and vector
+// rebuilds, the superseded prune and the remap skips are pinned by their own
+// tests.
+#[tokio::test]
+async fn segment_state_matrix_at_the_open_layer() {
+    use crate::index::frag_reuse::{
+        OpenPurpose, ResolvedRemapping, open_row_id_remapping, open_row_id_remapping_with_plan,
+    };
+    use arrow_array::{ArrayRef, Int32Array};
+
+    let mut dataset = fixture().await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    let fri = install(&mut dataset, content, destinations, false).await;
+    let appended = RecordBatch::try_from_iter(vec![(
+        "i",
+        Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+    )])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    // The appended fragment: live and on no lineage.
+    let live_only = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .find(|id| !matches!(id, 10 | 11))
+        .unwrap();
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let translating = indices
+        .iter()
+        .find(|index| index.name == "i_idx")
+        .cloned()
+        .unwrap();
+    let derive = |name: &str, bitmap: Option<RoaringBitmap>| {
+        let mut segment = translating.clone();
+        segment.uuid = Uuid::new_v4();
+        segment.name = name.to_string();
+        segment.fragment_bitmap = bitmap;
+        segment
+    };
+    let identity = derive("identity_idx", Some(RoaringBitmap::from_iter([live_only])));
+    let partial = derive("partial_idx", Some(RoaringBitmap::from_iter([0u32])));
+    let empty_last = derive("empty_idx", Some(RoaringBitmap::new()));
+    let unknown = derive("unknown_idx", None);
+    let mut corrupt = derive("corrupt_idx", translating.fragment_bitmap.clone());
+    corrupt.index_details = None;
+    // A newer sibling over both destinations supersedes the translating
+    // segment of its own name.
+    let mut superseded = derive("superseded_idx", translating.fragment_bitmap.clone());
+    superseded.name = "superseded_idx".into();
+    let direct = CreateIndexBuilder::new(
+        &mut dataset,
+        &["i"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .name("superseded_idx".into())
+    .replace(true)
+    .fragments(vec![10, 11])
+    .execute_uncommitted()
+    .await
+    .unwrap();
+    indices.extend([
+        identity.clone(),
+        partial.clone(),
+        empty_last.clone(),
+        unknown.clone(),
+        corrupt.clone(),
+        superseded.clone(),
+        direct.clone(),
+    ]);
+    persist_fixture(&mut dataset, indices).await;
+
+    let listed: HashMap<Uuid, RoaringBitmap> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|index| Some((index.uuid, index.fragment_bitmap.clone()?)))
+        .collect();
+    let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+    let empty = RoaringBitmap::new();
+    let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
+
+    #[derive(Debug, PartialEq)]
+    enum Cell {
+        Serves,
+        Empty,
+        Skip,
+        Error,
+    }
+    let query = |segment: &IndexMetadata| {
+        let dataset = dataset.clone();
+        let segment = segment.clone();
+        async move {
+            match open_row_id_remapping(&dataset, &segment, &NoOpMetricsCollector).await {
+                Ok(_) => Cell::Serves,
+                Err(_) => Cell::Error,
+            }
+        }
+    };
+    let maintenance = |segment: &IndexMetadata| {
+        let dataset = dataset.clone();
+        let segment = segment.clone();
+        async move {
+            match open_row_id_remapping_with_plan(
+                &dataset,
+                &segment,
+                None,
+                OpenPurpose::Maintenance,
+                &NoOpMetricsCollector,
+            )
+            .await
+            {
+                Ok(Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })))
+                    if fingerprint == no_coverage =>
+                {
+                    Cell::Empty
+                }
+                Ok(_) => Cell::Serves,
+                Err(error) if error.to_string().contains("cannot be translated") => Cell::Skip,
+                Err(_) => Cell::Error,
+            }
+        }
+    };
+    let rows: [(&str, &IndexMetadata, Option<RoaringBitmap>, Cell, Cell); 7] = [
+        (
+            "identity",
+            &identity,
+            Some(RoaringBitmap::from_iter([live_only])),
+            Cell::Serves,
+            Cell::Serves,
+        ),
+        (
+            "translating",
+            &translating,
+            Some(RoaringBitmap::from_iter([10u32, 11])),
+            Cell::Serves,
+            Cell::Serves,
+        ),
+        (
+            "partially withdrawn",
+            &partial,
+            None,
+            Cell::Error,
+            Cell::Empty,
+        ),
+        ("empty last", &empty_last, None, Cell::Error, Cell::Empty),
+        ("superseded", &superseded, None, Cell::Error, Cell::Empty),
+        ("bitmap None", &unknown, None, Cell::Error, Cell::Skip),
+        ("corrupt", &corrupt, None, Cell::Error, Cell::Error),
+    ];
+    for (state, segment, listing, query_cell, maintenance_cell) in rows {
+        assert_eq!(
+            listed.get(&segment.uuid).cloned(),
+            listing,
+            "{state}: listing"
+        );
+        assert_eq!(query(segment).await, query_cell, "{state}: query open");
+        assert_eq!(
+            maintenance(segment).await,
+            maintenance_cell,
+            "{state}: maintenance open"
+        );
+    }
+    assert_eq!(
+        listed.get(&direct.uuid),
+        Some(&RoaringBitmap::from_iter([10u32, 11])),
+        "the direct sibling serves the destinations"
+    );
+}
+
+// The untested seam: a legacy-format vector file on a tagged table. Legacy
+// readers only take the v0 remapper handle, which is `None` on a tagged
+// history, so the tagged reader must exclude such a segment from coverage
+// (`vector_supports_batch_remapping` is false for pre-(0,3) files) and the
+// query must scan flat, rather than serve untranslated addresses through ANN.
+#[tokio::test]
+async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(64))
+        .await
+        .unwrap();
+    // The legacy file format exists for IVF_PQ; enough rows to train a
+    // 4-bit codebook over two sub-vectors.
+    let mut params = crate::index::vector::VectorIndexParams::ivf_pq(
+        1,
+        4,
+        2,
+        lance_linalg::distance::DistanceType::L2,
+        10,
+    );
+    params.version(crate::index::vector::IndexFileVersion::Legacy);
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .clone();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    // Excluded from the query listing: no coverage the reader can honor.
+    assert!(
+        !dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == "vector_idx"),
+        "a legacy-format vector segment cannot be translated and must not claim coverage"
+    );
+    let mut scan = dataset.scan();
+    scan.nearest("vector", &query, 1).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(!plan.contains("ANN"), "{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), 6);
 }

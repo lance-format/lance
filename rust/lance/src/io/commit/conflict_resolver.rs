@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::index::frag_reuse::{
+    TaggedTrimOutcome, derive_superseded_segments, derive_tagged_trim,
+    is_superseded_prune_transaction, is_tagged_trim_operation,
+};
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_frag_reuse_rewrite_entry, legacy_version_transitions,
@@ -63,6 +67,13 @@ pub struct TransactionRebase<'a> {
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
     reuse: RewriteReuseState,
+    /// Set by the staged-segment replay (`replay_staged_segments`): the
+    /// CreateIndex being carried is not about to be committed, so a
+    /// same-name CreateIndex in the window (routine `optimize_indices` on the
+    /// logical index the segments extend) is no conflict; the overlap rules
+    /// settle it at commit time. A same-name CreateIndex that changed what
+    /// the index is (its fields or type) still conflicts.
+    staged_replay: bool,
 }
 
 /// A rewrite's fragment reuse intent as the rebase reads it: the entry at
@@ -84,6 +95,18 @@ struct RewriteReuseState {
     /// a tagged entry. `None` for a v0 entry, which `finish_rewrite` converts
     /// only when the table turned out tagged at commit.
     added_transitions: Option<Vec<Transition>>,
+}
+
+/// Whether two segments describe the same logical index: the same keyed and
+/// covering fields and the same index type.
+fn same_logical_index(a: &IndexMetadata, b: &IndexMetadata) -> bool {
+    let type_url = |index: &IndexMetadata| {
+        index
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone())
+    };
+    a.fields == b.fields && a.covering_fields == b.covering_fields && type_url(a) == type_url(b)
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -175,6 +198,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments,
                     read_schema,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::Delete {
@@ -210,6 +234,7 @@ impl<'a> TransactionRebase<'a> {
                         read_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
+                        staged_replay: false,
                     });
                 }
 
@@ -229,6 +254,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -254,6 +280,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse,
+                    staged_replay: false,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -275,6 +302,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -296,6 +324,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -316,6 +345,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
+                    staged_replay: false,
                 })
             }
         }
@@ -393,6 +423,12 @@ impl<'a> TransactionRebase<'a> {
     /// where `frag_reuse` is never serialized, so the entry is the only
     /// durable evidence that a rewrite appended a transition (see the Rewrite
     /// arm of `check_create_index_txn`). A no-op for every other operation.
+    /// Mark this rebase as the staged-segment replay; see `staged_replay`.
+    pub(crate) fn for_staged_replay(mut self) -> Self {
+        self.staged_replay = true;
+        self
+    }
+
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
@@ -836,6 +872,7 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &mut self.transaction.operation
         {
+            let self_is_tagged_trim = is_tagged_trim_operation(new_indices, removed_indices);
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
@@ -848,6 +885,22 @@ impl<'a> TransactionRebase<'a> {
                     new_indices: created_indices,
                     removed_indices: committed_removed_indices,
                 } => {
+                    if self_is_tagged_trim {
+                        // Two trims of the same entry cannot merge (mirrors the
+                        // v0 cleanup-vs-cleanup conflict); anything else only
+                        // changes the retention inputs, which the re-derivation
+                        // in `finish_create_index` recomputes from the current
+                        // manifest.
+                        return if created_indices
+                            .iter()
+                            .chain(committed_removed_indices.iter())
+                            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                        {
+                            Err(self.retryable_conflict_err(other_transaction, other_version))
+                        } else {
+                            Ok(())
+                        };
+                    }
                     let self_has_frag_reuse = new_indices
                         .iter()
                         .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
@@ -907,10 +960,22 @@ impl<'a> TransactionRebase<'a> {
                             })
                         });
 
+                    // In the staged replay a same-name CreateIndex is routine
+                    // maintenance of the index the segments extend, no
+                    // conflict, unless it changed what the index is.
+                    let name_conflict = if self.staged_replay {
+                        new_indices.iter().any(|new_index| {
+                            created_indices.iter().any(|created_index| {
+                                created_index.name == new_index.name
+                                    && !same_logical_index(new_index, created_index)
+                            })
+                        })
+                    } else {
+                        has_regular_name_conflict || has_append_drop_conflict
+                    };
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
-                        || has_regular_name_conflict
-                        || has_append_drop_conflict
+                        || name_conflict
                         || has_replaced_identity_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -1053,6 +1118,15 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_index,
                     ..
                 } => {
+                    // A tagged trim carries no state worth defending: the
+                    // rewrite's appended records live in the CURRENT manifest
+                    // entry (whether or not this process can see the in-memory
+                    // reuse update here), and `finish_create_index`
+                    // re-derives the whole trim against that entry, so the
+                    // concurrently appended transition is retained naturally.
+                    if self_is_tagged_trim {
+                        return Ok(());
+                    }
                     // if a reuse update is present, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
                     // The only case that needs rebasing is when the frag_reuse_index cleanup
@@ -2498,12 +2572,75 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
+        // Computed before the operation is borrowed mutably below.
+        let self_is_superseded_prune = is_superseded_prune_transaction(&self.transaction);
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
             ..
         } = &mut self.transaction.operation
         {
+            // A tagged trim is re-derived against the CURRENT entry whenever
+            // this attempt builds on a version newer than the one it read,
+            // mirroring the stable-partition rewrite's assemble-at-attempt:
+            // a concurrent append's records are re-filtered in, a concurrent
+            // trim's result is re-trimmed instead of spliced over. When
+            // nothing is left to trim after the rebase (a concurrent commit,
+            // such as an index catching up mid-trim, already satisfied it),
+            // the attempt aborts with a marker conflict instead of writing an
+            // empty no-op version; `cleanup_frag_reuse_index` treats exactly
+            // that conflict as success.
+            if is_tagged_trim_operation(new_indices, removed_indices)
+                && dataset.manifest.version != self.transaction.read_version
+            {
+                match derive_tagged_trim(dataset).await? {
+                    TaggedTrimOutcome::NothingToTrim => {
+                        return Err(Error::retryable_commit_conflict_source(
+                            dataset.manifest.version,
+                            crate::dataset::index::frag_reuse::TAGGED_TRIM_REBASED_TO_NOOP.into(),
+                        ));
+                    }
+                    TaggedTrimOutcome::Replace {
+                        new_entry,
+                        current_entry,
+                    } => {
+                        *new_indices = vec![new_entry];
+                        *removed_indices = vec![current_entry];
+                    }
+                    TaggedTrimOutcome::Delete { current_entry } => {
+                        new_indices.clear();
+                        *removed_indices = vec![current_entry];
+                    }
+                }
+                return Ok(self.transaction);
+            }
+
+            // A superseded-segment prune's removal of a segment is justified
+            // by the coverage of kept same-name siblings, and a concurrent
+            // commit can withdraw exactly that justification without touching
+            // any segment in the removal set (e.g. a remap swap replacing a
+            // kept sibling with a narrower-coverage one), so no conflict
+            // predicate fires. Re-committing the original removal set after
+            // such a rebase would silently drop index coverage. Mirror the
+            // tagged trim: whenever this attempt builds on a version newer
+            // than the one it read, re-derive the removal set wholesale
+            // against the current manifest, and when nothing is superseded
+            // anymore abort with a marker conflict instead of writing an
+            // empty no-op version; `prune_superseded_segments` treats exactly
+            // that conflict as success.
+            if self_is_superseded_prune && dataset.manifest.version != self.transaction.read_version
+            {
+                let rederived = derive_superseded_segments(dataset).await?;
+                if rederived.is_empty() {
+                    return Err(Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        crate::dataset::index::frag_reuse::SUPERSEDED_PRUNE_REBASED_TO_NOOP.into(),
+                    ));
+                }
+                *removed_indices = rederived;
+                return Ok(self.transaction);
+            }
+
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -4150,6 +4287,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -4360,6 +4498,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4425,6 +4564,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4572,6 +4712,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4620,6 +4761,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -4641,6 +4783,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -4727,6 +4870,7 @@ mod tests {
                         read_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
+                        staged_replay: false,
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -4783,6 +4927,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -4920,6 +5065,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let update = Transaction::new(
             1,
@@ -5002,6 +5148,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5029,6 +5176,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -5079,6 +5227,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let same_name = Transaction::new(
@@ -5140,6 +5289,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -5204,6 +5354,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -5251,6 +5402,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -5299,6 +5451,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -5374,6 +5527,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -6061,6 +6215,7 @@ mod tests {
                 read_fragments: None,
                 read_schema: None,
                 reuse: Default::default(),
+                staged_replay: false,
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -6130,6 +6285,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6174,6 +6330,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6219,6 +6376,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6264,6 +6422,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6320,6 +6479,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6351,6 +6511,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -6403,6 +6564,7 @@ mod tests {
             read_fragments: None,
             read_schema: None,
             reuse: Default::default(),
+            staged_replay: false,
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
@@ -6484,6 +6646,7 @@ mod tests {
     /// shared in-memory cache: every decision has to come from transaction
     /// files and the manifests themselves.
     mod tagged_rewrite_conflicts {
+        mod index_over_committed_sp;
         mod tagged_mutations;
 
         use super::*;
@@ -7126,8 +7289,8 @@ mod tests {
 
         /// Matrix row 5: a user reindex (CreateIndex over the fragments the
         /// rewrite consumes) is compatible: the rewrite defers remapping, the
-        /// index keeps its retired coverage as provenance, and afterwards v0
-        /// cleanup refuses to touch the now-tagged history.
+        /// index keeps its retired coverage as provenance, and afterwards the
+        /// tagged trim retains the record that index still needs.
         #[tokio::test]
         async fn sp_lands_over_concurrent_user_index_and_blocks_v0_trim() {
             let mut dataset = ram_fixture(2, 4).await;
@@ -7173,12 +7336,16 @@ mod tests {
                     .unwrap(),
                 1
             );
-            // v0 cleanup must refuse to trim the tagged history out from
-            // under the not-yet-caught-up index.
-            let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut committed)
+            // The tagged trim must not release the history out from under
+            // the not-yet-caught-up index: everything is retained, so the
+            // cleanup is a no-op (no commit, entry untouched).
+            let version = committed.manifest.version;
+            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut committed)
                 .await
-                .unwrap_err();
-            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                .unwrap();
+            assert_eq!(committed.manifest.version, version);
+            let (entry_after, _) = fri_ledger(&committed).await;
+            assert_eq!(entry_after.uuid, entry.uuid);
         }
 
         /// A distributed compaction plans at V and its driver holds a handle

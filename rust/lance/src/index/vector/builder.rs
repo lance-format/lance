@@ -563,13 +563,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         });
 
-        let files = self
-            .merge_partitions(
+        // Heap-pin the merge stage: at opt-level 0 its state machine is the bulk of
+        // this future, and this future is embedded in every caller up to
+        // `compact_files` (see `remap_boxed` in ivf.rs).
+        let files = Box::pin(
+            self.merge_partitions(
                 stream::iter(build_iter)
                     .buffered(get_num_compute_intensive_cpus())
                     .boxed(),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok(files)
     }
 

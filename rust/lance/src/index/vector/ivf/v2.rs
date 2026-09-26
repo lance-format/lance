@@ -6214,13 +6214,15 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist, recall_requirement).await;
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6283,7 +6285,8 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_pq_delete_all_rows_lifecycle() {
         let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6308,7 +6311,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let params = VectorIndexParams::with_ivf_sq_params(distance_type, ivf_params, sq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6349,7 +6353,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let rq_params = RQBuildParams::with_rotation_type(5, rotation_type);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6465,7 +6470,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6491,12 +6497,14 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params.clone()).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
         test_remap(params, nlist, recall_requirement).await;
     }
 
@@ -6934,21 +6942,23 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        test_index(
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(
             v1_params,
             nlist,
             recall_requirement,
             Some((dataset.clone(), vectors.clone())),
-        )
+        ))
         .await;
         dataset.checkout_latest().await.unwrap();
         // retest with v3 params on the same dataset
-        test_index(
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(
             v3_params,
             nlist,
             recall_requirement,
             Some((dataset.clone(), vectors)),
-        )
+        ))
         .await;
 
         dataset.checkout_latest().await.unwrap();
