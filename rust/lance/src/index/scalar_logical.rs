@@ -1024,8 +1024,10 @@ mod tests {
             .await
             .unwrap();
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(!coverage.contains(0), "must drop retired frag 0");
-        assert!(coverage.contains(1), "must keep live indexed frag 1");
+        assert!(
+            coverage.is_empty(),
+            "physical-address coverage must be invalidated by fragment relabeling"
+        );
 
         let field_path = dataset.schema().field_path(merged.fields[0]).unwrap();
         let index = crate::index::scalar::open_scalar_index(
@@ -1118,6 +1120,10 @@ mod tests {
             .await
             .unwrap();
         let merged_coverage = merged.fragment_bitmap.as_ref().unwrap().clone();
+        assert!(
+            merged_coverage.is_empty(),
+            "physical-address coverage must be invalidated by fragment relabeling"
+        );
         let merged_uuid = merged.uuid;
 
         dataset
@@ -1136,7 +1142,7 @@ mod tests {
             scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap_replace_retired")
                 .await
                 .unwrap()
-                .unwrap();
+                .unwrap_or_default();
         assert_eq!(combined_bitmap, merged_coverage);
     }
 
@@ -1545,7 +1551,8 @@ mod tests {
             "compaction should retire fragment 0"
         );
 
-        // Merge: the retired fragment should be dropped from coverage
+        // Merge: stable-row-ID index coverage should follow both the compacted
+        // fragment and the metadata-only relabeled trailing fragment.
         let segments = dataset
             .load_indices_by_name("text_fmindex_compact")
             .await
@@ -1556,14 +1563,7 @@ mod tests {
             .unwrap();
 
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(
-            !coverage.contains(0),
-            "merged coverage must drop retired fragment 0"
-        );
-        assert!(
-            coverage.contains(1),
-            "merged coverage must keep live fragment 1"
-        );
+        assert_eq!(coverage, &live_frags);
 
         // Commit the merged segment and verify search works
         dataset
@@ -1968,6 +1968,7 @@ mod tests {
             .await
             .unwrap();
         let source_uuid = segment.uuid;
+        let source_coverage = segment.fragment_bitmap.as_ref().unwrap().clone();
 
         // Retire fragment 0: delete its rows and compact it away.
         dataset.delete("text = 'alpha beta gamma'").await.unwrap();
@@ -1992,9 +1993,15 @@ mod tests {
             !live_frags.contains(0),
             "compaction should retire fragment 0"
         );
-        assert!(live_frags.contains(1), "fragment 1 should stay live");
+        assert_eq!(
+            source_coverage.intersection_len(&live_frags),
+            0,
+            "compaction should retire every fragment covered by the stale segment"
+        );
 
-        // Coverage shrank, so even a single segment must be rebuilt.
+        // The uncommitted segment was not present for compaction to relabel its
+        // coverage, so even a single segment must be rebuilt without claiming
+        // any current fragment.
         let merged = dataset
             .merge_existing_index_segments(vec![segment])
             .await
@@ -2003,14 +2010,9 @@ mod tests {
             merged.uuid, source_uuid,
             "shrunk coverage must trigger a rebuild"
         );
-        assert_eq!(
-            merged
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![1]
+        assert!(
+            merged.fragment_bitmap.as_ref().unwrap().is_empty(),
+            "rebuilt coverage must exclude every retired fragment"
         );
     }
 }
