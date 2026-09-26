@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::tests::{field, fixture, fixture_with_index, install, persist_fixture, prepare};
+use super::tests::{
+    field, fixture, fixture_with_index, install, persist_fixture, prepare,
+    prepare_partition_with_block_rows,
+};
 use super::*;
 use crate::dataset::WriteParams;
 use crate::index::create::CreateIndexBuilder;
@@ -19,6 +22,7 @@ use geoarrow_array::{GeoArrowArray, builder::LineStringBuilder};
 use geoarrow_schema::{Dimension, LineStringType};
 use lance_index::IndexType;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::frag_reuse::row_map::ROW_MAP_CACHE_CHUNK_BYTES;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::pb;
@@ -4061,4 +4065,161 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
     assert!(!plan.contains("ANN"), "{plan}");
     let batch = scan.try_into_batch().await.unwrap();
     assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), 6);
+}
+
+/// Row-map label IO of one translating query on `dataset`: `(requests, bytes)`
+/// against files under `_fri/`, plus the single matching value.
+async fn fri_read_cost(dataset: &Dataset, value: i32) -> (usize, u64) {
+    let filter = format!("i = {value}");
+    let plan = dataset
+        .scan()
+        .filter(&filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    dataset.object_store.as_ref().io_stats_incremental();
+    let batch = dataset
+        .scan()
+        .filter(&filter)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_eq!(batch.num_rows(), 1, "{filter}");
+    assert_eq!(
+        batch
+            .column_by_name("i")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .value(0),
+        value
+    );
+    let fri: Vec<_> = stats
+        .requests
+        .iter()
+        .filter(|request| request.path.as_ref().contains("/_fri/"))
+        .collect();
+    let bytes = fri
+        .iter()
+        .map(|request| {
+            let range = request
+                .range
+                .as_ref()
+                .unwrap_or_else(|| panic!("unranged FRI read: {request:?}"));
+            range.end - range.start
+        })
+        .sum();
+    (fri.len(), bytes)
+}
+
+// The row-map chunk cache only pays off when the index cache can retain a
+// ~4 MiB chunk. Opened through the real dataset path with an index cache too
+// small for that, a translating query must read exactly the block it needs
+// instead of loading a whole chunk it cannot keep; with a cache that can keep
+// the chunk, the second query is served entirely from memory. Measured on the
+// dataset's own IO tracker: both request counts and bytes.
+#[tokio::test]
+async fn row_map_reads_follow_index_cache_capacity() {
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_dataset(&dir, FragmentCount::from(2), FragmentRowCount::from(16384))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    // 256-row blocks: a 32-block chunk is 8192 labels (16 KiB), a block 512 B,
+    // so the row map spans four chunks and a chunk read is many times a block.
+    let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    let (transition, destinations) =
+        prepare_partition_with_block_rows(&dataset, &source_ids, 10, 256).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let uri = dataset.uri().to_string();
+    drop(dataset);
+
+    // Two rows in different BTree pages (so the second query cannot be served
+    // by a cached translated page) but in the same row-map chunk.
+    let (first, second) = (5000, 300);
+    let open = |capacity: Option<usize>| {
+        let uri = uri.clone();
+        async move {
+            let builder = crate::dataset::builder::DatasetBuilder::from_uri(&uri);
+            match capacity {
+                Some(capacity) => builder.with_index_cache_size_bytes(capacity),
+                None => builder,
+            }
+            .load()
+            .await
+            .unwrap()
+        }
+    };
+
+    // Default cache: the chunk is loaded once and retained, so a second query
+    // in the same chunk performs no FRI IO at all.
+    let dataset = open(None).await;
+    let (default_requests, default_bytes) = fri_read_cost(&dataset, first).await;
+    assert!(default_requests > 0);
+    assert_eq!(
+        fri_read_cost(&dataset, second).await,
+        (0, 0),
+        "a retained chunk serves the second query"
+    );
+
+    // Cache disabled: nothing can be retained, so each query pays the row-map
+    // open plus one block read, never a chunk.
+    let dataset = open(Some(0)).await;
+    let (zero_requests, zero_bytes) = fri_read_cost(&dataset, first).await;
+    assert!(
+        zero_bytes < default_bytes,
+        "without a cache a query reads a block, not a chunk: {zero_bytes} vs {default_bytes}"
+    );
+    assert!(
+        zero_requests <= default_requests,
+        "{zero_requests} vs {default_requests}"
+    );
+    let (repeat_requests, repeat_bytes) = fri_read_cost(&dataset, second).await;
+    assert!(repeat_requests > 0);
+    assert!(
+        repeat_bytes < default_bytes,
+        "{repeat_bytes} vs {default_bytes}"
+    );
+
+    // Cache smaller than one production chunk (4 MiB): the reader itself is
+    // retained but labels are read per block, so the second query costs one
+    // block read and no chunk is ever loaded.
+    let dataset = open(Some(ROW_MAP_CACHE_CHUNK_BYTES - 1)).await;
+    let (small_requests, small_bytes) = fri_read_cost(&dataset, first).await;
+    assert!(
+        small_bytes < default_bytes,
+        "below chunk capacity a query reads a block, not a chunk: {small_bytes} vs {default_bytes}"
+    );
+    assert!(
+        small_requests <= default_requests,
+        "{small_requests} vs {default_requests}"
+    );
+    let (block_requests, block_bytes) = fri_read_cost(&dataset, second).await;
+    assert_eq!(block_requests, 1, "exactly the block read");
+    assert!(block_bytes < small_bytes, "{block_bytes} vs {small_bytes}");
 }
