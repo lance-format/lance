@@ -593,6 +593,17 @@ pub mod tests {
         source_ids: &[u64],
         dest_base_id: u64,
     ) -> (Transition, Vec<Fragment>) {
+        prepare_partition_with_block_rows(dataset, source_ids, dest_base_id, 3).await
+    }
+
+    /// [`prepare_partition`] with the row map's block size chosen by the
+    /// caller, for tests that need several blocks per cache chunk.
+    pub async fn prepare_partition_with_block_rows(
+        dataset: &Dataset,
+        source_ids: &[u64],
+        dest_base_id: u64,
+        block_rows: u32,
+    ) -> (Transition, Vec<Fragment>) {
         let source_fragments: Vec<Fragment> = source_ids
             .iter()
             .map(|id| {
@@ -677,7 +688,8 @@ pub mod tests {
             .new_index_file(MAPPING_FILE, RowMapWriter::schema())
             .await
             .unwrap();
-        let mut writer = RowMapWriter::try_new_with_block_rows(writer, source_rows, 2, 3).unwrap();
+        let mut writer =
+            RowMapWriter::try_new_with_block_rows(writer, source_rows, 2, block_rows).unwrap();
         writer.append_labels(&labels).await.unwrap();
         let (file, _) = writer.finish().await.unwrap();
         let transition = Transition {
