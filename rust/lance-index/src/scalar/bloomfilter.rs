@@ -2736,6 +2736,14 @@ mod tests {
             Field::new("has_null", DataType::Boolean, false),
             Field::new("bloom_filter_data", DataType::Binary, false),
         ]));
+        // A real filter, because Sbbf::new rejects a zero-length bitset: one
+        // that cannot answer a query is not a state the format can carry.
+        let legacy_filter_bytes = crate::scalar::bloomfilter::SbbfBuilder::new()
+            .expected_items(1000)
+            .false_positive_probability(0.01)
+            .build()
+            .unwrap()
+            .to_bytes();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -2743,7 +2751,9 @@ mod tests {
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
                 Arc::new(UInt64Array::from(vec![3u64])) as _,
                 Arc::new(BooleanArray::from(vec![has_null])) as _,
-                Arc::new(arrow_array::BinaryArray::from_vec(vec![b"".as_ref()])) as _,
+                Arc::new(arrow_array::BinaryArray::from_vec(vec![
+                    legacy_filter_bytes.as_slice(),
+                ])) as _,
             ],
         )
         .unwrap();

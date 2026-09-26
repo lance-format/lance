@@ -242,7 +242,18 @@ pub struct Sbbf {
 
 impl Sbbf {
     /// Create a new SBBF from raw bitset data
+    ///
+    /// A zero-length bitset is rejected. It passes the multiple-of-32 check but
+    /// yields a filter with no blocks, and every query against that filter has
+    /// to answer without having indexed anything: `check_hash` would either
+    /// index `blocks[0]` and panic, or claim the value is absent and let the
+    /// caller skip rows it should have read.
     pub fn new(bitset: &[u8]) -> Result<Self> {
+        if bitset.is_empty() {
+            return Err(SbbfError::InvalidData {
+                message: "Bitset must not be empty".to_string(),
+            });
+        }
         if !bitset.len().is_multiple_of(32) {
             return Err(SbbfError::InvalidData {
                 message: format!(
@@ -480,6 +491,21 @@ impl Default for SbbfBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero-length bitset is a multiple of 32, so it used to construct a
+    /// filter with no blocks and then panic on the first query. It is rejected
+    /// at construction instead, which keeps every filter that exists able to
+    /// answer without false negatives.
+    #[test]
+    fn test_empty_bitset_is_rejected() {
+        let err = Sbbf::new(&[]).expect_err("an empty bitset must not load");
+        assert!(
+            matches!(err, SbbfError::InvalidData { ref message } if message.contains("must not be empty")),
+            "unexpected error: {err:?}"
+        );
+        // A 32-byte bitset is the smallest that does load.
+        assert_eq!(Sbbf::new(&[0u8; 32]).unwrap().num_blocks(), 1);
+    }
 
     #[test]
     fn test_hash_bytes() {
