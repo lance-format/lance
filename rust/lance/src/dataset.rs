@@ -4224,6 +4224,8 @@ pub(crate) async fn write_manifest_file(
             .schema
             .verify_primary_key()
             .map_err(CommitError::OtherError)?;
+        blob::validate_blob_threshold_metadata(&manifest.schema)
+            .map_err(CommitError::OtherError)?;
     }
 
     if config.auto_set_feature_flags {

@@ -48,22 +48,24 @@ impl Transaction {
 /// limit and the other way above it.
 pub fn operation_may_change_schema(transaction: &pb::Transaction) -> bool {
     use pb::transaction::Operation;
-    !matches!(
-        transaction.operation.as_ref(),
+    match transaction.operation.as_ref() {
+        Some(Operation::UpdateConfig(update)) => {
+            !update.field_metadata_updates.is_empty() || !update.field_metadata.is_empty()
+        }
         Some(
             Operation::Append(_)
-                | Operation::Delete(_)
-                | Operation::CreateIndex(_)
-                | Operation::Rewrite(_)
-                | Operation::DataReplacement(_)
-                | Operation::ReserveFragments(_)
-                | Operation::Update(_)
-                | Operation::UpdateConfig(_)
-                | Operation::UpdateMemWalState(_)
-                | Operation::UpdateBases(_)
-                | Operation::DataOverlay(_)
-        )
-    )
+            | Operation::Delete(_)
+            | Operation::CreateIndex(_)
+            | Operation::Rewrite(_)
+            | Operation::DataReplacement(_)
+            | Operation::ReserveFragments(_)
+            | Operation::Update(_)
+            | Operation::UpdateMemWalState(_)
+            | Operation::UpdateBases(_)
+            | Operation::DataOverlay(_),
+        ) => false,
+        _ => true,
+    }
 }
 
 /// Write-boundary conversion: serialize using protobuf at the last step.
@@ -118,6 +120,28 @@ mod tests {
             ..Default::default()
         };
         assert!(!operation_may_change_schema(&overlay));
+    }
+
+    #[test]
+    fn field_metadata_updates_change_schema() {
+        let mut update = pb::transaction::UpdateConfig {
+            config_updates: Some(pb::transaction::UpdateMap::default()),
+            ..Default::default()
+        };
+        let config_only = pb::Transaction {
+            operation: Some(pb::transaction::Operation::UpdateConfig(update.clone())),
+            ..Default::default()
+        };
+        assert!(!operation_may_change_schema(&config_only));
+
+        update
+            .field_metadata_updates
+            .insert(0, pb::transaction::UpdateMap::default());
+        let field_update = pb::Transaction {
+            operation: Some(pb::transaction::Operation::UpdateConfig(update)),
+            ..Default::default()
+        };
+        assert!(operation_may_change_schema(&field_update));
     }
 
     /// And the converse, so the exemption cannot silently widen to everything.
