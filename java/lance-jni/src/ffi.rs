@@ -6,7 +6,7 @@ use core::slice;
 use crate::Error;
 use crate::error::Result;
 use crate::utils::{get_query, get_vector_index_params};
-use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
+use jni::objects::{JByteArray, JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{JNIEnv, objects::JObject};
 use lance_index::scalar::inverted::query::{Occur, Operator};
@@ -72,8 +72,12 @@ pub trait JNIEnvExt {
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String>;
     // Get float array from Java Object with given method name.
     fn get_vec_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<f32>>;
+    // Get byte array from Java Object with given method name.
+    fn get_vec_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<u8>>;
     // Get int as usize from Java Object with given method name.
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize>;
+    // Get u8 byte from Java Object with given method name.
+    fn get_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u8>;
     // Get u32 int from Java Object with given method name.
     fn get_u32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u32>;
     // Get u64 int from Java Object with given method name.
@@ -330,8 +334,17 @@ impl JNIEnvExt for JNIEnv<'_> {
         Ok(buffer)
     }
 
+    fn get_vec_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<u8>> {
+        let array = self.call_method(obj, method_name, "()[B", &[])?.l()?;
+        Ok(self.convert_byte_array(JByteArray::from(array))?)
+    }
+
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize> {
         Ok(self.call_method(obj, method_name, "()I", &[])?.i()? as usize)
+    }
+
+    fn get_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u8> {
+        Ok(self.call_method(obj, method_name, "()B", &[])?.b()? as u8)
     }
 
     fn get_u32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u32> {

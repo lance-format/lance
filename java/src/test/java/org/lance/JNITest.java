@@ -19,6 +19,8 @@ import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
+import org.lance.index.vector.RQModel;
+import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
@@ -30,8 +32,10 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class JNITest {
   @Test
@@ -82,6 +86,53 @@ public class JNITest {
   @Test
   public void testRqBuildParamsDefaultNumBits() {
     assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
+  }
+
+  @Test
+  public void testRqModelSerializationAndValidation() {
+    RQModel model = RQModel.build(32, (byte) 3);
+    RQModel restored = RQModel.fromBytes(model.toBytes());
+    assertArrayEquals(model.toBytes(), restored.toBytes());
+    assertEquals(32, restored.getDimension());
+    assertEquals((byte) 3, restored.getNumBits());
+    assertEquals(RQRotationType.FAST, restored.getRotationType());
+
+    assertThrows(IllegalArgumentException.class, () -> RQModel.build(31, (byte) 3));
+    assertThrows(IllegalArgumentException.class, () -> RQModel.build(32, (byte) 0));
+    assertThrows(IllegalArgumentException.class, () -> RQModel.fromBytes(new byte[] {1, 2, 3}));
+
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+    RQBuildParams wrongBits =
+        new RQBuildParams.Builder().setNumBits((byte) 1).setModel(restored).build();
+    IllegalArgumentException bitsError =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                JniTestHelper.parseIndexParams(
+                    IndexParams.builder()
+                        .setVectorIndexParams(
+                            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, wrongBits))
+                        .build()));
+    assertTrue(bitsError.getMessage().contains("num_bits=3"));
+    assertTrue(bitsError.getMessage().contains("requested num_bits=1"));
+
+    RQBuildParams wrongRotation =
+        new RQBuildParams.Builder()
+            .setNumBits((byte) 3)
+            .setRotationType(RQRotationType.MATRIX)
+            .setModel(restored)
+            .build();
+    IllegalArgumentException rotationError =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                JniTestHelper.parseIndexParams(
+                    IndexParams.builder()
+                        .setVectorIndexParams(
+                            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, wrongRotation))
+                        .build()));
+    assertTrue(rotationError.getMessage().contains("rotation_type=Fast"));
+    assertTrue(rotationError.getMessage().contains("requested rotation_type=Matrix"));
   }
 
   @Test

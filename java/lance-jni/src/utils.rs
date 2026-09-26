@@ -15,7 +15,6 @@ use lance::io::ObjectStoreParams;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_index::IndexParams;
-use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -24,6 +23,7 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::rq_model::extract_rq_build_params;
 
 use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::{ApproxMode, Query};
@@ -525,10 +525,7 @@ pub fn get_vector_index_params(
             let rq_params = env.get_optional_from_method(
                 &vector_index_params_obj,
                 "getRqParams",
-                |env, rq_obj| {
-                    let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
-                    Ok(RQBuildParams::new(num_bits))
-                },
+                extract_rq_build_params,
             )?;
 
             if let Some(rq_params) = rq_params {
