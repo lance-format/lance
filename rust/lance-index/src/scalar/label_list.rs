@@ -151,7 +151,13 @@ impl Index for LabelListIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        // The values index already covers every fragment that holds a list
+        // element; add the fragments whose lists are themselves null.
+        let mut frag_ids = self.values_index.calculate_included_frags().await?;
+        for (frag_id, _) in self.list_nulls.iter() {
+            frag_ids.insert(*frag_id);
+        }
+        Ok(frag_ids)
     }
 }
 
@@ -1518,6 +1524,29 @@ mod tests {
             .await
             .unwrap();
         (tmpdir, index)
+    }
+
+    /// `calculate_included_frags` must union the fragments the values index
+    /// covers with the fragments whose lists are null. Frag 3 here is reached
+    /// only through a null list, so it is covered iff `list_nulls` is folded in.
+    /// The commit path calls this to recompute a fragment bitmap; before it was
+    /// implemented it hit `unimplemented!()` and panicked.
+    #[tokio::test]
+    async fn test_label_list_calculate_included_frags() {
+        let rows: Vec<SampleRow> = vec![
+            (1u64 << 32, Some(vec![Some("a".to_string())])),
+            ((1u64 << 32) + 1, Some(vec![Some("b".to_string())])),
+            (2u64 << 32, Some(vec![Some("a".to_string())])),
+            (3u64 << 32, None),
+        ];
+        let (_dir, index) = build_label_list_segment(&rows).await;
+
+        let frags = index.calculate_included_frags().await.unwrap();
+        assert_eq!(
+            frags.iter().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "included frags must union value fragments with null-list fragments"
+        );
     }
 
     /// `remap` carries `list_nulls` in a global buffer written through the

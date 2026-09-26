@@ -749,7 +749,40 @@ impl Index for BitmapIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        let mut frag_ids = RoaringBitmap::new();
+
+        // Every distinct value, and the null key, occupies one row of the
+        // lookup file's `bitmaps` column, so a single pass over all rows
+        // collects the fragments this index covers. Stream in bounded batches
+        // rather than materializing every per-value bitmap at once.
+        let reader = self.lazy_reader.get().await?;
+        let total_rows = reader.num_rows();
+        if total_rows == 0 {
+            return Ok(frag_ids);
+        }
+        let mut stream = reader
+            .read_range_stream(0..total_rows, Some(&["bitmaps"]), 4096, 2)
+            .await?;
+        while let Some(batch) = stream.try_next().await? {
+            let bitmaps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
+            for i in 0..bitmaps.len() {
+                let mut bitmap = RowAddrTreeMap::deserialize_from(bitmaps.value(i))?;
+                // Raw bitmaps read straight from the file still need fragment
+                // remapping, matching `load_bitmap`.
+                if let Some(fri) = &self.frag_reuse_index {
+                    bitmap = fri.remap_row_addrs_tree_map(&bitmap);
+                }
+                for (frag_id, _) in bitmap.iter() {
+                    frag_ids.insert(*frag_id);
+                }
+            }
+        }
+
+        Ok(frag_ids)
     }
 }
 
@@ -3123,6 +3156,66 @@ mod tests {
                 "Null search results not correct"
             );
         }
+    }
+
+    /// `calculate_included_frags` must report every fragment the index covers,
+    /// including a fragment reached only through null keys. The commit path
+    /// (`migrate_indices`) calls this to recompute a fragment bitmap; before
+    /// this was implemented it hit `unimplemented!()` and panicked.
+    #[tokio::test]
+    async fn test_bitmap_calculate_included_frags() {
+        use arrow_array::UInt32Array;
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // frag 1 - { 0: 1, 1: 2 }   frag 2 - { 0: 1 }   frag 3 - { 0: null, 1: null }
+        // frag 3 is reached only through null keys, so it is covered iff the
+        // null row is included in the sweep.
+        let values = vec![Some(1u32), Some(2u32), Some(1u32), None, None];
+        let row_ids: Vec<u64> = vec![
+            RowAddress::new_from_parts(1, 0).into(),
+            RowAddress::new_from_parts(1, 1).into(),
+            RowAddress::new_from_parts(2, 0).into(),
+            RowAddress::new_from_parts(3, 0).into(),
+            RowAddress::new_from_parts(3, 1).into(),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::UInt32, true),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+        // build_index_map requires input sorted by value with nulls first
+        // (production sorts via TrainingOrdering::Values); sort like the other
+        // bitmap tests so its debug_assert holds under CI's debug-assertions.
+        let batch = sort_batch_by_value(&batch);
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let frags = index.calculate_included_frags().await.unwrap();
+        assert_eq!(
+            frags.iter().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "included frags must span value and null-only fragments"
+        );
     }
 
     /// Remap must emit exactly what the pre-streaming path did: one row per
