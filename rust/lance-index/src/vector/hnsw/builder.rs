@@ -71,7 +71,7 @@ pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: 
 }
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
     /// Maximum number of levels in the graph.
     pub max_level: u16,

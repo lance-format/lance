@@ -5630,6 +5630,8 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+            Omitted (the default) keeps every index on the table updated,
+            including ones created later; an empty list keeps none.
         hnsw_params : dict, optional
             Per-index HNSW build-parameter overrides recorded as writer-config
             defaults, keyed by maintained vector index name. Each value is a dict

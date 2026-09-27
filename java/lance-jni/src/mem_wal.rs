@@ -1036,10 +1036,10 @@ pub extern "system" fn Java_org_lance_Dataset_nativeInitializeMemWal(
 }
 
 fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject) -> Result<()> {
-    let maintained_list = env
-        .call_method(&params, "maintainedIndexes", "()Ljava/util/List;", &[])?
-        .l()?;
-    let maintained_indexes = env.get_strings(&maintained_list)?;
+    let maintained_indexes =
+        env.get_optional_from_method(&params, "maintainedIndexes", |env, list| {
+            env.get_strings(&list)
+        })?;
     let bucket_column = env.get_optional_string_from_method(&params, "bucketColumn")?;
     let num_buckets = env.get_optional_u32_from_method(&params, "numBuckets")?;
     let identity_column = env.get_optional_string_from_method(&params, "identityColumn")?;
@@ -1078,7 +1078,11 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
     } else if unsharded {
         builder = builder.unsharded();
     }
-    builder = builder.maintained_indexes(maintained_indexes);
+    // Flattening an absent list to an empty one here would ask for no index
+    // at all rather than every one.
+    if let Some(maintained_indexes) = maintained_indexes {
+        builder = builder.maintained_indexes(maintained_indexes);
+    }
     if let Some(config) = writer_config {
         builder = builder.writer_config_defaults(config);
     }
@@ -1425,10 +1429,11 @@ fn index_details_to_java<'a>(
 
     Ok(env.new_object(
         "org/lance/memwal/MemWalIndexDetails",
-        "(JLjava/util/List;Ljava/util/Map;Ljava/util/List;)V",
+        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;)V",
         &[
             JValueGen::Long(details.num_shards as i64),
             JValueGen::Object(&maintained_indexes),
+            JValueGen::Bool(u8::from(details.maintain_all_indexes)),
             JValueGen::Object(&writer_config_defaults),
             JValueGen::Object(&sharding_specs),
         ],
