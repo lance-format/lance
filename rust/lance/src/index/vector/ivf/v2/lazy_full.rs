@@ -10,18 +10,23 @@
 //! eager scan's per-row step on the same global heap (stage 2).
 //!
 //! Stage 1 prunes against a threshold `T` taken from that heap: the top of a
-//! heap holding `k` rows at some point no later than the probe's scoring.
-//! The heap's top never increases once full, so every row stage 1 prunes is
-//! one the eager scan's per-row step would prune too, and stage 2 replays the
-//! remaining rows in the same order with the same inputs. Heap contents,
-//! distances, ties and prune counters are therefore identical to the eager
-//! scan; `T` only decides how many rows are read.
+//! heap holding `k` rows at some point no later than the probe's scoring, or
+//! +inf while the heap holds fewer. The heap's top never increases once full,
+//! so every row stage 1 prunes is one the eager scan's per-row step would
+//! prune too, and stage 2 replays the remaining rows in the same order with
+//! the same inputs. Heap contents, distances, ties and prune counters are
+//! therefore identical to the eager scan; `T` only decides how many rows are
+//! read.
 //!
 //! Pipeline, in probe order:
 //! - a producer task stages probes (sign plane, prefilter, stage 1 on the CPU
 //!   pool), then gathers each probe's survivors once the probe is at most
 //!   `window` probes ahead of scoring, reading the threshold the scorer
-//!   publishes over a `watch` channel;
+//!   publishes over a `watch` channel. A probe whose gate opens before the
+//!   heap is full waits until the heap fills or its turn comes, unless
+//!   waiting would not save reads (`LANCE_RQ_LAZY_EAGER_BEFORE_FULL`): then
+//!   it is gathered at once with `T` = +inf, selecting every accepted row as
+//!   the eager load does;
 //! - the query task scores ready probes on one heap and publishes progress.
 //!
 //! Every staging and gather step runs as its own task, so it makes progress
@@ -54,9 +59,9 @@ use lance_index::vector::bq::storage::{
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::storage::{
-    DistanceCalculatorOptions, ExIndex, GatherPlan, GatheredEx, LayeredExLayout, LayeredLazyConfig,
-    LazyPromotionTicket, PlaneSource, QueryScratchPool, RabitRawQueryContext, VectorStore,
-    plan_plane_gather,
+    DenseGatherMode, DistanceCalculatorOptions, ExIndex, GatherPlan, GatheredEx, LayeredExLayout,
+    LayeredLazyConfig, LazyPromotionTicket, PlaneSource, QueryScratchPool, RabitRawQueryContext,
+    VectorStore, origin_reads_whole_plane, plan_plane_gather,
 };
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{ApproxMode, Query};
@@ -143,6 +148,13 @@ struct LazyFetchContext {
     heap_capacity: usize,
     /// Rows of the probes before each rank.
     rows_before: Vec<usize>,
+    /// First rank whose earlier probes hold `k` rows (the probe count if
+    /// none): once they are scored the heap is full, unless the prefilter or
+    /// the distance bounds dropped rows.
+    fill_rank: usize,
+    /// Whether the gathers issued once the heap fills are expected to read
+    /// whole planes anyway, so issuing them before it fills reads no more.
+    dense_at_fill: bool,
     upper_bound: Option<f32>,
     layout: LayeredExLayout,
     progress: watch::Receiver<LazyProgress>,
@@ -341,7 +353,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 *rows += self.storage.partition_size(partitions.value(idx) as usize);
                 Some(before)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let fill_rank = rows_before
+            .iter()
+            .position(|&rows| rows >= heap_capacity)
+            .unwrap_or(probe_count);
+        let dense_at_fill = match config.dense {
+            DenseGatherMode::Whole => true,
+            DenseGatherMode::Sparse => false,
+            // The threshold once the heap fills keeps about `k` of the rows
+            // scored by then, so about that fraction of a later probe's rows
+            // survives stage 1 (more, as the lower bound is looser). Survivors
+            // are scattered, so their aligned bytes are a larger fraction still.
+            DenseGatherMode::Cost => rows_before.get(fill_rank).is_some_and(|&rows| {
+                heap_capacity as f64 >= config.dense_bytes_fraction * rows as f64
+            }),
+        };
         let (progress_tx, progress_rx) = watch::channel(LazyProgress {
             scored: 0,
             full: false,
@@ -366,6 +393,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             config,
             heap_capacity,
             rows_before,
+            fill_rank,
+            dense_at_fill,
             upper_bound: query.upper_bound,
             layout,
             progress: progress_rx,
@@ -677,21 +706,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 .wait_for(|progress| progress.scored.saturating_add(window) >= rank)
                 .await
                 .map_err(|_| scan_cancelled())?;
-            if gate.full || gate.scored >= rank {
+            // An infinite threshold gathers every accepted row, so wait for a
+            // finite one, or for this probe's turn. With eager-before-full,
+            // stop waiting where it saves no reads: when the gathers after the
+            // fill are expected to be dense anyway, or once the probes holding
+            // `k` rows were scored without filling the heap, after which
+            // waiting would issue gathers one probe at a time. +inf only
+            // over-selects: stage 2 prunes on the live heap.
+            let early = context.config.eager_before_full;
+            let released = |progress: &LazyProgress| {
+                progress.full
+                    || progress.scored >= rank
+                    || (early && progress.scored >= context.fill_rank)
+            };
+            let issue = if released(&gate) || (early && context.dense_at_fill) {
                 gate
             } else {
-                // An infinite threshold would gather every row; wait for a
-                // finite one, or for this probe's turn.
                 stats.deferred_issues.incr();
                 let issue = *progress
-                    .wait_for(|progress| progress.full || progress.scored >= rank)
+                    .wait_for(released)
                     .await
                     .map_err(|_| scan_cancelled())?;
-                if !issue.full {
+                if !issue.full && issue.scored >= rank {
                     stats.serial_waits.incr();
                 }
                 issue
+            };
+            if !issue.full && issue.scored < rank {
+                stats.eager_before_full.incr();
             }
+            issue
         };
         stats.gate_wait_ns.add_elapsed(gating);
         let staleness = rank.saturating_sub(issue.scored) as u64;
@@ -718,9 +762,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         stats.rows_fetched.add(rank, survivors.len() as u64);
 
         let partition_rows = probe.entry.storage.len();
-        let mut planes = [PlaneSource::Sparse; 2];
+        let mut plan = GatherPlan {
+            planes: [PlaneSource::Sparse; 2],
+            origin_whole: [false; 2],
+        };
         for (slot, plane) in [1u8, 2].into_iter().enumerate() {
-            planes[slot] = if self
+            let row_bytes = context.layout.row_bytes[slot];
+            plan.planes[slot] = if self
                 .index_cache
                 .peek_resident_with_key(&PlaneKey {
                     partition: probe.partition_id,
@@ -730,20 +778,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             {
                 PlaneSource::Resident
             } else {
-                plan_plane_gather(
-                    &survivors,
-                    partition_rows,
-                    context.layout.row_bytes[slot],
-                    &context.config,
-                )
+                plan_plane_gather(&survivors, partition_rows, row_bytes, &context.config)
             };
+            plan.origin_whole[slot] = plan.planes[slot] == PlaneSource::Sparse
+                && origin_reads_whole_plane(&survivors, row_bytes, &context.config);
         }
         let mut gathered = self
             .storage
             .gather_ex_rows(
                 probe.partition_id,
                 &survivors,
-                GatherPlan { planes },
+                plan,
                 &context.config,
                 &self.index_cache,
                 context.metrics.io_stats(),

@@ -170,6 +170,13 @@ layered_lazy_counters! {
         deferred_issues,
         /// Deferred issues released only when every earlier probe was scored.
         serial_waits,
+        /// Gathers issued before the heap was full and before their turn,
+        /// selecting every accepted row; see `LANCE_RQ_LAZY_EAGER_BEFORE_FULL`.
+        eager_before_full,
+        /// Sparse gathers of planes the persistent tier did not hold that
+        /// loaded the whole plane instead of more origin row runs than
+        /// `LANCE_RQ_LAZY_ORIGIN_MAX_RUNS` (unlimited by default).
+        origin_whole_fallbacks,
         /// Loading sign planes.
         sign_load_ns,
         /// Stage-1 CPU dispatches.

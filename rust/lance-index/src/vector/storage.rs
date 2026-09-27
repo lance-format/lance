@@ -28,7 +28,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex, OnceLock},
     time::Instant,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -643,6 +643,25 @@ pub const LAZY_PROMOTE_ENV: &str = "LANCE_RQ_LAZY_PROMOTE";
 pub const LAZY_PROMOTE_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_PROMOTE_INFLIGHT";
 /// Largest survivor count a scoring batch scores on the query task instead of the CPU pool.
 pub const LAZY_INLINE_ROWS_ENV: &str = "LANCE_RQ_LAZY_INLINE_ROWS";
+/// Whether a gather whose window gate opens before the heap holds `k` rows
+/// may be issued then, selecting every accepted row as the eager load does
+/// (`0` or `1`, default `1`). It is issued early when waiting would not save
+/// reads, because the gathers issued once the heap fills are expected to be
+/// dense anyway (large `k`), or when the heap is still not full after the
+/// probes that hold `k` rows were scored (filters), where waiting would issue
+/// the gathers one probe at a time. `0` is an ablation knob: such gathers
+/// wait for the heap to fill or for every earlier probe to be scored.
+pub const LAZY_EAGER_BEFORE_FULL_ENV: &str = "LANCE_RQ_LAZY_EAGER_BEFORE_FULL";
+/// Most coalesced row runs a sparse gather reads from the origin file when the
+/// persistent tier does not hold the plane; with more, it loads (and admits)
+/// the whole plane instead. Unlimited by default, and ignored by backends that
+/// gate plane admission, which would not admit the plane.
+pub const LAZY_ORIGIN_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_MAX_RUNS";
+/// Benchmark knob (`0` or `1`, default `0`): `1` loads a layered partition's
+/// sign plane before its ex planes on backends that do not gate plane
+/// admission too, as gated backends always do, instead of loading all three
+/// planes at once. Read once per process.
+pub const SEQUENTIAL_PLANE_LOADS_ENV: &str = "LANCE_RQ_SEQUENTIAL_PLANE_LOADS";
 
 const DEFAULT_LAZY_WINDOW: usize = 16;
 const DEFAULT_LAZY_MAX_RUNS: usize = 16;
@@ -651,6 +670,37 @@ const DEFAULT_LAZY_PROMOTE_READS: u32 = 1;
 const DEFAULT_LAZY_PROMOTE_INFLIGHT: usize = 4;
 /// About the rows one ~100µs CPU dispatch would score.
 const DEFAULT_LAZY_INLINE_ROWS: usize = 512;
+
+/// [`SEQUENTIAL_PLANE_LOADS_ENV`], read once per process.
+static SEQUENTIAL_PLANE_LOADS: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
+    sequential_plane_loads_from(std::env::var(SEQUENTIAL_PLANE_LOADS_ENV).ok().as_deref())
+        .map_err(|err| err.to_string())
+});
+
+/// Whether layered partition loads read the sign plane before the ex planes on
+/// every backend ([`SEQUENTIAL_PLANE_LOADS_ENV`]). The variable is read once
+/// per process; an invalid value fails here and every layered partition load.
+/// Call it at startup to fail before serving.
+pub fn sequential_plane_loads() -> Result<bool> {
+    SEQUENTIAL_PLANE_LOADS.clone().map_err(Error::invalid_input)
+}
+
+fn sequential_plane_loads_from(value: Option<&str>) -> Result<bool> {
+    value.map_or(Ok(false), |value| {
+        parse_flag(SEQUENTIAL_PLANE_LOADS_ENV, value)
+    })
+}
+
+/// Parse a `0`/`1` (or `false`/`true`) environment flag.
+fn parse_flag(name: &str, value: &str) -> Result<bool> {
+    match value.trim() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(Error::invalid_input(format!(
+            "{name}={value:?} is invalid, expected 0 or 1"
+        ))),
+    }
+}
 
 /// Page size the gather cost model aligns row runs to, matching the
 /// persistent cache's aligned reads.
@@ -698,6 +748,10 @@ pub struct LayeredLazyConfig {
     pub promote: LazyPromotion,
     pub promote_inflight: usize,
     pub inline_rows: usize,
+    /// See [`LAZY_EAGER_BEFORE_FULL_ENV`].
+    pub eager_before_full: bool,
+    /// See [`LAZY_ORIGIN_MAX_RUNS_ENV`]; `usize::MAX` never falls back.
+    pub origin_max_runs: usize,
 }
 
 impl Default for LayeredLazyConfig {
@@ -713,6 +767,8 @@ impl Default for LayeredLazyConfig {
             },
             promote_inflight: DEFAULT_LAZY_PROMOTE_INFLIGHT,
             inline_rows: DEFAULT_LAZY_INLINE_ROWS,
+            eager_before_full: true,
+            origin_max_runs: usize::MAX,
         }
     }
 }
@@ -742,11 +798,7 @@ impl LayeredLazyConfig {
         };
         let mut config = Self::default();
         if let Some(value) = lookup(LAZY_FULL_ENV) {
-            config.enabled = match value.trim() {
-                "1" | "true" => true,
-                "0" | "false" => false,
-                _ => return Err(invalid(LAZY_FULL_ENV, &value, "0 or 1")),
-            };
+            config.enabled = parse_flag(LAZY_FULL_ENV, &value)?;
         }
         if !config.enabled {
             return Ok(config);
@@ -788,6 +840,10 @@ impl LayeredLazyConfig {
         }
         config.promote_inflight = count(LAZY_PROMOTE_INFLIGHT_ENV, config.promote_inflight, 1)?;
         config.inline_rows = count(LAZY_INLINE_ROWS_ENV, config.inline_rows, 0)?;
+        if let Some(value) = lookup(LAZY_EAGER_BEFORE_FULL_ENV) {
+            config.eager_before_full = parse_flag(LAZY_EAGER_BEFORE_FULL_ENV, &value)?;
+        }
+        config.origin_max_runs = count(LAZY_ORIGIN_MAX_RUNS_ENV, config.origin_max_runs, 0)?;
         Ok(config)
     }
 }
@@ -809,6 +865,13 @@ pub enum PlaneSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatherPlan {
     pub planes: [PlaneSource; 2],
+    /// Per plane, whether a [`PlaneSource::Sparse`] read that the persistent
+    /// tier cannot serve loads the whole plane (see
+    /// [`origin_reads_whole_plane`]) instead of reading the rows from the
+    /// origin file. Backends that gate plane admission ignore it: they would
+    /// read the whole plane without admitting it, so every query would pay
+    /// for it again.
+    pub origin_whole: [bool; 2],
 }
 
 /// Row geometry of a layered index's ex planes.
@@ -838,6 +901,36 @@ pub fn plan_plane_gather(
         DenseGatherMode::Whole => return PlaneSource::Whole,
         DenseGatherMode::Cost => {}
     }
+    let (runs, pages) = sparse_read_extent(rows, row_bytes);
+    let plane_bytes = LAZY_GATHER_BODY_OFFSET_BYTES + partition_rows * row_bytes;
+    if runs > config.max_runs
+        || (pages * LAZY_GATHER_PAGE_BYTES) as f64
+            >= config.dense_bytes_fraction * plane_bytes as f64
+    {
+        PlaneSource::Whole
+    } else {
+        PlaneSource::Sparse
+    }
+}
+
+/// Whether a sparse read of sorted, unique `rows` that the persistent tier
+/// cannot serve should load the whole plane instead of reading the rows from
+/// the origin file: when the rows take more than
+/// [`LayeredLazyConfig::origin_max_runs`] runs (grouped as in
+/// [`plan_plane_gather`]).
+pub fn origin_reads_whole_plane(
+    rows: &[u32],
+    row_bytes: usize,
+    config: &LayeredLazyConfig,
+) -> bool {
+    config.origin_max_runs != usize::MAX
+        && sparse_read_extent(rows, row_bytes).0 > config.origin_max_runs
+}
+
+/// Row runs and pages of a sparse read of sorted, unique `rows`: rows closer
+/// than the plane cache codec's gap share a run, and every run is rounded out
+/// to whole pages.
+fn sparse_read_extent(rows: &[u32], row_bytes: usize) -> (usize, usize) {
     let gap_rows = LAZY_GATHER_COALESCE_GAP_BYTES / row_bytes.max(1);
     let page =
         |row: usize| (LAZY_GATHER_BODY_OFFSET_BYTES + row * row_bytes) / LAZY_GATHER_PAGE_BYTES;
@@ -856,15 +949,7 @@ pub fn plan_plane_gather(
         runs += 1;
         start = end;
     }
-    let plane_bytes = LAZY_GATHER_BODY_OFFSET_BYTES + partition_rows * row_bytes;
-    if runs > config.max_runs
-        || (pages * LAZY_GATHER_PAGE_BYTES) as f64
-            >= config.dense_bytes_fraction * plane_bytes as f64
-    {
-        PlaneSource::Whole
-    } else {
-        PlaneSource::Sparse
-    }
+    (runs, pages)
 }
 
 /// How stage-2 survivors index a [`GatheredEx`]'s batches.
@@ -1200,13 +1285,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             RQPrecision::Full => 2,
         };
         let load_plane = |plane| self.load_plane_entry(part_id, plane, cache, io_stats.clone());
-        // Admit the sign dependency first. The high and low reads can then
-        // overlap without changing admission policy or assembled column order.
-        let sign = load_plane(0).await?;
-        let ex = futures::future::try_join_all((1..=last).map(load_plane)).await?;
+        let planes = if sequential_plane_loads()? || cache.plane_admission_gated() {
+            // Admit the sign dependency first. The high and low reads can then
+            // overlap without changing admission policy or assembled column order.
+            let sign = load_plane(0).await?;
+            let ex = futures::future::try_join_all((1..=last).map(load_plane)).await?;
+            std::iter::once(sign).chain(ex).collect()
+        } else {
+            // Admission does not depend on the sign plane's residency, so a
+            // missed partition reads its planes in one round trip.
+            // `try_join_all` returns them in plane order.
+            futures::future::try_join_all((0..=last).map(load_plane)).await?
+        };
         let mut fields = Vec::new();
         let mut columns = Vec::new();
-        for batch in std::iter::once(sign).chain(ex) {
+        for batch in planes {
             fields.extend(batch.0.schema().fields().iter().cloned());
             columns.extend(batch.0.columns().iter().cloned());
         }
@@ -1375,11 +1468,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 1,
                 rows,
                 plan.planes[0],
+                plan.origin_whole[0],
                 config,
                 cache,
                 io_stats.clone()
             ),
-            self.fetch_ex_plane(part_id, 2, rows, plan.planes[1], config, cache, io_stats),
+            self.fetch_ex_plane(
+                part_id,
+                2,
+                rows,
+                plan.planes[1],
+                plan.origin_whole[1],
+                config,
+                cache,
+                io_stats
+            ),
         )?;
         let index = if high.source != PlaneSource::Sparse && low.source != PlaneSource::Sparse {
             ExIndex::Identity
@@ -1407,6 +1510,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         })
     }
 
+    /// Fetch one ex plane from `source`; `origin_whole` is the plan's
+    /// [`GatherPlan::origin_whole`] for the plane.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_ex_plane(
         &self,
@@ -1414,6 +1519,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         plane: u8,
         rows: &[u32],
         source: PlaneSource,
+        origin_whole: bool,
         config: &LayeredLazyConfig,
         cache: &WeakLanceCache,
         io_stats: Option<IoStats>,
@@ -1435,39 +1541,46 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 promotion: None,
             });
         }
-        if source != PlaneSource::Sparse {
-            let batch = self
-                .load_plane_entry(part_id, plane, cache, io_stats)
-                .await?;
-            stats.fetch_whole_ns.add_elapsed(started);
-            return Ok(FetchedPlane {
-                batch: batch.0.clone(),
-                source: PlaneSource::Whole,
-                from_origin: false,
-                promotion: None,
-            });
+        if source == PlaneSource::Sparse {
+            let persisted = cache.get_rows_with_key(&key, rows).await;
+            if persisted.is_some() || !origin_whole || cache.plane_admission_gated() {
+                let (batch, from_origin) = match persisted {
+                    Some(batch) => (batch.0.clone(), false),
+                    None => (
+                        self.read_plane(part_id, plane, Some(rows.to_vec()), io_stats)
+                            .await?,
+                        true,
+                    ),
+                };
+                if batch.num_rows() != rows.len() {
+                    return Err(Error::internal(format!(
+                        "sparse gather of partition {part_id} plane {plane} returned {} rows for {} offsets",
+                        batch.num_rows(),
+                        rows.len()
+                    )));
+                }
+                stats.fetch_sparse_ns.add_elapsed(started);
+                return Ok(FetchedPlane {
+                    batch,
+                    source: PlaneSource::Sparse,
+                    from_origin,
+                    promotion: self.request_lazy_promotion(part_id, plane, config, cache),
+                });
+            }
+            // Too many origin row runs: load the whole plane instead, which
+            // this backend admits like the eager load, so later queries find
+            // it cached.
+            stats.origin_whole_fallbacks.incr();
         }
-        let (batch, from_origin) = match cache.get_rows_with_key(&key, rows).await {
-            Some(batch) => (batch.0.clone(), false),
-            None => (
-                self.read_plane(part_id, plane, Some(rows.to_vec()), io_stats)
-                    .await?,
-                true,
-            ),
-        };
-        if batch.num_rows() != rows.len() {
-            return Err(Error::internal(format!(
-                "sparse gather of partition {part_id} plane {plane} returned {} rows for {} offsets",
-                batch.num_rows(),
-                rows.len()
-            )));
-        }
-        stats.fetch_sparse_ns.add_elapsed(started);
+        let batch = self
+            .load_plane_entry(part_id, plane, cache, io_stats)
+            .await?;
+        stats.fetch_whole_ns.add_elapsed(started);
         Ok(FetchedPlane {
-            batch,
-            source: PlaneSource::Sparse,
-            from_origin,
-            promotion: self.request_lazy_promotion(part_id, plane, config, cache),
+            batch: batch.0.clone(),
+            source: PlaneSource::Whole,
+            from_origin: false,
+            promotion: None,
         })
     }
 
@@ -1752,10 +1865,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseGatherMode, LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_FULL_ENV,
-        LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV, LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV,
-        LAZY_WINDOW_ENV, LayeredLazyConfig, LazyPromotion, PlaneSource, QueryScratchCapacity,
-        QueryScratchPool, compact_prewarm_batches, plan_plane_gather,
+        DenseGatherMode, LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_EAGER_BEFORE_FULL_ENV,
+        LAZY_FULL_ENV, LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV, LAZY_ORIGIN_MAX_RUNS_ENV,
+        LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig,
+        LazyPromotion, PlaneSource, QueryScratchCapacity, QueryScratchPool,
+        SEQUENTIAL_PLANE_LOADS_ENV, compact_prewarm_batches, origin_reads_whole_plane,
+        plan_plane_gather, sequential_plane_loads, sequential_plane_loads_from,
         spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
@@ -1903,6 +2018,8 @@ mod tests {
             (LAZY_PROMOTE_ENV, "bg:2"),
             (LAZY_PROMOTE_INFLIGHT_ENV, "8"),
             (LAZY_INLINE_ROWS_ENV, "0"),
+            (LAZY_EAGER_BEFORE_FULL_ENV, "0"),
+            (LAZY_ORIGIN_MAX_RUNS_ENV, "5"),
         ]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
@@ -1918,6 +2035,8 @@ mod tests {
                 promote: LazyPromotion::Background { reads: 2 },
                 promote_inflight: 8,
                 inline_rows: 0,
+                eager_before_full: false,
+                origin_max_runs: 5,
             }
         );
         assert_eq!(
@@ -1925,6 +2044,17 @@ mod tests {
             LayeredLazyConfig::default()
         );
         assert!(!LayeredLazyConfig::default().enabled);
+        assert!(LayeredLazyConfig::default().eager_before_full);
+        assert_eq!(LayeredLazyConfig::default().origin_max_runs, usize::MAX);
+        // The origin run cap does not depend on the eager-before-full switch.
+        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_ORIGIN_MAX_RUNS_ENV, "2")]);
+        let config =
+            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
+                .unwrap();
+        assert_eq!(
+            (config.eager_before_full, config.origin_max_runs),
+            (true, 2)
+        );
         let error =
             LayeredLazyConfig::from_lookup(|key| (key == LAZY_FULL_ENV).then(|| "yes".into()))
                 .unwrap_err();
@@ -1936,6 +2066,8 @@ mod tests {
             (LAZY_PROMOTE_INFLIGHT_ENV, "0"),
             (LAZY_DENSE_BYTES_FRACTION_ENV, "-1"),
             (LAZY_WINDOW_ENV, "many"),
+            (LAZY_EAGER_BEFORE_FULL_ENV, "on"),
+            (LAZY_ORIGIN_MAX_RUNS_ENV, "-1"),
         ] {
             let enabled = |key: &str| -> Option<String> {
                 if key == LAZY_FULL_ENV {
@@ -2002,6 +2134,59 @@ mod tests {
             );
             assert_eq!(plan_plane_gather(&[10], 2000, row_bytes, &config), expected);
         }
+    }
+
+    #[test]
+    fn test_origin_reads_whole_plane_counts_row_runs() {
+        // 520-byte rows: rows at most 7 apart share one run.
+        let row_bytes = 520;
+        let two_runs = [10, 17, 100];
+        let three_runs = [10, 100, 1000];
+        // Unlimited by default: origin rows are read whatever their runs.
+        let unlimited = LayeredLazyConfig::default();
+        assert!(!origin_reads_whole_plane(
+            &three_runs,
+            row_bytes,
+            &unlimited
+        ));
+        let capped = LayeredLazyConfig {
+            origin_max_runs: 2,
+            ..unlimited
+        };
+        assert!(!origin_reads_whole_plane(&two_runs, row_bytes, &capped));
+        assert!(origin_reads_whole_plane(&three_runs, row_bytes, &capped));
+        // The cap applies whether gathers before the heap fills are deferred.
+        let deferred = LayeredLazyConfig {
+            eager_before_full: false,
+            ..capped
+        };
+        assert!(origin_reads_whole_plane(&three_runs, row_bytes, &deferred));
+        let none = LayeredLazyConfig {
+            origin_max_runs: 0,
+            ..unlimited
+        };
+        assert!(origin_reads_whole_plane(&[10], row_bytes, &none));
+        assert!(!origin_reads_whole_plane(&[], row_bytes, &none));
+    }
+
+    #[test]
+    fn test_sequential_plane_loads_flag() {
+        // The accessor reports the process environment's value.
+        let process = std::env::var(SEQUENTIAL_PLANE_LOADS_ENV).ok();
+        assert_eq!(
+            sequential_plane_loads().ok(),
+            sequential_plane_loads_from(process.as_deref()).ok()
+        );
+        assert!(!sequential_plane_loads_from(None).unwrap());
+        assert!(!sequential_plane_loads_from(Some("0")).unwrap());
+        assert!(sequential_plane_loads_from(Some("1")).unwrap());
+        assert!(sequential_plane_loads_from(Some(" true ")).unwrap());
+        let error = sequential_plane_loads_from(Some("yes")).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains(SEQUENTIAL_PLANE_LOADS_ENV),
+            "{error}"
+        );
     }
 
     #[test]

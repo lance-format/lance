@@ -7306,6 +7306,22 @@ mod tests {
             /// for a slot in this bounded channel, like a tiered cache whose
             /// admissions queue their evictions for the disk.
             spill: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
+            /// When set, plane loads through `get_or_insert` are recorded
+            /// here, and each yields once after it starts so that loads its
+            /// caller issues together overlap.
+            plane_loads: std::sync::Mutex<Option<Vec<PlaneLoad>>>,
+        }
+
+        /// The loader a backend's `get_or_insert` receives.
+        type EntryLoader<'a> = std::pin::Pin<
+            Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
+        >;
+
+        /// A plane load through the backend's `get_or_insert`, by plane.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum PlaneLoad {
+            Started(u8),
+            Finished(u8),
         }
 
         impl std::fmt::Debug for TieredPlaneTestBackend {
@@ -7325,7 +7341,57 @@ mod tests {
                     serve_rows: AtomicBool::new(true),
                     hide_empty_planes: AtomicBool::new(false),
                     spill: Default::default(),
+                    plane_loads: Default::default(),
                 }
+            }
+
+            fn record_plane_loads(&self) {
+                *self.plane_loads.lock().unwrap() = Some(Vec::new());
+            }
+
+            /// The plane loads recorded since `record_plane_loads`, which
+            /// stops recording.
+            fn take_plane_loads(&self) -> Vec<PlaneLoad> {
+                self.plane_loads.lock().unwrap().take().unwrap_or_default()
+            }
+
+            /// Record `load` when recording; returns whether it did.
+            fn record_plane_load(&self, load: PlaneLoad) -> bool {
+                match self.plane_loads.lock().unwrap().as_mut() {
+                    Some(loads) => {
+                        loads.push(load);
+                        true
+                    }
+                    None => false,
+                }
+            }
+
+            async fn get_or_insert_entry(
+                &self,
+                key: &InternalCacheKey,
+                loader: EntryLoader<'_>,
+                codec: Option<CacheCodec>,
+            ) -> Result<(CacheEntry, bool)> {
+                if let Some(entry) = self.ram.get(key, None).await {
+                    return Ok((entry, true));
+                }
+                let admitted = match self.read_disk(key) {
+                    Some((entry, size)) => {
+                        self.ram.insert(key, entry.clone(), size, None).await;
+                        (entry, true)
+                    }
+                    None => {
+                        let (entry, size) = loader.await?;
+                        self.insert(key, entry.clone(), size, codec).await;
+                        (entry, false)
+                    }
+                };
+                let spill = self.spill.lock().unwrap().clone();
+                if let Some(spill) = spill {
+                    // A closed channel only means the test stopped draining it.
+                    let _ = spill.send(()).await;
+                }
+                Ok(admitted)
             }
 
             fn set_spill(&self, spill: Option<tokio::sync::mpsc::Sender<()>>) {
@@ -7439,26 +7505,17 @@ mod tests {
                 >,
                 codec: Option<CacheCodec>,
             ) -> Result<(CacheEntry, bool)> {
-                if let Some(entry) = self.ram.get(key, None).await {
-                    return Ok((entry, true));
+                let plane = codec
+                    .and_then(|codec| codec.plane_tag())
+                    .filter(|&plane| self.record_plane_load(PlaneLoad::Started(plane)));
+                if plane.is_some() {
+                    tokio::task::yield_now().await;
                 }
-                let admitted = match self.read_disk(key) {
-                    Some((entry, size)) => {
-                        self.ram.insert(key, entry.clone(), size, None).await;
-                        (entry, true)
-                    }
-                    None => {
-                        let (entry, size) = loader.await?;
-                        self.insert(key, entry.clone(), size, codec).await;
-                        (entry, false)
-                    }
-                };
-                let spill = self.spill.lock().unwrap().clone();
-                if let Some(spill) = spill {
-                    // A closed channel only means the test stopped draining it.
-                    let _ = spill.send(()).await;
+                let result = self.get_or_insert_entry(key, loader, codec).await;
+                if let Some(plane) = plane {
+                    self.record_plane_load(PlaneLoad::Finished(plane));
                 }
-                Ok(admitted)
+                result
             }
 
             async fn clear(&self) {
@@ -7624,6 +7681,16 @@ mod tests {
                     dense_bytes_fraction: f64::INFINITY,
                     ..enabled
                 },
+                LayeredLazyConfig {
+                    window: 4,
+                    eager_before_full: false,
+                    ..enabled
+                },
+                LayeredLazyConfig {
+                    dense: DenseGatherMode::Sparse,
+                    origin_max_runs: 0,
+                    ..enabled
+                },
             ]
         }
 
@@ -7722,6 +7789,10 @@ mod tests {
             /// A tiered backend without sign gating whose RAM holds only a
             /// few planes, prewarmed to disk.
             Tiny,
+            /// An empty tiered backend without sign gating that can hold every plane.
+            ColdUngated,
+            /// An empty tiered backend with sign gating that can hold every plane.
+            ColdGated,
         }
 
         async fn open_lazy_test_index(
@@ -7748,10 +7819,15 @@ mod tests {
                 LazyTestCache::Ungated
                 | LazyTestCache::Gated
                 | LazyTestCache::TieredResident
-                | LazyTestCache::Tiny => {
+                | LazyTestCache::Tiny
+                | LazyTestCache::ColdUngated
+                | LazyTestCache::ColdGated => {
                     let (ram_bytes, gated) = match cache {
                         LazyTestCache::Gated => (LAZY_SMALL_CACHE_BYTES, true),
-                        LazyTestCache::TieredResident => (LAZY_LARGE_CACHE_BYTES, false),
+                        LazyTestCache::TieredResident | LazyTestCache::ColdUngated => {
+                            (LAZY_LARGE_CACHE_BYTES, false)
+                        }
+                        LazyTestCache::ColdGated => (LAZY_LARGE_CACHE_BYTES, true),
                         LazyTestCache::Tiny => (LAZY_TINY_CACHE_BYTES, false),
                         _ => (LAZY_SMALL_CACHE_BYTES, false),
                     };
@@ -7776,7 +7852,10 @@ mod tests {
                 .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
                 .await
                 .unwrap();
-            if cache != LazyTestCache::Origin {
+            if !matches!(
+                cache,
+                LazyTestCache::Origin | LazyTestCache::ColdUngated | LazyTestCache::ColdGated
+            ) {
                 index.prewarm().await.unwrap();
             }
             (dataset, index, tiered)
@@ -7993,7 +8072,9 @@ mod tests {
                                 LazyTestCache::Small
                                 | LazyTestCache::Gated
                                 | LazyTestCache::TieredResident
-                                | LazyTestCache::Tiny => {}
+                                | LazyTestCache::Tiny
+                                | LazyTestCache::ColdUngated
+                                | LazyTestCache::ColdGated => {}
                             }
                             if case % 2 == 1 {
                                 let eager =
@@ -8386,6 +8467,8 @@ mod tests {
                 enabled: true,
                 dense: DenseGatherMode::Sparse,
                 promote: LazyPromotion::Background { reads: 1 },
+                // Gathers the persistent tier cannot serve read origin rows.
+                origin_max_runs: usize::MAX,
                 ..Default::default()
             };
             let queries: Vec<Query> = (0..4)
@@ -8485,7 +8568,8 @@ mod tests {
         /// steps were plain futures in those buffers, the channel handed the
         /// next freed slot to its oldest waiter, a staging step nobody polled,
         /// which never used it: the head gather and every later admission then
-        /// waited forever. Steps now run as tasks and complete on their own.
+        /// waited forever. Steps now run as tasks and complete on their own,
+        /// whether gathers before the heap fills are deferred or issued at once.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_layered_lazy_unpolled_staging_cannot_hold_spill_slot() {
             const PROBES: usize = 32;
@@ -8527,39 +8611,415 @@ mod tests {
             });
             tiered.set_spill(Some(spill_tx));
             ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
-                enabled: true,
-                window: 1,
-                dense: DenseGatherMode::Whole,
-                promote: LazyPromotion::Off,
-                ..Default::default()
-            });
-            layered_stats::snapshot_and_reset();
-            for (position, (query, expected)) in queries.iter().zip(&expected).enumerate() {
-                let result = tokio::time::timeout(
-                    QUERY_TIMEOUT,
-                    search_global(&index, query, filter.clone()),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("lazy query {position} did not finish within {QUERY_TIMEOUT:?}")
-                })
-                .unwrap();
-                assert_eq!(&result_bits(&result), expected, "query {position}");
+            for eager_before_full in [false, true] {
+                ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
+                    enabled: true,
+                    window: 1,
+                    dense: DenseGatherMode::Whole,
+                    promote: LazyPromotion::Off,
+                    eager_before_full,
+                    ..Default::default()
+                });
+                layered_stats::snapshot_and_reset();
+                for (position, (query, expected)) in queries.iter().zip(&expected).enumerate() {
+                    let result = tokio::time::timeout(
+                        QUERY_TIMEOUT,
+                        search_global(&index, query, filter.clone()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "lazy query {position} (eager_before_full={eager_before_full}) did not finish within {QUERY_TIMEOUT:?}"
+                        )
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        &result_bits(&result),
+                        expected,
+                        "query {position} eager_before_full={eager_before_full}"
+                    );
+                }
+                let stats = layered_stats::snapshot_and_reset();
+                assert_eq!(stats.lazy_queries, QUERIES as u64, "{stats:?}");
+                assert_eq!(stats.needed_not_fetched, 0, "{stats:?}");
+                let whole_planes: u64 = stats.high_whole.iter().chain(&stats.low_whole).sum();
+                assert!(
+                    whole_planes > 0,
+                    "gathers must admit whole ex planes: {stats:?}"
+                );
             }
-            let stats = layered_stats::snapshot_and_reset();
             tiered.set_spill(None);
             drainer.abort();
             ivf.set_lazy_prepare_parallelism_for_test(0);
             ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+        }
 
-            assert_eq!(stats.lazy_queries, QUERIES as u64, "{stats:?}");
-            assert_eq!(stats.needed_not_fetched, 0, "{stats:?}");
-            let whole_planes: u64 = stats.high_whole.iter().chain(&stats.low_whole).sum();
-            assert!(
-                whole_planes > 0,
-                "gathers must admit whole ex planes: {stats:?}"
+        /// Sums of the lazy counters that tell issue and origin policies apart.
+        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+        struct IssueTotals {
+            eager_before_full: u64,
+            deferred_issues: u64,
+            serial_waits: u64,
+            origin_whole_fallbacks: u64,
+            origin_row_reads: u64,
+            sparse_planes: u64,
+        }
+
+        impl IssueTotals {
+            fn add(&mut self, stats: &LayeredLazyStats) {
+                self.eager_before_full += stats.eager_before_full;
+                self.deferred_issues += stats.deferred_issues;
+                self.serial_waits += stats.serial_waits;
+                self.origin_whole_fallbacks += stats.origin_whole_fallbacks;
+                self.origin_row_reads += stats.origin_row_reads;
+                self.sparse_planes += stats
+                    .high_sparse
+                    .iter()
+                    .chain(&stats.low_sparse)
+                    .sum::<u64>();
+            }
+        }
+
+        /// Issuing gathers before the heap fills, and loading whole planes
+        /// instead of many origin row runs, change only what is read: results
+        /// match the eager scan with either switched on or off, including `k`
+        /// beyond the rows of the first probes and backends that serve no
+        /// persistent rows. Backends that gate plane admission (Lance's
+        /// default cache included) never fall back to whole planes.
+        #[rstest]
+        #[case::origin(LazyTestCache::Origin, true)]
+        #[case::small(LazyTestCache::Small, true)]
+        #[case::gated(LazyTestCache::Gated, true)]
+        #[case::tiny_without_rows(LazyTestCache::Tiny, false)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_eager_before_full_matches_eager(
+            #[case] cache: LazyTestCache,
+            #[case] serve_rows: bool,
+        ) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, tiered) = open_lazy_test_index(dir.as_str(), cache).await;
+            if let Some(tiered) = &tiered {
+                tiered.serve_rows.store(serve_rows, Ordering::Relaxed);
+            }
+            let origin_only = tiered.is_none() || !serve_rows;
+            let gated = lazy_index(&index).index_cache.plane_admission_gated();
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filters = lazy_test_filters();
+            let mut totals: HashMap<(bool, usize), IssueTotals> = HashMap::new();
+            let mut case = 0usize;
+            for row in [0, 777] {
+                for nprobes in [8, LAZY_PARTITIONS] {
+                    for k in [10, 1000, 5000, LAZY_ROWS + 1] {
+                        for eager_before_full in [true, false] {
+                            for origin_max_runs in [0, 2, usize::MAX] {
+                                for dense in [DenseGatherMode::Cost, DenseGatherMode::Sparse] {
+                                    case += 1;
+                                    let (filter_name, filter) = &filters[case % filters.len()];
+                                    let config = LayeredLazyConfig {
+                                        enabled: true,
+                                        dense,
+                                        eager_before_full,
+                                        origin_max_runs,
+                                        ..Default::default()
+                                    };
+                                    let query = lazy_test_query(vectors.value(row), k, nprobes);
+                                    let context = format!(
+                                        "cache={cache:?} serve_rows={serve_rows} row={row} nprobes={nprobes} k={k} filter={filter_name} config={config:?}"
+                                    );
+                                    let stats = assert_lazy_matches_eager(
+                                        &index, &query, filter, config, &context,
+                                    )
+                                    .await;
+                                    if !eager_before_full {
+                                        assert_eq!(stats.eager_before_full, 0, "{context}");
+                                    }
+                                    if origin_max_runs == usize::MAX || gated {
+                                        assert_eq!(stats.origin_whole_fallbacks, 0, "{context}");
+                                    }
+                                    totals
+                                        .entry((eager_before_full, origin_max_runs))
+                                        .or_default()
+                                        .add(&stats);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            wait_for_promotions().await;
+            let on_uncapped = totals[&(true, usize::MAX)];
+            assert!(on_uncapped.eager_before_full > 0, "{totals:?}");
+            if origin_only && !gated {
+                // The origin run cap applies with either issue policy.
+                for eager_before_full in [true, false] {
+                    let capped = totals[&(eager_before_full, 0)];
+                    assert!(capped.origin_whole_fallbacks > 0, "{totals:?}");
+                    assert_eq!(capped.origin_row_reads, 0, "{totals:?}");
+                    assert!(
+                        totals[&(eager_before_full, usize::MAX)].origin_row_reads > 0,
+                        "{totals:?}"
+                    );
+                }
+            }
+        }
+
+        /// `count` queries for `k` rows over `nprobes` probes, keyed by rows
+        /// of `vectors`, whose first probe alone holds more than `2 * k` rows:
+        /// it fills the heap, and the threshold then keeps under half of the
+        /// rows scored, so later gathers are not expected to be dense.
+        fn queries_filled_by_first_probe(
+            index: &Arc<dyn VectorIndex>,
+            vectors: &FixedSizeListArray,
+            k: usize,
+            nprobes: usize,
+            count: usize,
+        ) -> Vec<Query> {
+            let queries: Vec<Query> = (0..vectors.len())
+                .step_by(211)
+                .map(|row| lazy_test_query(vectors.value(row), k, nprobes))
+                .filter(|query| {
+                    let (partitions, _) = index.find_partitions(query).unwrap();
+                    lazy_index(index)
+                        .storage
+                        .partition_size(partitions.value(0) as usize)
+                        > 2 * k
+                })
+                .take(count)
+                .collect();
+            assert_eq!(queries.len(), count);
+            queries
+        }
+
+        /// Issue counters of the lazy scan with eager-before-full on and off
+        /// (the ablation), summed over `queries`.
+        async fn lazy_issue_totals(
+            index: &Arc<dyn VectorIndex>,
+            queries: &[Query],
+            filter: &Arc<dyn PreFilter>,
+        ) -> [IssueTotals; 2] {
+            let mut totals = [IssueTotals::default(); 2];
+            for (eager_before_full, totals) in [true, false].into_iter().zip(&mut totals) {
+                let config = LayeredLazyConfig {
+                    enabled: true,
+                    promote: LazyPromotion::Off,
+                    eager_before_full,
+                    ..Default::default()
+                };
+                for (position, query) in queries.iter().enumerate() {
+                    let context = format!(
+                        "eager_before_full={eager_before_full} query={position} k={}",
+                        query.k
+                    );
+                    let stats =
+                        assert_lazy_matches_eager(index, query, filter, config, &context).await;
+                    assert_eq!(stats.lazy_queries, 1, "{context}");
+                    totals.add(&stats);
+                }
+            }
+            totals
+        }
+
+        /// Whether gathers may be issued before the heap fills depends on
+        /// `k`, not on how staging races the first probes. When `k` spans
+        /// several probes, the gathers issued once the heap fills would read
+        /// whole planes anyway, so they are issued at once and none waits for
+        /// the heap or its turn. When the first probe alone fills the heap
+        /// (small `k`), gathers wait for its finite threshold, as the ablation
+        /// always does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_eager_before_full_depends_on_k() {
+            const PROBES: usize = 32;
+            const QUERIES: usize = 8;
+            const STAGING_STEPS: usize = 8;
+            const SMALL_K: usize = 10;
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let ivf = lazy_index(&index);
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            // A quarter of the probed rows, several probes' worth.
+            let large_k = LAZY_ROWS * PROBES / LAZY_PARTITIONS / 4;
+            let queries = |k: usize| -> Vec<Query> {
+                (0..QUERIES)
+                    .map(|row| lazy_test_query(vectors.value(row * 211), k, PROBES))
+                    .collect()
+            };
+            let small = queries_filled_by_first_probe(&index, vectors, SMALL_K, PROBES, QUERIES);
+            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
+            let [large_on, large_off] = lazy_issue_totals(&index, &queries(large_k), &filter).await;
+            let [small_on, small_off] = lazy_issue_totals(&index, &small, &filter).await;
+            ivf.set_lazy_prepare_parallelism_for_test(0);
+            assert_eq!(
+                (large_on.deferred_issues, large_on.serial_waits),
+                (0, 0),
+                "{large_on:?}"
             );
+            assert!(large_on.eager_before_full > 0, "{large_on:?}");
+            assert_eq!(large_off.eager_before_full, 0, "{large_off:?}");
+            assert!(large_off.deferred_issues > 0, "{large_off:?}");
+            for small in [small_on, small_off] {
+                assert_eq!(
+                    (small.eager_before_full, small.serial_waits),
+                    (0, 0),
+                    "{small:?}"
+                );
+                assert!(small.deferred_issues > 0, "{small:?}");
+            }
+        }
+
+        /// A selective prefilter keeps the heap from filling after the probes
+        /// that hold `k` rows. Deferred gathers are then issued at once
+        /// instead of one probe at a time, with identical results; the
+        /// ablation waits for each probe's turn.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_eager_before_full_when_filters_delay_the_heap() {
+            const PROBES: usize = 16;
+            const QUERIES: usize = 8;
+            const STAGING_STEPS: usize = 8;
+            const K: usize = 100;
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let ivf = lazy_index(&index);
+            let vectors = batch["vector"].as_fixed_size_list();
+            let (_, filter) = lazy_test_filters()
+                .into_iter()
+                .find(|(name, _)| *name == "sparse")
+                .unwrap();
+            // The first probe alone holds `k` rows, too few of which the
+            // filter accepts.
+            let queries = queries_filled_by_first_probe(&index, vectors, K, PROBES, QUERIES);
+            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
+            let [on, off] = lazy_issue_totals(&index, &queries, &filter).await;
+            ivf.set_lazy_prepare_parallelism_for_test(0);
+            assert!(on.eager_before_full > 0, "{on:?}");
+            assert!(on.serial_waits < off.serial_waits, "{on:?} {off:?}");
+            assert_eq!(off.eager_before_full, 0, "{off:?}");
+        }
+
+        /// A sparse gather the persistent tier cannot serve loads the whole
+        /// plane once its origin row runs exceed the cap, whether gathers
+        /// before the heap fills are deferred or not, with identical results.
+        /// Without a cap, or on a backend that gates plane admission (which
+        /// may not admit the plane; Lance's default cache is one), it reads
+        /// the rows.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_origin_runs_fall_back_to_whole_plane() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            for cache in [
+                LazyTestCache::Origin,
+                LazyTestCache::Ungated,
+                LazyTestCache::Gated,
+            ] {
+                let (_dataset, index, tiered) = open_lazy_test_index(dir.as_str(), cache).await;
+                if let Some(tiered) = &tiered {
+                    // Every sparse gather that misses RAM goes to the origin.
+                    tiered.serve_rows.store(false, Ordering::Relaxed);
+                }
+                let gated = lazy_index(&index).index_cache.plane_admission_gated();
+                assert_eq!(gated, cache != LazyTestCache::Ungated, "{cache:?}");
+                for eager_before_full in [true, false] {
+                    for origin_max_runs in [0, usize::MAX] {
+                        let config = LayeredLazyConfig {
+                            enabled: true,
+                            dense: DenseGatherMode::Sparse,
+                            promote: LazyPromotion::Off,
+                            eager_before_full,
+                            origin_max_runs,
+                            ..Default::default()
+                        };
+                        let mut totals = IssueTotals::default();
+                        for row in 0..4 {
+                            let query =
+                                lazy_test_query(vectors.value(row * 101), 100, LAZY_PARTITIONS);
+                            let context = format!("{cache:?} {config:?} row={row}");
+                            totals.add(
+                                &assert_lazy_matches_eager(
+                                    &index, &query, &filter, config, &context,
+                                )
+                                .await,
+                            );
+                        }
+                        let context = format!("{cache:?} {config:?} {totals:?}");
+                        if origin_max_runs == 0 && !gated {
+                            // Every origin gather takes at least one run.
+                            assert!(totals.origin_whole_fallbacks > 0, "{context}");
+                            assert_eq!(
+                                (totals.origin_row_reads, totals.sparse_planes),
+                                (0, 0),
+                                "{context}"
+                            );
+                        } else {
+                            assert_eq!(totals.origin_whole_fallbacks, 0, "{context}");
+                            assert!(totals.origin_row_reads > 0, "{context}");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A backend that admits planes like any entry loads a missed
+        /// partition's three planes at once, so it pays one round trip; a
+        /// gated backend admits the sign plane before it starts the ex planes,
+        /// whose admission depends on it. Results are identical.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_plane_loads_overlap_unless_gated() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let key = batch["vector"].as_fixed_size_list().value(17);
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let single = lazy_test_query(key.clone(), 10, 1);
+            let every = lazy_test_query(key, 100, LAZY_PARTITIONS);
+            let (_resident_dataset, resident, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Resident).await;
+            let expected = [
+                result_bits(
+                    &search_global(&resident, &single, filter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                result_bits(
+                    &search_global(&resident, &every, filter.clone())
+                        .await
+                        .unwrap(),
+                ),
+            ];
+            for cache in [LazyTestCache::ColdUngated, LazyTestCache::ColdGated] {
+                let (_dataset, index, tiered) = open_lazy_test_index(dir.as_str(), cache).await;
+                let tiered = tiered.unwrap();
+                tiered.record_plane_loads();
+                let result = search_global(&index, &single, filter.clone())
+                    .await
+                    .unwrap();
+                let loads = tiered.take_plane_loads();
+                assert_eq!(result_bits(&result), expected[0], "{cache:?}");
+                assert_eq!(loads.len(), 6, "{cache:?} {loads:?}");
+                let position =
+                    |load: PlaneLoad| loads.iter().position(|&seen| seen == load).unwrap();
+                let sign_loaded = position(PlaneLoad::Finished(0));
+                for plane in [1, 2] {
+                    let started = position(PlaneLoad::Started(plane));
+                    if cache == LazyTestCache::ColdGated {
+                        assert!(sign_loaded < started, "{cache:?} {loads:?}");
+                    } else {
+                        assert!(started < sign_loaded, "{cache:?} {loads:?}");
+                    }
+                }
+                let result = search_global(&index, &every, filter.clone()).await.unwrap();
+                assert_eq!(result_bits(&result), expected[1], "{cache:?}");
+            }
         }
     }
 
