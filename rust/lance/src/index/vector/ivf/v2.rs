@@ -1091,6 +1091,10 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// Lazy full-precision scan settings of a layered index; see
     /// [`LayeredLazyConfig`]. Locked only to copy it once per query.
     layered_lazy: Mutex<LayeredLazyConfig>,
+    /// Staging parallelism of the lazy scan when non-zero; see
+    /// `set_lazy_prepare_parallelism_for_test`.
+    #[cfg(test)]
+    lazy_prepare_parallelism_for_test: AtomicUsize,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -1667,6 +1671,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             prepared_partitions: Arc::default(),
             layered_rq,
             layered_lazy,
+            #[cfg(test)]
+            lazy_prepare_parallelism_for_test: AtomicUsize::new(0),
             _marker: PhantomData,
         })
     }
@@ -1716,6 +1722,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             prepared_partitions: Arc::default(),
             layered_rq,
             layered_lazy,
+            #[cfg(test)]
+            lazy_prepare_parallelism_for_test: AtomicUsize::new(0),
             _marker: PhantomData,
         })
     }
@@ -7275,6 +7283,8 @@ mod tests {
         ];
         /// About a tenth of the index's plane bytes, so plane entries churn.
         const LAZY_SMALL_CACHE_BYTES: usize = 512 * 1024;
+        /// A few plane entries, so nearly every plane a query reads is admitted anew.
+        const LAZY_TINY_CACHE_BYTES: usize = 64 * 1024;
         const LAZY_LARGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
         const LAZY_METADATA_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -7292,6 +7302,10 @@ mod tests {
             /// Report the plane entries of empty partitions as not resident,
             /// as if the tier had evicted them.
             hide_empty_planes: AtomicBool,
+            /// When set, every RAM admission through `get_or_insert` waits
+            /// for a slot in this bounded channel, like a tiered cache whose
+            /// admissions queue their evictions for the disk.
+            spill: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
         }
 
         impl std::fmt::Debug for TieredPlaneTestBackend {
@@ -7310,7 +7324,12 @@ mod tests {
                     gated,
                     serve_rows: AtomicBool::new(true),
                     hide_empty_planes: AtomicBool::new(false),
+                    spill: Default::default(),
                 }
+            }
+
+            fn set_spill(&self, spill: Option<tokio::sync::mpsc::Sender<()>>) {
+                *self.spill.lock().unwrap() = spill;
             }
 
             fn persist(
@@ -7420,12 +7439,26 @@ mod tests {
                 >,
                 codec: Option<CacheCodec>,
             ) -> Result<(CacheEntry, bool)> {
-                if let Some(entry) = self.get(key, codec).await {
+                if let Some(entry) = self.ram.get(key, None).await {
                     return Ok((entry, true));
                 }
-                let (entry, size) = loader.await?;
-                self.insert(key, entry.clone(), size, codec).await;
-                Ok((entry, false))
+                let admitted = match self.read_disk(key) {
+                    Some((entry, size)) => {
+                        self.ram.insert(key, entry.clone(), size, None).await;
+                        (entry, true)
+                    }
+                    None => {
+                        let (entry, size) = loader.await?;
+                        self.insert(key, entry.clone(), size, codec).await;
+                        (entry, false)
+                    }
+                };
+                let spill = self.spill.lock().unwrap().clone();
+                if let Some(spill) = spill {
+                    // A closed channel only means the test stopped draining it.
+                    let _ = spill.send(()).await;
+                }
+                Ok(admitted)
             }
 
             async fn clear(&self) {
@@ -7686,6 +7719,9 @@ mod tests {
             Gated,
             /// A tiered backend without sign gating that holds every plane.
             TieredResident,
+            /// A tiered backend without sign gating whose RAM holds only a
+            /// few planes, prewarmed to disk.
+            Tiny,
         }
 
         async fn open_lazy_test_index(
@@ -7709,10 +7745,14 @@ mod tests {
                     Session::new(LAZY_LARGE_CACHE_BYTES, LAZY_METADATA_CACHE_BYTES, registry),
                     None,
                 ),
-                LazyTestCache::Ungated | LazyTestCache::Gated | LazyTestCache::TieredResident => {
+                LazyTestCache::Ungated
+                | LazyTestCache::Gated
+                | LazyTestCache::TieredResident
+                | LazyTestCache::Tiny => {
                     let (ram_bytes, gated) = match cache {
                         LazyTestCache::Gated => (LAZY_SMALL_CACHE_BYTES, true),
                         LazyTestCache::TieredResident => (LAZY_LARGE_CACHE_BYTES, false),
+                        LazyTestCache::Tiny => (LAZY_TINY_CACHE_BYTES, false),
                         _ => (LAZY_SMALL_CACHE_BYTES, false),
                     };
                     let backend = Arc::new(TieredPlaneTestBackend::new(ram_bytes, gated));
@@ -7952,7 +7992,8 @@ mod tests {
                                 }
                                 LazyTestCache::Small
                                 | LazyTestCache::Gated
-                                | LazyTestCache::TieredResident => {}
+                                | LazyTestCache::TieredResident
+                                | LazyTestCache::Tiny => {}
                             }
                             if case % 2 == 1 {
                                 let eager =
@@ -8430,6 +8471,95 @@ mod tests {
             wait_for_promotions().await;
             ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
             drop(dataset);
+        }
+
+        /// A staged probe the producer is not polling must not hold a slot of
+        /// a fair cache resource that the head gather waits for.
+        ///
+        /// Every RAM admission of the backend waits for a slot in a bounded
+        /// spill channel drained slowly, like a tiered cache whose admissions
+        /// queue their evictions for the disk. Staging steps queue there for
+        /// sign planes ahead of the gathers' whole ex planes. With one step
+        /// window the gather buffer holds three probes, and while its head is
+        /// pending the producer stops polling the staging buffer. When the
+        /// steps were plain futures in those buffers, the channel handed the
+        /// next freed slot to its oldest waiter, a staging step nobody polled,
+        /// which never used it: the head gather and every later admission then
+        /// waited forever. Steps now run as tasks and complete on their own.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_unpolled_staging_cannot_hold_spill_slot() {
+            const PROBES: usize = 32;
+            const QUERIES: usize = 16;
+            // Staged probes in flight; the deadlock needs staging steps
+            // queued on the spill channel behind the ones that fill the
+            // gather buffer, whatever the host's core count.
+            const STAGING_STEPS: usize = 8;
+            const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, tiered) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Tiny).await;
+            let tiered = tiered.unwrap();
+            let ivf = lazy_index(&index);
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            // A quarter of the probed rows: the first probes are gathered
+            // before the heap fills, the later ones gate on its threshold.
+            let k = LAZY_ROWS * PROBES / LAZY_PARTITIONS / 4;
+            let queries: Vec<Query> = (0..QUERIES)
+                .map(|row| lazy_test_query(vectors.value(row * 211), k, PROBES))
+                .collect();
+
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+            let mut expected = Vec::with_capacity(QUERIES);
+            for query in &queries {
+                expected.push(result_bits(
+                    &search_global(&index, query, filter.clone()).await.unwrap(),
+                ));
+            }
+
+            let (spill_tx, mut spill_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let drainer = tokio::spawn(async move {
+                while spill_rx.recv().await.is_some() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            tiered.set_spill(Some(spill_tx));
+            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
+                enabled: true,
+                window: 1,
+                dense: DenseGatherMode::Whole,
+                promote: LazyPromotion::Off,
+                ..Default::default()
+            });
+            layered_stats::snapshot_and_reset();
+            for (position, (query, expected)) in queries.iter().zip(&expected).enumerate() {
+                let result = tokio::time::timeout(
+                    QUERY_TIMEOUT,
+                    search_global(&index, query, filter.clone()),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("lazy query {position} did not finish within {QUERY_TIMEOUT:?}")
+                })
+                .unwrap();
+                assert_eq!(&result_bits(&result), expected, "query {position}");
+            }
+            let stats = layered_stats::snapshot_and_reset();
+            tiered.set_spill(None);
+            drainer.abort();
+            ivf.set_lazy_prepare_parallelism_for_test(0);
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+
+            assert_eq!(stats.lazy_queries, QUERIES as u64, "{stats:?}");
+            assert_eq!(stats.needed_not_fetched, 0, "{stats:?}");
+            let whole_planes: u64 = stats.high_whole.iter().chain(&stats.low_whole).sum();
+            assert!(
+                whole_planes > 0,
+                "gathers must admit whole ex planes: {stats:?}"
+            );
         }
     }
 

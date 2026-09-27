@@ -24,10 +24,15 @@
 //!   publishes over a `watch` channel;
 //! - the query task scores ready probes on one heap and publishes progress.
 //!
+//! Every staging and gather step runs as its own task, so it makes progress
+//! whether or not the producer is polling the buffer that holds it; see
+//! `spawn_scan_step`.
+//!
 //! Probes whose ex planes are both resident, and probes that cannot gate on
 //! the lower bound, are scored by the eager scan in their probe position.
 
 use std::collections::BinaryHeap;
+use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -164,11 +169,12 @@ struct LazyScorer {
     progress: Arc<watch::Sender<LazyProgress>>,
 }
 
-/// Aborts the producer when the query is dropped or fails, which drops its
-/// pending gathers. Promotions it started keep running on their own.
-struct AbortProducerOnDrop(tokio::task::AbortHandle);
+/// Aborts a task of the scan when its owner is dropped: the producer when the
+/// query is dropped or fails, and a staging or gather step when the producer
+/// drops its buffers. Promotions are not tracked and keep running on their own.
+struct AbortOnDrop(tokio::task::AbortHandle);
 
-impl Drop for AbortProducerOnDrop {
+impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -176,6 +182,34 @@ impl Drop for AbortProducerOnDrop {
 
 fn scan_cancelled() -> Error {
     Error::internal("lazy layered scan ended before scoring every probe")
+}
+
+/// Run one staging or gather step as its own task, returning a future of its
+/// result that aborts the task when dropped.
+///
+/// The producer keeps the steps in nested ordered buffers and stops polling
+/// the staging buffer while the gather buffer is full. A step polled only
+/// through its buffer would then freeze inside whatever fair resource it was
+/// queued on: a cache that hands a freed slot of a bounded spill queue to its
+/// oldest waiter can hand it to a frozen staging step, which never uses it,
+/// while the head gather waits behind it forever. As a task, every step runs
+/// to completion on its own. The buffers still start a step only when they
+/// have room, so they bound the steps in flight and keep results in probe
+/// order exactly as before.
+fn spawn_scan_step<T: Send + 'static>(
+    step: impl Future<Output = Result<T>> + Send + 'static,
+) -> impl Future<Output = Result<T>> + Send + 'static {
+    let task = tokio::spawn(step);
+    let abort = AbortOnDrop(task.abort_handle());
+    async move {
+        let joined = task.await;
+        drop(abort);
+        match joined {
+            Ok(result) => result,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(_) => Err(scan_cancelled()),
+        }
+    }
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
@@ -196,6 +230,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             .layered_lazy
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = config;
+    }
+
+    /// Probes the lazy scan stages at once: the compute pool's width, like
+    /// the eager scan's prepare window.
+    fn lazy_prepare_parallelism(&self) -> usize {
+        #[cfg(test)]
+        {
+            let parallelism = self
+                .lazy_prepare_parallelism_for_test
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if parallelism > 0 {
+                return parallelism;
+            }
+        }
+        get_num_compute_intensive_cpus().max(1)
+    }
+
+    /// Override the lazy scan's staging parallelism, or restore the default
+    /// with 0, so tests stage several probes at once on hosts with few cores.
+    #[cfg(test)]
+    pub(crate) fn set_lazy_prepare_parallelism_for_test(&self, parallelism: usize) {
+        self.lazy_prepare_parallelism_for_test
+            .store(parallelism, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The settings for `query` when it can run the lazy scan. Queries that
@@ -318,29 +375,32 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         });
 
         let (ready_tx, mut ready_rx) = mpsc::channel(LAZY_READY_CHANNEL_CAPACITY);
-        let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+        let prepare_parallelism = self.lazy_prepare_parallelism();
         let stage_index = self.clone();
         let fetch_index = self.clone();
         let probe_start = probes.start;
         let producer = tokio::spawn(async move {
+            // `map` spawns a step only when `buffered` pulls it, so at most
+            // `prepare_parallelism` probes are staged or held staged, and the
+            // gather window bounds the gathers, as with plain futures.
             let fetched = stream::iter(probes)
                 .map(move |idx| {
                     let mut query = query.clone();
                     query.dist_q_c = q_c_dists.value(idx);
-                    stage_index.clone().lazy_stage_probe(
+                    spawn_scan_step(stage_index.clone().lazy_stage_probe(
                         idx - probe_start,
                         partitions.value(idx) as usize,
                         query,
                         pre_filter.clone(),
                         metrics.clone(),
                         raw_query_context.clone(),
-                    )
+                    ))
                 })
                 .buffered(prepare_parallelism)
                 .map(move |staged| {
                     let index = fetch_index.clone();
                     let context = fetch_context.clone();
-                    async move { index.lazy_fetch(staged?, &context).await }
+                    spawn_scan_step(async move { index.lazy_fetch(staged?, &context).await })
                 })
                 .buffered(config.window.saturating_add(LAZY_FETCH_EXTRA_SLOTS));
             futures::pin_mut!(fetched);
@@ -351,7 +411,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 }
             }
         });
-        let _abort_producer = AbortProducerOnDrop(producer.abort_handle());
+        let _abort_producer = AbortOnDrop(producer.abort_handle());
 
         let mut heap = BinaryHeap::with_capacity(heap_capacity);
         let mut scored = 0usize;
