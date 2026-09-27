@@ -3,10 +3,12 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
-use crate::vector::bq::layered::{PlaneBatch, PlaneKey};
+use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
+use crate::vector::bq::layered::{PlaneBatch, PlaneKey, RQLayout};
+use crate::vector::bq::layered_stats;
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -23,11 +25,13 @@ use prost::Message;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -565,12 +569,335 @@ impl DeepSizeOf for PlaneAccess {
 /// Runtime promotion history shared by reconstructions of the same cached index.
 /// This contains no readers or object-store handles and is not persisted to disk.
 #[derive(Debug, Clone, Default)]
-pub struct PlaneAccessTracker(Arc<Mutex<HashMap<(usize, u8), PlaneAccess>>>);
+pub struct PlaneAccessTracker {
+    /// Cascade candidate reads, see [`PLANE_PROMOTION_READS`].
+    accesses: Arc<Mutex<HashMap<(usize, u8), PlaneAccess>>>,
+    /// Background promotions of the lazy full-precision scan.
+    lazy: Arc<LazyPromotionState>,
+}
 
 impl DeepSizeOf for PlaneAccessTracker {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.0.deep_size_of_children(context)
+        self.accesses.deep_size_of_children(context) + self.lazy.deep_size_of_children(context)
     }
+}
+
+#[derive(Debug, Default)]
+struct LazyPromotionHistory {
+    /// Sparse gathers of each non-resident `(partition, plane)` since its last promotion.
+    sparse_reads: HashMap<(usize, u8), u32>,
+    in_flight: HashSet<(usize, u8)>,
+}
+
+#[derive(Debug, Default)]
+struct LazyPromotionState {
+    history: Mutex<LazyPromotionHistory>,
+    /// Bounds concurrent promotions; sized by the first promoting query's config.
+    permits: OnceLock<Arc<Semaphore>>,
+}
+
+impl DeepSizeOf for LazyPromotionState {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        history.sparse_reads.capacity() * size_of::<((usize, u8), u32)>()
+            + history.in_flight.capacity() * size_of::<(usize, u8)>()
+    }
+}
+
+/// A started background promotion of one ex plane. Dropping it, when the
+/// promotion finishes or is abandoned, frees its in-flight slot and permit.
+#[derive(Debug)]
+pub struct LazyPromotionTicket {
+    pub partition: usize,
+    pub plane: u8,
+    state: Arc<LazyPromotionState>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for LazyPromotionTicket {
+    fn drop(&mut self) {
+        self.state
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight
+            .remove(&(self.partition, self.plane));
+        layered_stats::promotion_finished();
+    }
+}
+
+/// Enables the lazy layered full-precision scan (`0` or `1`).
+pub const LAZY_FULL_ENV: &str = "LANCE_RQ_LAZY_FULL";
+/// Staleness window W: a gather may be issued while up to W earlier probes are unscored.
+pub const LAZY_WINDOW_ENV: &str = "LANCE_RQ_LAZY_WINDOW";
+/// Ex-plane gather policy: `cost`, `sparse` or `whole`.
+pub const LAZY_DENSE_ENV: &str = "LANCE_RQ_LAZY_DENSE";
+/// Most coalesced row runs a sparse gather may issue per plane.
+pub const LAZY_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_MAX_RUNS";
+/// Aligned sparse bytes, as a fraction of the plane, from which a whole read is cheaper.
+pub const LAZY_DENSE_BYTES_FRACTION_ENV: &str = "LANCE_RQ_LAZY_DENSE_BYTES_FRACTION";
+/// Background promotion policy: `off` or `bg:N` (promote after N sparse
+/// gathers). Backends that gate plane admission never promote.
+pub const LAZY_PROMOTE_ENV: &str = "LANCE_RQ_LAZY_PROMOTE";
+/// Most background promotions running at once.
+pub const LAZY_PROMOTE_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_PROMOTE_INFLIGHT";
+/// Largest survivor count a scoring batch scores on the query task instead of the CPU pool.
+pub const LAZY_INLINE_ROWS_ENV: &str = "LANCE_RQ_LAZY_INLINE_ROWS";
+
+const DEFAULT_LAZY_WINDOW: usize = 16;
+const DEFAULT_LAZY_MAX_RUNS: usize = 16;
+const DEFAULT_LAZY_DENSE_BYTES_FRACTION: f64 = 0.5;
+const DEFAULT_LAZY_PROMOTE_READS: u32 = 1;
+const DEFAULT_LAZY_PROMOTE_INFLIGHT: usize = 4;
+/// About the rows one ~100µs CPU dispatch would score.
+const DEFAULT_LAZY_INLINE_ROWS: usize = 512;
+
+/// Page size the gather cost model aligns row runs to, matching the
+/// persistent cache's aligned reads.
+const LAZY_GATHER_PAGE_BYTES: usize = 4096;
+/// Rows closer than this share one read, as in the plane cache codec.
+const LAZY_GATHER_COALESCE_GAP_BYTES: usize = 4096;
+/// Estimated cache envelope and plane header ahead of the first row. It only
+/// shifts page boundaries in the cost estimate.
+const LAZY_GATHER_BODY_OFFSET_BYTES: usize = 64;
+/// Bytes a cached ex-plane row stores besides its codes: add and scale factors.
+const EX_PLANE_FACTOR_BYTES: usize = 2 * size_of::<f32>();
+
+/// How the lazy scan chooses between reading selected ex-plane rows and the whole plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseGatherMode {
+    /// Read the whole plane when the row runs are too many or cover too much
+    /// of it (see [`plan_plane_gather`]).
+    Cost,
+    /// Always read selected rows.
+    Sparse,
+    /// Always read the whole plane.
+    Whole,
+}
+
+/// Whether sparse gathers promote whole planes into RAM in the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LazyPromotion {
+    /// Only whole-plane gathers admit planes.
+    Off,
+    /// Promote a plane after this many sparse gathers of it while not
+    /// resident, on backends that do not gate plane admission.
+    Background { reads: u32 },
+}
+
+/// Settings of the lazy layered full-precision scan, which bounds every row
+/// from the sign plane and reads the ex planes of the survivors only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayeredLazyConfig {
+    pub enabled: bool,
+    /// Probes a gather may run ahead of scoring; see [`LAZY_WINDOW_ENV`].
+    pub window: usize,
+    pub dense: DenseGatherMode,
+    pub max_runs: usize,
+    pub dense_bytes_fraction: f64,
+    pub promote: LazyPromotion,
+    pub promote_inflight: usize,
+    pub inline_rows: usize,
+}
+
+impl Default for LayeredLazyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window: DEFAULT_LAZY_WINDOW,
+            dense: DenseGatherMode::Cost,
+            max_runs: DEFAULT_LAZY_MAX_RUNS,
+            dense_bytes_fraction: DEFAULT_LAZY_DENSE_BYTES_FRACTION,
+            promote: LazyPromotion::Background {
+                reads: DEFAULT_LAZY_PROMOTE_READS,
+            },
+            promote_inflight: DEFAULT_LAZY_PROMOTE_INFLIGHT,
+            inline_rows: DEFAULT_LAZY_INLINE_ROWS,
+        }
+    }
+}
+
+impl LayeredLazyConfig {
+    /// Read the `LANCE_RQ_LAZY_*` variables; unset variables keep their defaults.
+    /// The other knobs are read only when [`LAZY_FULL_ENV`] enables the scan,
+    /// so with it off they are ignored exactly as before the scan existed.
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let invalid = |name: &str, value: &str, expected: &str| {
+            Error::invalid_input(format!("{name}={value:?} is invalid, expected {expected}"))
+        };
+        let count = |name: &str, default: usize, min: usize| -> Result<usize> {
+            let Some(value) = lookup(name) else {
+                return Ok(default);
+            };
+            value
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|parsed| *parsed >= min)
+                .ok_or_else(|| invalid(name, &value, &format!("an integer >= {min}")))
+        };
+        let mut config = Self::default();
+        if let Some(value) = lookup(LAZY_FULL_ENV) {
+            config.enabled = match value.trim() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => return Err(invalid(LAZY_FULL_ENV, &value, "0 or 1")),
+            };
+        }
+        if !config.enabled {
+            return Ok(config);
+        }
+        config.window = count(LAZY_WINDOW_ENV, config.window, 0)?;
+        if let Some(value) = lookup(LAZY_DENSE_ENV) {
+            config.dense = match value.trim() {
+                "cost" => DenseGatherMode::Cost,
+                "sparse" => DenseGatherMode::Sparse,
+                "whole" => DenseGatherMode::Whole,
+                _ => return Err(invalid(LAZY_DENSE_ENV, &value, "cost, sparse or whole")),
+            };
+        }
+        config.max_runs = count(LAZY_MAX_RUNS_ENV, config.max_runs, 0)?;
+        if let Some(value) = lookup(LAZY_DENSE_BYTES_FRACTION_ENV) {
+            config.dense_bytes_fraction = value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|fraction| fraction.is_finite() && *fraction >= 0.0)
+                .ok_or_else(|| {
+                    invalid(
+                        LAZY_DENSE_BYTES_FRACTION_ENV,
+                        &value,
+                        "a finite number >= 0",
+                    )
+                })?;
+        }
+        if let Some(value) = lookup(LAZY_PROMOTE_ENV) {
+            config.promote = match value.trim() {
+                "off" => LazyPromotion::Off,
+                other => other
+                    .strip_prefix("bg:")
+                    .and_then(|reads| reads.parse::<u32>().ok())
+                    .filter(|reads| *reads > 0)
+                    .map(|reads| LazyPromotion::Background { reads })
+                    .ok_or_else(|| invalid(LAZY_PROMOTE_ENV, &value, "off or bg:N with N >= 1"))?,
+            };
+        }
+        config.promote_inflight = count(LAZY_PROMOTE_INFLIGHT_ENV, config.promote_inflight, 1)?;
+        config.inline_rows = count(LAZY_INLINE_ROWS_ENV, config.inline_rows, 0)?;
+        Ok(config)
+    }
+}
+
+/// Where the lazy scan reads one ex plane of a partition from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaneSource {
+    /// The RAM-resident entry, read like a native memory hit. Falls back to
+    /// [`Self::Whole`] if the entry was evicted since it was planned.
+    Resident,
+    /// The whole plane, admitted like the eager full-precision load.
+    Whole,
+    /// Selected rows of the persistent entry (or the origin file), without
+    /// RAM admission.
+    Sparse,
+}
+
+/// Sources for the high (index 0) and low (index 1) ex planes of one gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatherPlan {
+    pub planes: [PlaneSource; 2],
+}
+
+/// Row geometry of a layered index's ex planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayeredExLayout {
+    pub rotated_dim: usize,
+    pub num_bits: u8,
+    /// Persistent-cache bytes per row of the high and low planes (codes plus factors).
+    pub row_bytes: [usize; 2],
+}
+
+/// Choose a sparse or whole read of one non-resident ex plane for sorted,
+/// unique `rows` of a partition with `partition_rows` rows.
+///
+/// Rows are grouped into runs with the plane cache codec's gap rule and each
+/// run is rounded out to whole pages. The plane is read whole when that takes
+/// more than `max_runs` runs, or when the pages cover at least
+/// `dense_bytes_fraction` of the plane.
+pub fn plan_plane_gather(
+    rows: &[u32],
+    partition_rows: usize,
+    row_bytes: usize,
+    config: &LayeredLazyConfig,
+) -> PlaneSource {
+    match config.dense {
+        DenseGatherMode::Sparse => return PlaneSource::Sparse,
+        DenseGatherMode::Whole => return PlaneSource::Whole,
+        DenseGatherMode::Cost => {}
+    }
+    let gap_rows = LAZY_GATHER_COALESCE_GAP_BYTES / row_bytes.max(1);
+    let page =
+        |row: usize| (LAZY_GATHER_BODY_OFFSET_BYTES + row * row_bytes) / LAZY_GATHER_PAGE_BYTES;
+    let page_end = |row: usize| {
+        (LAZY_GATHER_BODY_OFFSET_BYTES + row * row_bytes).div_ceil(LAZY_GATHER_PAGE_BYTES)
+    };
+    let mut runs = 0usize;
+    let mut pages = 0usize;
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len() && (rows[end] - rows[end - 1] - 1) as usize <= gap_rows {
+            end += 1;
+        }
+        pages += page_end(rows[end - 1] as usize + 1) - page(rows[start] as usize);
+        runs += 1;
+        start = end;
+    }
+    let plane_bytes = LAZY_GATHER_BODY_OFFSET_BYTES + partition_rows * row_bytes;
+    if runs > config.max_runs
+        || (pages * LAZY_GATHER_PAGE_BYTES) as f64
+            >= config.dense_bytes_fraction * plane_bytes as f64
+    {
+        PlaneSource::Whole
+    } else {
+        PlaneSource::Sparse
+    }
+}
+
+/// How stage-2 survivors index a [`GatheredEx`]'s batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExIndex {
+    /// Both planes are whole: a survivor's ex index is its partition offset.
+    Identity,
+    /// The batches hold the gathered rows only, in gather order.
+    Compact,
+}
+
+/// The ex-plane rows of one partition's survivors.
+#[derive(Debug)]
+pub struct GatheredEx {
+    /// High-plane batch (codes and high factors).
+    pub high: RecordBatch,
+    /// Low-plane batch (codes and the full ex factors).
+    pub low: RecordBatch,
+    pub index: ExIndex,
+    /// The source that served each plane, `None` when no rows were needed.
+    pub sources: [Option<PlaneSource>; 2],
+    /// Planes whose sparse rows came from the origin file.
+    pub origin_row_reads: usize,
+    /// Background promotions the caller must run (and then drop).
+    pub promotions: Vec<LazyPromotionTicket>,
+}
+
+/// One ex plane fetched for a gather.
+struct FetchedPlane {
+    batch: RecordBatch,
+    source: PlaneSource,
+    from_origin: bool,
+    promotion: Option<LazyPromotionTicket>,
 }
 
 /// Loader to load partitioned PQ storage from disk.
@@ -905,7 +1232,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// plane is read without admission, from the persistent entry or the
     /// origin file. Other backends admit every plane through their ordinary
     /// policy, as native partitions are.
-    async fn load_plane_entry(
+    pub async fn load_plane_entry(
         &self,
         part_id: usize,
         plane: u8,
@@ -955,6 +1282,246 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ))
         };
         Ok(batch)
+    }
+
+    /// Ex-plane geometry of a layered index.
+    pub fn layered_ex_layout(&self) -> Result<LayeredExLayout> {
+        let Quantizer::Rabit(rq) = self.quantizer()? else {
+            return Err(Error::invalid_input(
+                "ex-plane layout requires a layered IVF_RQ index",
+            ));
+        };
+        let metadata = rq.metadata_ref();
+        if !metadata.layered {
+            return Err(Error::invalid_input(
+                "ex-plane layout requires a layered IVF_RQ index",
+            ));
+        }
+        let layout = RQLayout::try_new(metadata.num_bits)?;
+        let rotated_dim = metadata.rotated_dim();
+        Ok(LayeredExLayout {
+            rotated_dim,
+            num_bits: metadata.num_bits,
+            row_bytes: [layout.high_bits, layout.low_bits]
+                .map(|bits| blocked_ex_code_bytes(rotated_dim, bits) + EX_PLANE_FACTOR_BYTES),
+        })
+    }
+
+    /// Stage-1 storage of the lazy full-precision scan: the partition's sign
+    /// plane alone, loaded (and admitted) like the eager load's sign plane.
+    pub async fn load_sign_stage(
+        &self,
+        part_id: usize,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        if !self.supports_candidate_reads() {
+            return Err(Error::invalid_input(
+                "the lazy full-precision scan requires an index without a row-id remapper",
+            ));
+        }
+        let sign = self.load_plane_entry(part_id, 0, cache, io_stats).await?;
+        Q::Storage::try_from_sign_plane_for_full(
+            sign.0.clone(),
+            self.metadata(),
+            self.distance_type,
+        )
+    }
+
+    /// Fetch the high and low ex-plane rows at the sorted, unique partition
+    /// offsets `rows`, each plane from the source `plan` names.
+    ///
+    /// When both planes end up whole the batches are the whole planes and
+    /// survivors keep their offsets as ex index ([`ExIndex::Identity`]);
+    /// otherwise whole planes are cut down to `rows` so both batches hold the
+    /// gathered rows in order ([`ExIndex::Compact`]). No rows means no reads.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gather_ex_rows(
+        &self,
+        part_id: usize,
+        rows: &[u32],
+        plan: GatherPlan,
+        config: &LayeredLazyConfig,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<GatheredEx> {
+        let partition_rows = self.partition_size(part_id);
+        if rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
+                .last()
+                .is_some_and(|&row| row as usize >= partition_rows)
+        {
+            return Err(Error::invalid_input(format!(
+                "gathered offsets of partition {part_id} must be sorted, unique and below its {partition_rows} rows"
+            )));
+        }
+        if rows.is_empty() {
+            let (high, low) = futures::try_join!(
+                self.read_plane(part_id, 1, Some(Vec::new()), None),
+                self.read_plane(part_id, 2, Some(Vec::new()), None),
+            )?;
+            return Ok(GatheredEx {
+                high,
+                low,
+                index: ExIndex::Compact,
+                sources: [None; 2],
+                origin_row_reads: 0,
+                promotions: Vec::new(),
+            });
+        }
+        let (high, low) = futures::try_join!(
+            self.fetch_ex_plane(
+                part_id,
+                1,
+                rows,
+                plan.planes[0],
+                config,
+                cache,
+                io_stats.clone()
+            ),
+            self.fetch_ex_plane(part_id, 2, rows, plan.planes[1], config, cache, io_stats),
+        )?;
+        let index = if high.source != PlaneSource::Sparse && low.source != PlaneSource::Sparse {
+            ExIndex::Identity
+        } else {
+            ExIndex::Compact
+        };
+        let indices = UInt32Array::from(rows.to_vec());
+        let compact = |plane: &FetchedPlane| -> Result<RecordBatch> {
+            if index == ExIndex::Compact && plane.source != PlaneSource::Sparse {
+                Ok(plane.batch.take(&indices)?)
+            } else {
+                Ok(plane.batch.clone())
+            }
+        };
+        Ok(GatheredEx {
+            high: compact(&high)?,
+            low: compact(&low)?,
+            index,
+            sources: [Some(high.source), Some(low.source)],
+            origin_row_reads: usize::from(high.from_origin) + usize::from(low.from_origin),
+            promotions: [high.promotion, low.promotion]
+                .into_iter()
+                .flatten()
+                .collect(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_ex_plane(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: &[u32],
+        source: PlaneSource,
+        config: &LayeredLazyConfig,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<FetchedPlane> {
+        let stats = layered_stats::counters();
+        let started = Instant::now();
+        let key = PlaneKey {
+            partition: part_id,
+            plane,
+        };
+        if source == PlaneSource::Resident
+            && let Some(batch) = cache.get_resident_with_key(&key).await
+        {
+            stats.fetch_resident_ns.add_elapsed(started);
+            return Ok(FetchedPlane {
+                batch: batch.0.clone(),
+                source: PlaneSource::Resident,
+                from_origin: false,
+                promotion: None,
+            });
+        }
+        if source != PlaneSource::Sparse {
+            let batch = self
+                .load_plane_entry(part_id, plane, cache, io_stats)
+                .await?;
+            stats.fetch_whole_ns.add_elapsed(started);
+            return Ok(FetchedPlane {
+                batch: batch.0.clone(),
+                source: PlaneSource::Whole,
+                from_origin: false,
+                promotion: None,
+            });
+        }
+        let (batch, from_origin) = match cache.get_rows_with_key(&key, rows).await {
+            Some(batch) => (batch.0.clone(), false),
+            None => (
+                self.read_plane(part_id, plane, Some(rows.to_vec()), io_stats)
+                    .await?,
+                true,
+            ),
+        };
+        if batch.num_rows() != rows.len() {
+            return Err(Error::internal(format!(
+                "sparse gather of partition {part_id} plane {plane} returned {} rows for {} offsets",
+                batch.num_rows(),
+                rows.len()
+            )));
+        }
+        stats.fetch_sparse_ns.add_elapsed(started);
+        Ok(FetchedPlane {
+            batch,
+            source: PlaneSource::Sparse,
+            from_origin,
+            promotion: self.request_lazy_promotion(part_id, plane, config, cache),
+        })
+    }
+
+    /// Record a sparse gather of a non-resident plane and, once the policy's
+    /// read count is reached, start a promotion unless one for the plane is
+    /// already running or every in-flight permit is taken.
+    ///
+    /// A gated backend admits ex planes only behind their resident sign
+    /// plane and evicts the lowest-priority plane first, so a promoted plane
+    /// would mostly be read whole and dropped again; promotions run only on
+    /// backends that admit planes through their ordinary policy.
+    fn request_lazy_promotion(
+        &self,
+        part_id: usize,
+        plane: u8,
+        config: &LayeredLazyConfig,
+        cache: &WeakLanceCache,
+    ) -> Option<LazyPromotionTicket> {
+        let LazyPromotion::Background { reads } = config.promote else {
+            return None;
+        };
+        if cache.plane_admission_gated() {
+            return None;
+        }
+        let stats = layered_stats::counters();
+        let state = &self.plane_access.lazy;
+        let key = (part_id, plane);
+        let mut history = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        if history.in_flight.contains(&key) {
+            stats.promotions_deduped.incr();
+            return None;
+        }
+        let count = history.sparse_reads.entry(key).or_default();
+        *count = count.saturating_add(1);
+        if *count < reads {
+            return None;
+        }
+        let permits = state
+            .permits
+            .get_or_init(|| Arc::new(Semaphore::new(config.promote_inflight)));
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            stats.promotions_skipped.incr();
+            return None;
+        };
+        history.sparse_reads.remove(&key);
+        history.in_flight.insert(key);
+        stats.promotions_issued.incr();
+        layered_stats::promotion_started();
+        Some(LazyPromotionTicket {
+            partition: part_id,
+            plane,
+            state: state.clone(),
+            _permit: permit,
+        })
     }
 
     /// Assemble a full-precision store from candidate rows only.
@@ -1037,7 +1604,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     let promote = {
                         let mut accesses = self
                             .plane_access
-                            .0
+                            .accesses
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
                         let access = accesses.entry((part_id, plane)).or_default();
@@ -1185,11 +1752,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryScratchCapacity, QueryScratchPool, compact_prewarm_batches,
+        DenseGatherMode, LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_FULL_ENV,
+        LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV, LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV,
+        LAZY_WINDOW_ENV, LayeredLazyConfig, LazyPromotion, PlaneSource, QueryScratchCapacity,
+        QueryScratchPool, compact_prewarm_batches, plan_plane_gather,
         spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
+    use lance_core::Error;
     use lance_core::deepsize::DeepSizeOf;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1318,6 +1890,118 @@ mod tests {
         let _checked_out = pool.scratch();
 
         assert_eq!(pool.deep_size_of(), idle_size);
+    }
+
+    #[test]
+    fn test_layered_lazy_config_parses_every_knob() {
+        let env = HashMap::from([
+            (LAZY_FULL_ENV, "1"),
+            (LAZY_WINDOW_ENV, "4"),
+            (LAZY_DENSE_ENV, "sparse"),
+            (LAZY_MAX_RUNS_ENV, "0"),
+            (LAZY_DENSE_BYTES_FRACTION_ENV, "0.25"),
+            (LAZY_PROMOTE_ENV, "bg:2"),
+            (LAZY_PROMOTE_INFLIGHT_ENV, "8"),
+            (LAZY_INLINE_ROWS_ENV, "0"),
+        ]);
+        let config =
+            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
+                .unwrap();
+        assert_eq!(
+            config,
+            LayeredLazyConfig {
+                enabled: true,
+                window: 4,
+                dense: DenseGatherMode::Sparse,
+                max_runs: 0,
+                dense_bytes_fraction: 0.25,
+                promote: LazyPromotion::Background { reads: 2 },
+                promote_inflight: 8,
+                inline_rows: 0,
+            }
+        );
+        assert_eq!(
+            LayeredLazyConfig::from_lookup(|_| None).unwrap(),
+            LayeredLazyConfig::default()
+        );
+        assert!(!LayeredLazyConfig::default().enabled);
+        let error =
+            LayeredLazyConfig::from_lookup(|key| (key == LAZY_FULL_ENV).then(|| "yes".into()))
+                .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(LAZY_FULL_ENV), "{error}");
+        for (name, value) in [
+            (LAZY_DENSE_ENV, "dense"),
+            (LAZY_PROMOTE_ENV, "bg:0"),
+            (LAZY_PROMOTE_INFLIGHT_ENV, "0"),
+            (LAZY_DENSE_BYTES_FRACTION_ENV, "-1"),
+            (LAZY_WINDOW_ENV, "many"),
+        ] {
+            let enabled = |key: &str| -> Option<String> {
+                if key == LAZY_FULL_ENV {
+                    Some("1".into())
+                } else {
+                    (key == name).then(|| value.into())
+                }
+            };
+            let error = LayeredLazyConfig::from_lookup(enabled).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "{name}={value}"
+            );
+            assert!(error.to_string().contains(name), "{error}");
+            // With the scan off (unset or 0) the other knobs are ignored.
+            for full in [None, Some("0")] {
+                let disabled = |key: &str| -> Option<String> {
+                    if key == LAZY_FULL_ENV {
+                        full.map(String::from)
+                    } else {
+                        (key == name).then(|| value.into())
+                    }
+                };
+                assert_eq!(
+                    LayeredLazyConfig::from_lookup(disabled).unwrap(),
+                    LayeredLazyConfig::default(),
+                    "{name}={value} with {LAZY_FULL_ENV}={full:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_plan_plane_gather_cost_rule() {
+        // 520-byte rows: rows at most 7 apart share one run.
+        let row_bytes = 520;
+        let config = LayeredLazyConfig {
+            max_runs: 2,
+            dense_bytes_fraction: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_plane_gather(&[10, 17, 24], 2000, row_bytes, &config),
+            PlaneSource::Sparse
+        );
+        assert_eq!(
+            plan_plane_gather(&[10, 100, 1000], 2000, row_bytes, &config),
+            PlaneSource::Whole,
+            "three runs exceed max_runs"
+        );
+        assert_eq!(
+            plan_plane_gather(&(0..1200).collect::<Vec<_>>(), 2000, row_bytes, &config),
+            PlaneSource::Whole,
+            "one run covering most of the plane"
+        );
+        for (dense, expected) in [
+            (DenseGatherMode::Sparse, PlaneSource::Sparse),
+            (DenseGatherMode::Whole, PlaneSource::Whole),
+        ] {
+            let config = LayeredLazyConfig { dense, ..config };
+            assert_eq!(
+                plan_plane_gather(&[10, 100, 1000], 2000, row_bytes, &config),
+                expected
+            );
+            assert_eq!(plan_plane_gather(&[10], 2000, row_bytes, &config), expected);
+        }
     }
 
     #[test]

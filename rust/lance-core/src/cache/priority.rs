@@ -43,6 +43,11 @@ impl<T: Clone> PriorityEntries<T> {
         self.order.insert((*priority, *stamp), *key);
         Some(value.clone())
     }
+    /// Look up an entry without refreshing its recency.
+    pub fn peek(&self, key: &InternalCacheKey) -> Option<&T> {
+        self.entries.get(key).map(|(_, _, _, value)| value)
+    }
+
     /// Membership only; unlike [`get`](Self::get), recency is unchanged.
     pub fn contains(&self, key: &InternalCacheKey) -> bool {
         self.entries.contains_key(key)
@@ -150,5 +155,30 @@ mod tests {
         assert_eq!(cache.insert(low, 2, 40, 1, 100), vec![2]);
         assert!(!cache.contains(&low));
         assert!(cache.contains(&sign));
+    }
+
+    #[test]
+    fn peek_does_not_refresh_recency() {
+        let (a, b, c) = (
+            InternalCacheKey::from_bytes([1; 16]),
+            InternalCacheKey::from_bytes([2; 16]),
+            InternalCacheKey::from_bytes([3; 16]),
+        );
+        let mut peeked = PriorityEntries::default();
+        peeked.insert(a, 1, 40, 1, 100);
+        peeked.insert(b, 2, 40, 1, 100);
+        assert_eq!(peeked.peek(&a), Some(&1));
+        assert!(peeked.contains(&a));
+        assert_eq!(peeked.insert(c, 3, 40, 1, 100), vec![1]);
+        assert!(!peeked.contains(&a) && peeked.peek(&a).is_none());
+        assert!(peeked.contains(&b) && peeked.contains(&c));
+
+        // A real access protects the same entry, so the test observes recency.
+        let mut touched = PriorityEntries::default();
+        touched.insert(a, 1, 40, 1, 100);
+        touched.insert(b, 2, 40, 1, 100);
+        assert_eq!(touched.get(&a), Some(1));
+        assert_eq!(touched.insert(c, 3, 40, 1, 100), vec![2]);
+        assert!(touched.contains(&a));
     }
 }

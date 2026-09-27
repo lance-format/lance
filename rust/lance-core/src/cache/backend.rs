@@ -59,6 +59,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Report whether `key` is resident in RAM without counting as an access,
+    /// so a residency probe does not change what the backend evicts next.
+    /// The default uses [`get_resident`](Self::get_resident), which backends
+    /// with recency state may treat as an access.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.get_resident(key).await.is_some()
+    }
+
     /// Whether layered index planes should gate lower-plane RAM admission on
     /// their sign plane being resident. Backends that admit plane entries
     /// through their ordinary policy return `false`, so lower planes are

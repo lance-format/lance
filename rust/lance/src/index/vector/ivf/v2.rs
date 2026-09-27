@@ -50,6 +50,7 @@ use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
+use lance_index::vector::bq::layered_stats;
 use lance_index::vector::bq::rabit_ex_bits;
 use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -62,8 +63,8 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    PlaneAccessTracker, QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool,
-    RabitRawQueryContext, VectorStore,
+    LayeredLazyConfig, PlaneAccessTracker, QueryResidual, QueryScratch, QueryScratchCapacity,
+    QueryScratchPool, RabitRawQueryContext, VectorStore,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -92,6 +93,8 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
+
+mod lazy_full;
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
@@ -204,6 +207,13 @@ pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
 const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
+
+/// Lazy layered full-precision scan settings from the `LANCE_RQ_LAZY_*`
+/// environment, read once per process. An invalid value fails opening a
+/// layered index rather than silently changing its scan; with the scan off
+/// only `LANCE_RQ_LAZY_FULL` itself is read.
+static LAYERED_LAZY_CONFIG: LazyLock<std::result::Result<LayeredLazyConfig, String>> =
+    LazyLock::new(|| LayeredLazyConfig::from_env().map_err(|err| err.to_string()));
 
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
 /// Default encoded-byte target of one prewarm read window.
@@ -1076,6 +1086,11 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     prepared_partitions: Arc<PreparedPartitionTracker>,
+    /// Whether the storage is a layered IVF_RQ index, fixed when opened.
+    layered_rq: bool,
+    /// Lazy full-precision scan settings of a layered index; see
+    /// [`LayeredLazyConfig`]. Locked only to copy it once per query.
+    layered_lazy: Mutex<LayeredLazyConfig>,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -1629,6 +1644,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
+        let layered_rq =
+            Q::quantization_type() == QuantizationType::Rabit && storage.is_layered_rq();
+        let layered_lazy = Mutex::new(Self::layered_lazy_config_at_open(layered_rq)?);
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
@@ -1647,6 +1665,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
+            layered_rq,
+            layered_lazy,
             _marker: PhantomData,
         })
     }
@@ -1670,6 +1690,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
+        let layered_rq =
+            Q::quantization_type() == QuantizationType::Rabit && storage.is_layered_rq();
+        let layered_lazy = Mutex::new(Self::layered_lazy_config_at_open(layered_rq)?);
         Ok(Self {
             uri,
             index_path,
@@ -1691,6 +1714,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
+            layered_rq,
+            layered_lazy,
             _marker: PhantomData,
         })
     }
@@ -2150,6 +2175,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         io_stats: Option<IoStats>,
         precision: Option<lance_index::vector::bq::layered::RQPrecision>,
     ) -> Result<PartitionEntry<S, Q>> {
+        let idx = self.load_sub_index(partition_id, io_stats.clone()).await?;
+        let storage = if let Some(precision) = precision {
+            Box::pin(self.storage.load_partition_at_precision(
+                partition_id,
+                precision,
+                &self.index_cache,
+                io_stats,
+            ))
+            .await?
+        } else {
+            self.load_partition_storage(partition_id, io_stats).await?
+        };
+        Ok(PartitionEntry::new(idx, storage))
+    }
+
+    async fn load_sub_index(&self, partition_id: usize, io_stats: Option<IoStats>) -> Result<S> {
         // `concat_batches` indexes the batches by this schema's field positions
         // without comparing the two, so the schema has to describe exactly what
         // was read: the full file schema over a projected read would index past
@@ -2203,19 +2244,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             S::metadata_key().to_owned(),
             self.sub_index_metadata[partition_id].clone(),
         )?;
-        let idx = S::load(batch)?;
-        let storage = if let Some(precision) = precision {
-            Box::pin(self.storage.load_partition_at_precision(
-                partition_id,
-                precision,
-                &self.index_cache,
-                io_stats,
-            ))
-            .await?
-        } else {
-            self.load_partition_storage(partition_id, io_stats).await?
-        };
-        Ok(PartitionEntry::new(idx, storage))
+        S::load(batch)
     }
 
     async fn materialize_prewarm_partition(
@@ -2770,6 +2799,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
+            if let Some(config) = self.lazy_full_config(&query, raw_query_context.is_some()) {
+                if !self
+                    .all_ex_planes_resident(&partitions, start_idx..end_idx)
+                    .await
+                {
+                    let batch = Box::pin(self.clone().search_partitions_lazy_full(
+                        query,
+                        partitions,
+                        q_c_dists,
+                        start_idx..end_idx,
+                        pre_filter,
+                        metrics,
+                        raw_query_context,
+                        config,
+                    ))
+                    .await?;
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        VECTOR_RESULT_SCHEMA.clone(),
+                        stream::once(async move { Ok(batch) }),
+                    )));
+                }
+                layered_stats::counters().lazy_all_resident_skips.incr();
+            }
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             pre_filter.wait_for_ready().await?;
             let prepare_index = self.clone();
@@ -7177,6 +7229,1208 @@ mod tests {
             );
         }
         test_remap(params, 4, 0.5).await;
+    }
+
+    /// The lazy layered full-precision scan must return exactly the eager
+    /// scan's batch (row ids, distance bits and heap order) for every cache
+    /// state, filter, bound and scan setting.
+    mod layered_lazy {
+        use super::*;
+        use std::sync::LazyLock;
+        use std::time::Duration;
+
+        use arrow::compute::concat_batches;
+        use bytes::Bytes;
+        use lance_core::cache::{CacheCodec, CacheEntry, InternalCacheKey, QuickCacheBackend};
+        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_index::vector::bq::layered::{PlaneBatch, PlaneKey, RQPrecision};
+        use lance_index::vector::bq::layered_stats::{self, LayeredLazyStats};
+        use lance_index::vector::bq::storage::{
+            RabitPruneStatsSnapshot, rabit_prune_stats_snapshot,
+        };
+        use lance_index::vector::storage::{DenseGatherMode, LayeredLazyConfig, LazyPromotion};
+        use lance_index::vector::{ApproxMode, PartitionSearchControl, VECTOR_RESULT_SCHEMA};
+        use lance_io::assert_io_eq;
+        use lance_io::object_store::ObjectStoreRegistry;
+        use rand::seq::SliceRandom;
+
+        use crate::session::Session;
+
+        type IvfRq = super::super::IVFIndex<FlatIndex, RabitQuantizer>;
+
+        const LAZY_DIM: usize = 128;
+        const LAZY_PARTITIONS: usize = 64;
+        const LAZY_ROWS: usize = 20_000;
+        /// `(partition, rows)` of partitions that are empty or smaller than
+        /// one 32-row FastScan block, or straddle its boundary.
+        const LAZY_SMALL_PARTITIONS: [(usize, usize); 8] = [
+            (3, 0),
+            (11, 0),
+            (7, 1),
+            (13, 5),
+            (19, 17),
+            (23, 31),
+            (29, 32),
+            (31, 33),
+        ];
+        /// About a tenth of the index's plane bytes, so plane entries churn.
+        const LAZY_SMALL_CACHE_BYTES: usize = 512 * 1024;
+        const LAZY_LARGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+        const LAZY_METADATA_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+        /// These tests assert deltas of process-wide counters, so they run one at a time.
+        static LAZY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+
+        /// RAM tier plus a serialized "disk" tier, like a tiered cache: disk
+        /// hits are admitted to RAM, loads are written through, and selected
+        /// rows are read from the serialized entry.
+        struct TieredPlaneTestBackend {
+            ram: QuickCacheBackend,
+            disk: std::sync::Mutex<HashMap<InternalCacheKey, (Bytes, CacheCodec, usize)>>,
+            gated: bool,
+            serve_rows: AtomicBool,
+            /// Report the plane entries of empty partitions as not resident,
+            /// as if the tier had evicted them.
+            hide_empty_planes: AtomicBool,
+        }
+
+        impl std::fmt::Debug for TieredPlaneTestBackend {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("TieredPlaneTestBackend")
+                    .field("gated", &self.gated)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl TieredPlaneTestBackend {
+            fn new(ram_bytes: usize, gated: bool) -> Self {
+                Self {
+                    ram: QuickCacheBackend::with_capacity(ram_bytes),
+                    disk: Default::default(),
+                    gated,
+                    serve_rows: AtomicBool::new(true),
+                    hide_empty_planes: AtomicBool::new(false),
+                }
+            }
+
+            fn persist(
+                &self,
+                key: &InternalCacheKey,
+                entry: &CacheEntry,
+                size: usize,
+                codec: Option<CacheCodec>,
+            ) {
+                let Some(codec) = codec else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                codec.serialize(entry, &mut bytes).unwrap();
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .insert(*key, (Bytes::from(bytes), codec, size));
+            }
+
+            fn read_disk(&self, key: &InternalCacheKey) -> Option<(CacheEntry, usize)> {
+                let (bytes, codec, size) = self.disk.lock().unwrap().get(key).cloned()?;
+                codec.deserialize(&bytes).hit().map(|entry| (entry, size))
+            }
+
+            fn persisted_entries(&self, type_id: &str) -> usize {
+                self.disk
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|(_, codec, _)| codec.type_id() == type_id)
+                    .count()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl CacheBackend for TieredPlaneTestBackend {
+            async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+                let entry = self.ram.get_resident(key).await?;
+                let empty_plane = entry
+                    .downcast_ref::<PlaneBatch>()
+                    .is_some_and(|plane| plane.0.num_rows() == 0);
+                if empty_plane && self.hide_empty_planes.load(Ordering::Relaxed) {
+                    return None;
+                }
+                Some(entry)
+            }
+
+            fn plane_admission_gated(&self) -> bool {
+                self.gated
+            }
+
+            async fn get_without_promotion(
+                &self,
+                key: &InternalCacheKey,
+                _codec: Option<CacheCodec>,
+            ) -> Option<CacheEntry> {
+                match self.ram.get_resident(key).await {
+                    Some(entry) => Some(entry),
+                    None => self.read_disk(key).map(|(entry, _)| entry),
+                }
+            }
+
+            async fn get_rows(
+                &self,
+                key: &InternalCacheKey,
+                rows: &[u32],
+                _codec: Option<CacheCodec>,
+            ) -> Option<CacheEntry> {
+                if !self.serve_rows.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (bytes, codec, _) = self.disk.lock().unwrap().get(key).cloned()?;
+                let reader = |range: Range<usize>| -> Result<Bytes> { Ok(bytes.slice(range)) };
+                codec.deserialize_rows(&reader, rows).hit()
+            }
+
+            async fn get(
+                &self,
+                key: &InternalCacheKey,
+                _codec: Option<CacheCodec>,
+            ) -> Option<CacheEntry> {
+                if let Some(entry) = self.ram.get(key, None).await {
+                    return Some(entry);
+                }
+                let (entry, size) = self.read_disk(key)?;
+                self.ram.insert(key, entry.clone(), size, None).await;
+                Some(entry)
+            }
+
+            async fn insert(
+                &self,
+                key: &InternalCacheKey,
+                entry: CacheEntry,
+                size_bytes: usize,
+                codec: Option<CacheCodec>,
+            ) {
+                self.persist(key, &entry, size_bytes, codec);
+                self.ram.insert(key, entry, size_bytes, None).await;
+            }
+
+            async fn get_or_insert<'a>(
+                &self,
+                key: &InternalCacheKey,
+                loader: std::pin::Pin<
+                    Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
+                >,
+                codec: Option<CacheCodec>,
+            ) -> Result<(CacheEntry, bool)> {
+                if let Some(entry) = self.get(key, codec).await {
+                    return Ok((entry, true));
+                }
+                let (entry, size) = loader.await?;
+                self.insert(key, entry.clone(), size, codec).await;
+                Ok((entry, false))
+            }
+
+            async fn clear(&self) {
+                self.ram.clear().await;
+                self.disk.lock().unwrap().clear();
+            }
+
+            async fn num_entries(&self) -> usize {
+                self.ram.num_entries().await
+            }
+
+            async fn size_bytes(&self) -> usize {
+                self.ram.size_bytes().await
+            }
+        }
+
+        /// Prefilter over a row-address mask. `collapses` makes the scan ask
+        /// for partition coverage and replace the filter with `NoFilter`.
+        struct LazyTestFilter {
+            mask: Arc<RowAddrMask>,
+            collapses: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl PreFilter for LazyTestFilter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn is_empty(&self) -> bool {
+                false
+            }
+
+            fn needs_partition_row_ids(&self) -> bool {
+                self.collapses
+            }
+
+            fn is_empty_for(&self, _rows: &RowAddrTreeMap) -> bool {
+                self.collapses
+            }
+
+            fn mask(&self) -> Arc<RowAddrMask> {
+                self.mask.clone()
+            }
+
+            fn filter_row_ids<'a>(
+                &self,
+                row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
+            ) -> Vec<u64> {
+                self.mask.selected_indices(row_ids)
+            }
+        }
+
+        /// A prefilter whose scalar-index load failed.
+        struct FailingFilter;
+
+        #[async_trait::async_trait]
+        impl PreFilter for FailingFilter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Err(lance_core::Error::internal("prefilter failed to load"))
+            }
+
+            fn is_empty(&self) -> bool {
+                false
+            }
+
+            fn mask(&self) -> Arc<RowAddrMask> {
+                Arc::new(RowAddrMask::all_rows())
+            }
+
+            fn filter_row_ids<'a>(
+                &self,
+                row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
+            ) -> Vec<u64> {
+                row_ids.copied().collect()
+            }
+        }
+
+        struct NeverStop;
+
+        impl PartitionSearchControl for NeverStop {
+            fn should_stop(&self) -> bool {
+                false
+            }
+        }
+
+        fn lazy_test_filters() -> Vec<(&'static str, Arc<dyn PreFilter>)> {
+            let rows = |keep: fn(u64) -> bool| -> RowAddrTreeMap {
+                (0..LAZY_ROWS as u64)
+                    .filter(|&row| keep(row))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .collect()
+            };
+            let filter = |mask: RowAddrMask, collapses: bool| -> Arc<dyn PreFilter> {
+                Arc::new(LazyTestFilter {
+                    mask: Arc::new(mask),
+                    collapses,
+                })
+            };
+            vec![
+                ("none", Arc::new(NoFilter) as Arc<dyn PreFilter>),
+                (
+                    "sparse",
+                    filter(RowAddrMask::from_allowed(rows(|row| row % 20 == 3)), false),
+                ),
+                (
+                    "dense",
+                    filter(RowAddrMask::from_block(rows(|row| row % 20 == 7)), false),
+                ),
+                (
+                    "alternating",
+                    filter(RowAddrMask::from_allowed(rows(|row| row % 2 == 0)), false),
+                ),
+                (
+                    "single",
+                    filter(RowAddrMask::from_allowed(rows(|row| row == 42)), false),
+                ),
+                (
+                    "empty",
+                    filter(RowAddrMask::from_allowed(RowAddrTreeMap::default()), false),
+                ),
+                ("collapse", filter(RowAddrMask::all_rows(), true)),
+            ]
+        }
+
+        fn lazy_test_configs() -> Vec<LayeredLazyConfig> {
+            let enabled = LayeredLazyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            vec![
+                enabled,
+                LayeredLazyConfig {
+                    window: 0,
+                    dense: DenseGatherMode::Sparse,
+                    promote: LazyPromotion::Off,
+                    inline_rows: 0,
+                    ..enabled
+                },
+                LayeredLazyConfig {
+                    window: 1,
+                    dense: DenseGatherMode::Whole,
+                    promote: LazyPromotion::Background { reads: 2 },
+                    inline_rows: usize::MAX,
+                    ..enabled
+                },
+                LayeredLazyConfig {
+                    window: 8,
+                    max_runs: 0,
+                    dense_bytes_fraction: 0.1,
+                    ..enabled
+                },
+                LayeredLazyConfig {
+                    window: 64,
+                    max_runs: 2,
+                    promote: LazyPromotion::Off,
+                    inline_rows: 0,
+                    ..enabled
+                },
+                LayeredLazyConfig {
+                    max_runs: usize::MAX,
+                    dense_bytes_fraction: f64::INFINITY,
+                    ..enabled
+                },
+            ]
+        }
+
+        /// Clustered vectors around seeded centroids, in shuffled row order,
+        /// with the partition sizes of [`LAZY_SMALL_PARTITIONS`].
+        fn lazy_test_data() -> (RecordBatch, Arc<FixedSizeListArray>) {
+            let mut rng = StdRng::seed_from_u64(0x1a2e_7ed5);
+            let centroids: Vec<f32> = (0..LAZY_PARTITIONS * LAZY_DIM)
+                .map(|_| rng.random_range(-1.0f32..1.0))
+                .collect();
+            let small_rows: usize = LAZY_SMALL_PARTITIONS.iter().map(|(_, rows)| rows).sum();
+            let regular_rows =
+                (LAZY_ROWS - small_rows) / (LAZY_PARTITIONS - LAZY_SMALL_PARTITIONS.len());
+            let mut sizes: Vec<usize> = (0..LAZY_PARTITIONS)
+                .map(|partition| {
+                    LAZY_SMALL_PARTITIONS
+                        .iter()
+                        .find(|(small, _)| *small == partition)
+                        .map_or(regular_rows, |(_, rows)| *rows)
+                })
+                .collect();
+            sizes[0] += LAZY_ROWS - sizes.iter().sum::<usize>();
+            let mut partitions: Vec<usize> = sizes
+                .iter()
+                .enumerate()
+                .flat_map(|(partition, &rows)| repeat_n(partition, rows))
+                .collect();
+            partitions.shuffle(&mut rng);
+            let mut values = Vec::with_capacity(LAZY_ROWS * LAZY_DIM);
+            for partition in partitions {
+                for dim in 0..LAZY_DIM {
+                    values.push(
+                        centroids[partition * LAZY_DIM + dim] + rng.random_range(-0.05f32..0.05),
+                    );
+                }
+            }
+            let vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(values),
+                LAZY_DIM as i32,
+            )
+            .unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("vector", vectors.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt64Array::from_iter_values(0..LAZY_ROWS as u64)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap();
+            let centroids = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(centroids),
+                LAZY_DIM as i32,
+            )
+            .unwrap();
+            (batch, Arc::new(centroids))
+        }
+
+        async fn write_lazy_test_dataset(
+            uri: &str,
+            bits: u8,
+            distance_type: DistanceType,
+        ) -> (Dataset, RecordBatch) {
+            let (batch, centroids) = lazy_test_data();
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+            let params = VectorIndexParams::with_ivf_rq_params(
+                distance_type,
+                IvfBuildParams::try_with_centroids(LAZY_PARTITIONS, centroids).unwrap(),
+                RQBuildParams::new(bits).with_layered(true),
+            );
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, true)
+                .await
+                .unwrap();
+            (dataset, batch)
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum LazyTestCache {
+            /// No capacity: every plane comes from the origin file.
+            Origin,
+            /// Lance's default backend at about a tenth of the planes, prewarmed.
+            Small,
+            /// Everything resident after prewarm.
+            Resident,
+            /// A tiered backend without sign gating, prewarmed to disk.
+            Ungated,
+            /// A tiered backend with sign gating at about a tenth of the planes.
+            Gated,
+            /// A tiered backend without sign gating that holds every plane.
+            TieredResident,
+        }
+
+        async fn open_lazy_test_index(
+            uri: &str,
+            cache: LazyTestCache,
+        ) -> (
+            Dataset,
+            Arc<dyn VectorIndex>,
+            Option<Arc<TieredPlaneTestBackend>>,
+        ) {
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let (session, tiered) = match cache {
+                LazyTestCache::Origin => {
+                    (Session::new(0, LAZY_METADATA_CACHE_BYTES, registry), None)
+                }
+                LazyTestCache::Small => (
+                    Session::new(LAZY_SMALL_CACHE_BYTES, LAZY_METADATA_CACHE_BYTES, registry),
+                    None,
+                ),
+                LazyTestCache::Resident => (
+                    Session::new(LAZY_LARGE_CACHE_BYTES, LAZY_METADATA_CACHE_BYTES, registry),
+                    None,
+                ),
+                LazyTestCache::Ungated | LazyTestCache::Gated | LazyTestCache::TieredResident => {
+                    let (ram_bytes, gated) = match cache {
+                        LazyTestCache::Gated => (LAZY_SMALL_CACHE_BYTES, true),
+                        LazyTestCache::TieredResident => (LAZY_LARGE_CACHE_BYTES, false),
+                        _ => (LAZY_SMALL_CACHE_BYTES, false),
+                    };
+                    let backend = Arc::new(TieredPlaneTestBackend::new(ram_bytes, gated));
+                    (
+                        Session::with_index_cache_backend(
+                            backend.clone(),
+                            LAZY_METADATA_CACHE_BYTES,
+                            registry,
+                        ),
+                        Some(backend),
+                    )
+                }
+            };
+            let dataset = crate::DatasetBuilder::from_uri(uri)
+                .with_session(Arc::new(session))
+                .load()
+                .await
+                .unwrap();
+            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+            let index = dataset
+                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            if cache != LazyTestCache::Origin {
+                index.prewarm().await.unwrap();
+            }
+            (dataset, index, tiered)
+        }
+
+        fn lazy_index(index: &Arc<dyn VectorIndex>) -> &IvfRq {
+            index
+                .as_any()
+                .downcast_ref::<IvfRq>()
+                .expect("layered IVF_RQ index")
+        }
+
+        fn lazy_test_query(key: ArrayRef, k: usize, nprobes: usize) -> Query {
+            Query {
+                rq_cascade_factor: None,
+                rq_precision: RQPrecision::Full,
+                column: "vector".to_string(),
+                key,
+                k,
+                lower_bound: None,
+                upper_bound: None,
+                minimum_nprobes: nprobes,
+                maximum_nprobes: Some(nprobes),
+                ef: None,
+                refine_factor: None,
+                metric_type: None,
+                use_index: true,
+                query_parallelism: DEFAULT_QUERY_PARALLELISM,
+                dist_q_c: 0.0,
+                approx_mode: ApproxMode::Normal,
+            }
+        }
+
+        async fn search_global(
+            index: &Arc<dyn VectorIndex>,
+            query: &Query,
+            filter: Arc<dyn PreFilter>,
+        ) -> Result<RecordBatch> {
+            let (partitions, dists) = index.find_partitions(query)?;
+            let probes = partitions.len();
+            let batches = index
+                .clone()
+                .search_partitions(
+                    query.clone(),
+                    Arc::new(partitions),
+                    Arc::new(dists),
+                    0,
+                    probes,
+                    filter,
+                    None,
+                    Arc::new(NoOpMetricsCollector),
+                )
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(concat_batches(&VECTOR_RESULT_SCHEMA, batches.iter())?)
+        }
+
+        /// Row ids and distance bits in heap order.
+        fn result_bits(batch: &RecordBatch) -> (Vec<u64>, Vec<u32>) {
+            (
+                batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec(),
+                batch[DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .map(|dist| dist.to_bits())
+                    .collect(),
+            )
+        }
+
+        fn prune_delta(
+            after: RabitPruneStatsSnapshot,
+            before: RabitPruneStatsSnapshot,
+        ) -> [u64; 7] {
+            [
+                after.calls - before.calls,
+                after.candidates - before.candidates,
+                after.pruned_upper_bound - before.pruned_upper_bound,
+                after.pruned_heap - before.pruned_heap,
+                after.exact - before.exact,
+                after.exact_rejected - before.exact_rejected,
+                after.bypass_calls - before.bypass_calls,
+            ]
+        }
+
+        /// Run `query` eagerly and with `config`, assert identical batches and
+        /// (when `LANCE_RQ_PRUNE_STATS` is on) identical prune counters, and
+        /// return the lazy run's counters.
+        async fn assert_lazy_matches_eager(
+            index: &Arc<dyn VectorIndex>,
+            query: &Query,
+            filter: &Arc<dyn PreFilter>,
+            config: LayeredLazyConfig,
+            context: &str,
+        ) -> LayeredLazyStats {
+            let ivf = lazy_index(index);
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+            let before = rabit_prune_stats_snapshot();
+            let eager = search_global(index, query, filter.clone()).await.unwrap();
+            let after_eager = rabit_prune_stats_snapshot();
+            layered_stats::snapshot_and_reset();
+            ivf.set_layered_lazy_config_for_test(config);
+            let lazy = search_global(index, query, filter.clone()).await.unwrap();
+            let after_lazy = rabit_prune_stats_snapshot();
+            let stats = layered_stats::snapshot_and_reset();
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+            assert_eq!(result_bits(&lazy), result_bits(&eager), "{context}");
+            if before.enabled {
+                assert_eq!(
+                    prune_delta(after_lazy, after_eager),
+                    prune_delta(after_eager, before),
+                    "prune counters: {context}"
+                );
+            }
+            assert_eq!(stats.needed_not_fetched, 0, "{context}");
+            stats
+        }
+
+        /// Deltas of the promotion gauge are not reset by snapshots; wait
+        /// until background promotions have finished.
+        async fn wait_for_promotions() {
+            for _ in 0..500 {
+                if layered_stats::promotions_in_flight() == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "{} lazy promotions still running",
+                layered_stats::promotions_in_flight()
+            );
+        }
+
+        fn with_bounds(query: &Query, eager: &RecordBatch) -> Option<Query> {
+            let mut dists = eager[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            if dists.len() < 4 {
+                return None;
+            }
+            dists.sort_by(f32::total_cmp);
+            let mut bounded = query.clone();
+            bounded.lower_bound = Some(dists[dists.len() / 10]);
+            bounded.upper_bound = Some(dists[dists.len() * 3 / 5]);
+            Some(bounded)
+        }
+
+        #[rstest]
+        #[case::rq5_l2(5, DistanceType::L2)]
+        #[case::rq7_l2(7, DistanceType::L2)]
+        #[case::rq9_l2(9, DistanceType::L2)]
+        #[case::rq7_cosine(7, DistanceType::Cosine)]
+        #[case::rq7_dot(7, DistanceType::Dot)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_full_matches_eager(
+            #[case] bits: u8,
+            #[case] distance_type: DistanceType,
+        ) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), bits, distance_type).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let mut rng = StdRng::seed_from_u64(u64::from(bits));
+            let random: ArrayRef = Arc::new(Float32Array::from_iter_values(
+                (0..LAZY_DIM).map(|_| rng.random_range(-1.0f32..1.0)),
+            ));
+            let keys = [vectors.value(0), vectors.value(777), random];
+            let filters = lazy_test_filters();
+            let configs = lazy_test_configs();
+            let mut case = 0usize;
+            for cache in [
+                LazyTestCache::Origin,
+                LazyTestCache::Small,
+                LazyTestCache::Resident,
+                LazyTestCache::Ungated,
+            ] {
+                let (_dataset, index, _) = open_lazy_test_index(dir.as_str(), cache).await;
+                let lengths = &lazy_index(&index).storage.ivf().lengths;
+                assert!(lengths.contains(&0), "the fixture needs an empty partition");
+                assert!(
+                    lengths.iter().any(|&rows| rows > 0 && rows < 32),
+                    "the fixture needs a partition below one FastScan block"
+                );
+                for key in &keys {
+                    for nprobes in [1, 4, LAZY_PARTITIONS] {
+                        for k in [1, 10, 100, 5000, LAZY_ROWS + 1] {
+                            case += 1;
+                            let (filter_name, filter) = &filters[case % filters.len()];
+                            let config = configs[case % configs.len()];
+                            let mut query = lazy_test_query(key.clone(), k, nprobes);
+                            if case.is_multiple_of(3) {
+                                query.approx_mode = ApproxMode::Accurate;
+                            }
+                            let context = format!(
+                                "bits={bits} {distance_type:?} cache={cache:?} nprobes={nprobes} k={k} approx={:?} filter={filter_name} config={config:?}",
+                                query.approx_mode
+                            );
+                            let stats =
+                                assert_lazy_matches_eager(&index, &query, filter, config, &context)
+                                    .await;
+                            match cache {
+                                LazyTestCache::Resident => {
+                                    assert_eq!(stats.lazy_all_resident_skips, 1, "{context}");
+                                    assert_eq!(stats.lazy_queries, 0, "{context}");
+                                }
+                                LazyTestCache::Origin => {
+                                    assert_eq!(stats.lazy_queries, 1, "{context}");
+                                }
+                                LazyTestCache::Ungated => {
+                                    assert_eq!(stats.origin_row_reads, 0, "{context}");
+                                }
+                                LazyTestCache::Small
+                                | LazyTestCache::Gated
+                                | LazyTestCache::TieredResident => {}
+                            }
+                            if case % 2 == 1 {
+                                let eager =
+                                    search_global(&index, &query, filter.clone()).await.unwrap();
+                                if let Some(bounded) = with_bounds(&query, &eager) {
+                                    assert_lazy_matches_eager(
+                                        &index,
+                                        &bounded,
+                                        filter,
+                                        config,
+                                        &format!("{context} bounds"),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Every setting against every filter on the widest probe set.
+                let query = lazy_test_query(keys[0].clone(), 100, LAZY_PARTITIONS);
+                for config in &configs {
+                    for (filter_name, filter) in &filters {
+                        let context = format!(
+                            "bits={bits} {distance_type:?} cache={cache:?} filter={filter_name} config={config:?}"
+                        );
+                        assert_lazy_matches_eager(&index, &query, filter, *config, &context).await;
+                    }
+                }
+                wait_for_promotions().await;
+            }
+        }
+
+        /// An ungated backend is warmed partition by partition, so every plane
+        /// is persisted even when RAM holds only part of the sign planes, and
+        /// warm queries read nothing from the origin file.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_ungated_prewarm_persists_every_plane() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (dataset, index, tiered) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Ungated).await;
+            let tiered = tiered.unwrap();
+            assert_eq!(
+                tiered.persisted_entries(<PlaneBatch as CacheCodecImpl>::TYPE_ID),
+                3 * LAZY_PARTITIONS
+            );
+            let key = batch["vector"].as_fixed_size_list().value(5);
+            let query = lazy_test_query(key, 100, LAZY_PARTITIONS);
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            search_global(&index, &query, filter.clone()).await.unwrap();
+            dataset.object_store.as_ref().io_stats_incremental();
+            let stats = assert_lazy_matches_eager(
+                &index,
+                &query,
+                &filter,
+                LayeredLazyConfig {
+                    enabled: true,
+                    dense: DenseGatherMode::Sparse,
+                    promote: LazyPromotion::Off,
+                    ..Default::default()
+                },
+                "ungated prewarm",
+            )
+            .await;
+            let io = dataset.object_store.as_ref().io_stats_incremental();
+            assert_io_eq!(
+                io,
+                read_iops,
+                0,
+                "warm layered queries read no origin plane"
+            );
+            assert_eq!(stats.origin_row_reads, 0);
+            let sparse_planes: u64 = stats.high_sparse.iter().chain(&stats.low_sparse).sum();
+            assert!(sparse_planes > 0, "{stats:?}");
+        }
+
+        /// Queries the lazy scan cannot serve run the eager scan and are
+        /// counted by reason.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_ineligible_queries_fall_back() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let key = batch["vector"].as_fixed_size_list().value(9);
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let config = LayeredLazyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+
+            let mut fast = lazy_test_query(key.clone(), 10, 8);
+            fast.approx_mode = ApproxMode::Fast;
+            let stats = assert_lazy_matches_eager(&index, &fast, &filter, config, "fast").await;
+            assert_eq!((stats.ineligible_fast, stats.lazy_queries), (1, 0));
+
+            let base = lazy_test_query(key.clone(), 100, 8);
+            let eager = search_global(&index, &base, filter.clone()).await.unwrap();
+            let mut cascade = with_bounds(&base, &eager).unwrap();
+            cascade.rq_cascade_factor = Some(4);
+            let stats =
+                assert_lazy_matches_eager(&index, &cascade, &filter, config, "cascade").await;
+            assert_eq!((stats.ineligible_cascade, stats.lazy_queries), (1, 0));
+
+            let mut refine = lazy_test_query(key.clone(), 10, 8);
+            refine.refine_factor = Some(2);
+            let stats = assert_lazy_matches_eager(&index, &refine, &filter, config, "refine").await;
+            assert_eq!((stats.ineligible_refine, stats.lazy_queries), (1, 0));
+
+            let mut high = lazy_test_query(key.clone(), 10, 8);
+            high.rq_precision = RQPrecision::High;
+            let stats = assert_lazy_matches_eager(&index, &high, &filter, config, "high").await;
+            assert_eq!((stats.ineligible_precision, stats.lazy_queries), (1, 0));
+
+            // `k == 0` runs the eager scan, which still waits for the
+            // prefilter and so reports its failure.
+            let zero = lazy_test_query(key, 0, 8);
+            let stats = assert_lazy_matches_eager(&index, &zero, &filter, config, "k=0").await;
+            assert_eq!((stats.ineligible_k_zero, stats.lazy_queries), (1, 0));
+            let failing: Arc<dyn PreFilter> = Arc::new(FailingFilter);
+            let ivf = lazy_index(&index);
+            for lazy in [LayeredLazyConfig::default(), config] {
+                ivf.set_layered_lazy_config_for_test(lazy);
+                let error = search_global(&index, &zero, failing.clone())
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("prefilter failed"), "{error}");
+            }
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+        }
+
+        /// A gated backend admits ex planes only behind their resident sign
+        /// plane, so a background promotion would read a whole plane only to
+        /// drop it; sparse gathers never promote there.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_gated_backend_never_promotes() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Gated).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let config = LayeredLazyConfig {
+                enabled: true,
+                dense: DenseGatherMode::Sparse,
+                promote: LazyPromotion::Background { reads: 1 },
+                ..Default::default()
+            };
+            let mut sparse_planes = 0;
+            for row in 0..4 {
+                let query = lazy_test_query(vectors.value(row * 101), 100, LAZY_PARTITIONS);
+                // Repeat each query so a plane is gathered sparsely more than once.
+                for repeat in 0..2 {
+                    let context = format!("gated row={row} repeat={repeat}");
+                    let stats =
+                        assert_lazy_matches_eager(&index, &query, &filter, config, &context).await;
+                    assert_eq!(stats.lazy_queries, 1, "{context}");
+                    assert_eq!(
+                        (
+                            stats.promotions_issued,
+                            stats.promotions_deduped,
+                            stats.promotions_skipped,
+                            stats.promotion_bytes
+                        ),
+                        (0, 0, 0, 0),
+                        "{context}"
+                    );
+                    sparse_planes += stats
+                        .high_sparse
+                        .iter()
+                        .chain(&stats.low_sparse)
+                        .sum::<u64>();
+                }
+            }
+            assert_eq!(layered_stats::promotions_in_flight(), 0);
+            assert!(sparse_planes > 0, "the gated setup must gather sparsely");
+        }
+
+        /// Empty partitions have no ex rows, so their plane entries, which the
+        /// lazy scan never touches, do not keep a query whose other ex planes
+        /// are all resident off the eager scan.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_empty_partitions_count_as_resident() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, tiered) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::TieredResident).await;
+            let tiered = tiered.unwrap();
+            let ivf = lazy_index(&index);
+            let empty = LAZY_SMALL_PARTITIONS
+                .iter()
+                .find(|(_, rows)| *rows == 0)
+                .map(|(partition, _)| *partition)
+                .unwrap();
+            assert_eq!(ivf.storage.partition_size(empty), 0);
+            let high = PlaneKey {
+                partition: empty,
+                plane: 1,
+            };
+            assert!(ivf.index_cache.peek_resident_with_key(&high).await);
+            tiered.hide_empty_planes.store(true, Ordering::Relaxed);
+            assert!(!ivf.index_cache.peek_resident_with_key(&high).await);
+
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let config = LayeredLazyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let query = lazy_test_query(
+                batch["vector"].as_fixed_size_list().value(11),
+                100,
+                LAZY_PARTITIONS,
+            );
+            let stats =
+                assert_lazy_matches_eager(&index, &query, &filter, config, "hidden empty planes")
+                    .await;
+            assert_eq!(
+                (stats.lazy_all_resident_skips, stats.lazy_queries),
+                (1, 0),
+                "{stats:?}"
+            );
+        }
+
+        /// A row-id remapper can drop physical rows, so offsets are not row
+        /// positions and the lazy scan must not run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_remapped_index_is_ineligible() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (batch, schema) = generate_batch::<Float32Type>(1000, None, 0.0..1.0, false);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
+            let mut dataset = Dataset::write(
+                reader,
+                dir.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 200,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let params = VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(4),
+                RQBuildParams::new(7).with_layered(true),
+            );
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, true)
+                .await
+                .unwrap();
+            dataset.delete("id % 7 = 0").await.unwrap();
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 500,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let uuid = dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .find(|index| index.name != FRAG_REUSE_INDEX_NAME)
+                .unwrap()
+                .uuid;
+            let index = dataset
+                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(!lazy_index(&index).storage.supports_candidate_reads());
+            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(1), 20, 4);
+            let stats = assert_lazy_matches_eager(
+                &index,
+                &query,
+                &(Arc::new(NoFilter) as Arc<dyn PreFilter>),
+                LayeredLazyConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                "remapper",
+            )
+            .await;
+            assert_eq!((stats.ineligible_remapper, stats.lazy_queries), (1, 0));
+        }
+
+        /// Per-partition, streaming, batch and cascade searches never use the
+        /// lazy scan.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_leaves_other_search_paths_unchanged() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let ivf = lazy_index(&index);
+            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(3), 50, 8);
+            let (partitions, dists) = index.find_partitions(&query).unwrap();
+            let partitions = Arc::new(partitions);
+            let dists = Arc::new(dists);
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let mut cascade = query.clone();
+            cascade.rq_cascade_factor = Some(4);
+
+            let mut outputs = Vec::new();
+            for config in [
+                LayeredLazyConfig::default(),
+                LayeredLazyConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            ] {
+                ivf.set_layered_lazy_config_for_test(config);
+                layered_stats::snapshot_and_reset();
+                let in_partition = index
+                    .search_in_partition(
+                        partitions.value(0) as usize,
+                        &query,
+                        filter.clone(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                let streamed = index
+                    .clone()
+                    .search_partitions(
+                        query.clone(),
+                        partitions.clone(),
+                        dists.clone(),
+                        0,
+                        partitions.len(),
+                        filter.clone(),
+                        Some(Arc::new(NeverStop)),
+                        Arc::new(NoOpMetricsCollector),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let batched = index
+                    .clone()
+                    .search_partitions_batch(
+                        query.clone(),
+                        vec![partitions.clone()],
+                        vec![dists.clone()],
+                        filter.clone(),
+                        Arc::new(NoOpMetricsCollector),
+                    )
+                    .await
+                    .unwrap();
+                let cascaded = search_global(&index, &cascade, filter.clone())
+                    .await
+                    .unwrap();
+                let stats = layered_stats::snapshot_and_reset();
+                assert_eq!(stats.lazy_queries, 0);
+                assert_eq!(stats.lazy_all_resident_skips, 0);
+                let mut output = vec![result_bits(&in_partition), result_bits(&cascaded)];
+                output.extend(streamed.iter().map(result_bits));
+                output.extend(batched.iter().map(result_bits));
+                outputs.push(output);
+            }
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+            assert_eq!(outputs[0], outputs[1]);
+        }
+
+        /// Concurrent queries share the promotion tracker, a cleared cache
+        /// and a missing persistent entry fall back to the origin file, and a
+        /// dropped query releases what it holds.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_lifecycle() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (dataset, index, tiered) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Ungated).await;
+            let tiered = tiered.unwrap();
+            let ivf = lazy_index(&index);
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let config = LayeredLazyConfig {
+                enabled: true,
+                dense: DenseGatherMode::Sparse,
+                promote: LazyPromotion::Background { reads: 1 },
+                ..Default::default()
+            };
+            let queries: Vec<Query> = (0..4)
+                .map(|row| lazy_test_query(vectors.value(row * 101), 10, LAZY_PARTITIONS))
+                .collect();
+
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+            let mut expected = Vec::new();
+            for query in &queries {
+                expected.push(result_bits(
+                    &search_global(&index, query, filter.clone()).await.unwrap(),
+                ));
+            }
+
+            // Identical queries in parallel promote each plane at most once at a time.
+            ivf.set_layered_lazy_config_for_test(config);
+            layered_stats::snapshot_and_reset();
+            let concurrent = futures::future::try_join_all(
+                queries
+                    .iter()
+                    .chain(queries.iter())
+                    .map(|query| search_global(&index, query, filter.clone())),
+            )
+            .await
+            .unwrap();
+            for (position, result) in concurrent.iter().enumerate() {
+                assert_eq!(result_bits(result), expected[position % queries.len()]);
+            }
+            wait_for_promotions().await;
+            let stats = layered_stats::snapshot_and_reset();
+            assert!(stats.promotions_issued > 0);
+            // A promoted plane the small RAM tier evicted again is not completed.
+            assert!(stats.promotions_completed > 0, "{stats:?}");
+            assert!(
+                stats.promotions_completed <= stats.promotions_issued,
+                "{stats:?}"
+            );
+
+            // Without persistent rows the gathers read the origin file. The
+            // promotions above may have left every plane these queries need
+            // resident, which would skip the gathers, so empty the RAM tier.
+            tiered.ram.clear().await;
+            tiered.serve_rows.store(false, Ordering::Relaxed);
+            for (query, expected) in queries.iter().zip(&expected) {
+                let result = search_global(&index, query, filter.clone()).await.unwrap();
+                assert_eq!(&result_bits(&result), expected);
+            }
+            wait_for_promotions().await;
+            let stats = layered_stats::snapshot_and_reset();
+            assert!(stats.origin_row_reads > 0, "{stats:?}");
+            tiered.serve_rows.store(true, Ordering::Relaxed);
+
+            // Clearing the cache between queries loses every plane entry.
+            tiered.clear().await;
+            for (query, expected) in queries.iter().zip(&expected) {
+                let result = search_global(&index, query, filter.clone()).await.unwrap();
+                assert_eq!(&result_bits(&result), expected);
+            }
+            wait_for_promotions().await;
+            let stats = layered_stats::snapshot_and_reset();
+            assert!(stats.origin_row_reads > 0, "{stats:?}");
+
+            // A dropped query stops its producer and releases its partitions.
+            for timeout in [1, 5, 50] {
+                let _ = tokio::time::timeout(
+                    Duration::from_micros(timeout),
+                    search_global(&index, &queries[0], filter.clone()),
+                )
+                .await;
+            }
+            wait_for_promotions().await;
+            for _ in 0..500 {
+                if ivf.prepared_partitions().in_flight() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(ivf.prepared_partitions().in_flight(), 0);
+            let result = search_global(&index, &queries[0], filter.clone())
+                .await
+                .unwrap();
+            assert_eq!(result_bits(&result), expected[0]);
+            wait_for_promotions().await;
+            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+            drop(dataset);
+        }
     }
 
     #[rstest]

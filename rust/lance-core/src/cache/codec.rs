@@ -234,6 +234,24 @@ pub trait CacheCodecImpl: Send + Sync {
         ))
     }
 
+    /// Payload byte ranges that [`deserialize_rows`](Self::deserialize_rows)
+    /// requests for `rows`, in request order, excluding the envelope and any
+    /// body header it reads through `reader` while planning.
+    ///
+    /// Lets a backend issue those reads concurrently before decoding. The
+    /// default `None` means the body cannot plan, and backends read serially.
+    fn plan_row_ranges(
+        _reader: &dyn CacheRangeReader,
+        _body_offset: usize,
+        _version: u32,
+        _rows: &[u32],
+    ) -> Result<Option<Vec<std::ops::Range<usize>>>>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
     /// Stable identity for this entry type. **Must not change once shipped.**
     /// This is a deliberate author-assigned string, not `std::any::type_name`
     /// (which is not stable across compiler versions).
@@ -262,6 +280,13 @@ pub trait CacheCodecImpl: Send + Sync {
 pub(crate) type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
 
 type RowDecoder = fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<ArcAny>;
+type RowPlanner =
+    fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<Option<Vec<std::ops::Range<usize>>>>;
+
+/// Envelope bytes before `type_id`: magic, envelope version and `type_id_len`.
+const ENVELOPE_ID_OFFSET: usize = 4 + 1 + 2;
+/// Envelope bytes that follow `type_id`: `type_version`.
+const ENVELOPE_VERSION_BYTES: usize = 4;
 
 /// Type-erased codec for serializing and deserializing cache entries.
 ///
@@ -273,6 +298,7 @@ type RowDecoder = fn(&dyn CacheRangeReader, usize, u32, &[u32]) -> Result<ArcAny
 #[derive(Copy, Clone)]
 pub struct CacheCodec {
     row_decoder: Option<RowDecoder>,
+    row_planner: Option<RowPlanner>,
     memory_priority: u8,
     plane_tag: Option<u8>,
     type_id: &'static str,
@@ -322,6 +348,7 @@ impl CacheCodec {
     ) -> Self {
         Self {
             row_decoder: None,
+            row_planner: None,
             memory_priority: 0,
             plane_tag: None,
             type_id,
@@ -338,6 +365,11 @@ impl CacheCodec {
                 Some(|reader, offset, version, rows| {
                     Ok(Arc::new(T::deserialize_rows(reader, offset, version, rows)?) as ArcAny)
                 })
+            } else {
+                None
+            },
+            row_planner: if T::SUPPORTS_ROW_SELECTION {
+                Some(T::plan_row_ranges)
             } else {
                 None
             },
@@ -391,6 +423,24 @@ impl CacheCodec {
         self.row_decoder.is_some()
     }
 
+    /// Read and validate the envelope of a range-read entry, returning the
+    /// body offset and the entry's `type_version`.
+    fn read_row_envelope(&self, reader: &dyn CacheRangeReader) -> Result<(usize, u32)> {
+        let prefix = reader.read_range(0..ENVELOPE_ID_OFFSET)?;
+        let id_bytes = prefix
+            .get(ENVELOPE_ID_OFFSET - 2..ENVELOPE_ID_OFFSET)
+            .ok_or_else(|| Error::invalid_input("short cache envelope"))?;
+        let id_len = u16::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
+        let header =
+            reader.read_range(0..(ENVELOPE_ID_OFFSET + id_len + ENVELOPE_VERSION_BYTES))?;
+        let envelope = parse_envelope(&header)
+            .ok_or_else(|| Error::invalid_input("invalid cache envelope"))?;
+        if envelope.type_id != self.type_id || envelope.type_version > self.version {
+            return Err(Error::invalid_input("incompatible cache entry"));
+        }
+        Ok((envelope.body_offset, envelope.type_version))
+    }
+
     /// Gather rows without loading the complete persistent entry.
     pub fn deserialize_rows(
         &self,
@@ -401,23 +451,28 @@ impl CacheCodec {
             let decoder = self
                 .row_decoder
                 .ok_or_else(|| Error::invalid_input("row selection unsupported"))?;
-            let prefix = reader.read_range(0..7)?;
-            let id_bytes = prefix
-                .get(5..7)
-                .ok_or_else(|| Error::invalid_input("short cache envelope"))?;
-            let id_len = u16::from_le_bytes(id_bytes.try_into().unwrap()) as usize;
-            let header = reader.read_range(0..(11 + id_len))?;
-            let envelope = parse_envelope(&header)
-                .ok_or_else(|| Error::invalid_input("invalid cache envelope"))?;
-            if envelope.type_id != self.type_id || envelope.type_version > self.version {
-                return Err(Error::invalid_input("incompatible cache entry"));
-            }
-            decoder(reader, envelope.body_offset, envelope.type_version, rows)
+            let (body_offset, version) = self.read_row_envelope(reader)?;
+            decoder(reader, body_offset, version, rows)
         };
         match decode() {
             Ok(entry) => CacheDecode::Hit(entry),
             Err(_) => CacheDecode::Miss(CacheMissReason::BodyError),
         }
+    }
+
+    /// Payload ranges that [`deserialize_rows`](Self::deserialize_rows) would
+    /// request for `rows`, beyond the envelope and body header it reads from
+    /// `reader` here. `None` when the codec cannot plan, the entry is not
+    /// compatible, or the rows are invalid; callers then decode serially,
+    /// which reports invalid rows as a miss.
+    pub fn plan_rows(
+        &self,
+        reader: &dyn CacheRangeReader,
+        rows: &[u32],
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        let planner = self.row_planner?;
+        let (body_offset, version) = self.read_row_envelope(reader).ok()?;
+        planner(reader, body_offset, version, rows).ok().flatten()
     }
 
     /// Deserialize an entry from `data`.
@@ -657,6 +712,67 @@ mod tests {
             .hit()
             .unwrap();
         assert_eq!(decoded.downcast_ref::<Widget>(), Some(&Widget { n: 11 }));
+    }
+
+    /// Row-selectable body that keeps the default (absent) range planner.
+    struct Rows;
+
+    impl CacheCodecImpl for Rows {
+        const TYPE_ID: &'static str = "test.Rows";
+        const CURRENT_VERSION: u32 = 1;
+        const SUPPORTS_ROW_SELECTION: bool = true;
+
+        fn serialize(&self, _writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn deserialize(_reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn deserialize_rows(
+            _reader: &dyn CacheRangeReader,
+            _body_offset: usize,
+            _version: u32,
+            _rows: &[u32],
+        ) -> Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn plan_rows_defaults_to_serial_decode() {
+        let value: ArcAny = Arc::new(Widget { n: 1 });
+        let widget = CacheCodec::from_impl::<Widget>();
+        let mut widget_bytes = Vec::new();
+        widget.serialize(&value, &mut widget_bytes).unwrap();
+        let widget_bytes = Bytes::from(widget_bytes);
+        let read = |range: std::ops::Range<usize>| -> Result<Bytes> {
+            widget_bytes
+                .get(range.clone())
+                .map(|_| widget_bytes.slice(range))
+                .ok_or_else(|| Error::invalid_input("out of range"))
+        };
+        assert!(!widget.supports_row_selection());
+        assert!(widget.plan_rows(&read, &[0]).is_none());
+
+        let rows = CacheCodec::from_impl::<Rows>();
+        let mut rows_bytes = Vec::new();
+        rows.serialize(&(Arc::new(Rows) as ArcAny), &mut rows_bytes)
+            .unwrap();
+        let rows_bytes = Bytes::from(rows_bytes);
+        let read = |range: std::ops::Range<usize>| -> Result<Bytes> {
+            rows_bytes
+                .get(range.clone())
+                .map(|_| rows_bytes.slice(range))
+                .ok_or_else(|| Error::invalid_input("out of range"))
+        };
+        assert!(rows.supports_row_selection());
+        assert!(rows.plan_rows(&read, &[0]).is_none());
+        assert!(matches!(
+            rows.deserialize_rows(&read, &[0]),
+            CacheDecode::Hit(_)
+        ));
     }
 
     #[test]
