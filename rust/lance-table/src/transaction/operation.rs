@@ -86,7 +86,28 @@ pub enum Operation {
         groups: Vec<RewriteGroup>,
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
-        /// The fragment reuse index to be created or updated to
+        /// The fragment reuse index entry to be created or updated to: the
+        /// complete entry the caller wants installed, that is the entry at
+        /// the transaction's read version plus this rewrite's own records.
+        ///
+        /// On a tagged history (`index_version` 1) the commit path does not
+        /// splice this entry as it is. It works out which records the entry
+        /// adds relative to the entry at the transaction's read version, so
+        /// the entry must be built from that same snapshot (its
+        /// `dataset_version` is the read version; an entry built from a
+        /// later snapshot is refused, since it would fold other writers'
+        /// records in between into this rewrite's additions). It then
+        /// validates them against `groups` (binding, row conservation,
+        /// deletion folding, the ledger), and merges them onto the entry
+        /// current at commit, so a rewrite never overwrites history another
+        /// writer recorded concurrently. A rewrite only appends: an entry
+        /// that drops a recorded transition, or carries a recorded transition
+        /// with different content, is refused; history is retired through
+        /// the reuse index cleanup instead.
+        ///
+        /// In-memory only, never serialized into the transaction file: other
+        /// writers' conflict decisions only need the fragment sets in
+        /// `groups`, and the manifest is the durable record of the history.
         frag_reuse_index: Option<IndexMetadata>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
@@ -271,6 +292,67 @@ impl std::fmt::Display for Operation {
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
         }
     }
+}
+
+/// What the commit path assembled for a rewrite on a tagged fragment reuse
+/// history: the complete entry to install, merged against the manifest the
+/// commit attempt builds on. Supplied through
+/// [`FragReuseUpdate::Rewrite`](crate::transaction::FragReuseUpdate) on the
+/// prepared index list once per attempt, while the operation's
+/// `frag_reuse_index` stays what the caller supplied, so every retry works
+/// from the same intent.
+#[derive(Debug, Clone)]
+pub struct TaggedRewriteAssembly {
+    /// The entry to install, assembled against the manifest being built.
+    pub entry: IndexMetadata,
+    /// `dataset_version` of the entry the assembly appended onto (`None`
+    /// when this rewrite creates the entry). The manifest build refuses the
+    /// splice when the manifest's entry is a different one.
+    pub base_entry_version: Option<u64>,
+    /// The source fragments of the transitions this rewrite appended. Their
+    /// rewrite groups redistribute rows, so index bitmaps keep the retired
+    /// source ids as provenance instead of following the rewrite.
+    pub reordered_sources: RoaringBitmap,
+}
+
+impl TaggedRewriteAssembly {
+    /// Bundle an assembled entry with the transitions it appended.
+    pub fn new(
+        entry: IndexMetadata,
+        base_entry_version: Option<u64>,
+        transitions: &[crate::format::pb::fragment_reuse_index_details::Transition],
+    ) -> lance_core::Result<Self> {
+        Ok(Self {
+            entry,
+            base_entry_version,
+            reordered_sources: reordered_sources(transitions)?,
+        })
+    }
+}
+
+/// The union of `transitions`' source fragment ids. Rewrite groups covered
+/// by this set skip index-bitmap maintenance: their bitmaps keep the retired
+/// source ids as provenance.
+///
+/// Fragment ids in the reuse domain are bounded by the row-address fragment
+/// space (u32); the ledger's digest validation is the authoritative
+/// enforcement, but it only runs during entry assembly, so an out-of-range
+/// id is rejected here too rather than silently truncated into an alias of
+/// another fragment.
+pub fn reordered_sources(
+    transitions: &[crate::format::pb::fragment_reuse_index_details::Transition],
+) -> lance_core::Result<RoaringBitmap> {
+    transitions
+        .iter()
+        .flat_map(|transition| transition.sources.iter().map(|source| source.id))
+        .map(|id| {
+            u32::try_from(id).map_err(|_| {
+                lance_core::Error::invalid_input(format!(
+                    "transition source fragment id {id} is outside the row-address range"
+                ))
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]

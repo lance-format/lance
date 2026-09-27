@@ -80,8 +80,12 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
 /// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
 pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Reserved for fragment trees. Readers and writers reject it until implemented.
+///
+/// Bit 11 is spilled row lineage, so this takes the next free bit.
+pub const FLAG_FRAGMENT_TREE: u64 = 1 << 12;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 12;
+pub const FLAG_UNKNOWN: u64 = 1 << 13;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -94,8 +98,10 @@ const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_FRAGMENT_TREE < FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
+pub(crate) const STICKY_PAIRED_FLAGS: u64 =
+    FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -248,14 +254,13 @@ fn supported_flags_when(overlay_enabled: bool, spilled_row_lineage_enabled: bool
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
-    // Bit 10 now falls below the unknown boundary, so keep tagged FRI refused
-    // until its reader/writer handling lands.
-    mark_supported(&mut supported, FLAG_FRAGMENT_REUSE_INDEX, false);
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
         spilled_row_lineage_enabled,
     );
+    // Reserved, not implemented: see the flag's doc comment.
+    mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     supported
 }
 
@@ -316,6 +321,15 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
+    if (manifest.reader_feature_flags ^ manifest.writer_feature_flags) & FLAG_FRAGMENT_REUSE_INDEX
+        != 0
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "FRI requires both reader and writer feature flags",
+        ));
+    }
+
     let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     if reader != writer {
@@ -335,6 +349,20 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tagged_fri_flag_is_supported_and_sticky() {
+        let flag = super::FLAG_FRAGMENT_REUSE_INDEX;
+        assert!(super::can_read_dataset(flag));
+        assert!(super::can_write_dataset(flag));
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = flag;
+        assert!(super::ensure_can_read_manifest(&manifest).is_err());
+        manifest.writer_feature_flags = flag;
+        super::apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & flag, flag);
+        assert_eq!(manifest.writer_feature_flags & flag, flag);
+    }
+
     /// The covering fence only works if the bit is one the current released
     /// build already rejects. That build's unknown boundary is 128, so the bit
     /// has to be 128 and this build has to have moved its own boundary past it
@@ -357,6 +385,17 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    #[test]
+    fn test_fragment_tree_flag_is_reserved_not_supported() {
+        assert_eq!(FLAG_FRAGMENT_TREE, 4096);
+        assert_eq!(
+            FLAG_FRAGMENT_TREE & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS | FLAG_FRAGMENT_REUSE_INDEX),
+            0
+        );
+        assert!(!can_read_dataset(FLAG_FRAGMENT_TREE));
+        assert!(!can_write_dataset(FLAG_FRAGMENT_TREE));
+    }
 
     /// Reserved ahead of its implementation: refused for reading and writing
     /// until the handling lands, so a build from the gap cannot open the table.

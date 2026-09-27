@@ -20,10 +20,13 @@ use crate::{Dataset, Error, Result};
 /// fully live is returned as-is: rebuilding it would produce equivalent content
 /// over the same fragments, which makes distributed builds (one uncommitted
 /// segment per worker, merged 1:1 into final segments) pay for every segment
-/// twice.
+/// twice. `is_rebuild_required` disables that passthrough when the caller has
+/// moved coverage into the current fragment space and the stored row addresses
+/// must be rebuilt to match it.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    is_rebuild_required: bool,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -81,7 +84,10 @@ pub(in crate::index) async fn merge_segments(
         });
     }
 
-    if segments.len() == 1 && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap) {
+    if !is_rebuild_required
+        && segments.len() == 1
+        && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap)
+    {
         return Ok(segments.into_iter().next().unwrap());
     }
 

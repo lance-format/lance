@@ -264,26 +264,6 @@ def test_flat(dataset):
 )
 def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
     k = 5
-    query_count = queries.shape[0]
-
-    batch = dataset.to_table(
-        columns=["id"],
-        nearest={
-            "column": "vector",
-            "q": queries,
-            "k": k,
-            "use_index": False,
-        },
-    )
-
-    assert batch.num_rows == query_count * k
-    assert batch.column_names == ["query_index", "id", "_distance"]
-    query_index_field = batch.schema.field("query_index")
-    assert query_index_field.type == pa.int32()
-    assert not query_index_field.nullable
-    expected_query_index = sum([[i] * k for i in range(query_count)], [])
-    assert batch["query_index"].to_pylist() == expected_query_index
-
     _assert_batch_matches_single_queries(
         dataset,
         queries,
@@ -314,18 +294,42 @@ def test_batch_indexed_query_matches_repeated_single_queries(
     # nprobes covers every partition so the shared-scan batch path and the
     # repeated single-query path search the same partitions deterministically.
     nearest_kwargs = {"use_index": True, "nprobes": 4}
-    batch = indexed.to_table(
-        columns=["id"],
-        nearest={"column": "vector", "q": queries, "k": k, **nearest_kwargs},
-    )
-
-    assert batch.column_names == ["query_index", "id", "_distance"]
-    assert batch["query_index"].to_pylist() == sum(
-        [[i] * k for i in range(query_count)], []
-    )
-
     _assert_batch_matches_single_queries(
         indexed,
+        queries,
+        k=k,
+        nearest_kwargs=nearest_kwargs,
+    )
+
+
+@pytest.mark.parametrize("query_count", [1, 2])
+@pytest.mark.parametrize("use_index", [False, True])
+def test_batch_binary_query_matches_repeated_single_queries(
+    tmp_path, query_count, use_index
+):
+    vectors = np.array([[0, 0], [255, 0], [0, 255], [255, 255]], dtype=np.uint8)
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(len(vectors)), type=pa.int32()),
+                "vector": pa.array(vectors.tolist(), type=pa.list_(pa.uint8(), 2)),
+            }
+        ),
+        tmp_path,
+    )
+    if use_index:
+        dataset = dataset.create_index(
+            "vector",
+            index_type="IVF_FLAT",
+            num_partitions=1,
+            metric="hamming",
+        )
+
+    queries = np.array([[0, 0], [255, 255]], dtype=np.uint8)[:query_count]
+    k = 2
+    nearest_kwargs = {"metric": "hamming", "use_index": use_index}
+    _assert_batch_matches_single_queries(
+        dataset,
         queries,
         k=k,
         nearest_kwargs=nearest_kwargs,
@@ -342,6 +346,16 @@ def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
             **nearest_kwargs,
         },
     )
+    query_count = len(queries)
+    assert batch.num_rows == query_count * k
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    query_index_field = batch.schema.field("query_index")
+    assert query_index_field.type == pa.int32()
+    assert not query_index_field.nullable
+    assert batch["query_index"].to_pylist() == sum(
+        [[i] * k for i in range(query_count)], []
+    )
+
     if "distance_range" in nearest_kwargs:
         lo, hi = nearest_kwargs["distance_range"]
         assert all(lo <= d < hi for d in batch["_distance"].to_pylist())
@@ -1339,18 +1353,19 @@ def test_create_ivf_rq_index():
     assert stats["indices"][0]["sub_index"]["num_bits"] == 5
     assert stats["indices"][0]["sub_index"]["packed"] is True
 
-    with pytest.raises(
-        NotImplementedError,
-        match="Creating empty vector indices with train=False is not yet implemented",
-    ):
-        ds.delete("id>=0")
-        ds = ds.create_index(
-            "vector",
-            index_type="IVF_RQ",
-            num_partitions=4,
-            num_bits=1,
-            replace=True,
-        )
+    # An emptied table still takes the index; it carries its settings and
+    # covers nothing until there is data to train on.
+    ds.delete("id>=0")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=1,
+        replace=True,
+    )
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["num_indexed_rows"] == 0
+    assert stats["num_unindexed_rows"] == 0
 
     zero_vectors = np.zeros((1000, 128)).astype(np.float32).tolist()
     tbl = pa.Table.from_pydict(
@@ -1964,7 +1979,9 @@ def test_index_cache_size(tmp_path):
                 },
             )
 
-    tbl = create_table(nvec=1024, ndim=16)
+    # Each of the 128 partitions is trained only when the data can give it a
+    # 256-code codebook's worth of vectors.
+    tbl = create_table(nvec=128 * 256, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
     dataset.create_index(
@@ -2009,7 +2026,9 @@ def test_index_cache_size_bytes(tmp_path):
                 },
             )
 
-    tbl = create_table(nvec=1024, ndim=16)
+    # Each of the 128 partitions is trained only when the data can give it a
+    # 256-code codebook's worth of vectors.
+    tbl = create_table(nvec=128 * 256, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "test")
 
     dataset.create_index(

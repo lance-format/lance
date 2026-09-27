@@ -331,6 +331,50 @@ async fn test_bm25_stats_for_terms_reuses_posting_metadata_cache() {
     );
 }
 
+/// Row-granularity statistics must not cost the posting file any extra IO
+/// when a partition's documents already map one-to-one onto rows, which is
+/// every V3 index and every V1/V2 index that is not a legacy list index. The
+/// deduplicating branch reads posting lists, so it has to stay behind the
+/// duplicate-row-id check rather than run for every legacy-format index.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_keeps_the_lazy_posting_metadata_path() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
+    // A V3 index would take the delegating early return, which proves nothing
+    // about the legacy branch this test exists for.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string()];
+    let documents = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(documents, (100, 100, vec![1]));
+    let metadata_rows = counter.metadata_rows_read();
+    let rows = counter.rows_read();
+    assert_eq!(metadata_rows, 1);
+
+    assert_eq!(
+        index.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+        documents,
+        "one document per row leaves the two granularities identical",
+    );
+    assert_eq!(
+        counter.metadata_rows_read() - metadata_rows,
+        1,
+        "row statistics should read one metadata row per (term, partition)",
+    );
+    assert_eq!(
+        counter.rows_read() - rows,
+        1,
+        "row statistics must not read the posting list itself (got {} extra rows)",
+        counter.rows_read() - rows,
+    );
+}
+
 #[tokio::test]
 async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
     let cache = LanceCache::with_capacity(1024 * 1024);
@@ -356,6 +400,48 @@ async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
         .await
         .unwrap();
     assert_eq!(warm_stats, cold_stats);
+    assert_eq!(warm.index_cache_misses(), 0);
+    assert_eq!(warm.index_cache_hits(), terms.len());
+}
+
+/// Row-granularity statistics go through `InvertedPartition::row_stats_for_terms`
+/// on a V1/V2 index, and its posting-metadata lookups must reach the caller's
+/// collector too: the cross-field scorer build is the only consumer, and it
+/// runs under an `ExecutionPlan` whose cache counters would otherwise miss
+/// them entirely.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_records_metadata_cache_stats() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (index, _counter, _tmpdir) = load_counted_v2_index(100, cache.clone()).await;
+    // A V3 index would delegate to the document-granularity path, which
+    // already has its own coverage.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string(), "t1".to_string(), "t2".to_string()];
+    let cold = LocalMetricsCollector::default();
+    let cold_stats = index
+        .bm25_row_stats_for_terms(&terms, Some(&cold))
+        .await
+        .unwrap();
+    assert_eq!(cold_stats, (100, 100, vec![1, 1, 1]));
+    assert_eq!(cold.index_cache_misses(), terms.len());
+    assert_eq!(cold.index_cache_hits(), 0);
+
+    let warm = LocalMetricsCollector::default();
+    assert_eq!(
+        index
+            .bm25_row_stats_for_terms(&terms, Some(&warm))
+            .await
+            .unwrap(),
+        cold_stats,
+    );
     assert_eq!(warm.index_cache_misses(), 0);
     assert_eq!(warm.index_cache_hits(), terms.len());
 }

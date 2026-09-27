@@ -23,6 +23,7 @@ use tracing::instrument;
 
 pub mod builder;
 pub mod distance;
+pub(crate) mod pairwise;
 pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
@@ -345,7 +346,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
-            0,
         );
 
         let diff = self.num_sub_vectors as f32 - 1.0;
@@ -415,7 +415,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code,
-            100,
         ))
     }
 

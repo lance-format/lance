@@ -32,7 +32,7 @@ use super::vector::ivf::{
     SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
-use super::vector::{LogicalVectorIndex, fresh_vector_segment_params};
+use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
@@ -614,6 +614,12 @@ async fn merge_scalar_indices<'a>(
 }
 
 async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
+    // Declared type first: an index awaiting training declares itself a vector
+    // index and has no file to find it by.
+    if index.index_details.is_some() {
+        return Ok(crate::index::segment_has_vector_details(index));
+    }
+
     if let Some(files) = &index.files {
         return Ok(files.iter().any(|file| file.path == INDEX_FILE_NAME));
     }
@@ -658,33 +664,50 @@ pub async fn merge_indices<'a>(
     .await
 }
 
-async fn build_fresh_vector_segment(
+/// Whether a rebuild of `params` should expect the definition alone, because
+/// the column does not hold the vectors its quantizer needs.
+async fn expects_definition_only(
     dataset: &Dataset,
-    logical_index: &LogicalVectorIndex,
+    field_path: &str,
+    params: &VectorIndexParams,
+) -> Result<bool> {
+    let Some(minimum) = super::vector::vector_quantizer_minimum_rows(&params.stages) else {
+        return Ok(false);
+    };
+    Ok(!super::vector::has_vectors_to_train(dataset, field_path, minimum).await?)
+}
+
+/// Retrain a whole segment over `fragment_bitmap` from index parameters alone.
+async fn rebuild_vector_segment(
+    dataset: &Dataset,
+    name: &str,
+    params: &VectorIndexParams,
     field_path: &str,
     fragment_bitmap: &RoaringBitmap,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<IndexMetadata> {
-    let (reference_metadata, reference_index) = logical_index.iter().last().ok_or_else(|| {
-        Error::index(format!(
-            "Optimize vector index: logical index '{}' has no physical segments",
-            logical_index.name()
-        ))
-    })?;
-    let params = fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
     let mut build_dataset = dataset.clone();
-    CreateIndexBuilder::new(
-        &mut build_dataset,
-        &[field_path],
-        IndexType::Vector,
-        &params,
-    )
-    .name(logical_index.name().to_string())
-    .replace(true)
-    .fragments(fragment_bitmap.iter().collect())
-    .progress(progress)
-    .execute_uncommitted()
-    .await
+    CreateIndexBuilder::new(&mut build_dataset, &[field_path], IndexType::Vector, params)
+        .name(name.to_string())
+        .replace(true)
+        .fragments(fragment_bitmap.iter().collect())
+        .progress(progress)
+        .execute_uncommitted()
+        .await
+}
+
+/// True when a segment carries only its definition: nothing to open, nothing
+/// to append to, so training is what it is waiting for.
+///
+/// Happens when an index is created against an empty table, or one without
+/// enough rows to justify training it.
+fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
+    let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
+    let covers_nothing = metadata
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(RoaringBitmap::is_empty);
+    no_files_recorded && covers_nothing
 }
 
 async fn scan_vector_fragments(
@@ -705,16 +728,85 @@ async fn scan_vector_fragments(
     scanner.try_into_stream().await
 }
 
+/// Train a column whose index is still only a definition, from the parameters
+/// that definition carries.
+///
+/// The result supersedes every segment the index had: they hold no data, and
+/// what this writes covers the whole column.
+async fn train_from_definition<'a>(
+    dataset: &Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    field_path: &str,
+    options: &OptimizeOptions,
+) -> Result<IndexMergeResults<'a>> {
+    let params = old_indices
+        .last()
+        .and_then(|metadata| metadata.index_details.as_deref())
+        .and_then(details::vector_params_from_details)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "Optimize vector index: index '{}' awaits training but carries no parameters",
+                old_indices[0].name
+            ))
+        })?;
+    let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
+    let segment = rebuild_vector_segment(
+        dataset.as_ref(),
+        &old_indices[0].name,
+        &params,
+        field_path,
+        &fragment_bitmap,
+        options.progress.clone(),
+    )
+    .await?;
+    // Only a result that looks degraded is worth confirming; a rebuild that
+    // covered rows needs no count to justify it.
+    let definition_expected = is_definition_only_segment(&segment)
+        && expects_definition_only(dataset.as_ref(), field_path, &params).await?;
+    fresh_vector_segment_result(
+        segment,
+        &fragment_bitmap,
+        old_indices.to_vec(),
+        definition_expected,
+    )
+}
+
 fn fresh_vector_segment_result<'a>(
     segment: IndexMetadata,
     expected_fragment_bitmap: &RoaringBitmap,
     removed_indices: Vec<&'a IndexMetadata>,
+    definition_expected: bool,
 ) -> Result<IndexMergeResults<'a>> {
     let fragment_bitmap = segment.fragment_bitmap.ok_or_else(|| {
         Error::index(
             "Optimize vector index: newly built segment has no fragment bitmap".to_string(),
         )
     })?;
+    // A column with too few vectors to train the quantizer yields the
+    // definition alone: its rows return to unindexed, which is the state a
+    // table below the threshold belongs in. Accepted only when the caller
+    // established that beforehand and the segment wrote no files to match, so
+    // coverage lost for any other reason still fails below.
+    let wrote_no_files = segment.files.as_ref().is_some_and(|files| files.is_empty());
+    if definition_expected && wrote_no_files && fragment_bitmap.is_empty() {
+        return Ok(IndexMergeResults {
+            new_uuid: segment.uuid,
+            removed_indices,
+            new_fragment_bitmap: fragment_bitmap,
+            new_dataset_version: segment.dataset_version,
+            new_index_version: segment.index_version,
+            new_index_details: segment
+                .index_details
+                .map(|details| details.as_ref().clone())
+                .ok_or_else(|| {
+                    Error::index(
+                        "Optimize vector index: rebuilt definition has no index details"
+                            .to_string(),
+                    )
+                })?,
+            files: Vec::new(),
+        });
+    }
     if fragment_bitmap != *expected_fragment_bitmap {
         return Err(Error::index(format!(
             "Optimize vector index: newly built segment covers fragments {:?}, expected {:?}",
@@ -839,8 +931,25 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(merged);
             }
             let rebuild_dormant = live_segments.is_empty() && !dormant_segments.is_empty();
-            if rebuild_dormant && unindexed.is_empty() {
+            // A deferred build leaves a segment with no file to open, so the
+            // column is trained from its definition rather than appended to.
+            // Opening the index by name opens every segment, so any one of
+            // them settles it.
+            let awaits_training = old_indices
+                .iter()
+                .any(|idx| is_definition_only_segment(idx));
+
+            // Rebuilding and first training both read the whole column, so
+            // neither has anything to do until a fragment sits outside the
+            // index.
+            if unindexed.is_empty() && (rebuild_dormant || awaits_training) {
                 return Ok(None);
+            }
+
+            if awaits_training {
+                return train_from_definition(&dataset, old_indices, &field_path, options)
+                    .await
+                    .map(Some);
             }
 
             let full_logical_index = dataset
@@ -872,19 +981,34 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             )?;
 
             if options.retrain || rebuild_dormant {
+                let (reference_metadata, reference_index) =
+                    logical_index.iter().last().ok_or_else(|| {
+                        Error::index(format!(
+                            "Optimize vector index: logical index '{}' has no physical segments",
+                            logical_index.name()
+                        ))
+                    })?;
+                let params =
+                    fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
                 let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
-                let segment = build_fresh_vector_segment(
+                let segment = rebuild_vector_segment(
                     dataset.as_ref(),
-                    &logical_index,
+                    logical_index.name(),
+                    &params,
                     &field_path,
                     &fragment_bitmap,
                     options.progress.clone(),
                 )
                 .await?;
+                // Only a result that looks degraded is worth confirming; a
+                // rebuild that covered rows needs no count to justify it.
+                let definition_expected = is_definition_only_segment(&segment)
+                    && expects_definition_only(dataset.as_ref(), &field_path, &params).await?;
                 return fresh_vector_segment_result(
                     segment,
                     &fragment_bitmap,
                     old_indices.to_vec(),
+                    definition_expected,
                 )
                 .map(Some);
             }

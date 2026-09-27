@@ -1832,6 +1832,11 @@ impl FtsMemIndex {
                         visit(index, query, terms)?;
                     }
                 }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
+                }
             }
             Ok(())
         }
@@ -1901,6 +1906,11 @@ impl FtsMemIndex {
                     {
                         visit(index, query, scorer, leaves)?;
                     }
+                }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
                 }
             }
             Ok(())
