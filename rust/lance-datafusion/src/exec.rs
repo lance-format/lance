@@ -39,7 +39,7 @@ use datafusion::{
     },
 };
 use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
-use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common::{DataFusionError, Statistics, utils::get_available_parallelism};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use futures::{StreamExt, stream};
@@ -310,8 +310,20 @@ const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
+    /// The number of partitions the DataFusion session will actually run with.
+    ///
+    /// When `target_partition` is not set we do not override the session config,
+    /// so the session falls back to DataFusion's default `target_partitions`,
+    /// which is the available parallelism (number of CPU cores). The memory pool
+    /// must be sized for that effective partition count, not for a single
+    /// partition, or sort-heavy plans exhaust the pool.
+    fn effective_target_partition(&self) -> u64 {
+        self.target_partition
+            .unwrap_or_else(get_available_parallelism) as u64
+    }
+
     pub fn mem_pool_size(&self) -> u64 {
-        let num_partitions = self.target_partition.unwrap_or(1) as u64;
+        let num_partitions = self.effective_target_partition();
         self.mem_pool_size.unwrap_or_else(|| {
             std::env::var("LANCE_MEM_POOL_SIZE")
                 .map(|s| match s.parse::<u64>() {
@@ -1339,9 +1351,14 @@ mod tests {
     fn test_mem_pool_size_scales_with_partitions() {
         let default_per_partition = DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION;
 
-        // No partitions specified → defaults to 1 partition
+        // No partitions specified → the session runs with DataFusion's default
+        // target_partitions (available parallelism), so the pool must be sized
+        // for that effective partition count.
         let opts = LanceExecutionOptions::default();
-        assert_eq!(opts.mem_pool_size(), default_per_partition);
+        assert_eq!(
+            opts.mem_pool_size(),
+            default_per_partition * get_available_parallelism() as u64
+        );
 
         // 4 partitions → 4x the per-partition size
         let opts = LanceExecutionOptions {

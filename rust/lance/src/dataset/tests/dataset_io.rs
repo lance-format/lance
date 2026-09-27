@@ -783,6 +783,59 @@ async fn test_shallow_clone_reuses_base_object_store() {
 }
 
 #[tokio::test]
+async fn test_base_files_share_one_scheduler_per_scan() {
+    use crate::dataset::fragment::{BaseSchedulers, FragReadConfig};
+    use futures::StreamExt;
+
+    // A shallow clone whose data files all reference the source base.
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let fragments = cloned.get_fragments();
+    assert!(
+        fragments.len() > 1,
+        "need multiple base fragments to exercise sharing"
+    );
+    assert!(
+        fragments
+            .iter()
+            .all(|f| f.metadata().files.iter().all(|df| df.base_id.is_some())),
+        "shallow clone data files must reference the source base"
+    );
+
+    // Open every base fragment through one shared cache, as a scan does.
+    let cache = BaseSchedulers::new(4 * 1024 * 1024);
+    let projection = cloned.schema().clone();
+    for fragment in &fragments {
+        let read_config = FragReadConfig::default().with_base_schedulers(cache.clone());
+        let reader = fragment.open(&projection, read_config).await.unwrap();
+        // Drive the read so the base file is actually opened and its scheduler
+        // resolved through the cache.
+        reader
+            .read_all(1024)
+            .await
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+    }
+
+    // Every fragment shares the source base, so opening all of them built
+    // exactly one scheduler. Reverting the open_current_file_reader change
+    // (a fresh scheduler per file) leaves the cache empty and fails this.
+    assert_eq!(
+        cache.len(),
+        1,
+        "all files of one base must share a single scheduler"
+    );
+}
+
+#[tokio::test]
 async fn test_base_object_store_cache_invalidation() {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
@@ -2719,6 +2772,94 @@ async fn test_shallow_clone_multiple_times(
     // Verify original dataset row count, fragment count, base_path count
     let original = Dataset::open(&test_uri).await.unwrap();
     validate_dataset(&original, 36, 1, 0).await;
+}
+
+/// A chained shallow clone (A -> B -> C) must not restamp an index entry that
+/// already references an earlier base. `Manifest::shallow_clone` carries the
+/// source's `base_paths` over under the same ids, so an index whose files live
+/// in A keeps `base_id = 0` through every hop; unconditionally restamping it
+/// to the newly assigned id would point C at B's `_indices/`, where the files
+/// do not exist, and break indexed queries of every index type.
+#[tokio::test]
+async fn test_chained_shallow_clone_keeps_index_base() {
+    let test_dir = TempStrDir::default();
+    let a_uri = format!("{}/a", test_dir.as_str());
+    let b_uri = format!("{}/b", test_dir.as_str());
+    let c_uri = format!("{}/c", test_dir.as_str());
+
+    // A: two fragments with a committed scalar index; the index files live
+    // only in A's `_indices/`.
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let mut dataset_a = Dataset::write(
+        data,
+        a_uri.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset_a
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let index_base = |dataset: &Dataset, indices: &[lance_table::format::IndexMetadata]| {
+        let index = indices.iter().find(|idx| idx.name == "i_idx").unwrap();
+        (index.base_id, dataset.manifest().base_paths.clone())
+    };
+
+    // First hop: A's own entry gets the newly assigned base (the control).
+    let a_version = dataset_a.version().version;
+    let mut dataset_b = dataset_a
+        .shallow_clone(b_uri.as_str(), a_version, None)
+        .await
+        .unwrap();
+    let b_indices = dataset_b.load_indices().await.unwrap();
+    let (b_base_id, b_base_paths) = index_base(&dataset_b, &b_indices);
+    assert_eq!(b_base_id, Some(0));
+    assert_eq!(b_base_paths.len(), 1);
+    assert_eq!(b_base_paths[&0].path, a_uri);
+    assert_eq!(
+        dataset_b
+            .count_rows(Some("i = 3".to_string()))
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Second hop: the already-stamped entry keeps referencing A through the
+    // carried base path instead of being restamped onto B.
+    let b_version = dataset_b.version().version;
+    let dataset_c = dataset_b
+        .shallow_clone(c_uri.as_str(), b_version, None)
+        .await
+        .unwrap();
+    let c_indices = dataset_c.load_indices().await.unwrap();
+    let (c_base_id, c_base_paths) = index_base(&dataset_c, &c_indices);
+    assert_eq!(c_base_id, Some(0));
+    assert_eq!(c_base_paths.len(), 2);
+    assert_eq!(c_base_paths[&0].path, a_uri);
+    assert_eq!(c_base_paths[&1].path, b_uri);
+
+    // The indexed query resolves the index files from A.
+    assert_eq!(
+        dataset_c
+            .count_rows(Some("i = 3".to_string()))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(dataset_c.count_rows(None).await.unwrap(), 8);
 }
 
 #[rstest]

@@ -135,6 +135,13 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
         normalize_download_mode(download_mode)?,
     );
 
+    if let Some(enabled) = options
+        .get("hf_enable_resolve_cache")
+        .or_else(|| options.get("enable_resolve_cache"))
+    {
+        config_map.insert("enable_resolve_cache".to_string(), enabled.clone());
+    }
+
     Ok(config_map)
 }
 
@@ -158,6 +165,14 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     }
     if let Some(download_mode) = config_map.get("download_mode") {
         builder = builder.download_mode(download_mode);
+    }
+    if let Some(enabled) = config_map.get("enable_resolve_cache") {
+        let enabled = enabled.parse::<bool>().map_err(|_| {
+            Error::invalid_input(format!(
+                "Invalid Huggingface enable_resolve_cache: {enabled:?}. Expected true or false"
+            ))
+        })?;
+        builder = builder.enable_resolve_cache(enabled);
     }
 
     let operator = Operator::new(builder).map_err(|e| {
@@ -242,6 +257,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::sync::Arc;
 
     use crate::object_store::StorageOptionsAccessor;
@@ -338,6 +354,66 @@ mod tests {
         assert_eq!(config.get("download_mode").unwrap(), "http");
     }
 
+    #[rstest]
+    #[case::default(None, None, None)]
+    #[case::prefixed_enabled(Some("true"), None, Some("true"))]
+    #[case::prefixed_disabled(Some("false"), None, Some("false"))]
+    #[case::unprefixed_enabled(None, Some("true"), Some("true"))]
+    #[case::unprefixed_disabled(None, Some("false"), Some("false"))]
+    #[case::prefixed_takes_precedence(Some("false"), Some("true"), Some("false"))]
+    fn storage_option_resolve_cache(
+        #[case] prefixed: Option<&str>,
+        #[case] unprefixed: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut options = HashMap::new();
+        if let Some(value) = prefixed {
+            options.insert("hf_enable_resolve_cache".to_string(), value.to_string());
+        }
+        if let Some(value) = unprefixed {
+            options.insert("enable_resolve_cache".to_string(), value.to_string());
+        }
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &StorageOptions(options),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.get("enable_resolve_cache").map(String::as_str),
+            expected
+        );
+        build_hf_store(config).unwrap();
+    }
+
+    #[rstest]
+    #[case::prefixed("hf_enable_resolve_cache", "invalid")]
+    #[case::unprefixed("enable_resolve_cache", "invalid")]
+    #[case::empty("hf_enable_resolve_cache", "")]
+    #[case::uppercase("hf_enable_resolve_cache", "TRUE")]
+    #[case::numeric("hf_enable_resolve_cache", "1")]
+    #[tokio::test]
+    async fn new_store_rejects_invalid_resolve_cache(#[case] key: &str, #[case] value: &str) {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(key.to_string(), value.to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let err = HuggingfaceStoreProvider
+            .new_store(
+                Url::parse("hf://datasets/acme/repo/table.lance").unwrap(),
+                &params,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("enable_resolve_cache"));
+        assert!(err.to_string().contains("Expected true or false"));
+    }
+
     #[test]
     fn storage_option_download_mode_rejects_invalid_value() {
         let err = normalize_hf_config(&build_hf_base_options(
@@ -417,7 +493,10 @@ mod tests {
         let parsed = parse_hf_url(&Url::parse("hf://datasets/acme/repo/path").unwrap()).unwrap();
         let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
             StaticMockStorageOptionsProvider {
-                options: HashMap::from([("hf_token".to_string(), "dynamic-token".to_string())]),
+                options: HashMap::from([
+                    ("hf_token".to_string(), "dynamic-token".to_string()),
+                    ("hf_enable_resolve_cache".to_string(), "true".to_string()),
+                ]),
             },
         )));
 

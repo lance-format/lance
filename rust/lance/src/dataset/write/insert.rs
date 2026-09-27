@@ -333,7 +333,15 @@ impl<'a> InsertBuilder<'a> {
             schema_cmp_opts.ignore_field_order = true;
 
             let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
-            normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+            if normalized_data_schema
+                .check_compatible(dataset.schema(), &schema_cmp_opts)
+                .is_err()
+            {
+                let normalized_data_schema =
+                    super::promote_legacy_blob_schema(&normalized_data_schema)?;
+                let dataset_schema = super::promote_legacy_blob_schema(dataset.schema())?;
+                normalized_data_schema.check_compatible(&dataset_schema, &schema_cmp_opts)?;
+            }
         }
 
         for field in data_schema.fields.iter() {
@@ -896,7 +904,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
+    async fn create_v2_2_dataset_accepts_legacy_blob_input() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("blob", DataType::Binary, false).with_metadata(HashMap::from([(
                 BLOB_META_KEY.to_string(),
@@ -918,50 +926,93 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = dataset.unwrap_err();
-        match err {
-            Error::InvalidInput { source, .. } => {
-                let message = source.to_string();
-                assert!(message.contains("Legacy blob columns"));
-                assert!(message.contains("lance.blob.v2"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let dataset = Arc::new(dataset.unwrap());
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"abc"
+        );
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
     }
 
+    #[rstest]
+    #[case::create(None)]
+    #[case::append_v20(Some(LanceFileVersion::V2_0))]
+    #[case::append_v21(Some(LanceFileVersion::V2_1))]
     #[tokio::test]
-    async fn create_v2_2_dataset_rejects_nested_legacy_blob_schema() {
-        let image_field = Field::new("image_bytes", DataType::Binary, true).with_metadata(
-            HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
-        );
+    async fn create_v2_2_dataset_accepts_nested_legacy_blob_input(
+        #[case] initial_version: Option<LanceFileVersion>,
+    ) {
+        let image_field =
+            Field::new("image_bytes", DataType::LargeBinary, true).with_metadata(HashMap::from([
+                (BLOB_META_KEY.to_string(), "true".to_string()),
+            ]));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "summary_image_nested",
             DataType::Struct(vec![image_field.clone()].into()),
             true,
         )]));
-        let image_values: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]));
+        let image_values: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![Some(
+            b"abc".as_slice(),
+        )]));
         let nested_values = StructArray::from(vec![(Arc::new(image_field), image_values)]);
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_values)]).unwrap();
 
-        let dataset = InsertBuilder::new("memory://forced-nested-blob-v2")
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        if let Some(version) = initial_version {
+            InsertBuilder::new(uri)
+                .with_params(&WriteParams {
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                })
+                .execute_stream(RecordBatchIterator::new(
+                    [Ok(batch.clone())],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        let dataset = InsertBuilder::new(uri)
             .with_params(&WriteParams {
-                mode: WriteMode::Create,
+                mode: if initial_version.is_some() {
+                    WriteMode::Append
+                } else {
+                    WriteMode::Create
+                },
                 data_storage_version: Some(LanceFileVersion::V2_2),
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = dataset.unwrap_err();
-        match err {
-            Error::InvalidInput { source, .. } => {
-                let message = source.to_string();
-                assert!(message.contains("Legacy blob columns"));
-                assert!(message.contains("summary_image_nested.image_bytes"));
-                assert!(message.contains("lance.blob.v2"));
-            }
-            other => panic!("unexpected error: {other:?}"),
+        let dataset = Arc::new(dataset.unwrap());
+        let blobs = dataset
+            .take_blobs_by_indices(&[0], "summary_image_nested.image_bytes")
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"abc"
+        );
+        let descriptors = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            descriptors.num_rows(),
+            if initial_version.is_some() { 2 } else { 1 }
+        );
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment.scan().try_into_batch().await.unwrap().schema(),
+                descriptors.schema()
+            );
         }
+        assert!(
+            dataset
+                .schema()
+                .field("summary_image_nested.image_bytes")
+                .unwrap()
+                .is_blob_v2()
+        );
     }
 
     mod external_error {

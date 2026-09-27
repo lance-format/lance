@@ -335,6 +335,11 @@ impl LanceCache {
         self.state.backend.size_bytes().await
     }
 
+    /// Weighted capacity in bytes, if the backend reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.state.backend.capacity_bytes()
+    }
+
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
@@ -583,6 +588,12 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
         }
+    }
+
+    /// Weighted capacity in bytes, if the cache is alive and its backend
+    /// reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.upgrade()?.capacity_bytes()
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>

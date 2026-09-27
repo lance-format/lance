@@ -204,26 +204,12 @@ impl Reader for CloudObjectReader {
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let object_store = self.object_store.clone();
         let path = self.path.clone();
-        let get_range = Range {
+        let range = Range {
             start: range.start as u64,
             end: range.end as u64,
         };
         Box::pin(async move {
-            let bytes = do_with_retry(move || {
-                let object_store = object_store.clone();
-                let path = path.clone();
-                let get_range = get_range.clone();
-                Box::pin(async move { object_store.get_ranges(&path, &[get_range]).await })
-            })
-            .await?;
-
-            bytes
-                .into_iter()
-                .next()
-                .ok_or_else(|| object_store::Error::Generic {
-                    store: "CloudObjectReader",
-                    source: "get_ranges returned no bytes".into(),
-                })
+            do_with_retry(|| Box::pin(object_store.get_range(&path, range.clone()))).await
         })
     }
 

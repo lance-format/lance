@@ -104,7 +104,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self},
 };
-use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
+use lance_arrow::json::convert_json_columns;
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
@@ -1761,20 +1761,6 @@ impl MergeInsertJob {
                             }
                             Err(e) => Err(e),
                         })?;
-
-                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary/JSONB)
-                    // before writing. Without this, Utf8 data is written raw while the
-                    // schema says LargeBinary, causing decoder panics on subsequent reads.
-                    let needs_json_conversion = batches[0]
-                        .schema()
-                        .fields()
-                        .iter()
-                        .any(|f| is_arrow_json_field(f) || has_json_fields(f));
-                    if needs_json_conversion {
-                        for batch in batches.iter_mut() {
-                            *batch = convert_json_columns(batch).map_err(Error::from)?;
-                        }
-                    }
 
                     let source_version = metadata
                         .referenced_lance_files()

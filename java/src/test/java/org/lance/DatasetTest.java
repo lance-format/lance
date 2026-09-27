@@ -2231,6 +2231,69 @@ public class DatasetTest {
   }
 
   @Test
+  void testReadUpToFillsAcrossReadAheadBoundary(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadUpToFillsAcrossReadAheadBoundary").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 16L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(4);
+      assertEquals(4, first.length);
+      byte[] second = blobFile.readUpTo(20);
+      assertEquals(20, second.length);
+      assertEquals(24L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 4), first);
+      assertArrayEquals(Arrays.copyOfRange(all, 4, 24), second);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testSetReadBufferSizeZeroStillReadsPayload(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeZeroStillReadsPayload").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 0L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(64);
+      byte[] rest = blobFile.read();
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      byte[] combined = new byte[first.length + rest.length];
+      System.arraycopy(first, 0, combined, 0, first.length);
+      System.arraycopy(rest, 0, combined, first.length, rest.length);
+      assertArrayEquals(all, combined);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testTakeBlobsRejectsNegativeBufferSizeForEmptySelection(@TempDir Path tempDir)
+      throws Exception {
+    String base =
+        tempDir.resolve("testTakeBlobsRejectsNegativeBufferSizeForEmptySelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobsByIndices(Collections.emptyList(), "blobs", -1L));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobs(Collections.emptyList(), "blobs", -1L));
+    }
+  }
+
+  @Test
+  void testSetReadBufferSizeFailureClosesOpenedHandles(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeFailureClosesOpenedHandles").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Arrays.asList(0L, 1L), "blobs");
+      blobs.get(1).close();
+      assertThrows(RuntimeException.class, () -> Dataset.setBlobReadBufferSize(blobs, 1024L));
+      assertThrows(RuntimeException.class, () -> blobs.get(0).readUpTo(1));
+    }
+  }
+
+  @Test
   public void testIndexStatistics(@TempDir Path tempDir) throws Exception {
     Path datasetPath = tempDir.resolve("testIndexStatistics");
 

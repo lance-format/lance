@@ -126,10 +126,9 @@ impl<I: Iterator<Item = u64>> Iterator for MissingAddrs<'_, I> {
                 self.last = None;
                 last
             } else {
-                // If we've exhausted row_addrs but we aren't done then use 0 which
-                // is guaranteed to not match because that would mean that row_addrs
-                // was empty and we check for that earlier.
-                self.row_addrs.next().unwrap_or(0)
+                // The tombstone fragment id cannot match a real fragment, so all
+                // remaining expected addresses are reported as missing.
+                self.row_addrs.next().unwrap_or(RowAddress::TOMBSTONE_ROW)
             };
 
             let current_fragment = &self.fragments[self.current_fragment_idx];
@@ -526,6 +525,31 @@ mod tests {
         // A fragment outside the group is unaffected by both.
         let outside = u64::from(RowAddress::new_from_parts(99, 0));
         assert_eq!(compact.get(outside), expected.get(&outside).copied());
+
+        // A fully deleted rewrite group has no rewritten addresses. Direct and
+        // compact remapping must still report every old address as deleted,
+        // including fragment 0 offset 0.
+        let old = vec![FragDigest {
+            id: 0,
+            physical_rows: 3,
+            num_deleted_rows: 3,
+        }];
+        let expected = transpose_row_ids_from_digest(RoaringTreemap::new(), &old, &[]);
+        let compact = RowAddrRemap::compact_with_layout([GroupInputWithLayout {
+            rewritten_old_row_addrs: RoaringTreemap::new(),
+            old_frags: vec![(0, 3)],
+            new_frags: vec![],
+        }])
+        .unwrap();
+
+        for offset in 0..3 {
+            let addr = u64::from(RowAddress::new_from_parts(0, offset));
+            assert_eq!(
+                compact.get(addr),
+                expected.get(&addr).copied(),
+                "mismatch at (0, {offset})"
+            );
+        }
     }
 
     #[test]

@@ -2553,7 +2553,7 @@ def test_merge_data_legacy(tmp_path: Path):
 
     # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
-    with pytest.raises(OSError, match=r"Join produced null values for type: Int64"):
+    with pytest.raises(OSError, match=r"Column 'c' has null values of type: Int64"):
         dataset.merge(new_tab, "a")
 
 
@@ -6920,6 +6920,30 @@ def test_commit_message_and_get_properties(tmp_path):
         transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
         == "Use Dataset.commit"
     )
+
+
+def test_get_transactions_on_branch(tmp_path):
+    table = pa.table({"a": [1]})
+    dataset = lance.write_dataset(table, tmp_path)
+    branch = dataset.create_branch("dev")
+
+    branch = lance.write_dataset(table, branch.uri, mode="append")
+    transactions = branch.get_transactions(2)
+
+    assert len(transactions) == 2
+    assert transactions[0] is not None
+    assert isinstance(transactions[0].operation, lance.LanceOperation.Append)
+
+    clone_transaction = transactions[1]
+    assert clone_transaction is not None
+    assert clone_transaction.read_version == dataset.version
+    clone = clone_transaction.operation
+    assert isinstance(clone, lance.LanceOperation.Clone)
+    assert clone.is_shallow
+    assert clone.ref_name is None
+    assert clone.ref_version == dataset.version
+    assert clone.ref_path == dataset.uri
+    assert clone.branch_name == "dev"
 
 
 def test_commit_with_stable_row_ids(tmp_path: Path):

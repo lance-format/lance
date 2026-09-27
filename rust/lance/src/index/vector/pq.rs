@@ -551,9 +551,13 @@ pub async fn build_pq_model_in_fragments(
     ivf: Option<&IvfModel>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<ProductQuantizer> {
-    let num_codes = 2_usize.pow(params.num_bits as u32);
-
     if let Some(codebook) = &params.codebook {
+        lance_index::vector::pq::validate_supplied_codebook(
+            codebook.len(),
+            dim,
+            params.num_sub_vectors,
+            params.num_bits,
+        )?;
         let dt = if metric_type == MetricType::Cosine {
             info!("Normalize training data for PQ training: Cosine");
             MetricType::L2
@@ -582,8 +586,10 @@ pub async fn build_pq_model_in_fragments(
         "Start to train PQ code: PQ{}, bits={}",
         params.num_sub_vectors, params.num_bits
     );
-    let expected_sample_size =
-        lance_index::vector::pq::num_centroids(params.num_bits as u32) * params.sample_rate;
+    // 2^num_bits panics on an unrepresentable num_bits, so it stays below the
+    // supplied-codebook branch, which rejects that input instead.
+    let num_codes = lance_index::vector::pq::num_centroids(params.num_bits as u32);
+    let expected_sample_size = num_codes * params.sample_rate;
     info!(
         "Loading training data for PQ. Sample size: {}",
         expected_sample_size
@@ -900,6 +906,41 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::Unprocessable { .. }));
+    }
+
+    /// The supplied codebook is checked before 2^num_bits is derived, so a
+    /// num_bits that does not fit reports the input rather than overflowing.
+    #[tokio::test]
+    async fn test_build_pq_model_rejects_unrepresentable_num_bits() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = 16;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        )]));
+
+        let vectors = generate_random_array_with_seed::<Float32Type>(dim * 10, [11u8; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
+            dim, [12u8; 32],
+        ));
+        let params = PQBuildParams::with_codebook(4, usize::BITS as usize, codebook);
+        let err = build_pq_model(&dataset, "vector", dim, MetricType::L2, &params, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains("not representable"), "got {err}");
     }
 
     struct TestPreFilter {

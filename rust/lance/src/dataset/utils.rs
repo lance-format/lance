@@ -196,7 +196,14 @@ fn downcast_view_columns(
     )
 }
 
-/// Adapter around the existing JSON and view-type conversion utilities.
+/// Converts between the Arrow representations callers use and the ones Lance
+/// stores: Arrow JSON text ↔ Lance JSONB, and top-level view arrays → offset
+/// arrays.
+///
+/// Dataset writes convert once, in the data file writer
+/// ([`V2WriterAdapter`](super::write::V2WriterAdapter)). The physical methods
+/// are otherwise only for combining caller data with values read back from
+/// storage before that point.
 #[derive(Debug, Clone)]
 pub struct SchemaAdapter {
     logical_schema: ArrowSchemaRef,
@@ -268,33 +275,6 @@ impl SchemaAdapter {
             downcast_view_columns(&batch)
         });
         Box::new(RecordBatchIterator::new(converted, schema))
-    }
-
-    /// Convert a logical stream into a physical stream.
-    pub fn to_physical_stream(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> SendableRecordBatchStream {
-        if !self.requires_physical_conversion() {
-            return stream;
-        }
-
-        let converted_schema = Self::physical_schema(&stream.schema());
-
-        let converted_stream = stream.map(move |batch_result| {
-            batch_result.and_then(|batch| {
-                let batch = convert_json_columns(&batch).map_err(|e| {
-                    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                })?;
-                downcast_view_columns(&batch)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
-            })
-        });
-
-        Box::pin(RecordBatchStreamAdapter::new(
-            converted_schema,
-            converted_stream,
-        ))
     }
 
     /// Convert a physical stream into a logical stream.

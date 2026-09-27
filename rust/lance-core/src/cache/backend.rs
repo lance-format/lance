@@ -117,6 +117,13 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         0
     }
 
+    /// Weighted capacity in bytes, or `None` when the backend has no fixed
+    /// capacity or cannot report it. Lets callers skip loading entries that
+    /// could never be retained.
+    fn capacity_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Computes the size of the entries currently held in memory.
     ///
     /// `size_of_entry` threads a shared [`Context`] through each value so

@@ -98,12 +98,15 @@ Index segments are created and updated through a transactional process:
 2. **Prepare the metadata**: Create an `IndexMetadata` message with:
    - `uuid`: The newly generated UUID
    - `name`: The index name (must match existing segments if adding to an existing index)
-   - `fields`: The columns the index depends on: the keyed column(s) it is searched on, followed
-     by any merely-carried columns named in `covering_fields`. `fields[0]` is always a keyed column.
-   - `covering_fields`: The trailing subset of `fields` whose values the index carries but is not
-     keyed on, letting a query that only projects those columns be answered without a fragment take.
-     Empty for an index that carries no extra columns. Declaring a column here does not by itself
-     make it servable -- see [Serving carried columns](#serving-carried-columns).
+   - `fields`: The columns the index depends on: the column(s) it is keyed on, plus any it
+     merely carries, as named in `covering_fields`. No id is repeated, and `fields[0]` is always
+     a column the index is keyed on.
+   - `covering_fields`: The subset of `fields` whose values the index carries, in the order it
+     emits them, letting a query that only projects those columns be answered without a fragment
+     take. A column is carried if and only if it is named here, including a column the index is
+     also keyed on. Empty for an index that carries no extra columns. Declaring a column here
+     does not by itself make it servable --
+     see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
@@ -141,18 +144,21 @@ fragments that would have been covered by that segment.
 carries. It does not establish that the segment's storage holds their values.
 
 **The segment's storage schema is authoritative.** Before answering a query from a
-carried column, an engine must confirm that column is present in the storage it opened,
-and fall back to a take against the base table when it is not. A segment whose
-declaration names a column its storage does not hold is a legal state, not corruption:
-a maintenance operation that cannot carry the payload through a rebuild is permitted to
-withdraw it and leave the declaration standing.
+carried column, an engine must confirm that column is present and bound to the declared
+logical field in the storage it opened, and fall back to a take against the base table
+when it cannot. A segment whose metadata identifies a column its storage does not hold is
+a legal state, not corruption: a maintenance operation that cannot carry the payload
+through a rebuild is permitted to withdraw it and leave the `covering_fields` listed in
+the metadata.
 
-!!! note "Current state"
+!!! note "Capability varies by segment"
 
-    No index builder writes carried values yet, so today every declaration is ahead of
-    its storage. Engines that read `covering_fields` must therefore treat it purely as a
-    declaration and serve every column from the base table until they have verified the
-    storage themselves. This is transitional; the rule above is not.
+    Whether a segment's storage holds a declared column depends on the index type, on the
+    writer that produced the segment, and on what later maintenance did to it, so one
+    logical index may hold values for some of its segments and not others. An engine
+    therefore verifies each selected segment rather than inferring capability from the
+    index type, the writer version, or the `covering_fields` metadata alone, and serves
+    from the base table every column it cannot verify.
 
 ## Loading an index
 
@@ -172,12 +178,15 @@ When loading an index:
 The `IndexMetadata` message contains important information about the index segment:
 
 - `uuid`: the unique identifier of the index segment.
-- `fields`: the columns the index depends on: the keyed column(s) the index is searched on, followed
-  by any columns it merely carries, as named in `covering_fields`. `fields[0]` is always a keyed column.
-- `covering_fields`: the trailing subset of `fields` whose values the index carries alongside its own
-  data but is not keyed on. Empty for an index that carries no extra columns. This declaration is
-  not authoritative for what the segment can serve -- see
-  [Serving carried columns](#serving-carried-columns).
+- `fields`: the columns the index depends on: the column(s) the index is keyed on, plus any it
+  merely carries, as named in `covering_fields`. No id is repeated, and `fields[0]` is always a
+  column the index is keyed on.
+- `covering_fields`: the subset of `fields` whose values the index carries alongside its own data,
+  in the order it emits them. A column is carried if and only if it is named here, including a
+  column the index is also keyed on. Empty for an index that carries no extra columns. Every id in
+  `covering_fields` names a top-level field. Covering a struct column carries the whole struct,
+  its children included, as one column. This metadata is not authoritative for what the segment
+  can serve -- see [Serving carried columns](#serving-carried-columns).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.

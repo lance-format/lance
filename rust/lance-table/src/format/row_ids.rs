@@ -4,13 +4,29 @@
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
+use bytes::Bytes;
+
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::pb;
 
-/// A reference to a part of a file.
+/// Field id of the hidden `_rowid` column that a spilled row id sequence lives in.
+///
+/// Field ids are `i32` and every negative value is reserved for system use:
+/// `-1` is the unassigned sentinel, `-2` is
+/// [`TOMBSTONE_FIELD_ID`](crate::format::overlay::TOMBSTONE_FIELD_ID), and
+/// `-3..=-5` are the three row lineage columns.
+pub const ROW_ID_FIELD_ID: i32 = -3;
+/// Field id of the hidden `_row_created_at_version` column that a spilled
+/// created-at version sequence lives in.
+pub const ROW_CREATED_AT_VERSION_FIELD_ID: i32 = -4;
+/// Field id of the hidden `_row_last_updated_at_version` column that a spilled
+/// last-updated-at version sequence lives in.
+pub const ROW_LAST_UPDATED_AT_VERSION_FIELD_ID: i32 = -5;
+
+/// A reference to a part of a file, used by the fragment reuse index details.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct ExternalFile {
     pub path: String,
@@ -46,7 +62,9 @@ pub struct InlineRowIds {
 }
 
 struct InlineRowIdsInner {
-    data: Vec<u8>,
+    /// `Bytes` rather than `Vec<u8>`: when the manifest is decoded from the
+    /// fetched buffer this is a slice of that buffer, not a copy of it.
+    data: Bytes,
     digest: OnceLock<[u8; 32]>,
 }
 
@@ -57,16 +75,27 @@ impl InlineRowIds {
             .digest
             .get_or_init(|| blake3::hash(&self.inner.data).into())
     }
+
+    /// The encoded bytes, sharing the underlying allocation.
+    pub fn bytes(&self) -> &Bytes {
+        &self.inner.data
+    }
 }
 
-impl From<Vec<u8>> for InlineRowIds {
-    fn from(data: Vec<u8>) -> Self {
+impl From<Bytes> for InlineRowIds {
+    fn from(data: Bytes) -> Self {
         Self {
             inner: Arc::new(InlineRowIdsInner {
                 data,
                 digest: OnceLock::new(),
             }),
         }
+    }
+}
+
+impl From<Vec<u8>> for InlineRowIds {
+    fn from(data: Vec<u8>) -> Self {
+        Self::from(Bytes::from(data))
     }
 }
 
@@ -123,7 +152,16 @@ impl DeepSizeOf for InlineRowIdsInner {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub enum RowIdMeta {
     Inline(InlineRowIds),
-    External(ExternalFile),
+    /// The sequence is spilled to a hidden [`ROW_ID_FIELD_ID`] column of one of
+    /// the fragment's data files, one row id per physical row, in offset order.
+    /// The file is the entry of [`Fragment::files`](super::Fragment::files)
+    /// whose fields carry that id; see
+    /// [`Fragment::row_lineage_file`](super::Fragment::row_lineage_file).
+    ///
+    /// An ordinary column rather than an opaque byte range: it carries the
+    /// file's encodings and page layout, so it can be read back a page at a
+    /// time instead of whole.
+    Column,
 }
 
 impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
@@ -132,13 +170,7 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
     fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
         match value {
             pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data.into())),
-            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
+            pb::data_fragment::RowIdSequence::ColumnRowIds(_) => Ok(Self::Column),
         }
     }
 }
@@ -189,6 +221,18 @@ mod tests {
         let fresh_clone = fresh.clone();
         let via_clone = *fresh_clone.digest();
         assert_eq!(fresh.digest(), &via_clone);
+    }
+
+    #[test]
+    fn inline_row_ids_from_bytes_shares_the_allocation() {
+        let buffer = Bytes::from((0..64u8).collect::<Vec<u8>>());
+        let slice = buffer.slice(16..48);
+        let inline = InlineRowIds::from(slice.clone());
+        assert_eq!(&*inline, &buffer[16..48]);
+        assert_eq!(inline.bytes().as_ptr(), slice.as_ptr());
+        // The bytes are charged by length, whatever buffer they slice.
+        let shorter = InlineRowIds::from(buffer.slice(0..8));
+        assert_eq!(inline.deep_size_of() - shorter.deep_size_of(), 32 - 8);
     }
 
     #[test]
