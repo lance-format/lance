@@ -44,7 +44,7 @@ use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
-use lance_table::transaction::{FragReuseUpdate, PreparedIndices};
+use lance_table::transaction::{FragReuseUpdate, PreparedIndices, has_writer_placed_lineage};
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
@@ -1437,10 +1437,25 @@ async fn build_config_for_attempt(
     write_config: &ManifestWriteConfig,
 ) -> Result<ManifestBuildConfig> {
     let mut config = write_config.to_build_config();
-    if matches!(
-        transaction.operation,
-        Operation::Update { .. } | Operation::DataOverlay { .. }
-    ) {
+    let reads_existing_lineage = match &transaction.operation {
+        // An update resolves its new fragments' created-at versions from the
+        // existing fragments unless their writer placed them, and refreshes
+        // the existing last-updated-at versions of the offsets it rewrote in
+        // place (`updated_fragment_offsets`).
+        Operation::Update {
+            new_fragments,
+            updated_fragment_offsets,
+            ..
+        } => {
+            !new_fragments.iter().all(has_writer_placed_lineage)
+                || updated_fragment_offsets
+                    .as_ref()
+                    .is_some_and(|offsets| !offsets.0.is_empty())
+        }
+        Operation::DataOverlay { .. } => true,
+        _ => false,
+    };
+    if reads_existing_lineage {
         config.spilled_row_lineage =
             load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
     }

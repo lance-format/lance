@@ -51,8 +51,39 @@ fn resolve_created_at_version(
         .unwrap_or(UNKNOWN_CREATED_AT_VERSION)
 }
 
+/// Whether an update's new `fragment` carries row lineage its writer placed
+/// outside the manifest, which the commit keeps instead of resolving.
+///
+/// That is spilled row ids or spilled created-at versions. The commit cannot
+/// read either back, and only a writer carrying the lineage of rows it read
+/// over into the fragment produces them. Inline created-at versions next to
+/// inline row ids do not count: the commit resolves those again from the row
+/// ids, whatever the caller supplied, so a hand-built transaction cannot
+/// commit stale ones.
+///
+/// ```
+/// use lance_table::format::{Fragment, RowIdMeta};
+/// use lance_table::transaction::has_writer_placed_lineage;
+///
+/// let mut fragment = Fragment::new(0);
+/// assert!(!has_writer_placed_lineage(&fragment));
+/// fragment.row_id_meta = Some(RowIdMeta::Column);
+/// assert!(has_writer_placed_lineage(&fragment));
+/// ```
+pub fn has_writer_placed_lineage(fragment: &Fragment) -> bool {
+    matches!(fragment.row_id_meta, Some(RowIdMeta::Column))
+        || matches!(
+            fragment.created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        )
+}
+
 /// For each new fragment produced by an update, set `created_at_version_meta`
 /// (preserved from the original rows) and `last_updated_at_version_meta`.
+///
+/// A fragment with writer-placed lineage (see [`has_writer_placed_lineage`])
+/// keeps its created-at versions and only has its last-updated-at versions
+/// stamped.
 ///
 /// `spilled` supplies the row ids and created-at versions of existing
 /// fragments that keep them outside the manifest; see
@@ -65,8 +96,12 @@ pub(super) fn resolve_update_version_metadata(
 ) -> Result<()> {
     // Collect only the row IDs we actually need to resolve, those appearing in new_fragments
     // with inline metadata. This bounds the lookup map to O(updated rows) instead of O(all dataset rows)
+    // A fragment with writer-placed lineage needs no lookup; when every new
+    // fragment has it, the set stays empty and the existing fragments are not
+    // scanned at all.
     let needed_row_ids: HashSet<u64> = new_fragments
         .iter()
+        .filter(|f| !has_writer_placed_lineage(f))
         .filter_map(|f| match &f.row_id_meta {
             Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
             _ => None,
@@ -169,18 +204,41 @@ pub(super) fn resolve_update_version_metadata(
     }
 
     for fragment in new_fragments.iter_mut() {
-        // A writer that read the rewritten rows already knows their created-at
-        // versions and may place them itself, spilled or inline. The
-        // last-updated-at version is this commit's, which only the commit
-        // knows (a conflict retry moves it), so it is stamped here regardless
-        // of what the writer left.
-        if fragment.created_at_version_meta.is_some() {
-            fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
-            continue;
-        }
-        let row_ids = match &fragment.row_id_meta {
-            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
-            Some(RowIdMeta::Column) => {
+        let row_ids = match (&fragment.row_id_meta, &fragment.created_at_version_meta) {
+            // Writer-placed lineage (see `has_writer_placed_lineage`): the
+            // writer read the rewritten rows and placed their created-at
+            // versions itself. The last-updated-at version is this commit's,
+            // which only the commit knows (a conflict retry moves it), so it
+            // is stamped here whatever the writer left.
+            (_, Some(RowDatasetVersionMeta::Column)) => {
+                fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
+                continue;
+            }
+            (Some(RowIdMeta::Column), Some(created_at)) => {
+                // Unlike a spilled sequence, an inline one can be checked
+                // against the fragment here without IO.
+                let placed_rows = created_at
+                    .load_sequence()
+                    .map_err(|error| {
+                        Error::invalid_input(format!(
+                            "fragment {} carries created-at version metadata that does not \
+                             decode: {error}",
+                            fragment.id
+                        ))
+                    })?
+                    .len();
+                let physical_rows = fragment.physical_rows.unwrap_or(0) as u64;
+                if placed_rows != physical_rows {
+                    return Err(Error::invalid_input(format!(
+                        "fragment {} carries {placed_rows} created-at versions for \
+                         {physical_rows} physical rows",
+                        fragment.id
+                    )));
+                }
+                fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
+                continue;
+            }
+            (Some(RowIdMeta::Column), None) => {
                 // Resolving the versions needs the row ids, which this
                 // commit-time path cannot read back from a data file; a writer
                 // that spills them has to place the created-at versions too.
@@ -191,7 +249,10 @@ pub(super) fn resolve_update_version_metadata(
                     fragment.id
                 )));
             }
-            None => None,
+            // Inline created-at versions next to inline row ids are resolved
+            // again below, overwriting whatever the caller supplied.
+            (Some(RowIdMeta::Inline(data)), _) => read_row_ids(data).ok(),
+            (None, _) => None,
         };
 
         if let Some(row_ids) = row_ids {
@@ -353,6 +414,7 @@ mod tests {
         created_at_versions, default_build_config, last_updated_at_versions,
         make_stable_row_id_manifest, update_txn,
     };
+    use rstest::rstest;
     use std::sync::Arc;
 
     #[test]
@@ -417,9 +479,10 @@ mod tests {
 
     #[test]
     fn test_resolve_update_versions_keeps_writer_placed_created_at() {
-        // A writer that placed a new fragment's created-at versions, spilled
-        // or inline, keeps them; the commit only stamps last-updated-at with
-        // its own version, which the writer could not know.
+        // A writer that placed a new fragment's lineage outside the manifest
+        // keeps its created-at versions; the commit only stamps
+        // last-updated-at with its own version, which the writer could not
+        // know.
         let mut new_fragments = vec![Fragment {
             id: 1,
             physical_rows: Some(50),
@@ -440,6 +503,127 @@ mod tests {
             new_fragments[0].last_updated_at_version_meta,
             Some(inline_versions(50, 9))
         );
+    }
+
+    #[test]
+    fn test_resolve_update_versions_skips_source_scan_for_spilled_new_fragments() {
+        // A new fragment whose writer spilled its created-at versions needs no
+        // lookup, so the commit does not scan the existing fragments' row ids
+        // at all: a spilled source that was not loaded ahead is no obstacle.
+        let existing = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(50, 2)),
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+        let mut new_fragments = vec![Fragment {
+            id: 2,
+            physical_rows: Some(2),
+            row_id_meta: Some(RowIdMeta::Inline(
+                write_row_ids(&RowIdSequence::from(10..12)).into(),
+            )),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+
+        resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
+            .unwrap();
+        assert_eq!(
+            new_fragments[0].created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        );
+        assert_eq!(
+            new_fragments[0].last_updated_at_version_meta,
+            Some(inline_versions(2, 9))
+        );
+    }
+
+    #[test]
+    fn test_resolve_update_versions_recomputes_inline_created_at() {
+        // Inline created-at versions next to inline row ids are not
+        // writer-placed: the commit resolves them from the row ids again, so a
+        // hand-built transaction cannot commit stale ones.
+        let row_ids = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from(0..10)).into(),
+        ));
+        let existing = vec![Fragment {
+            id: 1,
+            physical_rows: Some(10),
+            row_id_meta: row_ids.clone(),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(10, 3)),
+            created_at_version_meta: Some(inline_versions(10, 3)),
+        }];
+        let mut new_fragments = vec![Fragment {
+            id: 2,
+            physical_rows: Some(10),
+            row_id_meta: row_ids,
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: Some(inline_versions(10, 7)),
+        }];
+
+        resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
+            .unwrap();
+        assert_eq!(
+            new_fragments[0].created_at_version_meta,
+            Some(inline_versions(10, 3))
+        );
+        assert_eq!(
+            new_fragments[0].last_updated_at_version_meta,
+            Some(inline_versions(10, 9))
+        );
+    }
+
+    #[rstest]
+    #[case::covers_every_row(50)]
+    #[case::too_short(40)]
+    fn test_resolve_update_versions_checks_placed_inline_created_at(#[case] placed_rows: u64) {
+        // Inline created-at versions next to spilled row ids are writer-placed
+        // and kept as they are, so they have to cover every row.
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: Some(inline_versions(placed_rows, 3)),
+        }];
+
+        let result = resolve_update_version_metadata(&[], &mut fragments, 9, &Default::default());
+        if placed_rows == 50 {
+            result.unwrap();
+            assert_eq!(
+                fragments[0].created_at_version_meta,
+                Some(inline_versions(50, 3))
+            );
+            assert_eq!(
+                fragments[0].last_updated_at_version_meta,
+                Some(inline_versions(50, 9))
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("40 created-at versions for 50 physical rows"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
