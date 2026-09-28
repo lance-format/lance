@@ -202,6 +202,7 @@ impl ExecutionPlan for SharedPreFilterExec {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct PreFilterMasks {
     pub overlay_block: Option<RowAddrMask>,
     pub external_mask: Option<Arc<RowAddrMask>>,
@@ -476,14 +477,21 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     fragments: RoaringBitmap,
-    external_mask: Option<Arc<RowAddrMask>>,
+    masks: PreFilterMasks,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Arc<DatasetPreFilter>> {
-    let filter =
-        prefilter_mask_future(context, partition, prefilter_source, external_mask, metrics)?;
-    Ok(Arc::new(DatasetPreFilter::new_restricted_to_fragments(
-        ds, fragments, filter,
-    )))
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+    )?;
+    let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
+    if let Some(overlay_block) = masks.overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
 }
 
 struct RowIdPrefilterMetrics {

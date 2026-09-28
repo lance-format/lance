@@ -5773,13 +5773,14 @@ impl Scanner {
     /// unindexed sets, not their intersection: a fragment indexed for `title` but
     /// not `body` would otherwise be emitted with a partial `tf'`/`dl'`.
     ///
-    /// The same union absorbs the fragments whose index entries a newer data
-    /// overlay made stale, per target column, so the indexed scan neither returns a
-    /// pre-overlay hit nor hides a new one. See [`Self::fts_overlay_plan`].
-    ///
     /// Those fragments are routed to [`FlatCombinedFieldsExec`] instead, and the
     /// two sides are unioned and re-sorted by score, mirroring
     /// [`Self::plan_match_query`].
+    ///
+    /// Rows whose index entries a newer data overlay made stale, in any target
+    /// column, are routed the same way but one row at a time: the indexed scan
+    /// blocks them, so it neither returns a pre-overlay hit nor hides a new one,
+    /// and the flat side takes them by address. See [`Self::fts_overlay_plan`].
     async fn plan_combined_fields_query(
         &self,
         query: &CombinedFieldsQuery,
@@ -5804,6 +5805,8 @@ impl Scanner {
         // Kept per column; see `FlatStatsCoverage`.
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
+        // Stale rows of every target column, by fragment id and row offset.
+        let mut stale_addresses: HashMap<u32, RoaringBitmap> = HashMap::new();
         let mut any_indexed = false;
         let mut needs_whole_corpus = false;
         for column in query.column_names() {
@@ -5833,17 +5836,12 @@ impl Scanner {
                     .collect(),
             };
 
-            // Fragments this column's index does hold documents for, but whose entries
-            // a newer data overlay made stale. They join the union so the indexed scan
-            // skips them and the flat sibling re-reads their current values, and the
-            // stale rows themselves also join this column's fold so a term the overlay
-            // introduced reaches `docFreq_f`.
-            //
-            // `plan_match_query` blocks the individual stale row addresses and takes
-            // them back on the flat side. BM25F cannot: a row's score needs every
-            // target column's `tf_f`/`dl_f`, so a row is scored on exactly one side,
-            // and the side is chosen per fragment because that is the granularity the
-            // indexed scan's prefilter restriction works at.
+            // Rows this column's index does hold documents for, but whose entries a
+            // newer data overlay made stale. A row's BM25F score needs every target
+            // column's `tf_f`/`dl_f`, so a row stale in any column is scored wholly on
+            // the flat side from its current values, and the indexed side blocks it.
+            // The rows also join this column's fold, so a term the overlay introduced
+            // reaches `docFreq_f`.
             let mut column_stale_rows = RowAddrTreeMap::new();
             match self
                 .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
@@ -5851,8 +5849,10 @@ impl Scanner {
             {
                 FtsOverlayPlan::Unchanged(_) => {}
                 FtsOverlayPlan::RowLevel { stale_rows, .. } => {
-                    uncovered.extend(stale_rows.keys().copied());
                     column_stale_rows = self.stale_rows_in_id_domain(&stale_rows).await?;
+                    for (fragment_id, offsets) in stale_rows {
+                        *stale_addresses.entry(fragment_id).or_default() |= offsets;
+                    }
                 }
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
@@ -5880,6 +5880,10 @@ impl Scanner {
             )));
         }
 
+        // A stale row in a fragment the flat side reads whole is already read there.
+        stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
+        let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
+
         let uncovered_fragments: Vec<Fragment> = target_fragments
             .iter()
             .filter(|fragment| uncovered.contains(fragment.id as u32))
@@ -5896,11 +5900,11 @@ impl Scanner {
         // The only construction site for the indexed side, so the options every
         // shape needs cannot be set on one path and forgotten on another.
         //
-        // `covered` restricts the scan to the fragments every target column indexes
-        // and no overlay made stale; `None` means there is nothing to restrict.
-        // Segments stay unrestricted either way: the fragment restriction already
-        // keeps a stale row out of the results, and dropping a segment would drop
-        // its documents from the corpus statistics too.
+        // `covered` restricts the scan to the fragments every target column indexes;
+        // `None` means there is nothing to restrict. The overlay block keeps the
+        // stale rows in those fragments out of the results. Segments stay
+        // unrestricted either way: dropping a segment would drop its documents from
+        // the corpus statistics too.
         //
         // `shared_scorer` is set only when a flat sibling exists: that side alone
         // sees the rows no index covers, so it publishes the corpus statistics both
@@ -5918,6 +5922,9 @@ impl Scanner {
             if let Some(covered) = covered {
                 exec = exec.with_covered_fragments(covered);
             }
+            if let Some(overlay_block) = overlay_block.clone() {
+                exec = exec.with_overlay_block(overlay_block);
+            }
             if let Some(shared_scorer) = shared_scorer {
                 exec = exec.with_shared_scorer(shared_scorer);
             }
@@ -5928,11 +5935,12 @@ impl Scanner {
         // entries anywhere: one unified scan that already emits merged hits sorted
         // by score with the top-k limit applied, so no union/sort is needed, and
         // there are no fragments to restrict the prefilter to.
-        if uncovered_fragments.is_empty() {
+        if uncovered_fragments.is_empty() && stale_addresses.is_empty() {
             return Ok(index_exec(None, None));
         }
         // `fast_search` is index-only by contract, but must still drop the
-        // partially covered fragments so no partial score is emitted. When no
+        // partially covered fragments and the stale rows so no partial or
+        // pre-overlay score is emitted. When no
         // fragment is covered the answer is definitionally empty, and the index
         // exec would instead fail on the target column that has no segments.
         if self.fast_search {
@@ -5955,10 +5963,15 @@ impl Scanner {
                 FlatStatsScope::PerColumn(per_column_coverage),
             )
         };
+        let mut scanned_fragments: RoaringBitmap = flat_fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        scanned_fragments.extend(stale_addresses.keys().copied());
         // The flat side reads unfiltered and applies the filter only to the rows it
         // emits, as the indexed side does, so every row it reads counts toward the
         // corpus. Pushing the filter into the scan would make the corpus depend on
-        // the filter, and on whether an overlay routed a fragment onto this side.
+        // the filter, and on which rows an overlay routed onto this side.
         //
         // The emission prefilter is built over the fragments this scan reads, not
         // reused from the indexed child. `prefilter_source` spans the fragments the
@@ -5967,13 +5980,7 @@ impl Scanner {
         // (`build_prefilter_restricted_to_fragments`), never widened. Reusing it would
         // drop every match an unindexed fragment holds.
         let emit_prefilter = self
-            .prefilter_source(
-                filter_plan,
-                flat_fragments
-                    .iter()
-                    .map(|fragment| fragment.id as u32)
-                    .collect(),
-            )
+            .prefilter_source(filter_plan, scanned_fragments.clone())
             .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
@@ -5982,6 +5989,8 @@ impl Scanner {
         let flat_plan = self
             .plan_flat_combined_fields_query(
                 flat_fragments,
+                stale_addresses,
+                scanned_fragments,
                 stats_scope,
                 emit_prefilter,
                 query,
@@ -6011,15 +6020,20 @@ impl Scanner {
     }
 
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over
-    /// `fragments` projecting every target column, scored as one virtual field.
+    /// `fragments` and the `stale_rows` taken by address, projecting every target
+    /// column, scored as one virtual field. `scanned_fragments` names every
+    /// fragment either input reads from.
     ///
     /// The scan is unfiltered; `emit_prefilter` picks the rows it emits.
     ///
     /// Emits in scan order with no limit applied; the caller supplies the score
     /// sort and top-k fetch.
+    #[allow(clippy::too_many_arguments)]
     async fn plan_flat_combined_fields_query(
         &self,
         fragments: Vec<Fragment>,
+        stale_rows: HashMap<u32, RoaringBitmap>,
+        scanned_fragments: RoaringBitmap,
         stats_scope: FlatStatsScope,
         emit_prefilter: PreFilterSource,
         query: &CombinedFieldsQuery,
@@ -6046,17 +6060,8 @@ impl Scanner {
                 }
             })
             .collect::<Vec<_>>();
-        let scanned_fragments: RoaringBitmap = fragments
-            .iter()
-            .map(|fragment| fragment.id as u32)
-            .collect();
         let mut plan = self
-            .plan_uncovered_rows_scan(
-                fragments,
-                HashMap::new(),
-                columns,
-                &ExprFilterPlan::default(),
-            )
+            .plan_uncovered_rows_scan(fragments, stale_rows, columns, &ExprFilterPlan::default())
             .await?;
         // A nested target column needs a flat alias so the exec can resolve it by
         // name in the batch schema. A list-bearing one gets its flat column from

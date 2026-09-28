@@ -1752,7 +1752,7 @@ async fn fts_match_union_ids(dataset: &Dataset, term: &str, columns: &[&str]) ->
 
 /// Build an FTS index on `column` as one segment per fragment, the multi-segment
 /// counterpart of the whole-index single segment `build_text_fts_index` produces.
-/// An overlay-stale fragment is excluded from the indexed scan either way, so both
+/// An overlay-stale row is blocked from the indexed scan either way, so both
 /// layouts run the indexed and the flat side; only the number of segments the
 /// indexed side opens differs.
 async fn build_per_fragment_fts_index(dataset: &mut Dataset, column: &str) {
@@ -1780,14 +1780,10 @@ async fn build_per_fragment_fts_index(dataset: &mut Dataset, column: &str) {
         .unwrap();
 }
 
-/// `combined_fields` must honour the same data-overlay contract as `match`: a
-/// fragment holding an overlay-stale row is dropped from the indexed scan and
-/// re-evaluated on the flat path. Without that the indexed scan answers from the
-/// pre-overlay index, so it both returns stale hits and misses new matches.
-///
-/// `match` blocks the individual stale row addresses instead (see
-/// `plan_combined_fields_query` for why BM25F cannot), but the answer must be the
-/// same either way.
+/// `combined_fields` must honour the same data-overlay contract as `match`: an
+/// overlay-stale row is dropped from the indexed scan and re-evaluated on the flat
+/// path. Without that the indexed scan answers from the pre-overlay index, so it
+/// both returns stale hits and misses new matches.
 ///
 /// Parametrized over the segment layout: one segment for the whole index, and one
 /// segment per fragment.
@@ -2113,38 +2109,60 @@ async fn test_fts_combined_fields_overlay_preserves_every_score(
     );
 }
 
-/// An overlay must cost only the fragments it touched. Folding the stale rows on top
-/// of the index keeps the corpus global, so the untouched fragments stay on the
-/// indexed side instead of the whole table going through a full scan.
+/// An overlay must cost only the rows it touched: the flat side takes the stale
+/// row by address, and the rest of its fragment stays on the indexed side.
+///
+/// The overlay sits in fragment 1, where row ids and row addresses differ under
+/// stable row ids, so both the indexed side's block and the flat side's take have
+/// to land in the right id domain.
+#[rstest]
 #[tokio::test]
-async fn test_fts_combined_fields_overlay_keeps_clean_fragments_indexed() {
-    let mut dataset = create_text_dataset(false).await;
+async fn test_fts_combined_fields_overlay_routes_only_stale_rows(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
     build_text_fts_index(&mut dataset).await;
-
-    // Fragment 0 only; fragment 1 (ids 6..11) is untouched.
+    // Fragment 1, row offset 1 (id=7): "pear tart" → "mango tart".
     let dataset = commit_overlay(
         dataset,
-        "combined_partial_overlay",
-        0,
+        "combined_row_level_overlay",
+        1,
         &[1],
         OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
-        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+        vec![Arc::new(StringArray::from(vec![Some("mango tart")]))],
     )
     .await;
+
+    for (term, expected) in [
+        ("pear", vec![]),
+        ("mango", vec![6, 7]),
+        ("tart", vec![7]),
+        // An untouched row of the stale fragment, answered by the indexed side.
+        ("lemon", vec![8]),
+    ] {
+        let combined = fts_combined_ids(&dataset, term, &["text"], CombinedScan::default()).await;
+        assert_eq!(
+            combined,
+            fts_match_ids(&dataset, term, "text").await,
+            "combined_fields disagrees with match for '{term}'"
+        );
+        assert_eq!(combined, expected, "wrong rows for '{term}'");
+    }
 
     let mut scan = dataset.scan();
     scan.project(&["id"])
         .unwrap()
-        .full_text_search(combined_fields_query("cherry", &["text"]))
+        .full_text_search(combined_fields_query("mango", &["text"]))
         .unwrap();
-    let plan = scan.explain_plan(true).await.unwrap();
+    let plan = scan.analyze_plan().await.unwrap();
+    let flat_read = plan
+        .lines()
+        .skip_while(|line| !line.contains("FlatCombinedFields"))
+        .find(|line| line.contains("LanceRead"))
+        .unwrap_or_else(|| panic!("no flat read in the plan:\n{plan}"));
     assert!(
-        plan.contains("CombinedFieldsQuery"),
-        "fragment 1 has no stale entry, so it must stay on the indexed side:\n{plan}"
-    );
-    assert!(
-        plan.contains("FlatCombinedFields"),
-        "fragment 0 must be re-read on the flat side:\n{plan}"
+        flat_read.contains("rows_scanned=1,"),
+        "the flat side must read only the stale row:\n{plan}"
     );
 }
 
@@ -2270,13 +2288,13 @@ async fn create_two_column_text_dataset() -> Dataset {
 }
 
 /// The multi-column shape of the contract above. An overlay on one target column
-/// makes the whole fragment unscorable from the indexes: a stale row poisons the
-/// blended `dl'`/`tf'` of every target column, not just the overlaid one, so the
-/// fragment has to be re-evaluated flat across all of them.
+/// makes the row unscorable from the indexes: a stale row poisons the blended
+/// `dl'`/`tf'` of every target column, not just the overlaid one, so the row has
+/// to be re-evaluated flat across all of them.
 ///
-/// Only `title` is overlaid, so `body`'s index still covers the fragment. The
-/// indexed scan has to skip it for both columns anyway, the case where a missing
-/// fragment allow list emits the fragment twice, once per side of the union.
+/// Only `title` is overlaid, so `body`'s index still holds the row. The indexed
+/// scan has to skip it for both columns anyway, or the row would be emitted twice,
+/// once per side of the union.
 #[rstest]
 #[tokio::test]
 async fn test_fts_combined_fields_multi_column_overlay_agrees_with_match(
@@ -2335,10 +2353,11 @@ async fn test_fts_combined_fields_multi_column_overlay_agrees_with_match(
     }
 }
 
-/// `fast_search` is index-only, so the overlay-stale fragment is dropped instead of
-/// re-evaluated: the stale hit still must not come back, and the new value stays
-/// invisible until compaction folds the overlay into the base. Every other fragment
-/// keeps answering, whichever segment layout holds it.
+/// `fast_search` is index-only, so an overlay-stale row is dropped instead of
+/// re-evaluated: its stale hit must not come back, and its new value stays
+/// invisible until compaction folds the overlay into the base. Only that row is
+/// dropped, as for a single-column match: the rest of its fragment and every other
+/// fragment keep answering, whichever segment layout holds them.
 #[rstest]
 #[tokio::test]
 async fn test_fts_combined_fields_overlay_under_fast_search(
@@ -2350,6 +2369,7 @@ async fn test_fts_combined_fields_overlay_under_fast_search(
     } else {
         build_text_fts_index(&mut dataset).await;
     }
+    // Row 1 "apple banana" becomes "cherry mango".
     let dataset = commit_overlay(
         dataset,
         "combined_fast_search_overlay",
@@ -2360,9 +2380,14 @@ async fn test_fts_combined_fields_overlay_under_fast_search(
     )
     .await;
 
-    // Fragment 0 is stale either way, so nothing it holds is answerable: no stale
-    // "apple"/"banana" hit and no new "cherry" hit.
-    for term in ["apple", "banana", "cherry"] {
+    for (term, expected) in [
+        // Row 1's stale hits are gone; its fragment's other rows still answer.
+        ("apple", vec![0]),
+        ("banana", vec![3]),
+        // Row 1's new value is invisible to the index.
+        ("cherry", vec![2]),
+        ("mango", vec![6]),
+    ] {
         assert_eq!(
             fts_combined_ids(
                 &dataset,
@@ -2374,25 +2399,10 @@ async fn test_fts_combined_fields_overlay_under_fast_search(
                 },
             )
             .await,
-            Vec::<i32>::new(),
-            "fast_search returned a row from the stale fragment for '{term}'"
+            expected,
+            "wrong fast_search rows for '{term}'"
         );
     }
-    // Fragment 1 holds no stale row, so it stays on the indexed side and answers
-    // even though the whole-index segment layout also covers the stale fragment.
-    assert_eq!(
-        fts_combined_ids(
-            &dataset,
-            "mango",
-            &["text"],
-            CombinedScan {
-                fast_search: true,
-                ..Default::default()
-            },
-        )
-        .await,
-        vec![6]
-    );
 }
 
 /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.

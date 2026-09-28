@@ -3154,6 +3154,8 @@ pub struct CombinedFieldsQueryExec {
     /// When set, restrict this scan to exactly these fragments: the ones every
     /// target column's index covers. See [`Self::with_covered_fragments`].
     covered_fragments: Option<roaring::RoaringBitmap>,
+    /// See [`Self::with_overlay_block`].
+    overlay_block: Option<RowAddrMask>,
     /// Optional external row-address mask ANDead into the prefilter so only
     /// masked rows are scored (see [`MatchQueryExec::with_external_mask`]).
     external_mask: Option<Arc<RowAddrMask>>,
@@ -3183,6 +3185,7 @@ impl CombinedFieldsQueryExec {
             base_scorer: None,
             shared_scorer: None,
             covered_fragments: None,
+            overlay_block: None,
             external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -3211,6 +3214,13 @@ impl CombinedFieldsQueryExec {
     /// both sides of the union would emit the same row.
     pub fn with_covered_fragments(mut self, fragments: roaring::RoaringBitmap) -> Self {
         self.covered_fragments = Some(fragments);
+        self
+    }
+
+    /// Exclude the rows whose indexed text a newer data overlay superseded in any
+    /// target column. The flat sibling scores them from their current values.
+    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -3260,6 +3270,7 @@ impl CombinedFieldsQueryExec {
             base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
             covered_fragments: self.covered_fragments.clone(),
+            overlay_block: self.overlay_block.clone(),
             external_mask: self.external_mask.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -3476,7 +3487,10 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let covered_fragments = self.covered_fragments.clone();
-        let external_mask = self.external_mask.clone();
+        let masks = PreFilterMasks {
+            overlay_block: self.overlay_block.clone(),
+            external_mask: self.external_mask.clone(),
+        };
         let exec_metrics = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
@@ -3511,7 +3525,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                     &prefilter_source,
                     ds,
                     covered,
-                    external_mask,
+                    masks,
                     &exec_metrics,
                 )?,
                 None => build_prefilter(
@@ -3520,10 +3534,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                     &prefilter_source,
                     ds,
                     &all_segments,
-                    PreFilterMasks {
-                        overlay_block: None,
-                        external_mask,
-                    },
+                    masks,
                     &exec_metrics,
                 )?,
             };
@@ -4748,7 +4759,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                             // The external row-address mask is applied by the
                             // planner's `RowAddrMaskFilterExec` wrap around this
                             // node, so it stays out of the corpus statistics.
-                            None,
+                            PreFilterMasks::default(),
                             &metrics_set,
                         )?;
                         pre_filter.wait_for_ready().await?;
