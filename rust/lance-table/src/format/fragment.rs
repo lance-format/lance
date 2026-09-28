@@ -13,7 +13,10 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
-use super::row_ids::RowIdMeta;
+use super::row_ids::{
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    RowIdMeta,
+};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -598,6 +601,61 @@ impl Fragment {
             ));
         }
         Ok(file)
+    }
+
+    /// The reserved field ids of the row lineage sequences this fragment
+    /// marks as spilled: [`ROW_ID_FIELD_ID`] when its row ids are, and
+    /// likewise [`ROW_CREATED_AT_VERSION_FIELD_ID`] and
+    /// [`ROW_LAST_UPDATED_AT_VERSION_FIELD_ID`] for its versions.
+    ///
+    /// These ids are never in the dataset schema, so code that decides whether
+    /// a data file is still needed by its schema fields has to keep a file
+    /// carrying one of them as well: that file is the sequence's only copy.
+    pub fn spilled_row_lineage_field_ids(&self) -> Vec<i32> {
+        let mut field_ids = Vec::new();
+        if matches!(self.row_id_meta, Some(RowIdMeta::Column)) {
+            field_ids.push(ROW_ID_FIELD_ID);
+        }
+        if matches!(
+            self.created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_CREATED_AT_VERSION_FIELD_ID);
+        }
+        if matches!(
+            self.last_updated_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_LAST_UPDATED_AT_VERSION_FIELD_ID);
+        }
+        field_ids
+    }
+
+    /// Check that every sequence this fragment marks as spilled has exactly
+    /// one carrier among [`Self::files`], and that the carrier is a v2 file,
+    /// the only version that can hold the columns.
+    ///
+    /// This reads metadata only. Committing a fragment that fails it would
+    /// publish lineage no reader can load, and once cleanup removed the
+    /// unreferenced carrier that lineage would be lost for good.
+    pub(crate) fn validate_row_lineage_carriers(&self) -> Result<()> {
+        for field_id in self.spilled_row_lineage_field_ids() {
+            let Some(file) = self.row_lineage_file(field_id)? else {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: it marks row lineage field {} as spilled but \
+                     none of its data files carries it",
+                    self.id, field_id
+                )));
+            };
+            if file.file_version()? == ConcreteFileVersion::V1 {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: its spilled row lineage field {} is carried by \
+                     legacy v1 data file {}, which cannot hold row lineage columns",
+                    self.id, field_id, file.path
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn from_json(json: &str) -> Result<Self> {

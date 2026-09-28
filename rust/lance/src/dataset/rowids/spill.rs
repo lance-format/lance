@@ -416,7 +416,7 @@ mod tests {
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
+    use crate::dataset::{ColumnAlteration, UpdateBuilder, WriteMode, WriteParams};
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Field;
     use chrono::Utc;
@@ -424,6 +424,7 @@ mod tests {
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
     use lance_table::feature_flags::FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    use rstest::rstest;
 
     /// A sequence with no runs to exploit, which is what a globally shuffled
     /// table produces and what forces the spill path.
@@ -628,6 +629,42 @@ mod tests {
                 ))],
             )
             .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            dataset = Some(
+                Dataset::write(
+                    reader,
+                    uri,
+                    Some(WriteParams {
+                        enable_stable_row_ids: true,
+                        mode: if chunk == 0 {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        dataset.unwrap()
+    }
+
+    /// Like [`appended_dataset`] with four appends of 250 rows, plus a column
+    /// `j` next to the key `i`, so a schema change has a column to rename,
+    /// drop or cast while `i` still identifies every row.
+    async fn two_column_dataset(uri: &str) -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("j", DataType::Int32, true),
+        ]));
+        let mut dataset: Option<Dataset> = None;
+        for chunk in 0..4 {
+            let keys = Int32Array::from_iter_values((chunk * 250)..((chunk + 1) * 250));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(keys.clone()), Arc::new(keys)])
+                    .unwrap();
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
             dataset = Some(
                 Dataset::write(
@@ -1184,5 +1221,95 @@ mod tests {
             }
         }
         updated.validate().await.unwrap();
+    }
+
+    /// The write that spills the fixture's lineage ahead of a schema change.
+    /// Both leave it in a lineage-only file next to the fragment's data.
+    #[derive(Debug, Clone, Copy)]
+    enum SpillingWrite {
+        /// An update rewriting the rows with `i >= 500`.
+        Update,
+        /// A compaction into a single fragment.
+        Compaction,
+    }
+
+    /// A change to column `j` that adds or removes no rows.
+    #[derive(Debug, Clone, Copy)]
+    enum SchemaChange {
+        Rename,
+        Drop,
+        Cast,
+    }
+
+    /// A schema change keeps only the data files that still hold a schema
+    /// field, and the reserved ids of spilled lineage never are one. Renames
+    /// and drops commit a projection and a cast rewrites the column; each must
+    /// keep the file carrying the lineage, which is its only copy.
+    #[rstest]
+    #[case::update_then_rename(SpillingWrite::Update, SchemaChange::Rename)]
+    #[case::update_then_drop(SpillingWrite::Update, SchemaChange::Drop)]
+    #[case::update_then_cast(SpillingWrite::Update, SchemaChange::Cast)]
+    #[case::compact_then_drop(SpillingWrite::Compaction, SchemaChange::Drop)]
+    #[tokio::test]
+    async fn schema_change_keeps_spilled_lineage(
+        #[case] spilling_write: SpillingWrite,
+        #[case] change: SchemaChange,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = two_column_dataset(uri).await;
+        spill_everything(&mut dataset).await;
+        match spilling_write {
+            SpillingWrite::Update => {
+                let updated = UpdateBuilder::new(Arc::new(dataset))
+                    .update_where("i >= 500")
+                    .unwrap()
+                    .set("i", "i + 10000")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .execute()
+                    .await
+                    .unwrap();
+                dataset = updated.new_dataset.as_ref().clone();
+            }
+            SpillingWrite::Compaction => {
+                compact_files(&mut dataset, one_fragment(), None)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(
+            dataset
+                .get_fragments()
+                .iter()
+                .any(|fragment| fragment.metadata().has_spilled_row_lineage()),
+            "the fixture must spill before the schema change"
+        );
+        let before = by_key(&collect_rows(&dataset).await);
+
+        let j = || ColumnAlteration::new("j".to_string());
+        let changed = match change {
+            SchemaChange::Rename => dataset.alter_columns(&[j().rename("k".to_string())]).await,
+            SchemaChange::Drop => dataset.drop_columns(&["j"]).await,
+            SchemaChange::Cast => dataset.alter_columns(&[j().cast_to(DataType::Int64)]).await,
+        };
+        changed.unwrap();
+
+        let mut expected = before;
+        if matches!(change, SchemaChange::Cast) {
+            // A cast rewrites `j` in every fragment, which the commit records
+            // as an update of every row; ids and created-at stay.
+            let cast_version = dataset.version().version;
+            for (_, _, updated_at) in expected.values_mut() {
+                *updated_at = cast_version;
+            }
+        }
+        assert_eq!(by_key(&collect_rows(&dataset).await), expected);
+        dataset.validate().await.unwrap();
+
+        // Re-opened cold, so the lineage is read back from the committed files.
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(by_key(&collect_rows(&reopened).await), expected);
     }
 }
