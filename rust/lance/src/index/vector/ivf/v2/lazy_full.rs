@@ -33,8 +33,14 @@
 //! whether or not the producer is polling the buffer that holds it; see
 //! `spawn_scan_step`.
 //!
-//! Probes whose ex planes are both resident, and probes that cannot gate on
-//! the lower bound, are scored by the eager scan in their probe position.
+//! Probes whose ex planes are both resident, probes that cannot gate on the
+//! lower bound, and probes that `k` and the partition sizes predict to be
+//! gathered whole (`LANCE_RQ_LAZY_DENSE_TO_EAGER`, only for queries without a
+//! prefilter or upper distance bound, see `LazyDenseForecast`) are scored by
+//! the eager scan in their probe position. A predicted-dense probe is loaded
+//! at staging as the eager scan loads it, with its planes read together and
+//! as many probes in flight as the eager scan prepares, instead of its sign
+//! plane first and its ex planes within the gather window.
 
 use std::collections::BinaryHeap;
 use std::future::Future;
@@ -142,12 +148,10 @@ impl<S: IvfSubIndex, Q: Quantization> LazyProbe<S, Q> {
     }
 }
 
-/// Query-wide inputs of the gathers.
-struct LazyFetchContext {
-    config: LayeredLazyConfig,
-    heap_capacity: usize,
-    /// Rows of the probes before each rank.
-    rows_before: Vec<usize>,
+/// What `k` and the partition sizes predict about the probes' gathers before
+/// any plane is read. Staging and the gathers decide from the same forecast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LazyDenseForecast {
     /// First rank whose earlier probes hold `k` rows (the probe count if
     /// none): once they are scored the heap is full, unless the prefilter or
     /// the distance bounds dropped rows.
@@ -155,6 +159,79 @@ struct LazyFetchContext {
     /// Whether the gathers issued once the heap fills are expected to read
     /// whole planes anyway, so issuing them before it fills reads no more.
     dense_at_fill: bool,
+    /// Whether probes predicted to read their ex planes whole are loaded and
+    /// scored by the eager scan instead; see [`Self::new`].
+    route_dense: bool,
+}
+
+impl LazyDenseForecast {
+    /// The forecast for a query with heap capacity `k` over probes holding
+    /// `probe_rows` rows each, in probe order.
+    ///
+    /// `every_row_candidate` is whether stage 1 may keep every row of a
+    /// probe: the query has no prefilter (deletions included) and no upper
+    /// distance bound. Otherwise which rows a gather selects, even with an
+    /// infinite threshold, is known only once the probe's sign plane is read,
+    /// so no probe is routed to the eager scan. Nor is any under the `sparse`
+    /// gather policy, which never reads a whole plane, or with
+    /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` off.
+    fn new(
+        probe_rows: impl IntoIterator<Item = usize>,
+        k: usize,
+        every_row_candidate: bool,
+        config: &LayeredLazyConfig,
+    ) -> Self {
+        let rows_before = probe_rows
+            .into_iter()
+            .scan(0usize, |rows, probe| {
+                let before = *rows;
+                *rows += probe;
+                Some(before)
+            })
+            .collect::<Vec<_>>();
+        let fill_rank = rows_before
+            .iter()
+            .position(|&rows| rows >= k)
+            .unwrap_or(rows_before.len());
+        let dense_at_fill = match config.dense {
+            DenseGatherMode::Whole => true,
+            DenseGatherMode::Sparse => false,
+            // The threshold once the heap fills keeps about `k` of the rows
+            // scored by then, so about that fraction of a later probe's rows
+            // survives stage 1 (more, as the lower bound is looser). Survivors
+            // are scattered, so their aligned bytes are a larger fraction still.
+            DenseGatherMode::Cost => rows_before
+                .get(fill_rank)
+                .is_some_and(|&rows| k as f64 >= config.dense_bytes_fraction * rows as f64),
+        };
+        Self {
+            fill_rank,
+            dense_at_fill,
+            route_dense: config.dense_to_eager
+                && every_row_candidate
+                && config.dense != DenseGatherMode::Sparse,
+        }
+    }
+
+    /// Whether the probe at `rank` is scored before the heap can hold `k`
+    /// rows, so its threshold is +inf and its gather selects every accepted
+    /// row below the upper bound.
+    fn certain_dense(&self, rank: usize) -> bool {
+        rank < self.fill_rank
+    }
+
+    /// Whether the probe at `rank` is loaded and scored by the eager scan
+    /// because it is expected to read its ex planes whole: it is certain to
+    /// be dense, or every gather is expected to be dense once the heap fills.
+    fn routes_to_eager(&self, rank: usize) -> bool {
+        self.route_dense && (self.certain_dense(rank) || self.dense_at_fill)
+    }
+}
+
+/// Query-wide inputs of the gathers.
+struct LazyFetchContext {
+    config: LayeredLazyConfig,
+    forecast: LazyDenseForecast,
     upper_bound: Option<f32>,
     layout: LayeredExLayout,
     progress: watch::Receiver<LazyProgress>,
@@ -346,29 +423,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         let heap_capacity = query.k;
         let probe_count = probes.len();
         let layout = self.storage.layered_ex_layout()?;
-        let rows_before = probes
-            .clone()
-            .scan(0usize, |rows, idx| {
-                let before = *rows;
-                *rows += self.storage.partition_size(partitions.value(idx) as usize);
-                Some(before)
-            })
-            .collect::<Vec<_>>();
-        let fill_rank = rows_before
-            .iter()
-            .position(|&rows| rows >= heap_capacity)
-            .unwrap_or(probe_count);
-        let dense_at_fill = match config.dense {
-            DenseGatherMode::Whole => true,
-            DenseGatherMode::Sparse => false,
-            // The threshold once the heap fills keeps about `k` of the rows
-            // scored by then, so about that fraction of a later probe's rows
-            // survives stage 1 (more, as the lower bound is looser). Survivors
-            // are scattered, so their aligned bytes are a larger fraction still.
-            DenseGatherMode::Cost => rows_before.get(fill_rank).is_some_and(|&rows| {
-                heap_capacity as f64 >= config.dense_bytes_fraction * rows as f64
-            }),
-        };
+        let forecast = LazyDenseForecast::new(
+            probes
+                .clone()
+                .map(|idx| self.storage.partition_size(partitions.value(idx) as usize)),
+            heap_capacity,
+            pre_filter.is_empty() && query.upper_bound.is_none(),
+            &config,
+        );
         let (progress_tx, progress_rx) = watch::channel(LazyProgress {
             scored: 0,
             full: false,
@@ -391,10 +453,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         };
         let fetch_context = Arc::new(LazyFetchContext {
             config,
-            heap_capacity,
-            rows_before,
-            fill_rank,
-            dense_at_fill,
+            forecast,
             upper_bound: query.upper_bound,
             layout,
             progress: progress_rx,
@@ -414,12 +473,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             // gather window bounds the gathers, as with plain futures.
             let fetched = stream::iter(probes)
                 .map(move |idx| {
+                    let rank = idx - probe_start;
                     let mut query = query.clone();
                     query.dist_q_c = q_c_dists.value(idx);
                     spawn_scan_step(stage_index.clone().lazy_stage_probe(
-                        idx - probe_start,
+                        rank,
                         partitions.value(idx) as usize,
                         query,
+                        forecast.routes_to_eager(rank),
                         pre_filter.clone(),
                         metrics.clone(),
                         raw_query_context.clone(),
@@ -498,23 +559,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
     }
 
     /// Load a probe's sign plane and run stage 1, or prepare it for the eager
-    /// scan when both ex planes are resident.
+    /// scan when both ex planes are resident or when it is predicted to be
+    /// gathered whole (`dense_to_eager`).
+    #[allow(clippy::too_many_arguments)]
     async fn lazy_stage_probe(
         self: Arc<Self>,
         rank: usize,
         partition_id: usize,
         query: Query,
+        dense_to_eager: bool,
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<LazyStaged<S, Q>> {
         let stats = layered_stats::counters();
-        if self.ex_planes_resident(partition_id).await {
-            if self.storage.partition_size(partition_id) == 0 {
-                stats.empty.incr(rank);
+        let eager = if self.ex_planes_resident(partition_id).await {
+            Some(if self.storage.partition_size(partition_id) == 0 {
+                &stats.empty
             } else {
-                stats.eager_resident.incr(rank);
-            }
+                &stats.eager_resident
+            })
+        } else {
+            dense_to_eager.then_some(&stats.dense_to_eager)
+        };
+        if let Some(counter) = eager {
+            counter.incr(rank);
             return Ok(LazyStaged::Eager(
                 self.prepare_partition_without_prefilter_wait(
                     partition_id,
@@ -696,7 +765,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         let rank = probe.rank;
         let gating = Instant::now();
         let mut progress = context.progress.clone();
-        let issue = if context.rows_before[rank] < context.heap_capacity {
+        let forecast = &context.forecast;
+        let issue = if forecast.certain_dense(rank) {
             // The earlier probes cannot fill the heap, so the threshold is +inf at scoring.
             stats.certain_dense.incr(rank);
             *progress.borrow()
@@ -717,9 +787,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             let released = |progress: &LazyProgress| {
                 progress.full
                     || progress.scored >= rank
-                    || (early && progress.scored >= context.fill_rank)
+                    || (early && progress.scored >= forecast.fill_rank)
             };
-            let issue = if released(&gate) || (early && context.dense_at_fill) {
+            let issue = if released(&gate) || (early && forecast.dense_at_fill) {
                 gate
             } else {
                 stats.deferred_issues.incr();
@@ -1049,7 +1119,111 @@ fn record_gather_sources(rank: usize, gathered: &GatheredEx) {
 
 #[cfg(test)]
 mod tests {
-    use super::count_missing;
+    use super::{DenseGatherMode, LayeredLazyConfig, LazyDenseForecast, count_missing};
+
+    #[test]
+    fn dense_forecast_follows_k_and_partition_sizes() {
+        let config = LayeredLazyConfig {
+            dense_bytes_fraction: 0.5,
+            ..Default::default()
+        };
+        // 0, 100, 100 and 150 rows before each probe.
+        let rows = [100, 0, 50, 200];
+        let predicted = |forecast: LazyDenseForecast| {
+            (0..rows.len())
+                .map(|rank| (forecast.certain_dense(rank), forecast.routes_to_eager(rank)))
+                .collect::<Vec<_>>()
+        };
+
+        // The first probe fills the heap, whose threshold then keeps about a
+        // tenth of the rows scored: later gathers are sparse.
+        let small = LazyDenseForecast::new(rows, 10, true, &config);
+        assert_eq!(
+            small,
+            LazyDenseForecast {
+                fill_rank: 1,
+                dense_at_fill: false,
+                route_dense: true
+            }
+        );
+        assert_eq!(
+            predicted(small),
+            [(true, true), (false, false), (false, false), (false, false)]
+        );
+
+        // The heap fills from rank 3, keeping 120 of 150 rows: every probe is dense.
+        let large = LazyDenseForecast::new(rows, 120, true, &config);
+        assert_eq!(
+            large,
+            LazyDenseForecast {
+                fill_rank: 3,
+                dense_at_fill: true,
+                route_dense: true
+            }
+        );
+        assert_eq!(
+            predicted(large),
+            [(true, true), (true, true), (true, true), (false, true)]
+        );
+
+        // The probes never hold `k` rows, so every threshold is +inf.
+        let unfilled = LazyDenseForecast::new(rows, 1000, true, &config);
+        assert_eq!(
+            unfilled,
+            LazyDenseForecast {
+                fill_rank: rows.len(),
+                dense_at_fill: false,
+                route_dense: true
+            }
+        );
+        assert_eq!(predicted(unfilled), [(true, true); 4]);
+
+        // A fixed gather mode overrides the cost rule; whole gathers route
+        // every probe.
+        for (dense, dense_at_fill) in [
+            (DenseGatherMode::Whole, true),
+            (DenseGatherMode::Sparse, false),
+        ] {
+            for k in [10, 120] {
+                let config = LayeredLazyConfig { dense, ..config };
+                let forecast = LazyDenseForecast::new(rows, k, true, &config);
+                assert_eq!(forecast.dense_at_fill, dense_at_fill, "{dense:?} k={k}");
+                let routed = (0..rows.len()).all(|rank| forecast.routes_to_eager(rank));
+                assert_eq!(routed, dense == DenseGatherMode::Whole, "{dense:?} k={k}");
+            }
+        }
+
+        // No probe is routed under the sparse policy, which never reads a
+        // whole plane, when a prefilter or an upper bound may drop rows of
+        // any probe before its gather, or with the routing switched off;
+        // their certain-dense gathers are still issued at once.
+        let sparse = LayeredLazyConfig {
+            dense: DenseGatherMode::Sparse,
+            ..config
+        };
+        let whole = LayeredLazyConfig {
+            dense: DenseGatherMode::Whole,
+            ..config
+        };
+        let off = LayeredLazyConfig {
+            dense_to_eager: false,
+            ..config
+        };
+        for k in [10, 120, 1000] {
+            let fill_rank = LazyDenseForecast::new(rows, k, true, &config).fill_rank;
+            for (every_row_candidate, config) in
+                [(true, sparse), (true, off), (false, config), (false, whole)]
+            {
+                let forecast = LazyDenseForecast::new(rows, k, every_row_candidate, &config);
+                let context = format!("{config:?} every_row_candidate={every_row_candidate} k={k}");
+                assert_eq!(forecast.fill_rank, fill_rank, "{context}");
+                assert!(
+                    predicted(forecast).iter().all(|&(_, routed)| !routed),
+                    "{context}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn count_missing_compares_sorted_offsets() {

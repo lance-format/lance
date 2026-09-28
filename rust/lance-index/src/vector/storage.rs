@@ -650,8 +650,25 @@ pub const LAZY_INLINE_ROWS_ENV: &str = "LANCE_RQ_LAZY_INLINE_ROWS";
 /// dense anyway (large `k`), or when the heap is still not full after the
 /// probes that hold `k` rows were scored (filters), where waiting would issue
 /// the gathers one probe at a time. `0` is an ablation knob: such gathers
-/// wait for the heap to fill or for every earlier probe to be scored.
+/// wait for the heap to fill or for every earlier probe to be scored. With
+/// [`LAZY_DENSE_TO_EAGER_ENV`] on, the large-`k` probes of the queries it
+/// routes are scored eagerly instead and never gathered.
 pub const LAZY_EAGER_BEFORE_FULL_ENV: &str = "LANCE_RQ_LAZY_EAGER_BEFORE_FULL";
+/// Whether a probe that `k` and the partition sizes predict to be gathered
+/// whole is loaded and scored by the eager scan instead (`0` or `1`, default
+/// `1`): a probe scored before the probes ahead of it can hold `k` rows,
+/// whose gather selects every row, and every probe when the gathers issued
+/// once the heap fills are expected to read whole planes (large `k`). The
+/// eager load reads the partition's planes together (all at once on backends
+/// that do not gate plane admission), with as many probes in flight as the
+/// eager scan prepares, instead of the sign plane at staging and the ex
+/// planes a round trip later within the gather window. Only queries without
+/// a prefilter (deletions included) or upper distance bound are routed: a
+/// gather with an infinite threshold selects only the accepted rows below
+/// the bound, which the probe's sign plane tells. The `sparse` gather policy
+/// ([`LAZY_DENSE_ENV`]) never reads a whole plane and routes no probe. `0` is
+/// an ablation knob: such probes take the lazy pipeline.
+pub const LAZY_DENSE_TO_EAGER_ENV: &str = "LANCE_RQ_LAZY_DENSE_TO_EAGER";
 /// Most coalesced row runs a sparse gather reads from the origin file when the
 /// persistent tier does not hold the plane; with more, it loads (and admits)
 /// the whole plane instead. Unlimited by default, and ignored by backends that
@@ -719,7 +736,8 @@ pub enum DenseGatherMode {
     /// Read the whole plane when the row runs are too many or cover too much
     /// of it (see [`plan_plane_gather`]).
     Cost,
-    /// Always read selected rows.
+    /// Always read selected rows; no probe is routed to the eager scan
+    /// ([`LAZY_DENSE_TO_EAGER_ENV`]).
     Sparse,
     /// Always read the whole plane.
     Whole,
@@ -752,6 +770,8 @@ pub struct LayeredLazyConfig {
     pub eager_before_full: bool,
     /// See [`LAZY_ORIGIN_MAX_RUNS_ENV`]; `usize::MAX` never falls back.
     pub origin_max_runs: usize,
+    /// See [`LAZY_DENSE_TO_EAGER_ENV`].
+    pub dense_to_eager: bool,
 }
 
 impl Default for LayeredLazyConfig {
@@ -769,6 +789,7 @@ impl Default for LayeredLazyConfig {
             inline_rows: DEFAULT_LAZY_INLINE_ROWS,
             eager_before_full: true,
             origin_max_runs: usize::MAX,
+            dense_to_eager: true,
         }
     }
 }
@@ -844,6 +865,9 @@ impl LayeredLazyConfig {
             config.eager_before_full = parse_flag(LAZY_EAGER_BEFORE_FULL_ENV, &value)?;
         }
         config.origin_max_runs = count(LAZY_ORIGIN_MAX_RUNS_ENV, config.origin_max_runs, 0)?;
+        if let Some(value) = lookup(LAZY_DENSE_TO_EAGER_ENV) {
+            config.dense_to_eager = parse_flag(LAZY_DENSE_TO_EAGER_ENV, &value)?;
+        }
         Ok(config)
     }
 }
@@ -1865,10 +1889,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseGatherMode, LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_EAGER_BEFORE_FULL_ENV,
-        LAZY_FULL_ENV, LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV, LAZY_ORIGIN_MAX_RUNS_ENV,
-        LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig,
-        LazyPromotion, PlaneSource, QueryScratchCapacity, QueryScratchPool,
+        DenseGatherMode, LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_DENSE_TO_EAGER_ENV,
+        LAZY_EAGER_BEFORE_FULL_ENV, LAZY_FULL_ENV, LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV,
+        LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV,
+        LayeredLazyConfig, LazyPromotion, PlaneSource, QueryScratchCapacity, QueryScratchPool,
         SEQUENTIAL_PLANE_LOADS_ENV, compact_prewarm_batches, origin_reads_whole_plane,
         plan_plane_gather, sequential_plane_loads, sequential_plane_loads_from,
         spawn_prewarm_materialization,
@@ -2020,6 +2044,7 @@ mod tests {
             (LAZY_INLINE_ROWS_ENV, "0"),
             (LAZY_EAGER_BEFORE_FULL_ENV, "0"),
             (LAZY_ORIGIN_MAX_RUNS_ENV, "5"),
+            (LAZY_DENSE_TO_EAGER_ENV, "0"),
         ]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
@@ -2037,6 +2062,7 @@ mod tests {
                 inline_rows: 0,
                 eager_before_full: false,
                 origin_max_runs: 5,
+                dense_to_eager: false,
             }
         );
         assert_eq!(
@@ -2046,14 +2072,32 @@ mod tests {
         assert!(!LayeredLazyConfig::default().enabled);
         assert!(LayeredLazyConfig::default().eager_before_full);
         assert_eq!(LayeredLazyConfig::default().origin_max_runs, usize::MAX);
-        // The origin run cap does not depend on the eager-before-full switch.
+        assert!(LayeredLazyConfig::default().dense_to_eager);
+        // The origin run cap does not depend on the eager-before-full switch,
+        // and dense probes go to the eager scan unless switched off.
         let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_ORIGIN_MAX_RUNS_ENV, "2")]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
                 .unwrap();
         assert_eq!(
-            (config.eager_before_full, config.origin_max_runs),
-            (true, 2)
+            (
+                config.eager_before_full,
+                config.origin_max_runs,
+                config.dense_to_eager
+            ),
+            (true, 2, true)
+        );
+        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_DENSE_TO_EAGER_ENV, "false")]);
+        let config =
+            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
+                .unwrap();
+        assert_eq!(
+            config,
+            LayeredLazyConfig {
+                enabled: true,
+                dense_to_eager: false,
+                ..Default::default()
+            }
         );
         let error =
             LayeredLazyConfig::from_lookup(|key| (key == LAZY_FULL_ENV).then(|| "yes".into()))
@@ -2068,6 +2112,7 @@ mod tests {
             (LAZY_WINDOW_ENV, "many"),
             (LAZY_EAGER_BEFORE_FULL_ENV, "on"),
             (LAZY_ORIGIN_MAX_RUNS_ENV, "-1"),
+            (LAZY_DENSE_TO_EAGER_ENV, "2"),
         ] {
             let enabled = |key: &str| -> Option<String> {
                 if key == LAZY_FULL_ENV {

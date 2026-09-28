@@ -225,8 +225,15 @@ layered_lazy_counters! {
         /// Probes of empty partitions, which have no ex rows and are scored
         /// by the eager scan.
         empty,
-        /// Probes issued at once because the rows of all earlier probes
-        /// cannot fill the heap.
+        /// Probes of non-empty partitions whose ex planes were not both
+        /// resident, predicted from `k` and the partition sizes to be
+        /// gathered whole, and so loaded and scored by the eager scan; see
+        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER`.
+        dense_to_eager,
+        /// Lazy probes issued at once because the rows of all earlier probes
+        /// cannot fill the heap. The probes of queries that
+        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` routes are counted in
+        /// `dense_to_eager` instead.
         certain_dense,
         /// High planes served from RAM.
         high_resident,

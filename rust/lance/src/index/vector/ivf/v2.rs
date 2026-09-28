@@ -7252,7 +7252,7 @@ mod tests {
         use lance_core::cache::{CacheCodec, CacheEntry, InternalCacheKey, QuickCacheBackend};
         use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
         use lance_index::vector::bq::layered::{PlaneBatch, PlaneKey, RQPrecision};
-        use lance_index::vector::bq::layered_stats::{self, LayeredLazyStats};
+        use lance_index::vector::bq::layered_stats::{self, LayeredLazyStats, RANK_BUCKETS};
         use lance_index::vector::bq::storage::{
             RabitPruneStatsSnapshot, rabit_prune_stats_snapshot,
         };
@@ -7656,11 +7656,14 @@ mod tests {
                     inline_rows: 0,
                     ..enabled
                 },
+                // Whole gathers predict every probe dense, which would
+                // otherwise send every probe to the eager scan.
                 LayeredLazyConfig {
                     window: 1,
                     dense: DenseGatherMode::Whole,
                     promote: LazyPromotion::Background { reads: 2 },
                     inline_rows: usize::MAX,
+                    dense_to_eager: false,
                     ..enabled
                 },
                 LayeredLazyConfig {
@@ -7689,6 +7692,10 @@ mod tests {
                 LayeredLazyConfig {
                     dense: DenseGatherMode::Sparse,
                     origin_max_runs: 0,
+                    ..enabled
+                },
+                LayeredLazyConfig {
+                    dense_to_eager: false,
                     ..enabled
                 },
             ]
@@ -8109,7 +8116,10 @@ mod tests {
 
         /// An ungated backend is warmed partition by partition, so every plane
         /// is persisted even when RAM holds only part of the sign planes, and
-        /// warm queries read nothing from the origin file.
+        /// warm queries read nothing from the origin file, whether the first
+        /// probe (the only one this query gathers rows of: its threshold is
+        /// +inf) is gathered sparsely, as the sparse gather policy always
+        /// does, or loaded by the eager scan, as the cost policy routes it.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_layered_lazy_ungated_prewarm_persists_every_plane() {
             let _serial = LAZY_TEST_LOCK.lock().await;
@@ -8126,30 +8136,40 @@ mod tests {
             let query = lazy_test_query(key, 100, LAZY_PARTITIONS);
             let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
             search_global(&index, &query, filter.clone()).await.unwrap();
-            dataset.object_store.as_ref().io_stats_incremental();
-            let stats = assert_lazy_matches_eager(
-                &index,
-                &query,
-                &filter,
-                LayeredLazyConfig {
-                    enabled: true,
-                    dense: DenseGatherMode::Sparse,
-                    promote: LazyPromotion::Off,
-                    ..Default::default()
-                },
-                "ungated prewarm",
-            )
-            .await;
-            let io = dataset.object_store.as_ref().io_stats_incremental();
-            assert_io_eq!(
-                io,
-                read_iops,
-                0,
-                "warm layered queries read no origin plane"
-            );
-            assert_eq!(stats.origin_row_reads, 0);
-            let sparse_planes: u64 = stats.high_sparse.iter().chain(&stats.low_sparse).sum();
-            assert!(sparse_planes > 0, "{stats:?}");
+            // The sparse run goes first: the routed eager load admits the
+            // first probe's planes, after which it would gather nothing.
+            for dense in [DenseGatherMode::Sparse, DenseGatherMode::Cost] {
+                let context = format!("ungated prewarm dense={dense:?}");
+                dataset.object_store.as_ref().io_stats_incremental();
+                let stats = assert_lazy_matches_eager(
+                    &index,
+                    &query,
+                    &filter,
+                    LayeredLazyConfig {
+                        enabled: true,
+                        dense,
+                        promote: LazyPromotion::Off,
+                        ..Default::default()
+                    },
+                    &context,
+                )
+                .await;
+                let io = dataset.object_store.as_ref().io_stats_incremental();
+                assert_io_eq!(
+                    io,
+                    read_iops,
+                    0,
+                    "warm layered queries read no origin plane: {context}"
+                );
+                assert_eq!(stats.origin_row_reads, 0, "{context}");
+                let sparse_planes: u64 = stats.high_sparse.iter().chain(&stats.low_sparse).sum();
+                let eager_loads: u64 = stats.dense_to_eager.iter().sum();
+                if dense == DenseGatherMode::Sparse {
+                    assert!(eager_loads == 0 && sparse_planes > 0, "{context} {stats:?}");
+                } else {
+                    assert!(eager_loads > 0, "{context} {stats:?}");
+                }
+            }
         }
 
         /// Queries the lazy scan cannot serve run the eager scan and are
@@ -8569,7 +8589,9 @@ mod tests {
         /// next freed slot to its oldest waiter, a staging step nobody polled,
         /// which never used it: the head gather and every later admission then
         /// waited forever. Steps now run as tasks and complete on their own,
-        /// whether gathers before the heap fills are deferred or issued at once.
+        /// whether gathers before the heap fills are deferred or issued at
+        /// once, and when staging loads predicted-dense probes for the eager
+        /// scan instead (every probe here, as whole gathers predict them dense).
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_layered_lazy_unpolled_staging_cannot_hold_spill_slot() {
             const PROBES: usize = 32;
@@ -8611,15 +8633,20 @@ mod tests {
             });
             tiered.set_spill(Some(spill_tx));
             ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            for eager_before_full in [false, true] {
+            for (eager_before_full, dense_to_eager) in [(false, false), (true, false), (true, true)]
+            {
                 ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
                     enabled: true,
                     window: 1,
                     dense: DenseGatherMode::Whole,
                     promote: LazyPromotion::Off,
                     eager_before_full,
+                    dense_to_eager,
                     ..Default::default()
                 });
+                let setting = format!(
+                    "eager_before_full={eager_before_full} dense_to_eager={dense_to_eager}"
+                );
                 layered_stats::snapshot_and_reset();
                 for (position, (query, expected)) in queries.iter().zip(&expected).enumerate() {
                     let result = tokio::time::timeout(
@@ -8629,24 +8656,32 @@ mod tests {
                     .await
                     .unwrap_or_else(|_| {
                         panic!(
-                            "lazy query {position} (eager_before_full={eager_before_full}) did not finish within {QUERY_TIMEOUT:?}"
+                            "lazy query {position} ({setting}) did not finish within {QUERY_TIMEOUT:?}"
                         )
                     })
                     .unwrap();
                     assert_eq!(
                         &result_bits(&result),
                         expected,
-                        "query {position} eager_before_full={eager_before_full}"
+                        "query {position} {setting}"
                     );
                 }
                 let stats = layered_stats::snapshot_and_reset();
-                assert_eq!(stats.lazy_queries, QUERIES as u64, "{stats:?}");
-                assert_eq!(stats.needed_not_fetched, 0, "{stats:?}");
+                assert_eq!(stats.lazy_queries, QUERIES as u64, "{setting} {stats:?}");
+                assert_eq!(stats.needed_not_fetched, 0, "{setting} {stats:?}");
                 let whole_planes: u64 = stats.high_whole.iter().chain(&stats.low_whole).sum();
-                assert!(
-                    whole_planes > 0,
-                    "gathers must admit whole ex planes: {stats:?}"
-                );
+                let eager_loads: u64 = stats.dense_to_eager.iter().sum();
+                if dense_to_eager {
+                    assert!(
+                        eager_loads > 0 && whole_planes == 0,
+                        "staging must load every probe eagerly: {setting} {stats:?}"
+                    );
+                } else {
+                    assert!(
+                        eager_loads == 0 && whole_planes > 0,
+                        "gathers must admit whole ex planes: {setting} {stats:?}"
+                    );
+                }
             }
             tiered.set_spill(None);
             drainer.abort();
@@ -8654,19 +8689,35 @@ mod tests {
             ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
         }
 
-        /// Sums of the lazy counters that tell issue and origin policies apart.
+        /// Sums of the lazy counters that tell routing, issue and origin
+        /// policies apart.
         #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
         struct IssueTotals {
+            dense_to_eager: [u64; RANK_BUCKETS],
+            certain_dense: [u64; RANK_BUCKETS],
+            lazy_probes: u64,
+            empty: u64,
             eager_before_full: u64,
             deferred_issues: u64,
             serial_waits: u64,
             origin_whole_fallbacks: u64,
             origin_row_reads: u64,
             sparse_planes: u64,
+            whole_planes: u64,
         }
 
         impl IssueTotals {
             fn add(&mut self, stats: &LayeredLazyStats) {
+                for (totals, counts) in [
+                    (&mut self.dense_to_eager, stats.dense_to_eager),
+                    (&mut self.certain_dense, stats.certain_dense),
+                ] {
+                    for (total, count) in totals.iter_mut().zip(counts) {
+                        *total += count;
+                    }
+                }
+                self.lazy_probes += stats.lazy_probes.iter().sum::<u64>();
+                self.empty += stats.empty.iter().sum::<u64>();
                 self.eager_before_full += stats.eager_before_full;
                 self.deferred_issues += stats.deferred_issues;
                 self.serial_waits += stats.serial_waits;
@@ -8677,6 +8728,7 @@ mod tests {
                     .iter()
                     .chain(&stats.low_sparse)
                     .sum::<u64>();
+                self.whole_planes += stats.high_whole.iter().chain(&stats.low_whole).sum::<u64>();
             }
         }
 
@@ -8685,7 +8737,8 @@ mod tests {
         /// match the eager scan with either switched on or off, including `k`
         /// beyond the rows of the first probes and backends that serve no
         /// persistent rows. Backends that gate plane admission (Lance's
-        /// default cache included) never fall back to whole planes.
+        /// default cache included) never fall back to whole planes. Dense
+        /// probes stay in the lazy pipeline here, so every probe is gathered.
         #[rstest]
         #[case::origin(LazyTestCache::Origin, true)]
         #[case::small(LazyTestCache::Small, true)]
@@ -8722,6 +8775,7 @@ mod tests {
                                         dense,
                                         eager_before_full,
                                         origin_max_runs,
+                                        dense_to_eager: false,
                                         ..Default::default()
                                     };
                                     let query = lazy_test_query(vectors.value(row), k, nprobes);
@@ -8765,6 +8819,70 @@ mod tests {
             }
         }
 
+        /// Loading and scoring predicted-dense probes with the eager scan
+        /// changes only how they are read: results match the eager scan with
+        /// the routing on or off, for `k` within the first probe and beyond
+        /// the rows of the first probes, with prefilters that keep most or few
+        /// rows and with distance bounds, whether the planes come from the
+        /// origin, an ungated persistent tier or a tier that gates admission.
+        /// Only queries without a prefilter or upper bound are routed: those
+        /// drop rows of every probe before its gather, even at `k` beyond
+        /// every probed row, so their probes stay in the lazy pipeline.
+        #[rstest]
+        #[case::origin(LazyTestCache::Origin)]
+        #[case::ungated(LazyTestCache::Ungated)]
+        #[case::gated(LazyTestCache::Gated)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_dense_to_eager_matches_eager(#[case] cache: LazyTestCache) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) = open_lazy_test_index(dir.as_str(), cache).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filters: Vec<_> = lazy_test_filters()
+                .into_iter()
+                .filter(|(name, _)| matches!(*name, "none" | "sparse" | "dense"))
+                .collect();
+            let mut routed = [0u64; 2];
+            for row in [0, 777] {
+                for nprobes in [1, 8, LAZY_PARTITIONS] {
+                    for k in [10, 1000, LAZY_ROWS + 1] {
+                        for (filter_name, filter) in &filters {
+                            let query = lazy_test_query(vectors.value(row), k, nprobes);
+                            let eager =
+                                search_global(&index, &query, filter.clone()).await.unwrap();
+                            let bounded = with_bounds(&query, &eager);
+                            for query in std::iter::once(&query).chain(&bounded) {
+                                for dense_to_eager in [false, true] {
+                                    let config = LayeredLazyConfig {
+                                        enabled: true,
+                                        dense_to_eager,
+                                        ..Default::default()
+                                    };
+                                    let context = format!(
+                                        "cache={cache:?} row={row} nprobes={nprobes} k={k} filter={filter_name} bounds={} dense_to_eager={dense_to_eager}",
+                                        query.upper_bound.is_some()
+                                    );
+                                    let stats = assert_lazy_matches_eager(
+                                        &index, query, filter, config, &context,
+                                    )
+                                    .await;
+                                    let probes_routed: u64 = stats.dense_to_eager.iter().sum();
+                                    if *filter_name != "none" || query.upper_bound.is_some() {
+                                        assert_eq!(probes_routed, 0, "{context} {stats:?}");
+                                    }
+                                    routed[usize::from(dense_to_eager)] += probes_routed;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            wait_for_promotions().await;
+            assert_eq!(routed[0], 0, "switched off, no probe is routed");
+            assert!(routed[1] > 0, "{routed:?}");
+        }
+
         /// `count` queries for `k` rows over `nprobes` probes, keyed by rows
         /// of `vectors`, whose first probe alone holds more than `2 * k` rows:
         /// it fills the heap, and the threshold then keeps under half of the
@@ -8792,25 +8910,32 @@ mod tests {
             queries
         }
 
-        /// Issue counters of the lazy scan with eager-before-full on and off
-        /// (the ablation), summed over `queries`.
-        async fn lazy_issue_totals(
+        /// Lazy settings without promotions, with the given issue and routing
+        /// policies.
+        fn issue_policy(eager_before_full: bool, dense_to_eager: bool) -> LayeredLazyConfig {
+            LayeredLazyConfig {
+                enabled: true,
+                promote: LazyPromotion::Off,
+                eager_before_full,
+                dense_to_eager,
+                ..Default::default()
+            }
+        }
+
+        /// Issue counters of the lazy scan under each of `configs`, summed
+        /// over `queries`.
+        async fn lazy_issue_totals<const N: usize>(
             index: &Arc<dyn VectorIndex>,
             queries: &[Query],
             filter: &Arc<dyn PreFilter>,
-        ) -> [IssueTotals; 2] {
-            let mut totals = [IssueTotals::default(); 2];
-            for (eager_before_full, totals) in [true, false].into_iter().zip(&mut totals) {
-                let config = LayeredLazyConfig {
-                    enabled: true,
-                    promote: LazyPromotion::Off,
-                    eager_before_full,
-                    ..Default::default()
-                };
+            configs: [LayeredLazyConfig; N],
+        ) -> [IssueTotals; N] {
+            let mut totals = [IssueTotals::default(); N];
+            for (config, totals) in configs.into_iter().zip(&mut totals) {
                 for (position, query) in queries.iter().enumerate() {
                     let context = format!(
-                        "eager_before_full={eager_before_full} query={position} k={}",
-                        query.k
+                        "eager_before_full={} dense_to_eager={} query={position} k={}",
+                        config.eager_before_full, config.dense_to_eager, query.k
                     );
                     let stats =
                         assert_lazy_matches_eager(index, query, filter, config, &context).await;
@@ -8821,15 +8946,23 @@ mod tests {
             totals
         }
 
-        /// Whether gathers may be issued before the heap fills depends on
-        /// `k`, not on how staging races the first probes. When `k` spans
-        /// several probes, the gathers issued once the heap fills would read
-        /// whole planes anyway, so they are issued at once and none waits for
-        /// the heap or its turn. When the first probe alone fills the heap
-        /// (small `k`), gathers wait for its finite threshold, as the ablation
-        /// always does.
+        /// Which probes the eager scan loads, and whether lazy gathers may be
+        /// issued before the heap fills, depend on `k`, not on how staging
+        /// races the first probes.
+        ///
+        /// When `k` spans several probes, the gathers issued once the heap
+        /// fills would read whole planes anyway, so every probe is loaded and
+        /// scored by the eager scan and no ex plane is gathered whole. With
+        /// that switched off, the gathers read the planes whole and are issued
+        /// at once, and none waits for the heap or its turn.
+        ///
+        /// When the first probe alone fills the heap (small `k`), only that
+        /// probe, scored with an infinite threshold, goes to the eager scan,
+        /// exactly the probe the lazy pipeline otherwise gathers as certain
+        /// dense; later gathers wait for its finite threshold, as the
+        /// eager-before-full ablation always does.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_eager_before_full_depends_on_k() {
+        async fn test_layered_lazy_issue_policy_depends_on_k() {
             const PROBES: usize = 32;
             const QUERIES: usize = 8;
             const STAGING_STEPS: usize = 8;
@@ -8850,10 +8983,47 @@ mod tests {
                     .collect()
             };
             let small = queries_filled_by_first_probe(&index, vectors, SMALL_K, PROBES, QUERIES);
+            let configs = [
+                issue_policy(true, true),
+                issue_policy(true, false),
+                issue_policy(false, false),
+            ];
             ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            let [large_on, large_off] = lazy_issue_totals(&index, &queries(large_k), &filter).await;
-            let [small_on, small_off] = lazy_issue_totals(&index, &small, &filter).await;
+            let [large_routed, large_on, large_off] =
+                lazy_issue_totals(&index, &queries(large_k), &filter, configs).await;
+            let [small_routed, small_on, small_off] =
+                lazy_issue_totals(&index, &small, &filter, configs).await;
             ivf.set_lazy_prepare_parallelism_for_test(0);
+
+            // Nothing is resident, so every probe of a non-empty partition
+            // goes to the eager scan, in every rank bucket the probes reach.
+            let probes = (QUERIES * PROBES) as u64;
+            let routed: u64 = large_routed.dense_to_eager.iter().sum();
+            assert_eq!(routed + large_routed.empty, probes, "{large_routed:?}");
+            assert!(
+                large_routed.dense_to_eager[..4]
+                    .iter()
+                    .all(|&count| count > 0),
+                "{large_routed:?}"
+            );
+            assert_eq!(large_routed.dense_to_eager[4], 0, "{large_routed:?}");
+            assert_eq!(
+                (
+                    large_routed.lazy_probes,
+                    large_routed.whole_planes,
+                    large_routed.eager_before_full,
+                    large_routed.deferred_issues,
+                ),
+                (0, 0, 0, 0),
+                "{large_routed:?}"
+            );
+            assert_eq!(large_routed.certain_dense, [0; RANK_BUCKETS]);
+            for large in [large_on, large_off] {
+                assert_eq!(large.dense_to_eager, [0; RANK_BUCKETS], "{large:?}");
+                assert_eq!(large.lazy_probes + large.empty, probes, "{large:?}");
+                assert!(large.whole_planes > 0, "{large:?}");
+                assert!(large.certain_dense[0] > 0, "{large:?}");
+            }
             assert_eq!(
                 (large_on.deferred_issues, large_on.serial_waits),
                 (0, 0),
@@ -8862,13 +9032,23 @@ mod tests {
             assert!(large_on.eager_before_full > 0, "{large_on:?}");
             assert_eq!(large_off.eager_before_full, 0, "{large_off:?}");
             assert!(large_off.deferred_issues > 0, "{large_off:?}");
+
+            let mut first_probe = [0; RANK_BUCKETS];
+            first_probe[0] = QUERIES as u64;
+            assert_eq!(small_routed.dense_to_eager, first_probe, "{small_routed:?}");
+            assert_eq!(small_routed.certain_dense, [0; RANK_BUCKETS]);
+            assert!(small_routed.lazy_probes > 0, "{small_routed:?}");
             for small in [small_on, small_off] {
+                assert_eq!(small.dense_to_eager, [0; RANK_BUCKETS], "{small:?}");
+                assert_eq!(small.certain_dense, first_probe, "{small:?}");
+                assert!(small.deferred_issues > 0, "{small:?}");
+            }
+            for small in [small_routed, small_on, small_off] {
                 assert_eq!(
                     (small.eager_before_full, small.serial_waits),
                     (0, 0),
                     "{small:?}"
                 );
-                assert!(small.deferred_issues > 0, "{small:?}");
             }
         }
 
@@ -8897,7 +9077,8 @@ mod tests {
             // filter accepts.
             let queries = queries_filled_by_first_probe(&index, vectors, K, PROBES, QUERIES);
             ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            let [on, off] = lazy_issue_totals(&index, &queries, &filter).await;
+            let configs = [issue_policy(true, false), issue_policy(false, false)];
+            let [on, off] = lazy_issue_totals(&index, &queries, &filter, configs).await;
             ivf.set_lazy_prepare_parallelism_for_test(0);
             assert!(on.eager_before_full > 0, "{on:?}");
             assert!(on.serial_waits < off.serial_waits, "{on:?} {off:?}");
