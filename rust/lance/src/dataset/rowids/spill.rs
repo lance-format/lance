@@ -750,6 +750,8 @@ mod tests {
         ColumnAlteration, NewColumnTransform, UpdateBuilder, WriteMode, WriteParams,
     };
     use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray, StructArray};
     use arrow_schema::Field;
     use chrono::Utc;
@@ -1202,81 +1204,132 @@ mod tests {
         )
     }
 
-    /// Compaction writes the spilled columns after the user columns of its
-    /// output file. A column index counts physical columns, so after a
+    /// The table [`compaction_spills_and_reads_back_row_lineage`] compacts,
+    /// and the fragments the compaction writes from it.
+    #[derive(Clone, Copy, Debug)]
+    enum CompactionShape {
+        /// Four appends of 250 rows, compacted into one fragment.
+        OneOutput,
+        /// Three appends of 250 rows under a 300-row target. They make one
+        /// task, which writes them as two fragments of 375 rows, so the
+        /// hidden columns have to break at the row the writer ends a file.
+        TwoOutputs,
+        /// Four appends of 250 rows with every seventh row deleted, compacted
+        /// into one fragment of the 857 left. A deleted row leaves the lineage
+        /// sequences at the offset it leaves the data.
+        WithDeletions,
+    }
+
+    /// Compaction writes the spilled columns after the user columns of each
+    /// file it writes. A column index counts physical columns, so after a
     /// struct, or a list in 2.0, a lineage column's index no longer matches
     /// its position among the file's top-level fields.
     #[rstest]
-    #[case::flat(UserColumns::KeyOnly, None)]
-    #[case::nested_v2_2(UserColumns::WithStruct, Some(LanceFileVersion::V2_2))]
-    #[case::list_v2_0(UserColumns::WithList, Some(LanceFileVersion::V2_0))]
+    #[case::flat(UserColumns::KeyOnly, None, CompactionShape::OneOutput)]
+    #[case::nested_v2_2(
+        UserColumns::WithStruct,
+        Some(LanceFileVersion::V2_2),
+        CompactionShape::OneOutput
+    )]
+    #[case::list_v2_0(
+        UserColumns::WithList,
+        Some(LanceFileVersion::V2_0),
+        CompactionShape::OneOutput
+    )]
+    #[case::multi_output(UserColumns::KeyOnly, None, CompactionShape::TwoOutputs)]
+    #[case::with_deletions(UserColumns::KeyOnly, None, CompactionShape::WithDeletions)]
     #[tokio::test]
     async fn compaction_spills_and_reads_back_row_lineage(
         #[case] columns: UserColumns,
         #[case] version: Option<LanceFileVersion>,
+        #[case] shape: CompactionShape,
     ) {
+        let (appends, target_rows_per_fragment, output_rows) = match shape {
+            CompactionShape::OneOutput => (4, 1_000, vec![1_000]),
+            CompactionShape::TwoOutputs => (3, 300, vec![375, 375]),
+            CompactionShape::WithDeletions => (4, 1_000, vec![857]),
+        };
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut dataset = appended_dataset_with(uri, 4, 250, columns, version).await;
+        let mut dataset = appended_dataset_with(uri, appends, 250, columns, version).await;
         spill_everything(&mut dataset).await;
-        // Four appends at four versions, so the compacted created-at sequence
-        // has four runs rather than one.
-        let before = collect_lineage(&dataset).await;
-        assert_eq!(
-            before
-                .1
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            4
-        );
+        if matches!(shape, CompactionShape::WithDeletions) {
+            dataset.delete("i % 7 = 0").await.unwrap();
+        }
+        // One version per append, so the compacted created-at sequence has a
+        // run per append rather than one.
+        let before = collect_rows(&dataset).await;
+        let created_at_versions = before
+            .iter()
+            .map(|(_, _, created_at, _)| *created_at)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(created_at_versions.len(), appends as usize);
 
-        compact_files(&mut dataset, one_fragment(), None)
-            .await
-            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
-        let metadata = fragments[0].metadata();
-        assert!(
-            matches!(metadata.row_id_meta, Some(RowIdMeta::Column))
-                && matches!(
-                    metadata.created_at_version_meta,
-                    Some(RowDatasetVersionMeta::Column)
-                )
-                && matches!(
-                    metadata.last_updated_at_version_meta,
-                    Some(RowDatasetVersionMeta::Column)
-                ),
-            "compaction must spill every sequence under a zero inline budget, got {metadata:?}"
-        );
-        // The three columns ride in the fragment's own data file, after the
-        // user columns, so the fragment has no extra file to reference. Their
-        // column indices continue from the last physical user column.
-        assert_eq!(metadata.files.len(), 1);
-        let data_file = &metadata.files[0];
-        let (user_fields, lineage_fields) = data_file.fields.split_at(data_file.fields.len() - 3);
-        assert!(
-            user_fields.iter().all(|field| *field >= 0),
-            "unexpected data file fields {:?}",
-            data_file.fields
-        );
-        assert_eq!(
-            lineage_fields,
-            [
-                ROW_ID_FIELD_ID,
-                ROW_CREATED_AT_VERSION_FIELD_ID,
-                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
-            ]
-        );
-        let (user_columns, lineage_columns) = data_file.column_indices.split_at(user_fields.len());
-        let next = user_columns.iter().filter(|column| **column >= 0).count() as i32;
-        assert_eq!(lineage_columns, [next, next + 1, next + 2]);
-        for field_id in data_file.fields.iter().filter(|id| **id < 0) {
-            assert_eq!(
-                metadata.row_lineage_file(*field_id).unwrap(),
-                Some(data_file)
+        let written_rows = fragments
+            .iter()
+            .map(|fragment| fragment.metadata().physical_rows.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(written_rows, output_rows);
+        for fragment in &fragments {
+            let metadata = fragment.metadata();
+            assert!(
+                matches!(metadata.row_id_meta, Some(RowIdMeta::Column))
+                    && matches!(
+                        metadata.created_at_version_meta,
+                        Some(RowDatasetVersionMeta::Column)
+                    )
+                    && matches!(
+                        metadata.last_updated_at_version_meta,
+                        Some(RowDatasetVersionMeta::Column)
+                    ),
+                "compaction must spill every sequence under a zero budget, got {metadata:?}"
             );
+            // The three columns ride in the fragment's own data file, after
+            // the user columns, so the fragment has no extra file to
+            // reference. Their column indices continue from the last physical
+            // user column.
+            assert_eq!(metadata.files.len(), 1);
+            let data_file = &metadata.files[0];
+            let (user_fields, lineage_fields) =
+                data_file.fields.split_at(data_file.fields.len() - 3);
+            assert!(
+                user_fields.iter().all(|field| *field >= 0),
+                "unexpected data file fields {:?}",
+                data_file.fields
+            );
+            assert_eq!(
+                lineage_fields,
+                [
+                    ROW_ID_FIELD_ID,
+                    ROW_CREATED_AT_VERSION_FIELD_ID,
+                    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+                ]
+            );
+            let (user_columns, lineage_columns) =
+                data_file.column_indices.split_at(user_fields.len());
+            let next = user_columns.iter().filter(|column| **column >= 0).count() as i32;
+            assert_eq!(lineage_columns, [next, next + 1, next + 2]);
+            for field_id in data_file.fields.iter().filter(|id| **id < 0) {
+                assert_eq!(
+                    metadata.row_lineage_file(*field_id).unwrap(),
+                    Some(data_file)
+                );
+            }
+            // Each fragment's columns hold its own rows and no others.
+            let row_ids = load_row_id_sequence(&dataset, metadata).await.unwrap();
+            assert_eq!(Some(row_ids.len() as usize), metadata.physical_rows);
         }
         assert_ne!(
             dataset.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
@@ -1291,7 +1344,7 @@ mod tests {
 
         // The lineage survives the rewrite and is still served through the
         // ordinary scan path, now from the data file columns.
-        assert_eq!(collect_lineage(&dataset).await, before);
+        assert_eq!(collect_rows(&dataset).await, before);
         // `validate_stable_row_ids` reads every fragment's sequences back and
         // checks them against the fragment length, so this covers the loaders
         // independently of the scan.
@@ -1299,18 +1352,39 @@ mod tests {
 
         // Re-opened cold, so nothing is served from this process's caches.
         let reopened = Dataset::open(uri).await.unwrap();
-        assert_eq!(collect_lineage(&reopened).await, before);
-        let fragment = &reopened.get_fragments()[0];
-        let row_ids = load_row_id_sequence(&reopened, fragment.metadata())
-            .await
-            .unwrap();
-        assert_eq!(row_ids.iter().collect::<Vec<_>>(), before.0);
-        let created_at =
-            load_row_version_sequence(&reopened, fragment.metadata(), RowVersionKind::CreatedAt)
+        assert_eq!(collect_rows(&reopened).await, before);
+        let mut row_ids = Vec::with_capacity(before.len());
+        let mut created_at = Vec::with_capacity(before.len());
+        for fragment in reopened.get_fragments() {
+            let metadata = fragment.metadata();
+            let row_id_sequence = load_row_id_sequence(&reopened, metadata).await.unwrap();
+            row_ids.extend(row_id_sequence.iter());
+            let kind = RowVersionKind::CreatedAt;
+            let created_at_sequence = load_row_version_sequence(&reopened, metadata, kind)
                 .await
                 .unwrap()
                 .expect("a compacted fragment carries created-at versions");
-        assert_eq!(versions_of(&created_at), before.1);
+            created_at.extend(created_at_sequence.versions());
+        }
+        let expected_row_ids = before.iter().map(|(_, row_id, _, _)| *row_id);
+        assert_eq!(row_ids, expected_row_ids.collect::<Vec<_>>());
+        let expected_created_at = before.iter().map(|(_, _, created, _)| *created);
+        assert_eq!(created_at, expected_created_at.collect::<Vec<_>>());
+
+        // A take by row id resolves each id through the index built from the
+        // loaded sequences, so a sequence cut at the wrong row returns the
+        // wrong key.
+        let (sample_keys, sample_ids): (Vec<i32>, Vec<u64>) = before
+            .iter()
+            .step_by(61)
+            .map(|(key, row_id, _, _)| (*key, *row_id))
+            .unzip();
+        let taken = reopened
+            .take_rows(&sample_ids, reopened.schema().project(&["i"]).unwrap())
+            .await
+            .unwrap();
+        let taken_keys = taken["i"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(taken_keys, sample_keys);
     }
 
     /// Binary-copy compaction copies the input files page by page and cannot
@@ -1362,30 +1436,100 @@ mod tests {
         assert_eq!(plan.num_tasks(), 0);
     }
 
-    /// Cleanup decides what to delete by walking
-    /// [`Fragment::referenced_lance_files`], so a spilled sequence has to be
-    /// reachable from there. If it were not, an ordinary cleanup would delete a
-    /// live file and leave the fragment claiming row ids it can no longer read.
+    /// A second compaction reads the lineage back from the columns the first
+    /// one wrote into the data file. Its scan must not return those columns
+    /// with the user data: the task appends the lineage columns itself, and a
+    /// second copy would clash by name.
     #[tokio::test]
-    async fn cleanup_keeps_a_live_spilled_file() {
+    async fn compact_twice_reads_back_in_file_lineage() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset(uri, 4, 250).await;
+        spill_everything(&mut dataset).await;
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+        // Deleting every seventh row makes the compacted fragment compact
+        // again on its own, which masks the sequences read back from its file.
+        dataset.delete("i % 7 = 0").await.unwrap();
+        let before = collect_rows(&dataset).await;
+
+        let metrics = compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 1);
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let metadata = fragments[0].metadata();
+        assert_eq!(metadata.physical_rows, Some(before.len()));
+        assert_eq!(metadata.files.len(), 1, "{metadata:?}");
+        assert_eq!(
+            metadata.files[0].fields.as_ref(),
+            [
+                0,
+                ROW_ID_FIELD_ID,
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+            ]
+        );
+        assert_eq!(collect_rows(&dataset).await, before);
+        dataset.validate().await.unwrap();
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(collect_rows(&reopened).await, before);
+    }
+
+    /// Cleanup decides what to delete by walking
+    /// [`Fragment::referenced_lance_files`], so the file carrying a spilled
+    /// sequence has to be reachable from there. If it were not, an ordinary
+    /// cleanup would delete a live file and leave the fragment claiming row
+    /// ids it can no longer read. A reencoding compaction writes the lineage
+    /// into the fragment's data file, which cleanup keeps for the user columns
+    /// anyway; binary copy writes a file holding nothing but lineage, which
+    /// only the lineage keeps.
+    #[rstest]
+    #[case::in_file(CompactionMode::Reencode)]
+    #[case::lineage_file(CompactionMode::ForceBinaryCopy)]
+    #[tokio::test]
+    async fn cleanup_keeps_a_live_spilled_file(#[case] mode: CompactionMode) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = appended_dataset(uri, 4, 250).await;
         spill_everything(&mut dataset).await;
         let before = collect_lineage(&dataset).await;
 
-        compact_files(&mut dataset, one_fragment(), None)
-            .await
-            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                compaction_mode: Some(mode),
+                ..one_fragment()
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
-        let spilled = dataset.get_fragments()[0]
-            .metadata()
+        // Pin the layout, so each case keeps covering the file it is named
+        // after.
+        let fragments = dataset.get_fragments();
+        let metadata = fragments[0].metadata();
+        let carrier = metadata
             .row_lineage_file(ROW_ID_FIELD_ID)
             .unwrap()
-            .expect("compaction must spill under a zero inline budget")
-            .path
-            .clone();
-        let on_disk = std::path::Path::new(uri).join("data").join(&spilled);
+            .expect("compaction must spill under a zero inline budget");
+        if matches!(mode, CompactionMode::ForceBinaryCopy) {
+            assert_eq!(metadata.files.len(), 2, "{metadata:?}");
+            assert_eq!(carrier, &metadata.files[1]);
+            assert!(
+                carrier.fields.iter().all(|field| *field < 0),
+                "binary copy must write a lineage-only file: {metadata:?}"
+            );
+        } else {
+            assert_eq!(metadata.files.len(), 1, "{metadata:?}");
+            assert_eq!(carrier, &metadata.files[0]);
+        }
+        let on_disk = std::path::Path::new(uri).join("data").join(&carrier.path);
         assert!(on_disk.exists(), "no spilled file written at {on_disk:?}");
 
         // Everything written so far is older than this instant, so the
@@ -1843,12 +1987,15 @@ mod tests {
     /// A schema change keeps only the data files that still hold a schema
     /// field, and the reserved ids of spilled lineage never are one. Renames
     /// and drops commit a projection and a cast rewrites the column; each must
-    /// keep the file carrying the lineage, which is its only copy.
+    /// keep the file carrying the lineage, which is its only copy. A data file
+    /// holding the lineage next to user columns the change removes is covered
+    /// by [`dropping_every_column_of_a_lineage_carrier_keeps_lineage_until_compaction`].
     #[rstest]
     #[case::update_then_rename(SpillingWrite::Update, SchemaChange::Rename)]
     #[case::update_then_drop(SpillingWrite::Update, SchemaChange::Drop)]
     #[case::update_then_cast(SpillingWrite::Update, SchemaChange::Cast)]
     #[case::compact_then_drop(SpillingWrite::Compaction, SchemaChange::Drop)]
+    #[case::compact_then_cast(SpillingWrite::Compaction, SchemaChange::Cast)]
     #[tokio::test]
     async fn schema_change_keeps_spilled_lineage(
         #[case] spilling_write: SpillingWrite,
