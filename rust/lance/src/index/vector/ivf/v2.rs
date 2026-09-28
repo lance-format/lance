@@ -3739,6 +3739,150 @@ mod tests {
         assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
+    async fn build_ivf_flat_segment(
+        dataset: &mut Dataset,
+        metric: DistanceType,
+        fragment_ids: Vec<u32>,
+    ) -> IndexMetadata {
+        // Each segment trains its own IVF model, as distributed workers do.
+        // The build name differs from the committed index name on purpose:
+        // builders may not reuse the name of an existing index.
+        let params = VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, metric);
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("worker_idx".to_string())
+            .fragments(fragment_ids)
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_commit_index_segments_rejects_mixed_vector_metrics() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/mixed_metric_segments", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let l2_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::L2,
+            vec![fragments[0].id() as u32],
+        )
+        .await;
+        let cosine_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::Cosine,
+            vec![fragments[1].id() as u32],
+        )
+        .await;
+
+        let version_before = dataset.manifest.version;
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![l2_segment, cosine_segment],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("metric"),
+            "error should name the metric mismatch: {err}"
+        );
+        assert_eq!(dataset.manifest.version, version_before);
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_index_segments_rejects_metric_mismatch_with_retained_segment() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/retained_mixed_metric_segments", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let l2_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::L2,
+            vec![fragments[0].id() as u32],
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![l2_segment])
+            .await
+            .unwrap();
+
+        let version_before = dataset.manifest.version;
+        let cosine_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::Cosine,
+            vec![fragments[1].id() as u32],
+        )
+        .await;
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![cosine_segment])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("metric"),
+            "error should name the metric mismatch: {err}"
+        );
+        assert_eq!(dataset.manifest.version, version_before);
+        // The retained L2 segment still serves queries, unmodified.
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_index_segments_allows_metric_change_on_full_replacement() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/full_replacement_metric_change", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let all_fragment_ids = fragments.iter().map(|f| f.id() as u32).collect::<Vec<_>>();
+        let l2_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::L2,
+            vec![fragments[0].id() as u32],
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![l2_segment])
+            .await
+            .unwrap();
+
+        // A new metric is valid when no old segment remains in the index.
+        let cosine_segment =
+            build_ivf_flat_segment(&mut dataset, DistanceType::Cosine, all_fragment_ids).await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![cosine_segment])
+            .await
+            .unwrap();
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+    }
+
     #[tokio::test]
     async fn test_distributed_vector_build_supports_hnsw_variants() {
         let test_dir = TempStrDir::default();
