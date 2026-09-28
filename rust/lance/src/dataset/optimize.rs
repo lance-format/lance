@@ -91,8 +91,8 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::RowVersionKind;
 use super::rowids::{
-    RowLineage, RowLineageSpill, load_row_id_sequences, load_row_version_sequence,
-    place_row_lineage, plan_row_lineage_spill,
+    RowLineage, RowLineagePlan, RowLineageSpill, inline_row_lineage_max_bytes,
+    load_row_id_sequences, load_row_version_sequence, place_row_lineage, plan_row_lineage_spill,
 };
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -135,6 +135,7 @@ use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::{Fragment, IndexMetadata, RowDatasetVersionSequence};
+use lance_table::rowids::RowIdSequence;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -2570,30 +2571,7 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    // The output fragments' row lineage is known before anything is written:
-    // the row ids and versions carry over from the inputs, and the output
-    // file sizes are fixed above. Computing it here lets the sequences that
-    // leave the manifest ride along as hidden columns of the files being
-    // written, rather than need a file of their own. Binary copy cannot add
-    // columns to the files it copies, so it keeps writing that separate file.
-    let mut lineage_plan: Option<(Vec<RowLineage>, RowLineageSpill)> = None;
-    if !can_binary_copy && dataset.manifest.uses_stable_row_ids() {
-        let chunk_sizes = file_row_counts
-            .iter()
-            .map(|rows| *rows as u64)
-            .collect::<Vec<_>>();
-        let lineages = compute_row_lineage(dataset.as_ref(), &fragments, &chunk_sizes).await?;
-        let spill = plan_row_lineage_spill(dataset.as_ref(), &lineages)?;
-        if spill.any() {
-            let stream = reader
-                .take()
-                .expect("reader must be prepared for non-binary-copy path");
-            reader = Some(append_row_lineage_columns(stream, spill.columns(&lineages)));
-        }
-        lineage_plan = Some((lineages, spill));
-    }
-
-    if can_binary_copy {
+    let lineage_plan = if can_binary_copy {
         new_fragments = versions::rewrite_files_binary_copy(
             write_version,
             dataset.as_ref(),
@@ -2627,27 +2605,64 @@ async fn rewrite_files(
             let _ = tx.send(captured);
             row_ids_rx = Some(rx);
         }
+        None
     } else {
-        // The hidden lineage columns the stream now carries have to be in the
-        // schema the writer is given, or it would leave them out of the file.
+        let mut stream = reader.expect("reader must be prepared for non-binary-copy path");
         let mut write_schema = dataset.schema().clone();
-        if let Some((_, spill)) = &lineage_plan {
-            write_schema.fields.extend(spill.schema_fields()?);
-        }
+        // On a table that can spill, the output fragments' lineage is computed
+        // before anything is written: the row ids and versions carry over from
+        // the inputs, so a sequence that leaves the manifest can ride along as
+        // a hidden column of the file being written rather than need a file of
+        // its own. Every other table carries its lineage over after the write,
+        // cut at the row counts actually written, and holds none of it while
+        // writing. Binary copy cannot add columns to the files it copies, so
+        // it always takes that path.
+        let spill_budget = if dataset.manifest.uses_stable_row_ids() {
+            inline_row_lineage_max_bytes(dataset.as_ref())?
+        } else {
+            None
+        };
+        let lineage_plan = match spill_budget {
+            Some(limit) => {
+                let planned_rows = file_row_counts
+                    .iter()
+                    .map(|rows| *rows as u64)
+                    .collect::<Vec<_>>();
+                let mut lineages =
+                    compute_row_lineage(dataset.as_ref(), &fragments, &planned_rows).await?;
+                let plan = plan_row_lineage_spill(limit, &lineages);
+                if let RowLineagePlan::InFile(spill) = plan
+                    && spill.any()
+                {
+                    let fields = spill.schema_fields()?;
+                    let columns = spill.take_columns(&mut lineages);
+                    stream = append_row_lineage_columns(stream, &fields, columns);
+                    // The writer stores only the columns its schema lists.
+                    write_schema.fields.extend(fields);
+                }
+                Some(PlannedRowLineage {
+                    lineages,
+                    planned_rows,
+                    plan,
+                })
+            }
+            None => None,
+        };
         let (frags, _) = write_fragments_internal_with_file_row_counts(
             write_version,
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
             write_schema,
-            reader.expect("reader must be prepared for non-binary-copy path"),
+            stream,
             params,
             None,
             Some(file_row_counts),
         )
         .await?;
         new_fragments = frags;
-    }
+        lineage_plan
+    };
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -2669,9 +2684,10 @@ async fn rewrite_files(
         } else {
             if dataset.manifest.uses_stable_row_ids() {
                 log::info!("Compaction task {}: rechunking stable row ids", task_id);
-                match lineage_plan.take() {
-                    Some((lineages, spill)) => {
-                        place_row_lineage_in_files(&mut new_fragments, &lineages, spill)?
+                match lineage_plan {
+                    Some(planned) => {
+                        place_planned_row_lineage(dataset.as_ref(), &mut new_fragments, planned)
+                            .await?
                     }
                     None => {
                         rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &fragments)
@@ -2807,7 +2823,8 @@ async fn compute_row_lineage(
 /// Carry the lineage of `old_fragments` over to the already written
 /// `new_fragments` and place each one's sequences inline or in a separate
 /// lineage file, as the table's spill policy and their size call for. This is
-/// the path for output files the lineage could not be written into.
+/// the path for tables that cannot spill, and for binary copy, whose output
+/// files cannot take the lineage as extra columns.
 async fn rechunk_row_lineage(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
@@ -2824,63 +2841,225 @@ async fn rechunk_row_lineage(
     Ok(())
 }
 
-/// Mark each new fragment's spilled sequences as living in its own data file,
-/// which was written with them as hidden columns, and place the rest inline.
+/// The row lineage a compaction task computed for its planned output
+/// fragments before writing them, and how the task places it.
+struct PlannedRowLineage {
+    /// Each planned output fragment's lineage, in order. The sequences the
+    /// plan writes into the data files are empty: their values went into the
+    /// written columns.
+    lineages: Vec<RowLineage>,
+    /// Each planned output fragment's row count, which the writer only
+    /// follows until a byte limit closes a file early.
+    planned_rows: Vec<u64>,
+    plan: RowLineagePlan,
+}
+
+/// Place the lineage compaction planned before the write on the fragments it
+/// wrote.
+async fn place_planned_row_lineage(
+    dataset: &Dataset,
+    new_fragments: &mut [Fragment],
+    planned: PlannedRowLineage,
+) -> Result<()> {
+    let PlannedRowLineage {
+        lineages,
+        planned_rows,
+        plan,
+    } = planned;
+    match plan {
+        RowLineagePlan::InFile(spill) => {
+            place_row_lineage_in_files(new_fragments, lineages, &planned_rows, spill)
+        }
+        RowLineagePlan::PerFragment => {
+            let lineages = fit_row_lineage_to_written(
+                new_fragments,
+                lineages,
+                &planned_rows,
+                RowLineageSpill::default(),
+            )?;
+            for (fragment, lineage) in new_fragments.iter_mut().zip(lineages) {
+                place_row_lineage(dataset, &lineage).await?.apply(fragment);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Mark each written fragment's spilled sequences as living in its own data
+/// file, which was written with them as hidden columns, and place the rest
+/// inline.
 fn place_row_lineage_in_files(
     new_fragments: &mut [Fragment],
-    lineages: &[RowLineage],
+    lineages: Vec<RowLineage>,
+    planned_rows: &[u64],
     spill: RowLineageSpill,
 ) -> Result<()> {
-    if new_fragments.len() != lineages.len() {
-        return Err(Error::internal(format!(
-            "compaction wrote {} fragments but planned lineage for {}",
-            new_fragments.len(),
-            lineages.len()
-        )));
-    }
-    for (fragment, lineage) in new_fragments.iter_mut().zip(lineages) {
-        let [file] = fragment.files.as_slice() else {
-            return Err(Error::internal(format!(
-                "compaction wrote {} data files for fragment {}; the row lineage columns \
-                 are in exactly one",
-                fragment.files.len(),
-                fragment.id
-            )));
-        };
-        let missing = spill
-            .field_ids()
-            .find(|field_id| !file.fields.contains(field_id));
-        if let Some(field_id) = missing {
-            return Err(Error::internal(format!(
-                "compaction wrote fragment {}'s data file {} without row lineage field {}",
-                fragment.id, file.path, field_id
-            )));
+    let lineages = fit_row_lineage_to_written(new_fragments, lineages, planned_rows, spill)?;
+    for (fragment, lineage) in new_fragments.iter_mut().zip(&lineages) {
+        if spill.any() {
+            let [file] = fragment.files.as_slice() else {
+                return Err(Error::internal(format!(
+                    "compaction wrote {} data files for fragment {}; the row lineage columns \
+                     are in exactly one",
+                    fragment.files.len(),
+                    fragment.id
+                )));
+            };
+            let missing = spill
+                .field_ids()
+                .find(|field_id| !file.fields.contains(field_id));
+            if let Some(field_id) = missing {
+                return Err(Error::internal(format!(
+                    "compaction wrote fragment {}'s data file {} without row lineage field {}",
+                    fragment.id, file.path, field_id
+                )));
+            }
         }
         spill.place_in_file(lineage).apply(fragment);
     }
     Ok(())
 }
 
-/// Append the hidden row lineage columns to the batches of `stream`, in row
-/// order, so the file writer stores them next to the user columns.
-fn append_row_lineage_columns(
-    stream: SendableRecordBatchStream,
-    columns: Vec<(i32, &'static str, Vec<u64>)>,
-) -> SendableRecordBatchStream {
-    let mut fields = stream.schema().fields().to_vec();
-    for (_, name, _) in &columns {
-        fields.push(Arc::new(ArrowField::new(
-            *name,
-            ArrowDataType::UInt64,
-            false,
+/// Fit the lineage planned for output fragments of `planned_rows` rows each to
+/// the fragments the writer actually produced, one lineage per fragment.
+///
+/// A byte limit can close a file before its planned row count, after which the
+/// writer spreads the remaining rows over files of other sizes, so the
+/// sequences kept inline are cut again at the written row counts. The types
+/// `in_file` names need nothing: their columns were appended to the written
+/// rows one by one, so they follow any split, and their sequences are empty.
+///
+/// The in-file plan was made for the planned sizes. A written fragment is
+/// never larger than the largest planned one, but it can join the tail of one
+/// planned fragment to the head of the next, so a sequence that plan keeps
+/// inline can end up over the budget, up to about twice it. That is acceptable
+/// because the budget only bounds manifest growth and is not a format limit.
+/// The per-fragment plan decides again on the cut sequences.
+fn fit_row_lineage_to_written(
+    new_fragments: &[Fragment],
+    lineages: Vec<RowLineage>,
+    planned_rows: &[u64],
+    in_file: RowLineageSpill,
+) -> Result<Vec<RowLineage>> {
+    let written_rows = new_fragments
+        .iter()
+        .map(|fragment| match fragment.physical_rows {
+            Some(rows) => Ok(rows as u64),
+            None => Err(Error::internal(format!(
+                "compaction wrote fragment {} without a physical row count",
+                fragment.id
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let planned_total = planned_rows.iter().sum::<u64>();
+    let written_total = written_rows.iter().sum::<u64>();
+    if written_total != planned_total {
+        return Err(Error::internal(format!(
+            "compaction wrote {written_total} rows, in fragments of {written_rows:?} rows, \
+             but planned row lineage for {planned_total} rows, in fragments of \
+             {planned_rows:?} rows"
         )));
     }
-    let schema = Arc::new(ArrowSchema::new(fields));
-    let values = columns
-        .into_iter()
-        .map(|(_, _, values)| arrow_array::UInt64Array::from(values))
-        .collect::<Vec<_>>();
-    let total_rows = values.first().map_or(0, |column| column.len());
+
+    let lineages = if written_rows.as_slice() == planned_rows {
+        lineages
+    } else {
+        let cut_error = |error: Error| {
+            Error::internal(format!(
+                "compaction could not cut the row lineage planned for fragments of \
+                 {planned_rows:?} rows at the written fragments of {written_rows:?} rows: \
+                 {error}"
+            ))
+        };
+        let mut row_ids = Vec::with_capacity(lineages.len());
+        let mut created_at = Vec::with_capacity(lineages.len());
+        let mut last_updated_at = Vec::with_capacity(lineages.len());
+        for lineage in lineages {
+            row_ids.push(lineage.row_ids);
+            created_at.push(lineage.created_at);
+            last_updated_at.push(lineage.last_updated_at);
+        }
+        let fragment_count = written_rows.len();
+        let written = || written_rows.iter().copied();
+        let row_ids = if in_file.row_ids {
+            vec![RowIdSequence::new(); fragment_count]
+        } else {
+            lance_table::rowids::rechunk_sequences(row_ids, written(), false).map_err(cut_error)?
+        };
+        let created_at = if in_file.created_at {
+            vec![RowDatasetVersionSequence::new(); fragment_count]
+        } else {
+            lance_table::rowids::version::rechunk_version_sequences(created_at, written(), false)
+                .map_err(cut_error)?
+        };
+        let last_updated_at = if in_file.last_updated_at {
+            vec![RowDatasetVersionSequence::new(); fragment_count]
+        } else {
+            lance_table::rowids::version::rechunk_version_sequences(
+                last_updated_at,
+                written(),
+                false,
+            )
+            .map_err(cut_error)?
+        };
+        row_ids
+            .into_iter()
+            .zip(created_at)
+            .zip(last_updated_at)
+            .map(|((row_ids, created_at), last_updated_at)| RowLineage {
+                row_ids,
+                created_at,
+                last_updated_at,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if lineages.len() != new_fragments.len() {
+        return Err(Error::internal(format!(
+            "compaction has row lineage for {} fragments but wrote {}",
+            lineages.len(),
+            new_fragments.len()
+        )));
+    }
+    for ((fragment, &rows), lineage) in new_fragments.iter().zip(&written_rows).zip(&lineages) {
+        let inline_lengths = [
+            (in_file.row_ids, "row ids", lineage.row_ids.len()),
+            (
+                in_file.created_at,
+                "created-at versions",
+                lineage.created_at.len(),
+            ),
+            (
+                in_file.last_updated_at,
+                "last-updated-at versions",
+                lineage.last_updated_at.len(),
+            ),
+        ];
+        let mismatch = inline_lengths
+            .into_iter()
+            .find(|&(is_in_file, _, len)| !is_in_file && len != rows);
+        if let Some((_, sequence, len)) = mismatch {
+            return Err(Error::internal(format!(
+                "compaction has {len} inline {sequence} for fragment {} of {rows} physical rows",
+                fragment.id
+            )));
+        }
+    }
+    Ok(lineages)
+}
+
+/// Append the hidden row lineage columns, `fields` with the matching entry of
+/// `columns` as each one's values, to the batches of `stream`, in row order,
+/// so the file writer stores them next to the user columns.
+fn append_row_lineage_columns(
+    stream: SendableRecordBatchStream,
+    fields: &[LanceField],
+    columns: Vec<Vec<u64>>,
+) -> SendableRecordBatchStream {
+    let mut arrow_fields = stream.schema().fields().to_vec();
+    arrow_fields.extend(fields.iter().map(|field| Arc::new(ArrowField::from(field))));
+    let schema = Arc::new(ArrowSchema::new(arrow_fields));
+    let total_rows = columns.first().map_or(0, |values| values.len());
     let batch_schema = schema.clone();
     let mut offset = 0usize;
     let batches = stream.map(move |batch| {
@@ -2894,8 +3073,12 @@ fn append_row_lineage_columns(
             )));
         }
         let mut arrays = batch.columns().to_vec();
-        for column in &values {
-            arrays.push(Arc::new(column.slice(offset, rows)) as ArrayRef);
+        // Each batch gets a buffer of its own. A slice would share the whole
+        // task's buffer, and the writer, which sizes pages by the memory an
+        // array holds, would then cut a tiny page for every batch.
+        for values in &columns {
+            let batch_values = values[offset..offset + rows].to_vec();
+            arrays.push(Arc::new(arrow_array::UInt64Array::from(batch_values)) as ArrayRef);
         }
         offset += rows;
         RecordBatch::try_new(batch_schema.clone(), arrays)
@@ -3423,6 +3606,10 @@ mod tests {
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::dataset::rowids::read_spilled_row_ids;
+    use crate::dataset::rowids::{
+        INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+    };
     use crate::dataset::scanner::ColumnOrdering;
     use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
@@ -3439,6 +3626,7 @@ mod tests {
     use lance_arrow::BLOB_META_KEY;
     use lance_core::Error;
     use lance_core::ROW_ID;
+    use lance_core::ROW_ID_FIELD_ID;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
@@ -3452,7 +3640,9 @@ mod tests {
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
     use lance_linalg::distance::{DistanceType, MetricType};
+    use lance_table::format::RowIdMeta;
     use lance_table::io::manifest::read_manifest_indexes;
+    use lance_table::rowids::read_row_ids;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use std::collections::HashSet;
@@ -4643,6 +4833,287 @@ mod tests {
 
         let second_metrics = compact_files(&mut dataset, options, None).await.unwrap();
         assert_eq!(second_metrics, CompactionMetrics::default());
+    }
+
+    /// A byte limit can close a compaction output file before its planned row
+    /// count, and the writer then spreads the remaining rows over files of
+    /// other sizes. The lineage placed inline has to follow the written row
+    /// counts, and a written total that differs from the planned one is an
+    /// error rather than lineage shifted onto the wrong rows.
+    #[rstest]
+    #[case::extra_file(
+        &[10, 10],
+        &[9, 6, 5],
+        RowLineageSpill { row_ids: true, ..Default::default() },
+        None
+    )]
+    #[case::shifted(
+        &[101, 100, 100],
+        &[100, 101, 100],
+        RowLineageSpill { row_ids: true, ..Default::default() },
+        None
+    )]
+    #[case::shifted_all_inline(
+        &[101, 100, 100],
+        &[100, 101, 100],
+        RowLineageSpill::default(),
+        None
+    )]
+    #[case::mismatched_totals(
+        &[10, 10],
+        &[10, 9],
+        RowLineageSpill { row_ids: true, ..Default::default() },
+        Some("wrote 19 rows")
+    )]
+    fn place_row_lineage_in_files_follows_written_sizes(
+        #[case] planned_rows: &[u64],
+        #[case] written_rows: &[usize],
+        #[case] spill: RowLineageSpill,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let total_rows = planned_rows.iter().sum::<u64>();
+        // Every row has a version of its own, so a sequence cut at the wrong
+        // row cannot pass for the right one.
+        let versions = (1..=total_rows).collect::<Vec<_>>();
+        let mut lineages = Vec::with_capacity(planned_rows.len());
+        let mut start = 0_u64;
+        for rows in planned_rows {
+            let end = start + rows;
+            let created_at =
+                RowDatasetVersionSequence::from_versions(&versions[start as usize..end as usize]);
+            lineages.push(RowLineage {
+                row_ids: RowIdSequence::from(start..end),
+                last_updated_at: created_at.clone(),
+                created_at,
+            });
+            start = end;
+        }
+        let columns = spill.take_columns(&mut lineages);
+        if spill.row_ids {
+            assert_eq!(columns, vec![(0..total_rows).collect::<Vec<_>>()]);
+        } else {
+            assert!(columns.is_empty(), "{columns:?}");
+        }
+        // Each written file carries the user column and the spilled columns.
+        let fields = std::iter::once(0)
+            .chain(spill.field_ids())
+            .collect::<Vec<_>>();
+        let column_indices = (0..fields.len() as i32).collect::<Vec<_>>();
+        let mut fragments = written_rows
+            .iter()
+            .enumerate()
+            .map(|(id, rows)| {
+                Fragment::new(id as u64)
+                    .with_file(
+                        format!("{id}.lance"),
+                        fields.clone(),
+                        column_indices.clone(),
+                        ConcreteFileVersion::V2_0,
+                        None,
+                    )
+                    .with_physical_rows(*rows)
+            })
+            .collect::<Vec<_>>();
+
+        let placed = place_row_lineage_in_files(&mut fragments, lineages, planned_rows, spill);
+        if let Some(expected) = expected_error {
+            let error = placed.unwrap_err();
+            let Error::Internal { message, .. } = &error else {
+                panic!("expected an internal error, got {error}");
+            };
+            assert!(message.contains(expected), "{message}");
+            return;
+        }
+        placed.unwrap();
+        let mut placed_row_ids = Vec::with_capacity(versions.len());
+        let mut placed_created_at = Vec::with_capacity(versions.len());
+        let mut placed_last_updated_at = Vec::with_capacity(versions.len());
+        for fragment in &fragments {
+            let physical_rows = fragment.physical_rows.unwrap() as u64;
+            match &fragment.row_id_meta {
+                Some(RowIdMeta::Column) if spill.row_ids => {}
+                Some(RowIdMeta::Inline(bytes)) if !spill.row_ids => {
+                    let row_ids = read_row_ids(bytes).unwrap();
+                    assert_eq!(row_ids.len(), physical_rows);
+                    placed_row_ids.extend(row_ids.iter());
+                }
+                other => panic!(
+                    "fragment {} has row id meta {other:?} under {spill:?}",
+                    fragment.id
+                ),
+            }
+            for (meta, collected) in [
+                (&fragment.created_at_version_meta, &mut placed_created_at),
+                (
+                    &fragment.last_updated_at_version_meta,
+                    &mut placed_last_updated_at,
+                ),
+            ] {
+                let sequence = meta.as_ref().unwrap().load_sequence().unwrap();
+                assert_eq!(sequence.len(), physical_rows);
+                collected.extend(sequence.versions());
+            }
+        }
+        if !spill.row_ids {
+            assert_eq!(placed_row_ids, (0..total_rows).collect::<Vec<_>>());
+        }
+        assert_eq!(placed_created_at, versions);
+        assert_eq!(placed_last_updated_at, versions);
+    }
+
+    /// A sequence type over the budget in only some output fragments sends the
+    /// task down the per-fragment path: once the lineage is cut at the written
+    /// sizes, a fragment whose row ids fit keeps them inline, and only the ones
+    /// over the budget get a lineage file of their own.
+    #[tokio::test]
+    async fn per_fragment_plan_spills_only_the_fragments_over_budget() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "100"),
+            ])
+            .await
+            .unwrap();
+        // A range encodes to a few bytes at any length. The scattered ids, a
+        // permutation of 500..1000 with no runs, take about two bytes a row,
+        // so any 250 of them are well over the 100-byte budget.
+        let scattered = (0..500_u64)
+            .map(|i| 500 + (i * 7919) % 500)
+            .collect::<Vec<_>>();
+        let row_ids = [
+            RowIdSequence::from(0..500),
+            RowIdSequence::from(scattered.as_slice()),
+        ];
+        let lineages = row_ids
+            .into_iter()
+            .map(|row_ids| {
+                let created_at =
+                    RowDatasetVersionSequence::from_uniform_row_count(row_ids.len(), 1);
+                RowLineage {
+                    row_ids,
+                    last_updated_at: created_at.clone(),
+                    created_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        let plan = plan_row_lineage_spill(100, &lineages);
+        assert_eq!(plan, RowLineagePlan::PerFragment);
+        // Written as [250, 500, 250] rather than the planned [500, 500], so
+        // the middle fragment joins the tail of the range to the head of the
+        // scattered ids.
+        let mut fragments = [250, 500, 250]
+            .into_iter()
+            .enumerate()
+            .map(|(id, rows)| {
+                Fragment::new(id as u64)
+                    .with_file(
+                        format!("{id}.lance"),
+                        vec![0],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                    )
+                    .with_physical_rows(rows)
+            })
+            .collect::<Vec<_>>();
+
+        place_planned_row_lineage(
+            &dataset,
+            &mut fragments,
+            PlannedRowLineage {
+                lineages,
+                planned_rows: vec![500, 500],
+                plan,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(fragments[0].row_id_meta, Some(RowIdMeta::Inline(_))),
+            "a fragment whose row ids fit must keep them inline, got {:?}",
+            fragments[0].row_id_meta
+        );
+        assert_eq!(fragments[0].files.len(), 1);
+        for fragment in &fragments[1..] {
+            assert!(
+                matches!(fragment.row_id_meta, Some(RowIdMeta::Column)),
+                "fragment {}'s row ids are over the budget, got {:?}",
+                fragment.id,
+                fragment.row_id_meta
+            );
+            assert_eq!(fragment.files.len(), 2);
+            assert_eq!(fragment.files[1].fields.as_ref(), [ROW_ID_FIELD_ID]);
+        }
+        let mut placed_row_ids = Vec::with_capacity(1000);
+        for fragment in &fragments {
+            let row_ids = match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(bytes)) => read_row_ids(bytes).unwrap(),
+                _ => read_spilled_row_ids(&dataset, fragment).await.unwrap(),
+            };
+            placed_row_ids.extend(row_ids.iter());
+        }
+        assert_eq!(
+            placed_row_ids,
+            (0..500)
+                .chain(scattered.iter().copied())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The writer sizes a column's pages by the memory its arrays hold, so a
+    /// lineage array sharing one buffer with the whole task would make it cut
+    /// a tiny page for every batch.
+    #[tokio::test]
+    async fn append_row_lineage_columns_gives_each_batch_its_own_buffer() {
+        let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
+        let schema = batch.schema();
+        let batches = vec![batch; 3]
+            .into_iter()
+            .map(Ok::<_, datafusion::error::DataFusionError>);
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        let spill = RowLineageSpill {
+            row_ids: true,
+            ..Default::default()
+        };
+        let fields = spill.schema_fields().unwrap();
+
+        let output = append_row_lineage_columns(input, &fields, vec![(0..12).collect()])
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(output.len(), 3);
+        for (index, batch) in output.iter().enumerate() {
+            let start = index as u64 * 4;
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            assert_eq!(
+                row_ids.values().to_vec(),
+                (start..start + 4).collect::<Vec<_>>()
+            );
+            assert!(
+                row_ids.get_buffer_memory_size() <= batch.num_rows() * 8,
+                "batch {index}'s row ids hold {} bytes for {} rows",
+                row_ids.get_buffer_memory_size(),
+                batch.num_rows()
+            );
+        }
     }
 
     #[rstest]

@@ -104,9 +104,20 @@ pub fn inline_row_lineage_max_bytes(dataset: &Dataset) -> Result<Option<usize>> 
     })
 }
 
-/// Which of a compaction task's sequences leave the manifest, decided for all
-/// its output fragments together so that every data file the task writes
-/// carries the same hidden columns.
+/// The hidden row lineage columns by name and reserved field id, in the order
+/// a data file written by compaction stores them.
+const LINEAGE_COLUMNS: [(&str, i32); 3] = [
+    (ROW_ID, ROW_ID_FIELD_ID),
+    (ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD_ID),
+    (
+        ROW_LAST_UPDATED_AT_VERSION,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    ),
+];
+
+/// Which of a compaction task's sequences leave the manifest as hidden columns
+/// of the data files it writes. Every file the task writes carries the same
+/// columns, so this holds for all of its output fragments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowLineageSpill {
     pub row_ids: bool,
@@ -119,52 +130,52 @@ impl RowLineageSpill {
         self.row_ids || self.created_at || self.last_updated_at
     }
 
-    /// The reserved field ids of the columns that spill, in column order.
+    /// The reserved field ids of the spilled columns, in column order.
     pub fn field_ids(&self) -> impl Iterator<Item = i32> {
-        [
-            (self.row_ids, ROW_ID_FIELD_ID),
-            (self.created_at, ROW_CREATED_AT_VERSION_FIELD_ID),
-            (self.last_updated_at, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID),
-        ]
-        .into_iter()
-        .filter(|(spilled, _)| *spilled)
-        .map(|(_, field_id)| field_id)
+        let flags = [self.row_ids, self.created_at, self.last_updated_at];
+        LINEAGE_COLUMNS
+            .into_iter()
+            .zip(flags)
+            .filter_map(|((_, field_id), spilled)| spilled.then_some(field_id))
     }
 
-    /// The hidden columns to write, as `(field id, column name, values)`,
-    /// concatenated over `lineages` in order.
-    pub fn columns(&self, lineages: &[RowLineage]) -> Vec<(i32, &'static str, Vec<u64>)> {
-        let mut columns = Vec::with_capacity(3);
-        if self.row_ids {
-            let values = lineages.iter().flat_map(|l| l.row_ids.iter()).collect();
-            columns.push((ROW_ID_FIELD_ID, ROW_ID, values));
-        }
-        if self.created_at {
-            let values = lineages
-                .iter()
-                .flat_map(|l| l.created_at.versions())
-                .collect();
-            columns.push((
-                ROW_CREATED_AT_VERSION_FIELD_ID,
-                ROW_CREATED_AT_VERSION,
-                values,
-            ));
-        }
-        if self.last_updated_at {
-            let values = lineages
-                .iter()
-                .flat_map(|l| l.last_updated_at.versions())
-                .collect();
-            columns.push((
-                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
-                ROW_LAST_UPDATED_AT_VERSION,
-                values,
-            ));
-        }
-        columns
+    /// Move the spilled sequences out of `lineages` as the values of the
+    /// hidden columns, one vector per column in column order, concatenated
+    /// over `lineages`. The spilled sequences are left empty: nothing places
+    /// them inline, and their run-length form would otherwise stay alive
+    /// through the write next to the values built from it.
+    pub fn take_columns(&self, lineages: &mut [RowLineage]) -> Vec<Vec<u64>> {
+        let total_rows = lineages
+            .iter()
+            .map(|lineage| lineage.row_ids.len() as usize)
+            .sum::<usize>();
+        self.field_ids()
+            .map(|field_id| {
+                let mut values = Vec::with_capacity(total_rows);
+                for lineage in lineages.iter_mut() {
+                    match field_id {
+                        ROW_ID_FIELD_ID => {
+                            let row_ids = std::mem::take(&mut lineage.row_ids);
+                            values.extend(row_ids.iter());
+                        }
+                        ROW_CREATED_AT_VERSION_FIELD_ID => {
+                            let created_at = std::mem::take(&mut lineage.created_at);
+                            values.extend(created_at.versions());
+                        }
+                        // The only other id `field_ids` yields.
+                        _ => {
+                            let last_updated_at = std::mem::take(&mut lineage.last_updated_at);
+                            values.extend(last_updated_at.versions());
+                        }
+                    }
+                }
+                values
+            })
+            .collect()
     }
 
-    /// The hidden columns as write-schema fields, under their reserved ids.
+    /// The spilled columns as write-schema fields, in column order and under
+    /// their reserved ids.
     pub fn schema_fields(&self) -> Result<Vec<lance_core::datatypes::Field>> {
         self.field_ids().map(lineage_field).collect()
     }
@@ -197,46 +208,77 @@ impl RowLineageSpill {
 }
 
 /// The hidden column a spilled lineage sequence is stored in: a non-nullable
-/// `UInt64` named after the sequence, under its reserved `field_id`.
+/// `UInt64` named after the sequence in [`LINEAGE_COLUMNS`], under its
+/// reserved `field_id`.
 fn lineage_field(field_id: i32) -> Result<lance_core::datatypes::Field> {
-    let name = match field_id {
-        ROW_ID_FIELD_ID => ROW_ID,
-        ROW_CREATED_AT_VERSION_FIELD_ID => ROW_CREATED_AT_VERSION,
-        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID => ROW_LAST_UPDATED_AT_VERSION,
-        _ => {
-            return Err(Error::internal(format!(
-                "field id {field_id} is not a row lineage field id"
-            )));
-        }
-    };
+    let (name, _) = LINEAGE_COLUMNS
+        .into_iter()
+        .find(|(_, id)| *id == field_id)
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "field id {field_id} is not a reserved row lineage field id"
+            ))
+        })?;
     let mut field =
         lance_core::datatypes::Field::try_from(&ArrowField::new(name, DataType::UInt64, false))?;
     field.id = field_id;
     Ok(field)
 }
 
-/// Decide which sequence types of `lineages` spill: each one whose encoding
-/// exceeds the table's inline budget in any of them. Nothing spills on a
-/// table that has not opted in.
-pub fn plan_row_lineage_spill(
-    dataset: &Dataset,
-    lineages: &[RowLineage],
-) -> Result<RowLineageSpill> {
-    let Some(limit) = inline_row_lineage_max_bytes(dataset)? else {
-        return Ok(RowLineageSpill::default());
+/// How a compaction task places the lineage of the fragments it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLineagePlan {
+    /// Each sequence type the spill names is over the inline budget in every
+    /// output fragment and is written into the data files as a hidden column;
+    /// every other type is under the budget in all of them and stays inline.
+    InFile(RowLineageSpill),
+    /// Some sequence type is over the budget in some output fragments but not
+    /// in others. A column in every file would also spill the sequences that
+    /// fit inline, and their readers would then pay a read per row for what a
+    /// few bytes of manifest hold. The task writes no hidden columns instead,
+    /// and after the write places each fragment's lineage on its own with
+    /// [`place_row_lineage`], which spills only what is over the budget, to a
+    /// separate lineage file.
+    PerFragment,
+}
+
+/// Plan how the lineage of a compaction task's output fragments, `lineages`,
+/// is placed when every encoded sequence over `limit` bytes has to leave the
+/// manifest (see [`inline_row_lineage_max_bytes`]).
+pub fn plan_row_lineage_spill(limit: usize, lineages: &[RowLineage]) -> RowLineagePlan {
+    let over = |encoded: Vec<u8>| encoded.len() > limit;
+    let row_ids = over_in_all_or_none(lineages.iter().map(|l| over(write_row_ids(&l.row_ids))));
+    let created_at = over_in_all_or_none(
+        lineages
+            .iter()
+            .map(|l| over(write_dataset_versions(&l.created_at))),
+    );
+    let last_updated_at = over_in_all_or_none(
+        lineages
+            .iter()
+            .map(|l| over(write_dataset_versions(&l.last_updated_at))),
+    );
+    match (row_ids, created_at, last_updated_at) {
+        (Some(row_ids), Some(created_at), Some(last_updated_at)) => {
+            RowLineagePlan::InFile(RowLineageSpill {
+                row_ids,
+                created_at,
+                last_updated_at,
+            })
+        }
+        _ => RowLineagePlan::PerFragment,
+    }
+}
+
+/// Whether one sequence type is over the budget in every output fragment
+/// (`Some(true)`) or in none (`Some(false)`), given each output's verdict in
+/// `over`; `None` when the outputs disagree. It stops encoding at the first
+/// disagreement.
+fn over_in_all_or_none(mut over: impl Iterator<Item = bool>) -> Option<bool> {
+    let Some(first) = over.next() else {
+        return Some(false);
     };
-    let over = |encoded: usize| encoded > limit;
-    Ok(RowLineageSpill {
-        row_ids: lineages
-            .iter()
-            .any(|l| over(write_row_ids(&l.row_ids).len())),
-        created_at: lineages
-            .iter()
-            .any(|l| over(write_dataset_versions(&l.created_at).len())),
-        last_updated_at: lineages
-            .iter()
-            .any(|l| over(write_dataset_versions(&l.last_updated_at).len())),
-    })
+    over.all(|next| next == first).then_some(first)
 }
 
 /// The per-row lineage of one fragment, in row offset order.
@@ -973,6 +1015,44 @@ mod tests {
             RowDatasetVersionMeta::Inline(_)
         ));
         assert!(placed.file.is_none());
+    }
+
+    /// Compaction writes a sequence type into its data files only when it is
+    /// over the budget in every output fragment. A type over it in only some
+    /// of them sends the task down the per-fragment path, so the sequences
+    /// that fit stay inline.
+    #[rstest]
+    #[case::all_over(
+        vec![scattered_row_ids(500), scattered_row_ids(500)],
+        RowLineagePlan::InFile(RowLineageSpill { row_ids: true, ..Default::default() })
+    )]
+    #[case::none_over(
+        vec![RowIdSequence::from(0..500), RowIdSequence::from(500..1000)],
+        RowLineagePlan::InFile(RowLineageSpill::default())
+    )]
+    #[case::mixed(
+        vec![RowIdSequence::from(0..500), scattered_row_ids(500)],
+        RowLineagePlan::PerFragment
+    )]
+    fn plan_row_lineage_spill_decides_per_kind(
+        #[case] row_ids: Vec<RowIdSequence>,
+        #[case] expected: RowLineagePlan,
+    ) {
+        // Single-run version sequences encode to a few bytes, far under the
+        // budget, so the row ids alone decide.
+        let lineages = row_ids
+            .into_iter()
+            .map(|row_ids| {
+                let created_at =
+                    RowDatasetVersionSequence::from_uniform_row_count(row_ids.len(), 1);
+                RowLineage {
+                    row_ids,
+                    last_updated_at: created_at.clone(),
+                    created_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(plan_row_lineage_spill(100, &lineages), expected);
     }
 
     /// Opt the table into spilling, at a zero inline budget so every sequence
