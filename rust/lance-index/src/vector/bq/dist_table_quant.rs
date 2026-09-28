@@ -207,9 +207,8 @@ const FOLD_LANES: usize = 16;
 fn min_max_fold(values: &[f32]) -> (f32, f32) {
     let mut mins = [f32::INFINITY; FOLD_LANES];
     let mut maxs = [f32::NEG_INFINITY; FOLD_LANES];
-    let mut chunks = values.chunks_exact(FOLD_LANES);
-    for chunk in &mut chunks {
-        let chunk: &[f32; FOLD_LANES] = chunk.try_into().expect("chunks_exact length");
+    let (chunks, remainder) = values.as_chunks::<FOLD_LANES>();
+    for chunk in chunks {
         for (i, &v) in chunk.iter().enumerate() {
             mins[i] = if v < mins[i] { v } else { mins[i] };
             maxs[i] = if v > maxs[i] { v } else { maxs[i] };
@@ -223,7 +222,7 @@ fn min_max_fold(values: &[f32]) -> (f32, f32) {
     for v in maxs {
         max = if v > max { v } else { max };
     }
-    for &v in chunks.remainder() {
+    for &v in remainder {
         min = if v < min { v } else { min };
         max = if v > max { v } else { max };
     }
@@ -291,8 +290,8 @@ mod x86 {
         let mut min1 = min0;
         let mut max0 = _mm512_set1_ps(f32::NEG_INFINITY);
         let mut max1 = max0;
-        let mut chunks = values.chunks_exact(32);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = values.as_chunks::<32>();
+        for chunk in chunks {
             // SAFETY: the chunk holds 32 consecutive floats.
             let (v0, v1) = unsafe {
                 (
@@ -307,7 +306,7 @@ mod x86 {
         }
         let mut min = _mm512_reduce_min_ps(_mm512_min_ps(min0, min1));
         let mut max = _mm512_reduce_max_ps(_mm512_max_ps(max0, max1));
-        for &v in chunks.remainder() {
+        for &v in remainder {
             min = if v < min { v } else { min };
             max = if v > max { v } else { max };
         }
@@ -325,8 +324,8 @@ mod x86 {
         let mut min1 = min0;
         let mut max0 = _mm256_set1_ps(f32::NEG_INFINITY);
         let mut max1 = max0;
-        let mut chunks = values.chunks_exact(16);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = values.as_chunks::<16>();
+        for chunk in chunks {
             // SAFETY: the chunk holds 16 consecutive floats.
             let (v0, v1) = unsafe {
                 (
@@ -341,7 +340,7 @@ mod x86 {
         }
         let mut min = reduce_min_avx2(_mm256_min_ps(min0, min1));
         let mut max = reduce_max_avx2(_mm256_max_ps(max0, max1));
-        for &v in chunks.remainder() {
+        for &v in remainder {
             min = if v < min { v } else { min };
             max = if v > max { v } else { max };
         }

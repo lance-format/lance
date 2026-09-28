@@ -11,16 +11,12 @@ pub struct Bitmap {
 
 /// Set bits in `data`, counted a word at a time.
 pub(super) fn count_ones(data: &[u8]) -> usize {
-    let mut words = data.chunks_exact(8);
+    let (words, tail) = data.as_chunks::<8>();
     let full: usize = words
-        .by_ref()
-        .map(|word| u64::from_le_bytes(word.try_into().unwrap()).count_ones() as usize)
-        .sum();
-    let tail: usize = words
-        .remainder()
         .iter()
-        .map(|byte| byte.count_ones() as usize)
+        .map(|word| u64::from_le_bytes(*word).count_ones() as usize)
         .sum();
+    let tail: usize = tail.iter().map(|byte| byte.count_ones() as usize).sum();
     full + tail
 }
 

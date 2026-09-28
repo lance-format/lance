@@ -200,7 +200,7 @@ pub fn sum_4bit_dist_table_scalar(
     dists[..num_full_vectors].fill(0);
 
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
-        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+        for (sub_vec_idx, block) in blocks.as_chunks::<BATCH_SIZE>().0.iter().enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
             let next_dist_table =
                 &dist_table[(sub_vec_idx * 2 + 1) * 16..(sub_vec_idx * 2 + 2) * 16];
@@ -426,7 +426,7 @@ pub fn sum_4bit_hacc_dist_table_scalar(
     dists[..num_full_vectors].fill(0);
 
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
-        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+        for (sub_vec_idx, block) in blocks.as_chunks::<BATCH_SIZE>().0.iter().enumerate() {
             let table_offset = sub_vec_idx * 64;
             let current_low = &hacc_dist_table[table_offset..table_offset + 16];
             let next_low = &hacc_dist_table[table_offset + 16..table_offset + 32];
@@ -466,7 +466,7 @@ pub fn sum_4bit_dist_table_u16_scalar(
     dists[..num_full_vectors].fill(0);
 
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
-        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+        for (sub_vec_idx, block) in blocks.as_chunks::<BATCH_SIZE>().0.iter().enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
             let next_dist_table =
                 &dist_table[(sub_vec_idx * 2 + 1) * 16..(sub_vec_idx * 2 + 2) * 16];
@@ -889,7 +889,13 @@ fn sum_4bit_dist_table_transposed_scalar(
 ) {
     let dists = &mut dists[start..n];
     dists.fill(0);
-    for (column, tables) in dist_table.chunks_exact(32).take(code_len).enumerate() {
+    for (column, tables) in dist_table
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .take(code_len)
+        .enumerate()
+    {
         let (low_table, high_table) = tables.split_at(16);
         let column = &codes[column * n + start..column * n + n];
         for (dist, &code) in dists.iter_mut().zip(column) {
@@ -1090,7 +1096,13 @@ fn filter_transposed_batch_scalar(
     let end = n.min(start + TRANSPOSED_BATCH_SIZE);
     let sums = &mut sums[..end - start];
     sums.fill(0);
-    for (column, tables) in dist_table.chunks_exact(32).take(code_len).enumerate() {
+    for (column, tables) in dist_table
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .take(code_len)
+        .enumerate()
+    {
         let (low_table, high_table) = tables.split_at(16);
         let column = &codes[column * n + start..column * n + end];
         for (sum, &code) in sums.iter_mut().zip(column) {

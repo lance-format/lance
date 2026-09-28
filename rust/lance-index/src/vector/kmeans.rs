@@ -2008,7 +2008,7 @@ mod tests {
     use arrow_array::types::Float16Type;
     use half::f16;
     use lance_arrow::*;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
 
     use super::*;
     use lance_linalg::distance::dot_f16::amx_fp16_supported;
@@ -2150,7 +2150,7 @@ mod tests {
             0.0,
         );
         let centroids = model.centroids.as_primitive::<Float32Type>().values();
-        for centroid in centroids.chunks_exact(2) {
+        for centroid in centroids.as_chunks::<2>().0 {
             assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }
         assert_ne!(&centroids[..2], &centroids[2..]);
@@ -2179,7 +2179,8 @@ mod tests {
             .centroids
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
         {
             assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }
@@ -2852,7 +2853,13 @@ mod tests {
         // 80% of the vectors sit in one dense blob near the origin, the rest
         // spread over the unit cube, so a fixed fan-out would starve the blob
         // of centroids.
-        let mut values = generate_random_array(rows * dim).values().to_vec();
+        //
+        // Seeded so that tests asserting on seeded training see the same input
+        // every run: on about 1% of random inputs, exact reassignment leaves a
+        // hierarchical leaf without vectors when refinement is off.
+        let mut values = generate_random_array_with_seed::<Float32Type>(rows * dim, [42; 32])
+            .values()
+            .to_vec();
         for value in values.iter_mut().take(rows * 8 / 10 * dim) {
             *value *= 0.05;
         }
