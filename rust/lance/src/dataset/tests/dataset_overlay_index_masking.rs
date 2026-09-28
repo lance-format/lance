@@ -1940,6 +1940,59 @@ async fn test_fts_combined_fields_overlay_preserves_prefilter_corpus(
     );
 }
 
+/// A same-value overlay must not change any score of a filtered query whose flat
+/// side also reads an appended fragment.
+///
+/// The flat scan counts the appended rows the filter excludes whether or not an
+/// overlay exists. If the filter were pushed into the scan until an overlay
+/// appeared, the overlay would add the excluded `alpha` row (id 4) to the corpus
+/// and move every score.
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_preserves_filtered_appended_scores() {
+    let mut dataset = create_text_dataset_with(&[("text", &["alpha", "beta", "gamma"])], 3).await;
+    build_text_fts_index(&mut dataset).await;
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, [3, 4, 5, 6]),
+        ("text", Utf8, ["alpha", "alpha", "beta", "alpha"])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(
+        reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: crate::dataset::write::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let scan = || CombinedScan {
+        filter: Some("id != 4"),
+        ..Default::default()
+    };
+    let before = fts_combined_hits(&dataset, "alpha beta", &["text"], scan()).await;
+    let mut before_ids = before.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    before_ids.sort_unstable();
+    assert_eq!(before_ids, vec![0, 1, 3, 5, 6]);
+
+    // Row 2 rewritten with the value it already holds.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_filtered_appended_same_value_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+        vec![Arc::new(StringArray::from(vec![Some("gamma")]))],
+    )
+    .await;
+    assert_eq!(
+        fts_combined_hits(&dataset, "alpha beta", &["text"], scan()).await,
+        before
+    );
+}
+
 /// Fragment selection must restrict which rows are returned, not which corpus they
 /// are scored against. A same-value overlay inside the selection leaves every
 /// searchable value alone, so top-k must not move.
@@ -2081,10 +2134,10 @@ async fn test_fts_combined_fields_overlay_keeps_clean_fragments_indexed() {
 
 /// An overlay must not cost the flat scan the rows only it can return.
 ///
-/// Once a stale row folds, the flat scan is read unfiltered and its emitted rows
-/// are picked by a prefilter instead, so that a same-value overlay cannot move the
-/// corpus (see `test_fts_combined_fields_overlay_preserves_prefilter_corpus`).
-/// That prefilter has to span the fragments the flat scan reads. The indexed
+/// The flat scan is read unfiltered and its emitted rows are picked by a
+/// prefilter instead, so that the filter cannot move the corpus (see
+/// `test_fts_combined_fields_overlay_preserves_filtered_appended_scores`). That
+/// prefilter has to span the fragments the flat scan reads. The indexed
 /// child's own prefilter does not: it is built over the fragments the target
 /// columns' indexes cover, so it names no row in an appended fragment, and an
 /// allow-list can only be narrowed afterwards, never widened.
@@ -2130,7 +2183,7 @@ async fn test_fts_combined_fields_overlay_keeps_unindexed_selected_match() {
     );
 
     // Fragment 0 holds no `mango`, so this overlay changes no answer. All it does is
-    // route the scan onto the unfiltered-read path.
+    // move fragment 0 from the indexed side onto the flat side.
     let dataset = commit_overlay(
         dataset,
         "combined_unindexed_selected_match_overlay",

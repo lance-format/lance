@@ -2037,10 +2037,10 @@ async fn test_fts_combined_fields_three_columns_two_terms(#[case] append_unindex
 
 /// A `combined_fields` query with a filter, over a mixed-coverage dataset.
 ///
-/// The flat scan is a `filtered_read(is_prefilter=true)`. When the filter needs a
-/// refine expression, the scan projection gains that expression's columns, so the
-/// document columns no longer sit at the positions the query lists them in and
-/// `doc_col_indices` has to resolve them by name.
+/// The filter restricts which rows are returned, not the corpus they are scored
+/// against: the flat scan reads every row of the unindexed fragments and the
+/// filter is applied only to the rows it emits, just as the index statistics
+/// count the filtered-out indexed rows.
 ///
 /// Both cases filter to the same rows through different plan shapes: `id >= 4`
 /// resolves entirely through the scalar index (no refine), while `category` has no
@@ -2056,8 +2056,8 @@ async fn test_fts_combined_fields_with_filter(
     let params = combined_fields_test_params();
     // Rows 0-1 are indexed for both text columns and match nothing, so every
     // returned row comes from the flat side and its score can be checked exactly.
-    // Rows 2-3 match but are filtered out, so they contribute no corpus statistics
-    // either: the flat scan never sees them.
+    // Rows 2-3 match but are filtered out. They are not returned, but still count
+    // toward the corpus statistics.
     let titles = vec!["zz zz", "zz", "aa", "zz", "aa aa", "zz"];
     let bodies = vec!["zz", "zz zz", "zz", "aa aa", "zz", "aa"];
     let categories = ["keep", "keep", "drop", "drop", "keep", "keep"];
@@ -2091,31 +2091,27 @@ async fn test_fts_combined_fields_with_filter(
 
     let dataset = append_fts_dataset(&test_uri, batch((2..6).collect(), 2..6), Some(2)).await;
 
-    // The corpus the scan can see: every row of the indexed fragment (the index
-    // statistics are not filtered) plus only the flat rows that survive the filter.
-    let stats_rows = [0usize, 1, 4, 5];
-    let pick = |values: &[&'static str]| {
-        stats_rows
-            .iter()
-            .map(|&row| values[row])
-            .collect::<Vec<_>>()
-    };
+    // The corpus is every row, filtered out or not. Only the kept rows are returned.
     let weights = [2.0f32, 1.0f32];
     let expected = brute_force_bm25f(
-        &[(weights[0], pick(&titles)), (weights[1], pick(&bodies))],
+        &[(weights[0], titles.clone()), (weights[1], bodies.clone())],
         "aa",
         false,
     );
-    let expected_scores: HashMap<i32, f32> = stats_rows
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, &row)| expected[slot].map(|score| (row as i32, score)))
-        .collect();
     assert_eq!(
-        expected_scores.keys().copied().collect::<HashSet<_>>(),
-        HashSet::from([4, 5]),
-        "reference corpus changed; only the kept rows may match"
+        expected
+            .iter()
+            .enumerate()
+            .filter_map(|(row, score)| score.map(|_| row))
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5],
+        "reference corpus changed; the filtered-out rows 2-3 must match too, or \
+         counting them would not change the kept rows' scores"
     );
+    let expected_scores: HashMap<i32, f32> = [4usize, 5]
+        .into_iter()
+        .map(|row| (row as i32, expected[row].unwrap()))
+        .collect();
 
     let mut scan = dataset.scan();
     scan.project(&["id"])
@@ -2134,16 +2130,18 @@ async fn test_fts_combined_fields_with_filter(
         plan.contains("FlatCombinedFields"),
         "filtered plan lost its flat child:\n{plan}"
     );
+    assert!(
+        plan.lines()
+            .any(|line| line.contains("projection=[title, body]")
+                && line.contains("full_filter=--, refine_filter=--")),
+        "the flat scan must read its fragments unfiltered:\n{plan}"
+    );
     // Confirm the two cases really took the two different branches, rather than
     // both landing on the same one.
     if index_filter_column {
         assert!(
-            plan.contains("ScalarIndexQuery") && plan.contains("refine_filter=--"),
+            plan.contains("ScalarIndexQuery") && !plan.contains("category"),
             "expected the filter to resolve entirely through the scalar index:\n{plan}"
-        );
-        assert!(
-            !plan.contains("category"),
-            "no refine expression, so `category` must stay out of the projection:\n{plan}"
         );
     } else {
         assert!(
@@ -2152,12 +2150,8 @@ async fn test_fts_combined_fields_with_filter(
         );
         assert!(
             !plan.contains("FilterExec"),
-            "the scan already applies the refine expression, so no second filter:\n{plan}"
-        );
-        assert!(
-            plan.contains("projection=[category, title, body]"),
-            "the refine expression's column must be added to the flat scan \
-             projection:\n{plan}"
+            "the prefilter already applies the refine expression, so no second \
+             filter:\n{plan}"
         );
     }
 

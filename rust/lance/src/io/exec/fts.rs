@@ -4565,7 +4565,7 @@ impl FlatCombinedFieldsExec {
     }
 
     /// Select the emitted rows with `prefilter`, for a scan the planner reads
-    /// unfiltered; see `FlatScanFilter::AtEmission` in the scanner.
+    /// unfiltered so that the filter does not change the corpus statistics.
     pub(crate) fn with_emit_prefilter(mut self, prefilter: PreFilterSource) -> Self {
         self.emit_prefilter = Some(prefilter);
         self

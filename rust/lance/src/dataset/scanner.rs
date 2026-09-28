@@ -174,18 +174,6 @@ enum FtsOverlayPlan {
     FullScan,
 }
 
-/// How a `combined_fields` flat scan gets its rows and which of them it emits.
-enum FlatScanFilter<'a> {
-    /// Push the filter into the scan. Its statistics then describe only the rows
-    /// that survive, which is what the index already reports for everything else.
-    PushDown(&'a ExprFilterPlan),
-    /// Read unfiltered and pick emitted rows with this prefilter, as the indexed
-    /// side does. Needed once a stale row folds: with the filter on the scan, a
-    /// folded row's contribution would depend on the filter, so a same-value
-    /// overlay would move the corpus and with it the ranking.
-    AtEmission(PreFilterSource),
-}
-
 fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
     fn visit(query: &FtsQuery, columns: &mut Vec<String>, seen: &mut HashSet<String>) {
         match query {
@@ -5817,7 +5805,6 @@ impl Scanner {
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
         let mut any_indexed = false;
-        let mut any_overlay_stale = false;
         let mut needs_whole_corpus = false;
         for column in query.column_names() {
             let column_uncovered: RoaringBitmap = match self
@@ -5866,14 +5853,12 @@ impl Scanner {
                 FtsOverlayPlan::RowLevel { stale_rows, .. } => {
                     uncovered.extend(stale_rows.keys().copied());
                     column_stale_rows = self.stale_rows_in_id_domain(&stale_rows).await?;
-                    any_overlay_stale = true;
                 }
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
                 FtsOverlayPlan::FullScan => {
                     uncovered.extend(target_fragments.iter().map(|fragment| fragment.id as u32));
                     needs_whole_corpus = true;
-                    any_overlay_stale = true;
                 }
             }
 
@@ -5970,30 +5955,26 @@ impl Scanner {
                 FlatStatsScope::PerColumn(per_column_coverage),
             )
         };
-        // Reading unfiltered costs the flat side its pushdown, so it is confined to
-        // the scans that fold a stale row (see `FlatScanFilter::AtEmission`).
+        // The flat side reads unfiltered and applies the filter only to the rows it
+        // emits, as the indexed side does, so every row it reads counts toward the
+        // corpus. Pushing the filter into the scan would make the corpus depend on
+        // the filter, and on whether an overlay routed a fragment onto this side.
         //
         // The emission prefilter is built over the fragments this scan reads, not
         // reused from the indexed child. `prefilter_source` spans the fragments the
         // target columns' indexes cover, so it names no row in an unindexed fragment,
         // and an allow-list can only be narrowed afterwards
         // (`build_prefilter_restricted_to_fragments`), never widened. Reusing it would
-        // drop every match an unindexed fragment holds as soon as an overlay routes
-        // the scan onto this path.
-        let scan_filter = if any_overlay_stale {
-            let flat_prefilter = self
-                .prefilter_source(
-                    filter_plan,
-                    flat_fragments
-                        .iter()
-                        .map(|fragment| fragment.id as u32)
-                        .collect(),
-                )
-                .await?;
-            FlatScanFilter::AtEmission(flat_prefilter)
-        } else {
-            FlatScanFilter::PushDown(filter_plan)
-        };
+        // drop every match an unindexed fragment holds.
+        let emit_prefilter = self
+            .prefilter_source(
+                filter_plan,
+                flat_fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+            )
+            .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
         let is_mixed = !needs_whole_corpus && flat_fragments.len() != target_fragments.len();
@@ -6002,7 +5983,7 @@ impl Scanner {
             .plan_flat_combined_fields_query(
                 flat_fragments,
                 stats_scope,
-                scan_filter,
+                emit_prefilter,
                 query,
                 params,
                 shared_scorer.clone(),
@@ -6032,22 +6013,19 @@ impl Scanner {
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over
     /// `fragments` projecting every target column, scored as one virtual field.
     ///
+    /// The scan is unfiltered; `emit_prefilter` picks the rows it emits.
+    ///
     /// Emits in scan order with no limit applied; the caller supplies the score
     /// sort and top-k fetch.
     async fn plan_flat_combined_fields_query(
         &self,
         fragments: Vec<Fragment>,
         stats_scope: FlatStatsScope,
-        scan_filter: FlatScanFilter<'_>,
+        emit_prefilter: PreFilterSource,
         query: &CombinedFieldsQuery,
         params: &FtsSearchParams,
         shared_scorer: Option<Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let unfiltered = ExprFilterPlan::default();
-        let (filter_plan, emit_prefilter) = match scan_filter {
-            FlatScanFilter::PushDown(filter_plan) => (filter_plan, None),
-            FlatScanFilter::AtEmission(prefilter) => (&unfiltered, Some(prefilter)),
-        };
         // A path that continues past a `List` is not addressable by a projection,
         // so such a column is scanned through its list root and walked down to the
         // leaf by `FlatCombinedFieldsExec`, exactly as `plan_flat_match_query`
@@ -6073,7 +6051,12 @@ impl Scanner {
             .map(|fragment| fragment.id as u32)
             .collect();
         let mut plan = self
-            .plan_uncovered_rows_scan(fragments, HashMap::new(), columns, filter_plan)
+            .plan_uncovered_rows_scan(
+                fragments,
+                HashMap::new(),
+                columns,
+                &ExprFilterPlan::default(),
+            )
             .await?;
         // A nested target column needs a flat alias so the exec can resolve it by
         // name in the batch schema. A list-bearing one gets its flat column from
@@ -6092,10 +6075,8 @@ impl Scanner {
             scanned_fragments,
             resolved_fields,
             stats_scope,
-        )?;
-        if let Some(prefilter) = emit_prefilter {
-            flat_plan = flat_plan.with_emit_prefilter(prefilter);
-        }
+        )?
+        .with_emit_prefilter(emit_prefilter);
         if let Some(shared_scorer) = shared_scorer {
             flat_plan = flat_plan.with_shared_scorer(shared_scorer);
         }
