@@ -15,6 +15,8 @@ use lance_arrow::json::{
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_table::format::{RowDatasetVersionRun, RowDatasetVersionSequence};
+use lance_table::rowids::segment::U64Segment;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
@@ -65,6 +67,13 @@ pub fn make_rowid_capture_stream(
     let created_at_idx = schema
         .column_with_name(ROW_CREATED_AT_VERSION)
         .map(|(idx, _)| idx);
+    // Started here, rather than on the first batch, so a stream that carries
+    // the column but no rows still reports an empty capture.
+    if created_at_idx.is_some()
+        && let CapturedRowIds::SequenceStyle { created_at, .. } = &mut row_ids
+    {
+        *created_at = Some(RowDatasetVersionSequence::new());
+    }
     let data_cols = (0..schema.fields.len())
         .filter(|col| *col != row_id_idx && Some(*col) != created_at_idx)
         .collect::<Vec<_>>();
@@ -94,9 +103,9 @@ pub enum CapturedRowIds {
     AddressStyle(RoaringTreemap),
     SequenceStyle {
         row_ids: RowIdSequence,
-        /// The created-at version of each captured row, in capture order, when
-        /// the stream carried them; empty otherwise.
-        created_at: Vec<u64>,
+        /// The created-at versions of the captured rows, in capture order,
+        /// when the stream carried them; `None` when it did not.
+        created_at: Option<RowDatasetVersionSequence>,
     },
 }
 
@@ -105,7 +114,7 @@ impl CapturedRowIds {
         if stable_row_ids {
             Self::SequenceStyle {
                 row_ids: RowIdSequence::new(),
-                created_at: Vec::new(),
+                created_at: None,
             }
         } else {
             Self::AddressStyle(RoaringTreemap::new())
@@ -130,8 +139,36 @@ impl CapturedRowIds {
 
     /// Record the created-at versions of the rows just passed to [`Self::capture`].
     pub fn capture_created_at(&mut self, versions: &[u64]) {
-        if let Self::SequenceStyle { created_at, .. } = self {
-            created_at.extend_from_slice(versions);
+        let Self::SequenceStyle {
+            created_at: Some(sequence),
+            ..
+        } = self
+        else {
+            return;
+        };
+        // Run-length encoded as they arrive, and a run that carries on from
+        // the previous batch is extended rather than restarted: a run per
+        // batch would bloat the inline metadata of a large rewrite.
+        for run in versions.chunk_by(|a, b| a == b) {
+            let (version, rows) = (run[0], run.len() as u64);
+            let start = match sequence.runs.last_mut() {
+                Some(RowDatasetVersionRun {
+                    span: U64Segment::Range(span),
+                    version: last_version,
+                }) => {
+                    if *last_version == version {
+                        span.end += rows;
+                        continue;
+                    }
+                    span.end
+                }
+                // Every run pushed below spans a range, so this is the first.
+                _ => 0,
+            };
+            sequence.runs.push(RowDatasetVersionRun {
+                span: U64Segment::Range(start..start + rows),
+                version,
+            });
         }
     }
 
@@ -142,17 +179,12 @@ impl CapturedRowIds {
         }
     }
 
-    /// The captured rows' created-at versions, one per captured row id, when
-    /// the stream carried them.
-    pub fn created_at_versions(&self) -> Option<&[u64]> {
+    /// The captured rows' created-at versions, in capture order, when the
+    /// stream carried them.
+    pub fn created_at_sequence(&self) -> Option<&RowDatasetVersionSequence> {
         match self {
-            Self::SequenceStyle {
-                row_ids,
-                created_at,
-            } if created_at.len() as u64 == row_ids.len() && !created_at.is_empty() => {
-                Some(created_at)
-            }
-            _ => None,
+            Self::SequenceStyle { created_at, .. } => created_at.as_ref(),
+            Self::AddressStyle(_) => None,
         }
     }
 
@@ -358,5 +390,32 @@ impl SchemaAdapter {
             converted_schema,
             converted_stream,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_created_at_extends_a_run_across_batches() {
+        let mut captured = CapturedRowIds::SequenceStyle {
+            row_ids: RowIdSequence::new(),
+            created_at: Some(RowDatasetVersionSequence::new()),
+        };
+        captured.capture_created_at(&[1, 1, 2]);
+        captured.capture_created_at(&[]);
+        captured.capture_created_at(&[2, 3]);
+        // One run per version, the one split by the batch boundary included,
+        // with spans absolute over the whole capture.
+        assert_eq!(
+            captured.created_at_sequence(),
+            Some(&RowDatasetVersionSequence::from_versions(&[1, 1, 2, 2, 3]))
+        );
+
+        // A stream that did not carry the column captures nothing.
+        let mut not_carried = CapturedRowIds::new(true);
+        not_carried.capture_created_at(&[1, 2]);
+        assert_eq!(not_carried.created_at_sequence(), None);
     }
 }

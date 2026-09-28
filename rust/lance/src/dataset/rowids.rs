@@ -24,6 +24,7 @@ use lance_table::{
 };
 use std::sync::Arc;
 
+pub(crate) use spill::place_carried_row_lineage;
 pub use spill::{
     DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
     PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,

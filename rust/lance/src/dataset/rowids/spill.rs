@@ -61,10 +61,13 @@ const SPILL_BATCH_ROWS: usize = 64 * 1024;
 /// single-run version sequence.
 pub const DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES: usize = 200 * 1024;
 
-/// Table config key that turns spilling on: `"true"` lets compaction move
-/// oversized lineage sequences out of the manifest. Absent or anything else,
-/// every sequence stays inline however large it grows, which is what every
-/// released build does; a table that never sets it stays readable by them.
+/// Table config key that turns spilling on: `"true"` lets compaction and
+/// update move the oversized lineage sequences they carry over from existing
+/// rows out of the manifest -- row ids and created-at versions, and at
+/// compaction last-updated-at versions too; an update's last-updated-at
+/// version is the commit's and stays inline. Absent or anything else, every
+/// sequence stays inline however large it grows, which is what every released
+/// build does; a table that never sets it stays readable by them.
 pub const SPILL_ROW_LINEAGE_CONFIG_KEY: &str = "lance.row_lineage.spill";
 
 /// Table config key overriding [`DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES`], as a
@@ -207,6 +210,99 @@ pub async fn place_row_lineage(
             RowDatasetVersionMeta::Inline(inline_last_updated_at.into())
         },
         file: spilled,
+    })
+}
+
+/// The lineage an update carries over into one of its new fragments, as
+/// [`place_carried_row_lineage`] placed it.
+///
+/// `pub` rather than `pub(crate)` only because `clippy::redundant_pub_crate`
+/// fires inside the private `spill` module; the crate-private re-export of
+/// [`place_carried_row_lineage`] keeps it off the public API.
+pub struct CarriedRowLineage {
+    row_ids: RowIdMeta,
+    /// `None` when neither sequence spilled: the commit then resolves the
+    /// created-at versions from the inline row ids, as on a table that has not
+    /// opted in. `Some`, inline or spilled, once either sequence spilled.
+    created_at: Option<RowDatasetVersionMeta>,
+    /// The lineage file holding the spilled sequences, `None` when nothing
+    /// spilled.
+    file: Option<DataFile>,
+}
+
+impl CarriedRowLineage {
+    /// Put the placement on `fragment`: its row ids, its created-at versions
+    /// when they were placed, and the lineage file, if any, as one more of its
+    /// data files. The last-updated-at versions are left for the commit.
+    pub fn apply(self, fragment: &mut Fragment) {
+        fragment.row_id_meta = Some(self.row_ids);
+        fragment.created_at_version_meta = self.created_at;
+        fragment.last_updated_at_version_meta = None;
+        if let Some(file) = self.file {
+            fragment.files.push(file);
+        }
+    }
+}
+
+/// Place the row ids and created-at versions that rewritten rows carry over
+/// into a new fragment, spilling each whose encoding exceeds `limit` into a
+/// hidden column of one new data file.
+///
+/// When neither exceeds `limit`, only the row ids are placed, inline, and the
+/// created-at versions are left for the commit to resolve from them, as it
+/// does on a table that has not opted in. Once either spills the commit can no
+/// longer resolve them, since it cannot read spilled row ids, so the created-at
+/// versions are placed as well, spilled or inline.
+///
+/// The last-updated-at version is never placed: it is the commit's, and a
+/// conflict retry moves it.
+pub async fn place_carried_row_lineage(
+    dataset: &Dataset,
+    limit: usize,
+    row_ids: &RowIdSequence,
+    created_at: &RowDatasetVersionSequence,
+) -> Result<CarriedRowLineage> {
+    let inline_row_ids = write_row_ids(row_ids);
+    let inline_created_at = write_dataset_versions(created_at);
+    let spill_row_ids = inline_row_ids.len() > limit;
+    let spill_created_at = inline_created_at.len() > limit;
+    if !spill_row_ids && !spill_created_at {
+        return Ok(CarriedRowLineage {
+            row_ids: RowIdMeta::Inline(inline_row_ids.into()),
+            created_at: None,
+            file: None,
+        });
+    }
+
+    // Materialized before the write, as in `place_row_lineage`, so the future
+    // stays `Send`.
+    let mut columns: Vec<(i32, &str, ArrayRef)> = Vec::with_capacity(2);
+    if spill_row_ids {
+        let ids = UInt64Array::from(row_ids.iter().collect::<Vec<u64>>());
+        columns.push((ROW_ID_FIELD_ID, ROW_ID, Arc::new(ids)));
+    }
+    if spill_created_at {
+        let versions = UInt64Array::from(created_at.versions().collect::<Vec<u64>>());
+        columns.push((
+            ROW_CREATED_AT_VERSION_FIELD_ID,
+            ROW_CREATED_AT_VERSION,
+            Arc::new(versions),
+        ));
+    }
+    let file = write_lineage_file(dataset, &columns).await?;
+
+    Ok(CarriedRowLineage {
+        row_ids: if spill_row_ids {
+            RowIdMeta::Column
+        } else {
+            RowIdMeta::Inline(inline_row_ids.into())
+        },
+        created_at: Some(if spill_created_at {
+            RowDatasetVersionMeta::Column
+        } else {
+            RowDatasetVersionMeta::Inline(inline_created_at.into())
+        }),
+        file: Some(file),
     })
 }
 
@@ -575,6 +671,80 @@ mod tests {
             placed.file.as_ref().unwrap().fields.as_ref(),
             [ROW_CREATED_AT_VERSION_FIELD_ID]
         );
+    }
+
+    /// What an update carries over is placed in full only once something
+    /// spills: the commit resolves created-at versions from inline row ids but
+    /// cannot from spilled ones, and it always stamps last-updated-at itself.
+    #[rstest]
+    #[case::nothing_spills(false, false)]
+    #[case::row_ids_spill(true, false)]
+    #[case::created_at_spills(false, true)]
+    #[case::both_spill(true, true)]
+    #[tokio::test]
+    async fn carried_lineage_places_created_at_once_anything_spills(
+        #[case] spill_row_ids: bool,
+        #[case] spill_created_at: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let dataset = tiny_dataset(dir.as_str()).await;
+        // Under a 100-byte budget a scattered or alternating sequence of 1,000
+        // rows spills, and a range or a single run stays inline.
+        let row_ids = if spill_row_ids {
+            scattered_row_ids(1_000)
+        } else {
+            RowIdSequence::from(0..1_000)
+        };
+        let created_at = if spill_created_at {
+            alternating_versions(1_000, 1)
+        } else {
+            RowDatasetVersionSequence::from_uniform_row_count(1_000, 1)
+        };
+
+        let mut fragment = Fragment::new(42);
+        fragment.physical_rows = Some(1_000);
+        place_carried_row_lineage(&dataset, 100, &row_ids, &created_at)
+            .await
+            .unwrap()
+            .apply(&mut fragment);
+
+        assert_eq!(
+            matches!(fragment.row_id_meta, Some(RowIdMeta::Column)),
+            spill_row_ids
+        );
+        assert_eq!(fragment.last_updated_at_version_meta, None);
+        let placed_row_ids = load_row_id_sequence(&dataset, &fragment).await.unwrap();
+        assert_eq!(
+            placed_row_ids.iter().collect::<Vec<_>>(),
+            row_ids.iter().collect::<Vec<_>>()
+        );
+        if !spill_row_ids && !spill_created_at {
+            assert_eq!(fragment.created_at_version_meta, None);
+            assert!(fragment.files.is_empty());
+        } else {
+            let spilled = [
+                (spill_row_ids, ROW_ID_FIELD_ID),
+                (spill_created_at, ROW_CREATED_AT_VERSION_FIELD_ID),
+            ]
+            .into_iter()
+            .filter_map(|(spills, field_id)| spills.then_some(field_id))
+            .collect::<Vec<_>>();
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(fragment.files[0].fields.as_ref(), spilled.as_slice());
+            assert_eq!(
+                matches!(
+                    fragment.created_at_version_meta,
+                    Some(RowDatasetVersionMeta::Column)
+                ),
+                spill_created_at
+            );
+            let placed_created_at =
+                load_row_version_sequence(&dataset, &fragment, RowVersionKind::CreatedAt)
+                    .await
+                    .unwrap()
+                    .expect("created-at versions are placed once anything spills");
+            assert_eq!(versions_of(&placed_created_at), versions_of(&created_at));
+        }
     }
 
     /// The format allows the columns only in v2 files, so a legacy v1 table
