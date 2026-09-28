@@ -66,6 +66,16 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+/// A partition goes through the screened top-k scan only when it has more
+/// than this many rows per result. Screening computes a quantized sum for every
+/// row and then rescores its candidates exactly, in SIMD chunks of 16; with few
+/// rows per result most rows end up rescored, so the quantization and sums
+/// cost more than the scoring they skip. With 4-bit PQ at m=96 it lost to the
+/// bulk scan at 2.5 rows per result on x86 (won on Graviton3), and won on both
+/// at 5. Those ratios were measured when this routing was added, before later
+/// changes to candidate selection and the kernels, and have not been re-tuned.
+const MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN: usize = 4;
+
 /// Marker schema for the flat index, which stores no data of its own.
 static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
@@ -154,6 +164,23 @@ impl IvfSubIndex for FlatIndex {
         metrics.record_comparisons(storage.len());
 
         match prefilter.is_empty() {
+            // The calculator certifies that its top-k scan keeps every row the
+            // push below would, so it can skip scoring most rows.
+            true if storage.len() > k.saturating_mul(MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN)
+                && dist_calc.has_exact_topk_scan() =>
+            {
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    &mut res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+            }
             true => {
                 dist_calc.distance_all_with_scratch(
                     k,

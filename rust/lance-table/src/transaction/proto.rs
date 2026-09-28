@@ -812,6 +812,34 @@ mod tests {
     use crate::format::overlay::OverlayCoverage;
 
     #[test]
+    fn test_rewrite_frag_reuse_update_stays_in_memory() {
+        // The fragment reuse update never enters the transaction file:
+        // other writers' conflict decisions only need the fragment sets in
+        // `groups`.
+        let entry = crate::transaction::test_support::sample_index_metadata(
+            crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME,
+        );
+        let transaction = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(entry),
+            },
+            None,
+        );
+        let decoded = Transaction::try_from(pb::Transaction::from(&transaction)).unwrap();
+        match decoded.operation {
+            Operation::Rewrite {
+                frag_reuse_index, ..
+            } => {
+                assert!(frag_reuse_index.is_none());
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_data_overlay_operation_roundtrips() {
         // A DataOverlay operation survives the protobuf round-trip, preserving
         // the target fragment, the overlay's coverage, and its committed_version.

@@ -1609,6 +1609,73 @@ async fn unsupported_scalar_type_is_not_advertised_for_rewritten_fragments() {
     assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
 }
 
+/// System indexes are table-level metadata, not per-fragment query segments:
+/// MemWAL stores `fragment_bitmap: None` and has no remap plugin, so tagged
+/// coverage filtering must pass it through instead of silently dropping it
+/// (which would break MemWAL catch-up and statistics on any tagged table).
+/// A USER index without coverage must still be dropped.
+#[tokio::test]
+async fn tagged_coverage_filtering_bypasses_system_indexes() {
+    use lance_table::system_index::mem_wal::{
+        MEM_WAL_INDEX_NAME, MemWalIndexDetails, new_mem_wal_index_meta,
+    };
+
+    let mut dataset = fixture().await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    indices.push(
+        new_mem_wal_index_meta(dataset.manifest.version, MemWalIndexDetails::default()).unwrap(),
+    );
+    indices.push(IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "uncovered_idx".into(),
+        fields: vec![0],
+        covering_fields: vec![],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: None,
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    });
+    persist_fixture(&mut dataset, indices).await;
+
+    let loaded = dataset.load_indices().await.unwrap();
+    assert!(
+        loaded.iter().any(|index| index.name == MEM_WAL_INDEX_NAME),
+        "the MemWAL system index must survive tagged coverage filtering"
+    );
+    assert!(
+        loaded
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+    );
+    assert!(
+        !loaded.iter().any(|index| index.name == "uncovered_idx"),
+        "a user index without fragment coverage must still be dropped"
+    );
+    assert!(
+        dataset
+            .open_mem_wal_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .is_some(),
+        "the MemWAL index must open on a tagged table"
+    );
+}
+
 #[tokio::test]
 async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     use crate::index::frag_reuse::{FriQueryPlanKey, ResolvedRemapping, open_row_id_remapping};

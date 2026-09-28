@@ -18,6 +18,7 @@ use crate::dataset::mem_wal::TOMBSTONE;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -45,6 +46,10 @@ pub struct LsmScanPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which is what resolves a
+    /// generation's columns to the table's. Supplied by the caller rather than
+    /// read off whichever source happens to be present.
+    identity_schema: SchemaRef,
     /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
     /// Store params for opening SSTables, reusing the base dataset's store.
@@ -61,11 +66,13 @@ impl LsmScanPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
+        identity_schema: SchemaRef,
     ) -> Self {
         Self {
             collector,
             pk_columns,
             base_schema,
+            identity_schema,
             session: None,
             store_params: None,
             sstable_cache: None,
@@ -185,9 +192,13 @@ impl LsmScanPlanner {
                 (Some(n), false, false) => Some(n),
                 _ => None,
             };
-            let scan = self
-                .build_source_scan(&source, projection, filter, fetch)
-                .await?;
+            // Type-erased, not merely boxed: the `Send` proof recurses
+            // through a boxed future's concrete type but stops at a trait
+            // object. An arm resolves a generation's schema before it
+            // scans, which nests deeply enough to need that.
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                Box::pin(self.build_source_scan(&source, projection, filter, fetch));
+            let scan = arm.await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
             // Plain scans refill exactly, so keep the approximate-search
@@ -228,12 +239,39 @@ impl LsmScanPlanner {
                 scan
             };
 
-            source_plans.push(plan);
+            source_plans.push((plan, is_base));
         }
+
+        // Every arm has to agree before the union: a generation is written under
+        // the schema the shard held when it was sealed, so one sealed before a
+        // column was added does not carry it. `UnionExec` requires schema
+        // equality and does not reconcile.
+        //
+        // The base arm is the authority when it is here — it is the only source
+        // the schema change was applied to. Otherwise the newest generation is,
+        // and sources arrive generation-DESC, so it is the first of them.
+        let target = source_plans
+            .iter()
+            .find(|(_, is_base)| *is_base)
+            .or_else(|| source_plans.first())
+            .map(|(plan, _)| plan.schema());
+        let mut source_plans = match target {
+            Some(target) => source_plans
+                .into_iter()
+                .map(|(plan, _)| {
+                    if plan.schema() == target {
+                        Ok(plan)
+                    } else {
+                        project_to_canonical(plan, &target)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
         // Union, then coalesce into a single partition (UnionExec emits one
         // per arm; downstream consumers only read partition 0).
-        let mut plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
+        let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
             #[allow(deprecated)]
@@ -243,7 +281,7 @@ impl LsmScanPlanner {
 
         // Project to the canonical output schema, dropping `_rowaddr` /
         // `_memtable_gen` unless the caller opted in.
-        plan = project_to_canonical(
+        let mut plan = project_to_canonical(
             plan,
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address)?,
         )?;
@@ -335,37 +373,63 @@ impl LsmScanPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
 
-                let cols =
+                // Asked of this generation under its own names, so an older
+                // file is only asked for columns it has. A column it never had
+                // is filled in after the scan.
+                let asked_for =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
+                );
+                // A predicate the generation can answer is pushed into its scan
+                // under the names it has. One it cannot — because it names a
+                // column sealed before it existed, or a nested one — runs above
+                // the reconciliation instead, reading its columns from this
+                // scan, so they have to be in it whether the caller asked or
+                // not.
+                let (stored_filter, above) = generation.split_filter(filter);
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
                 scanner.with_row_address();
 
                 // Drop tombstones: fold `NOT _tombstone` into the predicate so
                 // it runs before the pushdown limit (counting only live rows).
                 // The older real row a tombstone supersedes is dropped by the
-                // cross-gen block-list, not by this filter. Gen written before
-                // deletes existed lack the column → no fold, nothing to drop.
+                // cross-gen block-list, not by this filter. A generation written
+                // before deletes existed lacks the column, so nothing is folded
+                // and there is nothing to drop.
                 let folded;
                 let effective: Option<&Expr> = if dataset.schema().field(TOMBSTONE).is_some() {
-                    folded = fold_not_tombstone(filter);
+                    folded = fold_not_tombstone(stored_filter.as_ref());
                     Some(&folded)
                 } else {
-                    filter
+                    stored_filter.as_ref()
                 };
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
-                // Per-source limit pushdown: SSTables are
-                // within-gen live (dedup-on-flush deletion vectors), so any
-                // `fetch` post-filter rows are valid contributions.
-                if let Some(fetch) = fetch {
+                // A limit under a filter that has not run would cut rows the
+                // filter never saw.
+                if let Some(fetch) = fetch.filter(|_| above.is_none()) {
                     scanner.limit(Some(fetch as i64), None)?;
                 }
 
-                scanner.create_plan().await
+                // Boxed at the call site, as the point-lookup arms are: the
+                // generation's own planning nests deeply enough that leaving
+                // this future inlined pushes the `Send` proof past rustc's
+                // recursion limit for callers stacked above it.
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
+                match &above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -378,6 +442,12 @@ impl LsmScanPlanner {
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
 
+                // Asked for under the table's own names, which is what a
+                // memtable stores them under: a memtable is created from the
+                // schema its writer holds, so a reader planning against that
+                // same schema needs no resolution. Pairing a memtable with a
+                // schema it was not created from is outside this contract --
+                // pass the memtable its own schema, or reopen the writer.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;

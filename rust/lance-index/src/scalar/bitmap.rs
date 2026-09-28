@@ -1067,8 +1067,7 @@ impl BitmapBatchWriter {
         if self.keys.is_empty() {
             return Ok(());
         }
-        let keys_array =
-            ScalarValue::iter_to_array(self.keys.drain(..).collect::<Vec<_>>()).unwrap();
+        let keys_array = ScalarValue::iter_to_array(std::mem::take(&mut self.keys)).unwrap();
         let total_size: usize = self.serialized.iter().map(|b| b.len()).sum();
         let mut binary_builder = BinaryBuilder::with_capacity(self.serialized.len(), total_size);
         for b in self.serialized.drain(..) {

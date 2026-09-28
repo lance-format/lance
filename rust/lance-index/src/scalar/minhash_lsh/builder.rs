@@ -383,7 +383,9 @@ fn read_spill_records(path: &Path, rows: Range<usize>) -> std::io::Result<Vec<(u
     let mut bytes = vec![0u8; rows.len() * BAND_ROW_BYTES];
     file.read_exact(&mut bytes)?;
     Ok(bytes
-        .chunks_exact(BAND_ROW_BYTES)
+        .as_chunks::<BAND_ROW_BYTES>()
+        .0
+        .iter()
         .map(|record| {
             let (key, doc_id) = record.split_at(8);
             (
