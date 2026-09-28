@@ -227,6 +227,11 @@ pub enum Operation {
     },
 
     /// Clone a dataset.
+    ///
+    /// Only a shallow clone can be committed through `CommitBuilder`. A deep
+    /// clone (`is_shallow = false`) must copy the source files first, so
+    /// committing one returns an invalid input error; use
+    /// `Dataset::deep_clone` instead.
     Clone {
         is_shallow: bool,
         ref_name: Option<String>,

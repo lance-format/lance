@@ -414,8 +414,10 @@ fn sample_segment(segment: &pb::U64Segment, rng: &mut SmallRng) -> Option<u64> {
             };
             let is_hole = array
                 .offsets
-                .chunks_exact(4)
-                .any(|hole| u32::from_le_bytes(hole.try_into().unwrap()) == offset);
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|hole| u32::from_le_bytes(*hole) == offset);
             (!is_hole).then_some(holes.start + offset as u64)
         }
         _ => unreachable!(),
@@ -457,8 +459,8 @@ fn shot_table_like(
             })
             .collect();
         slices.shuffle(&mut rng);
-        for pair in slices.chunks_exact(2) {
-            let mut pair = [pair[0], pair[1]];
+        for pair in slices.as_chunks::<2>().0 {
+            let mut pair = *pair;
             pair.sort_unstable();
             let segments = pair
                 .iter()

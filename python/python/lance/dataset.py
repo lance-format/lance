@@ -6497,6 +6497,10 @@ class LanceOperation:
         exposed so transactions returned by :meth:`LanceDataset.get_transactions`
         can represent clone metadata without losing information.
 
+        Only a shallow clone can be committed directly. A deep clone must copy
+        the source files first, so committing one raises ``OSError``; use
+        :meth:`LanceDataset.deep_clone` instead.
+
         Attributes
         ----------
         is_shallow: bool
