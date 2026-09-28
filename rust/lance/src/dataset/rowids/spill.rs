@@ -26,11 +26,12 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader, ReaderProjection};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{FileReader, ProjectedFileReader, ReaderProjection};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions;
 use lance_file::writer::FileWriterOptions;
@@ -165,31 +166,7 @@ impl RowLineageSpill {
 
     /// The hidden columns as write-schema fields, under their reserved ids.
     pub fn schema_fields(&self) -> Result<Vec<lance_core::datatypes::Field>> {
-        [
-            (self.row_ids, ROW_ID, ROW_ID_FIELD_ID),
-            (
-                self.created_at,
-                ROW_CREATED_AT_VERSION,
-                ROW_CREATED_AT_VERSION_FIELD_ID,
-            ),
-            (
-                self.last_updated_at,
-                ROW_LAST_UPDATED_AT_VERSION,
-                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
-            ),
-        ]
-        .into_iter()
-        .filter(|(spilled, _, _)| *spilled)
-        .map(|(_, name, id)| {
-            let mut field = lance_core::datatypes::Field::try_from(&ArrowField::new(
-                name,
-                DataType::UInt64,
-                false,
-            ))?;
-            field.id = id;
-            Ok(field)
-        })
-        .collect()
+        self.field_ids().map(lineage_field).collect()
     }
 
     /// The placement for one fragment whose own data file was written with
@@ -217,6 +194,25 @@ impl RowLineageSpill {
             file: None,
         }
     }
+}
+
+/// The hidden column a spilled lineage sequence is stored in: a non-nullable
+/// `UInt64` named after the sequence, under its reserved `field_id`.
+fn lineage_field(field_id: i32) -> Result<lance_core::datatypes::Field> {
+    let name = match field_id {
+        ROW_ID_FIELD_ID => ROW_ID,
+        ROW_CREATED_AT_VERSION_FIELD_ID => ROW_CREATED_AT_VERSION,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID => ROW_LAST_UPDATED_AT_VERSION,
+        _ => {
+            return Err(Error::internal(format!(
+                "field id {field_id} is not a row lineage field id"
+            )));
+        }
+    };
+    let mut field =
+        lance_core::datatypes::Field::try_from(&ArrowField::new(name, DataType::UInt64, false))?;
+    field.id = field_id;
+    Ok(field)
 }
 
 /// Decide which sequence types of `lineages` spill: each one whose encoding
@@ -519,7 +515,7 @@ pub async fn read_spilled_versions(
 /// Read the hidden `UInt64` column `field_id` of `fragment` in full: one
 /// value per physical row, from the one data file that carries the id.
 ///
-/// Callers box this future: it drives the full data file reader, and inlined
+/// Callers box this future: it drives the data file reader, and inlined
 /// into the row id index build (reached from `take`, and from there from index
 /// builds and `optimize_indices`) it makes those futures too deep for the trait
 /// solver to prove `Send`/`Sync` (E0275).
@@ -556,6 +552,21 @@ async fn read_spilled_column(
         )
     })?;
 
+    // The projected field is built from the reserved id rather than taken
+    // from the file schema. A column index counts physical columns -- one per
+    // leaf, and in 2.0 one per list or struct as well -- so once the lineage
+    // columns follow nested user columns, as in a compaction output, it is no
+    // longer the field's position among the file's top-level fields. Nor can
+    // the file schema be searched by id: a lineage-only file stores its
+    // fields under ids 0, 1 and 2.
+    let projection = ReaderProjection {
+        schema: Arc::new(Schema {
+            fields: vec![lineage_field(field_id)?],
+            metadata: Default::default(),
+        }),
+        column_indices: vec![column_index],
+    };
+
     // Resolved through `data_file_dir` rather than `data_dir` so a shallow
     // clone, which rewrites `base_id` on every referenced file, still finds it.
     let path: Path = dataset
@@ -569,46 +580,83 @@ async fn read_spilled_column(
     let file = scheduler
         .open_file(&path, &data_file.file_size_bytes)
         .await?;
-    let reader = FileReader::try_open(
-        file,
-        None,
-        Arc::<DecoderPlugins>::default(),
-        &dataset.metadata_cache.file_metadata_cache(&path),
-        dataset.file_reader_options.clone().unwrap_or_default(),
+    let options = dataset.file_reader_options.clone().unwrap_or_default();
+    let cache = dataset.metadata_cache.file_metadata_cache(&path);
+    let io =
+        Arc::new(LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size));
+    // An index past the file's columns means the data file entry and the file
+    // disagree. The reader would reject the projection as invalid input without
+    // naming the file, so it is checked here, once the column count is known.
+    let check_column_index = |num_columns: usize| {
+        if (column_index as usize) < num_columns {
+            Ok(())
+        } else {
+            Err(Error::corrupt_file_named(
+                &data_file.path,
+                format!(
+                    "spilled row lineage column {field_id} is at column index {column_index}, \
+                     but the file has only {num_columns} columns"
+                ),
+            ))
+        }
+    };
+    // A compaction output holds the lineage next to every user column, and
+    // decoding all their metadata to read one column would cost as much as
+    // opening the file for a scan. Past a few columns, only the one read here
+    // has its metadata fetched, by the same threshold the fragment reader uses.
+    let live_columns = data_file
+        .column_indices
+        .iter()
+        .filter(|column_index| **column_index >= 0)
+        .count();
+    let reader = versions::open_projected_reader(
+        data_file.file_version()?,
+        &projection,
+        projection.column_indices.len().saturating_mul(4) < live_columns,
+        || async {
+            let metadata_index = FileReader::read_metadata_index(&file).await?;
+            check_column_index(metadata_index.num_columns() as usize)?;
+            let reader = ProjectedFileReader::try_open_with_metadata_index(
+                io.clone(),
+                path.clone(),
+                Some(projection.clone()),
+                Arc::<DecoderPlugins>::default(),
+                Arc::new(metadata_index),
+                &cache,
+                options.clone(),
+            )
+            .await?;
+            Ok(Some(reader))
+        },
+        || async {
+            let metadata = FileReader::read_all_metadata(&file).await?;
+            check_column_index(metadata.column_infos.len())?;
+            ProjectedFileReader::try_open_with_file_metadata(
+                io.clone(),
+                path.clone(),
+                Some(projection.clone()),
+                Arc::<DecoderPlugins>::default(),
+                Arc::new(metadata),
+                &cache,
+                options.clone(),
+            )
+            .await
+        },
     )
     .await?;
 
-    // The lineage columns are flat primitives, so the file schema's column
-    // position is the column index in every file version.
-    let field = reader
-        .schema()
-        .fields
-        .get(column_index as usize)
-        .ok_or_else(|| {
-            Error::corrupt_file_named(
-                &data_file.path,
-                format!("spilled row lineage file has no column at index {column_index}"),
-            )
-        })?;
-    let projection = ReaderProjection {
-        schema: Arc::new(Schema {
-            fields: vec![field.clone()],
-            metadata: Default::default(),
-        }),
-        column_indices: vec![column_index],
-    };
-
     let mut values: Vec<u64> = Vec::with_capacity(reader.num_rows() as usize);
-    let mut stream = reader
-        .read_stream_projected(
+    let mut batches = reader
+        .read_tasks(
             ReadBatchParams::RangeFull,
             SPILL_BATCH_ROWS as u32,
-            8,
-            projection,
+            None,
             FilterExpression::no_filter(),
         )
-        .await?;
-    while let Some(batch) = stream.try_next().await? {
+        .await?
+        .map(|task| task.task)
+        .buffered(8);
+    while let Some(batch) = batches.try_next().await? {
         let column = batch
             .column(0)
             .as_any()
@@ -653,7 +701,8 @@ mod tests {
     use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
     use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
     use crate::dataset::{ColumnAlteration, UpdateBuilder, WriteMode, WriteParams};
-    use arrow_array::{Int32Array, RecordBatchIterator};
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{Int32Array, RecordBatchIterator, StringArray, StructArray};
     use arrow_schema::Field;
     use chrono::Utc;
     use lance_core::utils::tempfile::TempStrDir;
@@ -764,6 +813,18 @@ mod tests {
         assert_eq!(
             versions_of(&last_updated_at),
             versions_of(&lineage.last_updated_at)
+        );
+
+        // A data file entry that points past the file's columns is corruption
+        // of that file, not a bad projection from the caller.
+        fragment.files[0].column_indices = vec![3, 1, 2].into();
+        let error = read_spilled_row_ids(&dataset, &fragment).await.unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("is at column index 3, but the file has only 3 columns"),
+            "{error}"
         );
     }
 
@@ -926,62 +987,88 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// The user columns of a test table: its key column `i`, and possibly one
+    /// more column next to it.
+    #[derive(Clone, Copy, Debug)]
+    enum UserColumns {
+        KeyOnly,
+        /// Adds `meta: struct<a: int32, b: utf8>`, which from 2.1 on takes one
+        /// physical column per child and none for the struct itself.
+        WithStruct,
+        /// Adds `tags: list<utf8>`, which in 2.0 takes one physical column for
+        /// the list and one for its items.
+        WithList,
+        /// Adds `j: int32` holding the key again, so a schema change has a
+        /// column to rename, drop or cast while `i` still identifies every
+        /// row.
+        WithCopy,
+    }
+
+    /// A batch of `columns` holding `keys` in column `i`.
+    fn keyed_batch(columns: UserColumns, keys: std::ops::Range<i32>) -> RecordBatch {
+        let mut fields = vec![Field::new("i", DataType::Int32, false)];
+        let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int32Array::from_iter_values(keys.clone()))];
+        match columns {
+            UserColumns::KeyOnly => {}
+            UserColumns::WithStruct => {
+                let a: ArrayRef = Arc::new(Int32Array::from_iter_values(keys.clone()));
+                let b: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    keys.map(|key| format!("b{key}")),
+                ));
+                let meta = StructArray::from(vec![
+                    (Arc::new(Field::new("a", DataType::Int32, true)), a),
+                    (Arc::new(Field::new("b", DataType::Utf8, true)), b),
+                ]);
+                fields.push(Field::new("meta", meta.data_type().clone(), true));
+                arrays.push(Arc::new(meta));
+            }
+            UserColumns::WithList => {
+                let mut tags = ListBuilder::new(StringBuilder::new());
+                for key in keys {
+                    tags.values().append_value(format!("t{key}"));
+                    tags.append(true);
+                }
+                let tags = tags.finish();
+                fields.push(Field::new("tags", tags.data_type().clone(), true));
+                arrays.push(Arc::new(tags));
+            }
+            UserColumns::WithCopy => {
+                fields.push(Field::new("j", DataType::Int32, true));
+                arrays.push(Arc::new(Int32Array::from_iter_values(keys)));
+            }
+        }
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays).unwrap()
+    }
+
     /// A stable-row-id dataset built from `chunks` separate appends, so
     /// compacting it has several sequences to concatenate.
     async fn appended_dataset(uri: &str, chunks: i32, rows_per_chunk: i32) -> Dataset {
-        let schema = test_schema();
-        let mut dataset: Option<Dataset> = None;
-        for chunk in 0..chunks {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(
-                    (chunk * rows_per_chunk)..((chunk + 1) * rows_per_chunk),
-                ))],
-            )
-            .unwrap();
-            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-            dataset = Some(
-                Dataset::write(
-                    reader,
-                    uri,
-                    Some(WriteParams {
-                        enable_stable_row_ids: true,
-                        mode: if chunk == 0 {
-                            WriteMode::Create
-                        } else {
-                            WriteMode::Append
-                        },
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap(),
-            );
-        }
-        dataset.unwrap()
+        appended_dataset_with(uri, chunks, rows_per_chunk, UserColumns::KeyOnly, None).await
     }
 
-    /// Like [`appended_dataset`] with four appends of 250 rows, plus a column
-    /// `j` next to the key `i`, so a schema change has a column to rename,
-    /// drop or cast while `i` still identifies every row.
-    async fn two_column_dataset(uri: &str) -> Dataset {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("i", DataType::Int32, false),
-            Field::new("j", DataType::Int32, true),
-        ]));
+    /// [`appended_dataset`] with the given user columns, written in `version`,
+    /// or the default version when that is `None`.
+    async fn appended_dataset_with(
+        uri: &str,
+        chunks: i32,
+        rows_per_chunk: i32,
+        columns: UserColumns,
+        version: Option<LanceFileVersion>,
+    ) -> Dataset {
         let mut dataset: Option<Dataset> = None;
-        for chunk in 0..4 {
-            let keys = Int32Array::from_iter_values((chunk * 250)..((chunk + 1) * 250));
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(keys.clone()), Arc::new(keys)])
-                    .unwrap();
-            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        for chunk in 0..chunks {
+            let keys = (chunk * rows_per_chunk)..((chunk + 1) * rows_per_chunk);
+            let batch = keyed_batch(columns, keys);
+            let schema = batch.schema();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
             dataset = Some(
                 Dataset::write(
                     reader,
                     uri,
                     Some(WriteParams {
                         enable_stable_row_ids: true,
+                        data_storage_version: version,
                         mode: if chunk == 0 {
                             WriteMode::Create
                         } else {
@@ -1028,11 +1115,22 @@ mod tests {
         )
     }
 
+    /// Compaction writes the spilled columns after the user columns of its
+    /// output file. A column index counts physical columns, so after a
+    /// struct, or a list in 2.0, a lineage column's index no longer matches
+    /// its position among the file's top-level fields.
+    #[rstest]
+    #[case::flat(UserColumns::KeyOnly, None)]
+    #[case::nested_v2_2(UserColumns::WithStruct, Some(LanceFileVersion::V2_2))]
+    #[case::list_v2_0(UserColumns::WithList, Some(LanceFileVersion::V2_0))]
     #[tokio::test]
-    async fn compaction_spills_and_reads_back_row_lineage() {
+    async fn compaction_spills_and_reads_back_row_lineage(
+        #[case] columns: UserColumns,
+        #[case] version: Option<LanceFileVersion>,
+    ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut dataset = appended_dataset(uri, 4, 250).await;
+        let mut dataset = appended_dataset_with(uri, 4, 250, columns, version).await;
         spill_everything(&mut dataset).await;
         // Four appends at four versions, so the compacted created-at sequence
         // has four runs rather than one.
@@ -1066,18 +1164,27 @@ mod tests {
             "compaction must spill every sequence under a zero inline budget, got {metadata:?}"
         );
         // The three columns ride in the fragment's own data file, after the
-        // user column, so the fragment has no extra file to reference.
+        // user columns, so the fragment has no extra file to reference. Their
+        // column indices continue from the last physical user column.
         assert_eq!(metadata.files.len(), 1);
         let data_file = &metadata.files[0];
+        let (user_fields, lineage_fields) = data_file.fields.split_at(data_file.fields.len() - 3);
+        assert!(
+            user_fields.iter().all(|field| *field >= 0),
+            "unexpected data file fields {:?}",
+            data_file.fields
+        );
         assert_eq!(
-            data_file.fields.as_ref(),
+            lineage_fields,
             [
-                0,
                 ROW_ID_FIELD_ID,
                 ROW_CREATED_AT_VERSION_FIELD_ID,
                 ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
             ]
         );
+        let (user_columns, lineage_columns) = data_file.column_indices.split_at(user_fields.len());
+        let next = user_columns.iter().filter(|column| **column >= 0).count() as i32;
+        assert_eq!(lineage_columns, [next, next + 1, next + 2]);
         for field_id in data_file.fields.iter().filter(|id| **id < 0) {
             assert_eq!(
                 metadata.row_lineage_file(*field_id).unwrap(),
@@ -1415,7 +1522,6 @@ mod tests {
         use crate::dataset::{
             MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
         };
-        use arrow_array::StringArray;
 
         let dir = TempStrDir::default();
         let uri = dir.as_str();
@@ -1658,7 +1764,7 @@ mod tests {
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut dataset = two_column_dataset(uri).await;
+        let mut dataset = appended_dataset_with(uri, 4, 250, UserColumns::WithCopy, None).await;
         spill_everything(&mut dataset).await;
         match spilling_write {
             SpillingWrite::Update => {
