@@ -1580,18 +1580,20 @@ fn test_docset_remap_preserves_element_coordinates() {
     assert_eq!(docs.doc_index(1), vec![3]);
 }
 
-/// `contains_each` has to agree with a full decode for probes in the first and a
-/// middle full block, in the tail, before the first doc and past the last, for
-/// both tail codecs and both block sizes.
+/// `contains_each` has to agree with a full decode for probes in every block,
+/// before the first doc and past the last, for both tail codecs and both block
+/// sizes, and for a list that is only a tail or has no tail at all.
 #[rstest::rstest]
-#[case::fixed32_128(PostingTailCodec::Fixed32, 128)]
-#[case::varint_256(PostingTailCodec::VarintDelta, 256)]
+#[case::fixed32_128(PostingTailCodec::Fixed32, 128, 2 * 128 + 128 / 3)]
+#[case::varint_256(PostingTailCodec::VarintDelta, 256, 2 * 256 + 256 / 3)]
+#[case::tail_only(PostingTailCodec::VarintDelta, 128, 128 / 3)]
+#[case::no_tail(PostingTailCodec::Fixed32, 128, 2 * 128)]
 fn test_compressed_posting_contains_each_matches_full_decode(
     #[case] tail_codec: PostingTailCodec,
     #[case] block_size: usize,
+    #[case] length: usize,
 ) {
-    // Every third doc id from 5 on: two full blocks plus a partial tail.
-    let length = 2 * block_size + block_size / 3;
+    // Every third doc id from 5 on.
     let doc_ids: Vec<u32> = (0..length as u32).map(|i| 5 + 3 * i).collect();
     let freqs = vec![1u32; length];
     let blocks =
@@ -1616,7 +1618,7 @@ fn test_compressed_posting_contains_each_matches_full_decode(
 
     let last = *doc_ids.last().unwrap();
     let mut probes: Vec<u32> = vec![0, 4, 5, 6, 8, last, last + 1, last + 3];
-    for block_start in [block_size, 2 * block_size] {
+    for block_start in (0..length).step_by(block_size) {
         let first = doc_ids[block_start];
         probes.extend([first - 1, first, first + 3]);
     }

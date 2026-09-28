@@ -6080,8 +6080,8 @@ impl Scanner {
             scanned_fragments,
             resolved_fields,
             stats_scope,
-        )?
-        .with_emit_prefilter(emit_prefilter);
+            emit_prefilter,
+        )?;
         if let Some(shared_scorer) = shared_scorer {
             flat_plan = flat_plan.with_shared_scorer(shared_scorer);
         }

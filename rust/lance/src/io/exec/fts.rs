@@ -4494,8 +4494,9 @@ pub struct FlatCombinedFieldsExec {
     /// into document text.
     resolved_fields: Vec<ResolvedFtsField>,
     stats_scope: FlatStatsScope,
-    /// See [`Self::with_emit_prefilter`].
-    emit_prefilter: Option<PreFilterSource>,
+    /// Picks the emitted rows. The planner reads `unindexed_input` unfiltered, so
+    /// that the filter does not change the corpus statistics.
+    emit_prefilter: PreFilterSource,
     /// Publishes the blended scorer to an indexed sibling; see
     /// [`Self::with_shared_scorer`].
     shared_scorer: Option<Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>>,
@@ -4518,6 +4519,7 @@ impl DisplayAs for FlatCombinedFieldsExec {
 impl FlatCombinedFieldsExec {
     /// `resolved_fields` and a [`FlatStatsScope::PerColumn`] scope must hold one
     /// entry per target column, in query order.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         dataset: Arc<Dataset>,
         query: CombinedFieldsQuery,
@@ -4526,6 +4528,7 @@ impl FlatCombinedFieldsExec {
         scanned_fragments: roaring::RoaringBitmap,
         resolved_fields: Vec<ResolvedFtsField>,
         stats_scope: FlatStatsScope,
+        emit_prefilter: PreFilterSource,
     ) -> Result<Self> {
         let num_columns = query.column_names().len();
         let num_coverage = match &stats_scope {
@@ -4556,7 +4559,7 @@ impl FlatCombinedFieldsExec {
             scanned_fragments,
             resolved_fields,
             stats_scope,
-            emit_prefilter: None,
+            emit_prefilter,
             shared_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -4574,13 +4577,6 @@ impl FlatCombinedFieldsExec {
         self.shared_scorer = Some(scorer);
         self
     }
-
-    /// Select the emitted rows with `prefilter`, for a scan the planner reads
-    /// unfiltered so that the filter does not change the corpus statistics.
-    pub(crate) fn with_emit_prefilter(mut self, prefilter: PreFilterSource) -> Self {
-        self.emit_prefilter = Some(prefilter);
-        self
-    }
 }
 
 impl ExecutionPlan for FlatCombinedFieldsExec {
@@ -4590,11 +4586,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         let mut children = vec![&self.unindexed_input];
-        children.extend(
-            self.emit_prefilter
-                .as_ref()
-                .and_then(PreFilterSource::execution_plan),
-        );
+        children.extend(self.emit_prefilter.execution_plan());
         children
     }
 
@@ -4619,12 +4611,12 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             ));
         }
         // Reverse order: the optional prefilter child is last, so pop it first.
-        let emit_prefilter = match &self.emit_prefilter {
-            Some(source) if source.execution_plan().is_some() => Some(
-                source.with_execution_plan(children.pop().expect("child count checked above"))?,
-            ),
+        let emit_prefilter = if self.emit_prefilter.execution_plan().is_some() {
+            self.emit_prefilter
+                .with_execution_plan(children.pop().expect("child count checked above"))?
+        } else {
             // A prefilter source with no child of its own leaves the input last.
-            source => source.clone(),
+            self.emit_prefilter.clone()
         };
         let Some(unindexed_input) = children.pop() else {
             return Err(DataFusionError::Internal(
@@ -4748,24 +4740,21 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                     }
                 };
 
-                let emit_mask = match emit_prefilter {
-                    Some(prefilter) => {
-                        let pre_filter = build_prefilter_restricted_to_fragments(
-                            prefilter_context,
-                            partition,
-                            &prefilter,
-                            stats_mask_ds.clone(),
-                            scanned_fragments,
-                            // The external row-address mask is applied by the
-                            // planner's `RowAddrMaskFilterExec` wrap around this
-                            // node, so it stays out of the corpus statistics.
-                            PreFilterMasks::default(),
-                            &metrics_set,
-                        )?;
-                        pre_filter.wait_for_ready().await?;
-                        Some(pre_filter.mask())
-                    }
-                    None => None,
+                let emit_mask = {
+                    let pre_filter = build_prefilter_restricted_to_fragments(
+                        prefilter_context,
+                        partition,
+                        &emit_prefilter,
+                        stats_mask_ds.clone(),
+                        scanned_fragments,
+                        // The external row-address mask is applied by the
+                        // planner's `RowAddrMaskFilterExec` wrap around this
+                        // node, so it stays out of the corpus statistics.
+                        PreFilterMasks::default(),
+                        &metrics_set,
+                    )?;
+                    pre_filter.wait_for_ready().await?;
+                    pre_filter.mask()
                 };
 
                 flat_combined_fields_search_stream(
@@ -4773,7 +4762,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                     &columns,
                     doc_col_indices,
                     &stats_masks,
-                    emit_mask,
+                    Some(emit_mask),
                     matches!(stats_scope, FlatStatsScope::WholeCorpus),
                     &tokens,
                     tokenizer,
@@ -6812,6 +6801,7 @@ mod tests {
             roaring::RoaringBitmap::new(),
             resolved_fields,
             FlatStatsScope::PerColumn(vec![FlatStatsCoverage::default(); num_columns]),
+            PreFilterSource::None,
         )
         .unwrap();
         assert!(execute_results(&flat).await.unwrap().is_empty());
