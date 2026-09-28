@@ -534,14 +534,19 @@ pub(in super::super) struct BlendedRows {
 }
 
 /// Count the query tokens in every target column of a flat batch stream and blend
-/// them into per-row BM25F scoring inputs, retaining a row when any column has
-/// tokens.
+/// them into per-row BM25F scoring inputs.
 ///
 /// Unlike [`tokenize_and_count`], this walks all target columns in one pass,
 /// since a row may be empty in one field and populated in another. The
 /// per-column counts are dropped with each batch once blended; only the
 /// fixed-size [`FlatFieldStats`] needs them, so it is folded here, gated by
 /// `stats_masks`.
+///
+/// Every non-empty row is folded into the statistics, but only a row that can
+/// score is retained: one `emit_mask` selects and that holds a query term (every
+/// query term when `require_all_terms`). So the retained memory tracks the
+/// matches, not the scanned rows.
+#[allow(clippy::too_many_arguments)]
 pub(in super::super) async fn tokenize_and_blend_multi(
     input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
     tokenizer: Box<dyn LanceTokenizer>,
@@ -549,6 +554,8 @@ pub(in super::super) async fn tokenize_and_blend_multi(
     doc_col_indices: Arc<Vec<usize>>,
     weights: Arc<Vec<f32>>,
     stats_masks: Arc<Vec<Arc<RowAddrMask>>>,
+    emit_mask: Option<Arc<RowAddrMask>>,
+    require_all_terms: bool,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<(Vec<BlendedRows>, FlatFieldStats)> {
     let num_columns = doc_col_indices.len();
@@ -565,6 +572,7 @@ pub(in super::super) async fn tokenize_and_blend_multi(
             let doc_col_indices = doc_col_indices.clone();
             let weights = weights.clone();
             let stats_masks = stats_masks.clone();
+            let emit_mask = emit_mask.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
@@ -610,6 +618,10 @@ pub(in super::super) async fn tokenize_and_blend_multi(
                     }
                     let row_id = row_id_array.value(row);
                     let row_counts = &counts[row * counts_stride..(row + 1) * counts_stride];
+                    stats.fold_row(row_id, &stats_masks, lengths, row_counts);
+                    if emit_mask.as_ref().is_some_and(|mask| !mask.selected(row_id)) {
+                        continue;
+                    }
 
                     // Accumulate in column-slot order. f32 addition is not
                     // associative, so this order is part of the contract: it keeps
@@ -626,10 +638,18 @@ pub(in super::super) async fn tokenize_and_blend_multi(
                             *tf += weight * row_counts[base + term] as f32;
                         }
                     }
+                    // `And` spans the virtual field, so it checks the blended `tf'`.
+                    let matches = if require_all_terms {
+                        term_freqs.iter().all(|tf| *tf > 0.0)
+                    } else {
+                        term_freqs.iter().any(|tf| *tf > 0.0)
+                    };
+                    if !matches {
+                        blended.term_freqs.truncate(terms_start);
+                        continue;
+                    }
                     blended.row_ids.push(row_id);
                     blended.doc_lengths.push(doc_length);
-
-                    stats.fold_row(row_id, &stats_masks, lengths, row_counts);
                 }
 
                 let bytes_accumulated = bytes_accumulated.fetch_add(

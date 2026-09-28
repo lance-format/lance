@@ -104,6 +104,8 @@ pub async fn flat_combined_fields_search_stream(
         Arc::new(doc_col_indices),
         Arc::new(weights),
         Arc::new(stats_masks.to_vec()),
+        emit_mask,
+        operator == Operator::And,
         elapsed_compute.clone(),
     )
     .await?;
@@ -125,15 +127,8 @@ pub async fn flat_combined_fields_search_stream(
     let scores = {
         let terms_for_scoring = terms.clone();
         let scorer_for_scoring = scorer.clone();
-        let require_all_terms = operator == Operator::And;
         spawn_cpu(move || {
-            flat_combined_score(
-                &terms_for_scoring,
-                blended,
-                scorer_for_scoring.as_ref(),
-                require_all_terms,
-                emit_mask.as_deref(),
-            )
+            flat_combined_score(&terms_for_scoring, blended, scorer_for_scoring.as_ref())
         })
         .await?
     };
@@ -152,7 +147,8 @@ pub async fn flat_combined_fields_search_stream(
 }
 
 /// Score every retained flat row from its blended `dl'`/`tf'`, emitting
-/// `(ROW_ID, SCORE)` in [`FTS_SCHEMA`] for the rows `emit_mask` selects.
+/// `(ROW_ID, SCORE)` in [`FTS_SCHEMA`]. Rows the emit mask rejects or that miss
+/// the query terms were already dropped by [`tokenize_and_blend_multi`].
 ///
 /// Takes the chunks by value and drops each one as it is scored, so the blend and
 /// the output arrays are never both fully resident.
@@ -160,8 +156,6 @@ fn flat_combined_score(
     terms: &[String],
     blended: Vec<BlendedRows>,
     scorer: &CombinedFieldsBM25Scorer,
-    require_all_terms: bool,
-    emit_mask: Option<&RowAddrMask>,
 ) -> DataFusionResult<RecordBatch> {
     let num_terms = terms.len();
     let num_rows = blended.iter().map(|chunk| chunk.row_ids.len()).sum();
@@ -171,14 +165,7 @@ fn flat_combined_score(
         for (row, (input_row_id, dl_prime)) in
             chunk.row_ids.iter().zip(&chunk.doc_lengths).enumerate()
         {
-            if emit_mask.is_some_and(|mask| !mask.selected(*input_row_id)) {
-                continue;
-            }
             let tf_prime = &chunk.term_freqs[row * num_terms..(row + 1) * num_terms];
-            // `And` spans the virtual field, so it checks the blended `tf'`.
-            if require_all_terms && tf_prime.iter().any(|tf| *tf <= 0.0) {
-                continue;
-            }
             let score: f32 = terms
                 .iter()
                 .zip(tf_prime)
@@ -321,6 +308,8 @@ mod tests {
                         .map(|_| Arc::new(RowAddrMask::all_rows()))
                         .collect(),
                 ),
+                /*emit_mask=*/ None,
+                /*require_all_terms=*/ false,
                 None,
             )
             .await
@@ -352,6 +341,63 @@ mod tests {
             assert_eq!(stats.doc_freqs, vec![vec![rows; num_terms]; num_columns]);
         }
         assert!(footprints.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// Only the rows that can score are retained, but every non-empty row still
+    /// counts toward the corpus statistics, whether or not it is retained.
+    #[rstest::rstest]
+    #[case::or_keeps_any_match(None, false, vec![0, 1, 2])]
+    #[case::and_keeps_full_matches(None, true, vec![2])]
+    #[case::emit_mask_drops_rejected_rows(Some(1), false, vec![0, 2])]
+    #[tokio::test]
+    async fn test_flat_combined_fields_retains_only_scorable_rows(
+        #[case] blocked_row: Option<u64>,
+        #[case] require_all_terms: bool,
+        #[case] expected_row_ids: Vec<u64>,
+    ) {
+        let row_ids: Vec<u64> = (0..4).collect();
+        let docs = vec![
+            vec![Some("cat"), Some("bird"), Some("cat"), Some("bird")],
+            vec![Some("fish"), Some("dog"), Some("dog"), Some("fish")],
+        ];
+        let tokens = Arc::new(Tokens::new(
+            vec!["cat".to_string(), "dog".to_string()],
+            DocType::Text,
+        ));
+        let emit_mask = blocked_row.map(|row| {
+            Arc::new(RowAddrMask::all_rows().also_block(RowAddrTreeMap::from_iter([row])))
+        });
+        let (chunks, stats) = tokenize_and_blend_multi(
+            flat_input(&row_ids, &docs, 2),
+            InvertedIndexParams::default().build().unwrap(),
+            tokens,
+            Arc::new(vec![1, 2]),
+            Arc::new(vec![1.0, 1.0]),
+            Arc::new(vec![
+                Arc::new(RowAddrMask::all_rows()),
+                Arc::new(RowAddrMask::all_rows()),
+            ]),
+            emit_mask,
+            require_all_terms,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let retained: Vec<u64> = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.row_ids)
+            .copied()
+            .collect();
+        assert_eq!(retained, expected_row_ids);
+        let num_terms = 2;
+        for chunk in &chunks {
+            assert_eq!(chunk.doc_lengths.len(), chunk.row_ids.len());
+            assert_eq!(chunk.term_freqs.len(), chunk.row_ids.len() * num_terms);
+        }
+        // Row 3 matches nothing and is never retained, but still counts.
+        assert_eq!(stats.doc_counts, vec![4, 4]);
+        assert_eq!(stats.doc_freqs, vec![vec![2, 0], vec![0, 2]]);
     }
 
     /// A flat scan can legitimately see no batches at all (every scanned fragment
