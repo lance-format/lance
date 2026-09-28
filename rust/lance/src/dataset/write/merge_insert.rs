@@ -3827,6 +3827,7 @@ mod tests {
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use tokio::sync::{Barrier, Notify};
+    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
@@ -15257,7 +15258,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let external_dir = TempStrDir::default();
         let external_path = format!("{external_dir}/external.bin");
         std::fs::write(&external_path, b"external blob").unwrap();
-        let external_uri = format!("file://{external_path}");
+        let external_uri = Url::from_file_path(&external_path).unwrap().to_string();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
