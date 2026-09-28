@@ -2064,18 +2064,32 @@ async fn test_fts_combined_fields_overlay_preserves_fragment_corpus() {
 /// The index counts a stale row's old value and the flat scan folds in its current
 /// one, so the row is counted twice unless the old value is subtracted. Here that
 /// makes `alpha` look commoner than `beta` and flips the ranking. Ids alone would
-/// not catch it, because the same five rows come back either way.
+/// not catch it, because the same rows come back either way.
+///
+/// `multi_block` spreads the stale rows over several posting blocks of each term,
+/// including the first and the tail, so the subtraction has to find each one in
+/// the block that holds it.
+#[rstest]
+#[case::single_block(2, 3, &[0, 1])]
+#[case::multi_block(300, 400, &[0, 130, 299, 300, 520, 699])]
 #[tokio::test]
-async fn test_fts_combined_fields_overlay_preserves_every_score() {
-    let texts: &[&str] = &["alpha", "alpha", "beta", "beta", "beta"];
-    let mut dataset = create_text_dataset_with(&[("text", texts)], 5).await;
+async fn test_fts_combined_fields_overlay_preserves_every_score(
+    #[case] num_alpha: usize,
+    #[case] num_beta: usize,
+    #[case] stale_rows: &[u32],
+) {
+    let mut texts = vec!["alpha"; num_alpha];
+    texts.extend(vec!["beta"; num_beta]);
+    let mut dataset = create_text_dataset_with(&[("text", &texts)], texts.len()).await;
     build_text_fts_index(&mut dataset).await;
     let before =
         fts_combined_hits(&dataset, "alpha beta", &["text"], CombinedScan::default()).await;
     // `alpha` is the rarer term, so its rows lead.
-    assert_eq!(
-        before.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4]
+    assert_eq!(before.len(), texts.len());
+    assert!(
+        before[..num_alpha]
+            .iter()
+            .all(|(id, _)| (*id as usize) < num_alpha)
     );
 
     let dataset = commit_overlay(
@@ -2083,11 +2097,13 @@ async fn test_fts_combined_fields_overlay_preserves_every_score() {
         "combined_same_value_overlay_scores",
         0,
         &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([0, 1])),
-        vec![Arc::new(StringArray::from(vec![
-            Some("alpha"),
-            Some("alpha"),
-        ]))],
+        OverlayCoverage::dense(RoaringBitmap::from_iter(stale_rows.iter().copied())),
+        vec![Arc::new(StringArray::from(
+            stale_rows
+                .iter()
+                .map(|row| Some(texts[*row as usize]))
+                .collect::<Vec<_>>(),
+        ))],
     )
     .await;
 
