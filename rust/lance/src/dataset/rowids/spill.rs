@@ -1076,13 +1076,22 @@ mod tests {
             .collect()
     }
 
-    /// Resolving the rewritten rows' original created-at versions happens at
-    /// commit time, inside `lance-table`, which cannot read a data file. The
-    /// commit path reads the spilled sequences ahead of the build, so an
-    /// update on a spilled table keeps every row's lineage the way it does on
-    /// an inline one.
+    /// Updating rows whose lineage is spilled keeps every row's created-at
+    /// version. The update's scan reads each rewritten row's created-at
+    /// version, spilled column included. When what the update carries over
+    /// spills again, the writer places those versions and the commit only
+    /// stamps last-updated-at; when it fits inline, the commit resolves them
+    /// from the row ids, reading the source fragment's spilled sequences ahead
+    /// of the build. Deleted rows and a selection across the compacted
+    /// fragment's created-at runs mean a version read at the wrong offset
+    /// would show up as a neighbour's.
+    #[rstest]
+    #[case::writer_spills(true)]
+    #[case::commit_resolves(false)]
     #[tokio::test]
-    async fn updating_rows_with_spilled_lineage_keeps_their_created_at() {
+    async fn updating_rows_with_spilled_lineage_keeps_their_created_at(
+        #[case] update_spills: bool,
+    ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = appended_dataset(uri, 4, 250).await;
@@ -1090,16 +1099,34 @@ mod tests {
         compact_files(&mut dataset, one_fragment(), None)
             .await
             .unwrap();
+        // Deleted rows move the compacted fragment's scan positions away from
+        // its physical offsets, which its lineage is indexed by.
+        dataset.delete("i % 7 = 0").await.unwrap();
+        if !update_spills {
+            // A budget the update's carried-over lineage fits in, which leaves
+            // resolving the created-at versions to the commit.
+            dataset
+                .update_config([(INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "1000000")])
+                .await
+                .unwrap();
+        }
         let before = by_key(&collect_rows(&dataset).await);
-        // Row 700 came in the third append, so its created-at is not the
-        // default a reader would fall back to.
-        let (id_700, created_700, _) = before[&700];
-        assert_eq!(created_700, 3);
+        let selected = |key: i32| (240..260).contains(&key) || (745..755).contains(&key);
+        // The selection spans the run boundaries at 250, between the first
+        // and second appends, and at 750, between the third and fourth.
+        assert_eq!(
+            before
+                .iter()
+                .filter(|(key, _)| selected(**key))
+                .map(|(_, (_, created, _))| *created)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([1, 2, 3, 4])
+        );
 
         let updated = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("i = 700")
+            .update_where("(i >= 240 AND i < 260) OR (i >= 745 AND i < 755)")
             .unwrap()
-            .set("i", "7000")
+            .set("i", "i + 10000")
             .unwrap()
             .build()
             .unwrap()
@@ -1108,14 +1135,39 @@ mod tests {
             .unwrap();
         let updated = updated.new_dataset.as_ref();
         let update_version = updated.version().version;
-        let after = by_key(&collect_rows(updated).await);
+        let rewritten = updated
+            .manifest
+            .fragments
+            .last()
+            .expect("the update adds a fragment");
+        assert_eq!(
+            matches!(rewritten.row_id_meta, Some(RowIdMeta::Column)),
+            update_spills,
+            "{rewritten:?}"
+        );
+        assert_eq!(
+            matches!(
+                rewritten.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            ),
+            update_spills,
+            "{rewritten:?}"
+        );
 
-        // The rewritten row keeps its id and its created-at, and is stamped
+        // Each rewritten row keeps its id and its created-at, and is stamped
         // with the update's version; every other row is untouched.
-        assert_eq!(after[&7000], (id_700, created_700, update_version));
-        assert!(!after.contains_key(&700));
-        for (key, lineage) in before.iter().filter(|(key, _)| **key != 700) {
-            assert_eq!(after[key], *lineage, "row {key} must be untouched");
+        let after = by_key(&collect_rows(updated).await);
+        assert_eq!(after.len(), before.len());
+        for (key, (id, created, updated_at)) in before.iter() {
+            if selected(*key) {
+                assert_eq!(
+                    after[&(key + 10000)],
+                    (*id, *created, update_version),
+                    "row {key}"
+                );
+            } else {
+                assert_eq!(after[key], (*id, *created, *updated_at), "row {key}");
+            }
         }
         updated.validate().await.unwrap();
     }
@@ -1280,82 +1332,24 @@ mod tests {
         }
         patched.validate().await.unwrap();
     }
-    /// With the table opted in, an update spills the lineage of the rows it
-    /// rewrote at write time: their ids and created-at versions are known
-    /// before the commit and cannot change on a retry. The commit stamps the
-    /// last-updated-at version; the writer's placeholder is replaced.
+
+    /// An update carries the rewritten rows' ids and created-at versions over
+    /// and the commit stamps their last-updated-at version. On an opted-in
+    /// table what the update carries over spills at write time -- it is known
+    /// before the commit and a retry cannot change it -- while the commit's
+    /// stamp stays inline. Without the opt-in everything stays inline, as
+    /// every release has, and the lineage is the same.
+    #[rstest]
+    #[case::opted_in(true)]
+    #[case::not_opted_in(false)]
     #[tokio::test]
-    async fn update_on_an_opted_in_table_spills_the_rewritten_rows_lineage() {
+    async fn update_places_the_rewritten_rows_lineage(#[case] opted_in: bool) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = appended_dataset(uri, 4, 250).await;
-        spill_everything(&mut dataset).await;
-        let before = by_key(&collect_rows(&dataset).await);
-
-        let updated = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("i >= 500")
-            .unwrap()
-            .set("i", "i + 10000")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let updated = updated.new_dataset.as_ref();
-        let update_version = updated.version().version;
-
-        let rewritten = updated
-            .get_fragments()
-            .into_iter()
-            .map(|fragment| fragment.metadata().clone())
-            .find(|metadata| matches!(metadata.row_id_meta, Some(RowIdMeta::Column)))
-            .expect("the rewritten rows' fragment must spill its row ids");
-        assert!(
-            matches!(
-                rewritten.created_at_version_meta,
-                Some(RowDatasetVersionMeta::Column)
-            ),
-            "the created-at versions must spill with the row ids"
-        );
-        // The lineage file is one of the fragment's files, after its data.
-        assert_eq!(rewritten.files.len(), 2);
-        assert!(
-            rewritten.files[1].fields.iter().all(|field| *field < 0),
-            "the lineage file holds only lineage columns: {:?}",
-            rewritten.files[1].fields
-        );
-        assert!(
-            matches!(
-                rewritten.last_updated_at_version_meta,
-                Some(RowDatasetVersionMeta::Inline(_))
-            ),
-            "the commit stamps last-updated-at inline, got {:?}",
-            rewritten.last_updated_at_version_meta
-        );
-
-        let after = by_key(&collect_rows(updated).await);
-        for (key, (id, created, updated_at)) in before.iter() {
-            if *key >= 500 {
-                assert_eq!(
-                    after[&(key + 10000)],
-                    (*id, *created, update_version),
-                    "row {key}"
-                );
-            } else {
-                assert_eq!(after[key], (*id, *created, *updated_at), "row {key}");
-            }
+        if opted_in {
+            spill_everything(&mut dataset).await;
         }
-        updated.validate().await.unwrap();
-    }
-
-    /// Without the opt-in the same update places everything inline, as every
-    /// release has, and the lineage it carries is the same.
-    #[tokio::test]
-    async fn update_on_a_table_that_did_not_opt_in_keeps_lineage_inline() {
-        let dir = TempStrDir::default();
-        let uri = dir.as_str();
-        let dataset = appended_dataset(uri, 4, 250).await;
         let before = by_key(&collect_rows(&dataset).await);
 
         let updated = UpdateBuilder::new(Arc::new(dataset))
@@ -1371,13 +1365,57 @@ mod tests {
         let updated = updated.new_dataset.as_ref();
         let update_version = updated.version().version;
 
-        for fragment in updated.get_fragments() {
+        if opted_in {
+            let rewritten = updated
+                .get_fragments()
+                .into_iter()
+                .map(|fragment| fragment.metadata().clone())
+                .find(|metadata| matches!(metadata.row_id_meta, Some(RowIdMeta::Column)))
+                .expect("the rewritten rows' fragment must spill its row ids");
             assert!(
-                !fragment.metadata().has_spilled_row_lineage(),
-                "fragment {} spilled without the table opting in",
-                fragment.id()
+                matches!(
+                    rewritten.created_at_version_meta,
+                    Some(RowDatasetVersionMeta::Column)
+                ),
+                "the created-at versions must spill with the row ids"
             );
+            // The lineage file is one of the fragment's files, after its data,
+            // and holds only what the update carried over.
+            assert_eq!(rewritten.files.len(), 2);
+            assert_eq!(
+                rewritten.files[1].fields.as_ref(),
+                [ROW_ID_FIELD_ID, ROW_CREATED_AT_VERSION_FIELD_ID]
+            );
+            assert!(
+                matches!(
+                    rewritten.last_updated_at_version_meta,
+                    Some(RowDatasetVersionMeta::Inline(_))
+                ),
+                "the commit stamps last-updated-at inline, got {:?}",
+                rewritten.last_updated_at_version_meta
+            );
+            // The source fragments were plain appends, so this update is the
+            // commit that first spills anything and has to raise the flag.
+            assert_ne!(
+                updated.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                0,
+                "a spilled sequence must set the reader feature flag"
+            );
+            assert_ne!(
+                updated.manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                0,
+                "a spilled sequence must set the writer feature flag"
+            );
+        } else {
+            for fragment in updated.get_fragments() {
+                assert!(
+                    !fragment.metadata().has_spilled_row_lineage(),
+                    "fragment {} spilled without the table opting in",
+                    fragment.id()
+                );
+            }
         }
+
         let after = by_key(&collect_rows(updated).await);
         for (key, (id, created, updated_at)) in before.iter() {
             if *key >= 500 {
@@ -1391,6 +1429,12 @@ mod tests {
             }
         }
         updated.validate().await.unwrap();
+
+        // Re-opened cold, so the lineage is read through the committed
+        // manifest rather than from this process's caches.
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(by_key(&collect_rows(&reopened).await), after);
+        reopened.validate().await.unwrap();
     }
 
     /// The write that spills the fixture's lineage ahead of a schema change.
