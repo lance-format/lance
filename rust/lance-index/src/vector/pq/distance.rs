@@ -371,7 +371,7 @@ fn max_of<T: PartialOrd>(a: T, b: T) -> T {
 pub(super) fn bounded_4bit_scores(distance_table: &[f32]) -> bool {
     const NUM_CENTROIDS: usize = 16;
     let mut magnitude_sum = 0.0f32;
-    for table in distance_table.chunks_exact(NUM_CENTROIDS) {
+    for table in distance_table.as_chunks::<NUM_CENTROIDS>().0 {
         let mut max_magnitude = 0.0f32;
         for &d in table {
             if !d.is_finite() {

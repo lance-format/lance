@@ -889,7 +889,13 @@ fn sum_4bit_dist_table_transposed_scalar(
 ) {
     let dists = &mut dists[start..n];
     dists.fill(0);
-    for (column, tables) in dist_table.chunks_exact(32).take(code_len).enumerate() {
+    for (column, tables) in dist_table
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .take(code_len)
+        .enumerate()
+    {
         let (low_table, high_table) = tables.split_at(16);
         let column = &codes[column * n + start..column * n + n];
         for (dist, &code) in dists.iter_mut().zip(column) {
@@ -1090,7 +1096,13 @@ fn filter_transposed_batch_scalar(
     let end = n.min(start + TRANSPOSED_BATCH_SIZE);
     let sums = &mut sums[..end - start];
     sums.fill(0);
-    for (column, tables) in dist_table.chunks_exact(32).take(code_len).enumerate() {
+    for (column, tables) in dist_table
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .take(code_len)
+        .enumerate()
+    {
         let (low_table, high_table) = tables.split_at(16);
         let column = &codes[column * n + start..column * n + end];
         for (sum, &code) in sums.iter_mut().zip(column) {
