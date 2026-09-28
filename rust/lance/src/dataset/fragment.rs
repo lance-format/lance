@@ -1754,7 +1754,10 @@ impl FileFragment {
     /// Verifies:
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
-    /// * All data files exist and have the same length
+    /// * All data files holding user data exist and have the same length. A
+    ///   file kept only for the spilled row lineage it carries is not opened;
+    ///   [`Dataset::validate`] reads that lineage back, which checks its
+    ///   length.
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
@@ -1821,14 +1824,28 @@ impl FileFragment {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
-        // A file holding only row lineage columns has no dataset field to open
-        // it by; its length is checked against `physical_rows` when the
-        // sequences it carries are validated.
-        let user_data_files = self
-            .metadata
-            .files
-            .iter()
-            .filter(|data_file| data_file.fields.iter().any(|field| *field >= 0));
+        // A file that holds no field of the dataset schema is not opened when
+        // it holds no user field at all, or when the fragment keeps it for a
+        // spilled row lineage sequence it carries -- a data file whose user
+        // columns were all dropped or replaced after compaction wrote the
+        // lineage next to them. The sequences it carries are checked against
+        // `physical_rows` when they are validated. Any other file is opened,
+        // so a file listing only user fields the schema does not have is
+        // still reported.
+        let schema_field_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        let spilled_field_ids = self.metadata.spilled_row_lineage_field_ids();
+        let user_data_files = self.metadata.files.iter().filter(|data_file| {
+            let fields = &data_file.fields;
+            let holds_schema_field = fields.iter().any(|id| schema_field_ids.contains(id));
+            let holds_user_field = fields.iter().any(|id| *id >= 0);
+            let holds_spilled_lineage = fields.iter().any(|id| spilled_field_ids.contains(id));
+            holds_schema_field || (holds_user_field && !holds_spilled_lineage)
+        });
         let get_lengths = user_data_files.clone().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self

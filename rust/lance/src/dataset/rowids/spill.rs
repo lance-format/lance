@@ -740,9 +740,15 @@ async fn read_spilled_column(
 mod tests {
     use super::*;
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
-    use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
+    use crate::dataset::fragment::FileFragment;
+    use crate::dataset::optimize::{
+        CompactionMode, CompactionOptions, compact_files, plan_compaction,
+    };
     use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
-    use crate::dataset::{ColumnAlteration, UpdateBuilder, WriteMode, WriteParams};
+    use crate::dataset::transaction::Operation;
+    use crate::dataset::{
+        ColumnAlteration, NewColumnTransform, UpdateBuilder, WriteMode, WriteParams,
+    };
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray, StructArray};
     use arrow_schema::Field;
@@ -751,6 +757,7 @@ mod tests {
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
     use lance_table::feature_flags::FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
     use rstest::rstest;
 
     /// A sequence with no runs to exploit, which is what a globally shuffled
@@ -1348,6 +1355,11 @@ mod tests {
         );
         assert_eq!(collect_lineage(&dataset).await, before);
         dataset.validate().await.unwrap();
+
+        // The lineage-only file holds no dead user column, so it is no reason
+        // to compact the fragment again.
+        let plan = plan_compaction(&dataset, &one_fragment()).await.unwrap();
+        assert_eq!(plan.num_tasks(), 0);
     }
 
     /// Cleanup decides what to delete by walking
@@ -1912,5 +1924,208 @@ mod tests {
         // Re-opened cold, so the lineage is read back from the committed files.
         let reopened = Dataset::open(uri).await.unwrap();
         assert_eq!(by_key(&collect_rows(&reopened).await), expected);
+    }
+
+    /// How [`dropping_every_column_of_a_lineage_carrier_keeps_lineage_until_compaction`]
+    /// takes every user column away from the data file that compaction wrote
+    /// the lineage into.
+    #[derive(Debug, Clone, Copy)]
+    enum CarrierChange {
+        /// `k` is added in a file of its own and `i` and `j` are dropped. A
+        /// drop leaves the files it keeps as they are, so the data file still
+        /// lists the ids of `i` and `j`, which the schema no longer has.
+        Drop,
+        /// `i` and `j` are cast. A cast rewrites the columns under new field
+        /// ids into a new file and leaves their old ids, now dead, in the data
+        /// file.
+        Cast,
+        /// `i` and `j` are rewritten under their own field ids by a
+        /// `DataReplacement`, which tombstones them in the data file.
+        Replace,
+    }
+
+    /// Compaction writes the lineage into the fragment's data file, which
+    /// then outlives its user columns. It stays, as the lineage's only copy,
+    /// and neither reads nor `validate` open it for user data. The next
+    /// compaction rewrites the fragment, which moves the lineage next to the
+    /// live columns and lets the old file go. Binary copy cannot rewrite it,
+    /// so a compaction restricted to binary copy leaves the fragment alone
+    /// rather than planning a task that fails.
+    #[rstest]
+    #[case::drop(CarrierChange::Drop)]
+    #[case::cast(CarrierChange::Cast)]
+    #[case::replace(CarrierChange::Replace)]
+    #[tokio::test]
+    async fn dropping_every_column_of_a_lineage_carrier_keeps_lineage_until_compaction(
+        #[case] change: CarrierChange,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = appended_dataset_with(uri, 4, 250, UserColumns::WithCopy, None).await;
+        spill_everything(&mut dataset).await;
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+        let (row_ids, created_at, _) = collect_lineage(&dataset).await;
+
+        // The ids the data file lists for `i` and `j` once the change is made.
+        let carrier_user_fields = match change {
+            CarrierChange::Drop => {
+                // `k` lives in a file of its own, so dropping `i` and `j`
+                // leaves the compacted file with no field in the schema.
+                dataset
+                    .add_columns(
+                        NewColumnTransform::SqlExpressions(vec![("k".into(), "i + 1".into())]),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                dataset.drop_columns(&["i", "j"]).await.unwrap();
+                [0, 1]
+            }
+            CarrierChange::Cast => {
+                let alterations = [
+                    ColumnAlteration::new("i".into()).cast_to(DataType::Int64),
+                    ColumnAlteration::new("j".into()).cast_to(DataType::Int64),
+                ];
+                dataset.alter_columns(&alterations).await.unwrap();
+                [0, 1]
+            }
+            CarrierChange::Replace => {
+                let batch = keyed_batch(UserColumns::WithCopy, 0..1_000);
+                let fragments = dataset.get_fragments();
+                let replacement = fragments[0]
+                    .write_columns(futures::stream::iter([Ok(batch)]), dataset.schema())
+                    .await
+                    .unwrap();
+                let read_version = dataset.manifest.version;
+                let operation = Operation::DataReplacement {
+                    replacements: vec![replacement],
+                };
+                dataset = Dataset::commit(
+                    Arc::new(dataset),
+                    operation,
+                    Some(read_version),
+                    None,
+                    None,
+                    Arc::new(Default::default()),
+                    false,
+                )
+                .await
+                .unwrap();
+                [TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID]
+            }
+        };
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let metadata = fragments[0].metadata();
+        let carrier = metadata
+            .row_lineage_file(ROW_ID_FIELD_ID)
+            .unwrap()
+            .expect("the schema change must keep the lineage carrier");
+        let (user_fields, lineage_fields) = carrier.fields.split_at(2);
+        assert_eq!(user_fields, carrier_user_fields, "{metadata:?}");
+        assert_eq!(
+            lineage_fields,
+            [
+                ROW_ID_FIELD_ID,
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+            ]
+        );
+        assert!(
+            carrier
+                .fields
+                .iter()
+                .all(|field_id| dataset.schema().field_by_id(*field_id).is_none()),
+            "the carrier must have lost every user column: {metadata:?}"
+        );
+        dataset.validate().await.unwrap();
+        // A change may stamp every row as updated, so only the row ids and
+        // created-at versions are compared.
+        let changed = collect_lineage(&dataset).await;
+        assert_eq!((&changed.0, &changed.1), (&row_ids, &created_at));
+
+        let binary_copy_only = CompactionOptions {
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..one_fragment()
+        };
+        let plan = plan_compaction(&dataset, &binary_copy_only).await.unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+
+        compact_files(&mut dataset, one_fragment(), None)
+            .await
+            .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let metadata = fragments[0].metadata();
+        let mut expected_fields = dataset.schema().field_ids();
+        expected_fields.extend([
+            ROW_ID_FIELD_ID,
+            ROW_CREATED_AT_VERSION_FIELD_ID,
+            ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        ]);
+        assert_eq!(metadata.files.len(), 1, "{metadata:?}");
+        assert_eq!(
+            metadata.files[0].fields.as_ref(),
+            expected_fields.as_slice()
+        );
+        assert_eq!(collect_lineage(&dataset).await, changed);
+        dataset.validate().await.unwrap();
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(collect_lineage(&reopened).await, changed);
+
+        // What compaction wrote holds no dead user column, so it plans no
+        // further rewrite.
+        let plan = plan_compaction(&dataset, &one_fragment()).await.unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+    }
+
+    /// `FileFragment::validate` leaves a file without a schema field unopened
+    /// only when the fragment keeps it for a spilled sequence it carries, as
+    /// it keeps a lineage carrier whose user columns are gone. Any other file
+    /// whose user fields are all outside the schema is opened and reported, as
+    /// it always was, even when it lists a lineage id the fragment does not
+    /// spill.
+    #[rstest]
+    #[case::stale_user_file(vec![7], false)]
+    #[case::dead_lineage_carrier(vec![7, ROW_ID_FIELD_ID], true)]
+    #[case::unspilled_lineage_id(vec![7, ROW_ID_FIELD_ID], false)]
+    #[tokio::test]
+    async fn validate_skips_only_files_kept_for_spilled_lineage(
+        #[case] fields: Vec<i32>,
+        #[case] spills_row_ids: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let dataset = tiny_dataset(dir.as_str()).await;
+        let mut fragment = dataset.manifest.fragments[0].clone();
+        // A second entry for the fragment's data file, under field ids the
+        // schema does not have.
+        let mut extra = fragment.files[0].clone();
+        extra.column_indices = (0..fields.len() as i32).collect();
+        extra.fields = fields.into();
+        fragment.files.push(extra);
+        if spills_row_ids {
+            fragment.row_id_meta = Some(RowIdMeta::Column);
+        }
+
+        let result = FileFragment::new(Arc::new(dataset), fragment)
+            .validate()
+            .await;
+        if spills_row_ids {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not have any fields in common with the dataset schema"),
+                "{error}"
+            );
+        }
     }
 }

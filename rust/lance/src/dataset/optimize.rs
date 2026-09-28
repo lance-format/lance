@@ -134,7 +134,11 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_table::format::{Fragment, IndexMetadata, RowDatasetVersionSequence};
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
+use lance_table::format::{
+    Fragment, IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionSequence,
+};
 use lance_table::rowids::RowIdSequence;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
@@ -885,6 +889,19 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 .collect::<Vec<_>>()
         };
 
+        let schema_field_ids = dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        // Only reencoding reclaims a lineage carrier whose user columns are
+        // gone: its fields are not the schema's, so binary copy never applies
+        // to it, and under `ForceBinaryCopy` its task would fail the whole run.
+        let is_binary_copy_only = matches!(
+            self.options.compaction_mode(),
+            CompactionMode::ForceBinaryCopy
+        );
+
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
         let mut i = 0;
@@ -909,6 +926,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             let candidacy = if over_overlay_limit {
                 // Too many overlays: fully compact this fragment on its own,
                 // regardless of its size or deletion count.
+                Some(CompactionCandidacy::CompactItself)
+            } else if !is_binary_copy_only
+                && pins_dead_user_columns_for_lineage(&fragment, &schema_field_ids)
+            {
+                // Only a rewrite moves the row lineage out of a file whose
+                // user columns are all gone and lets the file go.
                 Some(CompactionCandidacy::CompactItself)
             } else if self.options.materialize_deletions
                 && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
@@ -1108,6 +1131,43 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     Ok(FragmentMetrics {
         physical_rows,
         num_deletions,
+    })
+}
+
+/// Whether one of `fragment`'s data files is referenced only for the row
+/// lineage columns it carries, while the user columns next to them have all
+/// been dropped or replaced. `schema_field_ids` holds the ids of the schema's
+/// fields.
+///
+/// Compaction writes spilled lineage into the data file of each fragment it
+/// writes. Once every user column in that file is dropped, cast or replaced,
+/// the lineage alone keeps the file, and its dead bytes, referenced: cleanup
+/// cannot remove it and nothing else rewrites it. A lineage-only file, which
+/// binary copy and update write, holds no dead user column and never matches;
+/// nor does any file compaction writes, so compacting a fragment that matches
+/// cannot leave one that matches again.
+fn pins_dead_user_columns_for_lineage(
+    fragment: &Fragment,
+    schema_field_ids: &HashSet<i32>,
+) -> bool {
+    fragment.files.iter().any(|file| {
+        let mut holds_dead_user_column = false;
+        let mut holds_lineage = false;
+        for field_id in file.fields.iter() {
+            if schema_field_ids.contains(field_id) {
+                return false;
+            }
+            match *field_id {
+                ROW_ID_FIELD_ID
+                | ROW_CREATED_AT_VERSION_FIELD_ID
+                | ROW_LAST_UPDATED_AT_VERSION_FIELD_ID => holds_lineage = true,
+                TOMBSTONE_FIELD_ID => holds_dead_user_column = true,
+                // A user field the schema no longer has: dropping a column
+                // leaves the ids of the files it keeps as they are.
+                other => holds_dead_user_column |= other >= 0,
+            }
+        }
+        holds_dead_user_column && holds_lineage
     })
 }
 
@@ -5071,6 +5131,39 @@ mod tests {
             (0..500)
                 .chain(scattered.iter().copied())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A fragment compacts on its own when one of its files is kept only for
+    /// the row lineage it carries next to user columns that are gone. Neither
+    /// layout compaction writes may qualify, or every compaction would plan
+    /// another. Field -2 is the tombstone and -3..=-5 are the lineage columns;
+    /// the schema holds fields 0 and 1, and 5 and 6 were dropped.
+    #[rstest]
+    #[case::in_file_carrier(vec![vec![0, 1, -3, -4, -5]], false)]
+    #[case::lineage_only_file(vec![vec![0, 1], vec![-3, -4, -5]], false)]
+    #[case::tombstoned_carrier(vec![vec![-2, -2, -3, -4, -5], vec![0, 1]], true)]
+    #[case::carrier_of_dropped_columns(vec![vec![5, 6, -3, -4, -5], vec![0, 1]], true)]
+    #[case::dead_file_without_lineage(vec![vec![-2, 6], vec![0, 1]], false)]
+    fn compaction_reclaims_lineage_carriers_of_dead_user_columns(
+        #[case] files: Vec<Vec<i32>>,
+        #[case] expected: bool,
+    ) {
+        let mut fragment = Fragment::new(0);
+        for (index, fields) in files.into_iter().enumerate() {
+            let column_indices = (0..fields.len() as i32).collect();
+            fragment.add_file(
+                format!("{index}.lance"),
+                fields,
+                column_indices,
+                ConcreteFileVersion::V2_2,
+                None,
+            );
+        }
+        let schema_field_ids = HashSet::from([0, 1]);
+        assert_eq!(
+            pins_dead_user_columns_for_lineage(&fragment, &schema_field_ids),
+            expected
         );
     }
 
