@@ -28,6 +28,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::generation_read::{GenerationRead, filter_above};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
@@ -81,6 +82,9 @@ pub struct LsmVectorSearchPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// The same schema with each field's id, which resolves a generation's
+    /// stored columns to the table's.
+    identity_schema: SchemaRef,
     /// Vector column name.
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
@@ -133,6 +137,7 @@ impl LsmVectorSearchPlanner {
         Self {
             collector,
             pk_columns,
+            identity_schema: base_schema.clone(),
             base_schema,
             vector_column,
             distance_type,
@@ -171,6 +176,16 @@ impl LsmVectorSearchPlanner {
     /// nothing to probe on the fresh tier. `ef` is what widens the search.
     pub fn with_ef(mut self, ef: Option<usize>) -> Self {
         self.ef = ef;
+        self
+    }
+
+    /// The table's schema carrying each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    ///
+    /// Defaults to the base schema, so a caller that has no ids to give is
+    /// matched by name as it was.
+    pub fn with_identity_schema(mut self, schema: SchemaRef) -> Self {
+        self.identity_schema = schema;
         self
     }
 
@@ -313,16 +328,21 @@ impl LsmVectorSearchPlanner {
                 (source, is_base, is_active, blocked, fetch_k)
             })
             .collect();
+        // Type-erased, not merely boxed: the `Send` proof recurses through a
+        // boxed future's concrete type but stops at a trait object, and an arm
+        // resolves a generation's schema before it searches.
         let built = futures::future::try_join_all(arm_inputs.iter().map(
             |(source, is_base, _, _, fetch_k)| {
-                Box::pin(self.build_knn_plan(
-                    source,
-                    query_vector,
-                    *fetch_k,
-                    nprobes,
-                    projection,
-                    *is_base && refine_base,
-                ))
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_knn_plan(
+                        source,
+                        query_vector,
+                        *fetch_k,
+                        nprobes,
+                        projection,
+                        *is_base && refine_base,
+                    ));
+                arm
             },
         ))
         .await?;
@@ -498,21 +518,66 @@ impl LsmVectorSearchPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                let cols =
+                // Asked of this generation under its own names: a rename moved
+                // the table's name while the file still holds the old one, so
+                // projecting the table's names would ask for a column that is
+                // not there.
+                let asked_for =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                let mut generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    asked_for,
+                );
+                // The index is on this generation's own column, under the name
+                // it had when the generation was sealed.
+                let Some(vector_column) = generation.stored_name(&self.vector_column) else {
+                    // The table dropped the column the search names, so this
+                    // generation has no candidates to offer.
+                    return self.empty_plan(projection);
+                };
+                let vector_column = vector_column.to_string();
+                // A predicate this generation cannot answer as written runs
+                // above the reconciliation, where the columns it names exist.
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
-                if let Some(ref filter) = self.filter {
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
+                if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the top-k.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
-                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
+                // A predicate that could not be pushed down runs above the
+                // reconciliation, which is after the search has chosen its
+                // top-k. Cutting to `k` first would drop rows that pass the
+                // predicate behind rows that do not, so this arm does not cut:
+                // it ranks everything it holds and lets the filter, and then
+                // the union's own top-k, decide. Only a generation the
+                // predicate cannot be translated against pays for this.
+                let k = match above {
+                    None => k,
+                    Some(_) => {
+                        let all = Box::pin(dataset.count_rows(None)).await?.max(1);
+                        // Logged because it is invisible otherwise: the query
+                        // is correct and simply slow, and the cause -- one
+                        // column this generation cannot be asked about under
+                        // its current name -- cannot be read off the query. It
+                        // clears when compaction folds the generation into base.
+                        log::warn!(
+                            "mem_wal vector search: ranking all {all} rows of a generation                              because a predicate could not be translated against it;                              requested k was {k}"
+                        );
+                        all
+                    }
+                };
+                scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
@@ -520,7 +585,14 @@ impl LsmVectorSearchPlanner {
                     scanner.ef(ef);
                 }
                 scanner.fast_search();
-                scanner.create_plan().await
+                // Boxed for the reason the scan planner's arm gives: a
+                // generation resolves its own schema before scanning, and
+                // the inlined future is too deep for the `Send` proof.
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
+                match &above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
+                }
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,

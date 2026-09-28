@@ -348,7 +348,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
-            0,
         );
 
         let diff = self.num_sub_vectors as f32 - 1.0;
@@ -418,7 +417,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code,
-            100,
         ))
     }
 

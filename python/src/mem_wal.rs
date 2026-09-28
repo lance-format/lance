@@ -22,7 +22,9 @@ use lance::dataset::mem_wal::scanner::{
     parse_filter_expr as parse_lsm_filter_expr,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
-use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
+use lance::dataset::mem_wal::{
+    LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
+};
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
@@ -726,9 +728,13 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        // A sealed generation stores the names it was written with, so the
+        // planner resolves its columns by id; `base_schema` carries none.
+        let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
         let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .with_identity_schema(identity_schema);
         Ok(Self {
             planner,
             dataset_schema: base_schema,
@@ -795,6 +801,8 @@ impl PyLsmVectorSearchPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        // See the point-lookup planner: a rename moves a name and keeps the id.
+        let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
 
         let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
 
@@ -815,6 +823,7 @@ impl PyLsmVectorSearchPlanner {
             vector_column,
             dist_type,
         )
+        .with_identity_schema(identity_schema)
         .with_dataset(ds);
         if let Some(filter) = filter {
             planner = planner.with_filter(Some(filter));

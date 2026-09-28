@@ -3,16 +3,31 @@
 
 //! Dataset API extensions for MemWAL.
 //!
-//! This module provides the user-facing API for initializing and using MemWAL
-//! on a Dataset.
-//!
 //! # Limitations
 //!
-//! MemWAL does not track dataset changes made after it is initialized: dropping
-//! or replacing a maintained index, or projecting away its column, leaves
-//! `maintained_indexes` naming something the writer cannot build. A change that
-//! races the initialization commit lands the same way. Both surface as a failing
-//! `mem_wal_writer`; handling them is follow-up work.
+//! `maintained_indexes` is fixed at initialization. An index created later is
+//! not maintained over the fresh tier. An index in the set that the dataset no
+//! longer has is skipped when a shard opens; naming one that never existed is
+//! rejected at initialization.
+//!
+//! A rename reaches sealed generations and replay, but not the active MemTable,
+//! which keeps its original names until its writer reopens.
+//!
+//! # Upgrading
+//!
+//! Generations are read by field id. Ones flushed before that carry positional
+//! ids instead, which mispair against a table whose ids have gaps, and nothing
+//! records which scheme a generation used. Compact generations into base before
+//! upgrading. Durable WAL entries are unaffected: they carry no ids.
+//!
+//! # Known gaps
+//!
+//! A schema change started on a handle opened before the MemWAL was installed
+//! still commits: the refusals below read MemWAL state from the caller's
+//! handle, and the conflict resolver accepts both commits in either order.
+//!
+//! Adding a non-nullable column is not refused, which leaves rows in older
+//! generations with no value for it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -678,8 +693,13 @@ impl DatasetMemWalExt for Dataset {
         // Get maintained_indexes from the MemWalIndex details
         let maintained_indexes = &mem_wal_index.details.maintained_indexes;
 
-        let index_configs =
-            build_index_configs(self, maintained_indexes, &config.hnsw_params).await?;
+        let index_configs = build_index_configs(
+            self,
+            maintained_indexes,
+            &config.hnsw_params,
+            OnMissingIndex::Skip,
+        )
+        .await?;
 
         // Set shard_id in config
         config.shard_id = shard_id;
@@ -702,11 +722,24 @@ impl DatasetMemWalExt for Dataset {
             base_path,
             base_uri,
             config,
-            Arc::new(self.schema().into()),
+            Arc::new(super::arrow_schema_with_field_ids(self.schema())),
             index_configs,
         )
         .await
     }
+}
+
+/// Whether an index the set names but the dataset does not have is fatal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnMissingIndex {
+    /// Validating a set before it is installed: a name that resolves to nothing
+    /// is the operator's mistake, and the only moment it can still be corrected.
+    Reject,
+    /// Opening a shard against a set installed earlier: the index may have been
+    /// dropped since, or carried away with the column it covered. The set
+    /// cannot be edited, so rejecting here refuses every read on the table for
+    /// something that costs only the fresh tier's copy of one index.
+    Skip,
 }
 
 /// Build the in-memory index configurations for `index_names`.
@@ -718,6 +751,7 @@ async fn build_index_configs(
     dataset: &Dataset,
     index_names: &[String],
     hnsw_params: &HashMap<String, HnswBuildParams>,
+    on_missing: OnMissingIndex,
 ) -> Result<Vec<MemIndexConfig>> {
     let mut index_configs = Vec::with_capacity(index_names.len());
     for index_name in index_names {
@@ -729,13 +763,26 @@ async fn build_index_configs(
             .load_indices_by_name(index_name)
             .await?
             .into_iter()
-            .next()
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
+            .next();
+
+        // An index the maintained set names and the dataset does not have:
+        // dropped outright, or carried away with the column it covered. Serve
+        // without it -- the base index is gone for everyone, so the fresh tier
+        // has nothing to keep in step with. See `OnMissingIndex::Skip`.
+        let Some(index_meta) = index_meta else {
+            if on_missing == OnMissingIndex::Reject {
+                return Err(Error::invalid_input(format!(
                     "Index '{}' from maintained_indexes not found on dataset",
                     index_name
-                ))
-            })?;
+                )));
+            }
+            log::warn!(
+                "index '{}' is named by maintained_indexes but is not on the dataset; \
+                 the fresh tier will not maintain it",
+                index_name
+            );
+            continue;
+        };
 
         // Detect index kind and create appropriate config
         let type_url = index_meta
@@ -782,7 +829,13 @@ async fn build_index_configs(
 pub async fn validate_maintained_indexes(dataset: &Dataset, index_names: &[String]) -> Result<()> {
     // Validation reads an index's name, column, and field id, never its HNSW
     // tuning, so the writer's build params are not needed here.
-    let index_configs = build_index_configs(dataset, index_names, &HashMap::new()).await?;
+    let index_configs = build_index_configs(
+        dataset,
+        index_names,
+        &HashMap::new(),
+        OnMissingIndex::Reject,
+    )
+    .await?;
 
     // The shard schema is base + `_tombstone`, as `ShardWriter::open` extends
     // it; field ids and the primary key resolve against that, not the base.

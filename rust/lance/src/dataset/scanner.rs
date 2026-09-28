@@ -18778,9 +18778,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let data = dataset.scan().try_into_batch().await.unwrap();
         let vectors = data["vec"].as_fixed_size_list();
 
-        // One 512-row partition and k=10 exceed max(FLAT_NUM_4BIT_PQ=200, k).
-        // Thus bulk scoring quantizes the middle rows; small fixtures or a large
-        // refinement budget would accidentally test only the exact prefix.
+        // One 512-row partition and k=10 leave most rows to the bulk scan's
+        // quantized screening; a large refinement budget would hide rows it
+        // wrongly drops.
         for query_row in [240, 360, 480] {
             let query = vectors.value(query_row);
             let make_scanner = |use_index| {

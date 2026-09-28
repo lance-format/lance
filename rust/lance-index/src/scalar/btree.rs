@@ -1198,6 +1198,23 @@ impl BTreeLookup {
     }
 }
 
+/// Pages read and materialized together per chunk of [`BTreeIndex::search_missing_pages`].
+///
+/// Loading pages one at a time costs a request per page, which dominates any
+/// query whose predicate spans many pages: a range covering most of a column
+/// touches one page per `batch_size` values.  Handing a chunk of the missing
+/// set to [`IndexReader::read_record_batches`] at once lets the reader merge
+/// neighbouring pages into shared requests.
+///
+/// Reading (and retaining) the *whole* missing set in one call would let peak
+/// memory and in-flight I/O scale with the entire predicate, which is
+/// unbounded for the billion-row scale `BTreeIndex` targets. Chunking keeps
+/// the coalescing benefit within a chunk while capping the working set to a
+/// fixed budget - each chunk's serialized pages are turned into cached
+/// [`FlatIndex`]es and dropped before the next chunk is read, at the cost of
+/// a few more requests than reading everything at once.
+const PAGE_PREFETCH_CHUNK_SIZE: usize = 128;
+
 // We only need to open a file reader for pages if we need to load a page.  If all
 // pages are cached we don't open it.  If we do open it we should only open it once.
 #[derive(Clone)]
@@ -1293,6 +1310,51 @@ impl IndexReader for LazyRangedIndexReader {
         reader
             .read_record_batch(local_page_idx as u64, batch_size)
             .await
+    }
+
+    /// Group the requested pages by the file that holds them, so each file
+    /// coalesces its own pages into one read rather than one read per page.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        // Keep each page's position in the request so the grouped reads can be
+        // scattered back into the order the caller asked for.
+        let mut by_file: HashMap<String, (Vec<u64>, Vec<usize>)> = HashMap::new();
+        for (position, page) in batch_numbers.iter().enumerate() {
+            let page_idx = *page as u32;
+            let (file_name, offset) = self.ranges_to_files.get(&page_idx).ok_or_else(|| {
+                Error::internal(format!(
+                    "Unexpected page index, index {} is out of range.",
+                    page_idx
+                ))
+            })?;
+            let entry = by_file.entry(file_name.clone()).or_default();
+            entry.0.push((page_idx - *offset) as u64);
+            entry.1.push(position);
+        }
+
+        let groups = by_file
+            .into_iter()
+            .map(|(file_name, (local_pages, positions))| async move {
+                let reader = self.get_reader(&file_name).await?;
+                let batches = reader.read_record_batches(&local_pages, batch_size).await?;
+                Result::Ok(positions.into_iter().zip(batches))
+            });
+        let groups = futures::future::try_join_all(groups).await?;
+
+        let mut results: Vec<Option<RecordBatch>> = vec![None; batch_numbers.len()];
+        for (position, batch) in groups.into_iter().flatten() {
+            results[position] = Some(batch);
+        }
+        results
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .ok_or_else(|| Error::internal("Missing page in ranged index read".to_string()))
+            })
+            .collect()
     }
 
     async fn read_range(
@@ -1688,6 +1750,8 @@ impl BTreeIndex {
         Ok(result)
     }
 
+    /// Look up a page, reading and caching it on its own if it is not already
+    /// cached.
     async fn lookup_page(
         &self,
         page_number: u32,
@@ -1707,6 +1771,130 @@ impl BTreeIndex {
         result.map(|(page, _)| page)
     }
 
+    /// Split `pages` into those already cached (looked up individually by the
+    /// caller) and those missing, the missing ones sorted by page id.
+    ///
+    /// Probing the cache for the whole page set before loading any of it is
+    /// what lets the misses be read together: within
+    /// [`Self::search_missing_pages`], sorting means each chunk's ranges are
+    /// ascending and disjoint, which is what lets the reader merge neighbours
+    /// into shared requests. The answer is a snapshot and may be stale by the
+    /// time a page is actually read (evicted by then, or already loaded by a
+    /// concurrent query); both call paths handle that through the cache's own
+    /// loader rather than assuming the snapshot still holds.
+    async fn partition_cached_pages(&self, pages: Vec<Matches>) -> (Vec<Matches>, Vec<Matches>) {
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        for matches in pages {
+            let is_cached = self
+                .index_cache
+                .get_with_key(&BTreePageKey {
+                    page_number: matches.page_id(),
+                })
+                .await
+                .is_some();
+            if is_cached {
+                cached.push(matches);
+            } else {
+                missing.push(matches);
+            }
+        }
+        missing.sort_unstable_by_key(Matches::page_id);
+        (cached, missing)
+    }
+
+    /// Read, cache, and search every page in `missing`,
+    /// [`PAGE_PREFETCH_CHUNK_SIZE`] pages at a time.
+    ///
+    /// `missing` must be sorted by page id (as returned by
+    /// [`Self::partition_cached_pages`]) so each chunk's ranges are ascending
+    /// and disjoint, which is what lets [`IndexReader::read_record_batches`]
+    /// merge neighbours into shared requests.
+    ///
+    /// A page is searched with the [`FlatIndex`] this call itself just built,
+    /// not with a follow-up cache lookup: without a warm, big-enough index
+    /// cache (no cache configured, or a chunk larger than the cache's
+    /// capacity) the page could already be evicted by the time a later step
+    /// looked it up, forcing an extra single-page read per page and making a
+    /// wide search cost *more* I/O than reading pages one at a time. The page
+    /// is still offered to the cache (so a concurrent or later query can
+    /// reuse it), but this call never depends on that succeeding. Each
+    /// chunk's materialized pages are searched and dropped before the next
+    /// chunk is read, which is what bounds peak memory to the chunk size
+    /// rather than the whole query.
+    ///
+    /// Each chunk records one [`MetricsCollector::record_batch_read`], so the
+    /// number of chunks a query actually took (as opposed to the number of
+    /// pages it materialized, via `record_parts_loaded`) is visible to
+    /// callers without needing `MetricsCollector::io_stats`.
+    async fn search_missing_pages(
+        &self,
+        missing: &[Matches],
+        index_reader: &LazyIndexReader,
+        query: &SargableQuery,
+        prebuilt: Option<&Arc<dyn PhysicalExpr>>,
+        track_nulls: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<PageMatches>> {
+        let mut results = Vec::with_capacity(missing.len());
+        for chunk in missing.chunks(PAGE_PREFETCH_CHUNK_SIZE) {
+            let reader = index_reader.get().await?;
+            let batch_numbers = chunk
+                .iter()
+                .map(|matches| matches.page_id() as u64)
+                .collect::<Vec<_>>();
+            let batches = reader
+                .read_record_batches(&batch_numbers, self.batch_size)
+                .await?;
+            metrics.record_batch_read();
+            if batches.len() != chunk.len() {
+                return Err(Error::internal(format!(
+                    "index reader returned {} batches for {} requested pages",
+                    batches.len(),
+                    chunk.len()
+                )));
+            }
+
+            let page_tasks =
+                chunk
+                    .iter()
+                    .copied()
+                    .zip(batches)
+                    .map(|(matches, serialized_page)| async move {
+                        let page_number = matches.page_id();
+                        let (subindex, was_cached) = self
+                            .index_cache
+                            .get_or_insert_with_key_hit(BTreePageKey { page_number }, move || {
+                                self.build_page(page_number, serialized_page, metrics)
+                            })
+                            .await?;
+                        if was_cached {
+                            metrics.record_index_cache_hit();
+                        } else {
+                            metrics.record_index_cache_miss();
+                        }
+                        Self::evaluate_page_matches(
+                            &subindex,
+                            matches,
+                            query,
+                            prebuilt,
+                            track_nulls,
+                            metrics,
+                        )
+                    });
+            // Bounded the same way the cached-page pipeline is, but only
+            // within a chunk - chunks themselves run one at a time (the `for`
+            // loop above), which is what keeps peak memory capped at one
+            // chunk's pages instead of the whole missing set.
+            let chunk_results: Vec<PageMatches> = stream::iter(page_tasks)
+                .buffered(get_num_compute_intensive_cpus())
+                .try_collect()
+                .await?;
+            results.extend(chunk_results);
+        }
+        Ok(results)
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn read_page(
         &self,
@@ -1714,15 +1902,28 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<FlatIndex> {
-        metrics.record_part_load();
-        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
         let serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
-        // Tagged async remap must run in this async context; the legacy
-        // synchronous remap is handled by `decode_page` (also used off the CPU
-        // pool in `prewarm`).
+        metrics.record_single_page_read();
+        self.build_page(page_number, serialized_page, metrics).await
+    }
+
+    /// Turn a page's serialized batch into a searchable page, applying
+    /// whichever row id remap is configured.
+    ///
+    /// Tagged async remap must run in this async context; the legacy
+    /// synchronous remap is handled by `decode_page` (also used off the CPU
+    /// pool in `prewarm`).
+    async fn build_page(
+        &self,
+        page_number: u32,
+        serialized_page: RecordBatch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<FlatIndex> {
+        metrics.record_part_load();
+        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         if let Some(remapper) = self.batch_remapper.as_ref() {
             let serialized_page =
                 remap_record_batch_async(remapper.as_ref(), serialized_page, 1).await?;
@@ -1806,9 +2007,25 @@ impl BTreeIndex {
         let subindex = self
             .lookup_page(matches.page_id(), index_reader, metrics)
             .await?;
+        Self::evaluate_page_matches(&subindex, matches, query, prebuilt, track_nulls, metrics)
+    }
 
-        // Each page hands back plain id arrays; the caller assembles the
-        // final `RowAddrTreeMap` once across all pages (see `search_with_options`).
+    /// Evaluate `matches` against an already-loaded page.
+    ///
+    /// Shared by [`Self::search_page`] (page already resident, from cache or
+    /// a single-page read) and [`Self::search_missing_pages`] (page just
+    /// built from a prefetch chunk), so both paths score a page the same way.
+    ///
+    /// Each page hands back plain id arrays; the caller assembles the final
+    /// `RowAddrTreeMap` once across all pages (see `search_with_options`).
+    fn evaluate_page_matches(
+        subindex: &FlatIndex,
+        matches: Matches,
+        query: &SargableQuery,
+        prebuilt: Option<&Arc<dyn PhysicalExpr>>,
+        track_nulls: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PageMatches> {
         match matches {
             // For a large IsIn the predicate is compiled once (see `search`) and
             // reused here, instead of rebuilding the whole IN-list per page.
@@ -2371,7 +2588,25 @@ impl ScalarIndex for BTreeIndex {
 
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
-        let page_tasks = pages
+        // Decide the whole page set before loading any of it, so the pages
+        // that are not cached can be fetched together rather than one
+        // request each - in fixed-size chunks (PAGE_PREFETCH_CHUNK_SIZE), so
+        // peak memory and in-flight I/O stay bounded instead of growing with
+        // the query. A missing page is searched as soon as its chunk is
+        // read, not via a follow-up cache lookup, so a small or absent index
+        // cache still gets the coalesced I/O (see `search_missing_pages`).
+        let (cached_pages, missing_pages) = self.partition_cached_pages(pages).await;
+        let missing_results = self
+            .search_missing_pages(
+                &missing_pages,
+                &lazy_index_reader,
+                query,
+                prebuilt.as_ref(),
+                options.track_nulls(),
+                metrics,
+            )
+            .await?;
+        let page_tasks = cached_pages
             .into_iter()
             .map(|page_index| {
                 self.search_page(
@@ -2385,15 +2620,20 @@ impl ScalarIndex for BTreeIndex {
                 .boxed()
             })
             .collect::<Vec<_>>();
-        debug!("Searching {} btree pages", page_tasks.len());
+        debug!(
+            "Searching {} btree pages ({} prefetched)",
+            page_tasks.len() + missing_results.len(),
+            missing_results.len()
+        );
 
         // Collect both matching row IDs and null row IDs from all pages
-        let results: Vec<PageMatches> = stream::iter(page_tasks)
+        let mut results: Vec<PageMatches> = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
             .try_collect()
             .await?;
+        results.extend(missing_results);
 
         // Assemble the result once. A page holds rows sorted by value, so its
         // ids are scattered across fragments; a per-page `RowAddrTreeMap`
@@ -3574,8 +3814,8 @@ mod tests {
 
     use super::{
         BTreeIndexPlugin, BTreeIndexState, BTreeLookup, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        Matches, OrderableScalarValue, part_lookup_file_path, part_page_data_file_path,
-        train_btree_index,
+        Matches, OrderableScalarValue, PAGE_PREFETCH_CHUNK_SIZE, part_lookup_file_path,
+        part_page_data_file_path, train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
@@ -3848,6 +4088,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_contains_keys_records_single_page_reads() {
+        // `contains_keys` looks each touched page up on its own - it never
+        // goes through the chunked `read_record_batches` path search() uses -
+        // so every distinct cold-cache page it touches should show up as a
+        // single-page read, not a batched one.
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 1000 distinct Int32 values at 64 per page is ~16 pages.
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Five keys, each landing on a different page (64 values apart).
+        let keys: Vec<ScalarValue> = [0, 64, 128, 192, 256]
+            .iter()
+            .map(|k| ScalarValue::Int32(Some(*k)))
+            .collect();
+
+        let metrics = LocalMetricsCollector::default();
+        index.contains_keys(&keys, &metrics).await.unwrap();
+
+        assert_eq!(
+            metrics.single_page_reads(),
+            5,
+            "expected one single-page read per distinct page contains_keys touched"
+        );
+        assert_eq!(
+            metrics.batch_reads(),
+            0,
+            "contains_keys should never use the batched read_record_batches path"
+        );
+    }
+
+    #[tokio::test]
     async fn test_page_cache() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
@@ -3931,6 +4226,288 @@ mod tests {
         assert_eq!(warm.index_cache_hits(), 1);
         assert_eq!(warm.index_cache_misses(), 0);
         assert_eq!(warm.parts_loaded.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_range_query_coalesces_page_reads() {
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 10k values at 64 per page is ~157 pages, enough that reading one page
+        // per request would be plainly visible in the IOPS count.
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // Ignore the I/O that loading the index itself did.
+        object_store.io_stats_incremental();
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
+            std::ops::Bound::Excluded(ScalarValue::Float32(Some(9000.0))),
+        );
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+        let SearchResult::Exact(selection) = result else {
+            panic!("expected an exact search result");
+        };
+        assert_eq!(selection.selected_rows().len(), Some(9000));
+
+        let parts_loaded = metrics.parts_loaded.load(Ordering::Relaxed) as u64;
+        assert!(
+            parts_loaded > 100,
+            "expected the range to span many pages, loaded {parts_loaded}"
+        );
+        // The pages are consecutive, so they should coalesce into a handful of
+        // requests rather than one per page.
+        let read_iops = object_store.io_stats_snapshot().read_iops;
+        assert!(
+            read_iops < parts_loaded / 4,
+            "expected {parts_loaded} pages to coalesce, but took {read_iops} reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wide_range_query_prefetches_in_bounded_chunks() {
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 40k values at 64 per page is ~625 pages, several times
+        // PAGE_PREFETCH_CHUNK_SIZE, so a query spanning all of them must be
+        // split across multiple prefetch chunks rather than handed to the
+        // reader in one call.
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(4000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // Ignore the I/O that loading the index itself did.
+        object_store.io_stats_incremental();
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
+            std::ops::Bound::Excluded(ScalarValue::Float32(Some(40000.0))),
+        );
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+        let SearchResult::Exact(selection) = result else {
+            panic!("expected an exact search result");
+        };
+        assert_eq!(selection.selected_rows().len(), Some(40000));
+
+        let parts_loaded = metrics.parts_loaded.load(Ordering::Relaxed) as u64;
+        let expected_chunks = parts_loaded.div_ceil(PAGE_PREFETCH_CHUNK_SIZE as u64);
+        assert!(
+            expected_chunks >= 3,
+            "expected the query to span several prefetch chunks, got {parts_loaded} pages / \
+             {PAGE_PREFETCH_CHUNK_SIZE} per chunk = {expected_chunks} chunks"
+        );
+
+        // Every page here is a cold-cache miss, so this counts
+        // `read_record_batches` calls exactly: one per prefetch chunk.
+        assert_eq!(
+            metrics.batch_reads() as u64,
+            expected_chunks,
+            "expected one batched read per prefetch chunk"
+        );
+        assert_eq!(
+            metrics.single_page_reads(),
+            0,
+            "a wide range query should never fall back to single-page reads"
+        );
+
+        // Each chunk still coalesces its own pages into a handful of requests,
+        // but a query spanning several chunks must take at least one request
+        // per chunk: a single request for the whole range would mean the
+        // missing set was handed to the reader all at once, unbounded,
+        // instead of PAGE_PREFETCH_CHUNK_SIZE pages at a time.
+        let read_iops = object_store.io_stats_snapshot().read_iops;
+        assert!(
+            read_iops >= expected_chunks,
+            "expected at least one request per prefetch chunk ({expected_chunks} chunks), but \
+             took only {read_iops} reads for {parts_loaded} pages"
+        );
+        assert!(
+            read_iops < parts_loaded / 4,
+            "expected {parts_loaded} pages to still coalesce within each chunk, but took \
+             {read_iops} reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wide_range_query_coalesces_without_index_cache() {
+        // With no index cache, a page built while prefetching one chunk is
+        // never findable through a later cache lookup - the search for that
+        // page must use the page this call itself just built, not go back to
+        // the cache, or every prefetched page gets read a second time on its
+        // own and a wide search costs *more* I/O than reading pages one at a
+        // time would.
+        let tmpdir = TempObjDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let test_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(4000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        // No index cache: a page inserted by one call is not guaranteed to
+        // still be there for a later lookup.
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Ignore the I/O that loading the index itself did.
+        object_store.io_stats_incremental();
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Float32(Some(0.0))),
+            std::ops::Bound::Excluded(ScalarValue::Float32(Some(40000.0))),
+        );
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+        let SearchResult::Exact(selection) = result else {
+            panic!("expected an exact search result");
+        };
+        assert_eq!(selection.selected_rows().len(), Some(40000));
+
+        let parts_loaded = metrics.parts_loaded.load(Ordering::Relaxed) as u64;
+        let expected_chunks = parts_loaded.div_ceil(PAGE_PREFETCH_CHUNK_SIZE as u64);
+        assert!(
+            expected_chunks >= 3,
+            "expected the query to span several prefetch chunks, got {parts_loaded} pages / \
+             {PAGE_PREFETCH_CHUNK_SIZE} per chunk = {expected_chunks} chunks"
+        );
+        assert_eq!(
+            metrics.batch_reads() as u64,
+            expected_chunks,
+            "expected one batched read per prefetch chunk even with no index cache"
+        );
+
+        // Bug being guarded against: a follow-up cache lookup after
+        // prefetching would always miss with no cache, falling back to one
+        // single-page read per page - single_page_reads and read_iops would
+        // then both track parts_loaded almost 1:1 instead of staying bounded.
+        assert_eq!(
+            metrics.single_page_reads(),
+            0,
+            "prefetched pages must be searched directly, not re-read one at a time \
+             because the cache couldn't retain them"
+        );
+        let read_iops = object_store.io_stats_snapshot().read_iops;
+        assert!(
+            read_iops < parts_loaded / 4,
+            "expected {parts_loaded} pages to still coalesce per chunk even with no index \
+             cache, but took {read_iops} reads (a read-per-page fallback would mean the \
+             prefetched page wasn't reused for the search)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batched_page_read_matches_individual_reads() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 1000 rows at 64 per page leaves a short final page, so the batched
+        // read has to clamp the last range the same way a single read does.
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(1));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+
+        let reader = test_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+        let num_pages = reader.num_batches(64).await as u64;
+        assert!(num_pages > 2, "expected several pages, got {num_pages}");
+
+        // Out of order and with a gap, to check the batched read puts the
+        // batches back in the order they were asked for.
+        let requested = [num_pages - 1, 0, 2];
+        let batched = reader.read_record_batches(&requested, 64).await.unwrap();
+        assert_eq!(batched.len(), requested.len());
+        for (page_number, batched_page) in requested.iter().zip(batched) {
+            let individual = reader.read_record_batch(*page_number, 64).await.unwrap();
+            assert_eq!(
+                batched_page, individual,
+                "page {page_number} differed between a batched and an individual read"
+            );
+        }
     }
 
     #[tokio::test]

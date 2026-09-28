@@ -69,6 +69,40 @@ pub trait MetricsCollector: Send + Sync {
         self.record_index_cache_misses(1);
     }
 
+    /// Record calls to `IndexReader::read_record_batches` made while serving
+    /// this query: one coalesced, batched request for several pages/parts at
+    /// once, as opposed to one request per page.
+    ///
+    /// This is a request count, not a page count - [`Self::record_parts_loaded`]
+    /// already tracks how many pages were materialized regardless of how many
+    /// requests it took to fetch them. A query whose predicate spans many
+    /// pages should show a `record_parts_loaded` count much larger than this
+    /// one when the reader is coalescing well. See
+    /// [`Self::record_single_page_reads`] for the unbatched counterpart -
+    /// together they account for every `IndexReader` read issued.
+    fn record_batch_reads(&self, _num_reads: usize) {}
+
+    /// Convenience for a single batched read.
+    fn record_batch_read(&self) {
+        self.record_batch_reads(1);
+    }
+
+    /// Record calls to `IndexReader::read_record_batch` (singular) made while
+    /// serving this query: one request for exactly one page/part, taken
+    /// outside of [`Self::record_batch_reads`]'s coalesced path - e.g. a
+    /// page that turned out to already be evicted by the time it was looked
+    /// up, or a caller (such as `BTreeIndex::contains_keys`) that looks pages
+    /// up individually rather than as a batch.
+    ///
+    /// A query dominated by this counter instead of `record_batch_reads` is
+    /// not benefiting from request coalescing.
+    fn record_single_page_reads(&self, _num_reads: usize) {}
+
+    /// Convenience for a single unbatched read.
+    fn record_single_page_read(&self) {
+        self.record_single_page_reads(1);
+    }
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///
@@ -100,9 +134,12 @@ pub struct LocalMetricsCollector {
     // Kept `pub(crate)` so that adding new metric fields to this public struct
     // does not break downstream callers that construct or destructure the
     // existing three fields. Callers can still read cumulative values via
-    // [`Self::index_cache_hits`] / [`Self::index_cache_misses`].
+    // [`Self::index_cache_hits`] / [`Self::index_cache_misses`] /
+    // [`Self::batch_reads`] / [`Self::single_page_reads`].
     pub(crate) index_cache_hits: AtomicUsize,
     pub(crate) index_cache_misses: AtomicUsize,
+    pub(crate) batch_reads: AtomicUsize,
+    pub(crate) single_page_reads: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -112,6 +149,8 @@ impl LocalMetricsCollector {
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
         other.record_index_cache_hits(self.index_cache_hits.load(Ordering::Relaxed));
         other.record_index_cache_misses(self.index_cache_misses.load(Ordering::Relaxed));
+        other.record_batch_reads(self.batch_reads.load(Ordering::Relaxed));
+        other.record_single_page_reads(self.single_page_reads.load(Ordering::Relaxed));
     }
 
     /// Cumulative index cache hits recorded so far.
@@ -122,6 +161,16 @@ impl LocalMetricsCollector {
     /// Cumulative index cache misses recorded so far.
     pub fn index_cache_misses(&self) -> usize {
         self.index_cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative batched `read_record_batches` calls recorded so far.
+    pub fn batch_reads(&self) -> usize {
+        self.batch_reads.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative unbatched `read_record_batch` calls recorded so far.
+    pub fn single_page_reads(&self) -> usize {
+        self.single_page_reads.load(Ordering::Relaxed)
     }
 }
 
@@ -147,6 +196,15 @@ impl MetricsCollector for LocalMetricsCollector {
         self.index_cache_misses
             .fetch_add(num_misses, Ordering::Relaxed);
     }
+
+    fn record_batch_reads(&self, num_reads: usize) {
+        self.batch_reads.fetch_add(num_reads, Ordering::Relaxed);
+    }
+
+    fn record_single_page_reads(&self, num_reads: usize) {
+        self.single_page_reads
+            .fetch_add(num_reads, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +217,8 @@ mod tests {
         comparisons: AtomicUsize,
         hits: AtomicUsize,
         misses: AtomicUsize,
+        batch_reads: AtomicUsize,
+        single_page_reads: AtomicUsize,
     }
 
     impl MetricsCollector for SumSink {
@@ -177,6 +237,12 @@ mod tests {
         fn record_index_cache_misses(&self, n: usize) {
             self.misses.fetch_add(n, Ordering::Relaxed);
         }
+        fn record_batch_reads(&self, n: usize) {
+            self.batch_reads.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_single_page_reads(&self, n: usize) {
+            self.single_page_reads.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -188,6 +254,12 @@ mod tests {
         local.record_part_load();
         local.record_index_load();
         local.record_comparisons(5);
+        local.record_batch_read();
+        local.record_batch_reads(2);
+        local.record_single_page_read();
+        local.record_single_page_reads(3);
+        assert_eq!(local.batch_reads(), 3);
+        assert_eq!(local.single_page_reads(), 4);
 
         let sink = SumSink {
             parts: AtomicUsize::new(0),
@@ -195,6 +267,8 @@ mod tests {
             comparisons: AtomicUsize::new(0),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            batch_reads: AtomicUsize::new(0),
+            single_page_reads: AtomicUsize::new(0),
         };
         local.dump_into(&sink);
 
@@ -203,6 +277,8 @@ mod tests {
         assert_eq!(sink.comparisons.load(Ordering::Relaxed), 5);
         assert_eq!(sink.hits.load(Ordering::Relaxed), 2);
         assert_eq!(sink.misses.load(Ordering::Relaxed), 3);
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(sink.single_page_reads.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -214,5 +290,9 @@ mod tests {
         collector.record_index_cache_miss();
         collector.record_index_cache_hits(10);
         collector.record_index_cache_misses(20);
+        collector.record_batch_read();
+        collector.record_batch_reads(10);
+        collector.record_single_page_read();
+        collector.record_single_page_reads(10);
     }
 }
