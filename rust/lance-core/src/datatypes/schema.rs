@@ -347,13 +347,21 @@ impl Schema {
             }
         }
 
+        // A negative id is reserved for system use; the only ones a schema may
+        // carry are the hidden row lineage columns a data file stores next to
+        // the user columns, as top-level fields under their own names. A
+        // nested field reusing one of these ids fails the duplicate check.
+        let row_lineage_ids = self
+            .fields
+            .iter()
+            .filter(|field| crate::row_lineage_field_id(&field.name) == Some(field.id))
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+
         // Check for duplicate field ids
         let mut seen_ids = HashSet::new();
         for field in self.fields_pre_order() {
-            // A negative id is reserved for system use; the only ones a schema
-            // may carry are the hidden row lineage columns a data file stores
-            // next to the user columns, and only under their own names.
-            if field.id < 0 && crate::row_lineage_field_id(&field.name) != Some(field.id) {
+            if field.id < 0 && !row_lineage_ids.contains(&field.id) {
                 return Err(Error::schema(format!(
                     "Field {} has a negative id {}",
                     field.name, field.id
@@ -1921,6 +1929,57 @@ mod tests {
         let error = schema.validate().unwrap_err();
         assert!(matches!(&error, Error::Schema { .. }));
         assert!(error.to_string().contains("Duplicate field id 0"));
+    }
+
+    #[test]
+    fn test_validate_admits_row_lineage_ids_only_at_top_level() {
+        let uint64_field = |name: &str, id: i32| {
+            let mut field = Field::new_arrow(name, DataType::UInt64, false).unwrap();
+            field.id = id;
+            field
+        };
+        let mut key = Field::new_arrow("i", DataType::Int32, false).unwrap();
+        key.id = 0;
+
+        // A hidden lineage column: top-level, under its own name's reserved id.
+        let schema = Schema {
+            fields: vec![key.clone(), uint64_field(ROW_ID, crate::ROW_ID_FIELD_ID)],
+            metadata: HashMap::new(),
+        };
+        schema.validate().unwrap();
+
+        // Another lineage column's id does not belong to this name.
+        let schema = Schema {
+            fields: vec![
+                key.clone(),
+                uint64_field(ROW_ID, crate::ROW_CREATED_AT_VERSION_FIELD_ID),
+            ],
+            metadata: HashMap::new(),
+        };
+        let error = schema.validate().unwrap_err();
+        assert!(matches!(error, Error::Schema { .. }), "{error}");
+        assert!(error.to_string().contains("negative id"), "{error}");
+
+        // A data file stores lineage columns only at the top level.
+        let mut parent = Field::new_arrow(
+            "s",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                ROW_CREATED_AT_VERSION,
+                DataType::UInt64,
+                false,
+            )])),
+            true,
+        )
+        .unwrap();
+        parent.id = 1;
+        parent.children[0].id = crate::ROW_CREATED_AT_VERSION_FIELD_ID;
+        let schema = Schema {
+            fields: vec![key, parent],
+            metadata: HashMap::new(),
+        };
+        let error = schema.validate().unwrap_err();
+        assert!(matches!(error, Error::Schema { .. }), "{error}");
+        assert!(error.to_string().contains("negative id"), "{error}");
     }
 
     #[test]
