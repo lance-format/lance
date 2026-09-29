@@ -1286,7 +1286,11 @@ impl InnerBuilder {
     async fn write_tokens(&mut self, store: &dyn IndexStore, path: &str) -> Result<IndexFile> {
         log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
-        let batch = tokens.to_batch(self.token_set_format)?;
+        let token_set_format = self.token_set_format;
+        // Sorting the tokens and building the FST takes seconds for a partition
+        // with millions of tokens. Tail partitions are written concurrently from
+        // one task, so doing it inline would serialize all of them.
+        let batch = spawn_cpu(move || tokens.to_batch(token_set_format)).await?;
         let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
         writer.finish().await
