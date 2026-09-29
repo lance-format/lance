@@ -422,14 +422,34 @@ impl CompressedPostingList {
         }
     }
 
-    pub(super) fn with_packed_first_docs(
-        mut self,
-        states: Arc<[OnceLock<Box<[u32]>>]>,
+    /// A view of one slot of a packed posting group, sharing the group's
+    /// lazily decoded block heads.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_packed_slot(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        posting_tail_codec: PostingTailCodec,
+        block_size: usize,
+        impacts: Option<ImpactSkipData>,
+        first_docs_states: Arc<[OnceLock<Box<[u32]>>]>,
         slot: usize,
     ) -> Self {
-        debug_assert!(slot < states.len());
-        self.first_docs = FirstDocsState::Packed { states, slot };
-        self
+        debug_assert!(block_size.is_power_of_two());
+        debug_assert!(slot < first_docs_states.len());
+        Self {
+            max_score,
+            length,
+            blocks,
+            posting_tail_codec,
+            block_size,
+            positions: None,
+            impacts,
+            first_docs: FirstDocsState::Packed {
+                states: first_docs_states,
+                slot,
+            },
+        }
     }
 
     /// Block sizes are validated powers of two, so per-doc hot loops derive
