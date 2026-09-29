@@ -98,7 +98,7 @@ impl CacheKey for MappingKey {
     }
 }
 
-pub(super) struct CachedMapping {
+pub struct CachedMapping {
     reader: Arc<dyn MappingReader>,
     cache: Option<(WeakLanceCache, MappingKey)>,
     grows_on_open: bool,
@@ -116,10 +116,7 @@ impl DeepSizeOf for CachedMapping {
 }
 
 impl CachedMapping {
-    pub(super) async fn remap_row_ids(
-        self: &Arc<Self>,
-        row_ids: &[u64],
-    ) -> Result<Vec<Option<u64>>> {
+    pub async fn remap_row_ids(self: &Arc<Self>, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
         let result = self.reader.remap_row_ids(row_ids).await;
         // TODO: Evaluate cache size accuracy versus latency impact.
         if self.grows_on_open {
@@ -136,7 +133,7 @@ impl CachedMapping {
     }
 
     #[cfg(test)]
-    pub(super) fn uncached(reader: Arc<dyn MappingReader>) -> Arc<Self> {
+    pub fn uncached(reader: Arc<dyn MappingReader>) -> Arc<Self> {
         Arc::new(Self {
             reader,
             cache: None,
@@ -146,7 +143,7 @@ impl CachedMapping {
     }
 }
 
-pub(super) async fn open_mapping(
+pub async fn open_mapping(
     dataset: &Dataset,
     transition: &Transition,
 ) -> Result<Arc<CachedMapping>> {

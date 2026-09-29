@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
@@ -46,7 +48,7 @@ use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
     BitmapIndexState, build_index_map, merge_index_maps, merge_source_entry_count,
-    new_bitmap_batch_writer, remap_index_map, remap_row_addrs,
+    new_bitmap_batch_writer, remap_index_map, remap_row_addrs_with,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -200,6 +202,40 @@ impl LabelListIndex {
     }
 }
 
+impl LabelListIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
+        let mut writer = new_bitmap_batch_writer(
+            dest_store,
+            BITMAP_LOOKUP_NAME,
+            self.values_index.value_type(),
+        )
+        .await?;
+        writer
+            .add_global_buffer(
+                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
+                serialize_list_nulls(&remapped_nulls)?,
+            )
+            .await?;
+        remap_index_map(&self.values_index, mapping, &mut writer).await?;
+        let file = writer.finish().await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
     #[instrument(skip_all, level = "debug")]
@@ -241,28 +277,15 @@ impl ScalarIndex for LabelListIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped_nulls = remap_row_addrs(&self.list_nulls, mapping)?;
-        let mut writer = new_bitmap_batch_writer(
-            dest_store,
-            BITMAP_LOOKUP_NAME,
-            self.values_index.value_type(),
-        )
-        .await?;
-        writer
-            .add_global_buffer(
-                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-                serialize_list_nulls(&remapped_nulls)?,
-            )
-            .await?;
-        remap_index_map(&self.values_index, mapping, &mut writer).await?;
-        let file = writer.finish().await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
-                .unwrap(),
-            index_version: LABEL_LIST_INDEX_VERSION,
-            files: vec![file],
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -1100,6 +1123,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
     use datafusion_common::ScalarValue;

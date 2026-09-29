@@ -351,6 +351,33 @@ async fn fri_query_plan(
         .await
 }
 
+/// Why the reader derives no coverage for the registered segment `index` on
+/// this snapshot, or `None` when it derives coverage (or identity) for it.
+/// Maintenance that rewrites a segment (remap) decides its eligibility from
+/// this before touching any file.
+pub(crate) async fn segment_coverage_reason(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> lance_core::Result<Option<MissingCoverageReason>> {
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(None);
+    };
+    if fri.index_version != 1 {
+        return Ok(None);
+    }
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+    Ok(match plan.segments.get(&index.uuid) {
+        Some(SegmentRemappingPlan::MissingCoverage(reason)) => Some(*reason),
+        Some(_) => None,
+        None => Some(MissingCoverageReason::NoDerivedCoverage),
+    })
+}
+
 /// Why the reader derives no coverage for `source`, from what it can see of
 /// the segment without opening its files.
 async fn missing_coverage_reason(

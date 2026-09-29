@@ -68,6 +68,7 @@ use lance_file::{
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
+use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
@@ -1557,6 +1558,13 @@ impl VectorIndex for IVFIndex {
         ))
     }
 
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize: see `remap`.
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
+    }
+
     fn ivf_model(&self) -> &IvfModel {
         &self.ivf
     }
@@ -2020,13 +2028,13 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap(mapping).await?;
+        page.remap_streaming(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2065,33 +2073,25 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
     Ok(tasks)
 }
 
-/// Run one builder's `remap` behind a heap pin so its state machine does not
-/// live inside `remap_index_file_v3`'s future.
+/// Runs one specialized builder's remap on the heap.
 ///
-/// Without this, every arm of the match below embeds its own
-/// `IvfIndexBuilder::remap` future as a stack temporary of the enclosing
-/// future, and that future is in turn embedded, unboxed, in `remap_vector_index`,
-/// `remap_index` and finally `compact_files`. The Python bindings drive
-/// `compact_files` with `block_on` on the calling thread, so the whole chain is
-/// polled on the Python thread's stack: on Windows that is the 1 MiB main-thread
-/// stack, and the dev-profile wheel (opt-level 0) keeps every temporary live.
-/// The eager compaction in `test_optimize.py::test_index_remapping*` overflowed
-/// that stack ("Windows fatal exception: stack overflow") once the remap chain
-/// grew past the threshold.
-///
-/// The return type is `impl Future` rather than `dyn Future` on purpose: the
-/// caller chain up to `DatasetIndexRemapper::remap_indices` needs the concrete
-/// future type to prove `Send`, and a `Box<dyn Future>` obligation there
-/// overflows the trait solver through the cache types (E0275 downstream).
-fn remap_boxed<S, Q>(
+/// The eager compaction remap runs under Python's `block_on` on the calling
+/// thread, and in CI (dev-profile wheel, opt-level 0) it overflowed the
+/// Windows main-thread stack. `remap_index_file_v3` dispatches over an 11-arm
+/// match whose arms each await a different monomorphization of
+/// `IvfIndexBuilder::remap_streaming`; without the box the outer future embeds
+/// every specialized builder future, and at opt-level 0 each arm's future is
+/// also materialized as a separate stack temporary while it is polled. Boxing
+/// per arm, in the concrete `Pin<Box<impl Future>>` form (a `dyn Future`
+/// trait object would put a `dyn Send` obligation in front of the solver, see
+/// `DatasetIndexRemapper::remap_indices`), leaves one pointer per arm
+/// on the caller's stack. The builder moves into the heap future too, so the
+/// dispatching future does not hold a builder across the await either.
+fn remap_boxed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     mut builder: IvfIndexBuilder<S, Q>,
-    mapping: &RowAddrRemap,
-) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>>
-where
-    S: IvfSubIndex + 'static,
-    Q: Quantization + 'static,
-{
-    Box::pin(async move { builder.remap(mapping).await })
+    mapping: &RowAddrTranslator,
+) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>> {
+    Box::pin(async move { builder.remap_streaming(mapping).await })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2099,7 +2099,7 @@ pub(crate) async fn remap_index_file_v3(
     dataset: &Dataset,
     new_uuid: &Uuid,
     index: Arc<dyn VectorIndex>,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     column: String,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
@@ -2222,7 +2222,7 @@ pub(crate) async fn remap_index_file(
     new_uuid: &Uuid,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
@@ -5045,6 +5045,7 @@ async fn train_ivf_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
 
     use std::collections::HashSet;
     use std::iter::repeat_n;
@@ -5842,7 +5843,7 @@ mod tests {
             &new_uuid,
             dataset_mut.version().version,
             ivf_index,
-            &RowAddrRemap::direct(mapping),
+            &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],

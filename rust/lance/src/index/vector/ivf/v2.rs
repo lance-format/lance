@@ -4,6 +4,7 @@
 //! IVF - Inverted File index.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -2866,6 +2867,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     }
 
     async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
+    }
+
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::index(
             "Remapping IVF in this way not supported".to_string(),
         ))
