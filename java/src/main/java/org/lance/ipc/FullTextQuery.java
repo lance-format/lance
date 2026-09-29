@@ -452,9 +452,18 @@ public abstract class FullTextQuery {
    *
    * <p>Target columns must be unique and share the same tokenizer/index configuration. When {@code
    * boosts} is given, its length must equal the number of columns and each per-column weight must
-   * be finite and {@code >= 1} (fractional weights allowed); when {@code null}, every column
-   * defaults to {@code 1.0}. A {@code null} operator defaults to {@link Operator#OR}. These
-   * constraints are validated in the Rust core and surface as an exception when the query runs.
+   * be a finite value in {@code [1, 2^20]} (fractional weights allowed); when {@code null}, every
+   * column defaults to {@code 1.0}. A {@code null} operator defaults to {@link Operator#OR}. These
+   * constraints are validated in the Rust core and surface as an {@link IllegalArgumentException}
+   * from {@code Dataset.newScan}, which builds the query when the scanner is created.
+   *
+   * <p>At least one target column needs an FTS index. Columns without an index, and rows added
+   * since the last index build, are read from the data and scored together with the indexed rows.
+   *
+   * <p>BM25F adds up each column's contribution for a whole row, so a column indexed only with
+   * {@link DocumentGranularity#LIST_ELEMENT} granularity is rejected, because its element
+   * coordinates have no counterpart in the other columns. A column that has both indexes uses the
+   * row one.
    */
   public static final class CombinedFieldsQuery extends FullTextQuery {
     private final String queryText;
