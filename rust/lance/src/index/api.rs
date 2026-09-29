@@ -152,6 +152,27 @@ pub trait IntoIndexSegment {
     fn into_index_segment(self) -> Result<IndexSegment>;
 }
 
+impl IndexSegment {
+    /// The segment as index metadata under `name`, for machinery that works
+    /// on manifest entries (the commit-time replay). Files are not carried:
+    /// the commit collects them from the index directory.
+    pub(crate) fn into_metadata(self, name: &str) -> IndexMetadata {
+        IndexMetadata {
+            uuid: self.uuid,
+            fields: self.fields,
+            covering_fields: self.covering_fields,
+            name: name.to_string(),
+            dataset_version: self.dataset_version,
+            fragment_bitmap: Some(self.fragment_bitmap),
+            index_details: Some(self.index_details),
+            index_version: self.index_version,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+}
+
 impl IntoIndexSegment for IndexSegment {
     fn into_index_segment(self) -> Result<IndexSegment> {
         Ok(self)
