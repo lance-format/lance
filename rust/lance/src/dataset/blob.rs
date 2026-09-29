@@ -51,6 +51,16 @@ use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
 
+mod ingest;
+
+use ingest::{
+    ExternalSlice, FetchWindow, INGEST_COALESCE_BUDGET, fetch_windows, ingest_coalesce_hole,
+    plan_coalesced_windows, slice_coalesced_bytes,
+};
+
+#[cfg(test)]
+use ingest::INGEST_FETCH_PARALLELISM;
+
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
@@ -437,7 +447,8 @@ impl RollingPackedBlobWriter {
 ///
 /// - Spills large blobs to sidecar files before encoding, reducing memory/CPU and avoiding copying huge payloads through page builders.
 /// - Emits `blob_id/blob_size` tied to the data file stem, giving readers a stable path independent of temporary fragment IDs assigned during write.
-/// - Leaves small inline blobs and URI rows unchanged for compatibility.
+/// - Leaves small inline blobs unchanged, and keeps external reference URIs as descriptors.
+/// - In ingest mode, nearby slices of one external object share a range read. Slices past the coalesce budget stream.
 pub struct BlobPreprocessor {
     object_store: ObjectStore,
     data_dir: Path,
@@ -463,6 +474,32 @@ struct ExternalBlobSource {
     reader: Box<dyn Reader>,
     start: u64,
     size: u64,
+}
+
+struct ExternalIngestRequest {
+    row: usize,
+    uri: String,
+    position: Option<u64>,
+    size: Option<u64>,
+}
+
+enum ClassifiedBlobRow {
+    Null,
+    Data,
+    Ingest,
+    Reference { offset: u64, size: u64 },
+}
+
+#[derive(Clone)]
+struct ExternalLocation {
+    store: Arc<ObjectStore>,
+    path: Path,
+    hole: u64,
+}
+
+struct CoalesceGroup {
+    location: ExternalLocation,
+    slices: Vec<ExternalSlice>,
 }
 
 /// A blob payload source used by packed and dedicated writers.
@@ -844,48 +881,6 @@ impl BlobPreprocessor {
         )))
     }
 
-    async fn open_external_source(
-        &mut self,
-        uri: &str,
-        position: Option<u64>,
-        size: Option<u64>,
-    ) -> Result<ExternalBlobSource> {
-        let (object_store, path) = ObjectStore::from_uri_and_params(
-            self.source_store_registry.clone(),
-            uri,
-            &self.source_store_params,
-        )
-        .await?;
-        let reader = object_store.open(&path).await?;
-        match (position, size) {
-            (Some(position), Some(size)) => {
-                position.checked_add(size).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "External blob range overflows u64: position={}, size={}",
-                        position, size
-                    ))
-                })?;
-                Ok(ExternalBlobSource {
-                    reader,
-                    start: position,
-                    size,
-                })
-            }
-            (None, None) => {
-                let size = reader.size().await? as u64;
-                Ok(ExternalBlobSource {
-                    reader,
-                    start: 0,
-                    size,
-                })
-            }
-            _ => Err(Error::invalid_input(format!(
-                "External blob URI '{}' must set both position and size when slicing for ingest",
-                uri
-            ))),
-        }
-    }
-
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let expected_columns = self.field_processors.len();
         if batch.num_columns() != expected_columns {
@@ -1158,6 +1153,77 @@ impl BlobPreprocessor {
             )));
         }
 
+        let (rows, requests) = Self::classify_logical_blob_rows(
+            field.name(),
+            struct_arr,
+            self.external_blob_mode == ExternalBlobMode::Ingest,
+        )?;
+        let mut prepared = if requests.is_empty() {
+            HashMap::new()
+        } else {
+            self.write_external_rows(
+                requests,
+                inline_threshold,
+                dedicated_threshold,
+                pack_file_threshold,
+            )
+            .await?
+        };
+        let data_col = struct_arr
+            .column_by_name("data")
+            .ok_or_else(|| Error::invalid_input("Blob struct missing `data` field"))?
+            .as_binary::<i64>();
+        let uri_col = struct_arr
+            .column_by_name("uri")
+            .ok_or_else(|| Error::invalid_input("Blob struct missing `uri` field"))?
+            .as_string::<i32>();
+
+        let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone());
+        for (i, row) in rows.into_iter().enumerate() {
+            match row {
+                ClassifiedBlobRow::Null => blob_writer.push_null()?,
+                ClassifiedBlobRow::Data => {
+                    let descriptor = self
+                        .store_payload(
+                            BlobWriteSource::Bytes(data_col.value(i)),
+                            inline_threshold,
+                            dedicated_threshold,
+                            pack_file_threshold,
+                        )
+                        .await?;
+                    blob_writer.push(descriptor)?;
+                }
+                ClassifiedBlobRow::Ingest => {
+                    let descriptor = prepared.remove(&i).ok_or_else(|| {
+                        Error::internal(format!(
+                            "Missing prepared external blob for row {i} during ingest"
+                        ))
+                    })?;
+                    blob_writer.push(descriptor)?;
+                }
+                ClassifiedBlobRow::Reference { offset, size } => {
+                    let (external_base_id, external_uri_or_path) =
+                        self.resolve_external_reference(uri_col.value(i)).await?;
+                    blob_writer.push(BlobDescriptor::External {
+                        base_id: external_base_id,
+                        uri: external_uri_or_path,
+                        offset,
+                        size,
+                    })?;
+                }
+            }
+        }
+
+        let column = blob_writer.finish()?;
+        let (field, array) = column.into_parts();
+        Ok((array, Arc::new(field)))
+    }
+
+    fn classify_logical_blob_rows(
+        field_name: &str,
+        struct_arr: &StructArray,
+        ingest: bool,
+    ) -> Result<(Vec<ClassifiedBlobRow>, Vec<ExternalIngestRequest>)> {
         let data_col = struct_arr
             .column_by_name("data")
             .ok_or_else(|| Error::invalid_input("Blob struct missing `data` field"))?
@@ -1173,155 +1239,268 @@ impl BlobPreprocessor {
             .column_by_name("size")
             .map(|col| col.as_primitive::<UInt64Type>());
 
-        let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone());
-
-        for i in 0..struct_arr.len() {
-            if struct_arr.is_null(i) {
-                blob_writer.push_null()?;
+        let mut rows = Vec::with_capacity(struct_arr.len());
+        let mut requests = Vec::new();
+        for row in 0..struct_arr.len() {
+            if struct_arr.is_null(row) {
+                rows.push(ClassifiedBlobRow::Null);
                 continue;
             }
-
-            let has_data = !data_col.is_null(i);
-            let has_uri = !uri_col.is_null(i);
-            let has_position = position_col
-                .as_ref()
-                .map(|col| !col.is_null(i))
-                .unwrap_or(false);
-            let has_size = size_col
-                .as_ref()
-                .map(|col| !col.is_null(i))
-                .unwrap_or(false);
-
-            if has_position != has_size {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' row {i} must set both `position` and `size`, or neither",
-                    field.name()
-                )));
+            let has_data = !data_col.is_null(row);
+            let uri = if uri_col.is_null(row) {
+                None
+            } else {
+                Some(uri_col.value(row))
+            };
+            let position = match &position_col {
+                Some(col) if !col.is_null(row) => Some(col.value(row)),
+                _ => None,
+            };
+            let size = match &size_col {
+                Some(col) if !col.is_null(row) => Some(col.value(row)),
+                _ => None,
+            };
+            match (has_data, uri, position, size) {
+                (_, _, Some(_), None) | (_, _, None, Some(_)) => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{field_name}' row {row} must set both `position` and `size`, or neither"
+                    )));
+                }
+                (_, None, Some(_), Some(_)) => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{field_name}' row {row} sets `position` and `size` but `uri` is null"
+                    )));
+                }
+                (true, Some(_), _, _) | (false, None, _, _) => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{field_name}' row {row} must set exactly one of `data` and `uri`"
+                    )));
+                }
+                (false, Some(_), Some(_), Some(0)) => {
+                    return Err(Error::invalid_input(format!(
+                        "Blob v2 field '{field_name}' row {row} external range `size` must be greater than zero"
+                    )));
+                }
+                (true, None, None, None) => rows.push(ClassifiedBlobRow::Data),
+                (false, Some(uri), None, None) => {
+                    if ingest {
+                        requests.push(ExternalIngestRequest {
+                            row,
+                            uri: uri.to_string(),
+                            position: None,
+                            size: None,
+                        });
+                        rows.push(ClassifiedBlobRow::Ingest);
+                    } else {
+                        rows.push(ClassifiedBlobRow::Reference { offset: 0, size: 0 });
+                    }
+                }
+                (false, Some(uri), Some(offset), Some(size)) => {
+                    if ingest {
+                        requests.push(ExternalIngestRequest {
+                            row,
+                            uri: uri.to_string(),
+                            position: Some(offset),
+                            size: Some(size),
+                        });
+                        rows.push(ClassifiedBlobRow::Ingest);
+                    } else {
+                        rows.push(ClassifiedBlobRow::Reference { offset, size });
+                    }
+                }
             }
-            if has_position && !has_uri {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' row {i} sets `position` and `size` but `uri` is null",
-                    field.name()
-                )));
-            }
-            if has_data == has_uri {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' row {i} must set exactly one of `data` and `uri`",
-                    field.name()
-                )));
-            }
-            if has_size && size_col.as_ref().is_some_and(|col| col.value(i) == 0) {
-                return Err(Error::invalid_input(format!(
-                    "Blob v2 field '{}' row {i} external range `size` must be greater than zero",
-                    field.name()
-                )));
-            }
+        }
+        Ok((rows, requests))
+    }
 
-            let data_len = if has_data { data_col.value(i).len() } else { 0 };
+    async fn write_external_rows(
+        &mut self,
+        requests: Vec<ExternalIngestRequest>,
+        inline_threshold: usize,
+        dedicated_threshold: usize,
+        pack_file_threshold: usize,
+    ) -> Result<HashMap<usize, BlobDescriptor>> {
+        let mut prepared = HashMap::with_capacity(requests.len());
+        let mut location_by_uri: HashMap<String, ExternalLocation> =
+            HashMap::with_capacity(requests.len());
+        let mut size_by_key: HashMap<BlobSourceKey, u64> = HashMap::new();
+        let mut grouped: HashMap<BlobSourceKey, CoalesceGroup> = HashMap::new();
+        let mut streamed = Vec::new();
+        let threshold = dedicated_threshold as u64;
 
-            if has_data && data_len > dedicated_threshold {
-                let value = Self::write_dedicated(
-                    self.object_store.clone(),
-                    self.data_dir.clone(),
-                    self.data_file_key.clone(),
-                    self.blob_id_allocator.clone(),
-                    BlobWriteSource::Bytes(data_col.value(i)),
+        for request in requests {
+            let location = if let Some(location) = location_by_uri.get(&request.uri) {
+                location.clone()
+            } else {
+                let location = self.locate_external(&request.uri).await?;
+                location_by_uri.insert(request.uri.clone(), location.clone());
+                location
+            };
+            let key = BlobSourceKey {
+                store_prefix: location.store.store_prefix.clone(),
+                path: location.path.to_string(),
+            };
+            let (start, size) = match (request.position, request.size) {
+                (Some(start), Some(size)) => (start, size),
+                (None, None) => {
+                    let size = if let Some(size) = size_by_key.get(&key) {
+                        *size
+                    } else {
+                        let size = location.store.size(&location.path).await?;
+                        size_by_key.insert(key.clone(), size);
+                        size
+                    };
+                    (0, size)
+                }
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "External blob URI '{}' must set both position and size when slicing for ingest",
+                        request.uri
+                    )));
+                }
+            };
+            if size == 0 {
+                prepared.insert(request.row, BlobDescriptor::Inline { data: Bytes::new() });
+                continue;
+            }
+            let end = start.checked_add(size).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "External blob range overflows u64: position={start}, size={size}"
+                ))
+            })?;
+            if Self::external_ingest_streams(size, threshold) {
+                streamed.push((request.row, location, start, size));
+                continue;
+            }
+            grouped
+                .entry(key)
+                .or_insert_with(|| CoalesceGroup {
+                    location,
+                    slices: Vec::new(),
+                })
+                .slices
+                .push(ExternalSlice {
+                    row: request.row,
+                    start,
+                    end,
+                });
+        }
+
+        for (row, location, start, size) in streamed {
+            let reader = location.store.open(&location.path).await?;
+            let descriptor = self
+                .store_payload(
+                    BlobWriteSource::External(&ExternalBlobSource {
+                        reader,
+                        start,
+                        size,
+                    }),
+                    inline_threshold,
+                    dedicated_threshold,
+                    pack_file_threshold,
                 )
                 .await?;
-                blob_writer.push(value)?;
-                continue;
-            }
+            prepared.insert(row, descriptor);
+        }
 
-            if has_data && data_len > inline_threshold {
-                let value = self
-                    .write_packed(
+        let windows = Self::plan_fetch_windows(grouped);
+        // Blob ids follow write order. Streamed slices are stored first, then each window in plan order.
+        let mut fetches = std::pin::pin!(fetch_windows(windows));
+        while let Some(window) = fetches.next().await {
+            let window = window?;
+            for slice in window.slices {
+                let view = slice_coalesced_bytes(&window.bytes, window.span_start, &slice)?;
+                let descriptor = self
+                    .store_payload(
+                        BlobWriteSource::Bytes(view.as_ref()),
+                        inline_threshold,
+                        dedicated_threshold,
                         pack_file_threshold,
-                        BlobWriteSource::Bytes(data_col.value(i)),
                     )
                     .await?;
-                blob_writer.push(value)?;
-                continue;
-            }
-
-            if has_uri {
-                let uri_val = uri_col.value(i);
-                if self.external_blob_mode == ExternalBlobMode::Ingest {
-                    let position = if has_position {
-                        Some(
-                            position_col
-                                .as_ref()
-                                .expect("position column must exist")
-                                .value(i),
-                        )
-                    } else {
-                        None
-                    };
-                    let size = if has_size {
-                        Some(size_col.as_ref().expect("size column must exist").value(i))
-                    } else {
-                        None
-                    };
-                    let source = self.open_external_source(uri_val, position, size).await?;
-                    let data_len = source.size();
-
-                    if data_len > dedicated_threshold as u64 {
-                        let value = Self::write_dedicated(
-                            self.object_store.clone(),
-                            self.data_dir.clone(),
-                            self.data_file_key.clone(),
-                            self.blob_id_allocator.clone(),
-                            BlobWriteSource::External(&source),
-                        )
-                        .await?;
-                        blob_writer.push(value)?;
-                        continue;
-                    }
-
-                    if data_len > inline_threshold as u64 {
-                        let value = self
-                            .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
-                            .await?;
-                        blob_writer.push(value)?;
-                        continue;
-                    }
-
-                    let data = source.read_all().await?;
-                    blob_writer.push_inline(data)?;
-                    continue;
-                }
-
-                let (external_base_id, external_uri_or_path) =
-                    self.resolve_external_reference(uri_val).await?;
-                let range = if has_position && has_size {
-                    BlobRange {
-                        offset: position_col
-                            .as_ref()
-                            .expect("position column must exist")
-                            .value(i),
-                        size: size_col.as_ref().expect("size column must exist").value(i),
-                    }
-                } else {
-                    BlobRange { offset: 0, size: 0 }
-                };
-                blob_writer.push(BlobDescriptor::External {
-                    base_id: external_base_id,
-                    uri: external_uri_or_path,
-                    offset: range.offset,
-                    size: range.size,
-                })?;
-                continue;
-            }
-
-            if has_data {
-                blob_writer.push_inline(Bytes::copy_from_slice(data_col.value(i)))?;
-            } else {
-                blob_writer.push_null()?;
+                prepared.insert(slice.row, descriptor);
             }
         }
 
-        let column = blob_writer.finish()?;
-        let (field, array) = column.into_parts();
-        Ok((array, Arc::new(field)))
+        Ok(prepared)
+    }
+
+    async fn store_payload(
+        &mut self,
+        source: BlobWriteSource<'_>,
+        inline_threshold: usize,
+        dedicated_threshold: usize,
+        pack_file_threshold: usize,
+    ) -> Result<BlobDescriptor> {
+        let byte_len = match &source {
+            BlobWriteSource::Bytes(data) => data.len() as u64,
+            BlobWriteSource::External(source) => source.size(),
+        };
+        if byte_len > dedicated_threshold as u64 {
+            return Self::write_dedicated(
+                self.object_store.clone(),
+                self.data_dir.clone(),
+                self.data_file_key.clone(),
+                self.blob_id_allocator.clone(),
+                source,
+            )
+            .await;
+        }
+        if byte_len > inline_threshold as u64 {
+            return self.write_packed(pack_file_threshold, source).await;
+        }
+        // Copy. A slice would keep the source allocation until the column finishes.
+        let data = match source {
+            BlobWriteSource::Bytes(data) => Bytes::copy_from_slice(data),
+            BlobWriteSource::External(source) => {
+                let read = source.read_all().await?;
+                Bytes::copy_from_slice(&read)
+            }
+        };
+        Ok(BlobDescriptor::Inline { data })
+    }
+
+    async fn locate_external(&mut self, uri: &str) -> Result<ExternalLocation> {
+        let (store, path) = ObjectStore::from_uri_and_params(
+            self.source_store_registry.clone(),
+            uri,
+            &self.source_store_params,
+        )
+        .await?;
+        let hole = ingest_coalesce_hole(store.is_local(), store.block_size() as u64);
+        Ok(ExternalLocation { store, path, hole })
+    }
+
+    fn plan_fetch_windows(groups: HashMap<BlobSourceKey, CoalesceGroup>) -> Vec<FetchWindow> {
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by(|left, right| {
+            left.0
+                .store_prefix
+                .cmp(&right.0.store_prefix)
+                .then(left.0.path.cmp(&right.0.path))
+        });
+        let mut windows = Vec::new();
+        for (_, group) in groups {
+            let planned =
+                plan_coalesced_windows(group.slices, group.location.hole, INGEST_COALESCE_BUDGET);
+            for window in planned {
+                let store = group.location.store.clone();
+                let path = group.location.path.clone();
+                // Open inside the fetch so queued windows don't hold file handles.
+                let open_reader = async move { store.open(&path).await }.boxed();
+                windows.push(FetchWindow {
+                    start: window.start,
+                    end: window.end,
+                    slices: window.slices,
+                    open_reader,
+                });
+            }
+        }
+        windows
+    }
+
+    fn external_ingest_streams(size: u64, dedicated_threshold: u64) -> bool {
+        size > dedicated_threshold || size > INGEST_COALESCE_BUDGET
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
@@ -4731,10 +4910,10 @@ mod tests {
     use super::{
         BlobEntry, BlobFile, BlobMaterializationBudget, BlobMaterializationBudgetState,
         BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ExternalBlobSource, ReadBlobsExecution, blob_version_from_descriptions,
-        collect_blob_files_v1, data_file_key_from_path, execute_blob_entries,
-        execute_blob_read_batches_stream, execute_blob_read_plan, plan_blob_read_batches,
-        plan_blob_read_plans,
+        ExternalBlobSource, INGEST_COALESCE_BUDGET, INGEST_FETCH_PARALLELISM, ReadBlobsExecution,
+        blob_version_from_descriptions, collect_blob_files_v1, data_file_key_from_path,
+        execute_blob_entries, execute_blob_read_batches_stream, execute_blob_read_plan,
+        plan_blob_read_batches, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -5045,6 +5224,25 @@ mod tests {
         active_blob_requests: AtomicUsize,
         peak_active_blob_requests: AtomicUsize,
         request_started: Notify,
+        live_read_bytes: Arc<AtomicUsize>,
+        peak_live_read_bytes: AtomicUsize,
+    }
+
+    struct TrackedRead {
+        data: Vec<u8>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for TrackedRead {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for TrackedRead {
+        fn drop(&mut self) {
+            self.live.fetch_sub(self.data.len(), Ordering::Relaxed);
+        }
     }
 
     impl RecordingRangeObjectStore {
@@ -5058,6 +5256,8 @@ mod tests {
                 active_blob_requests: AtomicUsize::new(0),
                 peak_active_blob_requests: AtomicUsize::new(0),
                 request_started: Notify::new(),
+                live_read_bytes: Arc::new(AtomicUsize::new(0)),
+                peak_live_read_bytes: AtomicUsize::new(0),
             }
         }
 
@@ -5071,6 +5271,8 @@ mod tests {
                 active_blob_requests: AtomicUsize::new(0),
                 peak_active_blob_requests: AtomicUsize::new(0),
                 request_started: Notify::new(),
+                live_read_bytes: Arc::new(AtomicUsize::new(0)),
+                peak_live_read_bytes: AtomicUsize::new(0),
             }
         }
 
@@ -5086,6 +5288,22 @@ mod tests {
 
         fn peak_active_blob_requests(&self) -> usize {
             self.peak_active_blob_requests.load(Ordering::Acquire)
+        }
+
+        fn peak_live_read_bytes(&self) -> usize {
+            self.peak_live_read_bytes.load(Ordering::Acquire)
+        }
+
+        fn track_read(&self, bytes: Bytes) -> Bytes {
+            let data = bytes.to_vec();
+            let len = data.len();
+            let current = self.live_read_bytes.fetch_add(len, Ordering::Relaxed) + len;
+            self.peak_live_read_bytes
+                .fetch_max(current, Ordering::Relaxed);
+            Bytes::from_owner(TrackedRead {
+                data,
+                live: self.live_read_bytes.clone(),
+            })
         }
 
         fn requested_ranges(&self) -> Vec<Range<u64>> {
@@ -5169,7 +5387,7 @@ mod tests {
                 }
                 self.active_blob_requests.fetch_sub(1, Ordering::AcqRel);
             }
-            let bytes = self.data.slice(range.start as usize..range.end as usize);
+            let bytes = self.track_read(self.data.slice(range.start as usize..range.end as usize));
             Ok(GetResult {
                 payload: GetResultPayload::Stream(
                     futures::stream::once(async move { Ok(bytes) }).boxed(),
@@ -9174,6 +9392,916 @@ mod tests {
         let blob = blobs[0].as_ref().unwrap();
         assert_eq!(blob.kind(), BlobKind::Dedicated);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn test_external_ingest_streams_large_slices() {
+        assert!(super::BlobPreprocessor::external_ingest_streams(
+            64 * 1024 * 1024,
+            super::DEDICATED_THRESHOLD as u64
+        ));
+        assert!(super::BlobPreprocessor::external_ingest_streams(
+            9 * 1024 * 1024,
+            100 * 1024 * 1024
+        ));
+        assert!(!super::BlobPreprocessor::external_ingest_streams(
+            3 * 1024 * 1024,
+            super::DEDICATED_THRESHOLD as u64
+        ));
+        assert!(!super::BlobPreprocessor::external_ingest_streams(
+            0,
+            super::DEDICATED_THRESHOLD as u64
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_coalesces_contiguous_slices() {
+        let uri = "mockingest://bucket/container.bin";
+        let mut file = vec![0u8; 1000 * 8192];
+        for row in 0..1000 {
+            file[row * 8192] = (row % 251) as u8;
+        }
+        let rows = (0..1000)
+            .rev()
+            .map(|row| (uri, (row * 8192) as u64, 8192))
+            .collect::<Vec<_>>();
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&rows),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.ranges, vec![0..1000 * 8192]);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        let kind = blob
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>();
+        for (out_row, source_row) in (0..1000).rev().enumerate() {
+            assert_eq!(kind.value(out_row), BlobKind::Inline as u8);
+            let value = data.value(out_row);
+            assert_eq!(value.len(), 8192);
+            assert_eq!(value[0], (source_row % 251) as u8);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_keeps_wide_gaps_as_separate_reads() {
+        let uri = "mockingest://bucket/container.bin";
+        let gap = (2 * object_store::OBJECT_STORE_COALESCE_DEFAULT) as usize;
+        let mut file = vec![0u8; 4 * 8 + 3 * gap];
+        let mut rows = Vec::new();
+        for row in 0..4 {
+            let start = row * (8 + gap);
+            file[start] = 0xA0 + row as u8;
+            rows.push((uri, start as u64, 8));
+        }
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&rows),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(
+            sorted_recorded_ranges(&recorded.ranges),
+            (0..4)
+                .map(|row| {
+                    let start = (row * (8 + gap)) as u64;
+                    start..start + 8
+                })
+                .collect::<Vec<_>>()
+        );
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        for row in 0..4 {
+            assert_eq!(data.value(row)[0], 0xA0 + row as u8);
+            assert_eq!(data.value(row).len(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_coalesced_read_excludes_gap_from_payload() {
+        let uri = "mockingest://bucket/container.bin";
+        let mut file = vec![0xAB; 2000];
+        file[..4].copy_from_slice(b"aaaa");
+        file[1500..1504].copy_from_slice(b"bbbb");
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&[(uri, 0, 4), (uri, 1500, 4)]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.ranges, vec![0..1504]);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(data.value(0), b"aaaa");
+        assert_eq!(data.value(1), b"bbbb");
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_does_not_coalesce_separate_objects() {
+        let recorded = preprocess_recorded_ingest(
+            b"abcdef".to_vec(),
+            external_slice_column(&[
+                ("mockingest://bucket/a.bin", 0, 4),
+                ("mockingest://bucket/b.bin", 0, 4),
+            ]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.ranges, vec![0..4, 0..4]);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(data.value(0), b"abcd");
+        assert_eq!(data.value(1), b"abcd");
+    }
+
+    #[rstest]
+    #[case::sub_megabyte(512 * 1024, 8)]
+    #[case::exact_hole(16 + object_store::OBJECT_STORE_COALESCE_DEFAULT, 16)]
+    #[tokio::test]
+    async fn test_external_ingest_merges_ranges_within_the_cloud_hole(
+        #[case] second: u64,
+        #[case] slice: u64,
+    ) {
+        let uri = "mockingest://bucket/container.bin";
+        let mut file = vec![0u8; (second + slice) as usize];
+        let slice_len = slice as usize;
+        file[..slice_len].fill(0x11);
+        file[second as usize..second as usize + slice_len].fill(0x22);
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&[(uri, 0, slice), (uri, second, slice)]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.ranges, vec![0..second + slice]);
+        assert_eq!(recorded.head_requests, 0);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(data.value(0), vec![0x11; slice_len].as_slice());
+        assert_eq!(data.value(1), vec![0x22; slice_len].as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_overlapping_slices_share_one_read() {
+        let uri = "mockingest://bucket/container.bin";
+        let file: Vec<u8> = (0..24).collect();
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_slice_column(&[(uri, 0, 12), (uri, 6, 12), (uri, 0, 12)]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.ranges, vec![0..18]);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(data.value(0), &file[0..12]);
+        assert_eq!(data.value(1), &file[6..18]);
+        assert_eq!(data.value(2), &file[0..12]);
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_many_separate_windows_keep_row_bytes() {
+        let uri = "mockingest://bucket/container.bin";
+        let gap = object_store::OBJECT_STORE_COALESCE_DEFAULT + 1;
+        let windows = INGEST_FETCH_PARALLELISM + 2;
+        let mut file = vec![0u8; windows * 8 + (windows - 1) * gap as usize];
+        let mut specs = Vec::with_capacity(windows);
+        for row in (0..windows).rev() {
+            let start = row * (8 + gap as usize);
+            file[start] = row as u8;
+            specs.push((start as u64, row as u8));
+        }
+        let rows = specs
+            .iter()
+            .map(|(start, _)| (uri, *start, 8))
+            .collect::<Vec<_>>();
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&rows),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        let expected = (0..windows)
+            .map(|row| {
+                let start = (row * (8 + gap as usize)) as u64;
+                start..start + 8
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sorted_recorded_ranges(&recorded.ranges), expected);
+
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        for (out_row, (_, marker)) in specs.iter().enumerate() {
+            assert_eq!(data.value(out_row).len(), 8);
+            assert_eq!(data.value(out_row)[0], *marker);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_local_hole_follows_block_size() {
+        let separate_at = 8 * 1024;
+        let mut separate = vec![0u8; separate_at + 8];
+        separate[..8].fill(0x31);
+        separate[separate_at..separate_at + 8].fill(0x32);
+        let (separate_batch, separate_ranges) =
+            preprocess_local_slices(separate, &[(0, 8), (separate_at as u64, 8)]).await;
+        assert_eq!(
+            separate_ranges,
+            vec![0..8, separate_at as u64..separate_at as u64 + 8]
+        );
+        let separate_blob = output_blob_struct(&separate_batch);
+        let separate_data = separate_blob
+            .column_by_name("data")
+            .unwrap()
+            .as_binary::<i64>();
+        assert_eq!(separate_data.value(0), &[0x31; 8]);
+        assert_eq!(separate_data.value(1), &[0x32; 8]);
+
+        let inside_block = 1000u64;
+        let mut close = vec![0u8; inside_block as usize + 8];
+        close[..8].fill(0x41);
+        close[inside_block as usize..inside_block as usize + 8].fill(0x42);
+        let (close_batch, close_ranges) =
+            preprocess_local_slices(close, &[(0, 8), (inside_block, 8)]).await;
+        assert_eq!(close_ranges, vec![0..inside_block + 8]);
+        let close_blob = output_blob_struct(&close_batch);
+        let close_data = close_blob
+            .column_by_name("data")
+            .unwrap()
+            .as_binary::<i64>();
+        assert_eq!(close_data.value(0), &[0x41; 8]);
+        assert_eq!(close_data.value(1), &[0x42; 8]);
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_out_of_order_overlap_matches_source_bytes() {
+        let uri = "mockingest://bucket/container.bin";
+        let far = 5_000_000u64;
+        let specs = [
+            (0u64, 32u64),
+            (far, 32),
+            (400_000, 40),
+            (400_020, 60),
+            (100, 40),
+        ];
+        let file_len = (far + 32) as usize;
+        let file = patterned_file(file_len);
+        let rows = specs
+            .iter()
+            .map(|(start, size)| (uri, *start, *size))
+            .collect::<Vec<_>>();
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_slice_column(&rows),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(
+            sorted_recorded_ranges(&recorded.ranges),
+            vec![0..400_080, far..far + 32]
+        );
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        for (row, (start, size)) in specs.iter().enumerate() {
+            let start = *start as usize;
+            let end = start + *size as usize;
+            assert_eq!(data.value(row), &file[start..end]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_zero_size_is_rejected() {
+        let uri = "mockingest://bucket/container.bin";
+        let hole = object_store::OBJECT_STORE_COALESCE_DEFAULT;
+        let zero_at = 8 + hole;
+        let second = 8 + 2 * hole;
+        let file = patterned_file((second + 8) as usize);
+        let Err(err) = try_preprocess_recorded_ingest(
+            file,
+            external_slice_column(&[(uri, 0, 8), (uri, zero_at, 0), (uri, second, 8)]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await
+        else {
+            panic!("zero-size external ingest should fail");
+        };
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("size` must be greater than zero"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_overflowing_streamed_range_reads_nothing() {
+        let uri = "mockingest://bucket/container.bin";
+        let size = INGEST_COALESCE_BUDGET + 1;
+        let position = u64::MAX - INGEST_COALESCE_BUDGET;
+        assert!(super::BlobPreprocessor::external_ingest_streams(
+            size,
+            super::DEDICATED_THRESHOLD as u64,
+        ));
+        let mut session =
+            recorded_ingest_session(vec![0], blob_field("blob", true), ExternalBlobMode::Ingest)
+                .await;
+        let column = external_slice_column(&[(uri, position, size)]);
+        let batch_field = Field::new("blob", column.data_type().clone(), true);
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![batch_field])), vec![column]).unwrap();
+        let err = session
+            .preprocessor
+            .preprocess_batch(&batch)
+            .await
+            .expect_err("overflowing external range should fail");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("overflows u64"), "{err}");
+        assert!(session.source.requested_ranges().is_empty());
+        assert_eq!(session.source.head_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_whole_object_rows_share_one_head() {
+        let uri = "mockingest://bucket/container.bin";
+        let file = b"whole-object".to_vec();
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_object_column(&[uri, uri, uri, uri]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.head_requests, 1);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        for row in 0..4 {
+            assert_eq!(data.value(row), file.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_distinct_whole_objects_head_once_each() {
+        let file = b"shared-bytes".to_vec();
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_object_column(&[
+                "mockingest://bucket/a.bin",
+                "mockingest://bucket/b.bin",
+                "mockingest://bucket/a.bin",
+            ]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(recorded.head_requests, 2);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        for row in 0..3 {
+            assert_eq!(data.value(row), file.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_budget_split_is_not_glued_back_together() {
+        let uri = "mockingest://bucket/container.bin";
+        let slice = 3 * 1024 * 1024u64;
+        let file = patterned_file((slice * 3) as usize);
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_slice_column(&[
+                (uri, 0, slice),
+                (uri, slice, slice),
+                (uri, slice * 2, slice),
+            ]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(
+            sorted_recorded_ranges(&recorded.ranges),
+            vec![0..slice * 2, slice * 2..slice * 3]
+        );
+        for (row, start) in [0u64, slice, slice * 2].into_iter().enumerate() {
+            let actual = ingested_payload(&recorded, row).await;
+            let expected = &file[start as usize..(start + slice) as usize];
+            assert_eq!(actual.as_slice(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_overlap_past_budget_keeps_each_payload() {
+        let uri = "mockingest://bucket/container.bin";
+        let slice = 3 * 1024 * 1024u64;
+        let second = slice - 1000;
+        let third = second + slice - 1000;
+        let file = patterned_file((third + slice) as usize);
+        assert!(second + slice <= INGEST_COALESCE_BUDGET);
+        assert!(third + slice > INGEST_COALESCE_BUDGET);
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_slice_column(&[(uri, 0, slice), (uri, second, slice), (uri, third, slice)]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(
+            sorted_recorded_ranges(&recorded.ranges),
+            vec![0..second + slice, third..third + slice]
+        );
+        for (row, start) in [0, second, third].into_iter().enumerate() {
+            let actual = ingested_payload(&recorded, row).await;
+            let expected = &file[start as usize..(start + slice) as usize];
+            assert_eq!(actual.as_slice(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_slice_over_budget_is_not_merged() {
+        let uri = "mockingest://bucket/container.bin";
+        let small = 16u64;
+        let big = INGEST_COALESCE_BUDGET + 1;
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            (16 * 1024 * 1024).to_string(),
+        );
+        field = field.with_metadata(metadata);
+        let file = patterned_file((small + big) as usize);
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_slice_column(&[(uri, 0, small), (uri, small, big)]),
+            field,
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(
+            sorted_recorded_ranges(&recorded.ranges),
+            vec![0..small, small..small + big]
+        );
+        let blob = output_blob_struct(&recorded.batch);
+        let kind = blob
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>();
+        assert_eq!(kind.value(0), BlobKind::Inline as u8);
+        assert_eq!(kind.value(1), BlobKind::Packed as u8);
+        let inline = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(inline.value(0), &file[..small as usize]);
+        let packed = ingested_payload(&recorded, 1).await;
+        assert_eq!(packed.as_slice(), &file[small as usize..]);
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_separate_objects_keep_their_ranges() {
+        let mut file = vec![0u8; 16];
+        file[..4].copy_from_slice(&[1, 2, 3, 4]);
+        file[10..14].copy_from_slice(&[5, 6, 7, 8]);
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&[
+                ("mockingest://bucket/a.bin", 0, 4),
+                ("mockingest://bucket/b.bin", 10, 4),
+            ]),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        assert_eq!(sorted_recorded_ranges(&recorded.ranges), vec![0..4, 10..14]);
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(data.value(0), &[1, 2, 3, 4]);
+        assert_eq!(data.value(1), &[5, 6, 7, 8]);
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_streams_dedicated_slice_separately() {
+        let uri = "mockingest://bucket/container.bin";
+        let mut file = vec![0u8; 72];
+        file[..8].copy_from_slice(b"small!!!");
+        file[8..].fill(0x5C);
+
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            "32".to_string(),
+        );
+        field = field.with_metadata(metadata);
+
+        let recorded = preprocess_recorded_ingest(
+            file,
+            external_slice_column(&[(uri, 0, 8), (uri, 8, 64)]),
+            field,
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        let mut ranges = recorded.ranges;
+        ranges.sort_by_key(|range| range.start);
+        assert_eq!(ranges, vec![0..8, 8..72]);
+
+        let blob = output_blob_struct(&recorded.batch);
+        let kind = blob
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>();
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(kind.value(0), BlobKind::Inline as u8);
+        assert_eq!(data.value(0), b"small!!!");
+        assert_eq!(kind.value(1), BlobKind::Dedicated as u8);
+
+        let blob_id = blob
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .value(1);
+        let path = lance_core::utils::blob::blob_path(&recorded.data_dir, "ingestkey", blob_id);
+        let dedicated = recorded
+            .object_store
+            .open(&path)
+            .await
+            .unwrap()
+            .get_range(0..64)
+            .await
+            .unwrap();
+        assert_eq!(dedicated.as_ref(), vec![0x5C; 64].as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_external_ingest_inline_rows_release_finished_windows() {
+        let uri = "mockingest://bucket/container.bin";
+        let windows = INGEST_FETCH_PARALLELISM * 3;
+        let gap = object_store::OBJECT_STORE_COALESCE_DEFAULT + 1;
+        let slice = 8usize;
+        let mut file = vec![0u8; windows * slice + (windows - 1) * gap as usize];
+        let mut rows = Vec::with_capacity(windows);
+        for row in 0..windows {
+            let start = row * (slice + gap as usize);
+            file[start..start + slice].fill(row as u8);
+            rows.push((uri, start as u64, slice as u64));
+        }
+        let recorded = preprocess_recorded_ingest(
+            file.clone(),
+            external_slice_column(&rows),
+            blob_field("blob", true),
+            ExternalBlobMode::Ingest,
+        )
+        .await;
+
+        let blob = output_blob_struct(&recorded.batch);
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        for (row, (_, start, _)) in rows.iter().copied().enumerate() {
+            let start = start as usize;
+            assert_eq!(data.value(row), &file[start..start + slice]);
+        }
+        assert!(recorded.peak_live_read_bytes >= slice);
+        assert!(
+            recorded.peak_live_read_bytes <= (INGEST_FETCH_PARALLELISM + 1) * slice,
+            "retained {} bytes from finished reads",
+            recorded.peak_live_read_bytes
+        );
+    }
+
+    #[derive(Debug)]
+    struct RecordingIngestProvider {
+        inner: Arc<RecordingRangeObjectStore>,
+    }
+
+    #[async_trait]
+    impl lance_io::object_store::ObjectStoreProvider for RecordingIngestProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            Ok(ObjectStore::new(
+                self.inner.clone() as Arc<dyn object_store::ObjectStore>,
+                base_path,
+                Some(64 * 1024),
+                None,
+                false,
+                true,
+                8,
+                3,
+                None,
+            ))
+        }
+    }
+
+    struct RecordedIngest {
+        batch: RecordBatch,
+        ranges: Vec<Range<u64>>,
+        object_store: ObjectStore,
+        data_dir: Path,
+        peak_live_read_bytes: usize,
+        head_requests: usize,
+    }
+
+    async fn preprocess_recorded_ingest(
+        file_bytes: Vec<u8>,
+        column: ArrayRef,
+        writer_field: Field,
+        mode: ExternalBlobMode,
+    ) -> RecordedIngest {
+        try_preprocess_recorded_ingest(file_bytes, column, writer_field, mode)
+            .await
+            .unwrap()
+    }
+
+    struct RecordedIngestSession {
+        preprocessor: super::BlobPreprocessor,
+        source: Arc<RecordingRangeObjectStore>,
+        object_store: ObjectStore,
+        data_dir: Path,
+    }
+
+    async fn recorded_ingest_session(
+        file_bytes: Vec<u8>,
+        writer_field: Field,
+        mode: ExternalBlobMode,
+    ) -> RecordedIngestSession {
+        let source = Arc::new(RecordingRangeObjectStore::new(Bytes::from(file_bytes)));
+        let registry = Arc::new(ObjectStoreRegistry::empty());
+        registry.insert(
+            "mockingest",
+            Arc::new(RecordingIngestProvider {
+                inner: source.clone(),
+            }),
+        );
+
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let object_store = object_store.as_ref().clone();
+        let data_dir = base_path.join("data");
+        let writer_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![writer_field])).unwrap();
+        let preprocessor = super::BlobPreprocessor::new(
+            object_store.clone(),
+            data_dir.clone(),
+            "ingestkey".to_string(),
+            &writer_schema,
+            None,
+            false,
+            mode,
+            registry,
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap();
+        RecordedIngestSession {
+            preprocessor,
+            source,
+            object_store,
+            data_dir,
+        }
+    }
+
+    async fn try_preprocess_recorded_ingest(
+        file_bytes: Vec<u8>,
+        column: ArrayRef,
+        writer_field: Field,
+        mode: ExternalBlobMode,
+    ) -> Result<RecordedIngest> {
+        let RecordedIngestSession {
+            mut preprocessor,
+            source,
+            object_store,
+            data_dir,
+        } = recorded_ingest_session(file_bytes, writer_field, mode).await;
+        let batch_field = Field::new("blob", column.data_type().clone(), true);
+        let batch_schema = Arc::new(Schema::new(vec![batch_field]));
+        let batch = RecordBatch::try_new(batch_schema, vec![column]).unwrap();
+        let batch = preprocessor.preprocess_batch(&batch).await?;
+        preprocessor.finish().await?;
+        Ok(RecordedIngest {
+            batch,
+            ranges: source.requested_ranges(),
+            object_store,
+            data_dir,
+            peak_live_read_bytes: source.peak_live_read_bytes(),
+            head_requests: source.head_requests.load(Ordering::Relaxed),
+        })
+    }
+
+    async fn preprocess_local_slices(
+        file_bytes: Vec<u8>,
+        slices: &[(u64, u64)],
+    ) -> (RecordBatch, Vec<Range<u64>>) {
+        let dir = TempDir::default();
+        let path = dir.std_path().join("container.bin");
+        std::fs::write(&path, &file_bytes).unwrap();
+        let uri = format!("file://{}", path.display());
+        let rows = slices
+            .iter()
+            .map(|(position, size)| (uri.as_str(), *position, *size))
+            .collect::<Vec<_>>();
+
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (source, _) =
+            ObjectStore::from_uri_and_params(registry.clone(), &uri, &ObjectStoreParams::default())
+                .await
+                .unwrap();
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let writer_field = blob_field("blob", true);
+        let writer_schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![writer_field])).unwrap();
+        let mut preprocessor = super::BlobPreprocessor::new(
+            object_store.as_ref().clone(),
+            base_path.join("data"),
+            "ingestkey".to_string(),
+            &writer_schema,
+            None,
+            false,
+            ExternalBlobMode::Ingest,
+            registry,
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap();
+        let column = external_slice_column(&rows);
+        let batch_field = Field::new("blob", column.data_type().clone(), true);
+        let batch_schema = Arc::new(Schema::new(vec![batch_field]));
+        let batch = RecordBatch::try_new(batch_schema, vec![column]).unwrap();
+        let batch = preprocessor.preprocess_batch(&batch).await.unwrap();
+        preprocessor.finish().await.unwrap();
+
+        let ranges = sorted_recorded_ranges(
+            &source
+                .io_stats_snapshot()
+                .requests
+                .into_iter()
+                .filter(|request| request.method == "get_range")
+                .filter_map(|request| request.range)
+                .collect::<Vec<_>>(),
+        );
+        (batch, ranges)
+    }
+
+    fn external_object_column(uris: &[&str]) -> ArrayRef {
+        let data = LargeBinaryArray::from(vec![None::<&[u8]>; uris.len()]);
+        let uri_array = StringArray::from(uris.iter().copied().map(Some).collect::<Vec<_>>());
+        let positions = UInt64Array::from(vec![None; uris.len()]);
+        let sizes = UInt64Array::from(vec![None; uris.len()]);
+        Arc::new(
+            StructArray::try_new(
+                vec![
+                    Field::new("data", DataType::LargeBinary, true),
+                    Field::new("uri", DataType::Utf8, true),
+                    Field::new("position", DataType::UInt64, true),
+                    Field::new("size", DataType::UInt64, true),
+                ]
+                .into(),
+                vec![
+                    Arc::new(data) as ArrayRef,
+                    Arc::new(uri_array) as ArrayRef,
+                    Arc::new(positions) as ArrayRef,
+                    Arc::new(sizes) as ArrayRef,
+                ],
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn external_slice_column(rows: &[(&str, u64, u64)]) -> ArrayRef {
+        let data = arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>; rows.len()]);
+        let uris = StringArray::from(
+            rows.iter()
+                .map(|(uri, _, _)| Some(*uri))
+                .collect::<Vec<_>>(),
+        );
+        let positions = UInt64Array::from(
+            rows.iter()
+                .map(|(_, position, _)| Some(*position))
+                .collect::<Vec<_>>(),
+        );
+        let sizes = UInt64Array::from(
+            rows.iter()
+                .map(|(_, _, size)| Some(*size))
+                .collect::<Vec<_>>(),
+        );
+        Arc::new(
+            StructArray::try_new(
+                vec![
+                    Field::new("data", DataType::LargeBinary, true),
+                    Field::new("uri", DataType::Utf8, true),
+                    Field::new("position", DataType::UInt64, true),
+                    Field::new("size", DataType::UInt64, true),
+                ]
+                .into(),
+                vec![
+                    Arc::new(data) as ArrayRef,
+                    Arc::new(uris) as ArrayRef,
+                    Arc::new(positions) as ArrayRef,
+                    Arc::new(sizes) as ArrayRef,
+                ],
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn output_blob_struct(batch: &RecordBatch) -> StructArray {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone()
+    }
+
+    fn patterned_file(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| (index as u32).wrapping_mul(17).wrapping_add(3) as u8)
+            .collect()
+    }
+
+    async fn ingested_payload(recorded: &RecordedIngest, row: usize) -> Vec<u8> {
+        let blob = output_blob_struct(&recorded.batch);
+        let kind = blob
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>()
+            .value(row);
+        if kind == BlobKind::Inline as u8 {
+            return blob
+                .column_by_name("data")
+                .unwrap()
+                .as_binary::<i64>()
+                .value(row)
+                .to_vec();
+        }
+        let blob_id = blob
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .value(row);
+        let size = blob
+            .column_by_name("blob_size")
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .value(row);
+        let position = if kind == BlobKind::Packed as u8 {
+            blob.column_by_name("position")
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .value(row)
+        } else {
+            0
+        };
+        let path = lance_core::utils::blob::blob_path(&recorded.data_dir, "ingestkey", blob_id);
+        recorded
+            .object_store
+            .open(&path)
+            .await
+            .unwrap()
+            .get_range(position as usize..(position + size) as usize)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    fn sorted_recorded_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
+        let mut ranges = ranges.to_vec();
+        ranges.sort_by(|left, right| left.start.cmp(&right.start).then(left.end.cmp(&right.end)));
+        ranges
     }
 
     #[tokio::test]
