@@ -6124,12 +6124,13 @@ mod tests {
     }
 
     async fn test_delete_all_rows(params: VectorIndexParams) {
+        // Boxed for CI clippy `large_futures`: each typed delete-all future grew past 16 KiB.
         match params.metric_type {
             DistanceType::Hamming => {
-                test_delete_all_rows_impl::<UInt8Type>(params, 0..4).await;
+                Box::pin(test_delete_all_rows_impl::<UInt8Type>(params, 0..4)).await;
             }
             _ => {
-                test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0).await;
+                Box::pin(test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0)).await;
             }
         }
     }
