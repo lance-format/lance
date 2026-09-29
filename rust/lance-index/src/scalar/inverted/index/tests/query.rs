@@ -108,7 +108,10 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
         }
         assert!(inverted.prewarmed_query_state_ready(false));
         assert_eq!(
-            inverted.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+            inverted
+                .bm25_stats_for_terms_if_loaded(&terms)
+                .unwrap()
+                .map(|loaded| loaded.stats),
             Some((4, 2, vec![2, 1]))
         );
     }
@@ -636,10 +639,18 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         .prewarm_with_options(&FtsPrewarmOptions::default())
         .await
         .unwrap();
-    let fast =
+    let (fast, token_ids) =
         crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
             .unwrap()
             .unwrap();
+    for (index, token_ids) in indices.iter().zip(&token_ids) {
+        let expected = index
+            .partitions
+            .iter()
+            .flat_map(|partition| terms.iter().map(|term| partition.tokens.get(term)))
+            .collect::<Vec<_>>();
+        assert_eq!(token_ids.as_ref(), expected, "ids must be partition-major");
+    }
     let mut async_stats = Vec::with_capacity(indices.len());
     for index in &indices {
         async_stats.push(index.bm25_stats_for_terms(&terms, None).await.unwrap());
@@ -687,6 +698,7 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         .unwrap(),
     );
     assert_eq!(fast_prepared.scorer().token_docs, fast.token_docs);
+    assert!(fast_prepared.term_ids().is_some());
     let slow_prepared = Arc::new(
         crate::scalar::inverted::prepare_bm25_query(
             &indices,
@@ -698,10 +710,164 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         .await
         .unwrap(),
     );
+    assert!(
+        slow_prepared.term_ids().is_none(),
+        "an injected scorer resolves no dictionary ids"
+    );
     assert_eq!(
         prepared_results(&indices, fast_prepared, params.clone()).await,
         prepared_results(&indices, slow_prepared, params).await,
         "the synchronous scorer must preserve final score bits"
+    );
+}
+
+async fn prepared_documents(
+    index: &InvertedIndex,
+    prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+    operator: Operator,
+) -> Vec<(u64, u32)> {
+    let mut results = index
+        .bm25_search_prepared_documents(
+            prepared,
+            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|document| (document.row_id, document.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    results.sort_unstable();
+    results
+}
+
+/// Load and fully prewarm an index. The index only holds a weak cache
+/// reference, so the caller keeps the returned cache alive.
+async fn load_prewarmed_index(
+    store: Arc<LanceIndexStore>,
+    partition_ids: Vec<u64>,
+) -> (Arc<InvertedIndex>, LanceCache) {
+    write_test_metadata(&store, partition_ids, InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(1 << 20);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    index
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap();
+    (index, cache)
+}
+
+/// The same prepared statistics without recorded dictionary ids, so every
+/// partition looks its tokens up again.
+fn without_term_ids(
+    prepared: &crate::scalar::inverted::PreparedBm25Query,
+) -> Arc<crate::scalar::inverted::PreparedBm25Query> {
+    Arc::new(crate::scalar::inverted::PreparedBm25Query::from_parts(
+        prepared.tokens().clone(),
+        prepared.scorer().clone(),
+        true,
+    ))
+}
+
+#[rstest::rstest]
+#[case::and(Operator::And, vec![0])]
+#[case::or(Operator::Or, vec![0, 1, 2, 3, 4])]
+#[tokio::test]
+async fn test_prepared_term_ids_search_like_dictionary_lookups(
+    #[case] operator: Operator,
+    #[case] expected_rows: Vec<u64>,
+) {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    // Partition 1 lacks "beta" and partition 2 lacks "alpha", so AND can only
+    // match partition 0 while OR reads every partition.
+    write_pair_partition(&store, 0, &[("alpha", "beta", 0), ("alpha", "gamma", 1)]).await;
+    write_pair_partition(&store, 1, &[("alpha", "gamma", 2)]).await;
+    write_pair_partition(&store, 2, &[("beta", "delta", 3), ("beta", "gamma", 4)]).await;
+    let (index, _cache) = load_prewarmed_index(store, vec![0, 1, 2]).await;
+    // The repeated token maps two query positions to one unique term.
+    let tokens = Tokens::new(
+        vec!["alpha".to_owned(), "beta".to_owned(), "alpha".to_owned()],
+        DocType::Text,
+    );
+    let prepared = crate::scalar::inverted::prepare_bm25_query(
+        std::slice::from_ref(&index),
+        tokens,
+        &FtsSearchParams::new().with_limit(Some(10)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(prepared.term_ids().is_some());
+
+    let resolved = prepared_documents(&index, Arc::new(prepared.clone()), operator).await;
+    let looked_up = prepared_documents(&index, without_term_ids(&prepared), operator).await;
+    assert_eq!(resolved, looked_up);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>(),
+        expected_rows
+    );
+}
+
+#[tokio::test]
+async fn test_prepared_term_ids_apply_only_to_their_segment() {
+    let prepared_dir = TempObjDir::default();
+    let prepared_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        prepared_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(&prepared_store, 0, &[("alpha", "beta", 0)]).await;
+    let (prepared_index, _prepared_cache) = load_prewarmed_index(prepared_store, vec![0]).await;
+
+    // "aaa" shifts every id, so reusing the prepared segment's id for "alpha"
+    // here would match the "aaa beta" document instead.
+    let other_dir = TempObjDir::default();
+    let other_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        other_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(
+        &other_store,
+        0,
+        &[("aaa", "beta", 10), ("alpha", "beta", 11)],
+    )
+    .await;
+    let other_index = load_test_index(other_store, vec![0]).await;
+
+    let prepared = crate::scalar::inverted::prepare_bm25_query(
+        std::slice::from_ref(&prepared_index),
+        Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+        &FtsSearchParams::new().with_limit(Some(10)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(prepared.term_ids().is_some());
+
+    let resolved =
+        prepared_documents(&other_index, Arc::new(prepared.clone()), Operator::And).await;
+    let looked_up =
+        prepared_documents(&other_index, without_term_ids(&prepared), Operator::And).await;
+    assert_eq!(resolved, looked_up);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>(),
+        vec![11]
     );
 }
 

@@ -479,7 +479,7 @@ pub(in super::super) struct PostingLoadOptions {
 }
 
 impl PostingLoadOptions {
-    const fn read_ahead(force_global_scorer: bool) -> Self {
+    pub(super) const fn read_ahead(force_global_scorer: bool) -> Self {
         Self {
             force_global_scorer,
             read_policy: PostingReadPolicy::ReadAhead,
@@ -546,11 +546,35 @@ fn token_dictionary_may_match(
     operator: Operator,
     is_phrase_query: bool,
 ) -> bool {
+    tokens_may_match(tokens, operator, is_phrase_query, |index| {
+        dictionary.get(tokens.get_token(index)).is_some()
+    })
+}
+
+/// [`InvertedPartition::may_match_tokens`] for token ids already resolved
+/// against the partition's dictionary.
+pub(super) fn token_ids_may_match(
+    tokens: &Tokens,
+    term_ids: PartitionTermIds<'_>,
+    operator: Operator,
+    is_phrase_query: bool,
+) -> bool {
+    tokens_may_match(tokens, operator, is_phrase_query, |index| {
+        term_ids.token_id(index).is_some()
+    })
+}
+
+fn tokens_may_match(
+    tokens: &Tokens,
+    operator: Operator,
+    is_phrase_query: bool,
+    mut in_dictionary: impl FnMut(usize) -> bool,
+) -> bool {
     if tokens.is_empty() {
         return false;
     }
     if operator != Operator::And && !is_phrase_query {
-        return (0..tokens.len()).any(|index| dictionary.get(tokens.get_token(index)).is_some());
+        return (0..tokens.len()).any(in_dictionary);
     }
 
     // Query positions are normally adjacent, but `Tokens::with_positions` is
@@ -558,17 +582,14 @@ fn token_dictionary_may_match(
     // without allocating two hash tables for every leaf in every partition.
     let mut positions = SmallVec::<[(u32, bool); 8]>::new();
     for index in 0..tokens.len() {
-        positions.push((
-            tokens.position(index),
-            dictionary.get(tokens.get_token(index)).is_some(),
-        ));
+        positions.push((tokens.position(index), in_dictionary(index)));
     }
     summarize_position_matches(positions).every_position_matched
 }
 
 fn posting_group_demand_counts(
     inverted_list: &PostingListReader,
-    token_ids: &[(u32, String, u32)],
+    token_ids: &[(u32, usize, u32)],
 ) -> HashMap<(u32, u32), usize> {
     let mut demanded_token_ids = token_ids
         .iter()
@@ -1310,7 +1331,6 @@ impl InvertedPartition {
         .await
     }
 
-    #[instrument(name = "load_posting_lists", level = "debug", skip_all)]
     pub(in super::super) async fn load_posting_lists_with_policy(
         &self,
         tokens: &Tokens,
@@ -1320,6 +1340,30 @@ impl InvertedPartition {
         metrics: &dyn MetricsCollector,
         options: PostingLoadOptions,
     ) -> Result<LoadedPostings> {
+        match self
+            .fetch_posting_lists(tokens, params, operator, metrics, options, None)
+            .await?
+        {
+            Some(fetched) => fetched.into_loaded(tokens, impact_scorer),
+            None => Ok(LoadedPostings::empty()),
+        }
+    }
+
+    /// Read the postings a query leaf needs from this partition without
+    /// building iterators. Returns `None` when the partition cannot contribute.
+    ///
+    /// `term_ids`, when present, replaces the dictionary lookup of every final
+    /// token with ids resolved earlier against this partition's dictionary.
+    #[instrument(name = "load_posting_lists", level = "debug", skip_all)]
+    pub(super) async fn fetch_posting_lists(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+        metrics: &dyn MetricsCollector,
+        options: PostingLoadOptions,
+        term_ids: Option<PartitionTermIds<'_>>,
+    ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
             force_global_scorer,
             read_policy: requested_read_policy,
@@ -1332,21 +1376,23 @@ impl InvertedPartition {
         let mut token_ids = Vec::with_capacity(tokens.len());
         let mut position_matches = SmallVec::<[(u32, bool); 8]>::new();
         for index in 0..tokens.len() {
-            let token = tokens.get_token(index);
             let position = tokens.position(index);
-            let token_id = self.map(token);
+            let token_id = match &term_ids {
+                Some(term_ids) => term_ids.token_id(index),
+                None => self.map(tokens.get_token(index)),
+            };
             position_matches.push((position, token_id.is_some()));
             if let Some(token_id) = token_id {
-                token_ids.push((token_id, token.to_owned(), position));
+                token_ids.push((token_id, index, position));
             }
         }
         let position_summary = summarize_position_matches(position_matches);
         let exact_scoring_required = position_summary.exact_scoring_required;
         if token_ids.is_empty() {
-            return Ok(LoadedPostings::empty());
+            return Ok(None);
         }
         if (is_and_query || is_phrase_query) && !position_summary.every_position_matched {
-            return Ok(LoadedPostings::empty());
+            return Ok(None);
         }
 
         token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
@@ -1358,9 +1404,11 @@ impl InvertedPartition {
             HashMap::new()
         };
 
-        let num_docs = self.docs.len();
-        let loaded_postings = stream::iter(token_ids)
-            .map(|(token_id, token, position)| {
+        let io_parallelism = self.store.io_parallelism();
+        let token_count = token_ids.len();
+        let reads = token_ids
+            .into_iter()
+            .map(|(token_id, token_index, position)| {
                 let read_policy = effective_posting_read_policy(
                     self.inverted_list.as_ref(),
                     requested_read_policy,
@@ -1386,12 +1434,20 @@ impl InvertedPartition {
                         }
                     };
 
-                    Result::Ok((token_id, token, position, posting))
+                    Result::Ok((token_id, token_index, position, posting))
                 }
-            })
-            .buffered(self.store.io_parallelism())
-            .try_collect::<Vec<_>>()
-            .await?;
+            });
+        // A leaf usually reads a handful of postings; joining them directly
+        // avoids a stream task allocation per read. Larger expansions keep the
+        // store's read concurrency bound.
+        let loaded_postings = if token_count <= io_parallelism {
+            futures::future::try_join_all(reads).await?
+        } else {
+            stream::iter(reads)
+                .buffered(io_parallelism)
+                .try_collect::<Vec<_>>()
+                .await?
+        };
 
         let needs_union = loaded_postings
             .windows(2)
@@ -1402,65 +1458,7 @@ impl InvertedPartition {
                 .iter()
                 .any(|(_, _, _, posting)| posting.is_empty())
         {
-            return Ok(LoadedPostings::empty());
-        }
-
-        if !needs_union {
-            let impact_safe = loaded_postings
-                .iter()
-                .all(|(_, _, _, posting)| posting.has_impacts());
-            let no_impact_fallback = !impact_safe;
-            if no_impact_fallback {
-                for (_, token, _, posting) in &loaded_postings {
-                    if !posting.has_impacts() {
-                        validate_no_impact_scorer_upper_bound(token, impact_scorer)?;
-                    }
-                }
-            }
-            let exact_scoring_required = exact_scoring_required || no_impact_fallback;
-            return Ok(LoadedPostings {
-                postings: loaded_postings
-                    .into_iter()
-                    .map(|(token_id, token, position, posting)| {
-                        let needs_scorer_upper_bound = !posting.has_impacts();
-                        let query_weight =
-                            if impact_safe || exact_scoring_required || force_global_scorer {
-                                impact_scorer.query_weight(&token)
-                            } else {
-                                idf(posting.len(), num_docs)
-                            };
-                        let posting = PostingIterator::with_query_weight(
-                            token,
-                            token_id,
-                            position,
-                            query_weight,
-                            posting,
-                            num_docs,
-                        );
-                        if needs_scorer_upper_bound {
-                            posting.with_scorer_upper_bound()
-                        } else {
-                            posting
-                        }
-                    })
-                    .collect(),
-                grouped_expansions: Vec::new(),
-                impact_safe,
-                exact_scoring_required,
-                #[cfg(test)]
-                no_impact_fallback,
-            });
-        }
-
-        let no_impact_fallback = loaded_postings
-            .iter()
-            .any(|(_, _, _, posting)| !posting.has_impacts());
-        if no_impact_fallback {
-            for (_, token, _, posting) in &loaded_postings {
-                if !posting.has_impacts() {
-                    validate_no_impact_scorer_upper_bound(token, impact_scorer)?;
-                }
-            }
+            return Ok(None);
         }
 
         let docs_for_union = if needs_union {
@@ -1474,100 +1472,15 @@ impl InvertedPartition {
             None
         };
 
-        // WAND's AND mode treats every iterator as required, so expansions from
-        // one original query position must be merged before scoring.
-        let mut grouped_postings = Vec::new();
-        let mut grouped_expansions = Vec::new();
-        let mut iter = loaded_postings.into_iter().peekable();
-        while let Some((token_id, token, position, posting)) = iter.next() {
-            let mut group = vec![(token_id, token, posting)];
-            while matches!(iter.peek(), Some((_, _, next_position, _)) if *next_position == position)
-            {
-                let (token_id, token, _, posting) = iter.next().expect("peeked item must exist");
-                group.push((token_id, token, posting));
-            }
-
-            let (token_id, token, posting) = if group.len() == 1 {
-                group.pop().expect("single-item group must exist")
-            } else {
-                let token_id = group[0].0;
-                let token = group[0].1.clone();
-                let terms = group
-                    .iter()
-                    .map(|(_, token, posting)| {
-                        GroupedTermScorer::new(impact_scorer.query_weight(token), posting)
-                    })
-                    .collect::<Vec<_>>();
-                let terms = Arc::<[GroupedTermScorer]>::from(terms);
-                let score_upper_bound =
-                    GroupedScoreUpperBound::new(terms.iter().map(GroupedTermScorer::query_weight));
-                let query_weight = score_upper_bound.query_weight;
-                grouped_expansions.push(GroupedExpansionTerms {
-                    position,
-                    terms: terms.clone(),
-                });
-                let postings = group
-                    .into_iter()
-                    .map(|(_, _, posting)| posting)
-                    .collect::<Vec<_>>();
-                let docs = docs_for_union.as_ref().ok_or_else(|| {
-                    Error::index("union docs were not loaded for grouped query terms".to_string())
-                })?;
-                let posting = Self::union_posting_lists(
-                    postings,
-                    docs,
-                    is_phrase_query,
-                    score_upper_bound,
-                    impact_scorer,
-                )?;
-                if posting.is_empty() && (is_and_query || is_phrase_query) {
-                    return Ok(LoadedPostings::empty());
-                }
-                grouped_postings.push(
-                    PostingIterator::with_query_weight(
-                        token,
-                        token_id,
-                        position,
-                        query_weight,
-                        posting,
-                        num_docs,
-                    )
-                    .with_grouped_terms(terms),
-                );
-                continue;
-            };
-            if posting.is_empty() {
-                if is_and_query || is_phrase_query {
-                    return Ok(LoadedPostings::empty());
-                }
-                continue;
-            }
-
-            let query_weight = impact_scorer.query_weight(&token);
-            let needs_scorer_upper_bound = !posting.has_impacts();
-            let posting = PostingIterator::with_query_weight(
-                token,
-                token_id,
-                position,
-                query_weight,
-                posting,
-                num_docs,
-            );
-            grouped_postings.push(if needs_scorer_upper_bound {
-                posting.with_scorer_upper_bound()
-            } else {
-                posting
-            });
-        }
-
-        Ok(LoadedPostings {
-            postings: grouped_postings,
-            grouped_expansions,
-            impact_safe: false,
-            exact_scoring_required: true,
-            #[cfg(test)]
-            no_impact_fallback,
-        })
+        Ok(Some(FetchedPostings {
+            postings: loaded_postings,
+            num_docs: self.docs.len(),
+            is_and_query,
+            is_phrase_query,
+            exact_scoring_required,
+            force_global_scorer,
+            docs_for_union,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1589,11 +1502,14 @@ impl InvertedPartition {
             operator,
             postings,
             impact_scorer,
+            None,
             metrics,
             shared_threshold,
         )
     }
 
+    /// `shared_norm_addends` is used only with `impact_scorer`, and must be
+    /// shared only by searches that pass the same impact scorer.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bm25_search_modern(
         &self,
@@ -1603,6 +1519,7 @@ impl InvertedPartition {
         operator: Operator,
         postings: Vec<PostingIterator>,
         impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: SharedNormAddends,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<DocId>>> {
@@ -1614,6 +1531,7 @@ impl InvertedPartition {
                 operator,
                 postings,
                 impact_scorer,
+                Some(shared_norm_addends),
                 metrics,
                 shared_threshold,
             )
@@ -1625,6 +1543,7 @@ impl InvertedPartition {
                 operator,
                 postings,
                 impact_scorer,
+                Some(shared_norm_addends),
                 metrics,
                 shared_threshold,
             )
@@ -1640,6 +1559,7 @@ impl InvertedPartition {
         operator: Operator,
         postings: Vec<PostingIterator>,
         impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: Option<SharedNormAddends>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
@@ -1650,6 +1570,9 @@ impl InvertedPartition {
         let hits = if let Some(scorer) = impact_scorer {
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
+            if let Some(shared_norm_addends) = shared_norm_addends {
+                wand = wand.with_shared_norm_addends(shared_norm_addends);
+            }
             wand.search(params, metrics)?
         } else {
             let scorer = IndexBM25Scorer::new(std::iter::once(self));
@@ -1717,6 +1640,208 @@ impl InvertedPartition {
     ) -> Result<(InnerBuilder, usize)> {
         self.into_builder_chunked(Some(chunk_tokens), Some(max_list_children))
             .await
+    }
+}
+
+/// Postings one partition read for a query leaf, before any iterator exists.
+///
+/// Building iterators allocates per-cursor decode state, so the modern search
+/// path defers [`Self::into_loaded`] to the CPU task that runs WAND and later
+/// frees that state on the same thread.
+pub(super) struct FetchedPostings {
+    /// `(token_id, token_index, position, posting)` sorted by
+    /// `(position, token_id)`; `token_index` indexes the fetched `Tokens`.
+    postings: Vec<(u32, usize, u32, PostingList)>,
+    num_docs: usize,
+    is_and_query: bool,
+    is_phrase_query: bool,
+    exact_scoring_required: bool,
+    force_global_scorer: bool,
+    /// Scoring lengths for unioning same-position postings, when any exist.
+    docs_for_union: Option<LoadedDocLengths>,
+}
+
+impl FetchedPostings {
+    /// Build the iterators; `tokens` must be the tokens these postings were
+    /// fetched for.
+    pub(super) fn into_loaded(
+        self,
+        tokens: &Tokens,
+        impact_scorer: &MemBM25Scorer,
+    ) -> Result<LoadedPostings> {
+        let Self {
+            postings: loaded_postings,
+            num_docs,
+            is_and_query,
+            is_phrase_query,
+            exact_scoring_required,
+            force_global_scorer,
+            docs_for_union,
+        } = self;
+        if docs_for_union.is_none() {
+            let impact_safe = loaded_postings
+                .iter()
+                .all(|(_, _, _, posting)| posting.has_impacts());
+            let no_impact_fallback = !impact_safe;
+            if no_impact_fallback {
+                for (_, token_index, _, posting) in &loaded_postings {
+                    if !posting.has_impacts() {
+                        validate_no_impact_scorer_upper_bound(
+                            tokens.get_token(*token_index),
+                            impact_scorer,
+                        )?;
+                    }
+                }
+            }
+            let exact_scoring_required = exact_scoring_required || no_impact_fallback;
+            return Ok(LoadedPostings {
+                postings: loaded_postings
+                    .into_iter()
+                    .map(|(token_id, token_index, position, posting)| {
+                        let token = tokens.get_token(token_index);
+                        let needs_scorer_upper_bound = !posting.has_impacts();
+                        let query_weight =
+                            if impact_safe || exact_scoring_required || force_global_scorer {
+                                impact_scorer.query_weight(token)
+                            } else {
+                                idf(posting.len(), num_docs)
+                            };
+                        let posting = PostingIterator::with_query_weight(
+                            token.to_owned(),
+                            token_id,
+                            position,
+                            query_weight,
+                            posting,
+                            num_docs,
+                        );
+                        if needs_scorer_upper_bound {
+                            posting.with_scorer_upper_bound()
+                        } else {
+                            posting
+                        }
+                    })
+                    .collect(),
+                grouped_expansions: Vec::new(),
+                impact_safe,
+                exact_scoring_required,
+                #[cfg(test)]
+                no_impact_fallback,
+            });
+        }
+
+        let no_impact_fallback = loaded_postings
+            .iter()
+            .any(|(_, _, _, posting)| !posting.has_impacts());
+        if no_impact_fallback {
+            for (_, token_index, _, posting) in &loaded_postings {
+                if !posting.has_impacts() {
+                    validate_no_impact_scorer_upper_bound(
+                        tokens.get_token(*token_index),
+                        impact_scorer,
+                    )?;
+                }
+            }
+        }
+
+        // WAND's AND mode treats every iterator as required, so expansions from
+        // one original query position must be merged before scoring.
+        let mut grouped_postings = Vec::new();
+        let mut grouped_expansions = Vec::new();
+        let mut iter = loaded_postings.into_iter().peekable();
+        while let Some((token_id, token_index, position, posting)) = iter.next() {
+            let mut group = vec![(token_id, token_index, posting)];
+            while matches!(iter.peek(), Some((_, _, next_position, _)) if *next_position == position)
+            {
+                let (token_id, token_index, _, posting) =
+                    iter.next().expect("peeked item must exist");
+                group.push((token_id, token_index, posting));
+            }
+
+            let (token_id, token_index, posting) = if group.len() == 1 {
+                group.pop().expect("single-item group must exist")
+            } else {
+                let token_id = group[0].0;
+                let token = tokens.get_token(group[0].1).to_owned();
+                let terms = group
+                    .iter()
+                    .map(|(_, token_index, posting)| {
+                        GroupedTermScorer::new(
+                            impact_scorer.query_weight(tokens.get_token(*token_index)),
+                            posting,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let terms = Arc::<[GroupedTermScorer]>::from(terms);
+                let score_upper_bound =
+                    GroupedScoreUpperBound::new(terms.iter().map(GroupedTermScorer::query_weight));
+                let query_weight = score_upper_bound.query_weight;
+                grouped_expansions.push(GroupedExpansionTerms {
+                    position,
+                    terms: terms.clone(),
+                });
+                let postings = group
+                    .into_iter()
+                    .map(|(_, _, posting)| posting)
+                    .collect::<Vec<_>>();
+                let docs = docs_for_union.as_ref().ok_or_else(|| {
+                    Error::index("union docs were not loaded for grouped query terms".to_string())
+                })?;
+                let posting = InvertedPartition::union_posting_lists(
+                    postings,
+                    docs,
+                    is_phrase_query,
+                    score_upper_bound,
+                    impact_scorer,
+                )?;
+                if posting.is_empty() && (is_and_query || is_phrase_query) {
+                    return Ok(LoadedPostings::empty());
+                }
+                grouped_postings.push(
+                    PostingIterator::with_query_weight(
+                        token,
+                        token_id,
+                        position,
+                        query_weight,
+                        posting,
+                        num_docs,
+                    )
+                    .with_grouped_terms(terms),
+                );
+                continue;
+            };
+            if posting.is_empty() {
+                if is_and_query || is_phrase_query {
+                    return Ok(LoadedPostings::empty());
+                }
+                continue;
+            }
+
+            let token = tokens.get_token(token_index);
+            let query_weight = impact_scorer.query_weight(token);
+            let needs_scorer_upper_bound = !posting.has_impacts();
+            let posting = PostingIterator::with_query_weight(
+                token.to_owned(),
+                token_id,
+                position,
+                query_weight,
+                posting,
+                num_docs,
+            );
+            grouped_postings.push(if needs_scorer_upper_bound {
+                posting.with_scorer_upper_bound()
+            } else {
+                posting
+            });
+        }
+
+        Ok(LoadedPostings {
+            postings: grouped_postings,
+            grouped_expansions,
+            impact_safe: false,
+            exact_scoring_required: true,
+            #[cfg(test)]
+            no_impact_fallback,
+        })
     }
 }
 

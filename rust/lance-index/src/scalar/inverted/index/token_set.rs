@@ -358,4 +358,158 @@ impl TokenSet {
             TokenMap::Fst(map) => map.as_fst().size(),
         }
     }
+
+    /// [`Self::get`] for many `(dictionary, token)` pairs, returning results
+    /// in input order.
+    ///
+    /// An FST walk is a chain of dependent reads, and the dictionaries of a
+    /// many-partition index far exceed the CPU caches, so resolving one pair
+    /// at a time waits on one cache miss at a time. Advancing several
+    /// independent walks in rotation, and prefetching each walk's next node,
+    /// overlaps those misses.
+    pub(super) fn get_many(lookups: &[(&Self, &str)]) -> Vec<Option<u32>> {
+        const MAX_WALKS: usize = 16;
+
+        struct Walk<'a> {
+            lookup: usize,
+            fst: &'a fst::raw::Fst<Vec<u8>>,
+            key: &'a [u8],
+            depth: usize,
+            addr: fst::raw::CompiledAddr,
+            output: fst::raw::Output,
+        }
+
+        let mut results = vec![None; lookups.len()];
+        let mut walks = Vec::with_capacity(MAX_WALKS.min(lookups.len()));
+        let mut next_lookup = 0;
+        loop {
+            while walks.len() < MAX_WALKS && next_lookup < lookups.len() {
+                let (dictionary, token) = lookups[next_lookup];
+                match &dictionary.tokens {
+                    TokenMap::HashMap(map) => results[next_lookup] = map.get(token).copied(),
+                    TokenMap::Fst(map) => {
+                        let fst = map.as_fst();
+                        walks.push(Walk {
+                            lookup: next_lookup,
+                            fst,
+                            key: token.as_bytes(),
+                            depth: 0,
+                            addr: fst.root().addr(),
+                            output: fst::raw::Output::zero(),
+                        });
+                    }
+                }
+                next_lookup += 1;
+            }
+            if walks.is_empty() {
+                return results;
+            }
+
+            // Mirrors `fst::raw::Fst::get`, one node per walk per round.
+            let mut walk_index = 0;
+            while walk_index < walks.len() {
+                let walk = &mut walks[walk_index];
+                let node = walk.fst.node(walk.addr);
+                let finished = match walk.key.get(walk.depth) {
+                    None => Some(
+                        node.is_final()
+                            .then(|| walk.output.cat(node.final_output()).value() as u32),
+                    ),
+                    Some(&byte) => match node.find_input(byte) {
+                        None => Some(None),
+                        Some(transition_index) => {
+                            let transition = node.transition(transition_index);
+                            walk.output = walk.output.cat(transition.out);
+                            walk.addr = transition.addr;
+                            walk.depth += 1;
+                            prefetch_fst_node(walk.fst.as_bytes(), transition.addr);
+                            None
+                        }
+                    },
+                };
+                if let Some(token_id) = finished {
+                    results[walk.lookup] = token_id;
+                    walks.swap_remove(walk_index);
+                } else {
+                    walk_index += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Hint the cache lines holding the FST node at `addr`. A node is decoded
+/// from its state byte at `addr` backwards, so fetch the preceding line too.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_fst_node(fst_bytes: &[u8], addr: fst::raw::CompiledAddr) {
+    for byte in [fst_bytes.get(addr), fst_bytes.get(addr.saturating_sub(63))]
+        .into_iter()
+        .flatten()
+    {
+        // SAFETY: prefetching only hints the cache and cannot fault; the
+        // pointer is in bounds of `fst_bytes` regardless.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                (byte as *const u8).cast(),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_fst_node(_fst_bytes: &[u8], _addr: fst::raw::CompiledAddr) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fst_dictionary(terms: &[&str]) -> TokenSet {
+        let mut terms = terms.to_vec();
+        terms.sort_unstable();
+        let map = fst::Map::from_iter(
+            terms
+                .iter()
+                .enumerate()
+                .map(|(token_id, term)| (*term, token_id as u64)),
+        )
+        .unwrap();
+        TokenSet {
+            tokens: TokenMap::Fst(map),
+            next_id: terms.len() as u32,
+            total_length: terms.iter().map(|term| term.len()).sum(),
+        }
+    }
+
+    #[test]
+    fn test_get_many_matches_get() {
+        let mut in_memory = TokenSet::default();
+        in_memory.add("a".to_owned());
+        in_memory.add("abc".to_owned());
+        let dictionaries = [
+            fst_dictionary(&["", "a", "ab", "abc", "abd", "b", "banana", "zeta"]),
+            fst_dictionary(&["ab", "abcd", "alpha", "b", "bandana"]),
+            fst_dictionary(&[]),
+            in_memory,
+        ];
+        // Keys that are prefixes of other keys, extend past a leaf, stop
+        // mid-edge, or are empty; more lookups than walks kept in flight.
+        let tokens = [
+            "", "a", "ab", "abc", "abcd", "abd", "abe", "alpha", "b", "ban", "banana", "bandana",
+            "zeta", "zz",
+        ];
+        let lookups = dictionaries
+            .iter()
+            .flat_map(|dictionary| tokens.iter().map(move |token| (dictionary, *token)))
+            .collect::<Vec<_>>();
+        let expected = lookups
+            .iter()
+            .map(|(dictionary, token)| dictionary.get(token))
+            .collect::<Vec<_>>();
+
+        assert_eq!(TokenSet::get_many(&lookups), expected);
+        assert!(expected.iter().any(Option::is_some));
+        assert!(expected.iter().any(Option::is_none));
+    }
 }

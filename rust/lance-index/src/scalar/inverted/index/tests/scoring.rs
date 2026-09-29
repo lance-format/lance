@@ -790,6 +790,7 @@ async fn search_test_impact_partition(
             Operator::Or,
             postings,
             Some(scorer),
+            SharedNormAddends::default(),
             &NoOpMetricsCollector,
             shared_threshold,
         )
@@ -901,6 +902,7 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
             .unwrap(),
     );
     let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+    let shared_norm_addends = SharedNormAddends::default();
     let mut results = Vec::new();
     let mut published_floors = Vec::new();
     for partition_id in [0, 1] {
@@ -943,6 +945,7 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
                     Operator::And,
                     postings,
                     Some(scorer.clone()),
+                    shared_norm_addends.clone(),
                     &NoOpMetricsCollector,
                     shared_threshold.clone(),
                 )

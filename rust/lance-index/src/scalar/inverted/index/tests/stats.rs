@@ -495,8 +495,17 @@ async fn test_loaded_bm25_stats_are_all_or_nothing_and_preserve_oov() {
         .unwrap()
         .unwrap();
     let asynchronous = index.bm25_stats_for_terms(&terms, None).await.unwrap();
-    assert_eq!(loaded, (10, 10, vec![1, 0, 1]));
-    assert_eq!(loaded, asynchronous);
+    assert_eq!(loaded.stats, (10, 10, vec![1, 0, 1]));
+    assert_eq!(loaded.stats, asynchronous);
+    let dictionary = &index.partitions[0].tokens;
+    assert_eq!(
+        loaded.token_ids.as_ref(),
+        terms
+            .iter()
+            .map(|term| dictionary.get(term))
+            .collect::<Vec<_>>(),
+        "recorded ids must be the partition dictionary's ids, with None for OOV terms"
+    );
 }
 
 #[tokio::test]
