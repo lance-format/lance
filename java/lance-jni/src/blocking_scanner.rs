@@ -385,6 +385,22 @@ pub(crate) fn build_scanner_with_options<'a>(
             .call_method(&java_obj, "getQueryVectorDim", "()I", &[])?
             .i()?;
         if query_vector_dim > 0 {
+            // The core interprets a list-shaped query against a multivector column as ONE
+            // multivector query (no `query_index`), which would silently break the
+            // `setKeys` batch contract, so reject it here.
+            if let Some(field) = dataset.schema().field(&column)
+                && matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            {
+                return Err(Error::input_error(format!(
+                    "Batch vector search (setKeys) is not supported on multivector column '{}' \
+                     of type {:?}",
+                    column,
+                    field.data_type()
+                )));
+            }
             // Batch nearest-neighbor search: the flat buffer packs multiple query
             // vectors of `query_vector_dim` values each. Wrapping it in a FixedSizeList
             // makes the core scanner run a shared partition scan across the batch and

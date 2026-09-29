@@ -17,10 +17,17 @@ import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.dataset.scanner.Scanner;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -29,6 +36,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -256,6 +264,46 @@ public class VectorSearchTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> builder.setKeys(new float[][] {{1.0f, 2.0f}, {1.0f, 2.0f, 3.0f}}));
+  }
+
+  @Test
+  void test_batch_knn_rejects_multivector_column() {
+    // A list-shaped query against a List<FixedSizeList> column is one multivector query in
+    // the core, which cannot honor the setKeys batch contract (per-query results with
+    // query_index), so the binding must reject it rather than silently change semantics.
+    Field vectorItem =
+        new Field(
+            "item",
+            FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)),
+            null);
+    Field vector =
+        new Field(
+            "item",
+            FieldType.nullable(new ArrowType.FixedSizeList(4)),
+            Collections.singletonList(vectorItem));
+    Field multivector =
+        new Field(
+            "mv", FieldType.nullable(new ArrowType.List()), Collections.singletonList(vector));
+    Schema schema = new Schema(Collections.singletonList(multivector));
+    String datasetPath = tempDir.resolve("test_batch_knn_multivector").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build())) {
+      ScanOptions options =
+          new ScanOptions.Builder()
+              .nearest(
+                  new Query.Builder()
+                      .setColumn("mv")
+                      .setKeys(new float[][] {{1f, 2f, 3f, 4f}, {5f, 6f, 7f, 8f}})
+                      .setK(1)
+                      .build())
+              .build();
+      IllegalArgumentException error =
+          assertThrows(IllegalArgumentException.class, () -> dataset.newScan(options));
+      assertTrue(
+          error.getMessage().contains("not supported on multivector column 'mv'"),
+          "Unexpected error message: " + error.getMessage());
+    }
   }
 
   @Test
