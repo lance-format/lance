@@ -96,27 +96,58 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .unwrap_or(default_worker_memory_limit_bytes)
 }
 
-/// Group the workers' leftover tail builders into as few partitions as the
+/// Merge the workers' leftover tail builders into as few partitions as the
 /// memory budget allows. Folding unconditionally would collapse every build
 /// whose workers never hit the flush threshold into a single partition, which
-/// destroys intra-query parallelism; splitting by the same per-partition
-/// budget as the flush path makes the final partition count converge to
-/// roughly total_builder_memory / memory_limit_bytes regardless of worker
-/// layout.
+/// destroys intra-query parallelism, so a partition only takes builders while
+/// it stays under the same per-partition budget as the flush path.
 ///
-/// Groups are planned from each builder's own memory size so that every group
-/// can be merged independently. Merging only deduplicates tokens, so the sum
-/// bounds the merged size up to capacity rounding.
-fn group_tail_partitions(
+/// Merging runs in rounds whose groups are merged concurrently. A round plans
+/// its groups from the sum of the builders' memory sizes, which overestimates
+/// the merged size: every worker keeps its own dictionary entry and posting
+/// list builder for each token it saw, and merging deduplicates them. The next
+/// round plans again from the merged sizes, until no two adjacent builders fit
+/// together. Every two adjacent partitions then reach the budget, so the
+/// partition count stays below 2 * merged_memory / memory_limit_bytes + 1
+/// however many workers produced tails.
+async fn merge_tail_partitions(
     tails: Vec<TailPartition>,
+    memory_limit_bytes: u64,
+) -> Result<Vec<InnerBuilder>> {
+    let mut builders = tails
+        .into_iter()
+        .map(|tail| tail.builder)
+        .collect::<Vec<_>>();
+    loop {
+        let groups =
+            spawn_cpu(move || Result::Ok(group_tail_builders(builders, memory_limit_bytes)))
+                .await?;
+        let merges_any = groups.iter().any(|group| group.len() > 1);
+        builders = futures::stream::iter(
+            groups
+                .into_iter()
+                .map(|group| spawn_cpu(move || merge_tail_group(group))),
+        )
+        .buffered(get_num_compute_intensive_cpus().max(1))
+        .try_collect()
+        .await?;
+        if !merges_any {
+            return Ok(builders);
+        }
+    }
+}
+
+/// Split `builders` into consecutive groups whose summed memory sizes stay
+/// under `memory_limit_bytes`.
+fn group_tail_builders(
+    builders: Vec<InnerBuilder>,
     memory_limit_bytes: u64,
 ) -> Vec<Vec<InnerBuilder>> {
     let mut groups: Vec<Vec<InnerBuilder>> = Vec::new();
     let mut group_memory_size = 0u64;
     let mut group_num_docs = 0usize;
     let mut empty_coordinate_builder: Option<InnerBuilder> = None;
-    for tail in tails {
-        let builder = tail.builder;
+    for builder in builders {
         if builder.is_empty() {
             if builder.docs.coordinate_rank() > 0 && empty_coordinate_builder.is_none() {
                 empty_coordinate_builder = Some(builder);
@@ -528,28 +559,23 @@ impl InvertedIndexBuilder {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let tail_groups = spawn_cpu(move || {
-                Result::Ok(group_tail_partitions(
-                    tail_partitions,
-                    worker_memory_limit_bytes,
-                ))
-            })
-            .await?;
+            let merged_tail_partitions =
+                merge_tail_partitions(tail_partitions, worker_memory_limit_bytes).await?;
             // Tail partitions hold most of the data when workers rarely hit the
-            // flush threshold; merging and writing them one at a time serializes
-            // the posting-list work of nearly the whole index behind a single
-            // thread. Merge, compress and write the groups concurrently.
+            // flush threshold; writing them one at a time serializes the
+            // posting-list compression of nearly the whole index behind a
+            // single producer thread. Compress and write them concurrently.
             let write_target = self.partition_write_target();
-            let mut tail_writes = futures::stream::iter(tail_groups.into_iter().map(|group| {
-                let dest_store = dest_store.clone();
-                async move {
-                    let mut builder = spawn_cpu(move || merge_tail_group(group)).await?;
-                    let partition_id = builder.id();
-                    let files = builder.write_to(dest_store.as_ref(), write_target).await?;
-                    Result::Ok((partition_id, files))
-                }
-            }))
-            .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
+            let mut tail_writes =
+                futures::stream::iter(merged_tail_partitions.into_iter().map(|mut builder| {
+                    let dest_store = dest_store.clone();
+                    async move {
+                        let partition_id = builder.id();
+                        let files = builder.write_to(dest_store.as_ref(), write_target).await?;
+                        Result::Ok((partition_id, files))
+                    }
+                }))
+                .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
             while let Some((partition_id, partition_files)) = tail_writes.try_next().await? {
                 self.new_partitions.push(partition_id);
                 files.extend(partition_files);
@@ -4576,18 +4602,8 @@ mod tests {
         TailPartition { builder }
     }
 
-    fn merge_tail_partitions(
-        tails: Vec<TailPartition>,
-        memory_limit_bytes: u64,
-    ) -> Result<Vec<InnerBuilder>> {
-        group_tail_partitions(tails, memory_limit_bytes)
-            .into_iter()
-            .map(merge_tail_group)
-            .collect()
-    }
-
-    #[test]
-    fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
         let merged = merge_tail_partitions(
             vec![
                 tail_with_docs(0, 4),
@@ -4595,15 +4611,16 @@ mod tests {
                 tail_with_docs(2, 4),
             ],
             u64::MAX,
-        )?;
+        )
+        .await?;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id(), 0);
         assert_eq!(merged[0].docs.len(), 12);
         Ok(())
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_splits_on_memory_budget() -> Result<()> {
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_splits_on_memory_budget() -> Result<()> {
         let tails = vec![
             tail_with_docs(0, 64),
             tail_with_docs(1, 64),
@@ -4612,14 +4629,14 @@ mod tests {
         ];
         let single = tails[0].builder.memory_size();
         // A budget below two builders' footprint must keep them separate.
-        let merged = merge_tail_partitions(tails, single + 1)?;
+        let merged = merge_tail_partitions(tails, single + 1).await?;
         assert_eq!(merged.len(), 4);
         assert!(merged.iter().all(|builder| builder.docs.len() == 64));
 
         // A budget that fits two builders pairs them up, and a merged pair
         // stays within it.
         let tails = (0..4).map(|id| tail_with_docs(id, 64)).collect();
-        let merged = merge_tail_partitions(tails, 2 * single + 1)?;
+        let merged = merge_tail_partitions(tails, 2 * single + 1).await?;
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().all(|builder| builder.docs.len() == 128));
         assert!(
@@ -4630,9 +4647,45 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
-        assert!(merge_tail_partitions(Vec::new(), u64::MAX)?.is_empty());
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
+        assert!(
+            merge_tail_partitions(Vec::new(), u64::MAX)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_plans_from_merged_sizes() -> Result<()> {
+        // Workers that saw the same tokens each hold their own per-token
+        // state, which merging deduplicates, so the tails' summed sizes
+        // overestimate the merged partition.
+        let tail_with_shared_tokens = |id: u64| {
+            let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
+            for token in 0..1000 {
+                builder.tokens.get_or_add(&format!("shared{token}"));
+            }
+            builder
+                .posting_lists
+                .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
+            let doc = builder.docs.append(id, 1000);
+            for posting_list in &mut builder.posting_lists {
+                posting_list.add(doc, PositionRecorder::Count(1));
+            }
+            TailPartition { builder }
+        };
+        let tails = (0..4).map(tail_with_shared_tokens).collect::<Vec<_>>();
+        let single = tails[0].builder.memory_size();
+        let memory_limit_bytes = single * 5 / 2;
+
+        // Summed sizes only admit pairs, but a merged pair is barely larger
+        // than one tail, so the pairs fit together.
+        let merged = merge_tail_partitions(tails, memory_limit_bytes).await?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].docs.len(), 4);
+        assert!(merged[0].memory_size() < memory_limit_bytes);
         Ok(())
     }
 
@@ -4790,8 +4843,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_merge_tail_partition_group_combines_tail_builders() -> Result<()> {
+    #[tokio::test]
+    async fn test_merge_tail_partition_group_combines_tail_builders() -> Result<()> {
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
         let hello = first.tokens.get_or_add("hello");
         first
@@ -4814,7 +4867,8 @@ mod tests {
                 TailPartition { builder: second },
             ],
             u64::MAX,
-        )?;
+        )
+        .await?;
         assert_eq!(merged.len(), 1);
         let merged = &merged[0];
 
