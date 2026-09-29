@@ -301,64 +301,6 @@ impl TokenSet {
         }
     }
 
-    // the `removed_token_ids` must be sorted
-    pub fn remap(&mut self, removed_token_ids: &[u32]) {
-        if removed_token_ids.is_empty() {
-            return;
-        }
-
-        let mut map = match std::mem::take(&mut self.tokens) {
-            TokenMap::HashMap(map) => map,
-            TokenMap::Fst(map) => {
-                let mut new_map = HashMap::with_capacity(map.len());
-                let mut stream = map.into_stream();
-                while let Some((token, token_id)) = stream.next() {
-                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
-                }
-
-                new_map
-            }
-        };
-
-        let mut retained_length = 0;
-        map.retain(
-            |token, token_id| match removed_token_ids.binary_search(token_id) {
-                Ok(_) => false,
-                Err(index) => {
-                    *token_id -= index as u32;
-                    retained_length += token.len();
-                    true
-                }
-            },
-        );
-
-        self.tokens = TokenMap::HashMap(map);
-
-        // The retain above compacts the surviving token ids into a dense `[0, len)`
-        // range, so `next_id` (handed to the next new token) must follow them down.
-        // `total_length` likewise must drop the removed tokens' bytes; it is persisted
-        // and feeds memory accounting, so a stale value drifts across remap/merge cycles.
-        self.next_id = self.tokens.len() as u32;
-        self.total_length = retained_length;
-    }
-
-    pub fn next_id(&self) -> u32 {
-        self.next_id
-    }
-
-    pub(crate) fn memory_size(&self) -> usize {
-        match &self.tokens {
-            TokenMap::HashMap(map) => {
-                self.total_length
-                    + map.capacity()
-                        * (std::mem::size_of::<String>()
-                            + std::mem::size_of::<u32>()
-                            + std::mem::size_of::<usize>())
-            }
-            TokenMap::Fst(map) => map.as_fst().size(),
-        }
-    }
-
     /// [`Self::get`] for many `(dictionary, token)` pairs, returning results
     /// in input order.
     ///
@@ -434,6 +376,64 @@ impl TokenSet {
                     walk_index += 1;
                 }
             }
+        }
+    }
+
+    // the `removed_token_ids` must be sorted
+    pub fn remap(&mut self, removed_token_ids: &[u32]) {
+        if removed_token_ids.is_empty() {
+            return;
+        }
+
+        let mut map = match std::mem::take(&mut self.tokens) {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
+        };
+
+        let mut retained_length = 0;
+        map.retain(
+            |token, token_id| match removed_token_ids.binary_search(token_id) {
+                Ok(_) => false,
+                Err(index) => {
+                    *token_id -= index as u32;
+                    retained_length += token.len();
+                    true
+                }
+            },
+        );
+
+        self.tokens = TokenMap::HashMap(map);
+
+        // The retain above compacts the surviving token ids into a dense `[0, len)`
+        // range, so `next_id` (handed to the next new token) must follow them down.
+        // `total_length` likewise must drop the removed tokens' bytes; it is persisted
+        // and feeds memory accounting, so a stale value drifts across remap/merge cycles.
+        self.next_id = self.tokens.len() as u32;
+        self.total_length = retained_length;
+    }
+
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    pub(crate) fn memory_size(&self) -> usize {
+        match &self.tokens {
+            TokenMap::HashMap(map) => {
+                self.total_length
+                    + map.capacity()
+                        * (std::mem::size_of::<String>()
+                            + std::mem::size_of::<u32>()
+                            + std::mem::size_of::<usize>())
+            }
+            TokenMap::Fst(map) => map.as_fst().size(),
         }
     }
 }
