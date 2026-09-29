@@ -1079,6 +1079,15 @@ async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
         "packed group deep_size_of {packed_size}B should be at least 25% smaller than the \
              {materialized_size}B materialized graph for {posting_count} postings"
     );
+    // Prewarm caches a group per 128 dictionary rows of every partition, and
+    // each is resident and charged at its inline size on top of its buffers,
+    // so a group keeps only the buffers every posting view reads, not an
+    // Arrow array (100+ bytes) per column.
+    let inline_size = std::mem::size_of_val(group.as_ref());
+    assert!(
+        inline_size <= 320,
+        "packed group holds {inline_size}B inline"
+    );
 }
 
 // ===========================================================================
