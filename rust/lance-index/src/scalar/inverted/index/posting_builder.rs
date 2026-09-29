@@ -44,10 +44,25 @@ const _: () = assert!(std::mem::size_of::<PostingListBuilder>() <= 40);
 /// Builder state that only posting lists with full blocks or positions need.
 #[derive(Debug, Default)]
 pub(super) struct PostingListOverflow {
-    pub(super) encoded_blocks: EncodedBlocks,
-    pub(super) encoded_position_blocks: EncodedPositionBlocks,
+    // Positions of the postings in `tail` and of the open document; only
+    // lists with positions use them.
     pub(super) tail_positions: PositionBlockBuilder,
     pub(super) open_doc: Option<OpenDoc>,
+    // Every token of a positional build allocates this box on its first
+    // posting, but most tokens never fill a block, so block storage is boxed
+    // separately.
+    pub(super) full_blocks: Option<Box<FullBlocks>>,
+}
+
+// Every distinct token of a positional build allocates one; keep it small.
+const _: () = assert!(std::mem::size_of::<PostingListOverflow>() <= 80);
+
+/// The encoded full blocks of a posting list that reached `block_size`
+/// postings.
+#[derive(Debug, Default)]
+pub(super) struct FullBlocks {
+    pub(super) encoded_blocks: EncodedBlocks,
+    pub(super) encoded_position_blocks: EncodedPositionBlocks,
 }
 
 /// A document whose positions are still streaming in through
@@ -112,10 +127,14 @@ impl PostingListBuilder {
             0
         };
         let overflow_size = self.overflow.as_deref().map_or(0, |overflow| {
+            let full_blocks_size = overflow.full_blocks.as_deref().map_or(0, |full_blocks| {
+                std::mem::size_of::<FullBlocks>()
+                    + full_blocks.encoded_blocks.size()
+                    + full_blocks.encoded_position_blocks.size()
+            });
             std::mem::size_of::<PostingListOverflow>()
-                + overflow.encoded_blocks.size()
-                + overflow.encoded_position_blocks.size()
                 + overflow.tail_positions.size()
+                + full_blocks_size
         });
         (tail_size + overflow_size) as u64
     }
@@ -176,7 +195,11 @@ impl PostingListBuilder {
         let tail_len = usize::from(self.tail_len);
         match self.overflow.as_deref() {
             Some(overflow) => {
-                overflow.encoded_blocks.len() * self.block_size()
+                let num_full_blocks = overflow
+                    .full_blocks
+                    .as_deref()
+                    .map_or(0, |full_blocks| full_blocks.encoded_blocks.len());
+                num_full_blocks * self.block_size()
                     + tail_len
                     + usize::from(overflow.open_doc.is_some())
             }
@@ -213,17 +236,21 @@ impl PostingListBuilder {
         let block_size = self.block_size();
         let mut decoded_positions = Vec::new();
 
-        if let Some(overflow) = self.overflow.as_deref() {
+        if let Some(full_blocks) = self
+            .overflow
+            .as_deref()
+            .and_then(|overflow| overflow.full_blocks.as_deref())
+        {
             let mut doc_ids = Vec::with_capacity(block_size);
             let mut frequencies = Vec::with_capacity(block_size);
-            for (block_index, block) in overflow.encoded_blocks.iter().enumerate() {
+            for (block_index, block) in full_blocks.encoded_blocks.iter().enumerate() {
                 doc_ids.clear();
                 frequencies.clear();
                 decode_full_posting_block(block, &mut doc_ids, &mut frequencies, block_size);
                 decoded_positions.clear();
                 if self.with_positions {
                     super::super::encoding::decode_position_stream_block(
-                        overflow.encoded_position_blocks.block(block_index),
+                        full_blocks.encoded_position_blocks.block(block_index),
                         &frequencies,
                         PositionStreamCodec::PackedDelta,
                         &mut decoded_positions,
@@ -370,12 +397,13 @@ impl PostingListBuilder {
             overflow.open_doc.is_none(),
             "cannot flush a posting block while a document is still open"
         );
-        overflow
+        let full_blocks = overflow.full_blocks.get_or_insert_with(Box::default);
+        full_blocks
             .encoded_blocks
             .push_full_block(&doc_ids, &frequencies)?;
         if with_positions {
             let tail_position_block = std::mem::take(&mut overflow.tail_positions).finish();
-            overflow
+            full_blocks
                 .encoded_position_blocks
                 .push_encoded_block(tail_position_block.as_slice());
         }
@@ -401,13 +429,17 @@ impl PostingListBuilder {
         let block_size = self.block_size();
         let (tail_doc_ids, tail_frequencies) = self.tail_entries().unzip();
         let overflow = self.overflow.map(|overflow| *overflow).unwrap_or_default();
+        let full_blocks = overflow
+            .full_blocks
+            .map(|full_blocks| *full_blocks)
+            .unwrap_or_default();
         PostingListParts {
             with_positions: self.with_positions,
             posting_tail_codec: self.posting_tail_codec,
             block_size,
             length,
-            encoded_blocks: overflow.encoded_blocks,
-            encoded_position_blocks: overflow.encoded_position_blocks,
+            encoded_blocks: full_blocks.encoded_blocks,
+            encoded_position_blocks: full_blocks.encoded_position_blocks,
             tail_doc_ids,
             tail_frequencies,
             tail_position_block: self

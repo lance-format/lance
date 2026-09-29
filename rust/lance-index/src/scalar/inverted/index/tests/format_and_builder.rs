@@ -1149,6 +1149,27 @@ fn test_posting_builder_short_lists_stay_inline() {
     assert_eq!(builder.len(), 102);
 }
 
+#[rstest::rstest]
+#[case::added(false)]
+#[case::streamed(true)]
+fn test_posting_builder_short_positional_lists_skip_block_storage(#[case] streamed: bool) {
+    let mut builder = PostingListBuilder::new_with_block_size(true, 256);
+    if streamed {
+        builder.add_occurrence(9_000, 4).unwrap();
+        builder.finish_open_doc(9_000).unwrap();
+    } else {
+        builder.add(9_000, PositionRecorder::Position(smallvec::smallvec![4]));
+    }
+    // Every token of a positional build needs position state from its first
+    // posting, but only lists that fill a block need block storage. One
+    // posting costs the position state box plus its first position buffer.
+    assert!(builder.size() <= 96, "{}", builder.size());
+    assert_eq!(
+        builder.iter().collect::<Vec<_>>(),
+        vec![(9_000_u32, 1_u32, Some(vec![4_u32]))]
+    );
+}
+
 #[test]
 fn test_posting_builder_flush_releases_tail_position_capacity() {
     let mut builder = PostingListBuilder::new(true);
