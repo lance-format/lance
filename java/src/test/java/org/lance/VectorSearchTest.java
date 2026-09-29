@@ -264,6 +264,12 @@ public class VectorSearchTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> builder.setKeys(new float[][] {{1.0f, 2.0f}, {1.0f, 2.0f, 3.0f}}));
+    // vectors x dimensions overflowing the flattened int-indexed buffer is rejected up front.
+    // Every row aliases one array, so this costs well under 1 MB.
+    float[] row = new float[1 << 15];
+    float[][] oversized = new float[1 << 16][];
+    Arrays.fill(oversized, row);
+    assertThrows(IllegalArgumentException.class, () -> builder.setKeys(oversized));
   }
 
   @Test

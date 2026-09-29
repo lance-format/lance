@@ -198,6 +198,9 @@ public class Query {
      * distance within each group). This column is added even when a single query vector is
      * supplied. The scan fails if the dataset already contains a column named {@code query_index}.
      *
+     * <p>Scan-level {@code limit} / {@code offset} apply to the combined result across all query
+     * vectors, not per query vector. Batch search is not supported on multivector columns.
+     *
      * @param keys The search vectors, one per row.
      * @return The Builder instance for method chaining.
      */
@@ -207,7 +210,14 @@ public class Query {
       Preconditions.checkNotNull(keys[0], "Query vector must not be null");
       int dim = keys[0].length;
       Preconditions.checkArgument(dim > 0, "Query vector dimension must be greater than 0");
-      float[] flattened = new float[keys.length * dim];
+      long totalLength = (long) keys.length * dim;
+      Preconditions.checkArgument(
+          totalLength <= Integer.MAX_VALUE,
+          "Batch query of %s vectors x %s dimensions exceeds the maximum buffer length %s",
+          keys.length,
+          dim,
+          Integer.MAX_VALUE);
+      float[] flattened = new float[(int) totalLength];
       for (int i = 0; i < keys.length; i++) {
         Preconditions.checkNotNull(keys[i], "Query vector must not be null");
         Preconditions.checkArgument(
