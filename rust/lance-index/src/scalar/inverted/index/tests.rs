@@ -56,7 +56,7 @@ async fn write_single_partition_index(
         format_version,
         block_size,
     );
-    partition.tokens.add(token.to_owned());
+    partition.tokens.get_or_add(token);
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),

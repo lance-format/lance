@@ -16,7 +16,6 @@ use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
-use fst::Streamer;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_arrow::json::JsonEncoding;
@@ -831,7 +830,7 @@ pub struct InnerBuilder {
     format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
     block_size: usize,
-    pub(crate) tokens: TokenSet,
+    pub(super) tokens: TokenDictionary,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
 }
@@ -894,7 +893,7 @@ impl InnerBuilder {
             format_version,
             posting_tail_codec: format_version.posting_tail_codec(),
             block_size,
-            tokens: TokenSet::default(),
+            tokens: TokenDictionary::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
         }
@@ -951,8 +950,14 @@ impl InnerBuilder {
     }
 
     /// Set the token set for this builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tokens` does not map its tokens to distinct ids in
+    /// `0..tokens.len()`, the ids the posting lists are indexed by.
     pub fn set_tokens(&mut self, tokens: TokenSet) {
-        self.tokens = tokens;
+        self.tokens = TokenDictionary::try_from_token_set(tokens)
+            .expect("token set must map its tokens to dense ids");
     }
 
     /// Set the document set for this builder.
@@ -1052,22 +1057,8 @@ impl InnerBuilder {
         }
 
         let mut token_id_map = vec![u32::MAX; posting_lists.len()];
-        match tokens.tokens {
-            TokenMap::HashMap(map) => {
-                for (token, token_id) in map {
-                    let new_token_id = self.tokens.get_or_add(token.as_str());
-                    token_id_map[token_id as usize] = new_token_id;
-                }
-            }
-            TokenMap::Fst(map) => {
-                let mut stream = map.stream();
-                while let Some((token, token_id)) = stream.next() {
-                    let new_token_id = self
-                        .tokens
-                        .get_or_add(String::from_utf8_lossy(token).as_ref());
-                    token_id_map[token_id as usize] = new_token_id;
-                }
-            }
+        for (token_id, token) in tokens.iter() {
+            token_id_map[token_id as usize] = self.tokens.get_or_add(token);
         }
 
         let doc_id_offset = self.docs.len() as u32;
@@ -3775,7 +3766,7 @@ mod tests {
             TokenSetFormat::default(),
             posting_tail_codec,
         );
-        partition.tokens.add("hello".to_owned());
+        partition.tokens.get_or_add("hello");
         let mut posting_list =
             PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
         posting_list.add(0, PositionRecorder::Count(1));
@@ -4552,7 +4543,7 @@ mod tests {
 
     fn tail_with_docs(id: u64, num_docs: u64) -> TailPartition {
         let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
-        let token = builder.tokens.add(format!("token{}", id));
+        let token = builder.tokens.get_or_add(&format!("token{}", id));
         builder
             .posting_lists
             .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
@@ -4758,7 +4749,7 @@ mod tests {
     #[test]
     fn test_merge_tail_partition_group_combines_tail_builders() -> Result<()> {
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
-        let hello = first.tokens.add("hello".to_owned());
+        let hello = first.tokens.get_or_add("hello");
         first
             .posting_lists
             .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
@@ -4766,7 +4757,7 @@ mod tests {
         first.posting_lists[hello as usize].add(first_doc, PositionRecorder::Count(1));
 
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
-        let world = second.tokens.add("world".to_owned());
+        let world = second.tokens.get_or_add("world");
         second
             .posting_lists
             .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
@@ -4804,7 +4795,7 @@ mod tests {
         // middle one, mirroring filter_old_data dropping a token whose postings emptied.
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
         for token in ["a", "b", "c"] {
-            first.tokens.add(token.to_owned());
+            first.tokens.get_or_add(token);
         }
         first
             .posting_lists
@@ -4817,16 +4808,12 @@ mod tests {
         first.tokens.remap(&[1]);
         first.posting_lists.remove(1);
         assert_eq!(first.tokens.len(), first.posting_lists.len());
+        assert_eq!(first.tokens.get("c"), Some(1));
 
-        // Mimic a token set persisted by a writer from before #7115. Converting the
-        // loaded set for mutation must restore the dense token-id invariant.
-        first.tokens.next_id = 9;
-        first.tokens = std::mem::take(&mut first.tokens).into_mutable();
-
-        // `second` contributes a brand-new token absent from `first`. Before the fix,
-        // get_or_add returned the stale next_id, indexing past posting_lists.
+        // `second` contributes a brand-new token absent from `first`; its id must
+        // follow the compacted ids rather than index past posting_lists.
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
-        let zeta = second.tokens.add("zeta".to_owned());
+        let zeta = second.tokens.get_or_add("zeta");
         second
             .posting_lists
             .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
@@ -4886,10 +4873,7 @@ mod tests {
 
         write_stale_next_id_token_file(store.as_ref(), 0).await;
         let reader = store.open_index_file(&token_file_path(0)).await.unwrap();
-        let tokens = TokenSet::load(reader, TokenSetFormat::Fst)
-            .await
-            .unwrap()
-            .into_mutable();
+        let tokens = TokenSet::load(reader, TokenSetFormat::Fst).await.unwrap();
 
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::Fst);
         first.set_tokens(tokens);
@@ -4901,7 +4885,7 @@ mod tests {
         first.posting_lists[1].add(doc, PositionRecorder::Count(1));
 
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::Fst);
-        let zeta = second.tokens.add("zeta".to_owned());
+        let zeta = second.tokens.get_or_add("zeta");
         second
             .posting_lists
             .resize_with(second.tokens.len(), || PostingListBuilder::new(false));

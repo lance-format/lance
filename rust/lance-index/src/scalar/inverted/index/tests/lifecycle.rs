@@ -19,7 +19,7 @@ async fn build_multi_partition_index(
         // A few distinct tokens per partition so each posting file has real
         // content to read and materialize during prewarm.
         for t in 0..4u32 {
-            builder.tokens.add(format!("tok_{id}_{t}"));
+            builder.tokens.get_or_add(&format!("tok_{id}_{t}"));
             let mut posting =
                 PostingListBuilder::new_with_posting_tail_codec(false, PostingTailCodec::Fixed32);
             let base = id * 1000 + t as u64 * 10;
@@ -144,7 +144,7 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
     let posting_tail_codec = format_version.posting_tail_codec();
     let mut partition =
         InnerBuilder::new_with_format_version(0, false, TokenSetFormat::default(), format_version);
-    partition.tokens.add("hello".to_owned());
+    partition.tokens.get_or_add("hello");
     let mut posting_list =
         PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
     posting_list.add(0, PositionRecorder::Count(1));
@@ -234,7 +234,7 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
         format_version,
         params.posting_block_size(),
     );
-    partition.tokens.add("hello".to_owned());
+    partition.tokens.get_or_add("hello");
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),
@@ -501,7 +501,7 @@ async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("test".to_owned());
+    builder.tokens.get_or_add("test");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder.docs.append(100, 1);

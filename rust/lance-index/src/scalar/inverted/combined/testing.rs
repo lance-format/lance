@@ -257,7 +257,7 @@ pub(super) async fn element_document_index(
     let mut postings: Vec<PostingListBuilder> = vocab
         .iter()
         .map(|token| {
-            builder.tokens.add((*token).to_owned());
+            builder.tokens.get_or_add(token);
             PostingListBuilder::new_with_posting_tail_codec_and_block_size(
                 false,
                 posting_tail_codec,

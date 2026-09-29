@@ -1685,7 +1685,7 @@ impl InvertedPartition {
             self.inverted_list.posting_tail_codec(),
             self.inverted_list.block_size(),
         );
-        builder.tokens = Arc::unwrap_or_clone(self.tokens).into_mutable();
+        builder.tokens = TokenDictionary::try_from_token_set(Arc::unwrap_or_clone(self.tokens))?;
         builder.docs = self.docs.load_build_docset().await?;
 
         builder

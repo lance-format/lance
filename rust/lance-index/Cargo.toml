@@ -34,6 +34,7 @@ geoarrow-array = { workspace = true, optional = true }
 geoarrow-schema = { workspace = true, optional = true }
 geo-types = { workspace = true, optional = true }
 half.workspace = true
+hashbrown = { version = "0.16", default-features = false }
 hex.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }

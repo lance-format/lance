@@ -4156,6 +4156,7 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
+ "hashbrown 0.16.1",
  "hex",
  "itertools 0.14.0",
  "jieba-rs",

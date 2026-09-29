@@ -201,7 +201,7 @@ async fn load_counted_v2_index(
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for i in 0..num_tokens {
-        builder.tokens.add(format!("t{}", i));
+        builder.tokens.get_or_add(&format!("t{}", i));
         let mut pl = PostingListBuilder::new(false);
         pl.add(i as u32, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -963,7 +963,7 @@ async fn load_v2_index_with_grouped_postings(
     let num_docs = num_tokens * docs_per_token;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token_id in 0..num_tokens {
-        builder.tokens.add(format!("t{token_id}"));
+        builder.tokens.get_or_add(&format!("t{token_id}"));
         let mut pl = PostingListBuilder::new(false);
         for d in 0..docs_per_token {
             let doc_id = (token_id * docs_per_token + d) as u32;

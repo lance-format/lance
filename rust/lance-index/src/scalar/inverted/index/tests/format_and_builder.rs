@@ -590,7 +590,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
         format_version,
         block_size,
     );
-    builder.tokens.add("needle".to_owned());
+    builder.tokens.get_or_add("needle");
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),
@@ -676,7 +676,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
         block_size,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             true,
             format_version.posting_tail_codec(),
@@ -782,7 +782,7 @@ async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
         LEGACY_BLOCK_SIZE,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             true,
             InvertedListFormatVersion::V1.posting_tail_codec(),
@@ -948,7 +948,7 @@ async fn test_chunk_posting_mode_controls_buffer_sharing() {
         MAX_POSTING_BLOCK_SIZE,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
             PostingTailCodec::VarintDelta,
@@ -1581,8 +1581,8 @@ async fn test_remap_to_empty_posting_list() {
     // 0: lance
     // 1: lake lake
     // 2: lake lake lake
-    builder.tokens.add("lance".to_owned());
-    builder.tokens.add("lake".to_owned());
+    builder.tokens.get_or_add("lance");
+    builder.tokens.get_or_add("lake");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -1700,4 +1700,72 @@ fn test_compressed_posting_contains_each_matches_full_decode(
     assert!(expected.iter().any(|found| *found) && expected.iter().any(|found| !*found));
     assert_eq!(posting.contains_each(&probes), expected);
     assert!(posting.contains_each(&[]).is_empty());
+}
+
+fn dictionary_test_tokens() -> Vec<String> {
+    let mut tokens = ["b", "a", "ab", "abc", "a b", "z", "é", "日本語"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    tokens.extend((0..1000).map(|index| format!("tok{index:04}")));
+    tokens
+}
+
+#[rstest::rstest]
+#[case::arrow(TokenSetFormat::Arrow)]
+#[case::fst(TokenSetFormat::Fst)]
+fn test_token_dictionary_writes_same_batch_as_token_set(#[case] format: TokenSetFormat) {
+    let mut expected = TokenSet::default();
+    let mut dictionary = TokenDictionary::default();
+    for token in dictionary_test_tokens() {
+        let token_id = dictionary.get_or_add(&token);
+        assert_eq!(dictionary.get_or_add(&token), token_id);
+        assert_eq!(expected.add(token), token_id);
+    }
+    assert_eq!(dictionary.len(), expected.len());
+    assert_eq!(
+        dictionary.to_batch(format).unwrap(),
+        expected.to_batch(format).unwrap()
+    );
+}
+
+#[rstest::rstest]
+#[case::arrow(TokenSetFormat::Arrow)]
+#[case::fst(TokenSetFormat::Fst)]
+#[tokio::test]
+async fn test_token_dictionary_keeps_loaded_token_ids(#[case] format: TokenSetFormat) {
+    let tmpdir = TempObjDir::default();
+    let store = LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    );
+    let mut written = TokenSet::default();
+    for token in dictionary_test_tokens() {
+        written.add(token);
+    }
+    let batch = written.clone().to_batch(format).unwrap();
+    let mut writer = store
+        .new_index_file("tokens.lance", batch.schema())
+        .await
+        .unwrap();
+    writer.write_record_batch(batch).await.unwrap();
+    writer.finish().await.unwrap();
+    let reader = store.open_index_file("tokens.lance").await.unwrap();
+    let loaded = TokenSet::load(reader, format).await.unwrap();
+
+    let mut dictionary = TokenDictionary::try_from_token_set(loaded).unwrap();
+    assert_eq!(dictionary.len(), written.len());
+    for token in dictionary_test_tokens() {
+        assert_eq!(dictionary.get(&token), written.get(&token), "{token}");
+    }
+    assert_eq!(dictionary.get_or_add("new token"), written.len() as u32);
+}
+
+#[test]
+fn test_token_dictionary_rejects_sparse_token_ids() {
+    let mut tokens = TokenSet::default();
+    tokens.tokens = TokenMap::HashMap(HashMap::from([("a".to_owned(), 0), ("b".to_owned(), 5)]));
+    let err = TokenDictionary::try_from_token_set(tokens).unwrap_err();
+    assert!(err.to_string().contains("distinct ids below 2"), "{err}");
 }
