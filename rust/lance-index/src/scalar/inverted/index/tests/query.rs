@@ -501,15 +501,31 @@ async fn write_pair_partition(
     partition_id: u64,
     documents: &[(&str, &str, u64)],
 ) {
-    let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+    write_pair_partition_with_position(store, partition_id, documents, false).await;
+}
+
+/// [`write_pair_partition`] that, with `with_position`, records each
+/// document's left token at position 0 and its right token at position 1.
+async fn write_pair_partition_with_position(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    documents: &[(&str, &str, u64)],
+    with_position: bool,
+) {
+    let mut builder = InnerBuilder::new(partition_id, with_position, TokenSetFormat::default());
     let mut postings = BTreeMap::<String, PostingListBuilder>::new();
     for (left, right, row_id) in documents {
         let doc_id = builder.docs.append(*row_id, 2);
-        for token in [left, right] {
+        for (position, token) in [left, right].into_iter().enumerate() {
+            let recorder = if with_position {
+                PositionRecorder::Position(vec![position as u32].into())
+            } else {
+                PositionRecorder::Count(1)
+            };
             postings
                 .entry((*token).to_owned())
-                .or_insert_with(|| PostingListBuilder::new(false))
-                .add(doc_id, PositionRecorder::Count(1));
+                .or_insert_with(|| PostingListBuilder::new(with_position))
+                .add(doc_id, recorder);
         }
     }
     for (token, posting) in postings {
@@ -724,12 +740,13 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
 async fn prepared_documents(
     index: &InvertedIndex,
     prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+    params: FtsSearchParams,
     operator: Operator,
 ) -> Vec<(u64, u32)> {
     let mut results = index
         .bm25_search_prepared_documents(
             prepared,
-            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            Arc::new(params),
             operator,
             Arc::new(NoFilter),
             Arc::new(NoOpMetricsCollector),
@@ -748,8 +765,9 @@ async fn prepared_documents(
 async fn load_prewarmed_index(
     store: Arc<LanceIndexStore>,
     partition_ids: Vec<u64>,
+    params: InvertedIndexParams,
 ) -> (Arc<InvertedIndex>, LanceCache) {
-    write_test_metadata(&store, partition_ids, InvertedIndexParams::default()).await;
+    write_test_metadata(&store, partition_ids, params).await;
     let cache = LanceCache::with_capacity(1 << 20);
     let index = InvertedIndex::load(store, None, &cache).await.unwrap();
     index
@@ -772,11 +790,20 @@ fn without_term_ids(
 }
 
 #[rstest::rstest]
-#[case::and(Operator::And, vec![0])]
-#[case::or(Operator::Or, vec![0, 1, 2, 3, 4])]
+// The repeated "alpha" maps two query positions to one unique term.
+#[case::and(&["alpha", "beta", "alpha"], Operator::And, 0, None, vec![0, 8])]
+#[case::or(&["alpha", "beta", "alpha"], Operator::Or, 0, None, vec![0, 1, 2, 3, 4, 5, 6, 8])]
+#[case::phrase(&["alpha", "beta"], Operator::And, 0, Some(0), vec![0])]
+// "alphx" expands to "alpha" and "alphb" at one query position.
+#[case::fuzzy_and(&["alphx", "beta"], Operator::And, 1, None, vec![0, 2, 6, 8])]
+#[case::fuzzy_or(&["alphx", "beta"], Operator::Or, 1, None, vec![0, 1, 2, 3, 4, 5, 6, 7, 8])]
+#[case::fuzzy_phrase(&["alphx", "beta"], Operator::And, 1, Some(0), vec![0, 2, 6])]
 #[tokio::test]
 async fn test_prepared_term_ids_search_like_dictionary_lookups(
+    #[case] query: &[&str],
     #[case] operator: Operator,
+    #[case] edit_distance: u32,
+    #[case] phrase_slop: Option<u32>,
     #[case] expected_rows: Vec<u64>,
 ) {
     let dir = TempObjDir::default();
@@ -785,21 +812,43 @@ async fn test_prepared_term_ids_search_like_dictionary_lookups(
         dir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
-    // Partition 1 lacks "beta" and partition 2 lacks "alpha", so AND can only
-    // match partition 0 while OR reads every partition.
-    write_pair_partition(&store, 0, &[("alpha", "beta", 0), ("alpha", "gamma", 1)]).await;
-    write_pair_partition(&store, 1, &[("alpha", "gamma", 2)]).await;
-    write_pair_partition(&store, 2, &[("beta", "delta", 3), ("beta", "gamma", 4)]).await;
-    let (index, _cache) = load_prewarmed_index(store, vec![0, 1, 2]).await;
-    // The repeated token maps two query positions to one unique term.
+    // Partition 0 holds both expansions of "alphx", so fuzzy leaves union two
+    // postings at one position; row 8 has both terms but not as a phrase.
+    // AND and phrase leaves must skip partition 1 (no "beta") and partition 2
+    // (neither expansion). Partition 3 holds only "alphb": exact leaves skip
+    // it, fuzzy leaves must not.
+    let partitions: [&[(&str, &str, u64)]; 4] = [
+        &[
+            ("alpha", "beta", 0),
+            ("alpha", "gamma", 1),
+            ("alphb", "beta", 2),
+            ("beta", "alpha", 8),
+        ],
+        &[("alpha", "gamma", 3)],
+        &[("beta", "delta", 4), ("beta", "gamma", 5)],
+        &[("alphb", "beta", 6), ("alphb", "gamma", 7)],
+    ];
+    for (partition_id, documents) in partitions.into_iter().enumerate() {
+        write_pair_partition_with_position(&store, partition_id as u64, documents, true).await;
+    }
+    let (index, _cache) = load_prewarmed_index(
+        store,
+        vec![0, 1, 2, 3],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let params = FtsSearchParams::new()
+        .with_limit(Some(10))
+        .with_fuzziness(Some(edit_distance))
+        .with_phrase_slop(phrase_slop);
     let tokens = Tokens::new(
-        vec!["alpha".to_owned(), "beta".to_owned(), "alpha".to_owned()],
+        query.iter().map(|token| (*token).to_owned()).collect(),
         DocType::Text,
     );
     let prepared = crate::scalar::inverted::prepare_bm25_query(
         std::slice::from_ref(&index),
         tokens,
-        &FtsSearchParams::new().with_limit(Some(10)),
+        &params,
         None,
         None,
     )
@@ -807,8 +856,9 @@ async fn test_prepared_term_ids_search_like_dictionary_lookups(
     .unwrap();
     assert!(prepared.term_ids().is_some());
 
-    let resolved = prepared_documents(&index, Arc::new(prepared.clone()), operator).await;
-    let looked_up = prepared_documents(&index, without_term_ids(&prepared), operator).await;
+    let resolved =
+        prepared_documents(&index, Arc::new(prepared.clone()), params.clone(), operator).await;
+    let looked_up = prepared_documents(&index, without_term_ids(&prepared), params, operator).await;
     assert_eq!(resolved, looked_up);
     assert_eq!(
         resolved
@@ -828,7 +878,8 @@ async fn test_prepared_term_ids_apply_only_to_their_segment() {
         Arc::new(LanceCache::no_cache()),
     ));
     write_pair_partition(&prepared_store, 0, &[("alpha", "beta", 0)]).await;
-    let (prepared_index, _prepared_cache) = load_prewarmed_index(prepared_store, vec![0]).await;
+    let (prepared_index, _prepared_cache) =
+        load_prewarmed_index(prepared_store, vec![0], InvertedIndexParams::default()).await;
 
     // "aaa" shifts every id, so reusing the prepared segment's id for "alpha"
     // here would match the "aaa beta" document instead.
@@ -857,10 +908,21 @@ async fn test_prepared_term_ids_apply_only_to_their_segment() {
     .unwrap();
     assert!(prepared.term_ids().is_some());
 
-    let resolved =
-        prepared_documents(&other_index, Arc::new(prepared.clone()), Operator::And).await;
-    let looked_up =
-        prepared_documents(&other_index, without_term_ids(&prepared), Operator::And).await;
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let resolved = prepared_documents(
+        &other_index,
+        Arc::new(prepared.clone()),
+        params.clone(),
+        Operator::And,
+    )
+    .await;
+    let looked_up = prepared_documents(
+        &other_index,
+        without_term_ids(&prepared),
+        params,
+        Operator::And,
+    )
+    .await;
     assert_eq!(resolved, looked_up);
     assert_eq!(
         resolved
