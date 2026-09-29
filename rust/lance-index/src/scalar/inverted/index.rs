@@ -72,18 +72,17 @@ use super::{
     DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams, wand::*,
 };
 use super::{
+    builder::{InnerBuilder, PositionRecorder},
+    iter::CompressedPostingListIterator,
+};
+use super::{
     builder::{
-        BLOCK_SIZE, ScoredDoc, doc_file_path,
-        inverted_list_schema_for_version_with_block_size_and_impacts, posting_file_path,
-        token_file_path,
+        ScoredDoc, doc_file_path, inverted_list_schema_for_version_with_block_size_and_impacts,
+        posting_file_path, token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
     scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
-};
-use super::{
-    builder::{InnerBuilder, PositionRecorder},
-    iter::CompressedPostingListIterator,
 };
 use crate::pbold;
 use crate::progress::IndexBuildProgress;

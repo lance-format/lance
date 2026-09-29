@@ -65,7 +65,9 @@ roaring.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-smallvec = "1.15"
+# `union` drops the inline/heap tag word, which keeps the per-token FTS
+# posting-list builder small.
+smallvec = { version = "1.15", features = ["union"] }
 tokio.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true

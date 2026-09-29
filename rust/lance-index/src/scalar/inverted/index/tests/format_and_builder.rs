@@ -1060,34 +1060,93 @@ async fn test_posting_builder_remap() {
     );
 }
 
-#[test]
-fn test_posting_builder_size_tracking_matches_structure() {
-    fn tracked_memory_size(builder: &PostingListBuilder) -> u64 {
-        let encoded_blocks_size = builder
-            .encoded_blocks
-            .iter()
-            .map(|encoded_blocks| std::mem::size_of::<EncodedBlocks>() + encoded_blocks.size())
-            .sum::<usize>();
-        let encoded_positions_size = builder
-            .encoded_position_blocks
-            .as_ref()
-            .map(|positions| std::mem::size_of::<EncodedPositionBlocks>() + positions.size())
-            .unwrap_or(0usize);
-        (encoded_blocks_size
-            + builder.tail_entries.capacity() * std::mem::size_of::<RawDocInfo>()
-            + builder.tail_positions.size()
-            + encoded_positions_size) as u64
+/// Doc id gaps and frequencies that exercise one- to five-byte varints in the
+/// builder's tail encoding.
+fn varied_postings(len: usize) -> (Vec<u32>, Vec<u32>) {
+    let gaps = [1_u32, 7, 130, 20_000, 3_000_000];
+    let frequencies = [1_u32, 2, 127, 128, 70_000];
+    let mut doc_id = 5u32;
+    let mut doc_ids = Vec::with_capacity(len);
+    for index in 0..len {
+        doc_ids.push(doc_id);
+        doc_id += if index == 1 {
+            300_000_000
+        } else {
+            gaps[index % gaps.len()]
+        };
     }
+    let freqs = (0..len)
+        .map(|index| frequencies[index % frequencies.len()])
+        .collect();
+    (doc_ids, freqs)
+}
 
-    let mut builder = PostingListBuilder::new(true);
-    for doc_id in 0..(BLOCK_SIZE + 5) as u32 {
-        builder.add(
-            doc_id,
-            PositionRecorder::Position(smallvec::smallvec![1, 3, 5]),
+#[rstest::rstest]
+#[case::legacy_fixed32_tail(PostingTailCodec::Fixed32, LEGACY_BLOCK_SIZE)]
+#[case::varint_tail_128(PostingTailCodec::VarintDelta, LEGACY_BLOCK_SIZE)]
+#[case::varint_tail_256(PostingTailCodec::VarintDelta, 256)]
+fn test_posting_builder_matches_reference_encoding(
+    #[case] posting_tail_codec: PostingTailCodec,
+    #[case] block_size: usize,
+) {
+    for len in [
+        1,
+        3,
+        block_size - 1,
+        block_size,
+        block_size + 1,
+        3 * block_size + 5,
+    ] {
+        let (doc_ids, frequencies) = varied_postings(len);
+        let mut builder = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            posting_tail_codec,
+            block_size,
         );
-    }
+        for (&doc_id, &frequency) in doc_ids.iter().zip(&frequencies) {
+            builder.add(doc_id, PositionRecorder::Count(frequency));
+        }
+        assert_eq!(builder.len(), doc_ids.len(), "len {len}");
+        let expected_entries = doc_ids
+            .iter()
+            .zip(&frequencies)
+            .map(|(&doc_id, &frequency)| (doc_id, frequency, None))
+            .collect::<Vec<_>>();
+        assert_eq!(builder.iter().collect::<Vec<_>>(), expected_entries);
 
-    assert_eq!(builder.size(), tracked_memory_size(&builder));
+        let block_max_scores = (0..doc_ids.len().div_ceil(block_size))
+            .map(|block| block as f32 + 0.5)
+            .collect::<Vec<_>>();
+        let expected = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            block_max_scores.iter().copied(),
+            posting_tail_codec,
+            block_size,
+        )
+        .unwrap();
+        let batch = builder.to_batch(block_max_scores).unwrap();
+        let actual = batch[POSTING_COL].as_list::<i32>().value(0);
+        assert_eq!(actual.as_binary::<i64>(), &expected, "len {len}");
+    }
+}
+
+#[test]
+fn test_posting_builder_short_lists_stay_inline() {
+    let mut builder = PostingListBuilder::new_with_block_size(false, 256);
+    // Most tokens of a corpus occur in only a few documents; they must not
+    // pay for a heap allocation.
+    for doc_id in [9_000, 90_000, 900_000] {
+        builder.add(doc_id, PositionRecorder::Count(1));
+    }
+    assert_eq!(builder.size(), 0);
+
+    for doc_id in 900_001..900_100 {
+        builder.add(doc_id, PositionRecorder::Count(3));
+    }
+    assert!(builder.size() as usize >= builder.tail.len());
+    assert_eq!(builder.len(), 102);
 }
 
 #[test]
@@ -1098,23 +1157,9 @@ fn test_posting_builder_flush_releases_tail_position_capacity() {
         builder.add(doc_id, PositionRecorder::Position(positions.clone()));
     }
 
-    assert_eq!(builder.tail_positions.size(), 0);
-    assert_eq!(builder.size(), {
-        let encoded_blocks_size = builder
-            .encoded_blocks
-            .iter()
-            .map(|encoded_blocks| std::mem::size_of::<EncodedBlocks>() + encoded_blocks.size())
-            .sum::<usize>();
-        let encoded_positions_size = builder
-            .encoded_position_blocks
-            .as_ref()
-            .map(|positions| std::mem::size_of::<EncodedPositionBlocks>() + positions.size())
-            .unwrap_or(0usize);
-        (encoded_blocks_size
-            + builder.tail_entries.capacity() * std::mem::size_of::<RawDocInfo>()
-            + builder.tail_positions.size()
-            + encoded_positions_size) as u64
-    });
+    let overflow = builder.overflow.as_deref().unwrap();
+    assert_eq!(overflow.tail_positions.size(), 0);
+    assert!(builder.tail.is_empty());
 }
 
 #[test]
@@ -1135,6 +1180,30 @@ fn test_posting_builder_streamed_positions_roundtrip() {
             (0_u32, 3_u32, Some(vec![1_u32, 4_u32, 9_u32])),
             (2_u32, 1_u32, Some(vec![3_u32])),
         ]
+    );
+
+    // Streaming across block boundaries must build the same posting list as
+    // adding whole documents.
+    let mut streamed = PostingListBuilder::new(true);
+    let mut added = PostingListBuilder::new(true);
+    let mut expected = Vec::new();
+    for doc_id in (0..(2 * BLOCK_SIZE + 3) as u32).map(|doc| doc * 3 + 1) {
+        let positions = (0..doc_id % 4 + 1)
+            .map(|index| index * 5 + doc_id % 7)
+            .collect::<Vec<_>>();
+        for &position in &positions {
+            streamed.add_occurrence(doc_id, position).unwrap();
+        }
+        streamed.finish_open_doc(doc_id).unwrap();
+        added.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+        expected.push((doc_id, positions.len() as u32, Some(positions)));
+    }
+    assert_eq!(streamed.len(), expected.len());
+    assert_eq!(streamed.iter().collect::<Vec<_>>(), expected);
+    let block_max_scores = vec![1.0; expected.len().div_ceil(BLOCK_SIZE)];
+    assert_eq!(
+        streamed.to_batch(block_max_scores.clone()).unwrap(),
+        added.to_batch(block_max_scores).unwrap()
     );
 }
 
