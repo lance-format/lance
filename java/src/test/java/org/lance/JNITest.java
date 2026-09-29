@@ -54,21 +54,27 @@ public class JNITest {
     Query defaultQuery =
         new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
     assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
+    assertEquals(Optional.empty(), defaultQuery.getLowerBound());
+    assertEquals(Optional.empty(), defaultQuery.getUpperBound());
 
-    JniTestHelper.parseQuery(
-        Optional.of(
-            new Query.Builder()
-                .setColumn("column")
-                .setKey(new float[] {1.0f, 2.0f, 3.0f})
-                .setK(10)
-                .setNprobes(20)
-                .setEf(30)
-                .setRefineFactor(40)
-                .setDistanceType(DistanceType.L2)
-                .setUseIndex(true)
-                .setQueryParallelism(-1)
-                .setApproxMode(ApproxMode.ACCURATE)
-                .build()));
+    Query query =
+        new Query.Builder()
+            .setColumn("column")
+            .setKey(new float[] {1.0f, 2.0f, 3.0f})
+            .setK(10)
+            .setLowerBound(1.5f)
+            .setUpperBound(2.5f)
+            .setNprobes(20)
+            .setEf(30)
+            .setRefineFactor(40)
+            .setDistanceType(DistanceType.L2)
+            .setUseIndex(true)
+            .setQueryParallelism(-1)
+            .setApproxMode(ApproxMode.ACCURATE)
+            .build();
+    assertEquals(Optional.of(1.5f), query.getLowerBound());
+    assertEquals(Optional.of(2.5f), query.getUpperBound());
+    JniTestHelper.parseQuery(Optional.of(query));
   }
 
   @Test
