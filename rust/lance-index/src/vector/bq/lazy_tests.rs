@@ -24,7 +24,7 @@ use super::builder::RabitQuantizer;
 use super::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
 };
-use super::layered::{PlaneBatch, RQPrecision, plane_columns};
+use super::layered::{PlaneBatch, RQPrecision, SignBounds, plane_columns};
 use super::storage::{
     ExRows, RabitPruneCounters, RabitQuantizationStorage, SignStage, StagePruneCounts, SurvivorRow,
     select_full_survivors, take_captured_prune_counters,
@@ -245,7 +245,7 @@ impl Fixture {
         let (batch, rotated_centroid, dist_q_c) = self.transform(residuals, centroid, row_id_base);
         let plane = |plane: u8| {
             let schema = batch.schema();
-            let indices: Vec<usize> = plane_columns(plane)
+            let indices: Vec<usize> = plane_columns(plane, SignBounds::default())
                 .iter()
                 .map(|name| schema.index_of(name).unwrap())
                 .collect();

@@ -5,8 +5,9 @@
 //!
 //! The counters only advance while a query runs the lazy scan (or is checked
 //! for it), so production queries with the scan disabled touch at most the
-//! `ineligible_disabled` counter. Readers take deltas with
-//! [`snapshot_and_reset`].
+//! `ineligible_disabled` counter. The `resident_columns_*` counters are the
+//! exception: they advance when an IVF_RQ index, layered or not, loads its
+//! resident columns. Readers take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -164,6 +165,14 @@ layered_lazy_counters! {
         /// Sparse gathers whose rows came from the origin file because the
         /// cache had no persistent entry for the plane.
         origin_row_reads,
+        /// Origin requests of those reads after coalescing within the lazy
+        /// origin gap (`LANCE_RQ_LAZY_ORIGIN_GAP_BYTES`) and splitting, which
+        /// are GETs on an object store. A load of the resident columns that
+        /// such a read starts is counted in `resident_columns_load_requests`
+        /// instead.
+        origin_sparse_requests,
+        /// Bytes those requests read, the gaps they span included.
+        origin_sparse_bytes,
         /// Sum over gathered probes of probes still unscored at issue.
         staleness_sum,
         /// Issues deferred because the heap was not yet full at the gate.
@@ -213,6 +222,31 @@ layered_lazy_counters! {
         /// Bytes of planes loaded by promotions, resident afterwards or not,
         /// apart from critical-path reads.
         promotion_bytes,
+        /// Bytes of values each load of an index's resident columns keeps in
+        /// memory (see `LANCE_RQ_RESIDENT_COLUMNS`). An index loads them
+        /// once, so over every snapshot this sums to the store's size.
+        resident_columns_bytes,
+        /// Memory the arrays of those loads hold: the capacity of their
+        /// buffers, counted per column. It exceeds `resident_columns_bytes`
+        /// when an array keeps a buffer larger than its values.
+        resident_columns_alloc_bytes,
+        /// Origin requests of those loads after coalescing and splitting,
+        /// which are GETs on an object store.
+        resident_columns_load_requests,
+        /// Bytes those loads read from the origin.
+        resident_columns_load_bytes,
+        /// Time those loads took.
+        resident_columns_load_ns,
+        /// Classifying staged probes' ex planes by the cache tier that holds
+        /// them (only RAM residency on a low-latency origin).
+        tier_peek_ns,
+        /// Gathers issued beyond the ordinary window with a permit of their
+        /// index's pool, because their probe reads an ex plane from a
+        /// high-latency origin; see `LANCE_RQ_LAZY_FAR_WINDOW`.
+        far_early_issues,
+        /// Gathers beyond the ordinary window that found no free permit and
+        /// waited for one or for the ordinary window, whichever came first.
+        far_permit_waits,
     }
     ranked {
         /// Probes gathered lazily.
@@ -227,11 +261,18 @@ layered_lazy_counters! {
         empty,
         /// Probes of non-empty partitions whose ex planes were not both
         /// resident, predicted from `k` and the partition sizes to be
-        /// gathered whole, and so loaded and scored by the eager scan; see
-        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER`.
+        /// gathered whole, and so loaded and scored by the eager scan, as
+        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` routes them for their planes' tiers.
         dense_to_eager,
+        /// Probes of non-empty partitions with a high or low plane that no
+        /// cache tier held when they were staged, on an index whose origin
+        /// latency class is high: reading the plane is a request to the
+        /// origin, an object store such as S3. Counted whether the probe was
+        /// then gathered lazily or routed to the eager scan; always 0 on a
+        /// low-latency origin.
+        s3_bound_probes,
         /// Lazy probes issued at once because the rows of all earlier probes
-        /// cannot fill the heap. The probes of queries that
+        /// cannot fill the heap. The probes that
         /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` routes are counted in
         /// `dense_to_eager` instead.
         certain_dense,
@@ -266,6 +307,10 @@ layered_lazy_counters! {
     maxima {
         /// Largest number of probes still unscored at a gather's issue.
         staleness_max,
+        /// Most permits of one index's pool taken at once, observed as each
+        /// gather beyond the ordinary window takes one; at most
+        /// `LANCE_RQ_LAZY_FAR_INFLIGHT`.
+        far_in_flight_max,
     }
 }
 

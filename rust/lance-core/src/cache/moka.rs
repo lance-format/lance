@@ -109,6 +109,12 @@ impl CacheBackend for MokaCacheBackend {
         self.cache.get(key).await.map(|r| r.entry)
     }
 
+    /// Moka does not count `contains_key` as a read: the entry's popularity
+    /// estimate and recency order stay unchanged.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.cache.contains_key(key)
+    }
+
     async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }

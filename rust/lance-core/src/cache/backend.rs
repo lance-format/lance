@@ -45,6 +45,20 @@ use super::{CacheCodec, InternalCacheKey};
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
+/// The tier that would serve a read of an entry, as
+/// [`CacheBackend::peek_tier`] predicts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheTier {
+    /// In RAM: a read is a memory hit.
+    Resident,
+    /// Not in RAM but held by a local tier below it, such as a persistent
+    /// store or a buffer of recently evicted entries: a read costs local I/O
+    /// at most, never the caller's loader.
+    Local,
+    /// Held by no tier: a read runs the caller's loader.
+    Absent,
+}
+
 /// Low-level pluggable cache backend.
 ///
 /// Implementations store entries keyed by [`InternalCacheKey`] and return
@@ -65,6 +79,20 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// with recency state may treat as an access.
     async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
         self.get_resident(key).await.is_some()
+    }
+
+    /// Predict which tier would serve a read of `key`, without reading the
+    /// entry or counting as an access, so the check changes neither what the
+    /// backend evicts next nor its hit statistics. The default knows RAM only,
+    /// through [`peek_resident`](Self::peek_resident), and reports every other
+    /// entry as [`CacheTier::Absent`]; backends with a local tier below RAM
+    /// override it.
+    async fn peek_tier(&self, key: &InternalCacheKey) -> CacheTier {
+        if self.peek_resident(key).await {
+            CacheTier::Resident
+        } else {
+            CacheTier::Absent
+        }
     }
 
     /// Whether layered index planes should gate lower-plane RAM admission on

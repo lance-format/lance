@@ -56,7 +56,7 @@ mod quick;
 pub use priority::PriorityEntries;
 mod registry;
 
-pub use backend::{CacheBackend, CacheEntry};
+pub use backend::{CacheBackend, CacheEntry, CacheTier};
 pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, CacheRangeReader, MAGIC,
@@ -396,6 +396,13 @@ impl LanceCache {
         self.state.backend.peek_resident(&key).await
     }
 
+    /// Predict which tier would serve a read of the entry, without reading it
+    /// or counting as an access; see [`CacheBackend::peek_tier`].
+    pub async fn peek_tier_with_key<K: CacheKey>(&self, cache_key: &K) -> CacheTier {
+        let key = self.sized_key(cache_key);
+        self.state.backend.peek_tier(&key).await
+    }
+
     /// Whether lower layered planes gate RAM admission on a resident sign plane.
     pub fn plane_admission_gated(&self) -> bool {
         self.state.backend.plane_admission_gated()
@@ -674,6 +681,15 @@ impl WeakLanceCache {
         match self.upgrade() {
             Some(cache) => cache.peek_resident_with_key(cache_key).await,
             None => false,
+        }
+    }
+
+    /// Predict the serving tier without counting as an access; a dropped
+    /// cache holds nothing.
+    pub async fn peek_tier_with_key<K: CacheKey>(&self, cache_key: &K) -> CacheTier {
+        match self.upgrade() {
+            Some(cache) => cache.peek_tier_with_key(cache_key).await,
+            None => CacheTier::Absent,
         }
     }
 
@@ -1220,6 +1236,58 @@ mod tests {
 
         drop(cache);
         assert!(!weak.peek_resident_with_key(&TestKey::new(1)).await);
+    }
+
+    /// Lance's in-memory backends have no tier below RAM, so the default tier
+    /// peek reports resident entries and nothing else as held. Peeks are not
+    /// accesses: they count neither hits nor misses.
+    #[tokio::test]
+    async fn tier_peek_defaults_to_residency_without_access() {
+        for kind in [TestBackendKind::Moka, TestBackendKind::Quick] {
+            let cache = kind.cache(4096);
+            let weak = WeakLanceCache::from(&cache);
+            assert_eq!(
+                cache.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+            cache
+                .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+                .await;
+            assert_eq!(
+                cache.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Resident,
+                "{kind:?}"
+            );
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Resident,
+                "{kind:?}"
+            );
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(2)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+            let stats = cache.stats().await;
+            assert_eq!((stats.hits, stats.misses), (0, 0), "{kind:?}");
+
+            cache.clear().await;
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+            cache
+                .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+                .await;
+            drop(cache);
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+        }
     }
 
     #[tokio::test]

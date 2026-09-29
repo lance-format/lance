@@ -158,6 +158,16 @@ impl CacheBackend for QuickCacheBackend {
             .map(|r| r.entry)
     }
 
+    /// Membership checks only: priority stamps and quick_cache's reference
+    /// bits stay unchanged, so a probed entry is evicted as if never probed.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.priority
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(key)
+            || self.cache.contains_key(key)
+    }
+
     async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
         if (self.priority_active.load(Ordering::Acquire)
             || codec.is_some_and(|c| c.memory_priority() > 0))
@@ -314,7 +324,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::cache::{CacheKey, LanceCache};
+    use crate::cache::{CacheKey, CacheTier, LanceCache};
 
     struct TestKey<T: 'static> {
         key: String,
@@ -415,6 +425,86 @@ mod tests {
         assert_eq!(cache.num_entries().await, 0);
         cache.insert(&key(0), Arc::new(0u64), 32, None).await;
         assert!(cache.get_resident(&key(0)).await.is_some());
+    }
+
+    /// Fill a single-shard cache so that `victim` is its only cold entry,
+    /// then peek at its tier or get it, and insert one more entry.
+    async fn cold_victim_after(touch_with_get: bool) -> QuickCacheBackend {
+        const ENTRY_BYTES: usize = 100;
+        const HOT_ENTRIES: u8 = 9;
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let entry_weight = key_footprint(&key(0)) + ENTRY_BYTES;
+        let capacity = entry_weight * (usize::from(HOT_ENTRIES) + 1);
+        let cache = QuickCacheBackend::with_capacity(capacity);
+        for id in 0..HOT_ENTRIES {
+            cache
+                .insert(&key(id), Arc::new(id), ENTRY_BYTES, None)
+                .await;
+        }
+        let victim = key(HOT_ENTRIES);
+        cache
+            .insert(&victim, Arc::new(0u8), ENTRY_BYTES, None)
+            .await;
+        if touch_with_get {
+            assert!(cache.get_resident(&victim).await.is_some());
+        } else {
+            assert_eq!(cache.peek_tier(&victim).await, CacheTier::Resident);
+        }
+        cache
+            .insert(&key(HOT_ENTRIES + 1), Arc::new(0u8), ENTRY_BYTES, None)
+            .await;
+        cache
+    }
+
+    #[tokio::test]
+    async fn tier_peek_leaves_eviction_order_unchanged() {
+        let victim = InternalCacheKey::from_bytes([9; 16]);
+        let peeked = cold_victim_after(false).await;
+        assert_eq!(peeked.peek_tier(&victim).await, CacheTier::Absent);
+        assert!(!peeked.cache.contains_key(&victim));
+
+        // A real access sets the reference bit, so the same victim survives.
+        let touched = cold_victim_after(true).await;
+        assert_eq!(touched.peek_tier(&victim).await, CacheTier::Resident);
+    }
+
+    /// The priority tier evicts its oldest stamp first; a tier peek leaves
+    /// the stamp alone where a get refreshes it.
+    #[tokio::test]
+    async fn tier_peek_leaves_priority_order_unchanged() {
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let codec = CacheCodec::new("test.priority", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+            .with_memory_priority(1);
+        for touch_with_get in [false, true] {
+            // Room for three 48-byte entries (32 bytes plus the 16-byte key).
+            let cache = QuickCacheBackend::with_capacity(160);
+            for id in 1..=3 {
+                cache
+                    .insert(&key(id), Arc::new(u64::from(id)), 32, Some(codec))
+                    .await;
+            }
+            if touch_with_get {
+                assert!(cache.get_resident(&key(1)).await.is_some());
+            } else {
+                assert_eq!(cache.peek_tier(&key(1)).await, CacheTier::Resident);
+            }
+            cache.insert(&key(4), Arc::new(4u64), 32, Some(codec)).await;
+            let (survivor, evicted) = if touch_with_get {
+                (key(1), key(2))
+            } else {
+                (key(2), key(1))
+            };
+            assert_eq!(
+                cache.peek_tier(&evicted).await,
+                CacheTier::Absent,
+                "get={touch_with_get}"
+            );
+            assert_eq!(
+                cache.peek_tier(&survivor).await,
+                CacheTier::Resident,
+                "get={touch_with_get}"
+            );
+        }
     }
 
     #[test]
