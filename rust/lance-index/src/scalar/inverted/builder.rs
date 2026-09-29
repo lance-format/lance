@@ -96,19 +96,24 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .unwrap_or(default_worker_memory_limit_bytes)
 }
 
-/// Merge the workers' leftover tail builders into as few partitions as the
+/// Group the workers' leftover tail builders into as few partitions as the
 /// memory budget allows. Folding unconditionally would collapse every build
 /// whose workers never hit the flush threshold into a single partition, which
 /// destroys intra-query parallelism; splitting by the same per-partition
 /// budget as the flush path makes the final partition count converge to
 /// roughly total_builder_memory / memory_limit_bytes regardless of worker
 /// layout.
-fn merge_all_tail_partitions(
+///
+/// Groups are planned from each builder's own memory size so that every group
+/// can be merged independently. Merging only deduplicates tokens, so the sum
+/// bounds the merged size up to capacity rounding.
+fn group_tail_partitions(
     tails: Vec<TailPartition>,
     memory_limit_bytes: u64,
-) -> Result<Vec<InnerBuilder>> {
-    let mut merged_builders: Vec<InnerBuilder> = Vec::new();
-    let mut merged: Option<InnerBuilder> = None;
+) -> Vec<Vec<InnerBuilder>> {
+    let mut groups: Vec<Vec<InnerBuilder>> = Vec::new();
+    let mut group_memory_size = 0u64;
+    let mut group_num_docs = 0usize;
     let mut empty_coordinate_builder: Option<InnerBuilder> = None;
     for tail in tails {
         let builder = tail.builder;
@@ -118,31 +123,41 @@ fn merge_all_tail_partitions(
             }
             continue;
         }
-        match &mut merged {
-            Some(current) => {
-                let would_exceed_memory =
-                    current.memory_size().saturating_add(builder.memory_size())
-                        >= memory_limit_bytes;
-                let would_exceed_doc_ids =
-                    current.docs.len().saturating_add(builder.docs.len()) > u32::MAX as usize;
-                if would_exceed_memory || would_exceed_doc_ids {
-                    merged_builders.push(std::mem::replace(current, builder));
-                } else {
-                    current.merge_from(builder)?;
-                }
+        let memory_size = builder.memory_size();
+        let num_docs = builder.docs.len();
+        match groups.last_mut() {
+            Some(group)
+                if group_memory_size.saturating_add(memory_size) < memory_limit_bytes
+                    && group_num_docs.saturating_add(num_docs) <= u32::MAX as usize =>
+            {
+                group.push(builder);
+                group_memory_size += memory_size;
+                group_num_docs += num_docs;
             }
-            None => merged = Some(builder),
+            _ => {
+                groups.push(vec![builder]);
+                group_memory_size = memory_size;
+                group_num_docs = num_docs;
+            }
         }
     }
-    if let Some(builder) = merged {
-        merged_builders.push(builder);
-    }
-    if merged_builders.is_empty()
+    if groups.is_empty()
         && let Some(builder) = empty_coordinate_builder
     {
-        merged_builders.push(builder);
+        groups.push(vec![builder]);
     }
-    Ok(merged_builders)
+    groups
+}
+
+fn merge_tail_group(group: Vec<InnerBuilder>) -> Result<InnerBuilder> {
+    let mut builders = group.into_iter();
+    let mut merged = builders
+        .next()
+        .ok_or_else(|| Error::internal("tail partition group is empty".to_owned()))?;
+    for builder in builders {
+        merged.merge_from(builder)?;
+    }
+    Ok(merged)
 }
 
 #[derive(Debug)]
@@ -513,25 +528,28 @@ impl InvertedIndexBuilder {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let merged_tail_partitions = spawn_cpu(move || {
-                merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
+            let tail_groups = spawn_cpu(move || {
+                Result::Ok(group_tail_partitions(
+                    tail_partitions,
+                    worker_memory_limit_bytes,
+                ))
             })
             .await?;
             // Tail partitions hold most of the data when workers rarely hit the
-            // flush threshold; writing them one at a time serializes the
-            // posting-list compression of nearly the whole index behind a
-            // single producer thread. Compress and write them concurrently.
+            // flush threshold; merging and writing them one at a time serializes
+            // the posting-list work of nearly the whole index behind a single
+            // thread. Merge, compress and write the groups concurrently.
             let write_target = self.partition_write_target();
-            let mut tail_writes =
-                futures::stream::iter(merged_tail_partitions.into_iter().map(|mut builder| {
-                    let dest_store = dest_store.clone();
-                    async move {
-                        let partition_id = builder.id();
-                        let files = builder.write_to(dest_store.as_ref(), write_target).await?;
-                        Result::Ok((partition_id, files))
-                    }
-                }))
-                .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
+            let mut tail_writes = futures::stream::iter(tail_groups.into_iter().map(|group| {
+                let dest_store = dest_store.clone();
+                async move {
+                    let mut builder = spawn_cpu(move || merge_tail_group(group)).await?;
+                    let partition_id = builder.id();
+                    let files = builder.write_to(dest_store.as_ref(), write_target).await?;
+                    Result::Ok((partition_id, files))
+                }
+            }))
+            .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
             while let Some((partition_id, partition_files)) = tail_writes.try_next().await? {
                 self.new_partitions.push(partition_id);
                 files.extend(partition_files);
@@ -4554,9 +4572,19 @@ mod tests {
         TailPartition { builder }
     }
 
+    fn merge_tail_partitions(
+        tails: Vec<TailPartition>,
+        memory_limit_bytes: u64,
+    ) -> Result<Vec<InnerBuilder>> {
+        group_tail_partitions(tails, memory_limit_bytes)
+            .into_iter()
+            .map(merge_tail_group)
+            .collect()
+    }
+
     #[test]
     fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
-        let merged = merge_all_tail_partitions(
+        let merged = merge_tail_partitions(
             vec![
                 tail_with_docs(0, 4),
                 tail_with_docs(1, 4),
@@ -4580,15 +4608,27 @@ mod tests {
         ];
         let single = tails[0].builder.memory_size();
         // A budget below two builders' footprint must keep them separate.
-        let merged = merge_all_tail_partitions(tails, single + 1)?;
+        let merged = merge_tail_partitions(tails, single + 1)?;
         assert_eq!(merged.len(), 4);
         assert!(merged.iter().all(|builder| builder.docs.len() == 64));
+
+        // A budget that fits two builders pairs them up, and a merged pair
+        // stays within it.
+        let tails = (0..4).map(|id| tail_with_docs(id, 64)).collect();
+        let merged = merge_tail_partitions(tails, 2 * single + 1)?;
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|builder| builder.docs.len() == 128));
+        assert!(
+            merged
+                .iter()
+                .all(|builder| builder.memory_size() <= 2 * single)
+        );
         Ok(())
     }
 
     #[test]
     fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
-        assert!(merge_all_tail_partitions(Vec::new(), u64::MAX)?.is_empty());
+        assert!(merge_tail_partitions(Vec::new(), u64::MAX)?.is_empty());
         Ok(())
     }
 
@@ -4764,7 +4804,7 @@ mod tests {
         let second_doc = second.docs.append(20, 2);
         second.posting_lists[world as usize].add(second_doc, PositionRecorder::Count(2));
 
-        let merged = merge_all_tail_partitions(
+        let merged = merge_tail_partitions(
             vec![
                 TailPartition { builder: first },
                 TailPartition { builder: second },
