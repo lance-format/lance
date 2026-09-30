@@ -167,6 +167,12 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     if options.scan_range_before_filter.is_some() || options.scan_range_after_filter.is_some() {
         return Ok(None);
     }
+    // A physical row selection is already represented in FilteredReadExec's planned ranges.
+    // CountFromMaskExec only understands fragment scope, deletion masks, and scalar-index masks,
+    // so replacing the read would count rows outside the selected fragment-local ranges.
+    if options.physical_row_addr_prefilter.is_some() {
+        return Ok(None);
+    }
     // We rely on the deletion mask being applied; with_deleted_rows changes
     // that contract. Surfacing as a warning because it shouldn't normally
     // pair with an aggregate plan — if we see it, the planner produced a

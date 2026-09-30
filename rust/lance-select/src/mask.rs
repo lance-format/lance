@@ -681,6 +681,24 @@ impl RowAddrTreeMap {
             .retain(|frag_id, _| frag_id_set.contains(frag_id));
     }
 
+    /// Optimize partial fragment selections for compact serialization.
+    ///
+    /// ```
+    /// use lance_select::RowAddrTreeMap;
+    ///
+    /// let mut rows = RowAddrTreeMap::from_iter(0..1_000_000);
+    /// let unoptimized_size = rows.serialized_size();
+    /// rows.optimize();
+    /// assert!(rows.serialized_size() < unoptimized_size);
+    /// ```
+    pub fn optimize(&mut self) {
+        for selection in self.inner.values_mut() {
+            if let RowAddrSelection::Partial(bitmap) = selection {
+                bitmap.optimize();
+            }
+        }
+    }
+
     /// Compute the serialized size of the set.
     pub fn serialized_size(&self) -> usize {
         // Starts at 4 because of the u32 num_entries
@@ -1577,6 +1595,22 @@ mod tests {
         assert!(
             err.to_string().contains("only 0 bytes remain"),
             "expected a length complaint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_row_addr_tree_map_optimize_compacts_dense_ranges() {
+        let mut rows = RowAddrTreeMap::from_iter(0..1_000_000);
+        let unoptimized_size = rows.serialized_size();
+
+        rows.optimize();
+
+        assert!(rows.serialized_size() < unoptimized_size);
+        let mut serialized = Vec::with_capacity(rows.serialized_size());
+        rows.serialize_into(&mut serialized).unwrap();
+        assert_eq!(
+            RowAddrTreeMap::deserialize_from(serialized.as_slice()).unwrap(),
+            rows
         );
     }
 
