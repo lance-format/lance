@@ -477,16 +477,25 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     context
 }
 
+/// Returns a new task context to execute one plan with `options`.
+///
+/// Every execution needs its own context: Lance operators treat a task
+/// context's identity as the identity of one plan execution, for example to
+/// share a MultiMatch prefilter mask only between the fields of one query.
 fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
 ) -> Arc<TaskContext> {
-    let mut state = session_ctx.state();
-    if let Some(batch_size) = options.batch_size.as_ref() {
-        state.config_mut().options_mut().execution.batch_size = *batch_size;
-    }
-
-    state.task_ctx()
+    // Build from the session state in place. `SessionContext::state` would clone
+    // the whole state (every function map, rule list and option) only to drop
+    // it, which is a measurable share of CPU for short queries.
+    let task_ctx = TaskContext::from(session_ctx);
+    let Some(batch_size) = options.batch_size else {
+        return Arc::new(task_ctx);
+    };
+    let mut session_config = task_ctx.session_config().clone();
+    session_config.options_mut().execution.batch_size = batch_size;
+    Arc::new(task_ctx.with_session_config(session_config))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -1255,6 +1264,14 @@ impl ExecutionPlan for HardCapBatchSizeExec {
 mod tests {
     use super::*;
 
+    use arrow_array::{Int32Array, cast::AsArray, record_batch, types::Int32Type};
+    use arrow_select::concat::concat_batches;
+    use datafusion::execution::memory_pool::MemoryLimit;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+    use futures::TryStreamExt;
+    use rstest::rstest;
+
     // Serialize cache tests since they share global state
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1356,6 +1373,90 @@ mod tests {
                 "new config should be cached"
             );
         }
+    }
+
+    #[test]
+    fn test_task_context_per_execution() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+
+        let default_options = LanceExecutionOptions::default();
+        let session_ctx = get_session_context(&default_options);
+        let task_ctx = get_task_context(&session_ctx, &default_options);
+        // Lance operators key per-execution state on the task context's identity.
+        assert!(!Arc::ptr_eq(
+            &task_ctx,
+            &get_task_context(&session_ctx, &default_options)
+        ));
+        assert_eq!(task_ctx.session_id(), session_ctx.session_id());
+        assert_eq!(
+            task_ctx.session_config().batch_size(),
+            session_ctx.copied_config().batch_size()
+        );
+        assert!(Arc::ptr_eq(
+            &task_ctx.runtime_env(),
+            &session_ctx.runtime_env()
+        ));
+        assert!(task_ctx.scalar_functions().contains_key("contains_tokens"));
+
+        let spill_options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(64 * 1024 * 1024),
+            target_partition: Some(3),
+            batch_size: Some(17),
+            ..Default::default()
+        };
+        let spill_session_ctx = get_session_context(&spill_options);
+        let spill_task_ctx = get_task_context(&spill_session_ctx, &spill_options);
+        assert_eq!(spill_task_ctx.session_config().batch_size(), 17);
+        assert_eq!(spill_task_ctx.session_config().target_partitions(), 3);
+        assert!(
+            spill_task_ctx
+                .scalar_functions()
+                .contains_key("contains_tokens")
+        );
+        // The batch size override applies to this execution only, and the
+        // execution still shares the session's memory pool.
+        assert_ne!(spill_session_ctx.copied_config().batch_size(), 17);
+        assert!(Arc::ptr_eq(
+            &spill_task_ctx.runtime_env(),
+            &spill_session_ctx.runtime_env()
+        ));
+        assert!(matches!(
+            spill_task_ctx.memory_pool().memory_limit(),
+            MemoryLimit::Finite(limit) if limit == 64 * 1024 * 1024
+        ));
+    }
+
+    #[rstest]
+    #[case::session_batch_size(None, &[6])]
+    #[case::batch_size_override(Some(4), &[4, 2])]
+    #[tokio::test]
+    async fn test_execute_plan_batch_size(
+        #[case] batch_size: Option<usize>,
+        #[case] expected_batch_rows: &[usize],
+    ) {
+        let batch = record_batch!(("x", Int32, [5, 3, 1, 4, 2, 0])).unwrap();
+        let sort_expr = PhysicalSortExpr::new_default(col("x", &batch.schema()).unwrap());
+        let plan = Arc::new(SortExec::new(
+            LexOrdering::new([sort_expr]).unwrap(),
+            Arc::new(OneShotExec::from_batch(batch.clone())),
+        ));
+        let options = LanceExecutionOptions {
+            batch_size,
+            ..Default::default()
+        };
+        let batches: Vec<RecordBatch> = execute_plan(plan, options)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let batch_rows: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(batch_rows, expected_batch_rows);
+        let sorted = concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(
+            sorted["x"].as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![0, 1, 2, 3, 4, 5])
+        );
     }
 
     #[test]

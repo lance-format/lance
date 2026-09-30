@@ -590,7 +590,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
         format_version,
         block_size,
     );
-    builder.tokens.add("needle".to_owned());
+    builder.tokens.get_or_add("needle");
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),
@@ -676,7 +676,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
         block_size,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             true,
             format_version.posting_tail_codec(),
@@ -782,7 +782,7 @@ async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
         LEGACY_BLOCK_SIZE,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             true,
             InvertedListFormatVersion::V1.posting_tail_codec(),
@@ -948,7 +948,7 @@ async fn test_chunk_posting_mode_controls_buffer_sharing() {
         MAX_POSTING_BLOCK_SIZE,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
             PostingTailCodec::VarintDelta,
@@ -1060,34 +1060,114 @@ async fn test_posting_builder_remap() {
     );
 }
 
-#[test]
-fn test_posting_builder_size_tracking_matches_structure() {
-    fn tracked_memory_size(builder: &PostingListBuilder) -> u64 {
-        let encoded_blocks_size = builder
-            .encoded_blocks
-            .iter()
-            .map(|encoded_blocks| std::mem::size_of::<EncodedBlocks>() + encoded_blocks.size())
-            .sum::<usize>();
-        let encoded_positions_size = builder
-            .encoded_position_blocks
-            .as_ref()
-            .map(|positions| std::mem::size_of::<EncodedPositionBlocks>() + positions.size())
-            .unwrap_or(0usize);
-        (encoded_blocks_size
-            + builder.tail_entries.capacity() * std::mem::size_of::<RawDocInfo>()
-            + builder.tail_positions.size()
-            + encoded_positions_size) as u64
+/// Doc id gaps and frequencies that exercise one- to five-byte varints in the
+/// builder's tail encoding.
+fn varied_postings(len: usize) -> (Vec<u32>, Vec<u32>) {
+    let gaps = [1_u32, 7, 130, 20_000, 3_000_000];
+    let frequencies = [1_u32, 2, 127, 128, 70_000];
+    let mut doc_id = 5u32;
+    let mut doc_ids = Vec::with_capacity(len);
+    for index in 0..len {
+        doc_ids.push(doc_id);
+        doc_id += if index == 1 {
+            300_000_000
+        } else {
+            gaps[index % gaps.len()]
+        };
     }
+    let freqs = (0..len)
+        .map(|index| frequencies[index % frequencies.len()])
+        .collect();
+    (doc_ids, freqs)
+}
 
-    let mut builder = PostingListBuilder::new(true);
-    for doc_id in 0..(BLOCK_SIZE + 5) as u32 {
-        builder.add(
-            doc_id,
-            PositionRecorder::Position(smallvec::smallvec![1, 3, 5]),
+#[rstest::rstest]
+#[case::legacy_fixed32_tail(PostingTailCodec::Fixed32, LEGACY_BLOCK_SIZE)]
+#[case::varint_tail_128(PostingTailCodec::VarintDelta, LEGACY_BLOCK_SIZE)]
+#[case::varint_tail_256(PostingTailCodec::VarintDelta, 256)]
+fn test_posting_builder_matches_reference_encoding(
+    #[case] posting_tail_codec: PostingTailCodec,
+    #[case] block_size: usize,
+) {
+    for len in [
+        1,
+        3,
+        block_size - 1,
+        block_size,
+        block_size + 1,
+        3 * block_size + 5,
+    ] {
+        let (doc_ids, frequencies) = varied_postings(len);
+        let mut builder = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            posting_tail_codec,
+            block_size,
         );
-    }
+        for (&doc_id, &frequency) in doc_ids.iter().zip(&frequencies) {
+            builder.add(doc_id, PositionRecorder::Count(frequency));
+        }
+        assert_eq!(builder.len(), doc_ids.len(), "len {len}");
+        let expected_entries = doc_ids
+            .iter()
+            .zip(&frequencies)
+            .map(|(&doc_id, &frequency)| (doc_id, frequency, None))
+            .collect::<Vec<_>>();
+        assert_eq!(builder.iter().collect::<Vec<_>>(), expected_entries);
 
-    assert_eq!(builder.size(), tracked_memory_size(&builder));
+        let block_max_scores = (0..doc_ids.len().div_ceil(block_size))
+            .map(|block| block as f32 + 0.5)
+            .collect::<Vec<_>>();
+        let expected = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            block_max_scores.iter().copied(),
+            posting_tail_codec,
+            block_size,
+        )
+        .unwrap();
+        let batch = builder.to_batch(block_max_scores).unwrap();
+        let actual = batch[POSTING_COL].as_list::<i32>().value(0);
+        assert_eq!(actual.as_binary::<i64>(), &expected, "len {len}");
+    }
+}
+
+#[test]
+fn test_posting_builder_short_lists_stay_inline() {
+    let mut builder = PostingListBuilder::new_with_block_size(false, 256);
+    // Most tokens of a corpus occur in only a few documents; they must not
+    // pay for a heap allocation.
+    for doc_id in [9_000, 90_000, 900_000] {
+        builder.add(doc_id, PositionRecorder::Count(1));
+    }
+    assert_eq!(builder.size(), 0);
+
+    for doc_id in 900_001..900_100 {
+        builder.add(doc_id, PositionRecorder::Count(3));
+    }
+    assert!(builder.size() as usize >= builder.tail.len());
+    assert_eq!(builder.len(), 102);
+}
+
+#[rstest::rstest]
+#[case::added(false)]
+#[case::streamed(true)]
+fn test_posting_builder_short_positional_lists_skip_block_storage(#[case] streamed: bool) {
+    let mut builder = PostingListBuilder::new_with_block_size(true, 256);
+    if streamed {
+        builder.add_occurrence(9_000, 4).unwrap();
+        builder.finish_open_doc(9_000).unwrap();
+    } else {
+        builder.add(9_000, PositionRecorder::Position(smallvec::smallvec![4]));
+    }
+    // Every token of a positional build needs position state from its first
+    // posting, but only lists that fill a block need block storage. One
+    // posting costs the position state box plus its first position buffer.
+    assert!(builder.size() <= 96, "{}", builder.size());
+    assert_eq!(
+        builder.iter().collect::<Vec<_>>(),
+        vec![(9_000_u32, 1_u32, Some(vec![4_u32]))]
+    );
 }
 
 #[test]
@@ -1098,23 +1178,9 @@ fn test_posting_builder_flush_releases_tail_position_capacity() {
         builder.add(doc_id, PositionRecorder::Position(positions.clone()));
     }
 
-    assert_eq!(builder.tail_positions.size(), 0);
-    assert_eq!(builder.size(), {
-        let encoded_blocks_size = builder
-            .encoded_blocks
-            .iter()
-            .map(|encoded_blocks| std::mem::size_of::<EncodedBlocks>() + encoded_blocks.size())
-            .sum::<usize>();
-        let encoded_positions_size = builder
-            .encoded_position_blocks
-            .as_ref()
-            .map(|positions| std::mem::size_of::<EncodedPositionBlocks>() + positions.size())
-            .unwrap_or(0usize);
-        (encoded_blocks_size
-            + builder.tail_entries.capacity() * std::mem::size_of::<RawDocInfo>()
-            + builder.tail_positions.size()
-            + encoded_positions_size) as u64
-    });
+    let overflow = builder.overflow.as_deref().unwrap();
+    assert_eq!(overflow.tail_positions.size(), 0);
+    assert!(builder.tail.is_empty());
 }
 
 #[test]
@@ -1135,6 +1201,30 @@ fn test_posting_builder_streamed_positions_roundtrip() {
             (0_u32, 3_u32, Some(vec![1_u32, 4_u32, 9_u32])),
             (2_u32, 1_u32, Some(vec![3_u32])),
         ]
+    );
+
+    // Streaming across block boundaries must build the same posting list as
+    // adding whole documents.
+    let mut streamed = PostingListBuilder::new(true);
+    let mut added = PostingListBuilder::new(true);
+    let mut expected = Vec::new();
+    for doc_id in (0..(2 * BLOCK_SIZE + 3) as u32).map(|doc| doc * 3 + 1) {
+        let positions = (0..doc_id % 4 + 1)
+            .map(|index| index * 5 + doc_id % 7)
+            .collect::<Vec<_>>();
+        for &position in &positions {
+            streamed.add_occurrence(doc_id, position).unwrap();
+        }
+        streamed.finish_open_doc(doc_id).unwrap();
+        added.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+        expected.push((doc_id, positions.len() as u32, Some(positions)));
+    }
+    assert_eq!(streamed.len(), expected.len());
+    assert_eq!(streamed.iter().collect::<Vec<_>>(), expected);
+    let block_max_scores = vec![1.0; expected.len().div_ceil(BLOCK_SIZE)];
+    assert_eq!(
+        streamed.to_batch(block_max_scores.clone()).unwrap(),
+        added.to_batch(block_max_scores).unwrap()
     );
 }
 
@@ -1512,8 +1602,8 @@ async fn test_remap_to_empty_posting_list() {
     // 0: lance
     // 1: lake lake
     // 2: lake lake lake
-    builder.tokens.add("lance".to_owned());
-    builder.tokens.add("lake".to_owned());
+    builder.tokens.get_or_add("lance");
+    builder.tokens.get_or_add("lake");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -1631,4 +1721,72 @@ fn test_compressed_posting_contains_each_matches_full_decode(
     assert!(expected.iter().any(|found| *found) && expected.iter().any(|found| !*found));
     assert_eq!(posting.contains_each(&probes), expected);
     assert!(posting.contains_each(&[]).is_empty());
+}
+
+fn dictionary_test_tokens() -> Vec<String> {
+    let mut tokens = ["b", "a", "ab", "abc", "a b", "z", "é", "日本語"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    tokens.extend((0..1000).map(|index| format!("tok{index:04}")));
+    tokens
+}
+
+#[rstest::rstest]
+#[case::arrow(TokenSetFormat::Arrow)]
+#[case::fst(TokenSetFormat::Fst)]
+fn test_token_dictionary_writes_same_batch_as_token_set(#[case] format: TokenSetFormat) {
+    let mut expected = TokenSet::default();
+    let mut dictionary = TokenDictionary::default();
+    for token in dictionary_test_tokens() {
+        let token_id = dictionary.get_or_add(&token);
+        assert_eq!(dictionary.get_or_add(&token), token_id);
+        assert_eq!(expected.add(token), token_id);
+    }
+    assert_eq!(dictionary.len(), expected.len());
+    assert_eq!(
+        dictionary.to_batch(format).unwrap(),
+        expected.to_batch(format).unwrap()
+    );
+}
+
+#[rstest::rstest]
+#[case::arrow(TokenSetFormat::Arrow)]
+#[case::fst(TokenSetFormat::Fst)]
+#[tokio::test]
+async fn test_token_dictionary_keeps_loaded_token_ids(#[case] format: TokenSetFormat) {
+    let tmpdir = TempObjDir::default();
+    let store = LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    );
+    let mut written = TokenSet::default();
+    for token in dictionary_test_tokens() {
+        written.add(token);
+    }
+    let batch = written.clone().to_batch(format).unwrap();
+    let mut writer = store
+        .new_index_file("tokens.lance", batch.schema())
+        .await
+        .unwrap();
+    writer.write_record_batch(batch).await.unwrap();
+    writer.finish().await.unwrap();
+    let reader = store.open_index_file("tokens.lance").await.unwrap();
+    let loaded = TokenSet::load(reader, format).await.unwrap();
+
+    let mut dictionary = TokenDictionary::try_from_token_set(loaded).unwrap();
+    assert_eq!(dictionary.len(), written.len());
+    for token in dictionary_test_tokens() {
+        assert_eq!(dictionary.get(&token), written.get(&token), "{token}");
+    }
+    assert_eq!(dictionary.get_or_add("new token"), written.len() as u32);
+}
+
+#[test]
+fn test_token_dictionary_rejects_sparse_token_ids() {
+    let mut tokens = TokenSet::default();
+    tokens.tokens = TokenMap::HashMap(HashMap::from([("a".to_owned(), 0), ("b".to_owned(), 5)]));
+    let err = TokenDictionary::try_from_token_set(tokens).unwrap_err();
+    assert!(err.to_string().contains("distinct ids below 2"), "{err}");
 }

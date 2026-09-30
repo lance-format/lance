@@ -62,6 +62,7 @@ pub struct PreparedBm25Query {
     scorer: Arc<MemBM25Scorer>,
     has_all_query_positions: bool,
     can_reuse_scorer: bool,
+    term_ids: Option<Arc<PreparedTermIds>>,
 }
 
 impl std::fmt::Debug for PreparedBm25Query {
@@ -87,6 +88,7 @@ impl PreparedBm25Query {
             scorer,
             has_all_query_positions,
             can_reuse_scorer: false,
+            term_ids: None,
         }
     }
 
@@ -106,6 +108,10 @@ impl PreparedBm25Query {
 
     pub(crate) fn has_all_query_positions(&self) -> bool {
         self.has_all_query_positions
+    }
+
+    pub(in crate::scalar::inverted) fn term_ids(&self) -> Option<&PreparedTermIds> {
+        self.term_ids.as_deref()
     }
 }
 
@@ -169,15 +175,21 @@ pub(crate) fn final_query_tokens(
     ))
 }
 
-fn unique_terms(tokens: &Tokens) -> Vec<String> {
+/// Deduplicated terms in first-occurrence order, plus each token's term
+/// ordinal.
+fn unique_terms(tokens: &Tokens) -> (Vec<String>, Box<[usize]>) {
     let mut terms = Vec::with_capacity(tokens.len());
-    let mut seen = HashSet::new();
-    for token in tokens {
-        if seen.insert(token.clone()) {
-            terms.push(token.clone());
-        }
-    }
-    terms
+    let mut term_ordinals = HashMap::with_capacity(tokens.len());
+    let term_by_token = tokens
+        .into_iter()
+        .map(|token| {
+            *term_ordinals.entry(token.as_str()).or_insert_with(|| {
+                terms.push(token.clone());
+                terms.len() - 1
+            })
+        })
+        .collect();
+    (terms, term_by_token)
 }
 
 pub(crate) fn has_all_query_positions(query_tokens: &Tokens, final_tokens: &Tokens) -> bool {
@@ -200,13 +212,17 @@ static LANCE_FTS_SYNC_DF_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     sync_df_enabled_from_value(std::env::var(LANCE_FTS_SYNC_DF_ENV).ok().as_deref())
 });
 
+/// A global scorer plus each segment's partition-major token ids for the
+/// scored terms, which the statistics had to resolve anyway.
+type LoadedScorer = (Arc<MemBM25Scorer>, Vec<Box<[Option<u32>]>>);
+
 /// Build the global scorer without futures when a completed full prewarm made
 /// every segment statistic and posting-length table synchronously available.
 /// Returning `None` leaves the existing asynchronous path entirely in charge.
 fn bm25_scorer_from_loaded_stats(
     indices: &[Arc<InvertedIndex>],
     terms: &[String],
-) -> Result<Option<Arc<MemBM25Scorer>>> {
+) -> Result<Option<LoadedScorer>> {
     bm25_scorer_from_loaded_stats_with_enabled(indices, terms, *LANCE_FTS_SYNC_DF_ENABLED)
 }
 
@@ -214,7 +230,7 @@ fn bm25_scorer_from_loaded_stats_with_enabled(
     indices: &[Arc<InvertedIndex>],
     terms: &[String],
     is_enabled: bool,
-) -> Result<Option<Arc<MemBM25Scorer>>> {
+) -> Result<Option<LoadedScorer>> {
     // Keep the kill switch first so an ablation does not even probe prewarm
     // state or resident metadata.
     if !is_enabled {
@@ -222,14 +238,16 @@ fn bm25_scorer_from_loaded_stats_with_enabled(
     }
 
     let mut loaded_stats = Vec::with_capacity(indices.len());
+    let mut token_ids = Vec::with_capacity(indices.len());
     for index in indices {
-        let Some(stats) = index.bm25_stats_for_terms_if_loaded(terms)? else {
+        let Some(loaded) = index.bm25_stats_for_terms_if_loaded(terms)? else {
             return Ok(None);
         };
-        loaded_stats.push(stats);
+        loaded_stats.push(loaded.stats);
+        token_ids.push(loaded.token_ids);
     }
 
-    merge_loaded_bm25_stats(terms, loaded_stats)
+    Ok(merge_loaded_bm25_stats(terms, loaded_stats)?.map(|scorer| (scorer, token_ids)))
 }
 
 fn merge_loaded_bm25_stats(
@@ -313,7 +331,8 @@ pub async fn prepare_bm25_query(
     } else {
         (Arc::new(query_tokens), true)
     };
-    let terms = unique_terms(tokens.as_ref());
+    let (terms, term_by_token) = unique_terms(tokens.as_ref());
+    let mut term_ids = None;
     let (scorer, can_reuse_scorer) = if let Some(scorer) = base_scorer {
         if let Some(missing) = terms
             .iter()
@@ -324,7 +343,14 @@ pub async fn prepare_bm25_query(
             )));
         }
         (scorer, false)
-    } else if let Some(scorer) = bm25_scorer_from_loaded_stats(indices, &terms)? {
+    } else if let Some((scorer, segment_token_ids)) =
+        bm25_scorer_from_loaded_stats(indices, &terms)?
+    {
+        let mut prepared_term_ids = PreparedTermIds::new(term_by_token, terms.len());
+        for (index, token_ids) in indices.iter().zip(segment_token_ids) {
+            prepared_term_ids.push_segment(index, token_ids)?;
+        }
+        term_ids = Some(Arc::new(prepared_term_ids));
         (scorer, true)
     } else {
         let (mut total_tokens, mut num_docs, first_token_docs) =
@@ -367,6 +393,7 @@ pub async fn prepare_bm25_query(
         scorer,
         has_all_query_positions,
         can_reuse_scorer,
+        term_ids,
     })
 }
 

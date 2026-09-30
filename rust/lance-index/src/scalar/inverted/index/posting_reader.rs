@@ -82,6 +82,10 @@ impl PostingReader {
 
 pub struct PostingListReader {
     pub(super) reader: PostingReader,
+    /// Row count of the posting file. Kept here because every query term
+    /// needs it to find its cache group, and asking `reader` costs a dynamic
+    /// call into file metadata that is usually cold.
+    num_rows: usize,
 
     /// Layout-specific metadata. V2 keeps its per-token max-score and
     /// length columns lazy so opening a partition doesn't drag O(num_tokens)
@@ -242,6 +246,7 @@ impl PostingListReader {
         });
 
         Ok(Self {
+            num_rows: reader.num_rows(),
             reader: PostingReader::Opened {
                 reader,
                 metadata: OnceLock::new(),
@@ -271,6 +276,7 @@ impl PostingListReader {
         };
         Ok(Self {
             reader: self.reader.with_store(store, path),
+            num_rows: self.num_rows,
             metadata: PostingMetadata::V2 {
                 metadata: metadata.clone(),
             },
@@ -310,7 +316,7 @@ impl PostingListReader {
     pub fn len(&self) -> usize {
         match &self.metadata {
             PostingMetadata::LegacyV1 { offsets, .. } => offsets.len(),
-            PostingMetadata::V2 { .. } => self.reader.num_rows(),
+            PostingMetadata::V2 { .. } => self.num_rows,
         }
     }
 

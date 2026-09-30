@@ -34,6 +34,7 @@ geoarrow-array = { workspace = true, optional = true }
 geoarrow-schema = { workspace = true, optional = true }
 geo-types = { workspace = true, optional = true }
 half.workspace = true
+hashbrown = { version = "0.16", default-features = false }
 hex.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
@@ -65,7 +66,9 @@ roaring.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-smallvec = "1.15"
+# `union` drops the inline/heap tag word, which keeps the per-token FTS
+# posting-list builder small.
+smallvec = { version = "1.15", features = ["union"] }
 tokio.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true

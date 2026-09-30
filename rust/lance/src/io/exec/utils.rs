@@ -92,6 +92,8 @@ struct SharedPreFilterEntry {
 /// Entries are keyed by task-context identity and partition. This prevents a
 /// reused physical plan from carrying a mask into a later query and keeps an
 /// accidental multi-partition execution from sharing across input partitions.
+/// It relies on every execution running under its own task context, as
+/// `execute_plan` guarantees.
 /// The mutex is held only while installing or cloning a future; prefilter
 /// execution never runs under it.
 struct SharedPreFilterMaterialization {
@@ -1069,23 +1071,31 @@ mod tests {
 
     use lance_index::metrics::{IndexTiming, LocalMetricsCollector, MetricsCollector};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
-    use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use arrow_array::{
+        ArrayRef, RecordBatch, RecordBatchReader, UInt64Array,
+        cast::AsArray,
+        types::{UInt32Type, UInt64Type},
+    };
+    use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
     use datafusion::common::NullEquality;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
+    use datafusion::execution::TaskContext;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
         physical_plan::{
-            ExecutionPlan, joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter,
+            ExecutionPlan, SendableRecordBatchStream, joins::SortMergeJoinExec,
+            stream::RecordBatchStreamAdapter,
         },
     };
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::{ROW_ID, utils::futures::Capacity};
-    use lance_datafusion::exec::OneShotExec;
+    use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::prefilter::FilterLoader;
     use lance_select::result::IndexExprResultWireFormat;
@@ -1095,7 +1105,8 @@ mod tests {
 
     use super::{
         FilteredRowIdsToPrefilter, InstrumentedChildInputStream, PreFilterSource, ReplayExec,
-        SharedPreFilterExec, SharedPreFilterMaterialization, shared_prefilter_future,
+        SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
+        shared_prefilter_future,
     };
 
     #[test]
@@ -1431,6 +1442,151 @@ mod tests {
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
         assert!(materialization.queries.lock().unwrap().is_empty());
+    }
+
+    /// A row-id prefilter source whose first execution fails, like a transient
+    /// object store error.
+    #[derive(Debug)]
+    struct FlakyRowIdSource {
+        schema: SchemaRef,
+        executions: AtomicUsize,
+    }
+
+    impl PartitionStream for FlakyRowIdSource {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batch = if self.executions.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(DataFusionError::Execution(
+                    "transient prefilter failure".to_string(),
+                ))
+            } else {
+                RecordBatch::try_new(
+                    self.schema.clone(),
+                    vec![Arc::new(UInt64Array::from_iter_values(0_u64..4))],
+                )
+                .map_err(DataFusionError::from)
+            };
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                stream::iter([batch]),
+            ))
+        }
+    }
+
+    /// Stands in for the FTS leaves of one MultiMatch: every execution loads
+    /// each field's prefilter under the task context it executes with and
+    /// reports how many rows the mask allows.
+    #[derive(Debug)]
+    struct MultiMatchPrefilterConsumer {
+        field_sources: Vec<PreFilterSource>,
+        schema: SchemaRef,
+    }
+
+    impl PartitionStream for MultiMatchPrefilterConsumer {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let masks = self
+                .field_sources
+                .iter()
+                .map(|source| {
+                    prefilter_mask_future(
+                        ctx.clone(),
+                        0,
+                        source,
+                        None,
+                        &ExecutionPlanMetricsSet::new(),
+                    )
+                    .map(|mask| mask.expect("a filtered MultiMatch field loads a prefilter"))
+                })
+                .collect::<lance_core::Result<Vec<_>>>();
+            let schema = self.schema.clone();
+            let batch = async move {
+                let masks = futures::future::try_join_all(masks?).await?;
+                let allowed_rows = masks[0].allow_list().and_then(|rows| rows.len());
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(UInt64Array::from(vec![allowed_rows]))],
+                )
+                .map_err(DataFusionError::from)
+            };
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                stream::once(batch),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_multimatch_prefilter_reruns_source_for_each_execution() {
+        let row_id_schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]));
+        let source = Arc::new(FlakyRowIdSource {
+            schema: row_id_schema.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let source_plan = StreamingTableExec::try_new(
+            row_id_schema,
+            vec![source.clone() as Arc<dyn PartitionStream>],
+            None,
+            [],
+            false,
+            None,
+        )
+        .unwrap();
+        let field_sources =
+            PreFilterSource::FilteredRowIds(Arc::new(source_plan)).shared_for_multimatch_fields(2);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "allowed_rows",
+            DataType::UInt64,
+            true,
+        )]));
+        let consumer = Arc::new(MultiMatchPrefilterConsumer {
+            field_sources,
+            schema: output_schema.clone(),
+        });
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingTableExec::try_new(
+                output_schema,
+                vec![consumer as Arc<dyn PartitionStream>],
+                None,
+                [],
+                false,
+                None,
+            )
+            .unwrap(),
+        );
+
+        // A reused plan must load its prefilter again on every execution
+        // instead of replaying the failure of an earlier one.
+        let failure = execute_plan(plan.clone(), LanceExecutionOptions::default())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("transient prefilter failure"),
+            "{failure}"
+        );
+        let batches = execute_plan(plan, LanceExecutionOptions::default())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0]["allowed_rows"].as_primitive::<UInt64Type>(),
+            &UInt64Array::from(vec![4])
+        );
+        // Both fields of one execution still share a single source execution.
+        assert_eq!(source.executions.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
