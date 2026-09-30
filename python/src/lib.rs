@@ -87,6 +87,7 @@ pub(crate) mod storage_options;
 pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;
+pub(crate) mod write_source;
 
 pub use crate::arrow::{BFloat16, bfloat16_array};
 use crate::file::LanceFileSession;

@@ -9,6 +9,8 @@ import pickle
 import platform
 import random
 import re
+import subprocess
+import sys
 import time
 import uuid
 from datetime import date, datetime, timedelta
@@ -2806,6 +2808,219 @@ def test_merge_insert_input_kinds(tmp_path: Path, materialized: bool):
         "id": [0, 1, 2, 3, 4, 5, 6],
         "value": [0, 10, 20, 0, 0, 50, 60],
     }
+
+
+@pytest.mark.parametrize(
+    "source_kind", ["dataset", "scanner", "unordered_scanner", "one_shot", "reader"]
+)
+def test_merge_insert_reopens_source_on_conflict(tmp_path, monkeypatch, source_kind):
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int64(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int64()),
+        ]
+    )
+    target = lance.write_dataset(
+        pa.table({"id": [0, 1], "value": [0, 0]}, schema=schema),
+        tmp_path / "target",
+        max_rows_per_file=1,
+    )
+    builder = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    # A primary-key append after the builder's snapshot forces a full retry.
+    lance.write_dataset(
+        pa.table({"id": [50], "value": [50]}, schema=schema),
+        target.uri,
+        mode="append",
+    )
+    source_table = pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema)
+    scans = []
+    if source_kind in ("dataset", "scanner", "unordered_scanner"):
+        source_dataset = lance.write_dataset(
+            source_table, tmp_path / "source", max_rows_per_file=1
+        )
+        source = (
+            source_dataset
+            if source_kind == "dataset"
+            else source_dataset.scanner(
+                scan_in_order=source_kind != "unordered_scanner"
+            )
+        )
+        to_reader = lance.LanceScanner.to_reader
+
+        def counted_reader(scanner):
+            scans.append(scanner)
+            return to_reader(scanner)
+
+        monkeypatch.setattr(lance.LanceScanner, "to_reader", counted_reader)
+    else:
+
+        def batches():
+            scans.append(None)
+            yield from source_table.to_batches(max_chunksize=1)
+
+        reader = pa.RecordBatchReader.from_batches(schema, batches())
+        source = (
+            pa_ds.Scanner.from_batches(reader) if source_kind == "one_shot" else reader
+        )
+
+    stats = builder.execute(source)
+    assert len(scans) == (2 if source_kind in ("dataset", "scanner") else 1)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 1
+    assert target.to_table().sort_by("id").to_pydict() == {
+        "id": [0, 1, 2, 50],
+        "value": [0, 10, 20, 50],
+    }
+
+
+@pytest.mark.parametrize("source_kind", ["dataset", "scanner"])
+def test_merge_insert_rescan_preserves_source_snapshot(
+    tmp_path, monkeypatch, source_kind
+):
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int64(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int64()),
+        ]
+    )
+    target = lance.write_dataset(
+        pa.table({"id": [0, 1, 2], "value": [0, 0, 0]}, schema=schema),
+        tmp_path / "target",
+        max_rows_per_file=1,
+    )
+    builder = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    lance.write_dataset(
+        pa.table({"id": [50], "value": [50]}, schema=schema),
+        target.uri,
+        mode="append",
+    )
+    source_table = pa.table({"id": [1, 2, 6], "value": [10, 20, 60]}, schema=schema)
+    source_table = source_table.append_column("unused", pa.array([100, 200, 600]))
+    source_dataset = lance.write_dataset(
+        source_table, tmp_path / "source", max_rows_per_file=1
+    )
+    options = {"columns": ["id", "value"], "filter": "id != 2"}
+    if source_kind == "dataset":
+        source_dataset = lance.dataset(source_dataset.uri, default_scan_options=options)
+        source = source_dataset
+    else:
+        source = source_dataset.scanner(**options)
+    scans = []
+    to_reader = lance.LanceScanner.to_reader
+
+    def advance_source_after_first_scan(scanner):
+        reader = to_reader(scanner)
+        scans.append(scanner)
+        if len(scans) == 1:
+            lance.write_dataset(
+                source_table.slice(1), source_dataset.uri, mode="overwrite"
+            )
+            source_dataset.checkout_latest()
+        return reader
+
+    monkeypatch.setattr(
+        lance.LanceScanner, "to_reader", advance_source_after_first_scan
+    )
+    builder.execute(source)
+    assert len(scans) == 2
+    assert source_dataset.version == 2
+    assert target.to_table().sort_by("id").to_pydict() == {
+        "id": [0, 1, 2, 6, 50],
+        "value": [0, 10, 0, 60, 50],
+    }
+
+
+@pytest.mark.parametrize("failure", ["factory", "schema", "metadata"])
+def test_merge_insert_rescannable_source_errors(tmp_path, failure):
+    from lance.types import SourceStrategy, WriteSource, coerce_source
+
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int64(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int64()),
+        ]
+    )
+    table = pa.table({"id": [1], "value": [10]}, schema=schema)
+    target = lance.write_dataset(table, tmp_path / "target")
+    builder = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    appended = pa.table({"id": [50], "value": [50]}, schema=schema)
+    lance.write_dataset(appended, target.uri, mode="append")
+    scans = []
+
+    class Source:
+        pass
+
+    def reader_factory():
+        scans.append(None)
+        if len(scans) == 1:
+            return table.to_reader()
+        if failure == "factory":
+            raise ValueError("source factory failed intentionally")
+        if failure == "metadata":
+            return table.replace_schema_metadata({"changed": "true"}).to_reader()
+        return pa.table({"id": [1], "value": ["invalid"]}).to_reader()
+
+    @coerce_source.register(Source)
+    def source_handler(source, schema=None):
+        return WriteSource(SourceStrategy.RESCANNABLE, table.schema, reader_factory)
+
+    message = (
+        "source factory failed intentionally" if failure == "factory" else "schema"
+    )
+    with pytest.raises(OSError, match=message):
+        builder.execute(Source())
+    assert len(scans) == 2
+    latest = lance.dataset(target.uri)
+    assert latest.version == 2
+    assert latest.to_table().sort_by("id") == pa.concat_tables([table, appended])
+
+
+def test_merge_insert_rescannable_source_single_worker():
+    script = """
+import lance
+import pyarrow as pa
+table = pa.table({"id": [1], "value": [10]})
+target = lance.write_dataset(table, "memory://target")
+source = lance.write_dataset(table, "memory://source")
+builder = target.merge_insert("id").when_matched_update_all()
+assert "StreamingTableExec" in builder.analyze_plan(source.scanner())
+assert builder.execute(source)["num_updated_rows"] == 1
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "TOKIO_WORKER_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_merge_insert_subcols(tmp_path: Path):
