@@ -11486,6 +11486,208 @@ mod test {
             .await;
     }
 
+    /// An in-place vector update (`update_columns` + `Operation::Update`) prunes the
+    /// fragment from the old segment's bitmap while that segment still physically
+    /// holds the pre-update vector, and `optimize_indices(append)` indexes the fresh
+    /// vector in a new delta. Like the single-query path, the batch node must apply
+    /// each segment's ownership so the stale copy is neither returned nor counted.
+    #[rstest]
+    #[case::fixed_nprobes(Some(2))]
+    #[tokio::test]
+    async fn test_batch_knn_skips_rows_owned_by_newer_delta(
+        #[case] nprobes: Option<usize>,
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        use crate::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+        use arrow_array::{RecordBatchReader, UInt64Array};
+
+        const DIM: usize = 8;
+        const BULK_ROWS: usize = 1000;
+        const UPDATED_ID: u32 = 10_000;
+        const STALE_VALUE: f32 = 10.0;
+        const FRESH_VALUE: f32 = -10.0;
+        let k = 5;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let vector_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIM as i32,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::UInt32, false),
+            ArrowField::new("vec", vector_type.clone(), true),
+        ]));
+        let constant_vector = |value: f32| {
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(value, DIM)),
+                DIM as i32,
+            )
+            .unwrap()
+        };
+
+        let bulk = lance_testing::datagen::generate_random_array_with_seed::<Float32Type>(
+            BULK_ROWS * DIM,
+            [7; 32],
+        );
+        let bulk_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..BULK_ROWS as u32)),
+                Arc::new(FixedSizeListArray::try_new_from_values(bulk, DIM as i32).unwrap()),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(bulk_batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let stale_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values([UPDATED_ID])),
+                Arc::new(constant_vector(STALE_VALUE)),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(stale_batch)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &VectorIndexParams::ivf_flat(4, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut fragment = dataset.get_fragment(1).unwrap();
+        let mut fragment_scan = fragment.scan();
+        fragment_scan.with_row_id();
+        let updated_row_id = fragment_scan.try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .value(0);
+        let update_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("vec", vector_type, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values([updated_row_id])),
+                Arc::new(constant_vector(FRESH_VALUE)),
+            ],
+        )
+        .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+        let updated = fragment
+            .update_columns_with_offsets(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+        let updated_fragment_id = updated.fragment.id;
+        let mut dataset = Dataset::commit(
+            test_uri,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated.fragment],
+                new_fragments: vec![],
+                fields_modified: updated.fields_modified,
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                    updated_fragment_id,
+                    updated.matched_offsets,
+                )]))),
+            },
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices_by_name("idx").await.unwrap().len(), 2);
+
+        // Query 0 sits on the stale value, query 1 on the fresh one.
+        let query_values: Vec<f32> = [STALE_VALUE, FRESH_VALUE]
+            .iter()
+            .flat_map(|&value| std::iter::repeat_n(value, DIM))
+            .collect();
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            DIM as i32,
+        )
+        .unwrap();
+        let configure = |scan: &mut Scanner, query: &dyn Array| {
+            scan.nearest("vec", query, k).unwrap();
+            match nprobes {
+                Some(nprobes) => {
+                    scan.nprobes(nprobes);
+                }
+                None => {
+                    scan.minimum_nprobes(1);
+                }
+            }
+            scan.project(&["id"]).unwrap();
+        };
+
+        let mut scan = dataset.scan();
+        configure(&mut scan, &queries);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfBatch"), "got:\n{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        for query_index in 0..2 {
+            let query = Float32Array::from(
+                query_values[query_index * DIM..(query_index + 1) * DIM].to_vec(),
+            );
+            let mut single_scan = dataset.scan();
+            configure(&mut single_scan, &query);
+            let single = single_scan.try_into_batch().await.unwrap();
+            let mask = BooleanArray::from_iter(
+                batch[QUERY_INDEX_COL]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let batch_rows = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            let ids = batch_rows["id"].as_primitive::<UInt32Type>().values();
+            assert_eq!(
+                ids.iter().filter(|&&id| id == UPDATED_ID).count(),
+                usize::from(query_index == 1),
+                "query {query_index}: the updated row must appear once, with its fresh vector only; ids {ids:?}"
+            );
+            assert_eq!(batch_rows.num_rows(), k);
+            assert_eq!(
+                batch_rows[DIST_COL].as_primitive::<Float32Type>().values(),
+                single[DIST_COL].as_primitive::<Float32Type>().values(),
+                "query {query_index}: batch distances must match single-query"
+            );
+        }
+    }
+
     /// `nprobes(0)` is not rejected by the query builder, so both probe bounds
     /// become zero. The single-query
     /// path then probes nothing and returns an empty result, whereas the batch
