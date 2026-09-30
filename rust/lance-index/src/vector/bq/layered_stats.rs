@@ -251,6 +251,37 @@ layered_lazy_counters! {
         /// Gathers beyond the ordinary window that found no free permit and
         /// waited for one or for the ordinary window, whichever came first.
         far_permit_waits,
+        /// Lazy scans that published the scoring of their first probe; see
+        /// `lazy_rank0_scored_ns`.
+        lazy_rank0_scored_queries,
+        /// Time from the start of each of those scans until it published the
+        /// scoring of its first probe (rank 0) to the gathers: once the probe
+        /// was scored or, earlier, once its rows filled the heap. No gather
+        /// that waits for the threshold or its turn is released before.
+        lazy_rank0_scored_ns,
+        /// Lazy scans that issued a gather of a probe that is not
+        /// `certain_dense`, whose issue waits on scoring progress; see
+        /// `lazy_first_gather_issue_ns`. Certain-dense gathers, the first
+        /// probe's always among them, are issued as soon as staged.
+        lazy_first_gather_issue_queries,
+        /// Time from the start of each of those scans until the first such
+        /// gather was issued, its gate waits and permit included.
+        lazy_first_gather_issue_ns,
+        /// Gathers whose probe was further ahead of scoring than their
+        /// staleness window (the far window for a probe that reads an ex
+        /// plane from a high-latency origin) when they reached the gate.
+        lazy_window_waits,
+        /// Time those gathers waited for scoring to bring their probe within
+        /// the window. Part of `gate_wait_ns`, as are
+        /// `lazy_release_wait_ns` and `far_permit_wait_ns`.
+        lazy_window_wait_ns,
+        /// Time the `deferred_issues` waited for the heap to fill, their turn
+        /// or, with eager-before-full, the scoring of the probes holding `k`
+        /// rows.
+        lazy_release_wait_ns,
+        /// Time the `far_permit_waits` waited for a permit or the ordinary
+        /// window.
+        far_permit_wait_ns,
     }
     ranked {
         /// Probes gathered lazily.

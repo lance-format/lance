@@ -8288,7 +8288,84 @@ mod tests {
                 );
             }
             assert_eq!(stats.needed_not_fetched, 0, "{context}");
+            assert_lazy_chain_timing(&stats, context);
             stats
+        }
+
+        /// Check the release-chain timings of `stats`, taken over lazy scans
+        /// that all completed. An eager scan times nothing; every lazy scan
+        /// times its first probe's scoring once; a wait is timed only when it
+        /// is counted, and the waits of a gather are part of its gate wait.
+        /// Within one scan, the first probe's scoring is published no later
+        /// than the heap first fills, and when a gather waited for the
+        /// threshold or its turn, no gather that waits on scoring was issued
+        /// before that publish.
+        fn assert_lazy_chain_timing(stats: &LayeredLazyStats, context: &str) {
+            let timings = [
+                (
+                    "rank 0 scored",
+                    stats.lazy_rank0_scored_queries,
+                    stats.lazy_rank0_scored_ns,
+                ),
+                (
+                    "first gather issue",
+                    stats.lazy_first_gather_issue_queries,
+                    stats.lazy_first_gather_issue_ns,
+                ),
+                (
+                    "window wait",
+                    stats.lazy_window_waits,
+                    stats.lazy_window_wait_ns,
+                ),
+                (
+                    "release wait",
+                    stats.deferred_issues,
+                    stats.lazy_release_wait_ns,
+                ),
+                (
+                    "far permit wait",
+                    stats.far_permit_waits,
+                    stats.far_permit_wait_ns,
+                ),
+            ];
+            for (timing, count, ns) in timings {
+                if stats.lazy_queries == 0 {
+                    assert_eq!((count, ns), (0, 0), "{timing}: {context}");
+                }
+                if count == 0 {
+                    assert_eq!(ns, 0, "{timing}: {context}");
+                }
+            }
+            assert_eq!(
+                stats.lazy_rank0_scored_queries, stats.lazy_queries,
+                "{context}"
+            );
+            assert!(
+                stats.lazy_first_gather_issue_queries <= stats.lazy_queries,
+                "{context}"
+            );
+            let waits =
+                stats.lazy_window_wait_ns + stats.lazy_release_wait_ns + stats.far_permit_wait_ns;
+            assert!(
+                waits <= stats.gate_wait_ns,
+                "waits {waits} ns beyond the gate wait {} ns: {context}",
+                stats.gate_wait_ns
+            );
+            if stats.lazy_queries == 1 {
+                if stats.time_to_first_full_ns > 0 {
+                    assert!(
+                        stats.lazy_rank0_scored_ns <= stats.time_to_first_full_ns,
+                        "{stats:?} {context}"
+                    );
+                }
+                if stats.deferred_issues > 0 {
+                    assert_eq!(stats.lazy_first_gather_issue_queries, 1, "{context}");
+                    assert!(
+                        stats.lazy_rank0_scored_ns <= stats.lazy_first_gather_issue_ns,
+                        "{stats:?} {context}"
+                    );
+                }
+            }
         }
 
         /// Deltas of the promotion gauge are not reset by snapshots; wait
@@ -8345,6 +8422,12 @@ mod tests {
             let filters = lazy_test_filters();
             let configs = lazy_test_configs();
             let mut case = 0usize;
+            // Single scans in which a gather waited for the threshold or its
+            // turn, whose release chain `assert_lazy_chain_timing` orders.
+            let mut deferred_scans = 0usize;
+            let mut count_deferred = |stats: &LayeredLazyStats| {
+                deferred_scans += usize::from(stats.lazy_queries == 1 && stats.deferred_issues > 0);
+            };
             for cache in [
                 LazyTestCache::Origin,
                 LazyTestCache::Small,
@@ -8398,6 +8481,7 @@ mod tests {
                             let stats =
                                 assert_lazy_matches_eager(index, &query, filter, config, &context)
                                     .await;
+                            count_deferred(&stats);
                             match cache {
                                 LazyTestCache::Resident => {
                                     assert_eq!(stats.lazy_all_resident_skips, 1, "{context}");
@@ -8431,6 +8515,7 @@ mod tests {
                                         &format!("{context} bounds"),
                                     )
                                     .await;
+                                    count_deferred(&stats);
                                     if class == OriginLatencyClass::High {
                                         far_early_issues += stats.far_early_issues;
                                     }
@@ -8450,6 +8535,7 @@ mod tests {
                         let stats =
                             assert_lazy_matches_eager(index, &query, filter, config, &context)
                                 .await;
+                        count_deferred(&stats);
                         if class == OriginLatencyClass::High {
                             far_early_issues += stats.far_early_issues;
                         }
@@ -8463,6 +8549,10 @@ mod tests {
                 }
                 wait_for_promotions().await;
             }
+            assert!(
+                deferred_scans > 0,
+                "bits={bits} {distance_type:?}: no scan deferred a gather, so no release chain was ordered"
+            );
         }
 
         /// An ungated backend is warmed partition by partition, so every plane
@@ -9108,6 +9198,7 @@ mod tests {
                 let stats = layered_stats::snapshot_and_reset();
                 assert_eq!(stats.lazy_queries, 0);
                 assert_eq!(stats.lazy_all_resident_skips, 0);
+                assert_lazy_chain_timing(&stats, "other search paths");
                 let mut output = vec![result_bits(&in_partition), result_bits(&cascaded)];
                 output.extend(streamed.iter().map(result_bits));
                 output.extend(batched.iter().map(result_bits));
@@ -9355,6 +9446,9 @@ mod tests {
             origin_row_reads: u64,
             sparse_planes: u64,
             whole_planes: u64,
+            rank0_scored_queries: u64,
+            first_gather_issue_queries: u64,
+            release_wait_ns: u64,
         }
 
         impl IssueTotals {
@@ -9380,6 +9474,9 @@ mod tests {
                     .chain(&stats.low_sparse)
                     .sum::<u64>();
                 self.whole_planes += stats.high_whole.iter().chain(&stats.low_whole).sum::<u64>();
+                self.rank0_scored_queries += stats.lazy_rank0_scored_queries;
+                self.first_gather_issue_queries += stats.lazy_first_gather_issue_queries;
+                self.release_wait_ns += stats.lazy_release_wait_ns;
             }
         }
 
@@ -9769,6 +9866,36 @@ mod tests {
                     (0, 0),
                     "{small:?}"
                 );
+            }
+
+            // Every scan times its first probe's scoring, and a wait for the
+            // threshold or a turn is timed exactly when one happens. Each
+            // small-`k` query gathers later probes, whose issue waits on the
+            // first probe's threshold (see `assert_lazy_chain_timing`),
+            // whether that probe is routed or gathered as certain dense; the
+            // routed large-`k` queries gather nothing.
+            let queries = QUERIES as u64;
+            for totals in [
+                large_routed,
+                large_on,
+                large_off,
+                small_routed,
+                small_on,
+                small_off,
+            ] {
+                assert_eq!(totals.rank0_scored_queries, queries, "{totals:?}");
+                assert_eq!(
+                    totals.release_wait_ns > 0,
+                    totals.deferred_issues > 0,
+                    "{totals:?}"
+                );
+            }
+            assert_eq!(
+                large_routed.first_gather_issue_queries, 0,
+                "{large_routed:?}"
+            );
+            for small in [small_routed, small_on, small_off] {
+                assert_eq!(small.first_gather_issue_queries, queries, "{small:?}");
             }
         }
 
@@ -11506,6 +11633,7 @@ mod tests {
                     assert_eq!(&result_bits(&result), eager, "{context}");
                     assert_eq!(stats.lazy_queries, 1, "{context}");
                     assert_eq!(stats.needed_not_fetched, 0, "{context}");
+                    assert_lazy_chain_timing(&stats, &context);
                     // A probe on the slow origin issues at most one far gather.
                     let slow_probes: u64 = stats.s3_bound_probes.iter().sum();
                     assert!(stats.far_early_issues <= slow_probes, "{context}");
@@ -11576,6 +11704,7 @@ mod tests {
                     assert_eq!(&result_bits(&result), eager, "{context}");
                     assert_eq!(stats.lazy_queries, 1, "{context}");
                     assert_eq!(stats.needed_not_fetched, 0, "{context}");
+                    assert_lazy_chain_timing(&stats, &context);
                     let slow_probes: u64 = stats.s3_bound_probes.iter().sum();
                     assert!(stats.far_early_issues <= slow_probes, "{context}");
                     far_early_issues += stats.far_early_issues;
@@ -11684,13 +11813,16 @@ mod tests {
                 }
                 assert_eq!(stats.lazy_queries, QUERIES as u64, "{context}");
                 assert_eq!(stats.needed_not_fetched, 0, "{context}");
+                assert_lazy_chain_timing(&stats, &context);
                 assert!(stats.far_early_issues > 0, "{context}");
                 // Observed as each far gather takes its permit.
                 let most = far_inflight as u64;
                 assert!((1..=most).contains(&stats.far_in_flight_max), "{context}");
                 if far_inflight == 1 {
-                    // The queries' far gathers queue for the one permit.
+                    // The queries' far gathers queue for the one permit, and
+                    // the queue is timed.
                     assert!(stats.far_permit_waits > 0, "{context}");
+                    assert!(stats.far_permit_wait_ns > 0, "{context}");
                 } else {
                     assert!(stats.far_in_flight_max > 1, "{context}");
                 }

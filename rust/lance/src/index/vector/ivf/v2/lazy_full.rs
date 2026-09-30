@@ -60,6 +60,7 @@ use std::collections::BinaryHeap;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
@@ -290,6 +291,11 @@ impl LazyFarIssue {
 
 /// Query-wide inputs of the gathers.
 struct LazyFetchContext {
+    /// When the scan started, which its chain timings count from.
+    started: Instant,
+    /// Whether a gather that waits on scoring progress was issued; the first
+    /// times `lazy_first_gather_issue_ns`.
+    first_gather_issued: AtomicBool,
     /// `None` when every gather keeps the ordinary window: the index's origin
     /// is low latency, or the far window is no wider.
     far: Option<LazyFarIssue>,
@@ -319,6 +325,25 @@ struct LazyScorer {
     scratch_pool: Arc<QueryScratchPool>,
     metrics: Arc<dyn MetricsCollector>,
     progress: Arc<watch::Sender<LazyProgress>>,
+    /// When the scan started, which its chain timings count from.
+    started: Instant,
+}
+
+impl LazyScorer {
+    /// Publish scoring progress to the gathers. The scan's first publish
+    /// comes from its first probe, once scored or once its rows fill the
+    /// heap, and is the earliest a gather waiting for the threshold or its
+    /// turn can be released; it is timed before any gather can see it.
+    fn publish(&self, update: impl FnOnce(&mut LazyProgress)) {
+        self.progress.send_modify(|progress| {
+            if progress.scored == 0 && !progress.full {
+                let stats = layered_stats::counters();
+                stats.lazy_rank0_scored_queries.incr();
+                stats.lazy_rank0_scored_ns.add_elapsed(self.started);
+            }
+            update(progress);
+        });
+    }
 }
 
 /// Aborts a task of the scan when its owner is dropped: the producer when the
@@ -522,6 +547,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             scratch_pool: self.scratch_pool.clone(),
             metrics: metrics.clone(),
             progress: Arc::new(progress_tx),
+            started,
         };
         let far = match config.active_far_window(self.origin_latency) {
             Some(window) => Some(LazyFarIssue {
@@ -536,6 +562,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             .map_or(config.window, |far| far.window)
             .saturating_add(LAZY_FETCH_EXTRA_SLOTS);
         let fetch_context = Arc::new(LazyFetchContext {
+            started,
+            first_gather_issued: AtomicBool::new(false),
             far,
             config,
             forecast,
@@ -912,10 +940,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         } else {
             let window = context.config.window;
             let gate_window = far.map_or(window, |far| far.window);
+            let within_gate =
+                |progress: &LazyProgress| progress.scored.saturating_add(gate_window) >= rank;
+            let window_closed = !within_gate(&progress.borrow());
+            let windowing = Instant::now();
             let gate = *progress
-                .wait_for(|progress| progress.scored.saturating_add(gate_window) >= rank)
+                .wait_for(within_gate)
                 .await
                 .map_err(|_| scan_cancelled())?;
+            if window_closed {
+                stats.lazy_window_waits.incr();
+                stats.lazy_window_wait_ns.add_elapsed(windowing);
+            }
             // An infinite threshold gathers every accepted row, so wait for a
             // finite one, or for this probe's turn. With eager-before-full,
             // stop waiting where it saves no reads: when the gathers after the
@@ -933,10 +969,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 gate
             } else {
                 stats.deferred_issues.incr();
+                let releasing = Instant::now();
                 let issue = *progress
                     .wait_for(released)
                     .await
                     .map_err(|_| scan_cancelled())?;
+                stats.lazy_release_wait_ns.add_elapsed(releasing);
                 if !issue.full && issue.scored >= rank {
                     stats.serial_waits.incr();
                 }
@@ -949,8 +987,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                         Some(permit) => (issue, Some(permit)),
                         None => {
                             stats.far_permit_waits.incr();
-                            far.wait_for_permit_or_window(&mut progress, window, rank)
-                                .await?
+                            let waiting = Instant::now();
+                            let waited = far
+                                .wait_for_permit_or_window(&mut progress, window, rank)
+                                .await?;
+                            stats.far_permit_wait_ns.add_elapsed(waiting);
+                            waited
                         }
                     };
                     if permit.is_some() {
@@ -965,6 +1007,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             };
             if !issue.full && issue.scored < rank {
                 stats.eager_before_full.incr();
+            }
+            if !context.first_gather_issued.swap(true, Ordering::Relaxed) {
+                stats.lazy_first_gather_issue_queries.incr();
+                stats
+                    .lazy_first_gather_issue_ns
+                    .add_elapsed(context.started);
             }
             (issue, far_permit)
         };
@@ -1108,7 +1156,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 .then(|| heap.peek().map(|node| node.dist.0))
                 .flatten();
             let scored = *scored;
-            scorer.progress.send_modify(|progress| {
+            scorer.publish(|progress| {
                 progress.scored = scored;
                 if let Some(top) = top {
                     progress.full = true;
@@ -1221,7 +1269,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 stage1,
                 heap,
                 |threshold| {
-                    scorer.progress.send_modify(|progress| {
+                    scorer.publish(|progress| {
                         progress.full = true;
                         progress.threshold = threshold;
                     });
