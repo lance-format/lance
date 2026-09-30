@@ -54,7 +54,11 @@ use super::graph::OrderedNode;
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
-pub use crate::vector::bq::resident::{ResidentColumns, resident_columns_bytes};
+pub use crate::vector::bq::resident::{
+    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, resident_columns_bytes,
+    resident_store_count, resident_store_is_live, resident_store_leases,
+    resident_store_preopen_lease,
+};
 
 async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
 where
@@ -579,8 +583,8 @@ impl DeepSizeOf for PlaneAccess {
 /// runtime handles registered under it, so that indexes opened at once, a
 /// re-open while an older index still runs, and a state read back from a
 /// persistent cache tier share them: the resident store
-/// ([`ResidentColumns::for_file`]) and the lazy scan's far gather permits
-/// ([`IvfQuantizationStorage::with_index_file`]).
+/// ([`ResidentColumns::in_index_cache`]) and the lazy scan's far gather
+/// permits ([`IvfQuantizationStorage::with_index_file`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IndexFileKey(Arc<IndexFileLocation>);
 
@@ -600,6 +604,21 @@ impl IndexFileKey {
             store_prefix: store_prefix.to_owned(),
             path: path.to_owned(),
         }))
+    }
+
+    /// The UUID of the index the file belongs to.
+    pub(crate) fn index_uuid(&self) -> &str {
+        &self.0.index_uuid
+    }
+
+    /// The prefix of the object store that holds the file.
+    pub(crate) fn store_prefix(&self) -> &str {
+        &self.0.store_prefix
+    }
+
+    /// The file's path in its object store.
+    pub(crate) fn path(&self) -> &str {
+        &self.0.path
     }
 }
 
@@ -1029,10 +1048,27 @@ fn sign_bounds_from(value: Option<&str>) -> Result<SignBounds> {
 /// storage file (row ids and factors) in memory, so that partition and plane
 /// reads fetch only the code and bounds columns from the file: `auto`
 /// (default), `on` or `off`. `auto` is on for [`OriginLatencyClass::High`],
-/// where each column read is a request. The memory is outside every cache
-/// budget; [`resident_columns_bytes`] gives it without I/O. Results are the
-/// same either way. Read once per process; resolved when an index opens.
+/// where each column read is a request, when the store fits the index cache
+/// (see [`ResidentColumnsSetting::admits`]). The store is an entry of the
+/// index cache, charged in its budget and kept in RAM while an index of the
+/// file is live (see [`ResidentColumns`]); [`resident_columns_bytes`] gives
+/// its size without I/O. Results are the same either way. Read once per
+/// process; resolved when an index opens.
 pub const RESIDENT_COLUMNS_ENV: &str = "LANCE_RQ_RESIDENT_COLUMNS";
+
+/// `auto` keeps the small columns resident only when the store takes at most
+/// this fraction (one over the divisor) of the largest entry the index
+/// cache admits ([`lance_core::cache::CacheBackend::max_entry_bytes`]): a
+/// store that would take most of a cache shard would leave the planes too
+/// little room, and one past the shard's budget could not be admitted.
+pub const RESIDENT_MAX_ENTRY_SHARE_DIVISOR: u64 = 2;
+
+/// Whether a resident store of `bytes` fits an index cache whose largest
+/// admissible entry is `max_entry_bytes` (`None`: no limit below its
+/// capacity); see [`RESIDENT_MAX_ENTRY_SHARE_DIVISOR`].
+pub fn resident_store_fits(bytes: u64, max_entry_bytes: Option<u64>) -> bool {
+    max_entry_bytes.is_none_or(|max| bytes <= max / RESIDENT_MAX_ENTRY_SHARE_DIVISOR)
+}
 
 /// The value of [`RESIDENT_COLUMNS_ENV`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1048,12 +1084,25 @@ pub enum ResidentColumnsSetting {
 
 impl ResidentColumnsSetting {
     /// Whether an index whose origin reads are `class` keeps its small
-    /// columns resident.
+    /// columns resident, before [`Self::admits`] sizes the store.
     pub fn resolve(self, class: OriginLatencyClass) -> bool {
         match self {
             Self::Auto => class == OriginLatencyClass::High,
             Self::On => true,
             Self::Off => false,
+        }
+    }
+
+    /// Whether a resident store of `bytes` may be kept in an index cache
+    /// whose largest admissible entry is `max_entry_bytes`: never when
+    /// `off`, and only a store with some columns otherwise; `auto` also
+    /// requires it to fit ([`resident_store_fits`]). An index keeps its
+    /// small columns resident when both this and [`Self::resolve`] hold.
+    pub fn admits(self, bytes: u64, max_entry_bytes: Option<u64>) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => bytes > 0,
+            Self::Auto => bytes > 0 && resident_store_fits(bytes, max_entry_bytes),
         }
     }
 
@@ -1096,6 +1145,66 @@ fn resident_columns_from(value: Option<&str>) -> Result<ResidentColumnsSetting> 
         "off" => Ok(ResidentColumnsSetting::Off),
         _ => Err(Error::invalid_input(format!(
             "{RESIDENT_COLUMNS_ENV}={value:?} is invalid, expected auto, on or off"
+        ))),
+    }
+}
+
+/// How long an IVF_RQ index file's resident store is kept in RAM: `index`
+/// (default) or `process`. Read once per process; an invalid value fails
+/// every IVF_RQ index open.
+pub const RESIDENT_LIFETIME_ENV: &str = "LANCE_RQ_RESIDENT_LIFETIME";
+
+/// The value of [`RESIDENT_LIFETIME_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentLifetime {
+    /// Leased by the live indexes of the file: an idle store is an ordinary
+    /// entry of the index cache, evicted under pressure and loaded again on
+    /// its next use.
+    #[default]
+    Index,
+    /// Also leased once for the life of the process, so the index cache
+    /// keeps it pinned (within its pinned cap) once it loaded. Still charged
+    /// in the cache budget.
+    Process,
+}
+
+impl ResidentLifetime {
+    /// The knob's spelling of the lifetime: `index` or `process`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Process => "process",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentLifetime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`RESIDENT_LIFETIME_ENV`], read once per process.
+static RESIDENT_LIFETIME: LazyLock<std::result::Result<ResidentLifetime, String>> =
+    LazyLock::new(|| {
+        resident_lifetime_from(std::env::var(RESIDENT_LIFETIME_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The setting of [`RESIDENT_LIFETIME_ENV`].
+pub fn resident_lifetime_setting() -> Result<ResidentLifetime> {
+    RESIDENT_LIFETIME.clone().map_err(Error::invalid_input)
+}
+
+fn resident_lifetime_from(value: Option<&str>) -> Result<ResidentLifetime> {
+    let Some(value) = value else {
+        return Ok(ResidentLifetime::default());
+    };
+    match value.trim() {
+        "index" => Ok(ResidentLifetime::Index),
+        "process" => Ok(ResidentLifetime::Process),
+        _ => Err(Error::invalid_input(format!(
+            "{RESIDENT_LIFETIME_ENV}={value:?} is invalid, expected index or process"
         ))),
     }
 }
@@ -1605,8 +1714,8 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        // The resident columns are set aside outside the cache budget; see
-        // `resident_columns_bytes`.
+        // The resident store is charged as its own entry of the index cache
+        // (`ResidentColumnsEntry`), not with every storage reading it.
         self.metadata.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.plane_access.deep_size_of_children(context)
@@ -1761,16 +1870,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.sign_bounds
     }
 
-    /// The store of this storage's resident columns, to retain in the
-    /// index's cached runtime state. It loads only while
+    /// This storage's handle on the resident store of its file, which leases
+    /// the store while the storage lives. It loads only while
     /// [`Self::resident_columns_enabled`].
     pub fn resident_columns(&self) -> &ResidentColumns {
         &self.resident_columns
     }
 
-    /// Share the resident store of a cached index when binding new readers
-    /// to it, or the store every open of the file shares
-    /// ([`ResidentColumns::for_file`]), so that the store loads once.
+    /// Read the small columns through `store`, the handle an open binds to
+    /// the store every live index of the file shares
+    /// ([`ResidentColumns::in_index_cache`]), so that the store loads once.
     pub fn with_resident_columns(mut self, store: ResidentColumns) -> Self {
         self.resident_columns = store;
         self
@@ -2807,11 +2916,13 @@ mod tests {
         LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV,
         LayeredLazyConfig, LazyFarPermits, LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV,
         OriginLatencyClass, PlaneSource, QueryScratchCapacity, QueryScratchPool,
-        RESIDENT_COLUMNS_ENV, ResidentColumnsSetting, SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV,
+        RESIDENT_COLUMNS_ENV, RESIDENT_LIFETIME_ENV, RESIDENT_MAX_ENTRY_SHARE_DIVISOR,
+        ResidentColumnsSetting, ResidentLifetime, SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV,
         SignBounds, compact_prewarm_batches, origin_latency_from, origin_latency_setting,
         origin_reads_whole_plane, plan_plane_gather, resident_columns_from,
-        resident_columns_setting, sequential_plane_loads, sequential_plane_loads_from,
-        sign_bounds_from, sign_bounds_setting, spawn_prewarm_materialization,
+        resident_columns_setting, resident_lifetime_from, resident_lifetime_setting,
+        resident_store_fits, sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from,
+        sign_bounds_setting, spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
     use futures::FutureExt;
@@ -3587,6 +3698,75 @@ mod tests {
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             let message = error.to_string();
             assert!(message.contains(RESIDENT_COLUMNS_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    /// `off` never keeps a store; `on` keeps any store with columns, however
+    /// large; `auto` keeps one that takes at most half of the cache's
+    /// largest admissible entry, any size on a cache without that limit.
+    #[test]
+    fn admits_follows_setting_bytes_and_limit() {
+        const MAX_ENTRY: u64 = 1 << 20;
+        let limit = MAX_ENTRY / RESIDENT_MAX_ENTRY_SHARE_DIVISOR;
+        assert_eq!(limit, MAX_ENTRY / 2);
+        let cases = [
+            (0, Some(MAX_ENTRY)),
+            (1, Some(MAX_ENTRY)),
+            (limit, Some(MAX_ENTRY)),
+            (limit + 1, Some(MAX_ENTRY)),
+            (MAX_ENTRY + 1, Some(MAX_ENTRY)),
+            (1, Some(0)),
+            (u64::MAX, None),
+            (0, None),
+        ];
+        for (setting, expected) in [
+            (
+                ResidentColumnsSetting::Auto,
+                [false, true, true, false, false, false, true, false],
+            ),
+            (
+                ResidentColumnsSetting::On,
+                [false, true, true, true, true, true, true, false],
+            ),
+            (ResidentColumnsSetting::Off, [false; 8]),
+        ] {
+            let admitted = cases.map(|(bytes, max)| setting.admits(bytes, max));
+            assert_eq!(admitted, expected, "{setting}");
+        }
+        assert!(resident_store_fits(limit, Some(MAX_ENTRY)));
+        assert!(!resident_store_fits(limit + 1, Some(MAX_ENTRY)));
+        assert!(resident_store_fits(u64::MAX, None));
+    }
+
+    #[test]
+    fn resident_lifetime_parses_and_rejects_unknown() {
+        let process = std::env::var(RESIDENT_LIFETIME_ENV).ok();
+        assert_eq!(
+            resident_lifetime_setting().ok(),
+            resident_lifetime_from(process.as_deref()).ok()
+        );
+        assert_eq!(
+            resident_lifetime_from(None).unwrap(),
+            ResidentLifetime::Index
+        );
+        assert_eq!(ResidentLifetime::default(), ResidentLifetime::Index);
+        for lifetime in [ResidentLifetime::Index, ResidentLifetime::Process] {
+            assert_eq!(
+                resident_lifetime_from(Some(lifetime.as_str())).unwrap(),
+                lifetime
+            );
+            assert_eq!(lifetime.to_string(), lifetime.as_str());
+        }
+        assert_eq!(
+            resident_lifetime_from(Some(" process ")).unwrap(),
+            ResidentLifetime::Process
+        );
+        for value in ["query", "PROCESS", "1", ""] {
+            let error = resident_lifetime_from(Some(value)).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(RESIDENT_LIFETIME_ENV), "{error}");
             assert!(message.contains(&format!("{value:?}")), "{error}");
         }
     }

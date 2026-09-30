@@ -6,6 +6,12 @@
 use super::InternalCacheKey;
 use std::collections::{BTreeMap, HashMap};
 
+/// Priority of a pinned-kind entry (a value admitted with a
+/// [`CachePin`](super::CachePin)): above sign planes (3), so an idle pinned
+/// entry is evicted after every plane. While leased within its budget it is
+/// never evicted at all.
+pub const PINNED_PRIORITY: u8 = 4;
+
 pub struct PriorityEntries<T> {
     entries: HashMap<InternalCacheKey, (u8, u64, usize, T)>,
     order: BTreeMap<(u8, u64), InternalCacheKey>,
@@ -66,11 +72,27 @@ impl<T: Clone> PriorityEntries<T> {
         priority: u8,
         capacity: usize,
     ) -> Vec<T> {
+        self.insert_with(key, value, bytes, priority, capacity, |_| false)
+    }
+
+    /// [`insert`](Self::insert) that never evicts an entry `is_pinned`
+    /// reports pinned, the inserted one included: pinned entries stay even
+    /// when only they are left over capacity. The pin budget keeps them to a
+    /// share of the capacity.
+    pub fn insert_with(
+        &mut self,
+        key: InternalCacheKey,
+        value: T,
+        bytes: usize,
+        priority: u8,
+        capacity: usize,
+        is_pinned: impl Fn(&T) -> bool,
+    ) -> Vec<T> {
         let mut dropped = Vec::new();
         if let Some(old) = self.remove(&key) {
             dropped.push(old);
         }
-        if bytes > capacity {
+        if bytes > capacity && !is_pinned(&value) {
             dropped.push(value);
             return dropped;
         }
@@ -80,9 +102,19 @@ impl<T: Clone> PriorityEntries<T> {
         self.order.insert((priority, self.sequence), key);
         self.bytes += bytes as u128;
         while self.bytes > capacity as u128 {
-            if let Some(key) = self.order.first_key_value().map(|(_, key)| *key)
-                && let Some(value) = self.remove(&key)
-            {
+            let victim = self
+                .order
+                .values()
+                .find(|key| {
+                    self.entries
+                        .get(key)
+                        .is_some_and(|(_, _, _, value)| !is_pinned(value))
+                })
+                .copied();
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(value) = self.remove(&victim) {
                 dropped.push(value);
             }
         }
@@ -180,5 +212,44 @@ mod tests {
         assert_eq!(touched.get(&a), Some(1));
         assert_eq!(touched.insert(c, 3, 40, 1, 100), vec![2]);
         assert!(touched.contains(&a));
+    }
+
+    /// Eviction passes over pinned entries, however old or low their
+    /// priority, and a pinned entry heavier than the budget is admitted; only
+    /// pinned entries can hold the budget over capacity.
+    #[test]
+    fn eviction_skips_pinned_entries() {
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let is_pinned = |value: &(u32, bool)| value.1;
+        let mut cache = PriorityEntries::default();
+        cache.insert_with(key(1), (1, true), 40, 1, 100, is_pinned);
+        cache.insert_with(key(2), (2, false), 40, 3, 100, is_pinned);
+        // The oldest, lowest entry is pinned: the sign entry goes instead.
+        let dropped = cache.insert_with(key(3), (3, false), 40, 3, 100, is_pinned);
+        assert_eq!(dropped, vec![(2, false)]);
+        assert!(cache.contains(&key(1)) && cache.contains(&key(3)));
+        // Nothing unpinned is left to evict but the new entry itself.
+        let dropped = cache.insert_with(key(4), (4, true), 120, 1, 100, is_pinned);
+        assert_eq!(dropped, vec![(3, false)]);
+        assert_eq!(cache.bytes(), 160);
+        assert!(cache.contains(&key(1)) && cache.contains(&key(4)));
+        // Once unpinned, an entry heavier than the budget is refused.
+        let dropped = cache.insert_with(key(5), (5, false), 120, 4, 100, is_pinned);
+        assert_eq!(dropped, vec![(5, false)]);
+    }
+
+    /// An idle pinned-kind entry outranks sign planes, so a sign plane is
+    /// evicted first; among pinned-kind entries the oldest goes first.
+    #[test]
+    fn pinned_priority_outranks_sign() {
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let mut cache = PriorityEntries::default();
+        cache.insert(key(1), 1, 40, PINNED_PRIORITY, 100);
+        cache.insert(key(2), 2, 40, 3, 100);
+        assert_eq!(cache.insert(key(3), 3, 40, 3, 100), vec![2]);
+        assert_eq!(cache.insert(key(4), 4, 40, PINNED_PRIORITY, 100), vec![3]);
+        assert_eq!(cache.insert(key(5), 5, 40, PINNED_PRIORITY, 100), vec![1]);
+        // Pinned-kind entries are not plane statistics.
+        assert_eq!(cache.stats(), [(0, 0); 3]);
     }
 }

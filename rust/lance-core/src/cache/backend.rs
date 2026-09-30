@@ -20,6 +20,16 @@
 //! Prefix invalidation and key inventory are intentionally not part of this
 //! interface: one-way digests cannot support either operation without
 //! retaining the logical strings that fixed-size keys are designed to remove.
+//!
+//! # Pinned entries
+//!
+//! A backend may keep entries in RAM while callers lease them (see the
+//! [`pin`](super::pin) module): [`insert_pinned`](CacheBackend::insert_pinned),
+//! [`get_or_insert_pinned`](CacheBackend::get_or_insert_pinned) and
+//! [`get_leased`](CacheBackend::get_leased). The defaults store such entries
+//! like any other, charged and evictable, so existing backends keep working;
+//! a pinning backend records each admission with [`CachePin::record`] in a
+//! [`PinBudget`](super::PinBudget) and skips pinned entries on eviction.
 //! Existing callers should migrate removed symbols as follows:
 //! - replace `with_backend_and_prefix(backend, prefix)` with
 //!   [`LanceCache::with_backend`](super::LanceCache::with_backend) followed by
@@ -40,10 +50,16 @@ use futures::Future;
 use crate::Result;
 use crate::deepsize::Context;
 
+use super::pin::{CachePin, PinnedStats};
 use super::{CacheCodec, InternalCacheKey};
 
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
+
+/// The loader [`CacheBackend::get_or_insert_pinned`] receives: the entry,
+/// its size in bytes and the pin its leases hold.
+pub type PinnedEntryLoader<'a> =
+    Pin<Box<dyn Future<Output = Result<(CacheEntry, usize, Arc<CachePin>)>> + Send + 'a>>;
 
 /// The tier that would serve a read of an entry, as
 /// [`CacheBackend::peek_tier`] predicts it.
@@ -161,6 +177,52 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
+
+    /// Look up RAM only, as an access that refreshes the entry's recency, so
+    /// that a caller can lease an entry it finds (see
+    /// [`CachePin::lease`]): never reads a persistent tier and counts no miss.
+    /// The default uses [`get_resident`](Self::get_resident).
+    async fn get_leased(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.get_resident(key).await
+    }
+
+    /// Store a RAM-only entry that stays resident while `pin` is leased and
+    /// the backend's pin budget has room for it. The default stores it like
+    /// any entry without a codec: charged, evictable, never pinned.
+    async fn insert_pinned(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        _pin: &Arc<CachePin>,
+    ) {
+        self.insert(key, entry, size_bytes, None).await
+    }
+
+    /// Get a RAM-only entry or compute it from `loader`, admitting a loaded
+    /// entry as [`insert_pinned`](Self::insert_pinned) does. Loads are
+    /// deduplicated as in [`get_or_insert`](Self::get_or_insert), which the
+    /// default uses, storing the entry without a pin.
+    async fn get_or_insert_pinned<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: PinnedEntryLoader<'a>,
+    ) -> Result<(CacheEntry, bool)> {
+        let loader = Box::pin(async move { loader.await.map(|(entry, size, _)| (entry, size)) });
+        self.get_or_insert(key, loader, None).await
+    }
+
+    /// Size in bytes of the largest entry the backend admits to RAM, or
+    /// `None` when it sets no limit below its capacity. A caller can keep a
+    /// value that would take most of it out of the cache.
+    fn max_entry_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// What the backend's pin budget holds. The default pins nothing.
+    fn pinned_stats(&self) -> PinnedStats {
+        PinnedStats::default()
+    }
 
     /// Remove all entries.
     async fn clear(&self);

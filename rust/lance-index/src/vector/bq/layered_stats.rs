@@ -5,9 +5,11 @@
 //!
 //! The counters only advance while a query runs the lazy scan (or is checked
 //! for it), so production queries with the scan disabled touch at most the
-//! `ineligible_disabled` counter. The `resident_columns_*` counters are the
-//! exception: they advance when an IVF_RQ index, layered or not, loads its
-//! resident columns. Readers take deltas with [`snapshot_and_reset`].
+//! `ineligible_disabled` counter. The `resident_columns_*`,
+//! `resident_store_evictions` and `pinned_overflow` counters are the
+//! exception: they advance when an IVF_RQ index, layered or not, opens with
+//! or loads its resident columns. Readers take deltas with
+//! [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -282,6 +284,31 @@ layered_lazy_counters! {
         /// Time the `far_permit_waits` waited for a permit or the ordinary
         /// window.
         far_permit_wait_ns,
+        /// Loads of an index file's resident store: one per store while the
+        /// index cache keeps it, and one more after it evicted the store idle.
+        resident_columns_loads,
+        /// Index opens that bound a resident store a live index of the file
+        /// had loaded, found through the process's weak registry of stores.
+        resident_columns_registry_reuses,
+        /// Index opens that bound a resident store charged in the index cache.
+        resident_columns_binds,
+        /// Loaded resident stores admitted to the index cache again by an
+        /// index open that found them gone: evicted while overflowed,
+        /// cleared, or refused at admission.
+        resident_columns_recharges,
+        /// Index opens whose resident store would take more of the index
+        /// cache's largest admissible entry than `auto` allows, so `auto`
+        /// kept the small columns in the file (`on` keeps them resident).
+        resident_columns_oversize,
+        /// Index opens that leased the cached resident store before their
+        /// first index-cache access.
+        resident_columns_preopen_leases,
+        /// Resident store entries the index cache dropped: evicted while
+        /// idle, cleared, or refused at admission.
+        resident_store_evictions,
+        /// Leases of a resident store that found no room under the index
+        /// cache's pinned cap, leaving the store evictable.
+        pinned_overflow,
     }
     ranked {
         /// Probes gathered lazily.

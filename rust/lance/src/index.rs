@@ -44,6 +44,7 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::storage::resident_store_preopen_lease;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
     FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus,
@@ -74,7 +75,7 @@ use vector::details::{
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
-use vector::ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox};
+use vector::ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -3038,10 +3039,25 @@ impl DatasetIndexInternalExt for Dataset {
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let object_store = self.object_store_for_index(&index_meta).await?;
+        let index_dir = self.indice_files_dir(&index_meta)?;
+        // An IVF_RQ index charges its resident store in its namespace of the
+        // index cache without the fragment reuse segment. Lease the store
+        // now if RAM holds it, before the first index-cache access below:
+        // the state lookup can promote a cached state from a persistent
+        // tier, and that admission must not evict the store the index is
+        // about to bind. Any other index misses the lookup.
+        let file_cache = self.index_cache.for_index(uuid, None);
+        let resident_lease = resident_store_preopen_lease(
+            &file_cache,
+            &aux_file_key(&object_store, &index_dir, uuid),
+        )
+        .await;
         // What the session declares about the index, for whichever IVF open
         // or reconstruction below runs.
         let open_context = IvfOpenContext {
             origin_latency_hint: self.session.index_origin_latency(),
+            file_cache: Some(file_cache),
+            resident_lease,
         };
 
         // Check sized cache first (v2+ indices with serializable state).
@@ -3069,7 +3085,6 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()
             .join(uuid.to_string())
