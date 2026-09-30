@@ -690,6 +690,7 @@ async fn convert_v3_metadata_to_details(
                     };
                     Some(Compression::Rq(RabitQuantization {
                         layered: rq.layered,
+                        row_layout: rabit_quantization::RowLayout::Columns.into(),
                         num_bits: rq.num_bits as u32,
                         rotation_type: rotation_type.into(),
                     }))
@@ -777,6 +778,7 @@ mod tests {
             (
                 Some(Compression::Rq(RabitQuantization {
                     layered: false,
+                    row_layout: rabit_quantization::RowLayout::Columns as i32,
                     num_bits: 1,
                     rotation_type: 0,
                 })),
@@ -870,6 +872,7 @@ mod tests {
             None,
             Some(Compression::Rq(RabitQuantization {
                 layered: false,
+                row_layout: rabit_quantization::RowLayout::Columns as i32,
                 num_bits: 1,
                 rotation_type: rabit_quantization::RotationType::Matrix as i32,
             })),
@@ -887,6 +890,7 @@ mod tests {
             None,
             Some(Compression::Rq(RabitQuantization {
                 layered: false,
+                row_layout: rabit_quantization::RowLayout::Columns as i32,
                 num_bits: 1,
                 rotation_type: rabit_quantization::RotationType::Fast as i32,
             })),

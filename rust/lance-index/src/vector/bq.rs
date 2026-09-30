@@ -194,10 +194,11 @@ impl RQBuildParams {
 
 impl From<&RQBuildParams> for RabitQuantization {
     fn from(value: &RQBuildParams) -> Self {
-        use crate::pb::vector_index_details::rabit_quantization::RotationType;
+        use crate::pb::vector_index_details::rabit_quantization::{RotationType, RowLayout};
         Self {
             num_bits: value.num_bits as u32,
             layered: value.layered,
+            row_layout: RowLayout::Columns as i32,
             rotation_type: match value.rotation_type {
                 RQRotationType::Fast => RotationType::Fast as i32,
                 RQRotationType::Matrix => RotationType::Matrix as i32,
