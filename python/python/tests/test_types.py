@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from functools import singledispatch
+from importlib import import_module
 from typing import Optional
 
 import lance
 import lance.types as source_types
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
 import pytest
 from lance.types import SourceStrategy, WriteSource, _coerce_reader, coerce_source
 
@@ -100,18 +103,137 @@ def test_unknown_source():
         coerce_source(object())
 
 
-@pytest.mark.parametrize("kind", ["dataset", "scanner", "one_shot_scanner"])
+@pytest.mark.parametrize("kind", ["union_dataset", "scanner", "one_shot_scanner"])
 def test_arrow_sources_remain_one_shot(kind):
     table = pa.table({"id": [1, 2], "value": [10, 20]})
     dataset = pa_ds.dataset(table)
     inputs = {
-        "dataset": dataset,
+        "union_dataset": pa_ds.UnionDataset(table.schema, [dataset]),
         "scanner": dataset.scanner(),
         "one_shot_scanner": pa_ds.Scanner.from_batches(table.to_reader()),
     }
     source = coerce_source(inputs[kind])
     assert source.strategy is SourceStrategy.ONE_SHOT
     assert source.reader_factory().read_all() == table
+
+
+@pytest.mark.parametrize("kind", ["memory", "filesystem"])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_known_arrow_datasets_preserve_filters(tmp_path, kind, filtered):
+    table = pa.table({"id": [0, 1, 2, 3], "value": [0, 10, 20, 30]})
+    if kind == "memory":
+        # Arrow 21 added RecordBatchReader inputs to InMemoryDataset.
+        data = table.to_reader() if int(pa.__version__.split(".")[0]) >= 21 else table
+        dataset = pa_ds.InMemoryDataset(data)
+        strategy = SourceStrategy.MATERIALIZED
+    else:
+        pq.write_table(table.slice(0, 2), tmp_path / "first.parquet")
+        pq.write_table(table.slice(2, 2), tmp_path / "second.parquet")
+        dataset = pa_ds.dataset(tmp_path, format="parquet")
+        strategy = SourceStrategy.RESCANNABLE
+    expected = table
+    if filtered:
+        dataset = dataset.filter(pa_ds.field("id") > 0).filter(pa_ds.field("id") != 2)
+        expected = table.take([1, 3])
+        if kind == "filesystem":
+            strategy = SourceStrategy.ONE_SHOT
+    source = coerce_source(dataset)
+    assert source.strategy is strategy
+    assert source.schema == expected.schema
+    first_scan = source.reader_factory().read_all()
+    assert first_scan.sort_by("id") == expected
+    if strategy is not SourceStrategy.ONE_SHOT:
+        assert source.reader_factory().read_all() == first_scan
+
+    # A caller-created Scanner remains one-shot, including its projection and
+    # its combination of the dataset's filter with an additional scan filter.
+    scanner = dataset.scanner(columns=["value"], filter=pa_ds.field("id") != 1)
+    source = coerce_source(scanner)
+    assert source.strategy is SourceStrategy.ONE_SHOT
+    expected = (
+        pa.table({"value": [30]}) if filtered else pa.table({"value": [0, 20, 30]})
+    )
+    assert source.schema == expected.schema
+    assert source.reader_factory().read_all().sort_by("value") == expected
+
+
+def test_arrow_volatile_filter_remains_one_shot(tmp_path):
+    table = pa.table({"id": [0, 1, 2, 3]})
+    pq.write_table(table, tmp_path / "source.parquet")
+    dataset = pa_ds.dataset(tmp_path, format="parquet")
+    dataset = dataset.filter(pc.Expression._call("random", []) > 0.5)
+    source = coerce_source(dataset)
+    assert source.strategy is SourceStrategy.ONE_SHOT
+    assert source.schema == table.schema
+
+
+@pytest.mark.parametrize(
+    "source_kind", ["memory", "filesystem", "scanner", "filtered_filesystem"]
+)
+def test_arrow_source_strategy_on_commit_conflict(tmp_path, monkeypatch, source_kind):
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int64(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int64()),
+        ]
+    )
+    target = lance.write_dataset(
+        pa.table({"id": [0, 1], "value": [0, 0]}, schema=schema),
+        tmp_path / "target",
+        max_rows_per_file=1,
+    )
+    builder = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    lance.write_dataset(
+        pa.table({"id": [50], "value": [50]}, schema=schema),
+        target.uri,
+        mode="append",
+    )
+    table = pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema)
+    if source_kind == "memory":
+        source = pa_ds.InMemoryDataset(table)
+    else:
+        paths = [tmp_path / "first.parquet", tmp_path / "second.parquet"]
+        for index, path in enumerate(paths):
+            pq.write_table(table.slice(index, 1), path)
+        source = pa_ds.dataset(paths, format="parquet")
+        if source_kind == "scanner":
+            source = source.scanner()
+        elif source_kind == "filtered_filesystem":
+            source = source.filter(pa_ds.field("id") > 1)
+    dataset_module = import_module("lance.dataset")
+    original_coerce = dataset_module.coerce_source
+    readers = []
+
+    def counted_source(data_obj, schema=None):
+        registered = original_coerce(data_obj, schema)
+
+        def reader_factory():
+            reader = registered.reader_factory()
+            readers.append(reader)
+            return reader
+
+        return WriteSource(registered.strategy, registered.schema, reader_factory)
+
+    monkeypatch.setattr(dataset_module, "coerce_source", counted_source)
+    stats = builder.execute(source)
+    assert len(readers) == (2 if source_kind == "filesystem" else 1)
+    assert stats["num_updated_rows"] == (
+        0 if source_kind == "filtered_filesystem" else 1
+    )
+    assert stats["num_inserted_rows"] == 1
+    assert target.to_table().sort_by("id").to_pydict() == {
+        "id": [0, 1, 2, 50],
+        "value": [0, 0 if source_kind == "filtered_filesystem" else 10, 20, 50],
+    }
 
 
 @pytest.mark.parametrize("kind", ["dataset", "scanner"])

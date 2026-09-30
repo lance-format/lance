@@ -396,9 +396,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The new data to use as the source table for the operation.  This parameter
             can be any source of data (e.g. table / dataset) that
             :func:`~lance.write_dataset` accepts.
-            Re-scannable Lance sources retain their dataset version and scan
-            options across conflict retries. Scans whose values or encounter
-            order may change are buffered for replay instead.
+            Repeatable LanceDataset and LanceScanner sources retain their
+            dataset version and scan options across conflict retries. Scans
+            whose values or encounter order may change, including default scan
+            options on a LanceDataset, are buffered for replay instead.
+            Arrow FileSystemDataset sources without an attached filter are
+            also re-scanned; their files must remain unchanged until the merge
+            completes, including retries. Filtered FileSystemDataset sources
+            are buffered for replay because filters may be non-deterministic.
             To buffer a repeatable source instead of reading it again on each
             retry, pass a reader, for example ``source.scanner().to_reader()``
             for a dataset or ``scanner.to_reader()`` for a scanner.

@@ -334,6 +334,110 @@ print(dataset.to_table().to_pandas())
 # 3  Francene   44
 ```
 
+### Source inputs and retries
+
+When a merge encounters a commit conflict, it may read its source again to
+recompute the changes against the latest target version. Lance selects how to
+replay the source from the input type:
+
+| Source examples | Replay strategy |
+| --- | --- |
+| Arrow Table, RecordBatch, in-memory DataFrame, InMemoryDataset | Reuse materialized batches. |
+| Repeatable LanceDataset or LanceScanner, Arrow FileSystemDataset without an attached filter | Open a fresh reader for each attempt, without a separate source buffer for retries. |
+| RecordBatchReader, batch iterator, generic Arrow Scanner, UnionDataset, filtered Arrow FileSystemDataset | When conflict retries are enabled, buffer the first read in memory or on disk for replay. |
+
+Repeatable Lance sources keep the dataset version and scan options selected
+when the merge starts. A LanceDataset or LanceScanner whose scan values or row
+order may change between attempts uses the buffered path. This includes scans
+configured through a LanceDataset's default scan options. Generic Arrow
+Scanners also use that path because a scanner created with
+`Scanner.from_batches` can only be consumed once.
+
+An Arrow FileSystemDataset is re-scanned only when it has no attached filter.
+Keep its selected files unchanged until the merge completes, including retries;
+Lance does not version those external files. A FileSystemDataset with a filter
+attached by `dataset.filter(...)` uses buffered replay, preserving the first
+scan's filtered results even if the filter contains non-deterministic functions.
+
+To replay the result of the first scan instead of re-reading a source on retry,
+pass `source.scanner().to_reader()` to `execute` for a dataset, or
+`scanner.to_reader()` for a scanner. This selects the one-shot buffering path
+when conflict retries are enabled.
+
+#### Registering a source
+
+An application or library can register its input type with
+`lance.types.coerce_source`. The adapter returns a `WriteSource` containing the
+Arrow schema, a zero-argument reader factory, and a `SourceStrategy`:
+
+- `MATERIALIZED`: the complete input is already in memory; the factory is called
+  once and Lance reuses its batches.
+- `RESCANNABLE`: the factory may be called multiple times during one merge. Each
+  call must return a fresh `pyarrow.RecordBatchReader` starting at the first row,
+  with the same data, row order, and schema, including schema and field metadata.
+- `ONE_SHOT`: the factory is called once; Lance buffers its data when conflict
+  retries are enabled.
+
+For `RESCANNABLE`, capture the source version or file selection and scan options
+before returning the factory. Keep them valid until the write completes. Lance
+checks each reader's schema; the adapter must ensure that the data and row order
+remain the same. A factory must not return a reader that an earlier attempt has
+already consumed.
+
+This example registers an application wrapper around a fixed list of Parquet
+files. The application keeps those files unchanged while the merge runs:
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import lance
+import pyarrow as pa
+import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
+from lance.types import SourceStrategy, WriteSource, coerce_source
+
+
+@dataclass(frozen=True)
+class ParquetSource:
+    paths: tuple[str, ...]
+
+
+@coerce_source.register(ParquetSource)
+def parquet_source(source, schema=None):
+    dataset = pa_ds.dataset(list(source.paths), format="parquet", schema=schema)
+    scanner = dataset.scanner()
+    return WriteSource(
+        SourceStrategy.RESCANNABLE, scanner.projected_schema, scanner.to_reader
+    )
+
+
+with TemporaryDirectory() as directory:
+    path = Path(directory)
+    changes = pa.table({"id": [1, 2], "value": [10, 20]})
+    pq.write_table(changes, path / "changes.parquet")
+    source = ParquetSource((str(path / "changes.parquet"),))
+    target = lance.write_dataset(
+        pa.table({"id": [0, 1], "value": [0, 0]}), path / "target.lance"
+    )
+    (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(source)
+    )
+    assert target.to_table().sort_by("id").to_pydict() == {
+        "id": [0, 1, 2],
+        "value": [0, 10, 20],
+    }
+```
+
+Pass the original source object to `execute`, not the `WriteSource` returned by
+the adapter. To use buffered replay for a registered source, pass
+`coerce_source(source).reader_factory()` to `execute` instead. Registrations also
+let `lance.write_dataset` accept the original source object.
+
 ## Reading Lance Dataset
 
 To open a Lance dataset, use the `lance.dataset` function:

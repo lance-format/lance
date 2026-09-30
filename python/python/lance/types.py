@@ -51,11 +51,16 @@ class WriteSource:
 
     For ``RESCANNABLE``, ``reader_factory`` must return a fresh
     :class:`pyarrow.RecordBatchReader` on every call, with the declared schema
-    and the same data. It must preserve scan options such as filters and
-    projections. For the other strategies, the factory is called once.
+    (including field and schema metadata), the same data, and the same row
+    order. It may be called multiple times during one merge. Capture the source
+    version or file selection and scan options such as filters and projections
+    before returning the factory, and keep them valid until the write completes.
+    Lance checks each reader's schema; the adapter guarantees the data and order.
+    For the other strategies, the factory is called once per write.
 
     Register a source with :func:`coerce_source` rather than passing this object
-    to a write API directly.
+    to a write API directly. Pass a reader from the factory to select the
+    one-shot buffering path for a merge with conflict retries enabled.
     """
 
     strategy: SourceStrategy
@@ -111,8 +116,17 @@ def coerce_source(
                 snapshot.to_reader,
             )
 
-    A re-scannable factory must return the same data and schema on each call;
-    see :class:`WriteSource`. Register only types that can honor that contract.
+    A re-scannable factory must return the same data, row order, and schema on
+    each call; see :class:`WriteSource`. Register only types that can honor that
+    contract. LanceDataset and LanceScanner inputs are re-scanned only when
+    their scan is repeatable, including any default scan options.
+
+    FileSystemDataset inputs without an attached filter are re-scanned on
+    retries: keep their source files unchanged until the write completes.
+    Filtered FileSystemDataset inputs use the one-shot strategy because their
+    filters may contain non-deterministic functions. Pass a reader, such as
+    ``data_obj.scanner().to_reader()``, to buffer the first scan of a repeatable
+    source when conflict retries are enabled.
     """
     if _check_for_pandas(data_obj):
         if pd.DataFrame not in coerce_source.registry:
@@ -151,6 +165,29 @@ def _coerce_batch(data_obj, schema=None) -> WriteSource:
 @coerce_source.register(pa.dataset.Dataset)
 def _coerce_dataset(data_obj, schema=None) -> WriteSource:
     return coerce_source(pa.dataset.Scanner.from_dataset(data_obj))
+
+
+@coerce_source.register(pa.dataset.InMemoryDataset)
+def _coerce_in_memory_dataset(data_obj, schema=None) -> WriteSource:
+    scanner = data_obj.scanner()
+    return WriteSource(
+        SourceStrategy.MATERIALIZED, scanner.projected_schema, scanner.to_reader
+    )
+
+
+@coerce_source.register(pa.dataset.FileSystemDataset)
+def _coerce_filesystem_dataset(data_obj, schema=None) -> WriteSource:
+    scanner = data_obj.scanner()
+    # Arrow cannot enumerate fragments when a dataset has attached scan options.
+    # Keep those sources one-shot: a filter can contain non-deterministic
+    # functions, and Arrow has no public expression volatility inspection API.
+    try:
+        data_obj.get_fragments()
+    except ValueError:
+        return coerce_source(scanner)
+    return WriteSource(
+        SourceStrategy.RESCANNABLE, scanner.projected_schema, scanner.to_reader
+    )
 
 
 @coerce_source.register(pa.dataset.Scanner)
