@@ -493,6 +493,7 @@ pub mod tests {
     use lance_index::scalar::IndexStore;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
     use lance_table::format::pb::fragment_reuse_index_details::{
         FragmentDigest, InlineContent, StablePartition, Transition, transition,
     };
@@ -543,7 +544,10 @@ pub mod tests {
             &params,
         )
         .name("i_idx".into())
-        .preprocessed_data(Box::new(reader))
+        .preprocessed_data(
+            Box::new(reader),
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        )
         .execute_uncommitted()
         .await
         .unwrap();

@@ -34,7 +34,8 @@
 //! - **DataFusion Integration**: Full ExecutionPlan compatibility
 
 mod builder;
+
 mod exec;
 
 pub use builder::MemTableScanner;
-pub use exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
+pub use exec::{FtsIndexExec, MemTableScanExec, ScalarIndexExec, VectorIndexExec};

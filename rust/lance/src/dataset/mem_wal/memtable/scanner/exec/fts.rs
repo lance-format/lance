@@ -4,6 +4,8 @@
 //! FtsIndexExec - Full-text search with MVCC visibility.
 
 use std::collections::{HashMap, hash_map::Entry};
+
+use crate::dataset::mem_wal::index::{FtsEntry, FtsMemQuery, MemMatches, SearchContext};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -119,7 +121,7 @@ impl FtsIndexExec {
         // than a narrower one.
         for column in query.columns() {
             if indexes
-                .get_fts_by_column_and_granularity(column, query.document_granularity)
+                .index_answering(column, &FtsMemQuery::probe(query.document_granularity))
                 .is_none()
             {
                 return Err(Error::invalid_input(format!(
@@ -236,7 +238,7 @@ impl FtsIndexExec {
         };
         let Some(index) = self
             .indexes
-            .get_fts_by_column_and_granularity(column, self.query.document_granularity)
+            .index_answering(column, &FtsMemQuery::probe(self.query.document_granularity))
         else {
             return Ok(vec![]);
         };
@@ -263,7 +265,24 @@ impl FtsIndexExec {
                 options = options.with_limit(limit);
             }
         }
-        let entries = index.search_with_options(&query_expr, options);
+        let query = FtsMemQuery {
+            expr: query_expr,
+            options,
+            granularity: self.query.document_granularity,
+        };
+        let ctx = SearchContext::new(self.max_readable_row.unwrap_or(u64::MAX));
+        let entries: Vec<FtsEntry> = index
+            .search(&query, &ctx)?
+            .as_ref()
+            .and_then(MemMatches::as_ranked)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| FtsEntry {
+                row_position: m.position,
+                doc_index: m.element.clone(),
+                score: m.score,
+            })
+            .collect();
 
         // Convert to (row_position, element ordinal, score) tuples.
         Ok(entries
@@ -280,24 +299,39 @@ impl FtsIndexExec {
     /// read from indexes whose tails have advanced differently still meet over
     /// one cut.
     fn query_across_columns(&self, columns: &[&str]) -> Result<Vec<FtsHit>> {
-        let mut indexes = HashMap::with_capacity(columns.len());
-        for &column in columns {
-            let Some(index) = self
+        // Each leaf is answered by the one index on its column; the tree is
+        // combined without any index taking part. So the leaves resolve through
+        // the same interface a single-column search uses, and a plugin serves
+        // one here exactly as it would on its own.
+        let _ = columns;
+        let options = SearchOptions::new().with_include_tail(self.query.include_tail);
+        let max_visible = self.max_readable_row.unwrap_or(u64::MAX);
+
+        let ctx = SearchContext::new(max_visible);
+        Ok(search_cross_column(&self.query.expr, |column, leaf| {
+            let granularity = self.query.document_granularity;
+            let index = self
                 .indexes
-                .get_fts_by_column_and_granularity(column, self.query.document_granularity)
-            else {
-                return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{column}'"
-                )));
+                .index_answering(column, &FtsMemQuery::probe(granularity))?;
+            let query = FtsMemQuery {
+                expr: leaf.clone(),
+                options: options.clone(),
+                granularity,
             };
-            indexes.insert(column, index);
-        }
-        Ok(search_cross_column(
-            &self.query.expr,
-            &indexes,
-            self.query.include_tail,
-            self.max_readable_row,
-        )?
+            let MemMatches::Ranked(ranked) = index.search(&query, &ctx).ok()?? else {
+                return None;
+            };
+            Some(
+                ranked
+                    .into_iter()
+                    .map(|m| FtsEntry {
+                        row_position: m.position,
+                        doc_index: m.element,
+                        score: m.score,
+                    })
+                    .collect(),
+            )
+        })?
         .into_iter()
         .map(|entry| (entry.row_position, entry.doc_index, entry.score))
         .collect())

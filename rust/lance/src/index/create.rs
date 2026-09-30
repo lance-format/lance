@@ -25,6 +25,7 @@ use crate::{
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::scalar::registry::TrainingCriteria;
 use lance_index::{
     IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex,
 };
@@ -41,6 +42,7 @@ use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
+use datafusion::physical_plan::SendableRecordBatchStream;
 /// Generate default index name from field path.
 ///
 /// Joins field names with `.` to create the base index name.
@@ -80,7 +82,7 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     index_uuid: Option<Uuid>,
-    preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
+    preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
@@ -134,11 +136,30 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    /// Supply already-prepared training rows, declaring the shape they are in.
+    ///
+    /// The rows go to the index's trainer untouched, so `criteria` must be what
+    /// that trainer asks for. It is checked before training rather than trusted:
+    /// a caller that promises the wrong ordering would otherwise train an index
+    /// that silently disagrees with its data.
     pub fn preprocessed_data(
-        mut self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        self,
+        reader: Box<dyn RecordBatchReader + Send + 'static>,
+        criteria: TrainingCriteria,
     ) -> Self {
-        self.preprocessed_data = Some(stream);
+        self.preprocessed_stream(lance_datafusion::utils::reader_to_stream(reader), criteria)
+    }
+
+    /// As [`Self::preprocessed_data`], for a caller that already has a stream.
+    ///
+    /// An index that holds its rows in memory hands them over without
+    /// materializing them all again first.
+    pub fn preprocessed_stream(
+        mut self,
+        stream: SendableRecordBatchStream,
+        criteria: TrainingCriteria,
+    ) -> Self {
+        self.preprocessed_data = Some((stream, criteria));
         self
     }
 
@@ -402,10 +423,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::MinHashLsh,
                 LANCE_SCALAR_INDEX,
             ) => {
-                assert!(
-                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
-                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
-                );
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
@@ -431,10 +448,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     params = scalar_params_from_inverted(inverted_params)?;
                 }
 
-                let preprocesssed_data = self
-                    .preprocessed_data
-                    .take()
-                    .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
+                let preprocesssed_data = self.preprocessed_data.take();
                 if self.index_type == IndexType::Bitmap && self.fragments.is_some() {
                     if !train {
                         return Err(Error::invalid_input(
@@ -2184,7 +2198,11 @@ mod tests {
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
             .name("id_btree".to_string())
-            .preprocessed_data(Box::new(sorted_reader))
+            .preprocessed_data(
+                Box::new(sorted_reader),
+                TrainingCriteria::new(lance_index::scalar::registry::TrainingOrdering::Values)
+                    .with_row_id(),
+            )
             .execute_uncommitted()
             .await
             .unwrap();

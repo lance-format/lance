@@ -62,7 +62,7 @@ impl FtsTraversal {
 
 /// Schema-derived form of an FTS field path.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedFtsField {
+pub struct ResolvedFtsField {
     pub final_field_id: i32,
     pub root_column: String,
     pub canonical_path: String,
@@ -73,7 +73,7 @@ pub(crate) struct ResolvedFtsField {
 
 /// One logical document extracted from a dataset row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FtsDocument {
+pub struct FtsDocument {
     pub row_index: usize,
     pub text: String,
     pub doc_index: Vec<u32>,

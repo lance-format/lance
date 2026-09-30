@@ -23,6 +23,8 @@
 //! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
 //!   key (fat node, but handles arbitrary scalar types).
 
+use std::ops::Bound;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -31,10 +33,18 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
+use lance_index::IndexType;
 use lance_index::scalar::btree::OrderableScalarValue;
+use lance_index::scalar::expression::{SargableQueryParser, ScalarQueryParser};
+use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use lance_index::scalar::{SargableQuery, compute_next_prefix};
 
 use super::RowPosition;
 use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
+use super::plugin::{
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, PrimaryKeyIndex,
+};
+use super::query::{MemMatches, MemQuery, MemSearchResult, PositionSet, SearchContext};
 
 /// Composite key for the scalar (fallback) backend.
 ///
@@ -434,6 +444,33 @@ impl FixedIntBackend {
         positions
     }
 
+    /// Positions whose value falls in `[lower, upper)`.
+    ///
+    /// Seeks to the lower bound and stops at the upper, so it touches only the
+    /// matching keys. Nulls are excluded: they sort outside every range, the
+    /// same rule the on-disk index follows.
+    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+        let low = lower.and_then(encode_scalar);
+        let high = upper.and_then(encode_scalar);
+        let mut positions = Vec::new();
+        let start = FixedKey {
+            enc: low.unwrap_or(0),
+            position: 0,
+        };
+        let walk: Box<dyn Iterator<Item = &FixedKey>> = if low.is_some() {
+            Box::new(self.reader.range_from(&start))
+        } else {
+            Box::new(self.reader.iter())
+        };
+        for key in walk {
+            if high.is_some_and(|bound| key.enc >= bound) {
+                break;
+            }
+            positions.push(key.position);
+        }
+        positions
+    }
+
     fn len(&self) -> usize {
         self.reader.len() + self.null_positions.lock().unwrap().len()
     }
@@ -630,6 +667,30 @@ impl BytesBackend {
         positions
     }
 
+    /// Positions whose value falls in `[lower, upper)`. See
+    /// [`FixedIntBackend::range`].
+    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+        let low = lower.and_then(value_bytes);
+        let high = upper.and_then(value_bytes);
+        let mut positions = Vec::new();
+        let start = BytesKey {
+            bytes: InlineBytes::new(low.unwrap_or(&[])),
+            position: 0,
+        };
+        let walk: Box<dyn Iterator<Item = &BytesKey>> = if low.is_some() {
+            Box::new(self.reader.range_from(&start))
+        } else {
+            Box::new(self.reader.iter())
+        };
+        for key in walk {
+            if high.is_some_and(|bound| key.bytes.as_slice() >= bound) {
+                break;
+            }
+            positions.push(key.position);
+        }
+        positions
+    }
+
     fn len(&self) -> usize {
         self.reader.len() + self.null_positions.lock().unwrap().len()
     }
@@ -812,6 +873,29 @@ impl ScalarBackend {
         positions
     }
 
+    /// Positions whose value falls in `[lower, upper)`. See
+    /// [`FixedIntBackend::range`].
+    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+        let mut positions = Vec::new();
+        let walk: Box<dyn Iterator<Item = &IndexKey>> = match lower {
+            Some(value) => {
+                let start = IndexKey {
+                    value: OrderableScalarValue(value.clone()),
+                    row_position: 0,
+                };
+                Box::new(self.reader.range_from(&start))
+            }
+            None => Box::new(self.reader.iter()),
+        };
+        for key in walk {
+            if upper.is_some_and(|bound| &key.value.0 >= bound) {
+                break;
+            }
+            positions.push(key.row_position);
+        }
+        positions
+    }
+
     fn len(&self) -> usize {
         self.reader.len()
     }
@@ -877,6 +961,14 @@ impl Backend {
         }
     }
 
+    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+        match self {
+            Self::FixedInt(b) => b.range(lower, upper),
+            Self::Bytes(b) => b.range(lower, upper),
+            Self::Scalar(b) => b.range(lower, upper),
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::FixedInt(b) => b.len(),
@@ -928,15 +1020,16 @@ pub struct BTreeMemIndex {
     backend: OnceLock<Backend>,
     /// Field ID this index is built on.
     field_id: i32,
-    /// Column name (for Arrow batch lookups).
-    column_name: String,
+    /// The covered column, held as a slice because that is the shape
+    /// [`MemIndex::columns`] returns.
+    columns: Vec<String>,
 }
 
 impl std::fmt::Debug for BTreeMemIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BTreeMemIndex")
             .field("field_id", &self.field_id)
-            .field("column_name", &self.column_name)
+            .field("column", &self.column_name())
             .field("len", &self.len())
             .finish()
     }
@@ -948,7 +1041,7 @@ impl BTreeMemIndex {
         Self {
             backend: OnceLock::new(),
             field_id,
-            column_name,
+            columns: vec![column_name],
         }
     }
 
@@ -982,10 +1075,13 @@ impl BTreeMemIndex {
     pub fn insert_and_report_existing(&self, batch: &RecordBatch, row_offset: u64) -> Result<bool> {
         let col_idx = batch
             .schema()
-            .column_with_name(&self.column_name)
+            .column_with_name(self.column_name())
             .map(|(idx, _)| idx)
             .ok_or_else(|| {
-                Error::invalid_input(format!("Column '{}' not found in batch", self.column_name))
+                Error::invalid_input(format!(
+                    "Column '{}' not found in batch",
+                    self.column_name()
+                ))
             })?;
 
         let column = batch.column(col_idx);
@@ -998,6 +1094,21 @@ impl BTreeMemIndex {
     /// Look up row positions for an exact value.
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
         self.backend.get().map(|b| b.get(value)).unwrap_or_default()
+    }
+
+    /// Row positions whose value falls in `[lower, upper)`, either bound open.
+    ///
+    /// Walks only the matching keys rather than the whole index, which is what
+    /// the ordered backing structure is for.
+    pub fn range(
+        &self,
+        lower: Option<&ScalarValue>,
+        upper: Option<&ScalarValue>,
+    ) -> Vec<RowPosition> {
+        self.backend
+            .get()
+            .map(|b| b.range(lower, upper))
+            .unwrap_or_default()
     }
 
     /// Get the number of entries (not unique values).
@@ -1021,7 +1132,7 @@ impl BTreeMemIndex {
 
     /// Get the column name.
     pub fn column_name(&self) -> &str {
-        &self.column_name
+        &self.columns[0]
     }
 
     /// Get a snapshot of all entries grouped by value in sorted order.
@@ -1110,15 +1221,207 @@ fn build_training_batch(
         .map_err(|e| Error::io(format!("Failed to create training batch: {}", e)))
 }
 
-/// Configuration for a BTree scalar index.
-#[derive(Debug, Clone)]
-pub struct BTreeIndexConfig {
-    /// Index name.
-    pub name: String,
-    /// Field ID the index is built on.
-    pub field_id: i32,
-    /// Column name (for Arrow batch lookups).
-    pub column: String,
+/// Answers a `SargableQuery` from the ordered map, and nothing else.
+///
+/// The B-tree is the reference scalar plugin: it takes the query types Lance
+/// already defines, so every filter shape the on-disk B-tree claims reaches
+/// this index too.
+#[async_trait::async_trait]
+impl super::plugin::MemIndex for BTreeMemIndex {
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    fn can_answer(&self, query: &dyn MemQuery) -> bool {
+        matches!(
+            query.as_any().downcast_ref::<SargableQuery>(),
+            Some(
+                SargableQuery::Equals(_)
+                    | SargableQuery::IsIn(_)
+                    | SargableQuery::Range(_, _)
+                    | SargableQuery::IsNull()
+                    | SargableQuery::LikePrefix(_)
+            )
+        )
+    }
+
+    fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+        Self::insert(self, batch, row_offset)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        Self::resident_bytes(self)
+    }
+
+    fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
+        let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
+            return Ok(None);
+        };
+
+        let positions = match query {
+            SargableQuery::Equals(value) => self.get(value),
+            SargableQuery::IsIn(values) => {
+                values.iter().flat_map(|value| self.get(value)).collect()
+            }
+            SargableQuery::Range(lower, upper) => self.bounded_range(lower, upper),
+            SargableQuery::IsNull() => match self.null_value() {
+                Some(null) => self.get(&null),
+                // Nothing has been inserted, so nothing is null.
+                None => Vec::new(),
+            },
+            SargableQuery::LikePrefix(prefix) => match self.prefix_range(prefix) {
+                Some(positions) => positions,
+                // Not a string prefix this index can turn into a range.
+                None => return Ok(None),
+            },
+            // A sorted map of whole values cannot score a text query.
+            SargableQuery::FullTextSearch(_) => return Ok(None),
+        };
+
+        let visible: PositionSet = positions
+            .into_iter()
+            .filter(|position| *position <= ctx.max_visible)
+            .collect();
+        Ok(Some(MemMatches::Filter(MemSearchResult::exact(visible))))
+    }
+
+    async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+        Ok(FlushOutcome::from_batches(Self::to_training_batches(
+            self,
+            ctx.batch_size,
+        )?))
+    }
+
+    fn as_primary_key(self: Arc<Self>) -> Option<Arc<dyn PrimaryKeyIndex>> {
+        Some(self)
+    }
+}
+
+impl PrimaryKeyIndex for BTreeMemIndex {
+    fn insert_and_report_existing(&self, batch: &RecordBatch, row_offset: u64) -> Result<bool> {
+        Self::insert_and_report_existing(self, batch, row_offset)
+    }
+
+    fn newest_visible(&self, key: &ScalarValue, max_visible: RowPosition) -> Option<RowPosition> {
+        self.get_newest_visible(key, max_visible)
+    }
+
+    fn training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
+        Self::to_training_batches(self, batch_size)
+    }
+
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+}
+
+impl BTreeMemIndex {
+    /// Positions whose value falls between `lower` and `upper`, honouring
+    /// whether each bound is inclusive.
+    ///
+    /// The backing walk is half-open, so an inclusive upper bound adds that
+    /// key's positions and an exclusive lower bound removes them. Both are one
+    /// extra point lookup, which is what the ordered structure is good at.
+    fn bounded_range(
+        &self,
+        lower: &Bound<ScalarValue>,
+        upper: &Bound<ScalarValue>,
+    ) -> Vec<RowPosition> {
+        let lower_value = match lower {
+            Bound::Included(value) | Bound::Excluded(value) => Some(value),
+            Bound::Unbounded => None,
+        };
+        let upper_value = match upper {
+            Bound::Included(value) | Bound::Excluded(value) => Some(value),
+            Bound::Unbounded => None,
+        };
+
+        let mut positions = self.range(lower_value, upper_value);
+        if let Bound::Excluded(value) = lower {
+            let excluded = self.get(value);
+            positions.retain(|position| !excluded.contains(position));
+        }
+        if let Bound::Included(value) = upper {
+            positions.extend(self.get(value));
+        }
+        positions
+    }
+
+    /// Positions whose value starts with `prefix`, or `None` when the prefix is
+    /// not a string this index can turn into a range.
+    fn prefix_range(&self, prefix: &ScalarValue) -> Option<Vec<RowPosition>> {
+        let (ScalarValue::Utf8(Some(text))
+        | ScalarValue::LargeUtf8(Some(text))
+        | ScalarValue::Utf8View(Some(text))) = prefix
+        else {
+            return None;
+        };
+        // Everything with the prefix sorts in `[prefix, next_prefix)`. Without
+        // a next prefix — the prefix is all maximal code points — everything
+        // from the prefix onwards is a match.
+        let lower = Bound::Included(prefix.clone());
+        let upper = match compute_next_prefix(text) {
+            Some(next) => Bound::Excluded(ScalarValue::Utf8(Some(next))),
+            None => Bound::Unbounded,
+        };
+        Some(self.bounded_range(&lower, &upper))
+    }
+
+    /// The typed null for this index's column, or `None` before the first
+    /// insert settles the type.
+    fn null_value(&self) -> Option<ScalarValue> {
+        let data_type = self.data_type()?;
+        ScalarValue::try_from(&data_type).ok()
+    }
+}
+
+/// Declares the built-in B-tree memtable index.
+#[derive(Debug, Default)]
+pub struct BTreeMemIndexPlugin;
+
+#[async_trait::async_trait]
+impl MemIndexPlugin for BTreeMemIndexPlugin {
+    fn name(&self) -> &str {
+        "BTree"
+    }
+
+    fn details_suffix(&self) -> &str {
+        "BTreeIndexDetails"
+    }
+
+    fn flush_index_type(&self) -> IndexType {
+        IndexType::BTree
+    }
+
+    fn training_criteria(&self) -> TrainingCriteria {
+        TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+    }
+
+    fn query_parser(
+        &self,
+        index_name: String,
+        _index_details: Option<&prost_types::Any>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        // The parser the on-disk B-tree uses, so the two claim the same
+        // expressions and a filter cannot reach one without the other.
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            "BTree".to_string(),
+            false,
+        )))
+    }
+
+    /// A B-tree falls back to per-row `ScalarValue` extraction, so it accepts
+    /// any column type the schema can hold. Existence is the only rule.
+    fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
+        ctx.single_column()?;
+        ctx.check_columns_resolve()
+    }
+
+    fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {
+        let (column, field_id) = ctx.single_column()?;
+        Ok(Arc::new(BTreeMemIndex::new(field_id, column.to_string())))
+    }
 }
 
 #[cfg(test)]
@@ -1297,6 +1600,94 @@ mod tests {
         assert_eq!(
             index.get_newest_visible(&ScalarValue::Int32(None), 10),
             Some(3)
+        );
+    }
+
+    /// A range walks only the matching keys, and both bounds behave the way the
+    /// predicate says: lower inclusive, upper exclusive.
+    #[rstest]
+    #[case::fixed_int(DataType::Int32)]
+    #[case::bytes(DataType::Utf8)]
+    fn test_range_bounds_are_half_open(#[case] data_type: DataType) {
+        let index = BTreeMemIndex::new(0, "v".to_string());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            data_type.clone(),
+            true,
+        )]));
+        // Values 0..6 in whichever type, one row each.
+        let column: ArrayRef = match data_type {
+            DataType::Int32 => Arc::new(Int32Array::from((0..6).collect::<Vec<i32>>())),
+            _ => Arc::new(StringArray::from(
+                (0..6).map(|v| format!("{v}")).collect::<Vec<_>>(),
+            )),
+        };
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let bound = |v: i32| match data_type {
+            DataType::Int32 => ScalarValue::Int32(Some(v)),
+            _ => ScalarValue::Utf8(Some(format!("{v}"))),
+        };
+
+        let mut got = index.range(Some(&bound(2)), Some(&bound(5)));
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 3, 4], "lower inclusive, upper exclusive");
+
+        let mut open_low = index.range(None, Some(&bound(2)));
+        open_low.sort_unstable();
+        assert_eq!(open_low, vec![0, 1]);
+
+        let mut open_high = index.range(Some(&bound(4)), None);
+        open_high.sort_unstable();
+        assert_eq!(open_high, vec![4, 5]);
+
+        let mut all = index.range(None, None);
+        all.sort_unstable();
+        assert_eq!(all, (0..6).collect::<Vec<u64>>());
+    }
+
+    /// Null sorts outside every range, which is what SQL says and what the
+    /// on-disk index does. The previous implementation walked a whole snapshot
+    /// and let nulls through whenever the lower bound was open.
+    #[test]
+    fn test_range_never_returns_nulls() {
+        let index = BTreeMemIndex::new(0, "v".to_string());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                None,
+                Some(5),
+            ]))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        // Positions 1 and 3 are null.
+        for (lower, upper) in [
+            (None, None),
+            (None, Some(ScalarValue::Int32(Some(10)))),
+            (Some(ScalarValue::Int32(Some(0))), None),
+        ] {
+            let got = index.range(lower.as_ref(), upper.as_ref());
+            assert!(
+                !got.contains(&1) && !got.contains(&3),
+                "a range must not answer with null rows, got {got:?}"
+            );
+        }
+
+        assert_eq!(
+            index.get(&ScalarValue::Int32(None)).len(),
+            2,
+            "nulls are still reachable by an explicit null lookup"
         );
     }
 
