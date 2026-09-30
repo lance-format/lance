@@ -670,6 +670,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+        context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
 }
 
@@ -848,6 +849,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+        context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>> {
         Box::pin(async move {
             match self.sub_index_type {
@@ -858,6 +860,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         file_metadata_cache,
                         index_cache,
                         frag_reuse_index,
+                        context,
                     )
                     .await
                 }
@@ -868,6 +871,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         file_metadata_cache,
                         index_cache,
                         frag_reuse_index,
+                        context,
                     )
                     .await
                 }
@@ -1060,6 +1064,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     fn codec() -> Option<CacheCodec> {
         super::partition_serde::partition_entry_codec::<S, Q>()
     }
+}
+
+/// What the session opening an IVF index declares about it, passed to
+/// [`IVFIndex::try_new`] and to the reconstruction from a cached
+/// [`IvfIndexState`]. The default declares nothing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IvfOpenContext {
+    /// The origin latency class the session declares for the IVF_RQ indexes
+    /// it opens (`Session::index_origin_latency`), `None` when it declares
+    /// none; see [`IVFIndex::origin_latency_at_open`].
+    pub(crate) origin_latency_hint: Option<OriginLatencyClass>,
 }
 
 /// IVF Index.
@@ -1558,6 +1573,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Create a new IVF index.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
         index_dir: Path,
@@ -1566,9 +1582,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
+        context: IvfOpenContext,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
-        let origin_latency = Self::origin_latency_at_open(&object_store)?;
+        let origin_latency =
+            Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
         let origin_block_size = object_store.block_size() as u64;
         let uuid_str = uuid.to_string();
         let aux_path = index_dir
@@ -1761,16 +1779,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         })
     }
 
-    /// The origin latency class of an index opened on `object_store`. Only
-    /// IVF_RQ indexes read (and validate) `LANCE_RQ_ORIGIN_LATENCY`; any other
-    /// index takes the class of its store.
-    fn origin_latency_at_open(object_store: &ObjectStore) -> Result<OriginLatencyClass> {
-        let setting = if Q::quantization_type() == QuantizationType::Rabit {
-            origin_latency_setting()?
-        } else {
-            None
-        };
-        Ok(OriginLatencyClass::resolve(setting, object_store))
+    /// The origin latency class of an index opened on `object_store` by a
+    /// session that declares `hint`. Only IVF_RQ indexes read (and validate)
+    /// `LANCE_RQ_ORIGIN_LATENCY` and take the hint, the setting first (see
+    /// [`OriginLatencyClass::resolve_with_hint`]); any other index takes the
+    /// class of its store, since no reader policy of theirs depends on it.
+    fn origin_latency_at_open(
+        object_store: &ObjectStore,
+        hint: Option<OriginLatencyClass>,
+    ) -> Result<OriginLatencyClass> {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return Ok(OriginLatencyClass::of_store(object_store));
+        }
+        Ok(OriginLatencyClass::resolve_with_hint(
+            origin_latency_setting()?,
+            hint,
+            object_store,
+        ))
     }
 
     /// Latency class of reads from the index's files, resolved when the index
@@ -3583,9 +3608,11 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+    context: IvfOpenContext,
 ) -> Result<Arc<dyn VectorIndex>> {
     let io_parallelism = object_store.io_parallelism();
-    let origin_latency = IVFIndex::<S, Q>::origin_latency_at_open(&object_store)?;
+    let origin_latency =
+        IVFIndex::<S, Q>::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
     let origin_block_size = object_store.block_size() as u64;
 
     let index_path = Path::parse(&state.index_file_path)
@@ -3698,7 +3725,8 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::v2::{
-        IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
+        IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfOpenContext, IvfPq, IvfStateEntryBox,
+        PartitionEntry,
     };
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
@@ -8763,7 +8791,8 @@ mod tests {
         }
 
         /// `auto` makes cloud object stores class high and local files and
-        /// memory class low; an explicit class applies to every store.
+        /// memory class low, unless the session declares a class; an explicit
+        /// class applies to every store, whatever the session declares.
         #[test]
         fn test_origin_latency_class_resolves_by_store() {
             let s3 = ObjectStore::new(
@@ -8785,12 +8814,29 @@ mod tests {
                 let scheme = store.scheme().to_string();
                 assert_eq!(OriginLatencyClass::of_store(&store), auto, "{scheme}");
                 assert_eq!(OriginLatencyClass::resolve(None, &store), auto, "{scheme}");
+                assert_eq!(
+                    OriginLatencyClass::resolve_with_hint(None, None, &store),
+                    auto,
+                    "{scheme}"
+                );
                 for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
                     assert_eq!(
                         OriginLatencyClass::resolve(Some(class), &store),
                         class,
                         "{scheme}"
                     );
+                    assert_eq!(
+                        OriginLatencyClass::resolve_with_hint(None, Some(class), &store),
+                        class,
+                        "{scheme} hint={class}"
+                    );
+                    for hint in [OriginLatencyClass::Low, OriginLatencyClass::High] {
+                        assert_eq!(
+                            OriginLatencyClass::resolve_with_hint(Some(class), Some(hint), &store),
+                            class,
+                            "{scheme} setting={class} hint={hint}"
+                        );
+                    }
                 }
             }
         }
@@ -8829,6 +8875,141 @@ mod tests {
             let reconstructed = lazy_index(&reopened);
             assert_eq!(reconstructed.origin_latency(), expected);
             assert_eq!(reconstructed.storage.origin_latency(), expected);
+        }
+
+        /// A session's origin latency hint is the class of the IVF_RQ indexes
+        /// it opens, when they open and when they are reconstructed from the
+        /// cached state, and residency, the lazy origin gap and the promotion
+        /// policy follow it. Without a hint an index takes its store's class,
+        /// low for the test's local files, and an IVF_PQ index the session
+        /// opens keeps its store's class whatever the hint. Results do not
+        /// depend on the class. A class the environment sets overrides every
+        /// hint, so the hint takes effect only where it sets none.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_session_origin_latency_hint_reaches_rq_index() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let rq_dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(rq_dir.as_str(), 7, DistanceType::L2).await;
+            let pq_dir = TempStrDir::default();
+            let (mut pq_dataset, _) =
+                generate_test_dataset::<Float32Type>(pq_dir.as_str(), 0.0..1.0).await;
+            let pq_params = VectorIndexParams::with_ivf_pq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS),
+                lightweight_pq_params(),
+            );
+            pq_dataset
+                .create_index(&["vector"], IndexType::Vector, None, &pq_params, true)
+                .await
+                .unwrap();
+
+            let setting = origin_latency_setting().unwrap();
+            let lazy_setting = LayeredLazyConfig::from_env().unwrap();
+            let resident_setting = resident_columns_setting().unwrap();
+            let vectors = batch["vector"].as_fixed_size_list();
+            let queries = [
+                lazy_test_query(vectors.value(0), 10, 8),
+                lazy_test_query(vectors.value(777), 100, LAZY_PARTITIONS),
+            ];
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let lazy = LayeredLazyConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let mut first_results = vec![None; queries.len()];
+            for hint in [
+                Some(OriginLatencyClass::High),
+                Some(OriginLatencyClass::Low),
+                None,
+            ] {
+                let session = Arc::new(
+                    Session::new(
+                        LAZY_LARGE_CACHE_BYTES,
+                        LAZY_METADATA_CACHE_BYTES,
+                        Arc::new(ObjectStoreRegistry::default()),
+                    )
+                    .with_index_origin_latency(hint),
+                );
+                let dataset = crate::DatasetBuilder::from_uri(rq_dir.as_str())
+                    .with_session(session.clone())
+                    .load()
+                    .await
+                    .unwrap();
+                let store_class = OriginLatencyClass::of_store(&dataset.object_store);
+                assert_eq!(store_class, OriginLatencyClass::Low);
+                let expected = setting.or(hint).unwrap_or(store_class);
+                let block_size = dataset.object_store.block_size() as u64;
+                let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+                let opened = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+                let state_key =
+                    crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
+                assert!(
+                    dataset.index_cache.get_with_key(&state_key).await.is_some(),
+                    "the reopen must reconstruct from the cached state"
+                );
+                let reconstructed = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                for (path, index) in [("open", &opened), ("reconstruct", &reconstructed)] {
+                    let context = format!("hint={hint:?} {path}");
+                    let ivf = lazy_index(index);
+                    assert_eq!(ivf.origin_latency(), expected, "{context}");
+                    assert_eq!(ivf.storage.origin_latency(), expected, "{context}");
+                    assert_eq!(
+                        ivf.resident_columns_enabled(),
+                        resident_setting.resolve(expected),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        ivf.lazy_origin_gap_bytes(),
+                        lazy_setting.origin_gap.resolve(expected, block_size),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        ivf.layered_lazy_config().promote,
+                        lazy_setting.promote.resolve(expected),
+                        "{context}"
+                    );
+                    for (position, query) in queries.iter().enumerate() {
+                        let context = format!("{context} query={position}");
+                        assert_lazy_matches_eager(index, query, &filter, lazy, &context).await;
+                        let eager = search_global(index, query, filter.clone()).await.unwrap();
+                        let bits = result_bits(&eager);
+                        let first = first_results[position].get_or_insert_with(|| bits.clone());
+                        assert_eq!(&bits, first, "{context}");
+                    }
+                }
+
+                let pq = crate::DatasetBuilder::from_uri(pq_dir.as_str())
+                    .with_session(session)
+                    .load()
+                    .await
+                    .unwrap();
+                let pq_class = OriginLatencyClass::of_store(&pq.object_store);
+                let pq_uuid = pq.load_indices().await.unwrap()[0].uuid;
+                let pq_frag_reuse_uuid = pq.frag_reuse_index_uuid().await;
+                let pq_state_key =
+                    crate::index::IvfIndexStateCacheKey::new(&pq_uuid, pq_frag_reuse_uuid.as_ref());
+                for path in ["open", "reconstruct"] {
+                    let cached = pq.index_cache.get_with_key(&pq_state_key).await.is_some();
+                    assert_eq!(cached, path == "reconstruct", "hint={hint:?} {path}");
+                    let index = pq
+                        .open_vector_index("vector", &pq_uuid, &NoOpMetricsCollector)
+                        .await
+                        .unwrap();
+                    let ivf_pq = index
+                        .as_any()
+                        .downcast_ref::<IvfPq>()
+                        .expect("IVF_PQ index");
+                    assert_eq!(ivf_pq.origin_latency(), pq_class, "hint={hint:?} {path}");
+                }
+            }
+            wait_for_promotions().await;
         }
 
         /// A plane's tier follows where the backend holds it: RAM, then only
@@ -8883,6 +9064,7 @@ mod tests {
                 &dataset.metadata_cache,
                 dataset.index_cache.for_index(&index.uuid, None),
                 index.file_size_map(),
+                IvfOpenContext::default(),
             )
             .await
             .unwrap()
@@ -10173,6 +10355,7 @@ mod tests {
                 &dataset.metadata_cache,
                 dataset.index_cache.for_index(&index.uuid, None),
                 index.file_size_map(),
+                IvfOpenContext::default(),
             )
             .await
             .unwrap()
@@ -11189,6 +11372,7 @@ mod tests {
                 &dataset.metadata_cache,
                 dataset.index_cache.for_index(&index.uuid, None),
                 index.file_size_map(),
+                IvfOpenContext::default(),
             )
             .await
             .unwrap()

@@ -74,7 +74,7 @@ use vector::details::{
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
-use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
+use vector::ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -3038,6 +3038,11 @@ impl DatasetIndexInternalExt for Dataset {
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let object_store = self.object_store_for_index(&index_meta).await?;
+        // What the session declares about the index, for whichever IVF open
+        // or reconstruction below runs.
+        let open_context = IvfOpenContext {
+            origin_latency_hint: self.session.index_origin_latency(),
+        };
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -3052,6 +3057,7 @@ impl DatasetIndexInternalExt for Dataset {
                     self.metadata_cache.as_ref(),
                     partition_cache,
                     frag_reuse_index,
+                    open_context,
                 )
                 .await;
         }
@@ -3184,6 +3190,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3197,6 +3204,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3216,6 +3224,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3230,6 +3239,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3244,6 +3254,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3259,6 +3270,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3272,6 +3284,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3287,6 +3300,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3301,6 +3315,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))

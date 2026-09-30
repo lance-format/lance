@@ -885,11 +885,14 @@ fn sequential_plane_loads_from(value: Option<&str>) -> Result<bool> {
 }
 
 /// Latency class of an IVF_RQ index's origin reads, those that no cache tier
-/// serves: `auto` (default), `low` or `high`. `auto` is high for a cloud
-/// object store ([`ObjectStore::is_cloud`]) and low for local files and
-/// memory. A store whose reads a local cache serves anyway, such as an object
-/// store wrapped in a page cache that also caches index files, should set
-/// `low`. Read once per process; the class is resolved when an index opens.
+/// serves: `auto` (default), `low` or `high`. `auto` takes the class the
+/// session opening the index declares, and without one the class of its
+/// object store: high for a cloud object store ([`ObjectStore::is_cloud`]) and
+/// low for local files and memory. A process whose object store is wrapped in
+/// a local cache that also caches index files declares `low` on its session
+/// instead, since the wrapper hides that from the store's scheme; `low` or
+/// `high` here overrides every session. Read once per process; the class is
+/// resolved when an index opens, see [`OriginLatencyClass::resolve_with_hint`].
 pub const ORIGIN_LATENCY_ENV: &str = "LANCE_RQ_ORIGIN_LATENCY";
 
 /// How slow an index's origin reads are. Reader policies that trade extra
@@ -915,9 +918,27 @@ impl OriginLatencyClass {
     }
 
     /// The class of an index read from `object_store` under `setting`, the
-    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`.
+    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, when no session
+    /// declares one.
     pub fn resolve(setting: Option<Self>, object_store: &ObjectStore) -> Self {
-        setting.unwrap_or_else(|| Self::of_store(object_store))
+        Self::resolve_with_hint(setting, None, object_store)
+    }
+
+    /// The class of an index read from `object_store` under `setting`, the
+    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, opened by a
+    /// session that declares `hint` for the indexes it opens (`None` when it
+    /// declares none). An explicit setting wins over the hint, and the hint
+    /// over the store's own class ([`Self::of_store`]): only the serving
+    /// process knows whether a wrapper around the store serves index reads
+    /// from a local cache.
+    pub fn resolve_with_hint(
+        setting: Option<Self>,
+        hint: Option<Self>,
+        object_store: &ObjectStore,
+    ) -> Self {
+        setting
+            .or(hint)
+            .unwrap_or_else(|| Self::of_store(object_store))
     }
 
     /// The knob's spelling of the class: `low` or `high`.
@@ -2797,6 +2818,7 @@ mod tests {
     use lance_core::Error;
     use lance_core::cache::CacheTier;
     use lance_core::deepsize::DeepSizeOf;
+    use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
@@ -3445,6 +3467,42 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains(ORIGIN_LATENCY_ENV), "{error}");
             assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    /// An explicit setting wins over a session's hint, and the hint over the
+    /// class of the store, low for local files and memory; without a hint the
+    /// class resolves as [`OriginLatencyClass::resolve`] resolves it. Lance's
+    /// IVF tests cover a cloud store, which needs a URL to build.
+    #[test]
+    fn test_origin_latency_resolve_with_hint() {
+        let classes = [
+            None,
+            Some(OriginLatencyClass::Low),
+            Some(OriginLatencyClass::High),
+        ];
+        for store in [ObjectStore::local(), ObjectStore::memory()] {
+            let scheme = store.scheme().to_string();
+            let auto = OriginLatencyClass::of_store(&store);
+            assert_eq!(auto, OriginLatencyClass::Low, "{scheme}");
+            for setting in classes {
+                assert_eq!(
+                    OriginLatencyClass::resolve_with_hint(setting, None, &store),
+                    OriginLatencyClass::resolve(setting, &store),
+                    "{scheme} setting={setting:?}"
+                );
+                for hint in classes {
+                    let expected = match (setting, hint) {
+                        (Some(class), _) | (None, Some(class)) => class,
+                        (None, None) => auto,
+                    };
+                    assert_eq!(
+                        OriginLatencyClass::resolve_with_hint(setting, hint, &store),
+                        expected,
+                        "{scheme} setting={setting:?} hint={hint:?}"
+                    );
+                }
+            }
         }
     }
 
