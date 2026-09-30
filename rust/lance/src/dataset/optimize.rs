@@ -2770,7 +2770,9 @@ async fn rewrite_files(
                 Some(planned) => {
                     place_planned_row_lineage(dataset.as_ref(), &mut new_fragments, planned).await?
                 }
-                None => rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &fragments).await?,
+                None => {
+                    rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &fragments).await?
+                }
             }
         }
 

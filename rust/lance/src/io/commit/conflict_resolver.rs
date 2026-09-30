@@ -22,8 +22,8 @@ use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
-use lance_table::transaction::TaggedRewriteAssembly;
 use lance_table::system_index::is_system_index;
+use lance_table::transaction::TaggedRewriteAssembly;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -5537,6 +5537,12 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                current_lineage: None,
+                current_live: None,
+                current_schema: None,
+                read_fragments: None,
+                read_schema: None,
+                reuse: Default::default(),
             };
             // Disjoint from the rewritten fragment, so this only exercises the
             // stable-row-ids check and not the group-straddling check below it.
