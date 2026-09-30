@@ -58,7 +58,7 @@ use crate::vector::bq::transform::{
     SCALE_FACTORS_COLUMN,
 };
 use crate::vector::bq::{
-    RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
+    RQRotationType, layered_stats, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
     validate_rq_num_bits,
 };
 use crate::vector::graph::{OrderedFloat, OrderedNode};
@@ -726,6 +726,15 @@ impl RabitQuantizationStorage {
             return Err(Error::invalid_input(
                 "RabitQ low plane requires layered metadata",
             ));
+        }
+        // Codes a file stores unpacked or in the legacy sequential ex layout
+        // are rewritten below on every construction, including each one
+        // from a cache entry that kept them as stored.
+        let repacks_ex = ex_bits != 0
+            && scope == PlaneScope::All
+            && repacks_sequential_ex_codes(&batch, rotated_dim, ex_bits);
+        if !metadata.packed || repacks_ex {
+            layered_stats::counters().storage_construct_repacks.incr();
         }
         if ex_bits != 0 && scope == PlaneScope::SignOnlyForFull {
             // The ex planes are gathered per query; see `ExRows`.
@@ -2838,6 +2847,23 @@ fn maybe_pack_ex_codes(
     }
 }
 
+/// Whether legacy sequential ex-code rows of `seq_codes`' width are already
+/// in the blocked layout, so they are used as stored.
+fn sequential_rows_are_blocked(seq_codes: &FixedSizeListArray, dim: usize, ex_bits: u8) -> bool {
+    sequential_matches_blocked(ex_bits)
+        && seq_codes.value_length() as usize == blocked_ex_code_bytes(dim, ex_bits)
+}
+
+/// Whether loading the ex codes of `batch` repacks rows: it holds only the
+/// legacy sequential column, in a layout the blocked one does not match.
+fn repacks_sequential_ex_codes(batch: &RecordBatch, dim: usize, ex_bits: u8) -> bool {
+    batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_none()
+        && batch
+            .column_by_name(RABIT_EX_CODE_COLUMN)
+            .and_then(|codes| codes.as_fixed_size_list_opt())
+            .is_some_and(|codes| !sequential_rows_are_blocked(codes, dim, ex_bits))
+}
+
 /// Bring legacy sequential ex codes into the blocked kernel layout: rows are
 /// repacked, except for the widths whose layouts agree byte-for-byte (then
 /// the column is used as stored).
@@ -2846,9 +2872,7 @@ fn blocked_ex_codes_from_sequential(
     dim: usize,
     ex_bits: u8,
 ) -> Result<FixedSizeListArray> {
-    if sequential_matches_blocked(ex_bits)
-        && seq_codes.value_length() as usize == blocked_ex_code_bytes(dim, ex_bits)
-    {
+    if sequential_rows_are_blocked(seq_codes, dim, ex_bits) {
         return Ok(seq_codes.clone());
     }
     let seq_code_len = seq_codes.value_length() as usize;
@@ -5917,6 +5941,67 @@ mod tests {
             64
         );
         assert!(stored_batch.column_by_name(ERROR_FACTORS_COLUMN).is_some());
+    }
+
+    /// A storage built from codes stored packed and blocked, as the index
+    /// builder writes them and cache entries keep them, uses them as stored.
+    /// Unpacked sign codes and sequential ex codes are rewritten, and
+    /// counted, on every construction.
+    #[test]
+    fn test_storage_construct_does_not_repack() {
+        const ROWS: usize = 50;
+        const CONSTRUCTIONS: u64 = 3;
+        // 6 ex bits: the sequential and blocked row layouts differ.
+        const NUM_BITS: u8 = 7;
+        let codes = make_test_codes(ROWS, 64);
+        let code_dim = codes.value_length() as usize * 8;
+        let ex_bits = rabit_ex_bits(NUM_BITS).unwrap();
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = NUM_BITS;
+        assert!(!metadata.packed);
+        let file_batch =
+            make_test_batch_with_ex(codes, make_test_ex_codes(ROWS, code_dim, NUM_BITS));
+        assert!(repacks_sequential_ex_codes(&file_batch, code_dim, ex_bits));
+
+        let repacks = || layered_stats::counters().storage_construct_repacks.get();
+        let before = repacks();
+        let construct = |batch: &RecordBatch, metadata: &RabitQuantizationMetadata| {
+            RabitQuantizationStorage::try_from_batch(
+                batch.clone(),
+                metadata,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap()
+        };
+        for _ in 1..CONSTRUCTIONS {
+            construct(&file_batch, &metadata);
+        }
+        let storage = construct(&file_batch, &metadata);
+        // Other tests construct storages concurrently: only a lower bound holds.
+        assert!(repacks() - before >= CONSTRUCTIONS);
+
+        let cached = storage.to_batches().unwrap().next().unwrap();
+        assert!(storage.metadata().packed);
+        assert!(!repacks_sequential_ex_codes(&cached, code_dim, ex_bits));
+        let rebuilt = construct(&cached, storage.metadata());
+        let rebuilt_batch = rebuilt.to_batches().unwrap().next().unwrap();
+        assert_eq!(rebuilt_batch, cached);
+        for column in [RABIT_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_COLUMN] {
+            let values_ptr = |batch: &RecordBatch| {
+                batch[column]
+                    .as_fixed_size_list()
+                    .values()
+                    .to_data()
+                    .buffers()[0]
+                    .as_ptr()
+            };
+            assert_eq!(
+                values_ptr(&rebuilt_batch),
+                values_ptr(&cached),
+                "{column} was rewritten"
+            );
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod layered_stats;
 mod lazy_tests;
 mod plane_cache;
 pub mod prune;
+pub mod raw_body;
 pub mod resident;
 pub mod rotation;
 pub mod storage;
