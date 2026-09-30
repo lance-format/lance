@@ -729,6 +729,48 @@ impl DatasetMemWalExt for Dataset {
     }
 }
 
+impl ShardWriter {
+    /// [`ShardWriter::evolve_schema`] to `dataset`'s current schema and
+    /// maintained index set, derived the way [`DatasetMemWalExt::mem_wal_writer`]
+    /// derives them when it opens a writer.
+    ///
+    /// `dataset` is the base table this writer's shard belongs to, read after
+    /// the schema change.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::mem_wal::ShardWriter;
+    /// # async fn doc(writer: &ShardWriter, dataset: &Dataset) -> Result<()> {
+    /// writer.evolve_to(dataset).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<()> {
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let mem_wal_index = dataset
+            .open_mem_wal_index(&NoOpMetricsCollector)
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "MemWAL is not initialized on the dataset this writer evolves to",
+                )
+            })?;
+        let index_configs = build_index_configs(
+            dataset,
+            &mem_wal_index.details.maintained_indexes,
+            &self.config().hnsw_params,
+            OnMissingIndex::Skip,
+        )
+        .await?;
+        self.evolve_schema(
+            Arc::new(super::arrow_schema_with_field_ids(dataset.schema())),
+            index_configs,
+        )
+        .await
+    }
+}
+
 /// Whether an index the set names but the dataset does not have is fatal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OnMissingIndex {

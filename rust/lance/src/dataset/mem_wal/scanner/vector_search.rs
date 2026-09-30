@@ -28,7 +28,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, filter_above, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
@@ -604,27 +604,74 @@ impl LsmVectorSearchPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-                // Supply PKs so the memtable scanner can choose HNSW for
-                // append-only data and exact newest-before-top-k search when
-                // PK rewrites or filters make stale suppression necessary.
-                scanner.with_pk_columns(self.pk_columns.clone());
                 // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                if let Some(ref filter) = self.filter {
-                    // Routed to filtered brute-force (see `plan_vector_search`):
-                    // the predicate masks rows before the memtable top-k cut.
-                    scanner.filter_expr(filter.clone());
+
+                if memtable_matches_table(schema, &self.identity_schema) {
+                    // Supply PKs so the memtable scanner can choose HNSW for
+                    // append-only data and exact newest-before-top-k search when
+                    // PK rewrites or filters make stale suppression necessary.
+                    scanner.with_pk_columns(self.pk_columns.clone());
+                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    if let Some(ref filter) = self.filter {
+                        // Routed to filtered brute-force (see `plan_vector_search`):
+                        // the predicate masks rows before the memtable top-k cut.
+                        scanner.filter_expr(filter.clone());
+                    }
+                    scanner.nearest(&self.vector_column, query_vector, k)?;
+                    scanner.distance_range(self.distance_range.0, self.distance_range.1);
+                    scanner.nprobes(nprobes);
+                    scanner.distance_metric(self.distance_type);
+                    if let Some(ef) = self.ef {
+                        scanner.ef(ef);
+                    }
+                    return scanner.create_plan().await;
                 }
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+
+                // Created before a schema change, so it is asked under the
+                // names it holds and resolved as the sealed-generation arm
+                // above resolves a generation.
+                let mut generation = GenerationRead::for_memtable(
+                    schema,
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    cols,
+                );
+                let Some(vector_column) = generation.stored_name(&self.vector_column) else {
+                    // Created before the searched column existed: no candidates.
+                    return self.empty_plan(projection);
+                };
+                let vector_column = vector_column.to_string();
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
+                scanner.with_pk_columns(generation.stored_pk_columns()?);
+                scanner.project(&generation.stored_projection())?;
+                if let Some(stored) = stored_filter {
+                    scanner.filter_expr(stored);
+                }
+                // A predicate that runs above the resolution runs after the
+                // top-k, so this arm ranks every row it holds exactly -- the
+                // graph would cut to its own beam first -- and leaves the cut to
+                // the filter and the union.
+                let k = match above {
+                    None => k,
+                    Some(_) => {
+                        scanner.use_index(false);
+                        batch_store.total_rows().max(1)
+                    }
+                };
+                scanner.nearest(&vector_column, query_vector, k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                scanner.create_plan().await
+                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
+                match &above {
+                    Some(expr) => filter_above(reconciled, expr),
+                    None => Ok(reconciled),
+                }
             }
         }
     }
