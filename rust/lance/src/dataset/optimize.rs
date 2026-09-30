@@ -7573,7 +7573,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         let msg = err.to_string();
-        assert!(msg.contains("fragment-reuse index"), "{msg}");
+        assert!(msg.contains("fragment reuse index"), "{msg}");
 
         // An address-domain index is still allowed: the FRI repairs it.
         dataset
