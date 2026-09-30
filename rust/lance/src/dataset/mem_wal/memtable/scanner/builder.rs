@@ -1383,7 +1383,7 @@ impl MemTableScanner {
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::index::MemIndexSpec;
-    use arrow_array::{BooleanArray, Int32Array, StringArray};
+    use arrow_array::{BooleanArray, Float64Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     fn create_test_schema() -> SchemaRef {
@@ -2876,5 +2876,48 @@ mod tests {
         let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
         scanner.filter("id >= 4 AND name = 'name_5'").unwrap();
         assert_eq!(scan_ids(&scanner.try_into_batch().await.unwrap()), vec![5]);
+    }
+
+    /// Null is not below any number. The generic B-tree backend (the one
+    /// floats land in) sorts null keys first, so an open lower bound walks
+    /// straight into them unless it skips them.
+    #[rstest::rstest]
+    #[case::less_than("value < 2.0")]
+    #[case::at_most("value <= 2.0")]
+    #[tokio::test]
+    async fn an_open_lower_bound_on_a_float_index_excludes_nulls(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let indexes = IndexStore::from_specs(
+            &[MemIndexSpec::btree("value_idx", 0, "value")],
+            &lance_schema,
+            100,
+            16,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(vec![
+                None,
+                Some(1.0),
+                Some(3.0),
+            ]))],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.filter(filter).unwrap();
+        let got = scanner.try_into_batch().await.unwrap();
+        assert_eq!(got.num_rows(), 1, "only 1.0 matches {filter}");
+        assert_eq!(got["value"].null_count(), 0);
     }
 }

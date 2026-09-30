@@ -885,7 +885,9 @@ impl ScalarBackend {
                 };
                 Box::new(self.reader.range_from(&start))
             }
-            None => Box::new(self.reader.iter()),
+            // Null keys sort first here, and a null is in no range, so an open
+            // lower bound starts past them.
+            None => Box::new(self.reader.iter().skip_while(|key| key.value.0.is_null())),
         };
         for key in walk {
             if upper.is_some_and(|bound| &key.value.0 >= bound) {
