@@ -173,6 +173,10 @@ layered_lazy_counters! {
         origin_sparse_requests,
         /// Bytes those requests read, the gaps they span included.
         origin_sparse_bytes,
+        /// Rows those reads gathered, which the gap does not change. Over one
+        /// plane, `origin_sparse_bytes / (origin_sparse_rows * row width)` is
+        /// the byte amplification of the gap.
+        origin_sparse_rows,
         /// Sum over gathered probes of probes still unscored at issue.
         staleness_sum,
         /// Issues deferred because the heap was not yet full at the gate.

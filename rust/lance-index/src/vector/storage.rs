@@ -2537,9 +2537,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Read the sorted partition offsets `rows` of ex plane `plane` from the
     /// origin file for a sparse gather, merging row runs within `config`'s
     /// origin gap for the index's origin, and count the read's requests and
-    /// bytes after coalescing. A first-use load of the resident store that
-    /// the read starts is not counted; its I/O, like the read's, is added to
-    /// `io_stats`.
+    /// bytes after coalescing and the rows it gathers. A first-use load of the
+    /// resident store that the read starts is not counted; its I/O, like the
+    /// read's, is added to `io_stats`.
     async fn read_origin_rows(
         &self,
         part_id: usize,
@@ -2563,6 +2563,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let stats = layered_stats::counters();
         stats.origin_sparse_requests.add(read.iops);
         stats.origin_sparse_bytes.add(read.bytes_read);
+        stats.origin_sparse_rows.add(rows.len() as u64);
         if let Some(io_stats) = io_stats {
             io_stats.add_scan_stats(&read);
         }
@@ -3141,12 +3142,13 @@ mod tests {
         let defaults = LayeredLazyConfig::default();
         assert_eq!(defaults.origin_gap, LazyOriginGap::Auto);
         assert_eq!(parse(" auto ").unwrap(), LazyOriginGap::Auto);
-        assert_eq!(parse("0").unwrap(), LazyOriginGap::Bytes(0));
-        assert_eq!(
-            parse(&u64::MAX.to_string()).unwrap(),
-            LazyOriginGap::Bytes(u64::MAX)
-        );
-        for value in ["max", "AUTO", "64k", "-1", ""] {
+        for bytes in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
+            assert_eq!(
+                parse(&bytes.to_string()).unwrap(),
+                LazyOriginGap::Bytes(bytes)
+            );
+        }
+        for value in ["max", "AUTO", "64k", "256k", "-1", ""] {
             let error = parse(value).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             let message = error.to_string();
@@ -3166,7 +3168,7 @@ mod tests {
             classes.map(|class| LazyOriginGap::Auto.resolve(class, block_size)),
             [block_size, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES]
         );
-        for bytes in [0, 64 * 1024, u64::MAX] {
+        for bytes in [0, 64 * 1024, 256 * 1024, u64::MAX] {
             let gap = LazyOriginGap::Bytes(bytes);
             assert_eq!(
                 classes.map(|class| gap.coalesce_gap(class)),

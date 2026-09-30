@@ -4226,7 +4226,7 @@ mod tests {
         let (baseline, _) = read_ranges_with_gap(&file_reader, &ranges, None).await;
         assert_eq!(baseline.columns(), expected.columns());
         let mut requests = Vec::new();
-        for gap in [0, 64 * 1024, 1024 * 1024, u64::MAX] {
+        for gap in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
             let (batch, gap_requests) =
                 read_ranges_with_gap(&file_reader, &ranges, Some(gap)).await;
             assert_eq!(batch, baseline, "gap={gap}");

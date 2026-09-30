@@ -10662,11 +10662,18 @@ mod tests {
             assert_eq!(store.loaded_bytes(), loaded);
         }
 
-        /// Gaps that coalesced origin reads are checked at: touching ranges
-        /// only, V11's S3 block size, the gap `auto` gives a high-latency
-        /// origin, and every range of a column page.
-        const COALESCE_TEST_GAPS: [u64; 4] =
-            [0, 64 * 1024, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES, u64::MAX];
+        /// Gaps that coalesced origin reads are checked at, in ascending
+        /// order so that neighbours compare a narrower gap with a wider one:
+        /// touching ranges only, V11's S3 block size, a narrower gap for a
+        /// high-latency origin, the gap `auto` gives one, and every range of
+        /// a column page.
+        const COALESCE_TEST_GAPS: [u64; 5] = [
+            0,
+            64 * 1024,
+            256 * 1024,
+            HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
+            u64::MAX,
+        ];
         /// Spacing of the single rows of a sparse selection.
         const COALESCE_TEST_ROW_STEP: usize = 41;
 
@@ -10685,6 +10692,7 @@ mod tests {
         async fn test_layered_read_plane_matches_across_coalesce_gaps(
             #[case] version: LanceFileVersion,
         ) {
+            assert!(COALESCE_TEST_GAPS.is_sorted(), "{COALESCE_TEST_GAPS:?}");
             let _serial = LAZY_TEST_LOCK.lock().await;
             let dir = TempStrDir::default();
             write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
@@ -10779,10 +10787,10 @@ mod tests {
 
         /// The lazy scan returns the eager results whatever gap its sparse
         /// reads of the origin file merge row runs within, whether it reads
-        /// every plane by selected rows or chooses by cost. Reading the same
-        /// rows, a wider gap makes no more origin requests, for no fewer
-        /// bytes, and `auto` on a high-latency origin reads as
-        /// [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] does.
+        /// every plane by selected rows or chooses by cost. Every gap counts
+        /// the same origin rows, and reading them, a wider gap makes no more
+        /// origin requests, for no fewer bytes; `auto` on a high-latency
+        /// origin reads as [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] does.
         #[rstest]
         #[case::rq7_l2(7, DistanceType::L2)]
         #[case::rq9_dot(9, DistanceType::Dot)]
@@ -10791,6 +10799,7 @@ mod tests {
             #[case] bits: u8,
             #[case] distance_type: DistanceType,
         ) {
+            assert!(COALESCE_TEST_GAPS.is_sorted(), "{COALESCE_TEST_GAPS:?}");
             let _serial = LAZY_TEST_LOCK.lock().await;
             let dir = TempStrDir::default();
             let (_, batch) = write_lazy_test_dataset(dir.as_str(), bits, distance_type).await;
@@ -10834,16 +10843,25 @@ mod tests {
             }
 
             let label = format!("{distance_type:?} bits={bits}");
-            let (mut requests, mut bytes) = (Vec::new(), Vec::new());
+            let mut reads = Vec::with_capacity(COALESCE_TEST_GAPS.len());
             for gap in COALESCE_TEST_GAPS {
-                let (gap_requests, gap_bytes) =
-                    origin_sparse_reads(&index, &queries, LazyOriginGap::Bytes(gap), &label).await;
-                requests.push(gap_requests);
-                bytes.push(gap_bytes);
+                reads.push(
+                    origin_sparse_reads(&index, &queries, LazyOriginGap::Bytes(gap), &label).await,
+                );
             }
+            let requests = reads.iter().map(|read| read.requests).collect::<Vec<_>>();
+            let bytes = reads.iter().map(|read| read.bytes).collect::<Vec<_>>();
+            let rows = reads.iter().map(|read| read.rows).collect::<Vec<_>>();
+            // Every gap gathers the same rows, so the rows counted are the
+            // denominator of each gap's byte amplification.
+            let context = format!("{label} requests={requests:?} bytes={bytes:?} rows={rows:?}");
+            assert!(rows[0] > 0, "{context}");
+            assert!(
+                rows.iter().all(|&gap_rows| gap_rows == rows[0]),
+                "{context}"
+            );
             // Gap 0 merges only touching row runs, and `u64::MAX` every run
             // of a read.
-            let context = format!("{label} requests={requests:?} bytes={bytes:?}");
             assert!(
                 requests.windows(2).all(|pair| pair[1] <= pair[0]),
                 "{context}"
@@ -10875,21 +10893,34 @@ mod tests {
                 &label,
             )
             .await;
-            assert!(auto.0 > 0, "{label}: {auto:?}");
+            assert!(auto.requests > 0, "{label}: {auto:?}");
             assert_eq!(auto, fixed, "{label}");
+            assert_eq!(auto.rows, rows[0], "{label}: {auto:?}");
         }
 
-        /// The origin requests and bytes of the lazy scan's sparse reads over
-        /// `queries` on `index` with `origin_gap`, each query's results
-        /// checked against the eager scan's. Every lazy probe is gathered by
-        /// selected rows once every earlier probe was scored, so the rows
-        /// each gather reads are the same for every gap.
+        /// What the lazy scan's sparse reads of the origin file added up to.
+        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+        struct OriginSparseReads {
+            /// Requests after coalescing and splitting.
+            requests: u64,
+            /// Bytes read, the gaps between row runs included.
+            bytes: u64,
+            /// Rows gathered.
+            rows: u64,
+        }
+
+        /// The origin requests, bytes and rows of the lazy scan's sparse
+        /// reads over `queries` on `index` with `origin_gap`, each query's
+        /// results checked against the eager scan's. Every lazy probe is
+        /// gathered by selected rows once every earlier probe was scored, so
+        /// the rows each gather reads are the same for every gap. Nothing is
+        /// cached, so the origin serves each survivor's row of both ex planes.
         async fn origin_sparse_reads(
             index: &Arc<dyn VectorIndex>,
             queries: &[Query],
             origin_gap: LazyOriginGap,
             label: &str,
-        ) -> (u64, u64) {
+        ) -> OriginSparseReads {
             let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
             let config = LayeredLazyConfig {
                 enabled: true,
@@ -10901,7 +10932,9 @@ mod tests {
                 far_window: 0,
                 ..Default::default()
             };
-            let (mut requests, mut bytes) = (0, 0);
+            // A gather reads its survivors' rows of the high and the low plane.
+            const EX_PLANES: u64 = 2;
+            let mut reads = OriginSparseReads::default();
             for query in queries {
                 let context = format!(
                     "{label} {origin_gap:?} nprobes={} k={}",
@@ -10909,10 +10942,17 @@ mod tests {
                 );
                 let stats =
                     assert_lazy_matches_eager(index, query, &filter, config, &context).await;
-                requests += stats.origin_sparse_requests;
-                bytes += stats.origin_sparse_bytes;
+                let survivors = stats.rows_fetched.iter().sum::<u64>();
+                assert_eq!(
+                    stats.origin_sparse_rows,
+                    EX_PLANES * survivors,
+                    "{context}: {stats:?}"
+                );
+                reads.requests += stats.origin_sparse_requests;
+                reads.bytes += stats.origin_sparse_bytes;
+                reads.rows += stats.origin_sparse_rows;
             }
-            (requests, bytes)
+            reads
         }
 
         /// The lazy origin gap is the environment's setting resolved for the
