@@ -14,7 +14,7 @@
 //! ([`ResidentColumns::for_file`]).
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use arrow::compute::concat_batches;
@@ -36,7 +36,7 @@ use super::storage::{
     RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN, RABIT_CODE_COLUMN,
     RABIT_EX_CODE_COLUMN,
 };
-use crate::vector::storage::{IndexFileKey, WeakRegistry, shared_by_key};
+use crate::vector::storage::IndexFileKey;
 
 /// Columns that reads always fetch from the file: the codes, which hold most
 /// of its bytes, and the estimator bounds, which only some scans read.
@@ -79,7 +79,12 @@ pub fn resident_columns_bytes(schema: &Schema, num_rows: u64) -> u64 {
 
 /// The resident stores of the open index files; see
 /// [`ResidentColumns::for_file`].
-static RESIDENT_STORES: LazyLock<WeakRegistry<IndexFileKey, OnceCell<ResidentColumnStore>>> =
+/// The store of every index file opened with resident columns, kept for the
+/// life of the process. A store's bytes are reserved out of the cache budget
+/// for as long as its index is used, so it must not be dropped and reloaded
+/// when the cached index state holding it is evicted at a moment no search
+/// holds it.
+static RESIDENT_STORES: LazyLock<Mutex<HashMap<IndexFileKey, ResidentColumns>>> =
     LazyLock::new(Default::default);
 
 /// The resident columns of one IVF_RQ storage file, loaded on first use.
@@ -92,15 +97,13 @@ pub struct ResidentColumns(Arc<OnceCell<ResidentColumnStore>>);
 
 impl ResidentColumns {
     /// The store of index file `file` that every open of it in the process
-    /// shares: the live one while an index or a cached state holds it, else
-    /// a new one, loaded on first use. Indexes of the file opened at once, a
-    /// re-open while an older index still runs, and a state read back from a
-    /// persistent cache tier thus read the file's small columns once, and
-    /// hold one copy of them.
+    /// shares, loaded on first use and kept until the process exits. Indexes
+    /// of the file opened at once, a re-open after its cached state was
+    /// evicted, and a state read back from a persistent cache tier thus read
+    /// the file's small columns once, and hold one copy of them.
     pub fn for_file(file: &IndexFileKey) -> Self {
-        Self(shared_by_key(&RESIDENT_STORES, file, || {
-            Arc::new(OnceCell::new())
-        }))
+        let mut stores = RESIDENT_STORES.lock().unwrap_or_else(|e| e.into_inner());
+        stores.entry(file.clone()).or_default().clone()
     }
 
     /// Bytes of values the store holds, `None` until it has loaded. Equals
@@ -375,11 +378,10 @@ mod tests {
         assert_eq!(resident_columns_bytes(&Schema::new(other), 10), 280);
     }
 
-    /// Every open of an index file shares one store while any holds it; the
-    /// same path in another bucket is another file, and a store no open
-    /// holds any more is made anew.
+    /// Every open of an index file shares one store, also after every open
+    /// dropped it; the same path in another bucket is another file.
     #[test]
-    fn for_file_shares_the_store_of_a_file_while_held() {
+    fn for_file_shares_the_store_of_a_file() {
         let path = "t.lance/_indices/resident-test/auxiliary.idx";
         let file = IndexFileKey::new("resident-test", "s3$bucket", path);
         let store = ResidentColumns::for_file(&file);
@@ -387,10 +389,10 @@ mod tests {
         assert!(Arc::ptr_eq(&store.0, &shared.0));
         let other = IndexFileKey::new("resident-test", "s3$other", path);
         assert!(!Arc::ptr_eq(&store.0, &ResidentColumns::for_file(&other).0));
-        let dropped = Arc::downgrade(&store.0);
+        let held = Arc::downgrade(&store.0);
         drop((store, shared));
-        assert!(dropped.upgrade().is_none());
-        assert_eq!(ResidentColumns::for_file(&file).loaded_bytes(), None);
+        let reopened = ResidentColumns::for_file(&file);
+        assert!(Arc::ptr_eq(&held.upgrade().unwrap(), &reopened.0));
     }
 
     /// A 100-row column in pages ending at rows 40, 40 (an empty page) and 100.
