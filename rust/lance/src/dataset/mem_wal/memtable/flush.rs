@@ -1255,6 +1255,11 @@ pub enum TriggerMemTableFlush {
     Flush {
         /// The frozen memtable to flush.
         memtable: Arc<MemTable>,
+        /// The secondary indexes the memtable was built with, rebuilt on its
+        /// generation. Carried with the memtable rather than read off the
+        /// writer: a schema change replaces the writer's set, and a memtable
+        /// sealed under the old schema still names its columns the old way.
+        index_configs: Arc<[MemIndexConfig]>,
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
@@ -1263,10 +1268,15 @@ pub enum TriggerMemTableFlush {
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flush { memtable, done } => f
+            Self::Flush {
+                memtable,
+                index_configs,
+                done,
+            } => f
                 .debug_struct("TriggerMemTableFlush::Flush")
                 .field("memtable_gen", &memtable.generation())
                 .field("memtable_rows", &memtable.row_count())
+                .field("index_count", &index_configs.len())
                 .field("has_done", &done.is_some())
                 .finish(),
         }

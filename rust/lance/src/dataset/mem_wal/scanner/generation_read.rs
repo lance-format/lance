@@ -68,7 +68,39 @@ impl GenerationRead {
         pk_columns: &[String],
         projection: Vec<String>,
     ) -> Self {
-        let stored_schema = arrow_schema_with_field_ids(dataset_schema);
+        Self::from_stored(
+            arrow_schema_with_field_ids(dataset_schema),
+            table_schema,
+            pk_columns,
+            projection,
+        )
+    }
+
+    /// An in-memory memtable, read under the table's schema.
+    ///
+    /// A memtable keeps the schema its writer created it under, field ids
+    /// included, so a memtable created before a schema change resolves the way
+    /// a generation sealed before it does.
+    pub(super) fn for_memtable(
+        memtable_schema: &Schema,
+        table_schema: &SchemaRef,
+        pk_columns: &[String],
+        projection: Vec<String>,
+    ) -> Self {
+        Self::from_stored(
+            memtable_schema.clone(),
+            table_schema,
+            pk_columns,
+            projection,
+        )
+    }
+
+    fn from_stored(
+        stored_schema: Schema,
+        table_schema: &SchemaRef,
+        pk_columns: &[String],
+        projection: Vec<String>,
+    ) -> Self {
         let names = stored_names(&stored_schema, table_schema);
         let (table_schema, pk_columns) = (Arc::clone(table_schema), pk_columns.to_vec());
         Self {
@@ -86,6 +118,24 @@ impl GenerationRead {
             .iter()
             .find(|(_, in_table)| *in_table == column)
             .map(|(in_generation, _)| in_generation.as_str())
+    }
+
+    /// The primary key under the names this generation stores it under.
+    ///
+    /// Every generation stores every primary key column — a key cannot be
+    /// added or dropped under a MemWAL — so a key it does not resolve is an
+    /// error rather than an absence.
+    pub(super) fn stored_pk_columns(&self) -> Result<Vec<String>> {
+        self.pk_columns
+            .iter()
+            .map(|pk| {
+                self.stored_name(pk).map(str::to_string).ok_or_else(|| {
+                    Error::internal(format!(
+                        "primary key column `{pk}` is not stored by a generation of this table"
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Also produce `column`, which the caller needs even though it did not ask
@@ -263,6 +313,38 @@ impl GenerationRead {
         }
         Arc::new(Schema::new(fields))
     }
+}
+
+/// Whether an in-memory memtable stores the table's columns exactly as the table
+/// declares them, so it can be read as it is, without [`GenerationRead`].
+///
+/// True in the steady state, where every memtable was created under the
+/// schema the table has now. A memtable created before a schema change —
+/// a column since added, dropped, renamed, or reshaped — is false and is read
+/// through [`GenerationRead::for_memtable`] instead. Checked positionally, since
+/// a memtable created under the table's schema stores its columns in the same
+/// order followed only by `_tombstone`; anything else takes the resolving read,
+/// which is correct for every layout and only costs a projection.
+pub(super) fn memtable_matches_table(memtable_schema: &Schema, table_schema: &Schema) -> bool {
+    let stored = memtable_schema.fields();
+    let declared = table_schema.fields();
+    let extra = &stored[declared.len().min(stored.len())..];
+    stored.len() >= declared.len()
+        && extra.iter().all(|f| f.name() == TOMBSTONE)
+        && stored
+            .iter()
+            .zip(declared.iter())
+            .all(|(stored, declared)| {
+                stored.name() == declared.name()
+                    && match (field_id_of(stored), field_id_of(declared)) {
+                        (Some(stored_id), Some(declared_id)) => {
+                            stored_id == declared_id && stored.data_type() == declared.data_type()
+                        }
+                        // Without ids on both sides only names relate the two, and
+                        // nested ids would make otherwise equal types differ.
+                        _ => stored.data_type().equals_datatype(declared.data_type()),
+                    }
+            })
 }
 
 /// Run `expr` above `plan`, for a predicate that could not be pushed into the
