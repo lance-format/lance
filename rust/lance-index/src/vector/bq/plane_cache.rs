@@ -19,7 +19,10 @@
 //!                [codes: width bytes]                              0 factor columns
 //! ```
 //!
-//! v2 ex-plane rows always carry both factors.
+//! v2 ex-plane rows always carry both factors. A code-only entry
+//! (`EntryColumns::Codes`) holds the file columns of its plane alone: its ex
+//! plane rows carry no factor columns, and its sign plane only the codes (and
+//! the bounds under eager bounds).
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -435,7 +438,9 @@ fn row_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::bq::layered::{FULL_BOUNDS_COLUMN, HIGH_BOUNDS_COLUMN, PlaneKey};
+    use crate::vector::bq::layered::{
+        EntryColumns, FULL_BOUNDS_COLUMN, HIGH_BOUNDS_COLUMN, PlaneKey, plane_entry_columns,
+    };
     use crate::vector::bq::raw_body::RAW_BODY_KIND;
     use crate::vector::bq::storage::RABIT_CODE_COLUMN;
     use arrow_array::{ArrayRef, UInt64Array};
@@ -684,6 +689,7 @@ mod tests {
                     partition: 0,
                     plane: tag,
                     sign_bounds,
+                    entry_columns: EntryColumns::default(),
                 }
                 .codec_for_key()
                 .unwrap();
@@ -702,6 +708,67 @@ mod tests {
                 ));
                 let read = |range: Range<usize>| -> Result<Bytes> { Ok(encoded.slice(range)) };
                 assert!(codec.plan_rows(&read, &[0]).is_none());
+            }
+        }
+    }
+
+    /// Code-only entries (`EntryColumns::Codes`) hold the file columns of
+    /// their plane: an ex plane's rows carry no factor columns, and the sign
+    /// and bounds planes keep raw bodies, whole and by rows.
+    #[test]
+    fn code_only_entries_round_trip() {
+        const ROWS: usize = 90;
+        for sign_bounds in [SignBounds::Lazy, SignBounds::Eager] {
+            for plane in [0, 1, 2, SIGN_BOUNDS_PLANE] {
+                let names = plane_entry_columns(plane, sign_bounds, EntryColumns::Codes);
+                if names.is_empty() {
+                    continue;
+                }
+                let codec = PlaneKey {
+                    partition: 0,
+                    plane,
+                    sign_bounds,
+                    entry_columns: EntryColumns::Codes,
+                }
+                .codec_for_key()
+                .unwrap();
+                let context = format!("plane {plane} {sign_bounds:?} {names:?}");
+                let original = match plane {
+                    1 | 2 => ex_plane_batch(plane, ROWS, 128, 0),
+                    _ => whole_plane_batch(&names, ROWS),
+                };
+                let schema = original.schema();
+                let columns: Vec<&str> = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect();
+                assert_eq!(columns, names, "{context}");
+                let encoded = encode(&codec, &original);
+                let body = &encoded[body_offset()..];
+                match plane {
+                    1 | 2 => {
+                        assert_eq!(&body[..2], &[plane, 0], "{context}");
+                        assert_eq!(body.len(), V3_HEADER_BYTES + ROWS * 128, "{context}");
+                        let rows = [0, 7, 8, 89];
+                        let CacheDecode::Hit(selected) = decode_rows(&codec, &encoded, &rows)
+                        else {
+                            panic!("{context}: row decode missed")
+                        };
+                        assert_eq!(
+                            selected,
+                            original
+                                .take(&arrow_array::UInt32Array::from(rows.to_vec()))
+                                .unwrap(),
+                            "{context}"
+                        );
+                    }
+                    _ => assert_eq!(body[1], RAW_BODY_KIND, "{context}"),
+                }
+                let CacheDecode::Hit(decoded) = decode(&codec, &encoded) else {
+                    panic!("{context}: decode missed")
+                };
+                assert_eq!(decoded, original, "{context}");
             }
         }
     }

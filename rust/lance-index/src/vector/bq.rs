@@ -24,6 +24,7 @@ pub mod layered;
 pub mod layered_stats;
 #[cfg(test)]
 mod lazy_tests;
+pub mod partition_codes;
 mod plane_cache;
 pub mod prune;
 pub mod raw_body;

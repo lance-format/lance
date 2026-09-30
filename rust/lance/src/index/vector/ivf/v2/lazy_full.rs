@@ -55,6 +55,13 @@
 //! planes read together and as many probes in flight as the eager scan
 //! prepares, instead of its sign plane first and its ex planes within the
 //! gather window.
+//!
+//! Plane entries hold the plane or, on an index with code-only entries
+//! (`LANCE_RQ_ENTRY_COLUMNS=codes` with the small columns resident), its code
+//! columns alone. The storage attaches the resident rows of the other
+//! columns to every plane it serves, sign stage and gathered rows alike, so
+//! the scan scores the same batches either way; a sparse origin read returns
+//! every column itself.
 
 use std::collections::BinaryHeap;
 use std::future::Future;
@@ -1085,8 +1092,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         })))
     }
 
-    /// Load a whole ex plane in the background, off the query's critical
-    /// path, admitting it as the eager load would.
+    /// Load a whole ex plane entry in the background, off the query's
+    /// critical path, admitting it as the eager load would. The entry holds
+    /// the plane's codes alone on an index with code-only entries, and
+    /// `promotion_bytes` counts what it holds.
     fn spawn_lazy_promotion(self: &Arc<Self>, ticket: LazyPromotionTicket) {
         let index = self.clone();
         tokio::spawn(async move {

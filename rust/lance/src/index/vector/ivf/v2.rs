@@ -50,8 +50,9 @@ use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
-use lance_index::vector::bq::layered::SignBounds;
+use lance_index::vector::bq::layered::{EntryColumns, SignBounds};
 use lance_index::vector::bq::layered_stats;
+use lance_index::vector::bq::partition_codes::PartitionCodesKey;
 use lance_index::vector::bq::rabit_ex_bits;
 use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -66,8 +67,8 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
     IndexFileKey, LayeredLazyConfig, OriginLatencyClass, PlaneAccessTracker, QueryResidual,
     QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentColumns,
-    ResidentColumnsSetting, VectorStore, origin_latency_setting, resident_columns_setting,
-    resident_lifetime_setting, resident_store_fits, sign_bounds_setting,
+    ResidentColumnsSetting, VectorStore, entry_columns_setting, origin_latency_setting,
+    resident_columns_setting, resident_lifetime_setting, resident_store_fits, sign_bounds_setting,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -1706,6 +1707,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_origin_latency(origin_latency)
             .with_resident_columns(resident_store)
             .with_resident_columns_enabled(resident_columns)
+            .with_entry_columns(Self::entry_columns_at_open()?)
             .with_index_file(index_file);
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
@@ -1975,6 +1977,50 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         self
     }
 
+    /// The entry columns an opening index asks its storage for: an IVF_RQ
+    /// index reads (and validates) `LANCE_RQ_ENTRY_COLUMNS`, and its storage
+    /// resolves them against residency (see
+    /// [`IvfQuantizationStorage::entry_columns`]); any other index keeps
+    /// full entries.
+    fn entry_columns_at_open() -> Result<EntryColumns> {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return Ok(EntryColumns::All);
+        }
+        entry_columns_setting()
+    }
+
+    /// What the index's cache entries hold, resolved when it opened; see
+    /// `LANCE_RQ_ENTRY_COLUMNS`. [`EntryColumns::Codes`] only for an index
+    /// whose small columns are resident: a layered index's sign, high and
+    /// low plane entries, or a native flat index's partition entries, which
+    /// are then [`PartitionCodes`](lance_index::vector::bq::partition_codes::PartitionCodes).
+    /// A native index with a graph caches whole partitions.
+    pub fn entry_columns(&self) -> EntryColumns {
+        if self.layered_rq || self.caches_partition_codes() {
+            self.storage.entry_columns()
+        } else {
+            EntryColumns::All
+        }
+    }
+
+    /// Whether the index caches its partitions as code-only entries: a
+    /// native IVF_RQ index with a flat sub-index, which holds nothing but
+    /// the storage, and code-only entries (see [`Self::entry_columns`]).
+    fn caches_partition_codes(&self) -> bool {
+        Q::quantization_type() == QuantizationType::Rabit
+            && !self.layered_rq
+            && S::name() == <FlatIndex as IvfSubIndex>::name()
+            && self.storage.entry_columns() == EntryColumns::Codes
+    }
+
+    /// Replace the entry columns the index asks for, so tests can open both
+    /// in one process; the storage still resolves them against residency.
+    #[cfg(test)]
+    pub(crate) fn with_entry_columns_for_test(mut self, entry_columns: EntryColumns) -> Self {
+        self.storage = self.storage.with_entry_columns(entry_columns);
+        self
+    }
+
     /// Where a newly opened index's cache keeps the bounds columns. Only
     /// layered indexes read (and validate) `LANCE_RQ_SIGN_BOUNDS`.
     fn sign_bounds_at_open(layered_rq: bool) -> Result<SignBounds> {
@@ -2028,6 +2074,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             )));
         }
 
+        if self.caches_partition_codes() {
+            return self
+                .load_code_only_partition(partition_id, write_cache, metrics)
+                .await;
+        }
+
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
 
         if write_cache {
@@ -2059,6 +2111,40 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     .await?,
             ))
         }
+    }
+
+    /// A native flat partition read through its code-only entry, which is
+    /// cached (admitted when `write_cache`) while the partition entry built
+    /// from it, with copies of the resident rows, is built again on every
+    /// read; see [`IvfQuantizationStorage::load_partition_cached`].
+    async fn load_code_only_partition(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        let io_stats = metrics.io_stats();
+        let (storage, hit) = self
+            .storage
+            .load_partition_cached(
+                partition_id,
+                &self.index_cache,
+                write_cache,
+                io_stats.clone(),
+            )
+            .await?;
+        if hit {
+            metrics.record_index_cache_hit();
+        } else {
+            metrics.record_index_cache_miss();
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+            metrics.record_part_load();
+        }
+        // A flat sub-index holds no rows, so building it reads nothing.
+        let index = self.load_sub_index(partition_id, io_stats).await?;
+        let mut entry = PartitionEntry::new(index, storage);
+        entry.cache_whole_partition = false;
+        Ok(Arc::new(entry))
     }
 
     /// Cut candidates across all probed partitions before fetching lower planes.
@@ -2570,6 +2656,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Q::Metadata: 'static,
         Q::Storage: 'static,
     {
+        if self.caches_partition_codes() {
+            return self.prewarm_partition_codes_window(partitions).await;
+        }
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -2672,6 +2761,58 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             } else {
                 run_end
             };
+        }
+        Ok(())
+    }
+
+    /// [`Self::prewarm_partition_window`] of an index that caches its
+    /// partitions as code-only entries: one read of the window's code
+    /// columns, cut into the entries of its partitions. The flat sub-index
+    /// holds nothing to warm, and the resident store loads on first use.
+    async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
+        let projection = self.storage.partition_codes_projection()?;
+        let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
+        let mut partition_id = partitions.start;
+        while partition_id < partitions.end {
+            let cached = |partition| async move {
+                let key = PartitionCodesKey { partition };
+                self.index_cache.get_with_key(&key).await.is_some()
+            };
+            if cached(partition_id).await {
+                partition_id += 1;
+                continue;
+            }
+            // Stop at a cached hole, as the whole-partition prewarm does.
+            let mut run_end = partition_id + 1;
+            while run_end < partitions.end && !cached(run_end).await {
+                run_end += 1;
+            }
+            let run = partition_id..run_end;
+            let batches = read_partition_window_batches(
+                self.storage.reader(),
+                Some(&projection),
+                &schema,
+                self.storage.ivf(),
+                run.clone(),
+                None,
+            )
+            .await?;
+            if batches.len() != run.len() {
+                return Err(Error::internal(format!(
+                    "IVF prewarm run {run:?} produced {} partitions of codes",
+                    batches.len()
+                )));
+            }
+            for (partition, batches) in run.zip(batches) {
+                let codes = self.storage.partition_codes_from_batches(batches)?;
+                self.index_cache
+                    .get_or_insert_with_key(
+                        PartitionCodesKey { partition },
+                        || async move { Ok(codes) },
+                    )
+                    .await?;
+            }
+            partition_id = run_end;
         }
         Ok(())
     }
@@ -3750,6 +3891,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let storage = storage
         .with_resident_columns(resident_columns)
         .with_resident_columns_enabled(resident)
+        .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?)
         .with_index_file(index_file);
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
@@ -7046,7 +7188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_layered_plane_promotion_survives_query_reconstruction() {
-        use lance_index::vector::bq::layered::{PlaneKey, SignBounds};
+        use lance_index::vector::bq::layered::{EntryColumns, PlaneKey, SignBounds};
 
         let dir = TempStrDir::default();
         let (mut dataset, vectors) =
@@ -7088,10 +7230,13 @@ mod tests {
             for partition in 0..4 {
                 for plane in [1, 2] {
                     // Ex plane keys do not depend on the bounds placement.
+                    // A local index keeps no resident store, so its entries
+                    // hold every column.
                     let key = PlaneKey {
                         partition,
                         plane,
                         sign_bounds: SignBounds::default(),
+                        entry_columns: EntryColumns::All,
                     };
                     let resident = cache.get_resident_with_key(&key).await;
                     assert_eq!(
@@ -7563,7 +7708,9 @@ mod tests {
         use std::time::Duration;
 
         use arrow::compute::concat_batches;
+        use arrow_array::UInt32Array;
         use bytes::Bytes;
+        use lance_arrow::RecordBatchExt;
         use lance_core::cache::{
             CacheCodec, CacheEntry, CachePin, CacheTier, InternalCacheKey, PinnedEntryLoader,
             PinnedStats, PinnedValue, QuickCacheBackend,
@@ -7572,20 +7719,22 @@ mod tests {
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::FileWriterOptions;
         use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_index::metrics::LocalMetricsCollector;
         use lance_index::vector::bq::layered::{
-            FULL_BOUNDS_COLUMN, PlaneBatch, RQPrecision, SIGN_BOUNDS_PLANE, SignBounds,
-            plane_columns,
+            EntryColumns, FULL_BOUNDS_COLUMN, PlaneBatch, RQPrecision, SIGN_BOUNDS_PLANE,
+            SignBounds, plane_columns, plane_entry_columns,
         };
         use lance_index::vector::bq::layered_stats::{self, LayeredLazyStats, RANK_BUCKETS};
+        use lance_index::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
         use lance_index::vector::bq::storage::{
-            RabitPruneStatsSnapshot, rabit_prune_stats_snapshot,
+            RABIT_CODE_COLUMN, RabitPruneStatsSnapshot, rabit_prune_stats_snapshot,
         };
         use lance_index::vector::storage::{
-            DenseGatherMode, DenseToEager, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES, IndexFileKey,
-            LayeredLazyConfig, LazyOriginGap, LazyPromotion, OriginLatencyClass,
-            ResidentColumnsKey, ResidentColumnsSetting, ResidentLifetime, origin_latency_setting,
-            resident_columns_setting, resident_lifetime_setting, resident_store_is_live,
-            sign_bounds_setting,
+            DenseGatherMode, DenseToEager, GatherPlan, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
+            IndexFileKey, LayeredLazyConfig, LazyOriginGap, LazyPromotion, OriginLatencyClass,
+            PlaneSource, ResidentColumnsKey, ResidentColumnsSetting, ResidentLifetime,
+            entry_columns_setting, origin_latency_setting, resident_columns_setting,
+            resident_lifetime_setting, resident_store_is_live, sign_bounds_setting,
         };
         use lance_index::vector::{ApproxMode, PartitionSearchControl, VECTOR_RESULT_SCHEMA};
         use lance_io::ReadBatchParams;
@@ -8329,6 +8478,31 @@ mod tests {
             Arc<dyn VectorIndex>,
             Option<Arc<TieredPlaneTestBackend>>,
         ) {
+            let (dataset, tiered) = open_lazy_test_dataset(uri, cache).await;
+            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+            let index = dataset
+                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            if cache.is_warmed() {
+                index.prewarm().await.unwrap();
+            }
+            (dataset, index, tiered)
+        }
+
+        impl LazyTestCache {
+            /// Whether the tests warm an index opened over this cache.
+            fn is_warmed(self) -> bool {
+                !matches!(self, Self::Origin | Self::ColdUngated | Self::ColdGated)
+            }
+        }
+
+        /// The dataset at `uri` over a new session whose index cache is
+        /// `cache`, and the tiered backend of that cache, if it is one.
+        async fn open_lazy_test_dataset(
+            uri: &str,
+            cache: LazyTestCache,
+        ) -> (Dataset, Option<Arc<TieredPlaneTestBackend>>) {
             let registry = Arc::new(ObjectStoreRegistry::default());
             let (session, tiered) = match cache {
                 LazyTestCache::Origin => {
@@ -8373,18 +8547,7 @@ mod tests {
                 .load()
                 .await
                 .unwrap();
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
-            let index = dataset
-                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            if !matches!(
-                cache,
-                LazyTestCache::Origin | LazyTestCache::ColdUngated | LazyTestCache::ColdGated
-            ) {
-                index.prewarm().await.unwrap();
-            }
-            (dataset, index, tiered)
+            (dataset, tiered)
         }
 
         fn lazy_index(index: &Arc<dyn VectorIndex>) -> &IvfRq {
@@ -9088,6 +9251,7 @@ mod tests {
             let setting = origin_latency_setting().unwrap();
             let lazy_setting = LayeredLazyConfig::from_env().unwrap();
             let resident_setting = resident_columns_setting().unwrap();
+            let entry_setting = entry_columns_setting().unwrap();
             let vectors = batch["vector"].as_fixed_size_list();
             let queries = [
                 lazy_test_query(vectors.value(0), 10, 8),
@@ -9147,6 +9311,12 @@ mod tests {
                         resident_setting.resolve(expected),
                         "{context}"
                     );
+                    // Code-only entries follow residency, so the hint.
+                    assert_eq!(
+                        ivf.entry_columns(),
+                        entry_setting.resolve(ivf.resident_columns_enabled()),
+                        "{context}"
+                    );
                     assert_eq!(
                         ivf.lazy_origin_gap_bytes(),
                         lazy_setting.origin_gap.resolve(expected, block_size),
@@ -9189,6 +9359,7 @@ mod tests {
                         .downcast_ref::<IvfPq>()
                         .expect("IVF_PQ index");
                     assert_eq!(ivf_pq.origin_latency(), pq_class, "hint={hint:?} {path}");
+                    assert_eq!(ivf_pq.entry_columns(), EntryColumns::All);
                 }
             }
             wait_for_promotions().await;
@@ -11658,6 +11829,788 @@ mod tests {
             assert_eq!(results[0], results[1]);
         }
 
+        /// Open the index of the dataset at `uri` over a new session whose
+        /// index cache is `cache`, as if its origin were of `class`, with its
+        /// small columns resident or read from the file and asking for
+        /// `entry_columns`; warm it when the tests warm that cache.
+        async fn open_entry_columns_test_index(
+            uri: &str,
+            cache: LazyTestCache,
+            class: OriginLatencyClass,
+            resident: bool,
+            entry_columns: EntryColumns,
+        ) -> (
+            Dataset,
+            Arc<dyn VectorIndex>,
+            Option<Arc<TieredPlaneTestBackend>>,
+        ) {
+            let (dataset, tiered) = open_lazy_test_dataset(uri, cache).await;
+            let index = open_entry_columns_index(&dataset, class, resident, entry_columns).await;
+            if cache.is_warmed() {
+                index.prewarm().await.unwrap();
+            }
+            (dataset, index, tiered)
+        }
+
+        /// Open the index of `dataset` over the dataset's caches, as
+        /// [`open_entry_columns_test_index`] does.
+        async fn open_entry_columns_index(
+            dataset: &Dataset,
+            class: OriginLatencyClass,
+            resident: bool,
+            entry_columns: EntryColumns,
+        ) -> Arc<dyn VectorIndex> {
+            let (store, index_dir) = index_files(dataset).await;
+            let ivf = open_rq_index(dataset, store, index_dir)
+                .await
+                .with_origin_latency_for_test(class)
+                .unwrap()
+                .with_resident_columns_for_test(resident)
+                .with_entry_columns_for_test(entry_columns);
+            Arc::new(ivf)
+        }
+
+        /// Bytes the columns of `full` that `entry` does not hold add to the
+        /// charge of `full`: each array and its buffers.
+        fn bytes_beyond(full: &RecordBatch, entry: &RecordBatch) -> usize {
+            full.schema()
+                .fields()
+                .iter()
+                .zip(full.columns())
+                .filter(|(field, _)| entry.column_by_name(field.name()).is_none())
+                .map(|(_, column)| {
+                    column.deep_size_of_children(&mut lance_core::deepsize::Context::new())
+                })
+                .sum()
+        }
+
+        fn column_names(batch: &RecordBatch) -> Vec<String> {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        }
+
+        /// A code-only entry holds the file columns of its plane or native
+        /// partition, and is charged the bytes of a read of the file but the
+        /// resident columns'. Attaching the resident columns to it, whole or
+        /// at selected rows, gives the batch a read of the file gives, with or
+        /// without the resident store, bit for bit, and whole planes and
+        /// partitions byte for byte: every partition, empty ones included, in
+        /// the writer's pages and in pages that partitions straddle, in either
+        /// file version. An entry of other rows is an error.
+        #[rstest]
+        #[case::native_v2_0(false, LanceFileVersion::V2_0)]
+        #[case::native_v2_2(false, LanceFileVersion::V2_2)]
+        #[case::layered_v2_0(true, LanceFileVersion::V2_0)]
+        #[case::layered_v2_2(true, LanceFileVersion::V2_2)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_code_only_entries_match_file_reads(
+            #[case] layered: bool,
+            #[case] version: LanceFileVersion,
+        ) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let source = &lazy_index(&index).storage;
+            let sign_bounds = source.sign_bounds();
+            // A native file has the sign plane's columns too.
+            let mut planes = vec![0];
+            if layered {
+                planes.extend([1, 2]);
+                if sign_bounds == SignBounds::Lazy {
+                    planes.push(SIGN_BOUNDS_PLANE);
+                }
+            }
+            for page_rows in [None, Some(RESIDENT_TEST_PAGE_ROWS)] {
+                let reader = rewrite_rq_storage(source, version, page_rows).await;
+                let file = rq_storage_over(source, &reader, false);
+                let resident = rq_storage_over(source, &reader, true);
+                let codes =
+                    rq_storage_over(source, &reader, true).with_entry_columns(EntryColumns::Codes);
+                assert_eq!(resident.entry_columns(), EntryColumns::All);
+                assert_eq!(codes.entry_columns(), EntryColumns::Codes);
+                // Code-only entries need the resident store.
+                let unresident =
+                    rq_storage_over(source, &reader, false).with_entry_columns(EntryColumns::Codes);
+                assert_eq!(unresident.entry_columns(), EntryColumns::All);
+                for partition in 0..source.num_partitions() {
+                    let context = format!(
+                        "layered={layered} {version:?} pages={page_rows:?} partition={partition}"
+                    );
+                    let size = source.partition_size(partition);
+                    if !layered {
+                        let expected = file.load_partition(partition, None).await.unwrap();
+                        let entry = codes.read_partition_codes(partition, None).await.unwrap();
+                        assert_eq!(
+                            column_names(&entry.0),
+                            [RABIT_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_COLUMN],
+                            "{context}"
+                        );
+                        let actual = codes
+                            .partition_from_codes(partition, &entry, None)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            actual.to_batches().unwrap().collect::<Vec<_>>(),
+                            expected.to_batches().unwrap().collect::<Vec<_>>(),
+                            "{context}"
+                        );
+                        assert_eq!(actual.deep_size_of(), expected.deep_size_of(), "{context}");
+                        // The entry is charged what the partition built from
+                        // it is but the copies of the resident rows.
+                        let actual_batch = actual.to_batches().unwrap().next().unwrap();
+                        assert_eq!(
+                            entry.0.deep_size_of(),
+                            actual_batch.deep_size_of() - bytes_beyond(&actual_batch, &entry.0),
+                            "{context}"
+                        );
+                    }
+                    let rows = resident_test_rows(size);
+                    let every_row: Vec<u32> = (0..size as u32).collect();
+                    for &plane in &planes {
+                        let context = format!("{context} plane={plane}");
+                        let full = file.read_plane(partition, plane, None, None).await.unwrap();
+                        assert_eq!(
+                            resident
+                                .read_plane(partition, plane, None, None)
+                                .await
+                                .unwrap(),
+                            full,
+                            "{context}"
+                        );
+                        let entry = codes
+                            .read_plane_entry(partition, plane, None)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            column_names(&entry),
+                            plane_entry_columns(plane, sign_bounds, EntryColumns::Codes),
+                            "{context}"
+                        );
+                        let whole = codes
+                            .attach_resident(partition, plane, &entry, None, None)
+                            .await
+                            .unwrap();
+                        assert_eq!(whole, full, "{context}");
+                        assert_eq!(whole.deep_size_of(), full.deep_size_of(), "{context}");
+                        // The entry is charged what the plane is but the
+                        // copies of the resident rows.
+                        assert_eq!(
+                            entry.deep_size_of(),
+                            whole.deep_size_of() - bytes_beyond(&whole, &entry),
+                            "{context}"
+                        );
+                        for selected in [&rows, &every_row] {
+                            let expected = file
+                                .read_plane(partition, plane, Some(selected.clone()), None)
+                                .await
+                                .unwrap();
+                            let entry_rows =
+                                entry.take(&UInt32Array::from(selected.clone())).unwrap();
+                            let actual = codes
+                                .attach_resident(
+                                    partition,
+                                    plane,
+                                    &entry_rows,
+                                    Some(selected),
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(actual, expected, "{context} rows={}", selected.len());
+                        }
+                        if !rows.is_empty() && rows.len() < size {
+                            let error = codes
+                                .attach_resident(partition, plane, &entry, Some(&rows), None)
+                                .await
+                                .unwrap_err();
+                            assert!(
+                                matches!(error, lance_core::Error::Internal { .. }),
+                                "{context}: {error}"
+                            );
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains(&format!("partition {partition} plane {plane}")),
+                                "{context}: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Searches return the same batches, and assemble partitions of the
+        /// same sizes, whether the index caches code-only or full entries,
+        /// with its small columns resident or not: every precision, the
+        /// cascade and the lazy scan under every setting of the parity tests
+        /// of a layered index, reading its planes from the origin file or
+        /// from a tiered cache that serves selected rows of persisted
+        /// entries, and a native index in both approximation modes and
+        /// under every prefilter.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_code_only_entries_search_parity(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let key = batch["vector"].as_fixed_size_list().value(777);
+            let mut queries: Vec<(String, Query, LayeredLazyConfig, Arc<dyn PreFilter>)> =
+                Vec::new();
+            if layered {
+                for (label, query, config) in sign_bounds_test_queries(&key) {
+                    queries.push((label, query, config, Arc::new(NoFilter)));
+                }
+                for (_, config) in lazy_test_configs() {
+                    let query = lazy_test_query(key.clone(), 100, LAZY_PARTITIONS);
+                    queries.push((format!("{config:?}"), query, config, Arc::new(NoFilter)));
+                }
+            } else {
+                for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
+                    for (filter_name, filter) in lazy_test_filters() {
+                        let mut query = lazy_test_query(key.clone(), 100, 8);
+                        query.approx_mode = approx_mode;
+                        let label = format!("approx={approx_mode:?} filter={filter_name}");
+                        queries.push((label, query, LayeredLazyConfig::default(), filter));
+                    }
+                }
+            }
+            let variants = [
+                (EntryColumns::All, false),
+                (EntryColumns::All, true),
+                (EntryColumns::Codes, false),
+                (EntryColumns::Codes, true),
+            ];
+            for cache in [LazyTestCache::Origin, LazyTestCache::Ungated] {
+                let mut expected: Option<Vec<(Vec<u64>, Vec<u32>)>> = None;
+                let mut expected_sizes: Option<Vec<usize>> = None;
+                for (entry_columns, resident) in variants {
+                    let context = format!(
+                        "layered={layered} cache={cache:?} entries={entry_columns} resident={resident}"
+                    );
+                    layered_stats::snapshot_and_reset();
+                    let (_dataset, index, _) = open_entry_columns_test_index(
+                        dir.as_str(),
+                        cache,
+                        OriginLatencyClass::High,
+                        resident,
+                        entry_columns,
+                    )
+                    .await;
+                    let ivf = lazy_index(&index);
+                    assert_eq!(
+                        ivf.entry_columns(),
+                        entry_columns.resolve(resident),
+                        "{context}"
+                    );
+                    let mut results = Vec::new();
+                    for (label, query, config, filter) in &queries {
+                        ivf.set_layered_lazy_config_for_test(*config);
+                        let result = search_global(&index, query, filter.clone()).await;
+                        ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+                        let result =
+                            result.unwrap_or_else(|error| panic!("{context} {label}: {error}"));
+                        results.push(result_bits(&result));
+                    }
+                    assert!(results.iter().any(|(ids, _)| !ids.is_empty()), "{context}");
+                    wait_for_promotions().await;
+                    let stats = layered_stats::snapshot_and_reset();
+                    if entry_columns.resolve(resident) == EntryColumns::Codes {
+                        assert!(stats.resident_attach_calls > 0, "{context} {stats:?}");
+                    }
+                    // The tiered cache persisted every plane, so the lazy
+                    // scan gathers selected rows from the persistent tier and
+                    // none from the origin file, and those rows, attached to
+                    // the resident columns, are the rows a read of the file
+                    // returns.
+                    if layered && cache == LazyTestCache::Ungated {
+                        assert_eq!(stats.origin_row_reads, 0, "{context} {stats:?}");
+                        let partition = (0..LAZY_PARTITIONS)
+                            .find(|&partition| ivf.storage.partition_size(partition) > 1)
+                            .unwrap();
+                        let rows = resident_test_rows(ivf.storage.partition_size(partition));
+                        let plan = GatherPlan {
+                            planes: [PlaneSource::Sparse; 2],
+                            origin_whole: [false; 2],
+                        };
+                        let gathered = ivf
+                            .storage
+                            .gather_ex_rows(
+                                partition,
+                                &rows,
+                                plan,
+                                &LayeredLazyConfig::default(),
+                                &ivf.index_cache,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(gathered.sources, [Some(PlaneSource::Sparse); 2]);
+                        assert_eq!(gathered.origin_row_reads, 0, "{context}");
+                        for (plane, batch) in [(1, &gathered.high), (2, &gathered.low)] {
+                            let expected = ivf
+                                .storage
+                                .read_plane(partition, plane, Some(rows.clone()), None)
+                                .await
+                                .unwrap();
+                            // A row read of a full entry decodes a schema
+                            // without the file's metadata; the columns match.
+                            assert_eq!(
+                                column_names(batch),
+                                column_names(&expected),
+                                "{context} plane={plane}"
+                            );
+                            assert_eq!(
+                                batch.columns(),
+                                expected.columns(),
+                                "{context} plane={plane}"
+                            );
+                        }
+                    }
+                    match &expected {
+                        None => expected = Some(results),
+                        Some(expected) => {
+                            for ((label, ..), (actual, expected)) in
+                                queries.iter().zip(results.iter().zip(expected))
+                            {
+                                assert_eq!(actual, expected, "{context} {label}");
+                            }
+                        }
+                    }
+                    // A partition is assembled of the same arrays from the
+                    // origin file whatever the entries hold.
+                    if cache == LazyTestCache::Origin {
+                        let mut sizes = Vec::with_capacity(LAZY_PARTITIONS);
+                        for partition in 0..LAZY_PARTITIONS {
+                            let entry = if layered {
+                                ivf.load_query_partition(
+                                    partition,
+                                    RQPrecision::Full,
+                                    &NoOpMetricsCollector,
+                                )
+                                .await
+                            } else {
+                                ivf.load_partition(partition, true, &NoOpMetricsCollector)
+                                    .await
+                            };
+                            sizes.push(entry.unwrap().size_bytes());
+                        }
+                        match &expected_sizes {
+                            None => expected_sizes = Some(sizes),
+                            Some(expected) => assert_eq!(&sizes, expected, "{context}"),
+                        }
+                    }
+                }
+            }
+        }
+
+        /// With its entries cached, a storage with code-only entries reads
+        /// nothing from the file; a miss reads the code columns alone, one
+        /// request per column in the writer's pages: 1 for a layered sign,
+        /// high or low plane, 2 for a native partition. Reading the entries
+        /// loads no store, and the first attaches, issued at once, load it
+        /// once.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_code_only_entries_cut_origin_requests(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let source = &lazy_index(&index).storage;
+            let reader = rewrite_rq_storage(source, LanceFileVersion::V2_0, None).await;
+            // Lazy bounds whatever `LANCE_RQ_SIGN_BOUNDS` sets: a sign plane
+            // entry then holds the code column alone.
+            let codes = Arc::new(
+                rq_storage_over(source, &reader, true)
+                    .with_sign_bounds(SignBounds::Lazy)
+                    .with_entry_columns(EntryColumns::Codes),
+            );
+            let planes: &[u8] = if layered { &[0, 1, 2] } else { &[] };
+            let warm = LanceCache::with_capacity(LAZY_LARGE_CACHE_BYTES);
+            let requests = |stats: &IoStats| stats.snapshot().iops;
+
+            layered_stats::snapshot_and_reset();
+            for partition in 0..LAZY_PARTITIONS {
+                if layered {
+                    for &plane in planes {
+                        codes
+                            .load_plane_entry(partition, plane, &WeakLanceCache::from(&warm), None)
+                            .await
+                            .unwrap();
+                    }
+                } else {
+                    let codes = &codes;
+                    warm.get_or_insert_with_key(PartitionCodesKey { partition }, || async move {
+                        codes.read_partition_codes(partition, None).await
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            let stats = layered_stats::snapshot_and_reset();
+            assert_eq!(stats.resident_columns_loads, 0, "{stats:?}");
+
+            let reads: Vec<_> = (0..RESIDENT_TEST_CONCURRENT_READS)
+                .map(|read| {
+                    let codes = codes.clone();
+                    let cache = WeakLanceCache::from(&warm);
+                    tokio::spawn(async move {
+                        let partition = read % LAZY_PARTITIONS;
+                        if layered {
+                            let plane = (read % 3) as u8;
+                            codes
+                                .load_plane(partition, plane, &cache, None)
+                                .await
+                                .map(|plane| (plane.num_rows(), true))
+                        } else {
+                            codes
+                                .load_partition_cached(partition, &cache, true, None)
+                                .await
+                                .map(|(storage, hit)| (storage.len(), hit))
+                        }
+                    })
+                })
+                .collect();
+            for read in reads {
+                let (_, hit) = read.await.unwrap().unwrap();
+                assert!(hit);
+            }
+            let stats = layered_stats::snapshot_and_reset();
+            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
+            assert_eq!(
+                stats.resident_columns_bytes,
+                source.resident_columns_bytes(),
+                "{stats:?}"
+            );
+            assert!(stats.resident_attach_calls > 0, "{stats:?}");
+
+            let partition = (0..LAZY_PARTITIONS)
+                .find(|&partition| source.partition_size(partition) > 1)
+                .unwrap();
+            let cold = LanceCache::with_capacity(LAZY_LARGE_CACHE_BYTES);
+            for (cache, hit) in [(&warm, true), (&cold, false)] {
+                let cache = WeakLanceCache::from(cache);
+                if layered {
+                    for &plane in planes {
+                        let stats = IoStats::new();
+                        codes
+                            .load_plane(partition, plane, &cache, Some(stats.clone()))
+                            .await
+                            .unwrap();
+                        let expected = if hit { 0 } else { 1 };
+                        assert_eq!(requests(&stats), expected, "plane={plane} hit={hit}");
+                    }
+                } else {
+                    let stats = IoStats::new();
+                    let (_, was_hit) = codes
+                        .load_partition_cached(partition, &cache, true, Some(stats.clone()))
+                        .await
+                        .unwrap();
+                    assert_eq!(was_hit, hit);
+                    let expected = if hit { 0 } else { 2 };
+                    assert_eq!(requests(&stats), expected, "hit={hit}");
+                }
+            }
+            let stats = layered_stats::snapshot_and_reset();
+            assert_eq!(stats.resident_columns_loads, 0, "{stats:?}");
+        }
+
+        /// Code-only and full entries of one index persist under keys of
+        /// their own: an index of either kind finds none of the other's
+        /// entries in a cache the other warmed, and reads its own, every one
+        /// of which decodes, with the same results.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_code_only_entries_persist_apart_from_full_entries(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let key = batch["vector"].as_fixed_size_list().value(0);
+            let query = lazy_test_query(key, 100, LAZY_PARTITIONS);
+            let partition_entry_type =
+                <PartitionEntry<FlatIndex, RabitQuantizer> as CacheCodecImpl>::TYPE_ID;
+            for order in [
+                [EntryColumns::All, EntryColumns::Codes],
+                [EntryColumns::Codes, EntryColumns::All],
+            ] {
+                let context = format!("layered={layered} order={order:?}");
+                let (dataset, tiered) =
+                    open_lazy_test_dataset(dir.as_str(), LazyTestCache::ColdUngated).await;
+                let tiered = tiered.unwrap();
+                let persisted = |entry_columns| match (layered, entry_columns) {
+                    (true, _) => tiered.persisted_entries(<PlaneBatch as CacheCodecImpl>::TYPE_ID),
+                    (false, EntryColumns::All) => tiered.persisted_entries(partition_entry_type),
+                    (false, EntryColumns::Codes) => {
+                        tiered.persisted_entries(<PartitionCodes as CacheCodecImpl>::TYPE_ID)
+                    }
+                };
+                let mut indexes = Vec::new();
+                for entry_columns in order {
+                    let index = open_entry_columns_index(
+                        &dataset,
+                        OriginLatencyClass::High,
+                        true,
+                        entry_columns,
+                    )
+                    .await;
+                    assert_eq!(lazy_index(&index).entry_columns(), entry_columns);
+                    indexes.push(index);
+                }
+                indexes[0].prewarm().await.unwrap();
+                let first_entries = persisted(order[0]);
+                assert!(first_entries > 0, "{context}");
+                // The second kind finds none of the first kind's entries.
+                let second = lazy_index(&indexes[1]);
+                for partition in 0..LAZY_PARTITIONS {
+                    let tiers = if layered {
+                        let mut tiers = Vec::new();
+                        for plane in [0, 1, 2] {
+                            tiers.push(
+                                second
+                                    .storage
+                                    .plane_tier(partition, plane, &second.index_cache)
+                                    .await,
+                            );
+                        }
+                        tiers
+                    } else if order[1] == EntryColumns::Codes {
+                        vec![
+                            second
+                                .index_cache
+                                .peek_tier_with_key(&PartitionCodesKey { partition })
+                                .await,
+                        ]
+                    } else {
+                        vec![
+                            second
+                                .index_cache
+                                .peek_tier_with_key(
+                                    &IVFPartitionKey::<FlatIndex, RabitQuantizer>::new(partition),
+                                )
+                                .await,
+                        ]
+                    };
+                    assert!(
+                        tiers.iter().all(|&tier| tier == CacheTier::Absent),
+                        "{context} partition={partition} {tiers:?}"
+                    );
+                }
+                indexes[1].prewarm().await.unwrap();
+                if layered {
+                    // Both kinds hold the sign, high and low planes.
+                    assert_eq!(persisted(order[1]), 2 * first_entries, "{context}");
+                } else {
+                    assert_eq!(persisted(order[1]), LAZY_PARTITIONS, "{context}");
+                    assert_eq!(first_entries, LAZY_PARTITIONS, "{context}");
+                }
+                for (bytes, codec, _) in tiered.disk.lock().unwrap().values() {
+                    assert!(
+                        codec.deserialize(bytes).hit().is_some(),
+                        "{context}: a persisted {} entry does not decode",
+                        codec.type_id()
+                    );
+                }
+                // Each kind reads its own entries back from the persistent
+                // tier, as it wrote them.
+                tiered.ram.clear().await;
+                let mut results = Vec::new();
+                for (index, entry_columns) in indexes.iter().zip(order) {
+                    let ivf = lazy_index(index);
+                    let partition = (0..LAZY_PARTITIONS)
+                        .find(|&partition| ivf.storage.partition_size(partition) > 0)
+                        .unwrap();
+                    let (held, expected): (Vec<String>, Vec<&str>) = if layered {
+                        let entry = ivf
+                            .index_cache
+                            .get_with_key(&ivf.storage.plane_key(partition, 1))
+                            .await
+                            .unwrap();
+                        let sign_bounds = ivf.sign_bounds();
+                        (
+                            column_names(&entry.0),
+                            plane_entry_columns(1, sign_bounds, entry_columns),
+                        )
+                    } else if entry_columns == EntryColumns::Codes {
+                        let entry = ivf
+                            .index_cache
+                            .get_with_key(&PartitionCodesKey { partition })
+                            .await
+                            .unwrap();
+                        (
+                            column_names(&entry.0),
+                            vec![RABIT_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_COLUMN],
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    assert_eq!(held, expected, "{context} {entry_columns}");
+                    let result = search_global(index, &query, Arc::new(NoFilter))
+                        .await
+                        .unwrap();
+                    results.push(result_bits(&result));
+                }
+                assert_eq!(results[0], results[1], "{context}");
+            }
+        }
+
+        /// A native index with code-only entries warms them, one per
+        /// partition and no whole partition, and a search that follows reads
+        /// every partition from them: no cache miss and no partition load,
+        /// with the results of full entries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_native_prewarm_inserts_partition_codes() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, false).await;
+            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(3), 100, 16);
+            let partition_entry_type =
+                <PartitionEntry<FlatIndex, RabitQuantizer> as CacheCodecImpl>::TYPE_ID;
+            let mut results = Vec::new();
+            for entry_columns in [EntryColumns::Codes, EntryColumns::All] {
+                let (_dataset, index, tiered) = open_entry_columns_test_index(
+                    dir.as_str(),
+                    LazyTestCache::TieredResident,
+                    OriginLatencyClass::High,
+                    true,
+                    entry_columns,
+                )
+                .await;
+                let tiered = tiered.unwrap();
+                let codes = tiered.persisted_entries(<PartitionCodes as CacheCodecImpl>::TYPE_ID);
+                let whole = tiered.persisted_entries(partition_entry_type);
+                match entry_columns {
+                    EntryColumns::Codes => assert_eq!((codes, whole), (LAZY_PARTITIONS, 0)),
+                    EntryColumns::All => assert_eq!((codes, whole), (0, LAZY_PARTITIONS)),
+                }
+                let metrics = Arc::new(LocalMetricsCollector::default());
+                let (partitions, dists) = index.find_partitions(&query).unwrap();
+                let probes = partitions.len();
+                let batches = index
+                    .clone()
+                    .search_partitions(
+                        query.clone(),
+                        Arc::new(partitions),
+                        Arc::new(dists),
+                        0,
+                        probes,
+                        Arc::new(NoFilter),
+                        None,
+                        metrics.clone(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let result = concat_batches(&VECTOR_RESULT_SCHEMA, batches.iter()).unwrap();
+                assert_eq!(metrics.index_cache_misses(), 0, "{entry_columns}");
+                assert!(metrics.index_cache_hits() >= probes, "{entry_columns}");
+                assert_eq!(
+                    metrics.parts_loaded.load(Ordering::Relaxed),
+                    0,
+                    "{entry_columns}"
+                );
+                results.push(result_bits(&result));
+            }
+            assert_eq!(results[0], results[1]);
+        }
+
+        /// A native index whose file stores its sign codes unpacked keeps
+        /// them packed in its code-only entries: every partition built from a
+        /// cached entry uses the entry's codes as they are, and searches
+        /// return the results of full entries, which pack the codes on every
+        /// construction.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_code_only_entries_keep_unpacked_codes_packed() {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (batch, centroids) = lazy_test_data();
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let mut dataset = Dataset::write(reader, dir.as_str(), None).await.unwrap();
+            let mut params = VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::try_with_centroids(LAZY_PARTITIONS, centroids).unwrap(),
+                RQBuildParams::new(7),
+            );
+            params.skip_transpose(true);
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, true)
+                .await
+                .unwrap();
+            let vectors = batch["vector"].as_fixed_size_list();
+            let mut results = Vec::new();
+            for entry_columns in [EntryColumns::All, EntryColumns::Codes] {
+                let (_dataset, index, _) = open_entry_columns_test_index(
+                    dir.as_str(),
+                    LazyTestCache::ColdUngated,
+                    OriginLatencyClass::High,
+                    true,
+                    entry_columns,
+                )
+                .await;
+                let ivf = lazy_index(&index);
+                assert!(!ivf.storage.metadata().packed);
+                let mut bits = Vec::new();
+                for key in [vectors.value(0), vectors.value(777)] {
+                    for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
+                        let mut query = lazy_test_query(key.clone(), 100, 8);
+                        query.approx_mode = approx_mode;
+                        let result = search_global(&index, &query, Arc::new(NoFilter))
+                            .await
+                            .unwrap();
+                        bits.push(result_bits(&result));
+                    }
+                }
+                results.push(bits);
+                if entry_columns == EntryColumns::Codes {
+                    for partition in 0..LAZY_PARTITIONS {
+                        if ivf.storage.partition_size(partition) == 0 {
+                            continue;
+                        }
+                        let loaded = ivf
+                            .load_partition(partition, true, &NoOpMetricsCollector)
+                            .await
+                            .unwrap();
+                        let cached = ivf
+                            .index_cache
+                            .get_with_key(&PartitionCodesKey { partition })
+                            .await
+                            .unwrap();
+                        let storage_batch = loaded.storage.to_batches().unwrap().next().unwrap();
+                        let values = |batch: &RecordBatch| {
+                            batch[RABIT_CODE_COLUMN]
+                                .as_fixed_size_list()
+                                .values()
+                                .to_data()
+                                .buffers()[0]
+                                .as_ptr()
+                        };
+                        assert_eq!(
+                            values(&storage_batch),
+                            values(&cached.0),
+                            "partition {partition} rewrote its cached codes"
+                        );
+                    }
+                }
+            }
+            assert_eq!(results[0], results[1]);
+        }
+
         /// Gaps that coalesced origin reads are checked at, in ascending
         /// order so that neighbours compare a narrower gap with a wider one:
         /// touching ranges only, V11's S3 block size, a narrower gap for a
@@ -12318,7 +13271,9 @@ mod tests {
             }
 
             // The layout is what the tier checks of a high-latency index see.
-            lay_out_ex_planes(&low_index, &tiered, layout).await;
+            // Each index lays out its own entries: the high-latency one's
+            // hold their codes alone when its small columns are resident.
+            lay_out_ex_planes(&high_index, &tiered, layout).await;
             let ivf = lazy_index(&high_index);
             let cache = &ivf.index_cache;
             for partition in 0..LAZY_PARTITIONS {
@@ -12601,6 +13556,10 @@ mod tests {
             const QUERIES: usize = 3;
             const STAGING_STEPS: usize = 8;
             const ROW_READ_DELAY: Duration = Duration::from_millis(5);
+            // Rows of the dropped query: a quarter of the rows, so that the
+            // heap fills only after several probes, with a threshold that
+            // leaves the far gathers after them rows to read.
+            const DROPPED_QUERY_K: usize = LAZY_ROWS / 4;
             let _serial = LAZY_TEST_LOCK.lock().await;
             let dir = TempStrDir::default();
             let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
@@ -12700,6 +13659,14 @@ mod tests {
             }
 
             // A query dropped while a far gather holds a permit returns it.
+            // A permit is seen only while its gather reads rows, for the row
+            // read delay: a far gather whose rows the threshold prunes holds
+            // it for no time. The first probe of a query with `SMALL_K` fills
+            // the heap, and whether its threshold leaves any far gather rows
+            // depends on how far staging ran ahead of scoring, so this query
+            // takes a `k` that leaves the far gathers rows to read.
+            let mut dropped = queries[0].clone();
+            dropped.k = DROPPED_QUERY_K;
             let permits = ivf.storage.lazy_far_permits(&one_permit).unwrap();
             ivf.set_layered_lazy_config_for_test(one_permit);
             tiered.clear().await;
@@ -12709,7 +13676,7 @@ mod tests {
                 }
             };
             let finished = tokio::select! {
-                result = search_global(&index, &queries[0], filter.clone()) => Some(result),
+                result = search_global(&index, &dropped, filter.clone()) => Some(result),
                 () = permit_taken => None,
             };
             assert!(

@@ -242,6 +242,10 @@ pub const SIGN_BOUNDS_PLANE: u8 = 3;
 /// plane over the high plane over the low plane.
 const SIGN_PLANE_MEMORY_PRIORITY: u8 = 3;
 
+/// Appended to the key of a sign, high or low plane entry that holds its
+/// codes alone ([`EntryColumns::Codes`]).
+const CODE_ONLY_KEY_SUFFIX: &str = "-codes";
+
 /// Where a layered index's cache keeps the estimator bounds columns
 /// ([`HIGH_BOUNDS_COLUMN`], [`FULL_BOUNDS_COLUMN`]). The placement decides
 /// what the sign plane entry holds, so it is part of that entry's key.
@@ -274,6 +278,47 @@ impl std::fmt::Display for SignBounds {
     }
 }
 
+/// Which columns an IVF_RQ index's cache entries hold: a layered
+/// partition's plane entries and a native flat partition's entry. The
+/// composition decides what an entry holds, so it is part of its key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum EntryColumns {
+    /// Every column a read of the plane or partition returns.
+    #[default]
+    All,
+    /// Only the columns the index's resident store does not keep: the codes
+    /// and the estimator bounds (see [`plane_entry_columns`]). Every read
+    /// attaches copies of the store's rows of the others, so the scored
+    /// batch is the one an `All` entry holds. Only an index whose small
+    /// columns are resident keeps such entries.
+    Codes,
+}
+
+impl EntryColumns {
+    /// The spelling of `LANCE_RQ_ENTRY_COLUMNS`: `all` or `codes`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Codes => "codes",
+        }
+    }
+
+    /// What an index that asks for `self` keeps in its entries: `Codes`
+    /// needs the resident store, so without it the entries hold `All`.
+    pub fn resolve(self, resident: bool) -> Self {
+        match self {
+            Self::Codes if resident => Self::Codes,
+            _ => Self::All,
+        }
+    }
+}
+
+impl std::fmt::Display for EntryColumns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Plane keys live under the immutable index UUID namespace.
 pub struct PlaneKey {
     pub partition: usize,
@@ -281,17 +326,26 @@ pub struct PlaneKey {
     /// The index's bounds placement. Only the sign plane's key depends on
     /// it: the other planes hold the same columns under either placement.
     pub sign_bounds: SignBounds,
+    /// What the index's entries hold. The keys of planes 0-2 depend on it;
+    /// the bounds plane holds file columns alone either way.
+    pub entry_columns: EntryColumns,
 }
 impl CacheKey for PlaneKey {
     type ValueType = PlaneBatch;
     fn key(&self) -> Cow<'_, str> {
-        // Persisted entries outlive the process, so each sign-plane
-        // composition needs its own key. The sign plane with bounds keeps
-        // the key its entries had before the bounds plane existed.
-        if self.plane == 0 && self.sign_bounds == SignBounds::Lazy {
-            format!("{}:0-bounds", self.partition).into()
+        // Persisted entries outlive the process, so each composition of an
+        // entry needs its own key. The sign plane with bounds keeps the key
+        // its entries had before the bounds plane existed, and a full entry
+        // the key it had before code-only entries existed.
+        let codes = if self.entry_columns == EntryColumns::Codes && self.plane < SIGN_BOUNDS_PLANE {
+            CODE_ONLY_KEY_SUFFIX
         } else {
-            format!("{}:{}", self.partition, self.plane).into()
+            ""
+        };
+        if self.plane == 0 && self.sign_bounds == SignBounds::Lazy {
+            format!("{}:0-bounds{codes}", self.partition).into()
+        } else {
+            format!("{}:{}{codes}", self.partition, self.plane).into()
         }
     }
     fn type_name() -> &'static str {
@@ -354,6 +408,23 @@ pub fn plane_columns(plane: u8, sign_bounds: SignBounds) -> &'static [&'static s
             &SIGN_PLANE_WITH_BOUNDS_COLUMNS[BOUNDS_COLUMNS_START..]
         }
         _ => &[],
+    }
+}
+
+/// Columns a plane entry of `plane` holds under `entry_columns`, in
+/// [`plane_columns`] order: every column of the plane, or under
+/// [`EntryColumns::Codes`] only those a resident store does not keep.
+pub fn plane_entry_columns(
+    plane: u8,
+    sign_bounds: SignBounds,
+    entry_columns: EntryColumns,
+) -> Vec<&'static str> {
+    let columns = plane_columns(plane, sign_bounds).iter().copied();
+    match entry_columns {
+        EntryColumns::All => columns.collect(),
+        EntryColumns::Codes => columns
+            .filter(|name| super::resident::is_file_column(name))
+            .collect(),
     }
 }
 
@@ -728,17 +799,20 @@ mod tests {
 
     #[test]
     fn plane_key_codec_tags_plane_and_priority() {
-        for (plane, priority) in [(0, 3), (1, 2), (2, 1), (SIGN_BOUNDS_PLANE, 2)] {
-            let codec = PlaneKey {
-                partition: 7,
-                plane,
-                sign_bounds: SignBounds::Lazy,
+        for entry_columns in [EntryColumns::All, EntryColumns::Codes] {
+            for (plane, priority) in [(0, 3), (1, 2), (2, 1), (SIGN_BOUNDS_PLANE, 2)] {
+                let codec = PlaneKey {
+                    partition: 7,
+                    plane,
+                    sign_bounds: SignBounds::Lazy,
+                    entry_columns,
+                }
+                .codec_for_key()
+                .unwrap();
+                assert_eq!(codec.plane_tag(), Some(plane));
+                assert_eq!(codec.memory_priority(), priority);
+                assert!(codec.supports_row_selection());
             }
-            .codec_for_key()
-            .unwrap();
-            assert_eq!(codec.plane_tag(), Some(plane));
-            assert_eq!(codec.memory_priority(), priority);
-            assert!(codec.supports_row_selection());
         }
         assert_eq!(PlaneKey::codec().unwrap().plane_tag(), None);
     }
@@ -752,6 +826,7 @@ mod tests {
                 partition: 7,
                 plane,
                 sign_bounds,
+                entry_columns: EntryColumns::All,
             };
             plane_key.key().into_owned()
         };
@@ -784,6 +859,84 @@ mod tests {
             assert_eq!(plane_columns(plane, SignBounds::Lazy).len(), 3);
         }
         assert!(plane_columns(SIGN_BOUNDS_PLANE + 1, SignBounds::Lazy).is_empty());
+    }
+
+    /// Code-only entries of the sign, high and low planes take their own
+    /// keys; every other key is the one its entries had before, so full
+    /// entries persisted by an earlier build keep being found.
+    #[test]
+    fn plane_key_separates_entry_columns() {
+        let key = |plane, sign_bounds, entry_columns| {
+            PlaneKey {
+                partition: 7,
+                plane,
+                sign_bounds,
+                entry_columns,
+            }
+            .key()
+            .into_owned()
+        };
+        let full_keys = [
+            (0, SignBounds::Lazy, "7:0-bounds"),
+            (0, SignBounds::Eager, "7:0"),
+            (1, SignBounds::Lazy, "7:1"),
+            (1, SignBounds::Eager, "7:1"),
+            (2, SignBounds::Lazy, "7:2"),
+            (2, SignBounds::Eager, "7:2"),
+            (SIGN_BOUNDS_PLANE, SignBounds::Lazy, "7:3"),
+            (SIGN_BOUNDS_PLANE, SignBounds::Eager, "7:3"),
+        ];
+        for (plane, sign_bounds, full) in full_keys {
+            assert_eq!(key(plane, sign_bounds, EntryColumns::All), full);
+            let codes = key(plane, sign_bounds, EntryColumns::Codes);
+            if plane == SIGN_BOUNDS_PLANE {
+                assert_eq!(codes, full);
+            } else {
+                assert_eq!(codes, format!("{full}-codes"));
+            }
+        }
+    }
+
+    /// A code-only entry holds the plane's code and bounds columns, in the
+    /// plane's order; the bounds plane holds the same columns either way.
+    #[test]
+    fn plane_entry_columns_keep_file_columns() {
+        for sign_bounds in [SignBounds::Lazy, SignBounds::Eager] {
+            for plane in [0, 1, 2, SIGN_BOUNDS_PLANE] {
+                assert_eq!(
+                    plane_entry_columns(plane, sign_bounds, EntryColumns::All),
+                    plane_columns(plane, sign_bounds)
+                );
+            }
+        }
+        let codes =
+            |plane, sign_bounds| plane_entry_columns(plane, sign_bounds, EntryColumns::Codes);
+        assert_eq!(codes(0, SignBounds::Lazy), [RABIT_CODE_COLUMN]);
+        assert_eq!(
+            codes(0, SignBounds::Eager),
+            [RABIT_CODE_COLUMN, HIGH_BOUNDS_COLUMN, FULL_BOUNDS_COLUMN]
+        );
+        assert_eq!(codes(1, SignBounds::Lazy), [RABIT_BLOCKED_EX_CODE_COLUMN]);
+        assert_eq!(
+            codes(2, SignBounds::Eager),
+            [RABIT_BLOCKED_EX_CODE_LO_COLUMN]
+        );
+        assert_eq!(
+            codes(SIGN_BOUNDS_PLANE, SignBounds::Lazy),
+            [HIGH_BOUNDS_COLUMN, FULL_BOUNDS_COLUMN]
+        );
+        assert!(codes(SIGN_BOUNDS_PLANE, SignBounds::Eager).is_empty());
+    }
+
+    #[test]
+    fn entry_columns_need_a_resident_store() {
+        assert_eq!(EntryColumns::Codes.resolve(true), EntryColumns::Codes);
+        assert_eq!(EntryColumns::Codes.resolve(false), EntryColumns::All);
+        assert_eq!(EntryColumns::All.resolve(true), EntryColumns::All);
+        assert_eq!(EntryColumns::All.resolve(false), EntryColumns::All);
+        assert_eq!(EntryColumns::default(), EntryColumns::All);
+        assert_eq!(EntryColumns::Codes.to_string(), "codes");
+        assert_eq!(EntryColumns::All.to_string(), "all");
     }
 
     /// A layered store needs the full bounds only to prune full precision on

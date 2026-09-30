@@ -6,10 +6,11 @@
 //! The counters only advance while a query runs the lazy scan (or is checked
 //! for it), so production queries with the scan disabled touch at most the
 //! `ineligible_disabled` counter. The `resident_columns_*`,
-//! `resident_store_evictions` and `pinned_overflow` counters are the
-//! exception: they advance when an IVF_RQ index, layered or not, opens with
-//! or loads its resident columns. So is `storage_construct_repacks`, which
-//! advances when any RaBitQ storage is built from codes it must rewrite.
+//! `resident_attach_*`, `resident_store_evictions` and `pinned_overflow`
+//! counters are the exception: they advance when an IVF_RQ index, layered or
+//! not, opens with, loads or reads through its resident columns. So is
+//! `storage_construct_repacks`, which advances when any RaBitQ storage is
+//! built from codes it must rewrite.
 //! Readers take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -323,6 +324,18 @@ layered_lazy_counters! {
         /// built from codes stored packed and blocked, as the index builder
         /// writes them and cache entries keep them, rewrites nothing.
         storage_construct_repacks,
+        /// Batches assembled with copies of an index's resident rows: every
+        /// read of a plane or partition from the file that takes its small
+        /// columns from the resident store, and every read of a code-only
+        /// cache entry (`LANCE_RQ_ENTRY_COLUMNS=codes`), hits included.
+        resident_attach_calls,
+        /// Rows those batches hold.
+        resident_attach_rows,
+        /// Bytes of the resident rows copied into them: what a full entry
+        /// would have kept in the cache.
+        resident_attach_bytes,
+        /// Time spent assembling them, copies included.
+        resident_attach_ns,
     }
     ranked {
         /// Probes gathered lazily.
