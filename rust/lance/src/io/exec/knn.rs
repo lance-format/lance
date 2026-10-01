@@ -3659,6 +3659,17 @@ mod tests {
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
         let first_schema = first.schema();
         let mut dataset = Dataset::write(first, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_owned()),
+                &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        let first_index = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let first_version = dataset.manifest.version;
         let first_fragments = dataset.fragment_bitmap.as_ref().clone();
         let field_id = dataset.schema().field("vector").unwrap().id;
@@ -3674,7 +3685,7 @@ mod tests {
         let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
         let old_segment = IndexMetadata {
-            uuid: Uuid::new_v4(),
+            uuid: first_index[0].uuid,
             fields: vec![field_id],
             covering_fields: vec![],
             name: "vector_idx".to_string(),
@@ -3735,6 +3746,50 @@ mod tests {
         let mut rows_with_unowned_entry = old_partition_rows;
         rows_with_unowned_entry.insert(u64::from(appended_fragment_id) << 32);
         assert!(!segment_prefilter.is_empty_for(&rows_with_unowned_entry));
+
+        let index = dataset
+            .open_vector_index(
+                "vector",
+                &old_segment.uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let batch_query = Query {
+            column: "vector".to_owned(),
+            key: Arc::new(Float32Array::from(vec![
+                0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
+            ])),
+            k: 5,
+            ..base_query()
+        };
+        let partition = Arc::new(UInt32Array::from(vec![0]));
+        let centroid_dist = Arc::new(Float32Array::from(vec![0.0]));
+        let partitions = vec![partition; 2];
+        let centroid_dists = vec![centroid_dist; 2];
+        let unfiltered = index
+            .clone()
+            .search_partitions_batch(
+                batch_query.clone(),
+                partitions.clone(),
+                centroid_dists.clone(),
+                Arc::new(lance_index::prefilter::NoFilter),
+                Arc::new(lance_index::metrics::NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        let owned = index
+            .search_partitions_batch(
+                batch_query,
+                partitions,
+                centroid_dists,
+                segment_prefilter,
+                Arc::new(lance_index::metrics::NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owned, unfiltered);
+        assert!(owned.iter().all(|batch| batch.num_rows() == 5));
 
         let ordinary_base = Arc::new(
             DatasetPreFilter::new(dataset, &[old_segment, new_segment], None)
