@@ -493,11 +493,33 @@ pub(crate) enum VectorSegmentCompatibility {
     QueryCompatibleModelsDiffer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum VectorModelMismatch {
     StorageFormat,
+    /// IVF_RQ segments that store their rows in different layouts, the
+    /// first segment's and another's described.
+    RabitLayout {
+        expected: String,
+        found: String,
+    },
     IvfCentroids,
     QuantizerMetadata,
+}
+
+/// How an IVF_RQ quantizer lays out the rows its index stores, layered or
+/// native and in columns or plane rows, as `native/columns`. `None` for
+/// other quantizers.
+fn rabit_layout(quantizer: &Quantizer) -> Option<String> {
+    let Quantizer::Rabit(quantizer) = quantizer else {
+        return None;
+    };
+    let metadata = quantizer.metadata(None);
+    let kind = if metadata.layered {
+        "layered"
+    } else {
+        "native"
+    };
+    Some(format!("{kind}/{}", metadata.row_layout))
 }
 
 fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
@@ -585,7 +607,16 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
             _ => {}
         }
 
-        if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
+        let quantizer = index.quantizer();
+        // Segments laid out differently cannot be merged, whatever model
+        // they share: the merged segment has a single layout.
+        if let (Some(expected), Some(found)) =
+            (rabit_layout(&first_quantizer), rabit_layout(&quantizer))
+            && expected != found
+        {
+            return Some(VectorModelMismatch::RabitLayout { expected, found });
+        }
+        if !shared_quantizer_model(&first_quantizer, &quantizer) {
             return Some(VectorModelMismatch::QuantizerMetadata);
         }
     }
@@ -611,6 +642,10 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
     match vector_model_mismatch(indices) {
         Some(VectorModelMismatch::StorageFormat) => Err(Error::index(format!(
             "{operation}: vector index segments do not share a storage format"
+        ))),
+        Some(VectorModelMismatch::RabitLayout { expected, found }) => Err(Error::index(format!(
+            "{operation}: IVF_RQ segments of different row layouts cannot be merged: the \
+             first segment is {expected} and another {found}"
         ))),
         Some(VectorModelMismatch::IvfCentroids) => Err(Error::index(format!(
             "{operation}: vector index segments do not share IVF centroids"
@@ -647,6 +682,8 @@ fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
                 && left.code_dim == right.code_dim
                 && left.num_bits == right.num_bits
                 && left.packed == right.packed
+                && left.layered == right.layered
+                && left.row_layout == right.row_layout
                 && left.query_estimator == right.query_estimator
                 && left.fast_rotation_signs == right.fast_rotation_signs
                 && match (&left.rotate_mat, &right.rotate_mat) {

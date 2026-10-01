@@ -2526,4 +2526,110 @@ mod tests {
             }
         }
     }
+
+    /// Segments of one index whose IVF_RQ rows are laid out differently, in
+    /// columns or plane rows, layered or native, are never merged into one:
+    /// an explicit merge fails naming both layouts, and a default optimize
+    /// indexes new rows in a segment of the last segment's layout and keeps
+    /// the others as they are.
+    #[rstest]
+    #[case::row_layout((false, RQRowLayout::Columns), (false, RQRowLayout::PlaneRows))]
+    #[case::layered((false, RQRowLayout::Columns), (true, RQRowLayout::Columns))]
+    #[case::layered_plane_rows((true, RQRowLayout::PlaneRows), (false, RQRowLayout::PlaneRows))]
+    #[tokio::test]
+    async fn test_optimize_does_not_merge_mixed_rq_layouts(
+        #[case] first: (bool, RQRowLayout),
+        #[case] second: (bool, RQRowLayout),
+    ) {
+        let model_dir = TempStrDir::default();
+        let dir = TempStrDir::default();
+        let model = column_dataset(
+            model_dir.as_str(),
+            false,
+            RQRotationType::Fast,
+            LanceFileVersion::V2_2,
+        )
+        .await;
+        let rotation = index_storage(&model).await.metadata().clone();
+        let mut dataset = write_dataset(dir.as_str(), LanceFileVersion::V2_2, ROWS / 2).await;
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let mut segments = Vec::new();
+        for (fragment, (layered, row_layout)) in fragments.iter().zip([first, second]) {
+            let mut rq = rq_params(layered, RQRotationType::Fast).with_row_layout(row_layout);
+            rq.rotation = Some(rotation.clone());
+            let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params(), rq);
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name(INDEX_NAME.to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let uuids: Vec<Uuid> = segments.iter().map(|segment| segment.uuid).collect();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", segments)
+            .await
+            .unwrap();
+        let layout = |(layered, row_layout): (bool, RQRowLayout)| {
+            format!(
+                "{}/{row_layout}",
+                if layered { "layered" } else { "native" }
+            )
+        };
+
+        let err = dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("different row layouts"), "{message}");
+        assert!(message.contains(&layout(first)), "{message}");
+        assert!(message.contains(&layout(second)), "{message}");
+
+        let batch = test_batch(200, ROWS as u64, 2);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        dataset.append(reader, None).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(segments.len(), 3);
+        for uuid in &uuids {
+            assert!(segments.iter().any(|segment| segment.uuid == *uuid));
+        }
+        let appended = segments
+            .iter()
+            .find(|segment| !uuids.contains(&segment.uuid))
+            .unwrap();
+        let Some(Compression::Rq(rq)) = rq_details(appended).unwrap().compression else {
+            unreachable!()
+        };
+        let row_layout = match rq.row_layout() {
+            rabit_quantization::RowLayout::Columns => RQRowLayout::Columns,
+            rabit_quantization::RowLayout::PlaneRows => RQRowLayout::PlaneRows,
+        };
+        assert_eq!(row_layout, second.1);
+        assert_eq!(appended.index_version, ivf_rq_index_version(second.1));
+        let index = dataset
+            .open_vector_index("vector", &appended.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let index = index.as_any().downcast_ref::<IvfRq>().unwrap();
+        assert_eq!(index.row_layout(), second.1);
+        // Every row is found across the segments of both layouts.
+        let (ids, _) = search(
+            &dataset,
+            query(11).as_ref(),
+            ROWS + 200,
+            PARTITIONS,
+            RQPrecision::Full,
+        )
+        .await;
+        assert_eq!(ids.len(), ROWS + 200);
+    }
 }
