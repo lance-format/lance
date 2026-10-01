@@ -857,9 +857,11 @@ pub const LAZY_ORIGIN_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_MAX_RUNS";
 pub const LAZY_ORIGIN_GAP_BYTES_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_GAP_BYTES";
 /// The gap `auto` gives the sparse origin reads of an
 /// [`OriginLatencyClass::High`] origin. S3 latency per request is about flat
-/// from 60 KiB to 700 KiB, and merging runs up to 1 MiB apart cut the lazy
-/// scan's origin requests by about 38% for about 35% more bytes.
-pub const HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES: u64 = 1024 * 1024;
+/// from 60 KiB to 700 KiB, so merging runs up to 256 KiB apart makes about a
+/// third fewer S3 requests than the 64 KiB block size. Lazy scans on S3 were
+/// faster with it than with 1 MiB, which makes fewer requests but reads more
+/// bytes between the runs.
+pub const HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES: u64 = 256 * 1024;
 /// Staleness window of the gathers of probes that read an ex plane from an
 /// [`OriginLatencyClass::High`] origin, because no cache tier held their high
 /// or low plane when they were staged (default 64): such a gather may be
@@ -4021,7 +4023,7 @@ mod tests {
             classes.map(|class| LazyOriginGap::Auto.resolve(class, block_size)),
             [block_size, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES]
         );
-        for bytes in [0, 64 * 1024, 256 * 1024, u64::MAX] {
+        for bytes in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
             let gap = LazyOriginGap::Bytes(bytes);
             assert_eq!(
                 classes.map(|class| gap.coalesce_gap(class)),

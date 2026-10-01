@@ -12790,16 +12790,16 @@ mod tests {
             assert_eq!(results[0], results[1]);
         }
 
-        /// Gaps that coalesced origin reads are checked at, in ascending
-        /// order so that neighbours compare a narrower gap with a wider one:
-        /// touching ranges only, V11's S3 block size, a narrower gap for a
-        /// high-latency origin, the gap `auto` gives one, and every range of
-        /// a column page.
+        /// Gaps that coalesced origin reads are checked at, in strictly
+        /// ascending order so that neighbours compare a narrower gap with a
+        /// wider one: touching ranges only, V11's S3 block size, the gap
+        /// `auto` gives a high-latency origin, the wider 1 MiB it gave
+        /// before, and every range of a column page.
         const COALESCE_TEST_GAPS: [u64; 5] = [
             0,
             64 * 1024,
-            256 * 1024,
             HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
+            1024 * 1024,
             u64::MAX,
         ];
         /// Spacing of the single rows of a sparse selection.
@@ -12820,7 +12820,10 @@ mod tests {
         async fn test_layered_read_plane_matches_across_coalesce_gaps(
             #[case] version: LanceFileVersion,
         ) {
-            assert!(COALESCE_TEST_GAPS.is_sorted(), "{COALESCE_TEST_GAPS:?}");
+            assert!(
+                COALESCE_TEST_GAPS.is_sorted_by(|narrower, wider| narrower < wider),
+                "{COALESCE_TEST_GAPS:?}"
+            );
             let _serial = LAZY_TEST_LOCK.lock().await;
             let dir = TempStrDir::default();
             write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
@@ -12927,7 +12930,10 @@ mod tests {
             #[case] bits: u8,
             #[case] distance_type: DistanceType,
         ) {
-            assert!(COALESCE_TEST_GAPS.is_sorted(), "{COALESCE_TEST_GAPS:?}");
+            assert!(
+                COALESCE_TEST_GAPS.is_sorted_by(|narrower, wider| narrower < wider),
+                "{COALESCE_TEST_GAPS:?}"
+            );
             let _serial = LAZY_TEST_LOCK.lock().await;
             let dir = TempStrDir::default();
             let (_, batch) = write_lazy_test_dataset(dir.as_str(), bits, distance_type).await;
