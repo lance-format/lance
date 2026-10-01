@@ -62,9 +62,9 @@ use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
 pub use crate::vector::bq::resident::{
-    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, resident_columns_bytes,
-    resident_store_charge, resident_store_count, resident_store_is_live, resident_store_leases,
-    resident_store_preopen_lease,
+    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentPreopen,
+    resident_columns_bytes, resident_store_charge, resident_store_count, resident_store_is_live,
+    resident_store_leases, resident_store_preopen_lease,
 };
 
 async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>

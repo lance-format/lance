@@ -195,6 +195,24 @@ pub fn resident_store_is_live(file: &IndexFileKey) -> bool {
         .is_some_and(|slot| slot.is_loaded())
 }
 
+/// An index open's lease on the cached resident store of its file
+/// ([`resident_store_preopen_lease`]), which also holds the store: a store
+/// the cache could not pin (its lease overflowed, or the backend never pins)
+/// and evicted during the open stays loaded, so the open's handle admits it
+/// again rather than loading it again.
+#[derive(Debug, Clone)]
+pub struct ResidentPreopen {
+    slot: Arc<ResidentSlot>,
+    lease: CacheLease,
+}
+
+impl ResidentPreopen {
+    /// The lease on the store.
+    pub fn lease(&self) -> &CacheLease {
+        &self.lease
+    }
+}
+
 /// Lease the resident store of `file` if `cache`, the index's namespace of
 /// the index cache without a fragment reuse segment, holds it in RAM. An
 /// index open takes it before its first index-cache access, whose admissions
@@ -205,14 +223,17 @@ pub fn resident_store_is_live(file: &IndexFileKey) -> bool {
 pub async fn resident_store_preopen_lease(
     cache: &LanceCache,
     file: &IndexFileKey,
-) -> Option<CacheLease> {
-    let (_, lease) = cache
+) -> Option<ResidentPreopen> {
+    let (entry, lease) = cache
         .get_resident_leased_with_key(&ResidentColumnsKey::new(file))
         .await?;
     layered_stats::counters()
         .resident_columns_preopen_leases
         .incr();
-    Some(lease)
+    Some(ResidentPreopen {
+        slot: entry.slot.clone(),
+        lease,
+    })
 }
 
 /// Cache key of the resident store of an IVF_RQ index file. An index keeps
@@ -352,18 +373,25 @@ impl ResidentColumns {
     /// columns resident: the store every live handle of the file shares,
     /// charged in `cache`, the index's namespace of the index cache without
     /// a fragment reuse segment. `preopen` is the lease the open took on the
-    /// cached store ([`resident_store_preopen_lease`]), which the handle
-    /// keeps. A store already loaded is leased now and admitted again if the
-    /// cache lost it; otherwise the first read loads, admits and leases it.
-    /// Under [`ResidentLifetime::Process`] the store also keeps a lease for
-    /// the life of the process once leased.
+    /// cached store ([`resident_store_preopen_lease`]), whose lease the
+    /// handle keeps and whose store it binds, loaded even if the cache
+    /// evicted it since. A store already loaded is leased now and admitted
+    /// again if the cache lost it; otherwise the first read loads, admits
+    /// and leases it. Under [`ResidentLifetime::Process`] the store also
+    /// keeps a lease for the life of the process once leased.
     pub async fn in_index_cache(
         cache: &LanceCache,
         file: &IndexFileKey,
-        preopen: Option<CacheLease>,
+        preopen: Option<ResidentPreopen>,
         lifetime: ResidentLifetime,
     ) -> Self {
-        let (slot, live) = shared_slot(file);
+        // The pre-open lease's store is the file's live store, which the
+        // registry would hand out too, kept alive even if the cache evicted
+        // it during the open.
+        let (slot, live) = match &preopen {
+            Some(preopen) => (preopen.slot.clone(), true),
+            None => shared_slot(file),
+        };
         let stats = layered_stats::counters();
         stats.resident_columns_binds.incr();
         if live && slot.is_loaded() {
@@ -378,8 +406,8 @@ impl ResidentColumns {
             }),
             lease: OnceLock::new(),
         };
-        if let Some(lease) = preopen {
-            handle.adopt(lease);
+        if let Some(preopen) = preopen {
+            handle.adopt(preopen.lease);
         }
         handle.ensure_charged().await;
         handle
@@ -955,7 +983,7 @@ mod tests {
         assert!(cache.peek_resident_with_key(&key).await);
 
         let preopen = resident_store_preopen_lease(&cache, &file).await.unwrap();
-        let preopen_pin = preopen.pin().clone();
+        let preopen_pin = preopen.lease().pin().clone();
         let handle =
             ResidentColumns::in_index_cache(&cache, &file, Some(preopen), ResidentLifetime::Index)
                 .await;
@@ -1068,6 +1096,36 @@ mod tests {
             assert_eq!(pinned, admitted, "{capacity}");
             assert_eq!(cache.pinned_stats().overflow > 0, !admitted, "{capacity}");
         }
+    }
+
+    /// A pre-open lease holds its store: when the cache drops the store's
+    /// entry between the lease and the bind, as an open's admissions can
+    /// evict a store the cache could not pin, the bound handle gets the
+    /// loaded store and admits it again rather than loading it again.
+    #[tokio::test]
+    async fn preopen_lease_keeps_a_store_evicted_during_the_open() {
+        let file = test_file("preopen-evicted");
+        let cache = pinning_cache();
+        let key = ResidentColumnsKey::new(&file);
+        // A loaded store, idle in the cache, which alone holds it.
+        let slot = loaded_slot(&file, 1000);
+        let handle =
+            ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Index).await;
+        let held = Arc::downgrade(&slot);
+        drop((handle, slot));
+        assert!(held.upgrade().is_some());
+
+        let preopen = resident_store_preopen_lease(&cache, &file).await.unwrap();
+        cache.clear().await;
+        assert!(!cache.peek_resident_with_key(&key).await);
+        let handle =
+            ResidentColumns::in_index_cache(&cache, &file, Some(preopen), ResidentLifetime::Index)
+                .await;
+        assert_eq!(handle.loaded_bytes(), Some(4000));
+        assert!(Arc::ptr_eq(&handle.slot, &held.upgrade().unwrap()));
+        assert!(cache.peek_resident_with_key(&key).await);
+        assert!(handle.lease().is_some_and(CacheLease::is_pinned));
+        assert_eq!(handle.slot.pin.holders(), 1);
     }
 
     /// Under the `process` lifetime a store keeps a lease once its first

@@ -33,7 +33,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    CacheLease, KeyBuilder, LanceCache, WeakLanceCache, pinned_partition_cap,
+    KeyBuilder, LanceCache, WeakLanceCache, pinned_partition_cap,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -67,8 +67,9 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
     IndexFileKey, LayeredLazyConfig, OriginLatencyClass, PlaneAccessTracker, QueryResidual,
     QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentColumns,
-    ResidentColumnsSetting, VectorStore, entry_columns_setting, origin_latency_setting,
-    resident_columns_setting, resident_lifetime_setting, resident_store_fits, sign_bounds_setting,
+    ResidentColumnsSetting, ResidentPreopen, VectorStore, entry_columns_setting,
+    origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
+    resident_store_fits, sign_bounds_setting,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -1081,10 +1082,10 @@ pub(crate) struct IvfOpenContext {
     pub(crate) file_cache: Option<LanceCache>,
     /// A lease on the index's resident store that the opener took before
     /// its first index-cache access (see
-    /// [`lance_index::vector::storage::resident_store_preopen_lease`]), kept
-    /// by an index that keeps its small columns resident and dropped by any
-    /// other.
-    pub(crate) resident_lease: Option<CacheLease>,
+    /// [`lance_index::vector::storage::resident_store_preopen_lease`]),
+    /// which holds the store until an index that keeps its small columns
+    /// resident binds it, and is dropped by any other.
+    pub(crate) resident_lease: Option<ResidentPreopen>,
 }
 
 /// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
