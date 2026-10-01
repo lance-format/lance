@@ -33,8 +33,8 @@ use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int8DictionaryArray, Int32Array, Int64Array,
-    RecordBatchIterator, StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int8DictionaryArray, Int32Array,
+    Int64Array, RecordBatchIterator, StringArray, UInt8Array, UInt8DictionaryArray,
     cast::as_string_array,
     types::{Float32Type, Int32Type},
 };
@@ -3130,6 +3130,35 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
             .to_string()
             .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
     );
+}
+
+/// `dict:{value}:{index}:false` cannot express a value type whose own logical
+/// string carries ':', so `Schema::try_from` used to panic on the way in rather
+/// than rejecting the write.
+#[tokio::test]
+async fn write_rejects_dictionary_value_type_that_has_no_logical_type() {
+    let values = Decimal128Array::from(vec![Some(100), Some(200), Some(300)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let indices = UInt8Array::from(vec![0, 1, 2, 1]);
+    let dictionary = UInt8DictionaryArray::try_new(indices, Arc::new(values)).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .expect_err("a decimal-valued dictionary has no parseable logical type");
+
+    assert!(matches!(error, Error::Schema { .. }));
+    assert!(error.to_string().contains("does not parse back"));
 }
 
 #[rstest]

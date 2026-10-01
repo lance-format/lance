@@ -3,7 +3,7 @@
 
 //! FtsIndexExec - Full-text search with MVCC visibility.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use lance_core::{Error, Result};
 use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
 use super::super::builder::FtsQuery;
-use super::newest_pk_positions;
+use super::{newest_pk_positions, scan_record_batch};
 use crate::dataset::mem_wal::index::{SearchOptions, search_cross_column};
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
@@ -329,6 +329,7 @@ impl FtsIndexExec {
         let mut all_row_positions: Vec<u64> = Vec::with_capacity(results.len());
         let mut all_doc_indices: Vec<Option<Vec<u32>>> = Vec::with_capacity(results.len());
         let mut all_columns: Vec<Vec<Arc<dyn arrow_array::Array>>> = Vec::new();
+        let mut scan_batches = HashMap::<usize, RecordBatch>::new();
 
         // Initialize column vectors based on first batch's schema
         let first_batch = self.batch_store.get(0);
@@ -344,11 +345,15 @@ impl FtsIndexExec {
             if let Some(batch_range) = self.find_batch(pos as usize)
                 && let Some(stored) = self.batch_store.get(batch_range.batch_id)
             {
+                let data = match scan_batches.entry(batch_range.batch_id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(scan_record_batch(&stored.data)?),
+                };
                 let row_in_batch = (pos as usize - batch_range.start) as u32;
                 let indices = UInt32Array::from(vec![row_in_batch]);
 
                 // Take each column value
-                for (col_idx, col) in stored.data.columns().iter().enumerate() {
+                for (col_idx, col) in data.columns().iter().enumerate() {
                     let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
                     if all_columns.len() <= col_idx {
                         all_columns.push(Vec::new());
@@ -389,7 +394,8 @@ impl FtsIndexExec {
                 let Some(first) = self.batch_store.get(0) else {
                     return Ok(vec![]);
                 };
-                let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+                let data_batch =
+                    RecordBatch::try_new(scan_record_batch(&first.data)?.schema(), final_columns)?;
                 let mask = predicate
                     .evaluate(&data_batch)?
                     .into_array(data_batch.num_rows())?;
@@ -491,7 +497,9 @@ impl FtsIndexExec {
             let source_fields = self
                 .batch_store
                 .get(0)
-                .map(|stored| stored.data.schema().fields().clone());
+                .map(|stored| scan_record_batch(&stored.data))
+                .transpose()?
+                .map(|batch| batch.schema().fields().clone());
             let mut projected: Vec<_> = match source_fields {
                 Some(fields) => take_projected_columns(
                     &final_columns,
@@ -582,7 +590,8 @@ impl FtsIndexExec {
             )?)
         };
 
-        let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+        let data_batch =
+            RecordBatch::try_new(scan_record_batch(&first.data)?.schema(), final_columns)?;
         let pk_indices = resolve_pk_indices(&data_batch, pk_columns)?;
         let keep = (0..data_batch.num_rows())
             .map(|row| {

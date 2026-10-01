@@ -1123,12 +1123,14 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         branch: str
-            Name of the branch to create.
+            Name of the branch to create. ``"main"`` is reserved for the
+            default branch and cannot be used as a new branch name.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -2933,9 +2935,12 @@ class LanceDataset(pa.dataset.Dataset):
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
         {'num_deleted_rows': 2}
         """
-        if isinstance(predicate, pa.compute.Expression):
-            predicate = str(predicate)
-        return self._ds.delete(predicate, conflict_retries, retry_timeout)
+        encoded_predicate = (
+            _serialize_expression(predicate, self._ds.schema)
+            if isinstance(predicate, pa.compute.Expression)
+            else predicate
+        )
+        return self._ds.delete(encoded_predicate, conflict_retries, retry_timeout)
 
     def truncate_table(self) -> None:
         """
@@ -3092,7 +3097,7 @@ class LanceDataset(pa.dataset.Dataset):
     def update(
         self,
         updates: Dict[str, str],
-        where: Optional[str] = None,
+        where: Optional[Union[str, Expression]] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
         data_storage_version: Optional[str] = None,
@@ -3104,8 +3109,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         updates : dict of str to str
             A mapping of column names to a SQL expression.
-        where : str, optional
-            A SQL predicate indicating which rows should be updated.
+        where : str or pa.compute.Expression, optional
+            A SQL predicate or pyarrow Expression indicating which rows should
+            be updated.
         conflict_retries : int, optional
             Number of times to retry the operation if there is contention.
             Default is 10.
@@ -3138,11 +3144,14 @@ class LanceDataset(pa.dataset.Dataset):
         1  4  b
         2  5  c
         """
-        if isinstance(where, pa.compute.Expression):
-            where = str(where)
+        encoded_where = (
+            _serialize_expression(where, self._ds.schema)
+            if isinstance(where, pa.compute.Expression)
+            else where
+        )
         return self._ds.update(
             updates,
-            where,
+            encoded_where,
             conflict_retries,
             retry_timeout,
             data_storage_version,
@@ -3267,7 +3276,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
 
         Returns
         -------
@@ -5233,7 +5243,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -5630,6 +5641,8 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+            Omitted (the default) keeps every index on the table updated,
+            including ones created later; an empty list keeps none.
         hnsw_params : dict, optional
             Per-index HNSW build-parameter overrides recorded as writer-config
             defaults, keyed by maintained vector index name. Each value is a dict
@@ -6801,6 +6814,34 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def _serialize_expression(
+    expression: pa.compute.Expression, schema: pa.Schema
+) -> bytes:
+    from pyarrow.substrait import serialize_expressions
+
+    # Keep each field's position so Substrait references still resolve against
+    # the stored schema when PyArrow cannot serialize an unrelated field's type.
+    scalar_schema = pa.schema(
+        [
+            (
+                pa.field(f"__unlikely_name_placeholder_{i}", pa.int8())
+                if _needs_substrait_placeholder(field.type)
+                else field
+            )
+            for i, field in enumerate(schema)
+        ]
+    )
+    serialized = serialize_expressions([expression], ["my_filter"], scalar_schema)
+    if isinstance(serialized, memoryview):
+        return serialized.tobytes()
+    try:
+        return serialized.to_pybytes()
+    except AttributeError:
+        raise TypeError(
+            f"serialize_expressions returned unexpected type {type(serialized)}"
+        )
+
+
 def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
     """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
 
@@ -6987,49 +7028,7 @@ class ScannerBuilder:
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
-            try:
-                from pyarrow.substrait import serialize_expressions
-
-                fields_without_lists = []
-                counter = 0
-                # Pyarrow cannot handle certain types when converting to
-                # Substrait (e.g. fixed_size_list at any nesting depth, or
-                # struct fields with non-None metadata left by extension types
-                # after a lance round-trip).  We replace any top-level field
-                # whose type tree contains such a type with an int8 placeholder
-                # so that ordinal field references in the filter remain correct.
-                # Filters are evaluated against the stored dataset fields.  The
-                # public schema may also contain scan-time fields such as _rowid.
-                for field in self.ds._ds.schema:
-                    if _needs_substrait_placeholder(field.type):
-                        pos = counter
-                        counter += 1
-                        fields_without_lists.append(
-                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
-                        )
-                    else:
-                        fields_without_lists.append(field)
-                        # Serialize the pyarrow compute expression toSubstrait and use
-                        # that as a filter.
-                        counter += 1
-                scalar_schema = pa.schema(fields_without_lists)
-                substrait_filter = serialize_expressions(
-                    [filter], ["my_filter"], scalar_schema
-                )
-                if isinstance(substrait_filter, memoryview):
-                    self._substrait_filter = substrait_filter.tobytes()
-                else:
-                    try:
-                        self._substrait_filter = substrait_filter.to_pybytes()
-                    except AttributeError:
-                        raise TypeError(
-                            "serialize_expressions returned unexpected"
-                            f"type {type(substrait_filter)}"
-                        )
-            except ImportError:
-                # serialize_expressions was introduced in pyarrow 14.  Fallback to
-                # stringifying the expression if pyarrow is too old
-                self._filter = str(filter)
+            self._substrait_filter = _serialize_expression(filter, self.ds._ds.schema)
         else:
             expr_filter = filter.get("expr_filter")
             if expr_filter is not None:
@@ -7890,7 +7889,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.create_tag(tag, reference)
 
@@ -7922,7 +7922,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.update_tag(tag, reference)
 
@@ -8465,8 +8466,7 @@ def _build_vector_search_query(
     metric: str, optional
         The distance metric to use (e.g., "L2", "cosine", "dot", "hamming").
     nprobes: int, optional
-        The number of partitions to search. Sets both minimum_nprobes and
-        maximum_nprobes to the same value.
+        The number of partitions to search, setting both the minimum and maximum.
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
@@ -8536,15 +8536,6 @@ def _build_vector_search_query(
     if maximum_nprobes is not None and int(maximum_nprobes) < 0:
         raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
 
-    if nprobes is not None:
-        if minimum_nprobes is not None or maximum_nprobes is not None:
-            raise ValueError(
-                "nprobes cannot be set in combination with minimum_nprobes or "
-                "maximum_nprobes"
-            )
-        else:
-            minimum_nprobes = nprobes
-            maximum_nprobes = nprobes
     if (
         minimum_nprobes is not None
         and maximum_nprobes is not None
@@ -8580,6 +8571,7 @@ def _build_vector_search_query(
         "q": q,
         "k": k,
         "metric": metric,
+        "nprobes": nprobes,
         "minimum_nprobes": minimum_nprobes,
         "maximum_nprobes": maximum_nprobes,
         "refine_factor": refine_factor,

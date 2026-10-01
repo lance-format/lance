@@ -49,10 +49,16 @@ pub mod write;
 
 use std::sync::Arc;
 
+use lance_core::Result;
 use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use object_store::path::Path;
+use uuid::Uuid;
+
+use self::util::{generate_random_hash, shard_base_path};
+use crate::dataset::fragment::write::generate_random_filename;
 
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
 ///
@@ -67,6 +73,70 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 /// lance injects the column on the write path ([`write::ShardWriter::put`] /
 /// [`write::ShardWriter::delete`]), so no caller ever constructs or names it.
 pub const TOMBSTONE: &str = "_tombstone";
+
+/// The storage identity reserved for one MemTable generation.
+///
+/// Managed Blob v2 payloads are written beneath `data_file_name` before the
+/// corresponding Lance data file exists, so this identity follows the
+/// MemTable through WAL persistence, recovery, and SSTable flush. A successor
+/// writer may continue a recovered target after reserving its persisted Blob
+/// IDs; `creator_epoch` identifies the writer that originally created the
+/// target, not necessarily the writer currently appending to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MemTableDataTarget {
+    pub generation: u64,
+    pub generation_dir: String,
+    pub data_file_name: String,
+    pub creator_epoch: u64,
+    pub batch_capacity: usize,
+}
+
+impl MemTableDataTarget {
+    pub fn new(generation: u64, creator_epoch: u64, batch_capacity: usize) -> Self {
+        let random_hash = generate_random_hash();
+        Self {
+            generation,
+            generation_dir: format!("{random_hash}_gen_{generation}"),
+            data_file_name: format!("{}.lance", generate_random_filename()),
+            creator_epoch,
+            batch_capacity,
+        }
+    }
+
+    pub fn generation_path(&self, base_path: &Path, shard_id: &Uuid) -> Path {
+        shard_base_path(base_path, shard_id).join(self.generation_dir.as_str())
+    }
+
+    pub fn data_file_key(&self) -> &str {
+        self.data_file_name
+            .strip_suffix(".lance")
+            .unwrap_or(&self.data_file_name)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let simple_component = |value: &str| {
+            !value.is_empty()
+                && value != "."
+                && value != ".."
+                && !value.contains('/')
+                && !value.contains('\\')
+        };
+        if !simple_component(&self.generation_dir)
+            || !simple_component(&self.data_file_name)
+            || !self.data_file_name.ends_with(".lance")
+            || self.batch_capacity == 0
+            || !self
+                .generation_dir
+                .ends_with(format!("_gen_{}", self.generation).as_str())
+        {
+            return Err(lance_core::Error::io(format!(
+                "invalid MemTable data target for generation {}: directory {:?}, file {:?}",
+                self.generation, self.generation_dir, self.data_file_name
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// The mem_wal tombstone field appended to the logical schema on the way to the
 /// storage schema.

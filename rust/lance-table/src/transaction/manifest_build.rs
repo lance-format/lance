@@ -26,8 +26,8 @@ use crate::io::{
 };
 use crate::rowids::version::build_version_meta;
 use crate::rowids::{read_row_ids, write_row_ids};
-use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
+use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -699,14 +699,9 @@ impl Transaction {
         let mut final_fragments = Vec::new();
         let mut final_indices = prepared_indices;
 
-        // A fragment-reuse index maps old row *addresses* to new ones, and the
-        // read path attaches it to every index it opens without checking
-        // whether the dataset uses stable row ids. Carrying it past the
-        // migration would therefore rewrite freshly issued row ids as if they
-        // were addresses, and rows whose new id happens to fall in the old
-        // address range would disappear from indexed queries. Nothing needs it
-        // afterwards either, since compaction rejects deferred index remap on
-        // a stable-row-id dataset.
+        // Release builds refuse to publish a stable-row-id dataset with a fragment
+        // reuse index, and nothing needs it: compaction rejects deferred index
+        // remap there.
         if config.migration_next_row_id.is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
@@ -822,6 +817,10 @@ impl Transaction {
                 for fragment in updated_fragments {
                     updated_by_id.entry(fragment.id).or_insert(fragment);
                 }
+                let live_field_ids = schema
+                    .fields_pre_order()
+                    .map(|field| field.id)
+                    .collect::<HashSet<_>>();
                 let updated_frags: Vec<Fragment> = existing_fragments
                     .iter()
                     .filter_map(|f| {
@@ -836,6 +835,16 @@ impl Transaction {
                             // fields it rewrote, since the fresh base values
                             // supersede them.
                             updated.overlays = f.overlays.clone();
+                            // A concurrent Project may have pruned files from the
+                            // current fragment after this post-image was staged.
+                            // Spilled lineage fields are absent from the schema,
+                            // but their carriers must survive just as in Project.
+                            let spilled = updated.spilled_row_lineage_field_ids();
+                            updated.files.retain(|file| {
+                                file.fields.iter().any(|field_id| {
+                                    live_field_ids.contains(field_id) || spilled.contains(field_id)
+                                })
+                            });
                             if matches!(update_mode, Some(RewriteColumns)) {
                                 crate::format::overlay::tombstone_overlay_fields(
                                     &mut updated.overlays,
@@ -923,6 +932,15 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+                // New fragments were staged against the same pre-Project schema.
+                for fragment in &mut new_fragments {
+                    let spilled = fragment.spilled_row_lineage_field_ids();
+                    fragment.files.retain(|file| {
+                        file.fields.iter().any(|field_id| {
+                            live_field_ids.contains(field_id) || spilled.contains(field_id)
+                        })
+                    });
+                }
 
                 // Assign row IDs to any fragments that don't have them yet
                 // (e.g., inserted rows from merge_insert operations)
@@ -1054,6 +1072,11 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
+                        // Its bitmap is lineage, not coverage, and a straddling
+                        // group would fail the recalculation.
+                        if is_frag_reuse_index_entry(index) {
+                            continue;
+                        }
                         let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if results_are_row_addrs {
@@ -1202,15 +1225,18 @@ impl Transaction {
 
                 // We might have removed all fields for certain data files, so
                 // we should remove the data files that are no longer relevant.
+                // A file carrying a spilled row lineage sequence stays: its
+                // reserved ids are never in the schema, and it is the only copy.
                 let remaining_field_ids = schema
                     .fields_pre_order()
                     .map(|f| f.id)
                     .collect::<HashSet<_>>();
                 for fragment in final_fragments.iter_mut() {
+                    let spilled = fragment.spilled_row_lineage_field_ids();
                     fragment.files.retain(|file| {
-                        file.fields
-                            .iter()
-                            .any(|field_id| remaining_field_ids.contains(field_id))
+                        file.fields.iter().any(|field_id| {
+                            remaining_field_ids.contains(field_id) || spilled.contains(field_id)
+                        })
                     });
                 }
 
@@ -1367,14 +1393,22 @@ impl Transaction {
                         // the dataset schema: a file kept alive only by
                         // tombstones or by ids the schema no longer defines is
                         // unreachable to readers, uncollectable by cleanup,
-                        // and reported corrupt by validate().
+                        // and reported corrupt by validate(). The exception is
+                        // a file carrying one of the fragment's spilled row
+                        // lineage sequences: their reserved ids are never in
+                        // the schema, the file holds their only copy, and the
+                        // replaced user columns in it are dead space until
+                        // compaction.
                         let live_ids = schema
                             .fields_pre_order()
                             .map(|field| field.id)
                             .collect::<HashSet<i32>>();
-                        new_frag
-                            .files
-                            .retain(|file| file.fields.iter().any(|f| live_ids.contains(f)));
+                        let spilled = new_frag.spilled_row_lineage_field_ids();
+                        new_frag.files.retain(|file| {
+                            file.fields
+                                .iter()
+                                .any(|f| live_ids.contains(f) || spilled.contains(f))
+                        });
                         new_frag.files.push(new_file.clone());
                     }
 
@@ -1548,6 +1582,17 @@ impl Transaction {
             if !fragment.overlays.is_empty() {
                 crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
             }
+        }
+
+        // A spilled row lineage sequence lives only in its carrier file. An
+        // operation that dropped or duplicated that file would otherwise go
+        // unnoticed until the next read, by which time cleanup may have
+        // deleted the only copy. Every fragment is checked, not only the ones
+        // this operation touched: the check reads metadata only, skips
+        // fragments that spill nothing, and also refuses to build on a
+        // manifest that already lost a carrier.
+        for fragment in &final_fragments {
+            fragment.validate_row_lineage_carriers()?;
         }
 
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
@@ -1902,7 +1947,9 @@ mod tests {
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
     use crate::format::{
-        DeletionFile, DeletionFileType, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+        DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
+        RowIdMeta,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
@@ -3125,11 +3172,135 @@ mod tests {
         assert_eq!(rows, vec![None, Some(42), None, Some(43)]);
     }
 
+    #[rstest::rstest]
+    #[case::unspecified(None)]
+    #[case::rewrite_rows(Some(UpdateMode::RewriteRows))]
+    #[case::rewrite_columns(Some(UpdateMode::RewriteColumns))]
+    fn test_update_build_manifest_does_not_restore_projected_files(
+        #[case] update_mode: Option<UpdateMode>,
+        #[values(false, true)] with_spilled_lineage: bool,
+    ) {
+        let mut manifest = sample_manifest_with_fragments(0..3);
+        if with_spilled_lineage {
+            manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
+            manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS;
+            manifest.next_row_id = 126;
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                let start = fragment.id * 42;
+                fragment.physical_rows = Some(42);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&RowIdSequence::from(start..start + 42)).into(),
+                ));
+            }
+        }
+        let projected_file = DataFile::new(
+            "projected.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        Arc::make_mut(&mut manifest.fragments)[1].files = vec![projected_file.clone()];
+
+        // Model an update staged before a projection removed field 1's file.
+        let mut updated = manifest.fragments[1].clone();
+        updated.files.push(DataFile::new(
+            "dropped.lance",
+            vec![1],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
+        updated.physical_rows = Some(42);
+        let inserted_projected_file = DataFile::new(
+            "inserted-projected.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut inserted = Fragment::new(0);
+        inserted.physical_rows = Some(42);
+        inserted.files = vec![
+            inserted_projected_file.clone(),
+            DataFile::new(
+                "inserted-dropped.lance",
+                vec![1],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+        ];
+
+        let mut expected_updated_files = vec![projected_file];
+        let mut expected_inserted_files = vec![inserted_projected_file];
+        if with_spilled_lineage {
+            // Separate carriers ensure each lineage kind is retained even when
+            // the file has no field from the live schema.
+            for (fragment, expected_files) in [
+                (&mut updated, &mut expected_updated_files),
+                (&mut inserted, &mut expected_inserted_files),
+            ] {
+                fragment.row_id_meta = Some(RowIdMeta::Column);
+                fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column);
+                fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
+                for field_id in [
+                    ROW_ID_FIELD_ID,
+                    ROW_CREATED_AT_VERSION_FIELD_ID,
+                    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+                ] {
+                    let file = DataFile::new(
+                        format!("lineage-{field_id}.lance"),
+                        vec![field_id],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    );
+                    fragment.files.push(file.clone());
+                    expected_files.push(file);
+                }
+            }
+        }
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated],
+                new_fragments: vec![inserted],
+                fields_modified: vec![1],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let fragment = &new_manifest.fragments[1];
+        assert_eq!(fragment.files, expected_updated_files);
+        assert_eq!(fragment.physical_rows, Some(42));
+        assert_eq!(new_manifest.fragments[3].files, expected_inserted_files);
+        assert_eq!(new_manifest.max_field_id(), 0);
+    }
+
     #[test]
     fn test_delete_build_manifest_applies_deletion_to_current_fragment() {
         let mut manifest = sample_manifest_with_fragments(0..5);
         manifest.version = 2;
+        let projected_file = DataFile::new_legacy_from_fields("projected.lance", vec![0], None);
         let current_fragment = &mut Arc::make_mut(&mut manifest.fragments)[2];
+        current_fragment.files = vec![projected_file.clone()];
         current_fragment.physical_rows = Some(42);
         current_fragment.overlays = vec![overlay_with_field(0, 2)];
         current_fragment.last_updated_at_version_meta = Some(
@@ -3139,8 +3310,13 @@ mod tests {
             .unwrap(),
         );
 
+        // Model a delete staged before a projection removed field 1's file.
         let mut updated2 = Fragment::new(2);
         updated2.physical_rows = Some(42);
+        updated2.files = vec![
+            projected_file.clone(),
+            DataFile::new_legacy_from_fields("dropped.lance", vec![1], None),
+        ];
         let deletion_file = DeletionFile {
             read_version: 1,
             id: 10,
@@ -3166,16 +3342,17 @@ mod tests {
 
         let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![0, 2, 4]);
-        let rows: Vec<Option<usize>> = new_manifest
+        let fragment2 = new_manifest
             .fragments
             .iter()
-            .map(|f| f.physical_rows)
-            .collect();
-        assert_eq!(rows, vec![None, Some(42), None]);
-        let overlays = &new_manifest.fragments[1].overlays;
-        assert_eq!(overlays.len(), 1);
-        assert_eq!(overlays[0].committed_version, 2);
-        assert_eq!(new_manifest.fragments[1].deletion_file, Some(deletion_file));
+            .find(|fragment| fragment.id == 2)
+            .unwrap();
+        assert_eq!(fragment2.files, vec![projected_file]);
+        assert_eq!(fragment2.deletion_file, Some(deletion_file));
+        assert_eq!(fragment2.overlays.len(), 1);
+        assert_eq!(fragment2.overlays[0].committed_version, 2);
+        assert_eq!(fragment2.physical_rows, Some(42));
+        assert_eq!(new_manifest.max_field_id(), 0);
         assert_eq!(last_updated_at_versions(&new_manifest, 2), vec![2; 42]);
     }
 
@@ -4398,6 +4575,191 @@ mod tests {
             "overlay committed after the snapshot must survive"
         );
         assert_eq!(fragment.overlays[0].data_file.fields.as_ref(), &[5]);
+    }
+
+    /// A projection keeps only the data files that still share a field with
+    /// the schema. The reserved ids of spilled row lineage are never in it, so
+    /// without an exception the file carrying them, their only copy, would go.
+    #[test]
+    fn project_keeps_file_carrying_spilled_row_lineage() {
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(4);
+        fragment.row_id_meta = Some(RowIdMeta::Column);
+        fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column);
+        fragment.files = vec![
+            DataFile::new(
+                "d.lance",
+                vec![0, 1],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+            DataFile::new(
+                "l.lance",
+                vec![ROW_ID_FIELD_ID, ROW_CREATED_AT_VERSION_FIELD_ID],
+                vec![0, 1],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
+        ];
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]);
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
+        manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS;
+
+        // Drop field 1, as `drop_columns(["b"])` would.
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Project {
+                schema: manifest.schema.project_by_ids(&[0], true),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let fragment = &result.fragments[0];
+        let paths = fragment
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["d.lance", "l.lance"]);
+        for field_id in [ROW_ID_FIELD_ID, ROW_CREATED_AT_VERSION_FIELD_ID] {
+            assert_eq!(
+                fragment
+                    .row_lineage_file(field_id)
+                    .unwrap()
+                    .map(|file| file.path.as_str()),
+                Some("l.lance"),
+                "field {field_id}"
+            );
+        }
+    }
+
+    /// Replacing part of a wider file tombstones the replaced fields where
+    /// they live and drops any file left without a schema field. The file
+    /// carrying the fragment's spilled row ids may have none, yet it is their
+    /// only copy and must stay next to the new file that answers for the user
+    /// fields. The carrier is either a file of its own, as an update writes
+    /// it, or a file that also holds user columns, all of which are replaced.
+    #[rstest::rstest]
+    #[case::lineage_only_file(
+        vec![("v.lance", vec![3, 4, 5, 6]), ("l.lance", vec![ROW_ID_FIELD_ID])],
+        vec![3, 4],
+        vec![
+            ("v.lance", vec![TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID, 5, 6]),
+            ("l.lance", vec![ROW_ID_FIELD_ID]),
+            ("v-new.lance", vec![3, 4]),
+        ],
+        "l.lance"
+    )]
+    #[case::in_file_carrier(
+        vec![("v.lance", vec![3, 4, 5, 6, ROW_ID_FIELD_ID])],
+        vec![3, 4, 5, 6],
+        vec![
+            (
+                "v.lance",
+                vec![
+                    TOMBSTONE_FIELD_ID,
+                    TOMBSTONE_FIELD_ID,
+                    TOMBSTONE_FIELD_ID,
+                    TOMBSTONE_FIELD_ID,
+                    ROW_ID_FIELD_ID,
+                ],
+            ),
+            ("v-new.lance", vec![3, 4, 5, 6]),
+        ],
+        "v.lance"
+    )]
+    fn data_replacement_keeps_lineage_carrier(
+        #[case] files: Vec<(&str, Vec<i32>)>,
+        #[case] replaced_fields: Vec<i32>,
+        #[case] expected_files: Vec<(&str, Vec<i32>)>,
+        #[case] carrier: &str,
+    ) {
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Column);
+        fragment.files = files
+            .into_iter()
+            .map(|(path, fields)| {
+                let column_indices = (0..fields.len() as i32).collect();
+                DataFile::new(
+                    path,
+                    fields,
+                    column_indices,
+                    ConcreteFileVersion::V2_0,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+
+        let fragment = replace_fields(fragment, replaced_fields, 1, 1).unwrap();
+        let files = fragment
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.fields.to_vec()))
+            .collect::<Vec<_>>();
+        assert_eq!(files, expected_files);
+        assert_eq!(
+            fragment
+                .row_lineage_file(ROW_ID_FIELD_ID)
+                .unwrap()
+                .map(|file| file.path.as_str()),
+            Some(carrier)
+        );
+    }
+
+    /// Whatever hands the commit a fragment whose spilled row ids have no v2
+    /// carrier -- an operation that dropped the file, or a writer that never
+    /// attached it -- the commit refuses it rather than publish lineage that
+    /// no reader can load.
+    #[rstest::rstest]
+    #[case::no_carrier(vec![0], ConcreteFileVersion::V2_0)]
+    #[case::v1_carrier(vec![0, ROW_ID_FIELD_ID], ConcreteFileVersion::V1)]
+    fn build_manifest_rejects_spilled_arm_without_carrier(
+        #[case] fields: Vec<i32>,
+        #[case] version: ConcreteFileVersion,
+    ) {
+        let manifest = sample_manifest();
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(4);
+        fragment.row_id_meta = Some(RowIdMeta::Column);
+        // Column indices do not matter to the commit, only ids and version.
+        let data_file = DataFile::new("d.lance", fields, vec![], version, None, None);
+        fragment.files = vec![data_file];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: vec![fragment],
+                schema: manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+
+        let err = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("fragment 0") && message.contains(&ROW_ID_FIELD_ID.to_string()),
+            "{message}"
+        );
     }
 
     #[test]

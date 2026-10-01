@@ -36,7 +36,7 @@ use datafusion::prelude::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
-use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::scanner::exec::compute_pk_hash;
 use crate::dataset::mem_wal::write::BatchStore;
 
@@ -197,6 +197,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
         let mut out: Vec<DataFusionResult<RecordBatch>> = Vec::with_capacity(batches.len());
 
         for (batch, row_offset) in batches {
+            let batch = scan_record_batch(&batch)?;
             let n = batch.num_rows();
             if n == 0 {
                 continue;

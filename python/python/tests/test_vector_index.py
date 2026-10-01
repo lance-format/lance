@@ -56,6 +56,9 @@ def test_dot_auto_probe_overrides(tmp_path, monkeypatch, query_scale):
     ).to_table()
     assert set(result["id"].to_pylist()) == expected
     assert captured[0].all_counts["partitions_searched"] == 2
+    # Python callbacks must expose the same nanosecond timings as native consumers.
+    assert captured[0].all_times["index_search_time"] > 0
+    assert captured[0].all_times["ANNSubIndexExec_elapsed_compute"] > 0
 
     # An initial cap must not prevent later probing when filters exhaust it.
     captured.clear()
@@ -69,6 +72,8 @@ def test_dot_auto_probe_overrides(tmp_path, monkeypatch, query_scale):
     assert len(filtered) == 10
     assert min(filtered["id"].to_pylist()) >= 224
     assert captured[0].all_counts["partitions_searched"] > 2
+    assert captured[0].all_times["index_search_time"] > 0
+    assert captured[0].all_times["ANNSubIndexExec_elapsed_compute"] > 0
 
     monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
     with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
@@ -2691,6 +2696,19 @@ def test_vector_index_with_nprobes(indexed_dataset):
 
     assert "minimum_nprobes=7" in res
     assert "maximum_nprobes=Some(7)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 10,
+            "minimum_nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(10)" in res
 
     res = indexed_dataset.scanner(
         nearest={

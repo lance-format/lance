@@ -24,11 +24,13 @@ use lance_table::{
 };
 use std::sync::Arc;
 
+pub(crate) use spill::place_carried_row_lineage;
 pub use spill::{
     DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
     PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
     place_row_lineage, read_spilled_row_ids, read_spilled_versions,
 };
+pub(crate) use spill::{RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.

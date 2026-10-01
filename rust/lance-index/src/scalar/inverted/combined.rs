@@ -23,6 +23,7 @@
 //! scored; see [`combined_fields_search`].
 
 mod cursor;
+mod flat;
 mod search;
 mod stats;
 #[cfg(test)]
@@ -31,9 +32,11 @@ mod testing;
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
+use lance_select::RowAddrTreeMap;
 
+pub use flat::flat_combined_fields_search_stream;
 pub use search::combined_fields_search;
-pub use stats::build_combined_bm25_scorer;
+pub use stats::{CombinedCorpusStats, FlatFieldStats, build_combined_bm25_scorer};
 
 use super::index::InvertedIndex;
 use super::query::Tokens;
@@ -47,6 +50,12 @@ pub struct CombinedFieldColumn {
     pub weight: f32,
     /// Opened inverted-index segments for this column.
     pub indices: Vec<Arc<InvertedIndex>>,
+    /// Rows an overlay made stale, in the row-id domain index results use.
+    ///
+    /// The flat scan folds their current values into the corpus, so their old
+    /// values are subtracted from `indices` to avoid counting them twice.
+    /// `None` when no overlay touched this column.
+    pub stale_rows: Option<Arc<RowAddrTreeMap>>,
 }
 
 /// Deduplicate the query tokens into the unique terms of the virtual field,

@@ -1360,6 +1360,26 @@ impl AddressKeyedDocuments {
         }
     }
 
+    /// Every live DocId the row at `address` owns in this partition.
+    ///
+    /// `None` for a legacy partition: its [`DocSet`] does not key documents by the
+    /// DocIds a compressed posting list holds, so callers keep walking postings
+    /// through [`Self::row_address`] there.
+    pub(crate) fn doc_ids_at(&self, address: u64) -> Option<impl Iterator<Item = u32> + '_> {
+        match &self.0 {
+            AddressKeyedSource::Legacy(_) => None,
+            AddressKeyedSource::Modern {
+                projection,
+                doc_ids_by_address,
+                ..
+            } => Some(
+                doc_ids_by_address
+                    .positions_in_address_range(projection, address, address)
+                    .map(|position| doc_ids_by_address.doc_id_at(position)),
+            ),
+        }
+    }
+
     /// Number of distinct row addresses the live documents cover.
     ///
     /// Equal to [`Self::len`] whenever each row owns a single live document.

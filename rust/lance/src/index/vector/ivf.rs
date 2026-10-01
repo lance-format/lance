@@ -499,7 +499,7 @@ fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
     }
 }
 
-fn validate_vector_query_compatibility(
+pub(crate) fn validate_vector_query_compatibility(
     indices: &[Arc<dyn VectorIndex>],
     operation: &str,
 ) -> Result<()> {

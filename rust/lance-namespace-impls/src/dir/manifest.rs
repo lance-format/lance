@@ -609,14 +609,13 @@ pub struct NamespaceInfo {
 ///
 /// This can be cloned cheaply. It supports concurrent reads or exclusive writes.
 ///
-/// This module never runs old-version cleanup on the manifest dataset and never
-/// writes an auto-cleanup policy into it, so its attached versions stay
-/// contiguous and reads only need to probe the immediate successor manifest
-/// before deciding whether a reload is needed. A manifest created by an older
-/// Lance release can still carry an auto-cleanup policy, and older writers act
-/// on it by removing old versions, which leaves gaps after the version a reader
-/// holds. While the held version carries that policy, reads resolve the latest
-/// version instead.
+/// Manifest rewrites never run old-version cleanup or add an auto-cleanup
+/// policy. Policy-free manifests therefore keep contiguous attached versions,
+/// so reloads only need to probe the immediate successor manifest. A manifest
+/// created by an older Lance release can still carry an auto-cleanup policy,
+/// and older writers act on it by removing old versions, which leaves gaps
+/// after the held version. While that version carries the policy, reloads
+/// resolve the latest version instead.
 #[derive(Debug, Clone)]
 pub struct DatasetConsistencyWrapper(Arc<RwLock<Dataset>>);
 
@@ -651,11 +650,13 @@ impl DatasetConsistencyWrapper {
 
     /// Get a mutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
+    ///
+    /// Acquires the write lock before reloading so that tokio's write-fairness
+    /// prevents reader starvation of the writer.
     pub async fn get_mut(&self) -> Result<DatasetWriteGuard<'_>> {
-        self.reload().await?;
-        let guard = DatasetWriteGuard {
-            guard: self.0.write().await,
-        };
+        let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await?;
+        let guard = DatasetWriteGuard { guard: write_guard };
         ensure_readable(guard.metadata())?;
         ensure_writable(guard.metadata())?;
         Ok(guard)
@@ -672,7 +673,10 @@ impl DatasetConsistencyWrapper {
         }
     }
 
-    /// Reload the dataset to the latest version.
+    /// Reload the dataset to the latest version (for the read path).
+    ///
+    /// Takes a read lock first to check if a reload is needed, then upgrades
+    /// to a write lock only if necessary.
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
@@ -700,10 +704,23 @@ impl DatasetConsistencyWrapper {
 
         // Need to reload, acquire write lock
         let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await
+    }
 
-        // Double-check after acquiring write lock (someone else might have reloaded)
-        if Self::has_newer_version(&write_guard).await? {
-            write_guard.checkout_latest().await.map_err(|e| {
+    /// Reload the dataset while already holding the write lock.
+    async fn reload_under_write_lock(
+        dataset: &mut tokio::sync::RwLockWriteGuard<'_, Dataset>,
+    ) -> Result<()> {
+        let dataset_uri = dataset.uri().to_string();
+        let current_version = dataset.version().version;
+        log::debug!(
+            "Reload (under write lock) for uri={}, current_version={}",
+            dataset_uri,
+            current_version
+        );
+
+        if Self::has_newer_version(dataset).await? {
+            dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
                 })
@@ -3865,11 +3882,11 @@ impl LanceNamespace for ManifestNamespace {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation, DeleteObjectMutation,
-        LANCE_DATA_DIR, LANCE_INDICES_DIR, MANIFEST_TABLE_NAME, ManifestBatchBuilder,
-        ManifestEntry, ManifestIndexAccumulator, ManifestNamespace, ManifestOutputRow,
-        ManifestRowValue, ManifestStreamMutation, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME,
-        ObjectType, has_auto_cleanup_config,
+        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation,
+        DatasetConsistencyWrapper, DeleteObjectMutation, LANCE_DATA_DIR, LANCE_INDICES_DIR,
+        MANIFEST_TABLE_NAME, ManifestBatchBuilder, ManifestEntry, ManifestIndexAccumulator,
+        ManifestNamespace, ManifestOutputRow, ManifestRowValue, ManifestStreamMutation,
+        OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME, ObjectType, has_auto_cleanup_config,
     };
     use crate::{DirectoryNamespace, DirectoryNamespaceBuilder};
     use arrow::datatypes::DataType;
@@ -3890,6 +3907,9 @@ mod tests {
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     async fn create_manifest_namespace(
         root: &str,
@@ -4272,14 +4292,45 @@ mod tests {
             .unwrap();
     }
 
-    /// Lance releases before 7.0 wrote an auto-cleanup policy into every new
-    /// `__manifest`, and writers of that era remove old versions under it. A
-    /// reader holding such a version must still observe newer commits after the
-    /// immediate successor is cleaned up, and the next rewrite must drop the
-    /// legacy policy.
-    #[tokio::test]
-    async fn test_legacy_auto_cleanup_manifest_reload_skips_removed_versions() {
+    fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempStdDir> {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data")
+            .join(table_path);
         let temp_dir = TempStdDir::default();
+        let mut directories = vec![(source, temp_dir.to_path_buf())];
+        while let Some((source, destination)) = directories.pop() {
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                let target = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    directories.push((entry.path(), target));
+                } else {
+                    std::fs::copy(entry.path(), target)?;
+                }
+            }
+        }
+        Ok(temp_dir)
+    }
+
+    #[derive(Debug)]
+    enum ManifestAccess {
+        Get,
+        GetRefreshed,
+        GetMut,
+    }
+
+    /// Readers and writers holding a manifest created by a released old writer
+    /// must observe newer commits after cleanup removes the immediate successor.
+    #[rstest]
+    #[case::get(ManifestAccess::Get)]
+    #[case::get_refreshed(ManifestAccess::GetRefreshed)]
+    #[case::get_mut(ManifestAccess::GetMut)]
+    #[tokio::test]
+    async fn test_legacy_auto_cleanup_manifest_reload_skips_removed_versions(
+        #[case] access: ManifestAccess,
+    ) {
+        let temp_dir = copy_test_data_to_tmp("v6.0.1/dir_manifest/namespace").unwrap();
         let temp_path = temp_dir.to_str().unwrap();
         let manifest_uri = format!("{}/{}", temp_path, MANIFEST_TABLE_NAME);
         // Directory listing would surface tables the manifest misses, so the
@@ -4291,24 +4342,23 @@ mod tests {
                 .build()
         };
 
-        let writer = build_namespace().await.unwrap();
-        create_manifest_only_table(&writer, "t1").await;
-        let mut manifest_ds = DatasetBuilder::from_uri(&manifest_uri)
+        let manifest_ds = DatasetBuilder::from_uri(&manifest_uri)
             .load()
             .await
             .unwrap();
-        assert!(!has_auto_cleanup_config(manifest_ds.manifest()));
-        // The policy Lance 5.x/6.x wrote by default on dataset creation.
-        manifest_ds
-            .update_config([
-                ("lance.auto_cleanup.interval", "20"),
-                ("lance.auto_cleanup.older_than", "14days"),
-            ])
-            .await
-            .unwrap();
+        assert!(has_auto_cleanup_config(manifest_ds.manifest()));
+        assert_eq!(
+            manifest_ds.manifest().config["lance.auto_cleanup.interval"],
+            "20"
+        );
+        assert_eq!(
+            manifest_ds.manifest().config["lance.auto_cleanup.older_than"],
+            "14days"
+        );
         let legacy_version = manifest_ds.version().version;
-
+        let wrapper = DatasetConsistencyWrapper::new(manifest_ds);
         let reader = build_namespace().await.unwrap();
+        let writer = build_namespace().await.unwrap();
         create_manifest_only_table(&writer, "t2").await;
         create_manifest_only_table(&writer, "t3").await;
 
@@ -4316,7 +4366,8 @@ mod tests {
             .load()
             .await
             .unwrap();
-        assert_eq!(latest.version().version, legacy_version + 2);
+        let latest_version = latest.version().version;
+        assert_eq!(latest_version, legacy_version + 2);
         assert!(!has_auto_cleanup_config(latest.manifest()));
         let policy = CleanupPolicyBuilder::default()
             .retain_n_versions(&latest, 1)
@@ -4325,13 +4376,48 @@ mod tests {
             .delete_unverified(true)
             .build();
         latest.cleanup_with_policy(policy).await.unwrap();
-        assert!(latest.checkout_version(legacy_version + 1).await.is_err());
+        let error = latest
+            .checkout_version(legacy_version + 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::DatasetNotFound { .. }),
+            "unexpected missing-version error: {error:?}"
+        );
+        assert!(error.to_string().contains("not found"));
+
+        let reloaded_version = match access {
+            ManifestAccess::Get => wrapper.get().await.unwrap().version().version,
+            ManifestAccess::GetRefreshed => {
+                wrapper.get_refreshed().await.unwrap().version().version
+            }
+            ManifestAccess::GetMut => wrapper.get_mut().await.unwrap().version().version,
+        };
+        assert_eq!(reloaded_version, latest_version);
+        assert!(!has_auto_cleanup_config(
+            wrapper.get().await.unwrap().manifest()
+        ));
 
         let mut list_request = ListTablesRequest::new();
         list_request.id = Some(vec![]);
-        let mut tables = reader.list_tables(list_request).await.unwrap().tables;
+        let mut tables = reader
+            .list_tables(list_request.clone())
+            .await
+            .unwrap()
+            .tables;
         tables.sort();
         assert_eq!(tables, vec!["t1", "t2", "t3"]);
+
+        // Once refreshed to a policy-free version, the successor fast path must
+        // still observe subsequent writes.
+        create_manifest_only_table(&writer, "t4").await;
+        assert_eq!(
+            wrapper.get().await.unwrap().version().version,
+            latest_version + 1
+        );
+        let mut tables = reader.list_tables(list_request).await.unwrap().tables;
+        tables.sort();
+        assert_eq!(tables, vec!["t1", "t2", "t3", "t4"]);
     }
 
     #[tokio::test]
@@ -4556,6 +4642,57 @@ mod tests {
             original_version
         );
         assert_eq!(manifest_data_paths(&manifest_ns).await, data_paths_before);
+    }
+
+    /// A reader that arrives after a waiting `get_mut()` must be served after
+    /// it. tokio's `RwLock` guarantees that only once the writer is queued on
+    /// the write lock: if `get_mut()` first queued as a reader to reload, the
+    /// later reader would be admitted alongside it, and a reader that holds
+    /// its permit until the writer is done would then block the write lock
+    /// forever.
+    #[tokio::test]
+    async fn test_get_mut_is_served_before_later_readers() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        let wrapper = manifest_ns.manifest_dataset.clone();
+
+        // Hold the lock exclusively so both tasks below park on their first
+        // lock request, in spawn order. The current-thread test runtime polls
+        // each spawned task before this task resumes from `yield_now`.
+        let blocker = wrapper.0.write().await;
+        let writer = {
+            let wrapper = wrapper.clone();
+            tokio::spawn(async move {
+                wrapper.get_mut().await.unwrap();
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // The late reader takes a single read permit and keeps it until told
+        // to let go. A raw lock rather than `get()` so that it never releases
+        // and re-acquires the permit around a reload probe, which would leave
+        // a window for the writer's request to slip in ahead of it.
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let late_reader = {
+            let wrapper = wrapper.clone();
+            tokio::spawn(async move {
+                let guard = wrapper.0.read().await;
+                release_rx.await.unwrap();
+                drop(guard);
+            })
+        };
+        tokio::task::yield_now().await;
+
+        drop(blocker);
+        timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("get_mut() waited on a reader that arrived after it")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), late_reader)
+            .await
+            .expect("the late reader did not finish after the writer released the lock")
+            .unwrap();
     }
 
     #[tokio::test]

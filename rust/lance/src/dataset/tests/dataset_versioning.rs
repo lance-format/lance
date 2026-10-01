@@ -1007,6 +1007,54 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
 }
 
 #[tokio::test]
+async fn test_main_branch_management() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let main_branch = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(main_branch.version().version, dataset.version().version);
+    assert_eq!(main_branch.manifest.branch, None);
+
+    let main_ref = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(main_ref.version().version, dataset.version().version);
+    assert_eq!(main_ref.manifest.branch, None);
+
+    let Err(create_branch_err) = dataset.create_branch("main", ("main", None), None).await else {
+        panic!("creating a branch named main should fail");
+    };
+    assert!(matches!(create_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        create_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{create_branch_err}"
+    );
+
+    assert!(!tempdir.std_path().join("tree").join("main").exists());
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+
+    let get_branch_err = dataset.branches().get("main").await.unwrap_err();
+    assert!(matches!(get_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        get_branch_err.to_string().contains("\"main\" is reserved"),
+        "{get_branch_err}"
+    );
+
+    let delete_branch_err = dataset.delete_branch("main").await.unwrap_err();
+    assert!(matches!(delete_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        delete_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{delete_branch_err}"
+    );
+}
+
+#[tokio::test]
 async fn test_cannot_delete_branch_referenced_by_tag() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();

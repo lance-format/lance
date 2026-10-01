@@ -33,6 +33,7 @@ use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::dataset::write::InsertBuilder;
 use crate::index::vector::details::vector_index_details_default;
 use crate::session::Session;
 
@@ -226,6 +227,33 @@ impl MemTableFlusher {
         }
     }
 
+    fn generation_target(&self, memtable: &MemTable) -> Result<(String, Path, Option<String>)> {
+        let generation = memtable.generation();
+        if let Some(target) = memtable.target() {
+            if target.generation != generation {
+                return Err(Error::internal(format!(
+                    "memtable generation {} carries data target generation {}",
+                    generation, target.generation
+                )));
+            }
+            return Ok((
+                target.generation_dir.clone(),
+                target.generation_path(&self.base_path, &self.shard_id),
+                Some(target.data_file_name.clone()),
+            ));
+        }
+
+        // Blob-free memtables do not reserve a storage identity during puts.
+        // Preserve the existing flush-time random generation and file naming
+        // for that path.
+        let random_hash = generate_random_hash();
+        Ok((
+            format!("{}_gen_{}", random_hash, generation),
+            sstable_path(&self.base_path, &self.shard_id, &random_hash, generation),
+            None,
+        ))
+    }
+
     /// Storage file version of the shard's base dataset. SSTables
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
@@ -269,11 +297,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
         let generation = memtable.generation();
         let size = FlushedSize::of(memtable);
-        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let (gen_folder_name, gen_path, preassigned_data_file_name) =
+            self.generation_target(memtable)?;
 
         info!(
             "Flushing MemTable generation {} to {} ({} rows, {} batches)",
@@ -283,7 +310,9 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
-        let (rows_flushed, deleted) = self.write_data_file(&gen_path, memtable).await?;
+        let (rows_flushed, deleted) = self
+            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .await?;
 
         // Persist the within-generation deletion vector so the
         // SSTable exposes newest-per-PK on every read path.
@@ -341,6 +370,7 @@ impl MemTableFlusher {
         &self,
         path: &Path,
         memtable: &MemTable,
+        preassigned_data_file_name: Option<&str>,
     ) -> Result<(usize, RoaringBitmap)> {
         use arrow_array::RecordBatchIterator;
 
@@ -386,6 +416,30 @@ impl MemTableFlusher {
         };
 
         let uri = self.path_to_uri(path);
+        if let Some(preassigned_data_file_name) = preassigned_data_file_name {
+            match self.open_generation(&uri).await {
+                Ok(dataset) => {
+                    let fragments = dataset.get_fragments();
+                    let is_expected = fragments.len() == 1
+                        && fragments[0].metadata().physical_rows == Some(total_rows)
+                        && fragments[0]
+                            .metadata()
+                            .files
+                            .iter()
+                            .any(|file| file.path == preassigned_data_file_name);
+                    if is_expected {
+                        return Ok((total_rows, deleted));
+                    }
+                    return Err(Error::io(format!(
+                        "generation {} already exists but does not describe the expected file {} and {} rows",
+                        path, preassigned_data_file_name, total_rows
+                    )));
+                }
+                Err(Error::DatasetNotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
@@ -404,7 +458,11 @@ impl MemTableFlusher {
             session: self.session.clone(),
             ..Default::default()
         };
-        Dataset::write(reader, &uri, Some(write_params)).await?;
+        let mut builder = InsertBuilder::new(uri.as_str()).with_params(&write_params);
+        if let Some(preassigned_data_file_name) = preassigned_data_file_name {
+            builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
+        }
+        builder.execute_stream(reader).await?;
 
         Ok((total_rows, deleted))
     }
@@ -501,11 +559,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
         let generation = memtable.generation();
         let size = FlushedSize::of(memtable);
-        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let (gen_folder_name, gen_path, preassigned_data_file_name) =
+            self.generation_target(memtable)?;
 
         info!(
             "Flushing MemTable generation {} with indexes to {} ({} rows, {} batches)",
@@ -515,7 +572,9 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
-        let (total_rows, deleted) = self.write_data_file(&gen_path, memtable).await?;
+        let (total_rows, deleted) = self
+            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .await?;
 
         // Open the dataset once for all index building. Dataset::write already
         // created a v1 manifest with the fragment data.

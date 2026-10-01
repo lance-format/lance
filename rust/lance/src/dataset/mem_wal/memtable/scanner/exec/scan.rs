@@ -22,6 +22,7 @@ use datafusion::prelude::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
+use crate::dataset::blob::prepared_blob_batch_to_descriptors;
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::write::BatchStore;
 
@@ -233,6 +234,14 @@ impl ExecutionPlan for MemTableScanExec {
         let projected_batches: Vec<DataFusionResult<RecordBatch>> = batches_with_offsets
             .into_iter()
             .filter_map(|(batch, row_offset)| {
+                let batch = match prepared_blob_batch_to_descriptors(&batch) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        return Some(Err(datafusion::error::DataFusionError::External(Box::new(
+                            error,
+                        ))));
+                    }
+                };
                 // Apply filter first (on unprojected data)
                 let (filtered_batch, filtered_row_offsets) = if let Some(ref predicate) =
                     filter_predicate

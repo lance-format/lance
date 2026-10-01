@@ -522,6 +522,22 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
+def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+    fragment = dataset.get_fragments()[0]
+    expression = pc.field("s") != "C:\\temp"
+
+    assert dataset.count_rows(filter=expression) == 2
+    assert fragment.count_rows(expression) == 1
+    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
+    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
+        "id"
+    ].to_pylist() == [0]
+
+
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
 def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     ds = write_dataset(

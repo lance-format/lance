@@ -1516,6 +1516,7 @@ mod tests {
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
@@ -1626,7 +1627,8 @@ mod tests {
             .unwrap()
             .nearest("vector", query, 1)
             .unwrap()
-            .nprobes(num_probes)
+            .minimum_nprobes(num_probes)
+            .maximum_nprobes(num_probes)
             .refine(1)
             .try_into_batch()
             .await
@@ -2017,8 +2019,34 @@ mod tests {
                     .unwrap(),
             );
         }
+        let version_before = dataset.version().version;
+        let error = dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(dataset.version().version, version_before);
+        assert!(
+            dataset
+                .load_indices_by_name(INDEX_NAME)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Bypass commit-time validation only to exercise append's independent guard
+        // against an incompatible segment set already present in the manifest.
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: segments,
+                removed_indices: vec![],
+            },
+            None,
+        );
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", segments)
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await
             .unwrap();
 
@@ -2665,7 +2693,8 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
-            .nprobes(2)
+            .minimum_nprobes(2)
+            .maximum_nprobes(2)
             .refine(1);
         let fanout_plan = fanout_scanner.explain_plan(true).await.unwrap();
         assert!(
@@ -2687,7 +2716,8 @@ mod tests {
                 .unwrap()
                 .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 1)
                 .unwrap()
-                .nprobes(2)
+                .minimum_nprobes(2)
+                .maximum_nprobes(2)
                 .refine(1)
                 .with_index_segments(vec![segment.uuid])
                 .unwrap();
@@ -2991,7 +3021,8 @@ mod tests {
             .unwrap()
             .nearest("vector", &query, 5)
             .unwrap()
-            .nprobes(1)
+            .minimum_nprobes(1)
+            .maximum_nprobes(1)
             .try_into_batch()
             .await
             .unwrap();

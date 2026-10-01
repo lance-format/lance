@@ -1119,10 +1119,13 @@ pub(super) async fn alter_columns(
                         .collect::<Vec<_>>()
                         .into();
                 }
+                // A file carrying a spilled row lineage sequence stays: its
+                // reserved ids are never in the schema, and it is the only copy.
+                let spilled = frag.spilled_row_lineage_field_ids();
                 frag.files.retain(|f| {
                     f.fields
                         .iter()
-                        .any(|field| schema_field_ids.contains(field))
+                        .any(|field| schema_field_ids.contains(field) || spilled.contains(field))
                 });
                 Ok(frag)
             })

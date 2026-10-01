@@ -42,7 +42,7 @@ pub fn mem_wal_hnsw_default() -> HnswBuildParams {
 }
 
 /// Configuration for an in-memory HNSW index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HnswIndexConfig {
     pub name: String,
     pub field_id: i32,

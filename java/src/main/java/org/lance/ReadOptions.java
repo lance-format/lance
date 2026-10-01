@@ -141,15 +141,14 @@ public class ReadOptions {
     }
 
     /**
-     * Index cache size. Index cache is a LRU cache with TTL. This number specifies the number of
-     * index pages, for example, IVF partitions, to be cached in the host memory. Roughly, for an
-     * IVF_PQ partition with n rows, the size of each index page equals the combination of the pq
-     * code (nd.array([n,pq], dtype=uint8)) and the row ids (nd.array([n], dtype=uint64)).
-     * Approximately, n = Total Rows / number of IVF partitions. pq = number of PQ sub-vectors.
-     * Default is 256.
+     * Set the index cache size as a count of index entries, each assumed to be ~20 MB. The count is
+     * converted to a byte budget ({@code indexCacheSize * 20 MB}) and stored the same way as {@link
+     * #setIndexCacheSizeBytes(long)}. Index cache is an LRU cache with TTL.
      *
-     * @param indexCacheSize the index cache size
+     * @param indexCacheSize the number of ~20 MB index entries to cache
      * @return this builder
+     * @deprecated Use {@link #setIndexCacheSizeBytes(long)} to set the cache size in bytes
+     *     directly. When neither is set, the default cache size is 6 GiB.
      */
     @Deprecated
     public Builder setIndexCacheSize(int indexCacheSize) {

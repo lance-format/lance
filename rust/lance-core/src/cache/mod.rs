@@ -62,7 +62,7 @@ pub use codec::{
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 pub use moka::MokaCacheBackend;
-pub use quick::{QuickCacheBackend, recommended_cache_shards};
+pub use quick::{QuickCacheBackend, QuickCacheShardPolicy, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 
 use std::any::TypeId;

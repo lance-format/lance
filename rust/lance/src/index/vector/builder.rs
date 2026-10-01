@@ -39,6 +39,8 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -181,6 +183,63 @@ fn apply_centroid_splits(
         concatenated,
         original.value_length(),
     )?)
+}
+
+/// Remap one partition of an IVF_HNSW index.
+///
+/// Every quantizer storage `remap` keeps the surviving vectors in their
+/// original order, so when no row was deleted the graph is carried over by
+/// [`remap_graph_batch`] unchanged. The graph is read with all columns because
+/// search loads skip the distances the index file must keep.
+///
+/// A deleted row does not rebuild the graph. Edges between survivors are kept,
+/// and each node that lost a neighbor is reconnected by
+/// [`remap_graph_repair`]: a construction-time beam search over the surviving
+/// graph, then the same neighbor heuristic the builder uses. The graph is
+/// rebuilt only when that repair cannot be applied.
+async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
+    index: &IVFIndex<S, Q>,
+    partition_id: usize,
+    mapping: &RowAddrRemap,
+) -> Result<(Q::Storage, S)> {
+    let old_storage = index.load_partition_storage(partition_id, None).await?;
+    let storage = old_storage.remap(mapping)?;
+    let graph = index.read_sub_index_batch(partition_id, None, None).await?;
+
+    let mut new_ids = Vec::with_capacity(old_storage.len());
+    let mut num_kept = 0u32;
+    for row_id in old_storage.row_ids() {
+        if matches!(mapping.get(*row_id), Some(None)) {
+            new_ids.push(None);
+        } else {
+            new_ids.push(Some(num_kept));
+            num_kept += 1;
+        }
+    }
+    let num_deleted = old_storage.len() - num_kept as usize;
+    if num_kept as usize == storage.len() {
+        let repaired = if num_deleted == 0 {
+            remap_graph_batch(&graph, &new_ids)
+        } else {
+            remap_graph_repair(&graph, &new_ids, &storage)
+        };
+        match repaired {
+            Ok(graph) => return Ok((storage, S::load(graph)?)),
+            // An index written before graphs were bounded to their storage can
+            // hold fewer nodes than vectors; rebuilding gives it full coverage.
+            Err(e) => log::warn!(
+                "Rebuilding the HNSW graph of partition {partition_id} during remap: {e}"
+            ),
+        }
+    } else {
+        log::warn!(
+            "Rebuilding the HNSW graph of partition {partition_id} during remap: {num_kept} \
+             rows survive the remap but the remapped storage has {} rows",
+            storage.len()
+        );
+    }
+    let index = S::load(graph)?.remap(mapping, &storage)?;
+    Ok((storage, index))
 }
 
 /// An index segment an optimize pass reads existing rows from, paired with the rows
@@ -554,12 +613,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .as_any()
                     .downcast_ref::<IVFIndex<S, Q>>()
                     .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-                let part = ivf_index
-                    .load_partition(part_id, false, &NoOpMetricsCollector)
-                    .await?;
-
-                let storage = part.storage.remap(&mapping)?;
-                let index = part.index.remap(&mapping, &storage)?;
+                let (storage, index) = if S::name() == HNSW::name() {
+                    remap_hnsw_partition(ivf_index, part_id, &mapping).await?
+                } else {
+                    let part = ivf_index
+                        .load_partition(part_id, false, &NoOpMetricsCollector)
+                        .await?;
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    (storage, index)
+                };
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
                     partition_id: part_id,
                     built: Some((storage, index, 0.0)),

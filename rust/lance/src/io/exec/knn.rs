@@ -47,7 +47,7 @@ use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::{
@@ -1454,9 +1454,12 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                 let ds = ds.clone();
                 let metrics = metrics.clone();
                 async move {
-                    let index = ds
-                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
-                        .await?;
+                    let index = {
+                        let _open_timer =
+                            IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
+                        ds.open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                            .await?
+                    };
                     // Normalize cosine queries once before partition ranking.
                     let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
@@ -2375,9 +2378,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                         )
                         .await?;
-                        let raw_index = ds
-                            .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
-                            .await?;
+                        let raw_index = {
+                            let _open_timer = IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
+                            ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
+                        };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
                         let (vector_type, _) = crate::index::vector::utils::get_vector_type(ds.schema(), &column)?;
                         let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref(), &vector_type)?;
@@ -2719,9 +2723,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); query_count];
 
             for index_meta in &indices {
-                let index = ds
-                    .open_vector_index(&column, &index_meta.uuid, &metrics.index_metrics)
-                    .await?;
+                let index = {
+                    let _open_timer =
+                        IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
+                    ds.open_vector_index(&column, &index_meta.uuid, &metrics.index_metrics)
+                        .await?
+                };
                 // The scanner's `batch_index_search_supported` gate decides which
                 // indices reach this node; this check only guards against that
                 // gate and the index implementation disagreeing (an internal
@@ -5038,6 +5045,90 @@ mod tests {
             "warm search should report no index-file I/O, got bytes_read={}",
             warm.bytes_read
         );
+        // Cache hits eliminate I/O, not query preparation or distance/TopK work.
+        for stats in [&cold, &warm] {
+            for name in [
+                "ANNSubIndexExec_elapsed_compute",
+                "index_partition_load_time",
+                "index_partition_prepare_time",
+                "index_cpu_queue_wait_time",
+                "index_search_time",
+                "index_query_prepare_time",
+                "index_distance_topk_time",
+                "index_result_materialize_time",
+            ] {
+                assert!(
+                    stats.all_times.get(name).is_some_and(|time| *time > 0),
+                    "missing timing {name}: {:?}",
+                    stats.all_times
+                );
+            }
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_partition_prepare_metrics_cold_vs_warm(#[values(false, true)] is_prepared: bool) {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let indices = fixture.dataset.load_indices().await.unwrap();
+        let index = fixture
+            .dataset
+            .open_vector_index(
+                "vector",
+                &indices[0].uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let query = Query {
+            column: "vector".to_owned(),
+            key: fixture.get_centroid(0),
+            ..base_query()
+        };
+        let mut previous = None;
+        for is_warm in [false, true] {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let collector = IndexMetrics::new(&metrics, 0);
+            let prefilter = Arc::new(lance_index::prefilter::NoFilter);
+            // Call both entry points directly so CPU/session limits cannot silently
+            // turn the parallel-path regression into another sequential search.
+            let batch = if is_prepared {
+                let handle = index
+                    .prepare_partition_search(0, &query, prefilter, &collector)
+                    .await
+                    .unwrap();
+                index.search_prepared_partition(handle, &collector).unwrap()
+            } else {
+                index
+                    .search_in_partition(0, &query, prefilter, &collector)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(batch.num_rows(), query.k);
+            if let Some(previous) = &previous {
+                assert_eq!(&batch, previous);
+            }
+            previous = Some(batch);
+            let timings = metrics.clone_inner();
+            let prepare = timings
+                .sum_by_name("index_partition_prepare_time")
+                .unwrap()
+                .as_usize();
+            let load = timings
+                .sum_by_name("index_partition_load_time")
+                .unwrap()
+                .as_usize();
+            assert!(
+                prepare > 0,
+                "missing preparation time: prepared={is_prepared}, warm={is_warm}"
+            );
+            // DataFusion rounds zero-duration updates up to 1ns, so positivity
+            // alone cannot detect a missing preparation timer.
+            assert!(
+                prepare >= load,
+                "preparation must include partition loading"
+            );
+        }
     }
 
     /// The new I/O metrics must actually surface in `EXPLAIN ANALYZE` text on

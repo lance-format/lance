@@ -8,7 +8,9 @@ use std::time::Duration;
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::{
+    get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
+};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
@@ -28,10 +30,12 @@ use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
+use lance_table::rowids::version::rechunk_version_sequences;
+use lance_table::rowids::{RowIdSequence, rechunk_sequences, write_row_ids};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
@@ -106,13 +110,35 @@ impl UpdateBuilder {
         (&merged).into()
     }
 
-    pub fn update_where(mut self, filter: &str) -> Result<Self> {
+    pub fn update_where(self, filter: &str) -> Result<Self> {
         let filter_schema = Self::filterable_schema(self.dataset.schema());
         let planner = Planner::new(Arc::new(filter_schema));
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
+        self.update_where_expr(expr)
+    }
+
+    /// Set the row filter from a DataFusion expression.
+    ///
+    /// This is equivalent to [`Self::update_where`] for callers that already
+    /// have an expression instead of a SQL string.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::UpdateBuilder;
+    /// # use datafusion::prelude::{col, lit};
+    /// # use std::sync::Arc;
+    /// # fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let builder = UpdateBuilder::new(dataset)
+    ///     .update_where_expr(col("region_id").eq(lit(10)))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_where_expr(mut self, expr: Expr) -> Result<Self> {
+        let filter_schema = Self::filterable_schema(self.dataset.schema());
+        let planner = Planner::new(Arc::new(filter_schema));
         self.condition = Some(
             planner
                 .optimize_expr(expr)
@@ -316,6 +342,15 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        // Resolved before any IO, so a malformed budget fails the update
+        // before it rewrites the rows rather than after. Only a table with
+        // stable row ids carries lineage over, so no other table depends on
+        // the setting.
+        let spill_budget = if self.dataset.manifest.uses_stable_row_ids() {
+            inline_row_lineage_max_bytes(&self.dataset)?
+        } else {
+            None
+        };
         let mut scanner = self.dataset.scan();
         let legacy_blob_ids = self
             .dataset
@@ -336,6 +371,22 @@ impl UpdateJob {
             scanner.with_row_address();
         }
         scanner.with_row_id();
+        // The rewritten rows keep their created-at versions. On a table that
+        // may spill, read them here, where the source rows are in hand: once
+        // their row ids spill the commit can no longer look them up. Elsewhere
+        // the commit looks them up from the inline row ids, and reading them
+        // would only build a column for every scanned row.
+        if spill_budget.is_some() {
+            let columns = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .chain([ROW_CREATED_AT_VERSION])
+                .collect::<Vec<_>>();
+            scanner.project(&columns)?;
+        }
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -471,23 +522,23 @@ impl UpdateJob {
             .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
 
         if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
-            let fragment_sizes = new_fragments
-                .iter()
-                .map(|f| f.physical_rows.unwrap() as u64);
-            let sequences = lance_table::rowids::rechunk_sequences(
-                [row_id_sequence.clone()],
-                fragment_sizes,
-                false,
-            )
-            .map_err(|e| {
-                Error::internal(format!(
-                    "Captured row ids not equal to number of rows written: {}",
-                    e
-                ))
-            })?;
-            for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                let serialized = lance_table::rowids::write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
+            let placed = self
+                .place_rewritten_lineage(
+                    &mut new_fragments,
+                    row_id_sequence,
+                    removed_row_ids.created_at_sequence(),
+                    spill_budget,
+                )
+                .await;
+            if let Err(e) = placed {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    None,
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
             }
         }
 
@@ -522,6 +573,56 @@ impl UpdateJob {
             affected_rows,
             num_updated_rows,
         })
+    }
+
+    /// Give each new fragment the row ids its rows carried before the rewrite
+    /// and, where the lineage spills under `spill_budget`, their created-at
+    /// versions too; see [`place_carried_row_lineage`]. The last-updated-at
+    /// version is the commit's to stamp.
+    ///
+    /// `created_at` is `None` when the scan did not read the created-at
+    /// versions, which it only does when the table may spill.
+    async fn place_rewritten_lineage(
+        &self,
+        new_fragments: &mut [Fragment],
+        row_ids: &RowIdSequence,
+        created_at: Option<&RowDatasetVersionSequence>,
+        spill_budget: Option<usize>,
+    ) -> Result<()> {
+        let fragment_sizes = new_fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap() as u64)
+            .collect::<Vec<_>>();
+        let row_ids = rechunk_sequences([row_ids.clone()], fragment_sizes.iter().copied(), false)
+            .map_err(|e| {
+            Error::internal(format!(
+                "Captured row ids not equal to number of rows written: {}",
+                e
+            ))
+        })?;
+        let (Some(limit), Some(created_at)) = (spill_budget, created_at) else {
+            // Nothing can spill: the row ids stay inline and the commit
+            // resolves the created-at versions from them, as it always has.
+            for (fragment, row_ids) in new_fragments.iter_mut().zip(row_ids) {
+                fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+            }
+            return Ok(());
+        };
+        let created_at =
+            rechunk_version_sequences([created_at.clone()], fragment_sizes.iter().copied(), false)
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "Captured created-at versions not equal to number of rows written: {e}"
+                    ))
+                })?;
+        for ((fragment, row_ids), created_at) in
+            new_fragments.iter_mut().zip(row_ids).zip(created_at)
+        {
+            place_carried_row_lineage(&self.dataset, limit, &row_ids, &created_at)
+                .await?
+                .apply(fragment);
+        }
+        Ok(())
     }
 
     async fn commit_impl(
@@ -688,14 +789,19 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::rowids::{
+        INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+        read_spilled_row_ids, read_spilled_versions,
+    };
     use crate::dataset::{WriteDestination, WriteMode};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow::{
         array::AsArray,
         datatypes::{Int64Type, UInt32Type},
     };
+    use arrow_array::record_batch;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{
         Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
@@ -714,6 +820,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    use lance_table::format::ROW_CREATED_AT_VERSION_FIELD_ID;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
@@ -2260,6 +2367,159 @@ mod tests {
             baseline_files,
             "Rewritten data files should be cleaned up on apply_deletions failure"
         );
+    }
+
+    /// On a table that cannot spill, or when nothing an update carries over
+    /// exceeds the inline budget, the new fragments carry only inline row ids:
+    /// the commit resolves their created-at versions, as it always has.
+    #[rstest]
+    #[case::not_opted_in(false)]
+    #[case::under_budget(true)]
+    #[tokio::test]
+    async fn update_leaves_inline_created_at_to_the_commit(#[case] opted_in: bool) {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+        let mut dataset = dataset.as_ref().clone();
+        if opted_in {
+            dataset
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "true")])
+                .await
+                .unwrap();
+        }
+        let update_data = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 15")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute_impl()
+            .await
+            .unwrap();
+
+        assert!(!update_data.new_fragments.is_empty());
+        for fragment in &update_data.new_fragments {
+            assert!(
+                matches!(fragment.row_id_meta, Some(RowIdMeta::Inline(_))),
+                "{fragment:?}"
+            );
+            assert_eq!(fragment.created_at_version_meta, None);
+            assert_eq!(fragment.last_updated_at_version_meta, None);
+            assert_eq!(fragment.files.len(), 1, "no lineage file: {fragment:?}");
+        }
+    }
+
+    /// A malformed inline budget fails the update before it writes anything.
+    /// Every write to the data directory fails here, so an update that
+    /// rewrote the rows first would report that failure instead.
+    #[tokio::test]
+    async fn update_rejects_malformed_inline_max_bytes_before_writing() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+        let batch = record_batch!(("id", Int64, [0, 1, 2, 3, 4, 5])).unwrap();
+        let schema = batch.schema();
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &routed_uri, Some(write_params))
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "200KB"),
+            ])
+            .await
+            .unwrap();
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("put", "/data/", "injected data write failure");
+        failing.fail_when("put_multipart", "/data/", "injected data write failure");
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let error = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 3")
+            .unwrap()
+            .set("id", "id + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY),
+            "{error}"
+        );
+    }
+
+    /// The captured lineage is split across the new fragments by their row
+    /// counts, and a created-at capture that does not cover every written row
+    /// is an error rather than a silent fallback to the commit.
+    #[tokio::test]
+    async fn place_rewritten_lineage_splits_lineage_by_output_fragment() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+        let job = UpdateBuilder::new(dataset)
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap();
+        let output_fragments = || {
+            [(1, 3), (2, 2)].map(|(id, rows)| {
+                let mut fragment = Fragment::new(id);
+                fragment.physical_rows = Some(rows);
+                fragment
+            })
+        };
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 20, 21].as_slice());
+
+        // A zero budget spills everything, so each fragment's share is read
+        // back from its own lineage file.
+        let mut fragments = output_fragments();
+        let created_at = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3, 3]);
+        job.place_rewritten_lineage(&mut fragments, &row_ids, Some(&created_at), Some(0))
+            .await
+            .unwrap();
+        let mut placed = Vec::new();
+        for fragment in &fragments {
+            let ids = read_spilled_row_ids(&job.dataset, fragment).await.unwrap();
+            let versions =
+                read_spilled_versions(&job.dataset, fragment, ROW_CREATED_AT_VERSION_FIELD_ID)
+                    .await
+                    .unwrap();
+            placed.push((
+                ids.iter().collect::<Vec<_>>(),
+                versions.versions().collect::<Vec<_>>(),
+            ));
+        }
+        assert_eq!(placed[0], (vec![10, 11, 12], vec![1, 1, 2]));
+        assert_eq!(placed[1], (vec![20, 21], vec![3, 3]));
+
+        let mut fragments = output_fragments();
+        let too_few = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3]);
+        let error = job
+            .place_rewritten_lineage(&mut fragments, &row_ids, Some(&too_few), Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }), "{error:?}");
     }
 
     #[tokio::test]

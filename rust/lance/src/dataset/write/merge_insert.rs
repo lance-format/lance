@@ -73,8 +73,8 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
-use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
 use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
@@ -1185,6 +1185,60 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
             deduplicated,
         ))
     }
+}
+
+/// Re-expose every dataset column the source does not carry under its bare
+/// dataset field name, taking the value from the `target` side of the join.
+///
+/// `df` is the target-joined-source plan, whose target columns are qualified
+/// `target` and whose source columns are qualified `source`. For matched rows a
+/// filled column carries the existing target value (preserving non-source
+/// columns on update); for unmatched source rows the outer join leaves the
+/// target side NULL, so inserts get NULL. The unqualified name matches the
+/// dataset field and makes it a normal data column from the write exec's
+/// perspective.
+///
+/// A filled column replaces `target.X` in place rather than being appended, so
+/// the output is the join schema with some columns unqualified, in the same
+/// order, and the same width. Appending instead would leave both `target.X` and
+/// a bare `X` in scope, which downstream column references read as ambiguous.
+fn fill_missing_target_columns(
+    df: DataFrame,
+    dataset_schema: &Schema,
+    source_field_names: &HashSet<String>,
+) -> Result<DataFrame> {
+    let missing_from_source: HashSet<&str> = dataset_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .filter(|name| !source_field_names.contains(*name))
+        .collect();
+    if missing_from_source.is_empty() {
+        return Ok(df);
+    }
+
+    // Keep this a single projection. `DataFrame::with_column` would express the
+    // fill one field at a time and read better, but each call re-lists every
+    // column in a fresh `Projection`, so a per-field loop nests N of them and
+    // the optimizer's recursive walk overflows the stack on wide tables (#9504).
+    let target_qualifier = TableReference::bare("target");
+    let projection = df
+        .schema()
+        .iter()
+        .map(|(qualifier, field)| {
+            let expr = logical_expr::col(DFColumn::from((qualifier, field)));
+            if qualifier == Some(&target_qualifier)
+                && missing_from_source.contains(field.name().as_str())
+            {
+                // An alias is unqualified, which is what drops the `target.`
+                // prefix and makes this a plain data column.
+                expr.alias(field.name())
+            } else {
+                expr
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(df.select(projection)?)
 }
 
 impl MergeInsertJob {
@@ -2428,6 +2482,17 @@ impl MergeInsertJob {
             .iter()
             .map(|f| f.name().clone())
             .collect();
+        let source_blob_columns = self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| {
+                source_field_names.contains(&field.name)
+                    && crate::dataset::optimize::field_contains_blob_v2(field)
+            })
+            .map(|field| field.name.clone())
+            .collect();
         // Inject a sentinel literal column so we can reliably determine, after the join,
         // whether the source side contributed a row.  This is NULL-safe: even when every
         // ON column is NULL the sentinel lets us distinguish a source-only row from a
@@ -2452,31 +2517,15 @@ impl MergeInsertJob {
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
             )?;
 
-        // Partial-schema upsert: for every dataset column missing from the
-        // source, add a synthetic unqualified column that copies the target
-        // side's value for that column. For matched rows this carries the
-        // existing target value (preserving non-source columns on update);
-        // for unmatched source rows (inserts) the outer join leaves the
-        // target side NULL, so inserts get NULL for missing columns. The
-        // unqualified name matches the dataset field and becomes a normal
-        // data column from the write exec's perspective.
-        //
-        // We iterate the dataset schema in order so that the resulting
-        // physical plan is deterministic and easy to inspect in tests.
+        // Partial-schema upsert: fill the dataset columns the source does not
+        // carry from the target side of the join.
         //
         // `RewriteColumns` patches the source columns into the fragments that
         // already hold the matched rows, so the missing columns keep their
         // stored values and must not be filled here. Skipping the fill is also
         // what keeps them out of the target scan's projection.
         if write_sink == WriteSink::RewriteRows {
-            for field in dataset_schema.fields() {
-                if !source_field_names.contains(field.name()) {
-                    df = df.with_column(
-                        field.name(),
-                        logical_expr::col(format!("target.\"{}\"", field.name())),
-                    )?;
-                }
-            }
+            df = fill_missing_target_columns(df, &dataset_schema, &source_field_names)?;
         }
 
         let (session_state, logical_plan) = df.into_parts();
@@ -2487,6 +2536,7 @@ impl MergeInsertJob {
             self.params.clone(),
             source_skipped_duplicates,
             write_sink,
+            source_blob_columns,
         );
         let logical_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),
@@ -3820,10 +3870,68 @@ mod tests {
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use tokio::sync::{Barrier, Notify};
+    use url::Url;
 
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    /// The fill's plan depth must not grow with the number of columns the
+    /// source omits. Building it with a `DataFrame::with_column` per missing
+    /// field — the obvious way, and what this did before #9504 — nests one
+    /// `Projection` per column; the optimizer's recursive walk over that chain
+    /// aborted the process on a 315-column table. No other test in this suite
+    /// builds a partial-schema merge wide enough to notice, so a regression to
+    /// that form would surface in production rather than here.
+    ///
+    /// Only the depth is asserted. What the fill produces is covered by the
+    /// partial-schema merge tests below.
+    #[test]
+    fn test_fill_missing_target_columns_depth_is_width_independent() {
+        fn fill_depth(num_cols: usize) -> usize {
+            fn depth(plan: &LogicalPlan) -> usize {
+                1 + plan.inputs().iter().map(|i| depth(i)).max().unwrap_or(0)
+            }
+
+            let ctx = SessionContext::new();
+            let dataset_schema = Schema::new(
+                (0..num_cols)
+                    .map(|i| Field::new(format!("c{i}"), DataType::Int32, true))
+                    .collect::<Vec<_>>(),
+            );
+            let target = Arc::new(
+                MemTable::try_new(Arc::new(dataset_schema.clone()), vec![vec![]]).unwrap(),
+            );
+            // The source carries only the join key, so every other column is
+            // filled from the target side.
+            let source = Arc::new(
+                MemTable::try_new(
+                    Arc::new(Schema::new(vec![Field::new("c0", DataType::Int32, true)])),
+                    vec![vec![]],
+                )
+                .unwrap(),
+            );
+            let joined = ctx
+                .read_table(target)
+                .unwrap()
+                .alias("target")
+                .unwrap()
+                .join(
+                    ctx.read_table(source).unwrap().alias("source").unwrap(),
+                    JoinType::Left,
+                    &["\"c0\""],
+                    &["\"c0\""],
+                    None,
+                )
+                .unwrap();
+            let source_field_names: HashSet<String> = std::iter::once("c0".to_string()).collect();
+            let filled =
+                fill_missing_target_columns(joined, &dataset_schema, &source_field_names).unwrap();
+            depth(filled.logical_plan())
+        }
+
+        assert_eq!(fill_depth(8), fill_depth(512));
     }
 
     #[test]
@@ -15239,6 +15347,113 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_preserves_carried_external_blob() {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        let dataset_dir = TempStrDir::default();
+        let external_dir = TempStrDir::default();
+        let external_path = format!("{external_dir}/external.bin");
+        std::fs::write(&external_path, b"external blob").unwrap();
+        let external_uri = Url::from_file_path(&external_path).unwrap().to_string();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            blob_field("payload", true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_uri(external_uri.clone()).unwrap();
+        blobs.push_bytes(b"internal blob").unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                blobs.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["a", "other"])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &dataset_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 1,
+                    allow_external_blob_outside_bases: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let source = record_batch!(("id", Int64, [1]), ("tag", Utf8, ["updated"])).unwrap();
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, _) = job
+            .execute_reader(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            ))
+            .await
+            .unwrap();
+
+        let result = dataset
+            .scan()
+            .project(&["id", "tag"])
+            .unwrap()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let ids = result["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let row = ids.values().iter().position(|id| *id == 1).unwrap();
+        assert_eq!(result["tag"].as_string::<i32>().value(row), "updated");
+        let blobs = dataset
+            .take_blobs_by_indices(&[row as u64], "payload")
+            .await
+            .unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), lance_core::datatypes::BlobKind::External);
+        assert_eq!(blob.uri(), Some(external_uri.as_str()));
+        assert_eq!(blob.read().await.unwrap().as_ref(), b"external blob");
+
+        let mut source_blob = BlobArrayBuilder::new(1);
+        source_blob.push_uri(external_uri).unwrap();
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                source_blob.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["another update"])),
+            ],
+        )
+        .unwrap();
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let error = job
+            .execute_reader(RecordBatchIterator::new(vec![Ok(source)], schema))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("in field 'payload' is outside registered external bases"),
+            "{error:?}"
         );
     }
 

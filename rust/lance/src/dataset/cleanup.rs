@@ -2547,8 +2547,11 @@ mod tests {
         assert_eq!(after_count.num_tx_files, 2);
     }
 
+    #[rstest]
+    #[case::version_number(false)]
+    #[case::raw_main_alias(true)]
     #[tokio::test]
-    async fn cleanup_error_when_tagged_old_versions() {
+    async fn cleanup_error_when_tagged_old_versions(#[case] use_main_alias: bool) {
         // We should not clean up old versions that are tagged.
         // This tests when `error_if_tagged_old_version=true`.
         // When `true`, no files should be cleaned and a `Error::CleanupError`
@@ -2560,8 +2563,31 @@ mod tests {
 
         let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags().create("old-tag", 1).await.unwrap();
-        dataset.tags().create("another-old-tag", 2).await.unwrap();
+        let reference = |version| {
+            if use_main_alias {
+                crate::dataset::refs::Ref::Version(Some("main".to_string()), Some(version))
+            } else {
+                crate::dataset::refs::Ref::VersionNumber(version)
+            }
+        };
+        dataset
+            .tags()
+            .create("old-tag", reference(1))
+            .await
+            .unwrap();
+        dataset
+            .tags()
+            .create("another-old-tag", reference(3))
+            .await
+            .unwrap();
+        dataset
+            .tags()
+            .update("another-old-tag", reference(2))
+            .await
+            .unwrap();
+        for tag in dataset.tags().list().await.unwrap().values() {
+            assert_eq!(tag.branch, None);
+        }
 
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
