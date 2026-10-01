@@ -33,12 +33,12 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use futures::TryStreamExt;
 use lance_core::cache::{
-    CacheKey, CacheKeySchema, CacheLease, CachePin, KeyBuilder, LanceCache, PinnedValue,
-    WeakLanceCache,
+    CacheKey, CacheKeySchema, CacheLease, CachePin, InternalCacheKey, KeyBuilder, LanceCache,
+    PinnedValue, WeakLanceCache,
 };
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
-use lance_encoding::decoder::FilterExpression;
+use lance_encoding::decoder::{FilterExpression, PageInfo};
 use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
@@ -671,32 +671,76 @@ impl ResidentColumnStore {
     }
 }
 
-/// The row at which each page of column `name` of `reader`'s file ends.
-fn column_page_ends(reader: &FileReader, name: &str) -> Result<Vec<u64>> {
+/// The pages of column `name` of `reader`'s file.
+fn column_pages<'a>(reader: &'a FileReader, name: &str) -> Result<&'a [PageInfo]> {
     let metadata = reader.metadata();
     let projection = lance_file::versions::reader_projection_from_column_names(
         metadata.version(),
         reader.schema(),
         &[name],
     )?;
-    let column = match projection.column_indices.as_slice() {
+    match projection.column_indices.as_slice() {
         [column] => metadata.column_infos.get(*column as usize),
         _ => None,
     }
+    .map(|column| column.page_infos.as_ref())
     .ok_or_else(|| {
         Error::internal(format!(
             "resident column {name} is not one column of the file: {:?}",
             projection.column_indices
         ))
-    })?;
-    Ok(column
-        .page_infos
+    })
+}
+
+/// The row at which each page of column `name` of `reader`'s file ends, one
+/// per page in a vector of exactly that capacity, as
+/// [`resident_store_charge`] counts them.
+fn column_page_ends(reader: &FileReader, name: &str) -> Result<Vec<u64>> {
+    let pages = column_pages(reader, name)?;
+    let mut page_ends = Vec::with_capacity(pages.len());
+    let mut end = 0u64;
+    for page in pages {
+        end += page.num_rows;
+        page_ends.push(end);
+    }
+    Ok(page_ends)
+}
+
+/// Bytes an index cache charges for the resident store of `reader`'s file
+/// once loaded, known without reading it: what its cache entry
+/// ([`ResidentColumnsEntry`]) takes, which is the store's columns in buffers
+/// of exactly their values ([`resident_columns_bytes`]), their page ends,
+/// names and map, the shared slot and the entry's `Arc`, and the cost a
+/// backend adds for the entry's key. An open compares it with the cache's
+/// pinned cap before keeping a store resident, as a lease compares the
+/// charged entry with it.
+pub fn resident_store_charge(reader: &FileReader) -> Result<u64> {
+    let schema = Schema::from(reader.schema().as_ref());
+    let columns = schema
+        .fields()
         .iter()
-        .scan(0u64, |end, page| {
-            *end += page.num_rows;
-            Some(*end)
+        .filter_map(|field| Some((field.name(), resident_width(field)?)))
+        .map(|(name, width)| Ok((name.as_str(), width, column_pages(reader, name)?.len())))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(store_charge(&columns, reader.num_rows()))
+}
+
+/// [`resident_store_charge`] of a store of `num_rows` rows of `columns`,
+/// each a name, a value width and a number of pages.
+fn store_charge(columns: &[(&str, usize, usize)], num_rows: u64) -> u64 {
+    let map_bytes = HashMap::<String, ResidentColumn>::with_capacity(columns.len()).capacity()
+        * std::mem::size_of::<(String, ResidentColumn)>();
+    let column_bytes: u64 = columns
+        .iter()
+        .map(|&(name, width, pages)| {
+            (name.len() + pages * std::mem::size_of::<u64>()) as u64 + width as u64 * num_rows
         })
-        .collect())
+        .sum();
+    let fixed_bytes = std::mem::size_of::<ResidentColumnsEntry>()
+        + std::mem::size_of::<ResidentSlot>()
+        + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+        + std::mem::size_of::<InternalCacheKey>();
+    (map_bytes + fixed_bytes) as u64 + column_bytes
 }
 
 /// Every row of one resident column, with the column's pages in the file.
@@ -760,6 +804,7 @@ mod tests {
         ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
         SCALE_FACTORS_COLUMN,
     };
+    use crate::vector::storage::{ResidentColumnsSetting, ResidentStoreSize};
 
     fn list_field(name: &str, item: DataType, width: i32) -> Field {
         Field::new(
@@ -928,6 +973,101 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// A store of `rows` rows of `columns`, each a name and a value width
+    /// of 4 or 8 bytes, in `pages` pages, laid out as a load lays it out.
+    fn store_of(columns: &[(&str, usize)], rows: usize, pages: usize) -> ResidentColumnStore {
+        let mut map = HashMap::with_capacity(columns.len());
+        let mut bytes = 0;
+        for &(name, width) in columns {
+            let values: ArrayRef = match width {
+                4 => Arc::new(Float32Array::from(vec![1.0; rows])),
+                _ => Arc::new(UInt64Array::from(vec![1; rows])),
+            };
+            let mut page_ends = Vec::with_capacity(pages);
+            page_ends.extend((1..=pages).map(|page| (rows * page / pages) as u64));
+            map.insert(name.to_string(), ResidentColumn { values, page_ends });
+            bytes += (width * rows) as u64;
+        }
+        ResidentColumnStore {
+            columns: map,
+            num_rows: rows as u64,
+            bytes,
+        }
+    }
+
+    /// The slot of `file`, loaded with `store`, and held by the caller.
+    fn slot_with(file: &IndexFileKey, store: ResidentColumnStore) -> Arc<ResidentSlot> {
+        let (slot, _) = shared_slot(file);
+        slot.store.set(store).unwrap();
+        slot
+    }
+
+    const CHARGE_TEST_COLUMNS: [(&str, usize); 3] =
+        [("_rowid", 8), ("__add_factors", 4), ("__scale_factors", 4)];
+
+    /// What [`resident_store_charge`] estimates without reading the store
+    /// is what a pinning cache charges for it once loaded.
+    #[tokio::test]
+    async fn store_charge_is_what_the_cache_charges() {
+        for (rows, pages) in [(1, 1), (1000, 1), (10_000, 7), (100_000, 64)] {
+            let columns: Vec<(&str, usize, usize)> = CHARGE_TEST_COLUMNS
+                .iter()
+                .map(|&(name, width)| (name, width, pages))
+                .collect();
+            let charge = store_charge(&columns, rows as u64);
+            let file = test_file(&format!("store-charge-{rows}-{pages}"));
+            let _slot = slot_with(&file, store_of(&CHARGE_TEST_COLUMNS, rows, pages));
+            let cache =
+                LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(64 << 20)));
+            let handle =
+                ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Index).await;
+            assert!(handle.lease().is_some_and(CacheLease::is_pinned));
+            assert_eq!(cache.pinned_stats().pinned_bytes, charge, "{rows} {pages}");
+        }
+    }
+
+    /// `auto` keeps a store resident exactly when the cache pins it: where
+    /// the store's charge fits the pinned cap, a lease pins it, and a cache
+    /// a byte smaller resolves it off rather than leaving it to overflow, as
+    /// it would at a cap that fits its values but not its charge.
+    #[tokio::test]
+    async fn auto_admits_a_store_where_the_cache_pins_it() {
+        let rows = 10_000;
+        let pages = 3;
+        let columns: Vec<(&str, usize, usize)> = CHARGE_TEST_COLUMNS
+            .iter()
+            .map(|&(name, width)| (name, width, pages))
+            .collect();
+        let store = ResidentStoreSize {
+            bytes: 16 * rows as u64,
+            charge: store_charge(&columns, rows as u64),
+        };
+        assert!(store.charge > store.bytes);
+        let (bytes, charge) = (store.bytes as usize, store.charge as usize);
+        for capacity in [
+            2 * charge - 2,
+            2 * charge - 1,
+            2 * charge,
+            2 * charge + 1,
+            2 * bytes,
+            2 * bytes + 1,
+        ] {
+            let cache =
+                LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(capacity)));
+            assert_eq!(cache.max_entry_bytes(), Some(capacity as u64));
+            let admitted = ResidentColumnsSetting::Auto.admits(store, cache.max_entry_bytes());
+            assert_eq!(admitted, capacity >= 2 * charge, "{capacity}");
+            // Lease the store as an index that keeps it resident does.
+            let file = test_file(&format!("auto-admits-{capacity}"));
+            let _slot = slot_with(&file, store_of(&CHARGE_TEST_COLUMNS, rows, pages));
+            let handle =
+                ResidentColumns::in_index_cache(&cache, &file, None, ResidentLifetime::Index).await;
+            let pinned = handle.lease().is_some_and(CacheLease::is_pinned);
+            assert_eq!(pinned, admitted, "{capacity}");
+            assert_eq!(cache.pinned_stats().overflow > 0, !admitted, "{capacity}");
+        }
     }
 
     /// Under the `process` lifetime a store keeps a lease once its first

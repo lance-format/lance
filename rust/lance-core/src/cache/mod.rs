@@ -68,6 +68,7 @@ pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey
 pub use moka::MokaCacheBackend;
 pub use pin::{
     CacheLease, CachePin, PINNED_CAP_FRACTION, PinBudget, PinRecord, PinnedStats, PinnedValue,
+    pinned_partition_cap,
 };
 pub use quick::{QuickCacheBackend, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};

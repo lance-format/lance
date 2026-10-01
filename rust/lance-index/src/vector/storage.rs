@@ -20,7 +20,7 @@ use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheTier, WeakLanceCache};
+use lance_core::cache::{CacheTier, WeakLanceCache, pinned_partition_cap};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
@@ -63,7 +63,7 @@ use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
 pub use crate::vector::bq::resident::{
     ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, resident_columns_bytes,
-    resident_store_count, resident_store_is_live, resident_store_leases,
+    resident_store_charge, resident_store_count, resident_store_is_live, resident_store_leases,
     resident_store_preopen_lease,
 };
 
@@ -1060,7 +1060,7 @@ fn sign_bounds_from(value: Option<&str>) -> Result<SignBounds> {
 /// storage file (row ids and factors) in memory, so that partition and plane
 /// reads fetch only the code and bounds columns from the file: `auto`
 /// (default), `on` or `off`. `auto` is on for [`OriginLatencyClass::High`],
-/// where each column read is a request, when the store fits the index cache
+/// where each column read is a request, when the cache can pin the store
 /// (see [`ResidentColumnsSetting::admits`]). The store is an entry of the
 /// index cache, charged in its budget and kept in RAM while an index of the
 /// file is live (see [`ResidentColumns`]); [`resident_columns_bytes`] gives
@@ -1068,18 +1068,27 @@ fn sign_bounds_from(value: Option<&str>) -> Result<SignBounds> {
 /// process; resolved when an index opens.
 pub const RESIDENT_COLUMNS_ENV: &str = "LANCE_RQ_RESIDENT_COLUMNS";
 
-/// `auto` keeps the small columns resident only when the store takes at most
-/// this fraction (one over the divisor) of the largest entry the index
-/// cache admits ([`lance_core::cache::CacheBackend::max_entry_bytes`]): a
-/// store that would take most of a cache shard would leave the planes too
-/// little room, and one past the shard's budget could not be admitted.
-pub const RESIDENT_MAX_ENTRY_SHARE_DIVISOR: u64 = 2;
+/// The size of an IVF_RQ storage file's resident store, known without
+/// reading it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResidentStoreSize {
+    /// Bytes of values the store holds ([`resident_columns_bytes`]).
+    pub bytes: u64,
+    /// Bytes an index cache charges for the loaded store
+    /// ([`resident_store_charge`]).
+    pub charge: u64,
+}
 
-/// Whether a resident store of `bytes` fits an index cache whose largest
-/// admissible entry is `max_entry_bytes` (`None`: no limit below its
-/// capacity); see [`RESIDENT_MAX_ENTRY_SHARE_DIVISOR`].
-pub fn resident_store_fits(bytes: u64, max_entry_bytes: Option<u64>) -> bool {
-    max_entry_bytes.is_none_or(|max| bytes <= max / RESIDENT_MAX_ENTRY_SHARE_DIVISOR)
+/// Whether a resident store an index cache charges `charge` bytes for fits
+/// the cache's pinned cap, so that a lease pins it: the cap
+/// ([`lance_core::cache::pinned_partition_cap`]) of a partition as large as
+/// the largest entry the cache admits, `max_entry_bytes`
+/// ([`lance_core::cache::CacheBackend::max_entry_bytes`]; `None`: no limit
+/// below its capacity). A store past the cap would overflow on every lease
+/// and stay evictable while in use; one that takes most of a cache shard
+/// would also leave the planes too little room.
+pub fn resident_store_fits(charge: u64, max_entry_bytes: Option<u64>) -> bool {
+    max_entry_bytes.is_none_or(|max| charge <= pinned_partition_cap(max))
 }
 
 /// The value of [`RESIDENT_COLUMNS_ENV`].
@@ -1105,16 +1114,17 @@ impl ResidentColumnsSetting {
         }
     }
 
-    /// Whether a resident store of `bytes` may be kept in an index cache
-    /// whose largest admissible entry is `max_entry_bytes`: never when
+    /// Whether a resident store of `store`'s size may be kept in an index
+    /// cache whose largest admissible entry is `max_entry_bytes`: never when
     /// `off`, and only a store with some columns otherwise; `auto` also
-    /// requires it to fit ([`resident_store_fits`]). An index keeps its
-    /// small columns resident when both this and [`Self::resolve`] hold.
-    pub fn admits(self, bytes: u64, max_entry_bytes: Option<u64>) -> bool {
+    /// requires the bytes the cache charges for it to fit its pinned cap
+    /// ([`resident_store_fits`]). An index keeps its small columns resident
+    /// when both this and [`Self::resolve`] hold.
+    pub fn admits(self, store: ResidentStoreSize, max_entry_bytes: Option<u64>) -> bool {
         match self {
             Self::Off => false,
-            Self::On => bytes > 0,
-            Self::Auto => bytes > 0 && resident_store_fits(bytes, max_entry_bytes),
+            Self::On => store.bytes > 0,
+            Self::Auto => store.bytes > 0 && resident_store_fits(store.charge, max_entry_bytes),
         }
     }
 
@@ -2084,6 +2094,20 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             return 0;
         }
         resident_columns_bytes(&self.schema(), self.num_rows())
+    }
+
+    /// The size of the resident store of this storage's file, loaded or
+    /// not, and what an index cache charges for it; zero for a plane-row
+    /// file. It reads nothing.
+    pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
+        let bytes = self.resident_columns_bytes();
+        if bytes == 0 {
+            return Ok(ResidentStoreSize::default());
+        }
+        Ok(ResidentStoreSize {
+            bytes,
+            charge: resident_store_charge(&self.reader)?,
+        })
     }
 
     /// Ask the cache entries to hold `entry_columns`, resolved when the
@@ -3594,9 +3618,9 @@ mod tests {
         LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig, LazyFarPermits,
         LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV, OriginLatencyClass, PlaneSource,
         QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV, RESIDENT_LIFETIME_ENV,
-        RESIDENT_MAX_ENTRY_SHARE_DIVISOR, ResidentColumnsSetting, ResidentLifetime,
-        SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches,
-        entry_columns_from, entry_columns_setting, origin_latency_from, origin_latency_setting,
+        ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize, SEQUENTIAL_PLANE_LOADS_ENV,
+        SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches, entry_columns_from,
+        entry_columns_setting, origin_latency_from, origin_latency_setting,
         origin_reads_whole_plane, plan_plane_gather, resident_columns_from,
         resident_columns_setting, resident_lifetime_from, resident_lifetime_setting,
         resident_store_fits, sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from,
@@ -4434,39 +4458,43 @@ mod tests {
     }
 
     /// `off` never keeps a store; `on` keeps any store with columns, however
-    /// large; `auto` keeps one that takes at most half of the cache's
-    /// largest admissible entry, any size on a cache without that limit.
+    /// large; `auto` keeps one whose charge fits the pinned cap of the
+    /// cache's largest admissible entry, half of it, whatever its values'
+    /// bytes, and any size on a cache without that limit.
     #[test]
-    fn admits_follows_setting_bytes_and_limit() {
-        const MAX_ENTRY: u64 = 1 << 20;
-        let limit = MAX_ENTRY / RESIDENT_MAX_ENTRY_SHARE_DIVISOR;
-        assert_eq!(limit, MAX_ENTRY / 2);
+    fn admits_follows_setting_charge_and_pinned_cap() {
+        const MAX_ENTRY: u64 = (1 << 20) + 1;
+        let cap = lance_core::cache::pinned_partition_cap(MAX_ENTRY);
+        assert_eq!(cap, MAX_ENTRY / 2);
+        let size = |bytes, charge| ResidentStoreSize { bytes, charge };
         let cases = [
-            (0, Some(MAX_ENTRY)),
-            (1, Some(MAX_ENTRY)),
-            (limit, Some(MAX_ENTRY)),
-            (limit + 1, Some(MAX_ENTRY)),
-            (MAX_ENTRY + 1, Some(MAX_ENTRY)),
-            (1, Some(0)),
-            (u64::MAX, None),
-            (0, None),
+            (size(0, 0), Some(MAX_ENTRY)),
+            (size(1, 100), Some(MAX_ENTRY)),
+            (size(cap - 100, cap), Some(MAX_ENTRY)),
+            // Values at the cap, charged past it.
+            (size(cap, cap + 100), Some(MAX_ENTRY)),
+            (size(cap - 100, cap + 1), Some(MAX_ENTRY)),
+            (size(MAX_ENTRY + 1, MAX_ENTRY + 100), Some(MAX_ENTRY)),
+            (size(1, 100), Some(0)),
+            (size(u64::MAX, u64::MAX), None),
+            (size(0, 0), None),
         ];
         for (setting, expected) in [
             (
                 ResidentColumnsSetting::Auto,
-                [false, true, true, false, false, false, true, false],
+                [false, true, true, false, false, false, false, true, false],
             ),
             (
                 ResidentColumnsSetting::On,
-                [false, true, true, true, true, true, true, false],
+                [false, true, true, true, true, true, true, true, false],
             ),
-            (ResidentColumnsSetting::Off, [false; 8]),
+            (ResidentColumnsSetting::Off, [false; 9]),
         ] {
-            let admitted = cases.map(|(bytes, max)| setting.admits(bytes, max));
+            let admitted = cases.map(|(store, max)| setting.admits(store, max));
             assert_eq!(admitted, expected, "{setting}");
         }
-        assert!(resident_store_fits(limit, Some(MAX_ENTRY)));
-        assert!(!resident_store_fits(limit + 1, Some(MAX_ENTRY)));
+        assert!(resident_store_fits(cap, Some(MAX_ENTRY)));
+        assert!(!resident_store_fits(cap + 1, Some(MAX_ENTRY)));
         assert!(resident_store_fits(u64::MAX, None));
     }
 

@@ -24,6 +24,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// entries to evict.
 pub const PINNED_CAP_FRACTION: f64 = 0.5;
 
+/// Bytes the pinned entries of one budget partition may hold, for a
+/// partition whose share of the capacity is `share_bytes`: the cap a lease
+/// compares an entry's charged bytes with. A backend whose largest
+/// admissible entry is its partition's share
+/// ([`CacheBackend::max_entry_bytes`](super::CacheBackend::max_entry_bytes))
+/// pins an entry only when it charges at most this much of it.
+pub fn pinned_partition_cap(share_bytes: u64) -> u64 {
+    (share_bytes as f64 * PINNED_CAP_FRACTION) as u64
+}
+
 /// What a [`PinBudget`] holds, as [`PinBudget::stats`] reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PinnedStats {
@@ -69,7 +79,7 @@ impl PinBudget {
         let partitions = partitions.max(1);
         let share = capacity / partitions as u64;
         Self {
-            partition_cap: (share as f64 * PINNED_CAP_FRACTION) as u64,
+            partition_cap: pinned_partition_cap(share),
             state: Mutex::new(BudgetState {
                 pinned: vec![0; partitions],
                 ..Default::default()

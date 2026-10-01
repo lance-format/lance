@@ -33,7 +33,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    CacheLease, KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLease, KeyBuilder, LanceCache, WeakLanceCache, pinned_partition_cap,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -1104,15 +1104,18 @@ pub(crate) fn aux_file_key(
 }
 
 /// Warn, once per process, that `LANCE_RQ_RESIDENT_COLUMNS=on` keeps a
-/// resident store of `bytes` that the index cache, admitting entries up to
-/// `max_entry_bytes`, cannot hold: it stays loaded while an index of the
-/// file is live, but charged nowhere and loaded again after each drop.
-fn warn_resident_store_oversize(bytes: u64, max_entry_bytes: Option<u64>) {
+/// resident store that the index cache charges `charge` bytes for, more than
+/// it pins for an entry when it admits entries up to `max_entry_bytes`: the
+/// store stays evictable while an index of the file uses it, and loads again
+/// whenever its last index drops after an eviction.
+fn warn_resident_store_oversize(charge: u64, max_entry_bytes: Option<u64>) {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
+        let cap = max_entry_bytes.map(pinned_partition_cap);
         log::warn!(
-            "LANCE_RQ_RESIDENT_COLUMNS=on keeps a resident store of {bytes} bytes, more than \
-             the {max_entry_bytes:?} bytes the index cache admits per entry"
+            "LANCE_RQ_RESIDENT_COLUMNS=on keeps a resident store the index cache charges \
+             {charge} bytes for, more than the {cap:?} bytes it pins per entry; the store \
+             stays evictable while in use"
         );
     });
 }
@@ -1697,11 +1700,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
         let storage =
             IvfQuantizationStorage::try_new_with_remapper(storage_reader, frag_reuse_index).await?;
-        let resident_columns = Self::resident_columns_at_open(
-            origin_latency,
-            storage.resident_columns_bytes(),
-            context.file_cache.as_ref(),
-        )?;
+        let resident_columns =
+            Self::resident_columns_at_open(origin_latency, &storage, context.file_cache.as_ref())?;
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
@@ -1881,11 +1881,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         mut self,
         origin_latency: OriginLatencyClass,
     ) -> Result<Self> {
-        let resident_columns = Self::resident_columns_at_open(
-            origin_latency,
-            self.storage.resident_columns_bytes(),
-            None,
-        )?;
+        let resident_columns = Self::resident_columns_at_open(origin_latency, &self.storage, None)?;
         let layered_lazy = Self::layered_lazy_config_at_open(self.layered_rq, origin_latency)?;
         self.origin_latency = origin_latency;
         self.storage = self
@@ -1896,16 +1892,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(self)
     }
 
-    /// Whether an index opened with origin latency `class` keeps its small
-    /// columns, a store of `bytes`, resident in `file_cache`: when the
-    /// setting resolves for the class and admits the store for the cache's
-    /// largest entry (see [`ResidentColumnsSetting::admits`]). Only IVF_RQ
-    /// indexes read (and validate) `LANCE_RQ_RESIDENT_COLUMNS` and
-    /// `LANCE_RQ_RESIDENT_LIFETIME`: the resident columns are told apart from
-    /// the RaBitQ code columns, so other storages keep none.
+    /// Whether an index opened with origin latency `class` keeps the small
+    /// columns of `storage`'s file resident in `file_cache`: when the setting
+    /// resolves for the class and admits the store for the cache's largest
+    /// entry (see [`ResidentColumnsSetting::admits`]), which `auto` sizes by
+    /// what the cache would charge for the store against its pinned cap.
+    /// Only IVF_RQ indexes read (and validate) `LANCE_RQ_RESIDENT_COLUMNS`
+    /// and `LANCE_RQ_RESIDENT_LIFETIME`: the resident columns are told apart
+    /// from the RaBitQ code columns, so other storages keep none.
     fn resident_columns_at_open(
         class: OriginLatencyClass,
-        bytes: u64,
+        storage: &IvfQuantizationStorage<Q>,
         file_cache: Option<&LanceCache>,
     ) -> Result<bool> {
         if Q::quantization_type() != QuantizationType::Rabit {
@@ -1916,16 +1913,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if !setting.resolve(class) {
             return Ok(false);
         }
+        let store = storage.resident_store_size()?;
         let max_entry_bytes = file_cache.and_then(LanceCache::max_entry_bytes);
-        if bytes > 0 && !resident_store_fits(bytes, max_entry_bytes) {
+        if store.bytes > 0 && !resident_store_fits(store.charge, max_entry_bytes) {
             layered_stats::counters().resident_columns_oversize.incr();
-            if setting == ResidentColumnsSetting::On
-                && max_entry_bytes.is_some_and(|max| bytes > max)
-            {
-                warn_resident_store_oversize(bytes, max_entry_bytes);
+            if setting == ResidentColumnsSetting::On {
+                warn_resident_store_oversize(store.charge, max_entry_bytes);
             }
         }
-        Ok(setting.admits(bytes, max_entry_bytes))
+        Ok(setting.admits(store, max_entry_bytes))
     }
 
     /// The resident store handle of an index opening on index file `file`:
@@ -3892,7 +3888,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     // the file's live indexes share, and any state pins nothing.
     let resident = IVFIndex::<S, Q>::resident_columns_at_open(
         origin_latency,
-        storage.resident_columns_bytes(),
+        &storage,
         context.file_cache.as_ref(),
     )?;
     let resident_columns =
@@ -7742,8 +7738,9 @@ mod tests {
             DenseGatherMode, DenseToEager, GatherPlan, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
             IndexFileKey, LayeredLazyConfig, LazyOriginGap, LazyPromotion, OriginLatencyClass,
             PlaneSource, ResidentColumnsKey, ResidentColumnsSetting, ResidentLifetime,
-            entry_columns_setting, origin_latency_setting, resident_columns_setting,
-            resident_lifetime_setting, resident_store_is_live, sign_bounds_setting,
+            ResidentStoreSize, entry_columns_setting, origin_latency_setting,
+            resident_columns_setting, resident_lifetime_setting, resident_store_is_live,
+            sign_bounds_setting,
         };
         use lance_index::vector::{ApproxMode, PartitionSearchControl, VECTOR_RESULT_SCHEMA};
         use lance_io::ReadBatchParams;
@@ -11192,9 +11189,11 @@ mod tests {
                 open_lazy_test_index(dir.as_str(), LazyTestCache::Resident).await;
             let ivf = lazy_index(&index);
             let bytes = ivf.resident_columns_bytes();
+            let size = ivf.storage.resident_store_size().unwrap();
+            assert_eq!(size.bytes, bytes);
             let setting = resident_columns_setting().unwrap();
             let expected = setting.resolve(ivf.origin_latency())
-                && setting.admits(bytes, dataset.index_cache.max_entry_bytes());
+                && setting.admits(size, dataset.index_cache.max_entry_bytes());
             assert_eq!(ivf.resident_columns_enabled(), expected);
             assert_eq!(ivf.storage.resident_columns_enabled(), expected);
             // Load the store through the index's handle.
@@ -11378,7 +11377,11 @@ mod tests {
             let resident = first.resident_columns_enabled();
             assert_eq!(
                 resident,
-                setting.resolve(first.origin_latency()) && setting.admits(bytes, max_entry_bytes)
+                setting.resolve(first.origin_latency())
+                    && setting.admits(
+                        first.storage.resident_store_size().unwrap(),
+                        max_entry_bytes
+                    )
             );
             if cache_bytes == 0 && setting == ResidentColumnsSetting::Auto {
                 assert!(!resident);
@@ -11532,7 +11535,13 @@ mod tests {
             let index_lifetime = resident_lifetime_setting().unwrap() == ResidentLifetime::Index;
             index_lifetime
                 && setting.resolve(class)
-                && setting.admits(LAZY_RESIDENT_BYTES, max_entry_bytes)
+                && setting.admits(
+                    ResidentStoreSize {
+                        bytes: LAZY_RESIDENT_BYTES,
+                        charge: LAZY_RESIDENT_BYTES + RESIDENT_ENTRY_OVERHEAD_BYTES,
+                    },
+                    max_entry_bytes,
+                )
         }
 
         /// The layered lazy test index at `uri`, opened by a session that
@@ -11648,7 +11657,9 @@ mod tests {
                 stats.resident_columns_bytes, LAZY_RESIDENT_BYTES,
                 "{stats:?}"
             );
+            // The store holds exactly its values.
             let alloc = stats.resident_columns_alloc_bytes;
+            assert_eq!(alloc, LAZY_RESIDENT_BYTES, "{stats:?}");
             let entry = test
                 .file_cache()
                 .get_resident_with_key(&ResidentColumnsKey::new(&test.file))
@@ -11667,6 +11678,12 @@ mod tests {
             let pinned = test.dataset.index_cache.pinned_stats();
             assert_eq!((pinned.pinned_entries, pinned.leased_entries), (1, 1));
             assert!(pinned.pinned_bytes >= charged, "{pinned:?}");
+            // What the open sized the store at against the pinned cap.
+            assert_eq!(
+                pinned.pinned_bytes,
+                ivf.storage.resident_store_size().unwrap().charge,
+                "{pinned:?}"
+            );
 
             drop((entry, index));
             let pinned = wait_until_unleased(&test.dataset.index_cache).await;
