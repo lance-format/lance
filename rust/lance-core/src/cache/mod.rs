@@ -653,10 +653,17 @@ impl LanceCache {
     /// access that refreshes the entry's recency, so a caller that leases
     /// the entry keeps it through the next eviction pass. Returns whether it
     /// admitted the value.
+    ///
+    /// The check and the admission are one
+    /// [`CacheBackend::get_or_insert_pinned`], so an entry a concurrent load
+    /// is admitting counts as held. A single-flight backend can hand the
+    /// loaded value to the load's waiters before the entry is in RAM, as
+    /// quick_cache's guard does; a RAM lookup there misses, and admitting the
+    /// value again would replace the load's entry with a second admission.
     pub async fn ensure_pinned_with_key<K>(
         &self,
         cache_key: &K,
-        make: impl FnOnce() -> Arc<K::ValueType>,
+        make: impl FnOnce() -> Arc<K::ValueType> + Send,
     ) -> bool
     where
         K: CacheKey,
@@ -666,23 +673,28 @@ impl LanceCache {
         self.ensure_pinned(&key, make).await
     }
 
-    async fn ensure_pinned<V>(&self, key: &InternalCacheKey, make: impl FnOnce() -> Arc<V>) -> bool
+    async fn ensure_pinned<V>(
+        &self,
+        key: &InternalCacheKey,
+        make: impl FnOnce() -> Arc<V> + Send,
+    ) -> bool
     where
         V: PinnedValue + DeepSizeOf + Send + Sync + 'static,
     {
-        if let Some(entry) = self.state.backend.get_leased(key).await
-            && entry.downcast_ref::<V>().is_some()
-        {
-            return false;
+        let state = self.state.clone();
+        let admit = Box::pin(async move {
+            let value = make();
+            let size = state.entry_size(value.as_ref());
+            let pin = value.cache_pin().clone();
+            Ok((value as CacheEntry, size, pin))
+        });
+        match self.state.backend.get_or_insert_pinned(key, admit).await {
+            Ok((_, was_cached)) => !was_cached,
+            Err(error) => {
+                log::warn!("LanceCache: admitting a pinned entry failed: {error}");
+                false
+            }
         }
-        let value = make();
-        let size = self.state.entry_size(value.as_ref());
-        let pin = value.cache_pin().clone();
-        self.state
-            .backend
-            .insert_pinned(key, value, size, &pin)
-            .await;
-        true
     }
 
     /// Size of the largest entry the backend admits to RAM; see
@@ -996,7 +1008,7 @@ impl WeakLanceCache {
     pub async fn ensure_pinned_with_key<K>(
         &self,
         cache_key: &K,
-        make: impl FnOnce() -> Arc<K::ValueType>,
+        make: impl FnOnce() -> Arc<K::ValueType> + Send,
     ) -> bool
     where
         K: CacheKey,
@@ -1483,6 +1495,152 @@ mod tests {
                 .is_some();
             assert_eq!(resident, label == "moka");
         }
+    }
+
+    /// A RAM backend whose single-flight load hands the loaded value to the
+    /// callers that join it before admitting the entry, as quick_cache's
+    /// guard notifies its waiters before it takes the shard lock. The load
+    /// waits on `admit` in between, and counts its admissions and the
+    /// entries they replaced.
+    #[derive(Debug, Default)]
+    struct PublishFirstBackend {
+        resident: std::sync::Mutex<HashMap<InternalCacheKey, CacheEntry>>,
+        /// Loaded values handed out but not admitted yet.
+        published: std::sync::Mutex<HashMap<InternalCacheKey, CacheEntry>>,
+        loaded: tokio::sync::Notify,
+        admit: tokio::sync::Notify,
+        admissions: AtomicUsize,
+        replaced: AtomicUsize,
+    }
+
+    impl PublishFirstBackend {
+        fn admit_entry(&self, key: &InternalCacheKey, entry: CacheEntry) {
+            self.admissions.fetch_add(1, Ordering::SeqCst);
+            if self.resident.lock().unwrap().insert(*key, entry).is_some() {
+                self.replaced.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for PublishFirstBackend {
+        async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+            self.resident.lock().unwrap().get(key).cloned()
+        }
+
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            _codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            self.get_resident(key).await
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            _size_bytes: usize,
+            _codec: Option<CacheCodec>,
+        ) {
+            self.admit_entry(key, entry);
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            _codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            if let Some(entry) = self.get_resident(key).await {
+                return Ok((entry, true));
+            }
+            let (entry, _) = loader.await?;
+            self.admit_entry(key, entry.clone());
+            Ok((entry, false))
+        }
+
+        async fn insert_pinned(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            _size_bytes: usize,
+            _pin: &Arc<CachePin>,
+        ) {
+            self.admit_entry(key, entry);
+        }
+
+        async fn get_or_insert_pinned<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: PinnedEntryLoader<'a>,
+        ) -> Result<(CacheEntry, bool)> {
+            let held = self.get_resident(key).await;
+            if let Some(entry) = held.or_else(|| self.published.lock().unwrap().get(key).cloned()) {
+                return Ok((entry, true));
+            }
+            let (entry, _, _) = loader.await?;
+            self.published.lock().unwrap().insert(*key, entry.clone());
+            self.loaded.notify_one();
+            self.admit.notified().await;
+            self.admit_entry(key, entry.clone());
+            self.published.lock().unwrap().remove(key);
+            Ok((entry, false))
+        }
+
+        async fn clear(&self) {
+            self.resident.lock().unwrap().clear();
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.resident.lock().unwrap().len()
+        }
+
+        async fn size_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    /// A caller that joins a load whose value the backend handed out before
+    /// admitting it leases the value without admitting it again: the load's
+    /// admission is the only one and replaces nothing.
+    #[tokio::test]
+    async fn leased_join_of_an_admitting_load_admits_once() {
+        let backend = Arc::new(PublishFirstBackend::default());
+        let cache = LanceCache::with_backend(backend.clone());
+        let load = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_or_insert_leased_with_key(PinnedTestKey(1), || async {
+                        Ok(PinnedTestValue(CachePin::new()))
+                    })
+                    .await
+                    .unwrap()
+            }
+        });
+        backend.loaded.notified().await;
+        let (joined, joined_lease, joined_hit) = cache
+            .get_or_insert_leased_with_key(PinnedTestKey(1), || async {
+                Ok(PinnedTestValue(CachePin::new()))
+            })
+            .await
+            .unwrap();
+        backend.admit.notify_one();
+        let (loaded, lease, loaded_hit) = load.await.unwrap();
+
+        assert!(joined_hit && !loaded_hit);
+        assert!(Arc::ptr_eq(&joined, &loaded));
+        assert_eq!(backend.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.replaced.load(Ordering::SeqCst), 0);
+        assert_eq!(loaded.0.holders(), 2);
+        drop((joined_lease, lease));
+        assert!(
+            !cache
+                .ensure_pinned_with_key(&PinnedTestKey(1), || panic!("admitted twice"))
+                .await
+        );
+        assert_eq!(backend.admissions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

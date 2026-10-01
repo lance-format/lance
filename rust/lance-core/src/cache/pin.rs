@@ -245,6 +245,15 @@ impl CachePin {
         self.lock().holders
     }
 
+    /// Live admissions of the value: the [`PinRecord`]s its backends hold,
+    /// one per admission however many copies of the entry share it. A
+    /// backend dropping an entry whose record is the only one left drops
+    /// the value from the cache; one replaced by another admission of the
+    /// same value does not.
+    pub fn admissions(&self) -> usize {
+        self.lock().records
+    }
+
     /// Whether the entry is admitted and leased but found no room under its
     /// budget's cap, so it stays evictable.
     pub fn is_overflowed(&self) -> bool {
@@ -469,8 +478,27 @@ mod tests {
         let _new = CachePin::record(&pin, &second, 0, 100);
         assert_eq!(first.stats().pinned_bytes, 0);
         assert_eq!(second.stats().pinned_bytes, 100);
+        assert_eq!(pin.admissions(), 2);
         drop(old);
         // The pin is still admitted once, so it stays pinned.
+        assert_eq!(pin.admissions(), 1);
         assert!(pin.is_pinned());
+    }
+
+    /// Admissions count records, not the copies of an entry that share one.
+    #[test]
+    fn admissions_count_records() {
+        let budget = Arc::new(PinBudget::new(1000, 1));
+        let pin = CachePin::new();
+        assert_eq!(pin.admissions(), 0);
+        let record = Arc::new(CachePin::record(&pin, &budget, 0, 100));
+        let copy = record.clone();
+        assert_eq!(pin.admissions(), 1);
+        let replacement = CachePin::record(&pin, &budget, 0, 100);
+        assert_eq!(pin.admissions(), 2);
+        drop((record, copy));
+        assert_eq!(pin.admissions(), 1);
+        drop(replacement);
+        assert_eq!(pin.admissions(), 0);
     }
 }
