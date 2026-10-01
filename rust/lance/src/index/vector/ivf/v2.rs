@@ -67,7 +67,7 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
     IndexFileKey, LayeredLazyConfig, OriginLatencyClass, PlaneAccessTracker, QueryResidual,
     QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentColumns,
-    ResidentColumnsSetting, ResidentPreopen, VectorStore, entry_columns_setting,
+    ResidentColumnsSetting, ResidentPreopen, ResidentStoreSize, VectorStore, entry_columns_setting,
     origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
     resident_store_fits, sign_bounds_setting,
 };
@@ -1966,6 +1966,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// Zero for a plane-row file, which never keeps a resident store.
     pub fn resident_columns_bytes(&self) -> u64 {
         self.storage.resident_columns_bytes()
+    }
+
+    /// The size of the index's resident store, whether or not it keeps
+    /// one, and what an index cache charges for it once loaded, which the
+    /// open compared with the cache's pinned cap; see
+    /// [`ResidentColumnsSetting::admits`]. Zero for a plane-row file.
+    pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
+        self.storage.resident_store_size()
     }
 
     /// How the index's auxiliary file stores each row's fields. Only an
