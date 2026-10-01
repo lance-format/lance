@@ -286,7 +286,7 @@ For **RabitQ (RQ)**:
 | --------------------- | ---- | ---------------------------------------------------- |
 | `rotate_mat_position` | u32  | Position of the rotation matrix in the global buffer |
 | `num_bits`            | u8   | Number of bits per dimension, in the range 1..=9     |
-| `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
+| `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code. Older matrix-rotation indexes may store 0; their rotated dimension is then the rotation matrix's dimension. |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
 | `query_estimator`     | string | Distance estimator layout: `residual_query` or `raw_query`. Missing values are read as `residual_query` for compatibility with released 1-bit IVF_RQ indexes. |
 | `row_layout`          | string | Row layout of the internal columns: `columns` or `plane_rows`. Missing values are read as `columns`. See [RaBitQ plane-row layout](#rabitq-plane-row-layout). |
@@ -552,9 +552,10 @@ pruning do not depend on the layout.
 
 Each packed column has type `list<uint8>[stride]`. Its value at a row is the
 concatenation, in the order listed below and without padding, of the values the
-column layout stores in the packed fields at that row. Here `d` is `code_dim`,
-`p = 64 * ceil(d / 64)`, `h` and `l` are the layered high and low widths, and `f`
-is 3 when the index stores `__error_factors` and 2 otherwise.
+column layout stores in the packed fields at that row. Here `d` is the rotated
+dimension (`code_dim`, or the rotation matrix's dimension when `code_dim` is 0;
+see [RQ](#rq)), `p = 64 * ceil(d / 64)`, `h` and `l` are the layered high and
+low widths, and `f` is 3 when the index stores `__error_factors` and 2 otherwise.
 
 | Packed column      | Index   | Packed fields, in order                                                                                                               | Stride in bytes                                                               |
 | ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
@@ -585,7 +586,9 @@ A layered plane-row file starts with `__rq_sign_rows`, `__rq_bounds_rows`,
 `__rq_rows`. The packed columns replace the fields they pack: a plane-row file
 has none of the column layout's internal columns, and every packed column its
 index needs is present with exactly the stride above. The packed columns and
-their `uint8` items are non-nullable. Carried columns are not packed; they follow
+their `uint8` items are non-nullable. A Lance file schema does not keep a list
+item's nullability, so readers reject null items rather than rely on the schema
+to declare them non-nullable. Carried columns are not packed; they follow
 the packed columns unchanged and are still discovered by exclusion. A reader
 treats a schema that does not match `row_layout` as an invalid index.
 
@@ -607,9 +610,14 @@ Every writer derives the version from the layout it writes. Appending,
 optimizing and remapping keep the layout of the index they extend or rewrite,
 and its version: a delta segment of a plane-row index is written in plane rows
 with version 3, and a column-layout index never becomes version 3. The rule
-covers native and layered indexes alike. All segments merged into one index must
-share a layout; the reference implementation rejects a merge of several
-plane-row segments as not supported until its merger handles packed columns.
+covers native and layered indexes alike. All segments merged into one segment
+must share a layout, both the row layout and whether the index is layered;
+merging segments of different layouts is an error. In the reference
+implementation, optimize reads the segments it merges or rewrites through the
+index and writes in their layout, so plane-row segments merge into a plane-row
+segment with version 3. Its distributed merger, which merges segments or partial
+auxiliary files built apart, does not handle packed columns yet and rejects any
+plane-row input, a single one included, as not supported.
 
 Because both layouts hold the same values, an index can be converted between
 them without re-encoding. A conversion rewrites only the auxiliary file's
