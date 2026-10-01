@@ -28,10 +28,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
-use arrow::compute::concat_batches;
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, new_empty_array};
 use arrow_schema::{Field, Schema, SchemaRef};
-use arrow_select::concat::concat;
 use arrow_select::take::take;
 use futures::TryStreamExt;
 use lance_core::cache::{
@@ -52,6 +50,7 @@ use super::storage::{
     RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN, RABIT_CODE_COLUMN,
     RABIT_EX_CODE_COLUMN,
 };
+use crate::vector::exact_buffers::{exact_array, exact_batch};
 use crate::vector::storage::{IndexFileKey, ResidentLifetime, WeakRegistry, shared_by_key};
 
 /// Columns that reads always fetch from the file: the codes, which hold most
@@ -549,7 +548,9 @@ impl ResidentColumnStore {
                 .await?
                 .try_collect::<Vec<_>>()
                 .await?;
-            Some(concat_batches(&projected, batches.iter())?)
+            // Buffers of exactly the values, so the cache charges the store
+            // what `resident_columns_bytes` sizes it at without reading it.
+            Some(exact_batch(&projected, &batches, false)?)
         };
         let mut columns = HashMap::with_capacity(fields.len());
         let mut bytes = 0u64;
@@ -706,11 +707,11 @@ pub(crate) struct ResidentColumn {
 }
 
 impl ResidentColumn {
-    /// A copy of the ascending file rows `rows`, laid out as a file read of
-    /// them so that a cache entry holding it is charged the same bytes: the
-    /// reader decodes each page a read touches into a buffer of exactly its
-    /// rows and concatenates the buffers when the read touches several
-    /// pages. A slice would instead keep, and be charged, the whole column.
+    /// A copy of the ascending file rows `rows` in a buffer of exactly their
+    /// values, as a whole read of the file returns them (see
+    /// `read_projected`), so that a cache entry holding it is charged the
+    /// same bytes. A slice would instead keep, and be charged, the whole
+    /// column.
     pub(crate) fn copy_rows(&self, rows: &UInt64Array) -> Result<ArrayRef> {
         let offsets = rows.values();
         // The page split below relies on the order.
@@ -742,10 +743,7 @@ impl ResidentColumn {
         match pieces.len() {
             0 => Ok(new_empty_array(self.values.data_type())),
             1 => Ok(pieces.swap_remove(0)),
-            _ => {
-                let pieces: Vec<&dyn Array> = pieces.iter().map(|piece| piece.as_ref()).collect();
-                Ok(concat(&pieces)?)
-            }
+            _ => exact_array(&pieces.iter().collect::<Vec<_>>(), false),
         }
     }
 }
@@ -1048,8 +1046,11 @@ mod tests {
         }
     }
 
+    /// Rows across pages are copied into one buffer of exactly their
+    /// values, as a whole read of the file returns them wherever its pages
+    /// end.
     #[test]
-    fn copy_rows_across_pages_matches_a_file_read() {
+    fn copy_rows_across_pages_holds_exactly_the_rows() {
         let column = column();
         for rows in [
             (30..60).collect::<Vec<u64>>(),
@@ -1059,18 +1060,13 @@ mod tests {
             let copied = copy(&column, &rows);
             assert_eq!(values(&copied), as_values(&rows));
             assert!(copied.nulls().is_none());
-            // The reader concatenates the pages it decodes, each into a
-            // buffer of exactly its rows.
             let (first, second): (Vec<u64>, Vec<u64>) = rows.iter().partition(|&&row| row < 40);
             let pages = [first, second]
                 .map(|page| take(column.values.as_ref(), &UInt64Array::from(page), None).unwrap());
-            let read = concat(&[pages[0].as_ref(), pages[1].as_ref()]).unwrap();
+            let read =
+                arrow_select::concat::concat(&[pages[0].as_ref(), pages[1].as_ref()]).unwrap();
             assert_eq!(copied.as_ref(), read.as_ref(), "{rows:?}");
-            assert_eq!(
-                copied.get_buffer_memory_size(),
-                read.get_buffer_memory_size(),
-                "{rows:?}"
-            );
+            assert_eq!(copied.get_buffer_memory_size(), rows.len() * 4, "{rows:?}");
         }
     }
 }

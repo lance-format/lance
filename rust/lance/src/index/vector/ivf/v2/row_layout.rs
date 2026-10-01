@@ -12,7 +12,7 @@
 //! `row_layout` member, as text, so every other byte of it is kept.
 //! [`verify_rq_row_layout`] checks a converted index against its source.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
@@ -31,12 +31,12 @@ use lance_file::writer::{FileWriteSummary, FileWriterOptions};
 use lance_index::pb::VectorIndexDetails;
 use lance_index::pb::vector_index_details::{Compression, rabit_quantization};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::layered::{SIGN_BOUNDS_PLANE, SignBounds};
+use lance_index::vector::bq::layered::{EntryColumns, SIGN_BOUNDS_PLANE, SignBounds};
 use lance_index::vector::bq::plane_rows::{PlaneRowsSpec, requests_fullzip};
 use lance_index::vector::bq::storage::{
-    RABIT_METADATA_KEY, RQRowLayout, RabitQuantizationMetadata,
+    RABIT_METADATA_KEY, RQRowLayout, RabitQuantizationMetadata, RabitQuantizationStorage,
 };
-use lance_index::vector::storage::{IvfQuantizationStorage, STORAGE_METADATA_KEY};
+use lance_index::vector::storage::{IvfQuantizationStorage, STORAGE_METADATA_KEY, VectorStore};
 use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, ivf_rq_index_version};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
@@ -48,6 +48,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::read_partition_window_batches;
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
@@ -507,6 +508,50 @@ pub struct PageStats {
     pub partitions_over_16mib: usize,
 }
 
+/// Shapes of reads and cache entries whose memory [`verify_rq_row_layout`]
+/// compares, as [`RowLayoutVerification::deep_sizes`] names them.
+pub mod deep_size_shapes {
+    /// Every row of a partition, which partition entries are built from.
+    pub const PARTITION_BATCH: &str = "partition_batch";
+    /// Every row of a plane of a layered index, which a plane entry holding
+    /// every column holds.
+    pub const PLANE: &str = "plane";
+    /// Every third row of a plane of a layered index: a sparse read, which
+    /// no cache entry holds.
+    pub const PLANE_SPARSE: &str = "plane_sparse";
+    /// The storage a partition entry holds.
+    pub const PARTITION_STORAGE: &str = "partition_storage";
+    /// The storage a partition entry holds when a prewarm built it from a
+    /// read of several partitions.
+    pub const PREWARM_PARTITION_STORAGE: &str = "prewarm_partition_storage";
+    /// A code-only entry: a native partition's or a layered plane's code
+    /// (and bounds) columns.
+    pub const CODE_ONLY_ENTRY: &str = "code_only_entry";
+    /// A native partition's code-only entry as a prewarm cuts it from a read
+    /// of several partitions.
+    pub const PREWARM_CODE_ONLY_ENTRY: &str = "prewarm_code_only_entry";
+}
+
+/// The memory one shape of read or cache entry takes on both sides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DeepSizes {
+    /// Reads or entries compared.
+    pub count: usize,
+    /// Those whose two sides take different memory.
+    pub mismatches: usize,
+    pub source_bytes: u64,
+    pub converted_bytes: u64,
+}
+
+impl DeepSizes {
+    fn record(&mut self, source: u64, converted: u64) {
+        self.count += 1;
+        self.mismatches += usize::from(source != converted);
+        self.source_bytes += source;
+        self.converted_bytes += converted;
+    }
+}
+
 /// What [`verify_rq_row_layout`] found.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RowLayoutVerification {
@@ -514,18 +559,33 @@ pub struct RowLayoutVerification {
     pub converted_uuid: String,
     pub source_layout: String,
     pub converted_layout: String,
+    /// The Lance file version of each side's auxiliary file.
+    pub source_file_version: String,
+    pub converted_file_version: String,
     pub partitions: usize,
     pub rows: u64,
     /// Reads compared: every partition whole, and for a layered index every
     /// plane, whole and at every third row.
     pub reads: usize,
-    /// Reads whose batches differ in a field or a value.
+    /// Cache entries compared: every partition's storage, read alone and
+    /// cut from a prewarm's read, and its code-only entries.
+    pub entries: usize,
+    /// Reads and entries whose batches differ in a field or a value.
     pub batch_mismatches: usize,
-    /// Reads whose batches take different memory, which only arrays that
-    /// keep more buffer than their values cause.
+    /// Whole reads and cache entries whose two sides take different memory,
+    /// so would be charged differently in a cache, and their memory.
     pub deep_size_mismatches: usize,
     pub source_deep_bytes: u64,
     pub converted_deep_bytes: u64,
+    /// Sparse reads whose two sides take different memory, and their
+    /// memory. No cache entry holds a sparse read, so this is reported
+    /// apart: a column-layout read of selected rows of a Lance 2.0 file can
+    /// keep more buffer than its values.
+    pub sparse_deep_size_mismatches: usize,
+    pub sparse_source_deep_bytes: u64,
+    pub sparse_converted_deep_bytes: u64,
+    /// The memory of each shape of read and entry ([`deep_size_shapes`]).
+    pub deep_sizes: BTreeMap<String, DeepSizes>,
     /// SHA-256 over every partition's values, rows packed as the plane-row
     /// layout packs them, for each side.
     pub source_digest: String,
@@ -553,12 +613,12 @@ pub struct RowLayoutVerification {
 
 impl RowLayoutVerification {
     /// Whether the converted index holds the source's values, files and
-    /// metadata, but for the layout. The memory its reads take is reported
-    /// apart: a column-layout read of a Lance 2.0 file can return arrays
-    /// that keep more buffer than their values, while a plane-row read
-    /// returns exactly its values.
+    /// metadata, but for the layout, and every whole read and cache entry of
+    /// it takes the memory the source's does, so a cache charges both the
+    /// same. Sparse reads, which no entry holds, are reported apart.
     pub fn is_ok(&self) -> bool {
         self.batch_mismatches == 0
+            && self.deep_size_mismatches == 0
             && self.source_digest == self.converted_digest
             && self.schema_matches
             && self.metadata_patch_ok
@@ -567,6 +627,82 @@ impl RowLayoutVerification {
             && self.global_buffers_equal
             && self.index_file_equal
     }
+
+    /// Count a read or entry of `shape` whose values are `same` and whose
+    /// sides take `source` and `converted` bytes.
+    fn record(&mut self, shape: &str, same: bool, source: u64, converted: u64) {
+        self.batch_mismatches += usize::from(!same);
+        self.deep_sizes
+            .entry(shape.to_string())
+            .or_default()
+            .record(source, converted);
+        let mismatch = usize::from(source != converted);
+        if shape == deep_size_shapes::PLANE_SPARSE {
+            self.sparse_deep_size_mismatches += mismatch;
+            self.sparse_source_deep_bytes += source;
+            self.sparse_converted_deep_bytes += converted;
+        } else {
+            self.deep_size_mismatches += mismatch;
+            self.source_deep_bytes += source;
+            self.converted_deep_bytes += converted;
+        }
+    }
+
+    /// Count read `a` of the source against read `b` of the converted index.
+    fn compare(&mut self, shape: &str, a: &RecordBatch, b: &RecordBatch) {
+        self.reads += usize::from(!is_entry_shape(shape));
+        self.entries += usize::from(is_entry_shape(shape));
+        let same = a.schema().fields() == b.schema().fields() && a.columns() == b.columns();
+        self.record(shape, same, deep_bytes(a), deep_bytes(b));
+    }
+
+    /// Count the storage of a partition entry of each side.
+    fn compare_storage(
+        &mut self,
+        shape: &str,
+        a: &RabitQuantizationStorage,
+        b: &RabitQuantizationStorage,
+    ) {
+        self.entries += 1;
+        let same = a.len() == b.len() && a.row_ids().eq(b.row_ids());
+        self.record(
+            shape,
+            same,
+            a.deep_size_of() as u64,
+            b.deep_size_of() as u64,
+        );
+    }
+}
+
+/// `storage`'s partitions as a prewarm cuts them from one read of every
+/// partition, which it builds their entries from.
+async fn prewarm_window(
+    storage: &IvfQuantizationStorage<RabitQuantizer>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    let schema = Arc::new(ArrowSchema::from(storage.reader().schema().as_ref()));
+    read_partition_window_batches(
+        storage.reader(),
+        None,
+        &schema,
+        storage.ivf(),
+        0..storage.num_partitions(),
+        None,
+    )
+    .await
+}
+
+/// Whether `shape` is a cache entry rather than a read.
+fn is_entry_shape(shape: &str) -> bool {
+    [
+        deep_size_shapes::CODE_ONLY_ENTRY,
+        deep_size_shapes::PREWARM_CODE_ONLY_ENTRY,
+    ]
+    .contains(&shape)
+}
+
+/// The memory `batch`'s arrays take, as a cache charges it.
+fn deep_bytes(batch: &RecordBatch) -> u64 {
+    batch.deep_size_of_children(&mut Context::new()) as u64
 }
 
 /// Check that index `index_name` of `converted`, a single segment converted
@@ -609,11 +745,21 @@ pub async fn verify_rq_row_layout(
         open(converted, &converted_aux, SignBounds::Eager).await?,
     ];
     let [src, conv] = &lazy;
+    let file_version = |storage: &IvfQuantizationStorage<RabitQuantizer>| -> String {
+        storage
+            .reader()
+            .metadata()
+            .version()
+            .to_manifest_string()
+            .to_string()
+    };
     let mut report = RowLayoutVerification {
         source_uuid: source_segment.uuid.to_string(),
         converted_uuid: converted_segment.uuid.to_string(),
         source_layout: src.row_layout().to_string(),
         converted_layout: conv.row_layout().to_string(),
+        source_file_version: file_version(src),
+        converted_file_version: file_version(conv),
         partitions: src.num_partitions(),
         rows: src.num_rows(),
         schema_matches: src.logical_schema()?.fields() == conv.logical_schema()?.fields(),
@@ -642,12 +788,38 @@ pub async fn verify_rq_row_layout(
     let specs = [plane_rows(src)?, plane_rows(conv)?];
     let mut digests = [Sha256::new(), Sha256::new()];
     let layered = src.is_layered_rq();
+    let [mut src_prewarm, mut conv_prewarm] =
+        [prewarm_window(src).await?, prewarm_window(conv).await?].map(Vec::into_iter);
+    // A native partition's code-only entry as a prewarm of the column side
+    // cuts it; the plane-row layout caches none, so its twin is the read of
+    // the same columns.
+    let column_side = if src.row_layout() == RQRowLayout::Columns {
+        src
+    } else {
+        conv
+    };
+    let mut prewarm_codes = if layered {
+        Vec::new()
+    } else {
+        let projection = column_side.partition_codes_projection()?;
+        let schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
+        read_partition_window_batches(
+            column_side.reader(),
+            Some(&projection),
+            &schema,
+            column_side.ivf(),
+            0..column_side.num_partitions(),
+            None,
+        )
+        .await?
+    }
+    .into_iter();
     for partition in 0..report.partitions {
         let batches = [
             src.read_partition_batch(partition, None).await?,
             conv.read_partition_batch(partition, None).await?,
         ];
-        compare(&batches[0], &batches[1], &mut report);
+        report.compare(deep_size_shapes::PARTITION_BATCH, &batches[0], &batches[1]);
         for ((digest, spec), batch) in digests.iter_mut().zip(&specs).zip(&batches) {
             let packed = spec.pack(batch)?;
             for column in spec.packed_columns() {
@@ -661,7 +833,42 @@ pub async fn verify_rq_row_layout(
                 digest.update(rows.values());
             }
         }
+        report.compare_storage(
+            deep_size_shapes::PARTITION_STORAGE,
+            &src.load_partition(partition, None).await?,
+            &conv.load_partition(partition, None).await?,
+        );
+        let prewarmed = [src_prewarm.next(), conv_prewarm.next()].map(|batches| {
+            batches.ok_or_else(|| Error::internal("a prewarm read missed a partition"))
+        });
+        let [src_prewarmed, conv_prewarmed] = prewarmed;
+        report.compare_storage(
+            deep_size_shapes::PREWARM_PARTITION_STORAGE,
+            &src.materialize_partition_for_prewarm(src_prewarmed?)
+                .await?,
+            &conv
+                .materialize_partition_for_prewarm(conv_prewarmed?)
+                .await?,
+        );
         if !layered {
+            let codes = [
+                src.read_partition_codes(partition, None).await?,
+                conv.read_partition_codes(partition, None).await?,
+            ];
+            report.compare(deep_size_shapes::CODE_ONLY_ENTRY, &codes[0].0, &codes[1].0);
+            let prewarmed = column_side
+                .partition_codes_from_batches(
+                    prewarm_codes
+                        .next()
+                        .ok_or_else(|| Error::internal("a prewarm read missed a partition"))?,
+                )?
+                .0;
+            let [a, b] = if column_side.row_layout() == src.row_layout() {
+                [&prewarmed, &codes[1].0]
+            } else {
+                [&codes[0].0, &prewarmed]
+            };
+            report.compare(deep_size_shapes::PREWARM_CODE_ONLY_ENTRY, a, b);
             continue;
         }
         let rows = src.partition_size(partition);
@@ -670,17 +877,29 @@ pub async fn verify_rq_row_layout(
             (&lazy, &[0, 1, 2, SIGN_BOUNDS_PLANE][..]),
             (&eager, &[0][..]),
         ] {
+            let [a, b] = storages;
             for &plane in planes {
                 for selected in [None, Some(every_third.clone())] {
-                    let [a, b] = storages;
-                    let a = a
-                        .read_plane(partition, plane, selected.clone(), None)
-                        .await?;
-                    let b = b
-                        .read_plane(partition, plane, selected.clone(), None)
-                        .await?;
-                    compare(&a, &b, &mut report);
+                    let shape = if selected.is_some() {
+                        deep_size_shapes::PLANE_SPARSE
+                    } else {
+                        deep_size_shapes::PLANE
+                    };
+                    report.compare(
+                        shape,
+                        &a.read_plane(partition, plane, selected.clone(), None)
+                            .await?,
+                        &b.read_plane(partition, plane, selected.clone(), None)
+                            .await?,
+                    );
                 }
+                report.compare(
+                    deep_size_shapes::CODE_ONLY_ENTRY,
+                    &a.read_plane_entry_with(partition, plane, EntryColumns::Codes, None)
+                        .await?,
+                    &b.read_plane_entry_with(partition, plane, EntryColumns::Codes, None)
+                        .await?,
+                );
             }
         }
     }
@@ -812,20 +1031,6 @@ fn page_stats(storage: &IvfQuantizationStorage<RabitQuantizer>) -> Result<PageSt
         }
     }
     Ok(stats)
-}
-
-/// Count read `a` of the source against read `b` of the converted index.
-fn compare(a: &RecordBatch, b: &RecordBatch, report: &mut RowLayoutVerification) {
-    report.reads += 1;
-    if a.schema().fields() != b.schema().fields() || a.columns() != b.columns() {
-        report.batch_mismatches += 1;
-    }
-    let sizes = [a, b].map(|batch| batch.deep_size_of_children(&mut Context::new()) as u64);
-    report.source_deep_bytes += sizes[0];
-    report.converted_deep_bytes += sizes[1];
-    if sizes[0] != sizes[1] {
-        report.deep_size_mismatches += 1;
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1492,16 +1697,25 @@ mod tests {
         let verification = verify_rq_row_layout(&source, &converted, INDEX_NAME)
             .await
             .unwrap();
+        // Whole reads and cache entries weigh the same in a cache; a sparse
+        // column read of a 2.0 file can keep more buffer than its values.
         assert!(verification.is_ok(), "{verification:#?}");
-        // Reads weigh the same in a cache, but where a 2.0 column read keeps
-        // a larger buffer than its values.
-        if version == LanceFileVersion::V2_0 {
-            assert!(
-                verification.converted_deep_bytes <= verification.source_deep_bytes,
+        assert_eq!(verification.deep_size_mismatches, 0, "{verification:#?}");
+        for file_version in [
+            &verification.source_file_version,
+            &verification.converted_file_version,
+        ] {
+            assert_eq!(file_version, version.resolve().to_manifest_string());
+        }
+        assert!(
+            verification.sparse_converted_deep_bytes <= verification.sparse_source_deep_bytes,
+            "{verification:#?}"
+        );
+        if version != LanceFileVersion::V2_0 {
+            assert_eq!(
+                verification.sparse_deep_size_mismatches, 0,
                 "{verification:#?}"
             );
-        } else {
-            assert_eq!(verification.deep_size_mismatches, 0, "{verification:#?}");
         }
         if small_pages {
             assert!(
@@ -1628,6 +1842,141 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A copy of the plane-row dataset at `from` at `to`, converted in place
+    /// back to the column layout with `options`, at most `batch_rows` rows
+    /// per batch.
+    async fn column_copy_in_batches(
+        from: &str,
+        to: &str,
+        options: FileWriterOptions,
+        batch_rows: Option<usize>,
+    ) -> Dataset {
+        copy_dir(std::path::Path::new(from), std::path::Path::new(to));
+        let mut dataset = Dataset::open(to).await.unwrap();
+        rewrite_rq_row_layout_impl(
+            &mut dataset,
+            INDEX_NAME,
+            RQRowLayout::Columns,
+            options,
+            batch_rows,
+        )
+        .await
+        .unwrap();
+        dataset
+    }
+
+    /// Partitions whose rows of `column` span more than one of its pages.
+    fn straddling_partitions(
+        storage: &IvfQuantizationStorage<RabitQuantizer>,
+        column: &str,
+    ) -> usize {
+        let reader = storage.reader();
+        let projection = lance_file::versions::reader_projection_from_column_names(
+            reader.metadata().version(),
+            reader.schema(),
+            &[column],
+        )
+        .unwrap();
+        let info = &reader.metadata().column_infos[projection.column_indices[0] as usize];
+        let mut page_starts = Vec::new();
+        let mut next = 0;
+        for page in info.page_infos.iter() {
+            next += page.num_rows;
+            page_starts.push(next);
+        }
+        page_starts.pop();
+        (0..storage.num_partitions())
+            .filter(|&partition| {
+                let range = storage.ivf().row_range(partition);
+                page_starts
+                    .iter()
+                    .any(|&start| start > range.start as u64 && start < range.end as u64)
+            })
+            .count()
+    }
+
+    /// Twins weigh the same in a cache even where the column layout's reads
+    /// span pages: every whole read, partition storage (read alone or cut
+    /// from a prewarm's read) and code-only entry of a column file whose
+    /// pages end inside partitions takes the memory the plane-row twin's
+    /// does, on 2.0 and 2.2 files and in either direction of a conversion.
+    #[rstest]
+    #[tokio::test]
+    async fn test_column_entries_weigh_as_plane_rows(
+        #[values(false, true)] layered: bool,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    ) {
+        let source_dir = TempStrDir::default();
+        let rows_dir = TempStrDir::default();
+        let columns_dir = TempStrDir::default();
+        column_dataset(source_dir.as_str(), layered, RQRotationType::Fast, version).await;
+        let rows_path = format!("{}/rows", rows_dir.as_str());
+        let (rows, _) = converted_copy(
+            source_dir.as_str(),
+            &rows_path,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let columns = column_copy_in_batches(
+            &rows_path,
+            &format!("{}/columns", columns_dir.as_str()),
+            FileWriterOptions {
+                data_cache_bytes: Some(SMALL_PAGE_BYTES),
+                max_page_bytes: Some(SMALL_PAGE_BYTES),
+                ..Default::default()
+            },
+            Some(SMALL_BATCH_ROWS),
+        )
+        .await;
+        let storage = index_storage(&columns).await;
+        assert_eq!(storage.row_layout(), RQRowLayout::Columns);
+        assert!(straddling_partitions(&storage, RABIT_CODE_COLUMN) > 0);
+
+        let entry_shapes: &[&str] = if layered {
+            &[
+                deep_size_shapes::PARTITION_BATCH,
+                deep_size_shapes::PLANE,
+                deep_size_shapes::PARTITION_STORAGE,
+                deep_size_shapes::PREWARM_PARTITION_STORAGE,
+                deep_size_shapes::CODE_ONLY_ENTRY,
+            ]
+        } else {
+            &[
+                deep_size_shapes::PARTITION_BATCH,
+                deep_size_shapes::PARTITION_STORAGE,
+                deep_size_shapes::PREWARM_PARTITION_STORAGE,
+                deep_size_shapes::CODE_ONLY_ENTRY,
+                deep_size_shapes::PREWARM_CODE_ONLY_ENTRY,
+            ]
+        };
+        for (source, converted) in [(&columns, &rows), (&rows, &columns)] {
+            let verification = verify_rq_row_layout(source, converted, INDEX_NAME)
+                .await
+                .unwrap();
+            assert!(verification.is_ok(), "{verification:#?}");
+            assert_eq!(verification.deep_size_mismatches, 0, "{verification:#?}");
+            assert_eq!(
+                verification.source_deep_bytes, verification.converted_deep_bytes,
+                "{verification:#?}"
+            );
+            for shape in entry_shapes {
+                let sizes = &verification.deep_sizes[*shape];
+                assert!(sizes.count >= PARTITIONS, "{shape}: {sizes:?}");
+                assert_eq!(sizes.mismatches, 0, "{shape}: {sizes:?}");
+                assert_eq!(
+                    sizes.source_bytes, sizes.converted_bytes,
+                    "{shape}: {sizes:?}"
+                );
+            }
+            assert_eq!(
+                verification
+                    .deep_sizes
+                    .contains_key(deep_size_shapes::PLANE_SPARSE),
+                layered
+            );
         }
     }
 
