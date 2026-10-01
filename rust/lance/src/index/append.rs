@@ -29,8 +29,8 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
-    optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
+    SteadyStateRebalance, VectorSegmentCompatibility, optimize_vector_indices,
+    segmented_optimize_index_version, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, DatasetIndexInternalExt};
@@ -944,8 +944,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     removed_indices: Vec::new(),
                     new_fragment_bitmap: base_unindexed_bitmap,
                     new_dataset_version: dataset.manifest.version,
-                    new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
-                        .version(),
+                    new_index_version: segmented_optimize_index_version(reference_index.as_ref())?,
                     new_index_details: reference_metadata
                         .index_details
                         .as_deref()
@@ -1123,7 +1122,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 let index_version = if let Some(metadata) = removed_indices.first() {
                     metadata.index_version as u32
                 } else {
-                    index_type_for_segmented_optimize(reference_index.as_ref())?.version() as u32
+                    segmented_optimize_index_version(reference_index.as_ref())? as u32
                 };
 
                 Ok((
@@ -2502,10 +2501,11 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         let appended_segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let expected_version = crate::index::create::vector_index_version(&index_params) as i32;
         assert!(
             appended_segments
                 .iter()
-                .all(|segment| segment.index_version == index_params.index_type().version()),
+                .all(|segment| segment.index_version == expected_version),
             "append must preserve the storage type's index version"
         );
         let logical_index = dataset
@@ -2590,8 +2590,7 @@ mod tests {
             "the reference-compatible append segment must merge with its source"
         );
         assert_eq!(
-            merged[0].index_version,
-            index_params.index_type().version(),
+            merged[0].index_version, expected_version,
             "merge must preserve the storage type's index version"
         );
         assert_eq!(

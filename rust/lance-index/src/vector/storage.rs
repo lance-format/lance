@@ -10,8 +10,9 @@ use crate::vector::bq::layered::{
 };
 use crate::vector::bq::layered_stats;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
+use crate::vector::bq::plane_rows::{PACKED_COLUMNS, PlaneRowsSpec};
 use crate::vector::bq::resident::{ResidentColumnStore, is_resident};
-use crate::vector::bq::storage::normalize_entry_codes;
+use crate::vector::bq::storage::{RQRowLayout, normalize_entry_codes};
 use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::{QuantizationMetadata, QuantizerStorage};
 use arrow::compute::concat_batches;
@@ -1791,6 +1792,10 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     /// open of it shares; see [`Self::with_index_file`]. `None` keeps the
     /// far gather pools to the plane access tracker.
     index_file: Option<IndexFileKey>,
+    /// The file's plane-row layout, when its metadata declares one: built
+    /// and validated when the storage opens the file, or on first use when it
+    /// is reconstructed from a cache; see [`Self::plane_rows`].
+    plane_rows: OnceLock<Arc<PlaneRowsSpec>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -1859,6 +1864,25 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let bytes = reader.read_global_buffer(pos).await?;
             metadata.parse_buffer(bytes)?;
         }
+        // A file whose schema does not match its declared row layout is an
+        // invalid index; it fails here rather than on a later read.
+        let plane_rows = OnceLock::new();
+        match metadata.row_layout() {
+            RQRowLayout::Columns => {
+                if let Some(name) = PACKED_COLUMNS
+                    .iter()
+                    .find(|name| schema.field(name).is_some())
+                {
+                    return Err(Error::index(format!(
+                        "invalid IVF_RQ file: its metadata declares the column layout, but it has plane-row column {name}"
+                    )));
+                }
+            }
+            RQRowLayout::PlaneRows => {
+                let spec = Self::plane_rows_spec(&metadata, distance_type, &reader)?;
+                plane_rows.get_or_init(|| Arc::new(spec));
+            }
+        }
 
         Ok(Self {
             reader,
@@ -1875,6 +1899,53 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             packed_metadata: OnceLock::new(),
             attach_schemas: AttachSchemas::default(),
             index_file: None,
+            plane_rows,
+        })
+    }
+
+    /// The plane-row layout of `reader`'s file, an IVF_RQ storage with
+    /// `metadata`, checked against the file's schema.
+    fn plane_rows_spec(
+        metadata: &Q::Metadata,
+        distance_type: DistanceType,
+        reader: &FileReader,
+    ) -> Result<PlaneRowsSpec> {
+        let Quantizer::Rabit(rq) = Q::from_metadata(metadata, distance_type)? else {
+            return Err(Error::index(
+                "invalid index file: only an IVF_RQ file can store plane rows",
+            ));
+        };
+        let schema = arrow_schema::Schema::from(reader.schema().as_ref());
+        PlaneRowsSpec::for_file(rq.metadata_ref(), &schema)
+    }
+
+    /// How the file stores each row's fields, from its metadata.
+    pub fn row_layout(&self) -> RQRowLayout {
+        self.metadata.row_layout()
+    }
+
+    /// The file's plane-row layout, `None` for the column layout. Reads of a
+    /// plane-row file go through it: they read the packed columns that hold
+    /// the fields they want and unpack them into those fields, so every read
+    /// returns what it returns from a column-layout file.
+    pub fn plane_rows(&self) -> Result<Option<&Arc<PlaneRowsSpec>>> {
+        if self.row_layout() == RQRowLayout::Columns {
+            return Ok(None);
+        }
+        if let Some(spec) = self.plane_rows.get() {
+            return Ok(Some(spec));
+        }
+        let spec = Self::plane_rows_spec(&self.metadata, self.distance_type, &self.reader)?;
+        Ok(Some(self.plane_rows.get_or_init(|| Arc::new(spec))))
+    }
+
+    /// The fields reads return: the file's schema, or on a plane-row file
+    /// the column layout's fields its packed columns hold, then the columns
+    /// it carries.
+    pub fn logical_schema(&self) -> Result<SchemaRef> {
+        Ok(match self.plane_rows()? {
+            Some(spec) => spec.logical_schema().clone(),
+            None => self.schema(),
         })
     }
 
@@ -1915,6 +1986,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             packed_metadata: OnceLock::new(),
             attach_schemas: AttachSchemas::default(),
             index_file: None,
+            plane_rows: OnceLock::new(),
         }
     }
 
@@ -1983,9 +2055,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// Set whether reads take the file's small columns from the resident
-    /// store, resolved when the index opened.
+    /// store, resolved when the index opened. A plane-row file keeps no
+    /// small columns apart, so it never reads through the store.
     pub fn with_resident_columns_enabled(mut self, enabled: bool) -> Self {
-        self.resident_columns_enabled = enabled;
+        self.resident_columns_enabled = enabled && self.row_layout() == RQRowLayout::Columns;
         self
     }
 
@@ -1998,8 +2071,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// Bytes the resident store holds for this storage's file, loaded or
-    /// not; see [`resident_columns_bytes`].
+    /// not; see [`resident_columns_bytes`]. Zero for a plane-row file, whose
+    /// small columns are packed with the codes of their plane.
     pub fn resident_columns_bytes(&self) -> u64 {
+        if self.row_layout() == RQRowLayout::PlaneRows {
+            return 0;
+        }
         resident_columns_bytes(&self.schema(), self.num_rows())
     }
 
@@ -2140,6 +2217,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.distance_type
     }
 
+    /// The file's schema: on a plane-row file, its packed columns; reads
+    /// return [`Self::logical_schema`]'s fields.
     pub fn schema(&self) -> SchemaRef {
         Arc::new(self.reader.schema().as_ref().into())
     }
@@ -2158,23 +2237,56 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// uninstrumented reader is used.
     ///
     /// With [`Self::resident_columns_enabled`], only the code and bounds
-    /// columns are read from the file.
+    /// columns are read from the file. A plane-row file's partition is read
+    /// as its packed columns and unpacked.
     pub async fn load_partition(
         &self,
         part_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
+        let batch = self
+            .read_partition_batch(part_id, io_stats.as_ref())
+            .await?;
+        Q::Storage::try_from_batch_with_remapper(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )
+    }
+
+    /// Every row of partition `part_id` as [`Self::logical_schema`]'s
+    /// columns, read through a reader that also records into `io_stats`:
+    /// what [`Self::load_partition`] builds the partition's storage from.
+    pub async fn read_partition_batch(
+        &self,
+        part_id: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
         let range = self.ivf.row_range(part_id);
-        let schema: SchemaRef = Arc::new(self.reader.schema().as_ref().into());
-        let batch = if range.is_empty() {
+        let schema = self.logical_schema()?;
+        Ok(if range.is_empty() {
             RecordBatch::new_empty(schema)
-        } else if let Some(store) = self.resident_store(&schema, io_stats.as_ref()).await? {
+        } else if let Some(spec) = self.plane_rows()? {
+            let batches = self
+                .file_reader(io_stats, None)
+                .read_stream(
+                    ReadBatchParams::Range(range),
+                    u32::MAX,
+                    1,
+                    FilterExpression::no_filter(),
+                )
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            spec.unpack(&batches, &schema)?
+        } else if let Some(store) = self.resident_store(&schema, io_stats).await? {
             let params = ReadBatchParams::Range(range.clone());
-            let reader = self.file_reader(io_stats.as_ref(), None);
+            let reader = self.file_reader(io_stats, None);
             self.read_with_resident_columns(store, schema, range, None, params, &reader)
                 .await?
         } else {
-            let reader = self.file_reader(io_stats.as_ref(), None);
+            let reader = self.file_reader(io_stats, None);
             let batches = reader
                 .read_stream(
                     ReadBatchParams::Range(range),
@@ -2186,13 +2298,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .try_collect::<Vec<_>>()
                 .await?;
             concat_batches(&schema, batches.iter())?
-        };
-        Q::Storage::try_from_batch_with_remapper(
-            batch,
-            self.metadata(),
-            self.distance_type,
-            self.frag_reuse_index.clone(),
-        )
+        })
     }
 
     /// The file columns a native partition's code-only entry
@@ -2369,7 +2475,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
         use super::bq::layered::RQPrecision;
         let planes: Vec<u8> = std::iter::once(0)
-            .chain(self.planes_after_sign(RQPrecision::Full))
+            .chain(self.planes_after_sign(RQPrecision::Full)?)
             .collect();
         if !cache.plane_admission_gated() {
             for part_id in 0..self.num_partitions() {
@@ -2418,9 +2524,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// sign plane leaves them out, then the ex planes the precision scores.
     /// High precision prunes with the high bounds; full precision prunes
     /// with the error factors, or with the full bounds on a file without them.
-    fn planes_after_sign(&self, precision: super::bq::layered::RQPrecision) -> Vec<u8> {
+    fn planes_after_sign(&self, precision: super::bq::layered::RQPrecision) -> Result<Vec<u8>> {
         use super::bq::layered::RQPrecision;
-        let has_error_factors = self.reader.schema().field(ERROR_FACTORS_COLUMN).is_some();
+        let has_error_factors = match self.plane_rows()? {
+            Some(spec) => spec
+                .logical_schema()
+                .field_with_name(ERROR_FACTORS_COLUMN)
+                .is_ok(),
+            None => self.reader.schema().field(ERROR_FACTORS_COLUMN).is_some(),
+        };
         let (reads_bounds, last_ex_plane) = match precision {
             RQPrecision::Sign => (false, 0),
             RQPrecision::High => (true, 1),
@@ -2431,7 +2543,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             planes.push(SIGN_BOUNDS_PLANE);
         }
         planes.extend(1..=last_ex_plane);
-        planes
+        Ok(planes)
     }
 
     /// Read independent plane entries through the existing persistent cache.
@@ -2451,7 +2563,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             }
             return self.load_partition(part_id, io_stats).await;
         }
-        let after_sign = self.planes_after_sign(precision);
+        let after_sign = self.planes_after_sign(precision)?;
         let load_plane = |plane| self.load_plane(part_id, plane, cache, io_stats.clone());
         let planes = if sequential_plane_loads()? || cache.plane_admission_gated() {
             // Admit the sign dependency first. The other reads can then
@@ -2946,7 +3058,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let code_only = self.entry_columns() == EntryColumns::Codes;
         // The planes are independent. Overlap their cache/origin reads,
         // while preserving plane order when assembling the full row schema.
-        let planes = std::iter::once(0).chain(self.planes_after_sign(RQPrecision::Full));
+        let planes = std::iter::once(0).chain(self.planes_after_sign(RQPrecision::Full)?);
         let batches = futures::future::try_join_all(planes.map(|plane| {
             let rows = &rows;
             let indices = &indices;
@@ -3185,12 +3297,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 self.sign_bounds
             )));
         }
-        let projection = lance_file::versions::reader_projection_from_column_names(
-            self.reader.metadata().version(),
-            self.reader.schema(),
-            columns,
-        )?;
-        let schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
+        let (projection, schema) = self.read_projection(columns)?;
         let range = self.ivf.row_range(part_id);
         if range.is_empty() || rows.as_ref().is_some_and(Vec::is_empty) {
             return Ok(RecordBatch::new_empty(schema));
@@ -3222,6 +3329,40 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .read_with_resident_columns(store, schema, range, rows.as_deref(), params, &reader)
                 .await;
         }
+        self.read_projected(&reader, params, projection, &schema)
+            .await
+    }
+
+    /// How a read of the file's `columns` reads them, and the schema of the
+    /// batch it returns: the columns themselves, or on a plane-row file the
+    /// packed columns that hold them, which the read unpacks into them.
+    fn read_projection(&self, columns: &[&str]) -> Result<(ReaderProjection, SchemaRef)> {
+        let plane_rows = self.plane_rows()?;
+        let file_columns = match plane_rows {
+            Some(spec) => spec.packed_for(columns)?,
+            None => columns.to_vec(),
+        };
+        let projection = lance_file::versions::reader_projection_from_column_names(
+            self.reader.metadata().version(),
+            self.reader.schema(),
+            &file_columns,
+        )?;
+        let schema = match plane_rows {
+            Some(spec) => spec.projection(columns)?,
+            None => Arc::new(arrow_schema::Schema::from(projection.schema.as_ref())),
+        };
+        Ok((projection, schema))
+    }
+
+    /// Read `projection` ([`Self::read_projection`]) at `params` through
+    /// `reader` into one batch of `schema`, unpacking plane rows.
+    async fn read_projected(
+        &self,
+        reader: &FileReader,
+        params: ReadBatchParams,
+        projection: ReaderProjection,
+        schema: &SchemaRef,
+    ) -> Result<RecordBatch> {
         let batches = reader
             .read_stream_projected(
                 params,
@@ -3233,7 +3374,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .await?
             .try_collect::<Vec<_>>()
             .await?;
-        concat_batches(&schema, batches.iter()).map_err(Into::into)
+        match self.plane_rows()? {
+            Some(spec) => spec.unpack(&batches, schema),
+            None => concat_batches(schema, batches.iter()).map_err(Into::into),
+        }
     }
 
     /// This storage's file reader, also recording its I/O into `io_stats`,
@@ -3336,28 +3480,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         columns: &[&str],
         io_stats: Option<&IoStats>,
     ) -> Result<RecordBatch> {
-        let projection = lance_file::versions::reader_projection_from_column_names(
-            self.reader.metadata().version(),
-            self.reader.schema(),
-            columns,
-        )?;
-        let schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
+        let (projection, schema) = self.read_projection(columns)?;
         if range.is_empty() {
             return Ok(RecordBatch::new_empty(schema));
         }
-        let batches = self
-            .file_reader(io_stats, None)
-            .read_stream_projected(
-                ReadBatchParams::Range(range),
-                u32::MAX,
-                1,
-                projection,
-                FilterExpression::no_filter(),
-            )
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(concat_batches(&schema, batches.iter())?)
+        let reader = self.file_reader(io_stats, None);
+        self.read_projected(&reader, ReadBatchParams::Range(range), projection, &schema)
+            .await
     }
 
     /// Materialize a compact partition for the parallel prewarm path.
@@ -3377,8 +3506,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         let frag_reuse_index = self.frag_reuse_index.clone();
+        let plane_rows = self.plane_rows()?.cloned();
         spawn_prewarm_materialization(move || {
-            let batch = compact_prewarm_batches(batches)?;
+            // Unpacking copies the rows into buffers of their own too.
+            let batch = match plane_rows {
+                Some(spec) => spec.unpack(&batches, spec.logical_schema())?,
+                None => compact_prewarm_batches(batches)?,
+            };
             Q::Storage::try_from_batch_with_remapper(
                 batch,
                 &metadata,

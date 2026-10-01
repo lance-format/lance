@@ -385,6 +385,22 @@ pub(crate) fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Resu
     IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
 }
 
+/// The index version of a segment that optimizing `index` writes, which keeps
+/// `index`'s row layout: an IVF_RQ segment's follows that layout (see
+/// [`lance_index::ivf_rq_index_version`]), so a column-layout index keeps its
+/// version; any other segment's is its type's.
+pub(crate) fn segmented_optimize_index_version(index: &dyn VectorIndex) -> Result<i32> {
+    let index_type = index_type_for_segmented_optimize(index)?;
+    if index_type != IndexType::IvfRq {
+        return Ok(index_type.version());
+    }
+    let row_layout = match index.quantizer() {
+        Quantizer::Rabit(rq) => rq.metadata_ref().row_layout,
+        _ => lance_index::vector::bq::RQRowLayout::Columns,
+    };
+    Ok(lance_index::ivf_rq_index_version(row_layout))
+}
+
 /// What a steady-state optimize (no new rows) should do to a logical IVF index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SteadyStateRebalance {

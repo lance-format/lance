@@ -10,7 +10,8 @@
 //! counters are the exception: they advance when an IVF_RQ index, layered or
 //! not, opens with, loads or reads through its resident columns. So is
 //! `storage_construct_repacks`, which advances when any RaBitQ storage is
-//! built from codes it must rewrite.
+//! built from codes it must rewrite, and `plane_rows_unpack_*`, which advance
+//! on every read of a plane-row IVF_RQ file.
 //! Readers take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -336,6 +337,11 @@ layered_lazy_counters! {
         resident_attach_bytes,
         /// Time spent assembling them, copies included.
         resident_attach_ns,
+        /// Bytes of packed row columns that reads of plane-row IVF_RQ files
+        /// unpacked into the column layout's fields.
+        plane_rows_unpack_bytes,
+        /// Time spent unpacking them.
+        plane_rows_unpack_ns,
     }
     ranked {
         /// Probes gathered lazily.

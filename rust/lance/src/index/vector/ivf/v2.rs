@@ -54,7 +54,7 @@ use lance_index::vector::bq::layered::{EntryColumns, SignBounds};
 use lance_index::vector::bq::layered_stats;
 use lance_index::vector::bq::partition_codes::PartitionCodesKey;
 use lance_index::vector::bq::rabit_ex_bits;
-use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
+use lance_index::vector::bq::storage::{RQRowLayout, RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
@@ -99,6 +99,7 @@ use uuid::Uuid;
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
 mod lazy_full;
+pub mod row_layout;
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
@@ -1965,8 +1966,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     /// Bytes the index's resident columns take, whether or not it keeps
     /// them; see [`lance_index::vector::storage::resident_columns_bytes`].
+    /// Zero for a plane-row file, which never keeps a resident store.
     pub fn resident_columns_bytes(&self) -> u64 {
         self.storage.resident_columns_bytes()
+    }
+
+    /// How the index's auxiliary file stores each row's fields. Only an
+    /// IVF_RQ index can store plane rows; reads unpack them, so results do
+    /// not depend on the layout.
+    pub fn row_layout(&self) -> RQRowLayout {
+        self.storage.row_layout()
     }
 
     /// Replace whether reads keep the small columns resident, so tests can
@@ -8926,6 +8935,150 @@ mod tests {
                 deferred_scans > 0,
                 "bits={bits} {distance_type:?}: no scan deferred a gather, so no release chain was ordered"
             );
+        }
+
+        /// A plane-row copy of the fixture answers every query, precision,
+        /// filter, cache and origin class as the column layout does, bit for
+        /// bit: eager, with a cascade, and lazily under every scan setting
+        /// (far window, one far permit, dense-to-eager routing, promotions).
+        #[rstest]
+        #[case::rq7_l2(7, DistanceType::L2, true)]
+        #[case::rq9_dot(9, DistanceType::Dot, true)]
+        #[case::native_rq7_l2(7, DistanceType::L2, false)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_plane_rows_search_matches_columns(
+            #[case] bits: u8,
+            #[case] distance_type: DistanceType,
+            #[case] layered: bool,
+        ) {
+            use super::super::row_layout::rewrite_rq_row_layout;
+            use lance_index::vector::bq::storage::RQRowLayout;
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let columns_dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(columns_dir.as_str(), bits, distance_type, layered).await;
+            let rows_dir = TempStrDir::default();
+            let rows_path = format!("{}/plane_rows", rows_dir.as_str());
+            copy_test_dir(
+                std::path::Path::new(columns_dir.as_str()),
+                std::path::Path::new(&rows_path),
+            );
+            let mut converted = Dataset::open(&rows_path).await.unwrap();
+            let name = converted.load_indices().await.unwrap()[0].name.clone();
+            rewrite_rq_row_layout(&mut converted, &name, RQRowLayout::PlaneRows)
+                .await
+                .unwrap();
+
+            let vectors = batch["vector"].as_fixed_size_list();
+            let keys = [vectors.value(0), vectors.value(777)];
+            let filters = lazy_test_filters();
+            let configs = lazy_test_configs();
+            let precisions: &[RQPrecision] = if layered {
+                &[RQPrecision::Full, RQPrecision::High, RQPrecision::Sign]
+            } else {
+                &[RQPrecision::Full]
+            };
+            let mut case = 0usize;
+            for cache in [
+                LazyTestCache::Origin,
+                LazyTestCache::Small,
+                LazyTestCache::Ungated,
+            ] {
+                let (columns, _, _) = open_lazy_test_index(columns_dir.as_str(), cache).await;
+                let (rows, row_index, _) = open_lazy_test_index(&rows_path, cache).await;
+                assert_eq!(lazy_index(&row_index).row_layout(), RQRowLayout::PlaneRows);
+                for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
+                    let open = move |dataset: Dataset| async move {
+                        let (store, dir) = index_files(&dataset).await;
+                        open_with_origin_latency(&dataset, store, dir, class).await
+                    };
+                    let column = open(columns.clone()).await;
+                    let row = open(rows.clone()).await;
+                    assert!(!lazy_index(&row).resident_columns_enabled());
+                    for key in &keys {
+                        for nprobes in [1, 4, LAZY_PARTITIONS] {
+                            for k in [1, 10, 100, LAZY_ROWS + 1] {
+                                for &precision in precisions {
+                                    case += 1;
+                                    let (filter_name, filter) = &filters[case % filters.len()];
+                                    let mut query = lazy_test_query(key.clone(), k, nprobes);
+                                    query.rq_precision = precision;
+                                    // A cascade scores a partition's first stage at
+                                    // high precision only while its high plane is
+                                    // resident, so it compares the layouts where
+                                    // both caches hold the same planes: a
+                                    // high-latency column index caches code-only
+                                    // entries, which the plane-row index cannot.
+                                    if layered
+                                        && precision == RQPrecision::Full
+                                        && case.is_multiple_of(4)
+                                        && (class == OriginLatencyClass::Low
+                                            || cache == LazyTestCache::Origin)
+                                    {
+                                        query.rq_cascade_factor = Some(4);
+                                    }
+                                    let context = format!(
+                                        "cache={cache:?} class={class} nprobes={nprobes} k={k} precision={precision:?} cascade={:?} filter={filter_name}",
+                                        query.rq_cascade_factor
+                                    );
+                                    assert_eq!(
+                                        result_bits(
+                                            &search_global(&column, &query, filter.clone())
+                                                .await
+                                                .unwrap()
+                                        ),
+                                        result_bits(
+                                            &search_global(&row, &query, filter.clone())
+                                                .await
+                                                .unwrap()
+                                        ),
+                                        "{context}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !layered {
+                        continue;
+                    }
+                    // Every lazy setting of the class on the widest probe set.
+                    let query = lazy_test_query(keys[0].clone(), 100, LAZY_PARTITIONS);
+                    let eager = result_bits(
+                        &search_global(&column, &query, filters[0].1.clone())
+                            .await
+                            .unwrap(),
+                    );
+                    for &(config_class, config) in &configs {
+                        if config_class != class {
+                            continue;
+                        }
+                        let context = format!("cache={cache:?} class={class} config={config:?}");
+                        assert_lazy_matches_eager(&row, &query, &filters[0].1, config, &context)
+                            .await;
+                        lazy_index(&row).set_layered_lazy_config_for_test(config);
+                        let lazy = search_global(&row, &query, filters[0].1.clone())
+                            .await
+                            .unwrap();
+                        lazy_index(&row)
+                            .set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+                        assert_eq!(result_bits(&lazy), eager, "{context}");
+                    }
+                    wait_for_promotions().await;
+                }
+            }
+        }
+
+        fn copy_test_dir(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_test_dir(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
         }
 
         /// An ungated backend is warmed partition by partition, so every plane
