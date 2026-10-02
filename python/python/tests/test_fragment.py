@@ -522,16 +522,24 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
-def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+@pytest.mark.parametrize("ignored_scalar_indices", [None, ["s_btree"]])
+def test_fragment_pyarrow_expression_filter(tmp_path: Path, ignored_scalar_indices):
     data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
     dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
     assert len(dataset.get_fragments()) == 2
     fragment = dataset.get_fragments()[0]
     expression = pc.field("s") != "C:\\temp"
 
     assert dataset.count_rows(filter=expression) == 2
     assert fragment.count_rows(expression) == 1
-    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
+    scanner = fragment.scanner(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )
+    assert ("ScalarIndexQuery" in scanner.explain_plan(True)) == (
+        ignored_scalar_indices is None
+    )
+    assert scanner.to_table()["id"].to_pylist() == [1]
     assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
     assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
         "id"
