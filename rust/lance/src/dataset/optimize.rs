@@ -787,6 +787,39 @@ pub trait CompactionPlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
 }
 
+/// Runs one task of a [`CompactionPlan`]. Pass an implementation to
+/// [`compact_files_with_executor`] to run the tasks somewhere else (say, on a
+/// cluster) or to wrap the default one; [`CompactionTask::execute`] runs the
+/// default one for a task executed by hand.
+///
+/// The results go to [`commit_compaction`].
+#[async_trait::async_trait]
+pub trait CompactionExecutor: Send + Sync {
+    /// Execute `task` against `dataset`, which is at the plan's read version.
+    async fn execute(
+        &self,
+        dataset: &Dataset,
+        task: TaskData,
+        options: &CompactionOptions,
+    ) -> Result<RewriteResult>;
+}
+
+/// Runs a task the way this crate does: rewrites its fragments into new ones.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultCompactionExecutor;
+
+#[async_trait::async_trait]
+impl CompactionExecutor for DefaultCompactionExecutor {
+    async fn execute(
+        &self,
+        dataset: &Dataset,
+        task: TaskData,
+        options: &CompactionOptions,
+    ) -> Result<RewriteResult> {
+        rewrite_files(Cow::Borrowed(dataset), task, options).await
+    }
+}
+
 /// Formulate a plan to compact the files in a dataset
 ///
 /// The compaction plan will contain a list of tasks to execute. Each task
@@ -1046,6 +1079,17 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
+    compact_files_with_executor(dataset, remap_options, planner, &DefaultCompactionExecutor).await
+}
+
+/// Plan with `planner`, run every task with `executor`, and commit the
+/// results with [`commit_compaction`].
+pub async fn compact_files_with_executor(
+    dataset: &mut Dataset,
+    remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
+    planner: &dyn CompactionPlanner,
+    executor: &dyn CompactionExecutor,
+) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // A tagged FRI history is maintained by appending transitions to the
@@ -1074,28 +1118,21 @@ pub async fn compact_files_with_planner(
         return Ok(CompactionMetrics::default());
     }
 
-    let dataset_ref = &dataset.clone();
-
-    let result_stream = futures::stream::iter(compaction_plan.tasks)
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
-        .buffer_unordered(
-            compaction_plan
-                .options
-                .num_threads
-                .unwrap_or_else(get_num_compute_intensive_cpus),
-        );
-
-    let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
+    let concurrency = compaction_plan
+        .options
+        .num_threads
+        .unwrap_or_else(get_num_compute_intensive_cpus);
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(
-        dataset,
-        completed_tasks,
-        remap_options,
-        &compaction_plan.options,
-    )
-    .await?;
-
-    Ok(metrics)
+    let options = &compaction_plan.options;
+    // Execute against an immutable snapshot; the commit takes `&mut dataset`
+    // once every task has finished.
+    let snapshot = &dataset.clone();
+    let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.tasks.clone())
+        .map(|task| executor.execute(snapshot, task, options))
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+    commit_compaction(dataset, results, remap_options, options).await
 }
 
 /// Information about a fragment used to decide its fate in compaction
@@ -2146,7 +2183,9 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(dataset, self.task.clone(), &self.options).await
+        DefaultCompactionExecutor
+            .execute(dataset.as_ref(), self.task.clone(), &self.options)
+            .await
     }
 }
 
@@ -4191,6 +4230,64 @@ mod tests {
                 serde_json::from_value::<LanceFileVersion>(serde_json::json!(value)).unwrap_err();
             assert!(error.to_string().contains(value));
         }
+    }
+
+    /// `compact_files_with_executor` runs every planned task through the
+    /// executor it is given and commits what that executor returns.
+    #[tokio::test]
+    async fn compact_files_runs_tasks_through_the_given_executor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(AtomicUsize);
+
+        #[async_trait]
+        impl CompactionExecutor for Counting {
+            async fn execute(
+                &self,
+                dataset: &Dataset,
+                task: TaskData,
+                options: &CompactionOptions,
+            ) -> Result<RewriteResult> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                DefaultCompactionExecutor
+                    .execute(dataset, task, options)
+                    .await
+            }
+        }
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = dataset.count_rows(None).await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 5_000,
+            ..Default::default()
+        };
+        let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
+        let tasks = plan_compaction(&dataset, &options)
+            .await
+            .unwrap()
+            .num_tasks();
+        assert!(tasks > 0);
+
+        let executor = Counting(AtomicUsize::new(0));
+        let metrics = compact_files_with_executor(&mut dataset, None, &planner, &executor)
+            .await
+            .unwrap();
+
+        assert_eq!(executor.0.load(Ordering::SeqCst), tasks);
+        assert!(metrics.fragments_removed > 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), before);
+        dataset.validate().await.unwrap();
     }
 
     #[rstest]
