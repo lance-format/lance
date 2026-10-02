@@ -82,7 +82,7 @@ use lance_index::vector::pq::storage::{
 };
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::v3::shuffler::create_ivf_shuffler;
+use lance_index::vector::v3::shuffler::create_owned_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
@@ -797,9 +797,7 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let format_version = dataset_format_version(dataset);
 
-    let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
-    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
+    let shuffler = create_owned_ivf_shuffler(num_partitions, format_version, None)?;
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let summary = match index_type {
