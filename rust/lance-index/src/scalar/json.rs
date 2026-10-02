@@ -58,11 +58,78 @@ const JSON_INDEX_VERSION: u32 = 0;
 pub struct JsonIndex {
     target_index: Arc<dyn ScalarIndex>,
     path: String,
+    /// The `JsonTargetDataType` this index's details recorded, held as the raw
+    /// enum value so a variant this build does not recognize survives a `remap`
+    /// or `update` performed by this build instead of being erased.
+    ///
+    /// `Unspecified` for an index built before the field existed.
+    recorded_target_data_type: i32,
 }
 
 impl JsonIndex {
     pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
-        Self { target_index, path }
+        Self {
+            target_index,
+            path,
+            recorded_target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+        }
+    }
+
+    /// Record the `JsonTargetDataType` this index's details carried.
+    ///
+    /// Takes the raw value straight from the decoded details rather than a
+    /// parsed enum, so a value written by a newer build is carried forward
+    /// untouched.
+    pub fn with_target_data_type(mut self, target_data_type: i32) -> Self {
+        self.recorded_target_data_type = target_data_type;
+        self
+    }
+
+    /// The raw `JsonTargetDataType` to write into details this index produces.
+    ///
+    /// Prefers what the details already recorded, so a variant this build does
+    /// not recognize survives. Falls back to asking the target index, which
+    /// upgrades an index built before the field existed: total on the `update`
+    /// path, which already requires the target to report its training type, and
+    /// BTree-only on the `remap` path, where an index that cannot answer is left
+    /// no worse off than before.
+    ///
+    /// Deliberately infallible: a type with no representation here is recorded
+    /// as `Unspecified`, leaving details exactly as lossy as they already were,
+    /// rather than failing the compaction that produced them.
+    fn target_data_type_to_record(&self) -> i32 {
+        if self.recorded_target_data_type != crate::pb::JsonTargetDataType::Unspecified as i32 {
+            return self.recorded_target_data_type;
+        }
+        self.target_index
+            .training_data_type()
+            .as_ref()
+            .and_then(|data_type| JsonIndexTargetType::try_from(data_type).ok())
+            .map(|target_type| target_type.to_pb() as i32)
+            .unwrap_or(crate::pb::JsonTargetDataType::Unspecified as i32)
+    }
+
+    /// The type the target index was trained on, or `None` when it cannot be
+    /// recovered and a rebuild has to infer it from the data again.
+    ///
+    /// Prefers the value the details recorded. Indices built before that field
+    /// existed record `Unspecified`, and so does a value this build does not
+    /// recognize, so both fall back to asking the target index -- which only
+    /// BTree answers.
+    ///
+    /// Unlike [`Self::target_data_type_to_record`], this errors rather than
+    /// degrading when the target reports an Arrow type with no representation
+    /// here, because a rebuild driven by the result must not silently use the
+    /// wrong type.
+    fn resolve_target_data_type(&self) -> Result<Option<JsonIndexTargetType>> {
+        if let Some(recorded) = JsonIndexTargetType::from_pb(self.recorded_target_data_type) {
+            return Ok(Some(recorded));
+        }
+        self.target_index
+            .training_data_type()
+            .as_ref()
+            .map(JsonIndexTargetType::try_from)
+            .transpose()
     }
 }
 
@@ -137,7 +204,7 @@ impl ScalarIndex for JsonIndex {
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
-            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_data_type: self.target_data_type_to_record(),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -176,7 +243,7 @@ impl ScalarIndex for JsonIndex {
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
-            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_data_type: self.target_data_type_to_record(),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
@@ -196,12 +263,7 @@ impl ScalarIndex for JsonIndex {
 
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
         let target_params = self.target_index.derive_index_params()?;
-        let target_data_type = self
-            .target_index
-            .training_data_type()
-            .as_ref()
-            .map(JsonIndexTargetType::try_from)
-            .transpose()?;
+        let target_data_type = self.resolve_target_data_type()?;
         let params = JsonIndexParameters {
             target_index_type: target_params.index_type,
             target_index_parameters: target_params.params,
@@ -226,13 +288,65 @@ pub struct JsonIndexParameters {
     path: String,
 }
 
+/// The Arrow type a JSON index decodes the value at its path into, and trains
+/// its target index on.
+///
+/// The variants are the image of the JSONB type tags, so they cover every JSON
+/// value type: arrays and objects are re-serialized and indexed as
+/// [`Self::LargeBinary`].
+/// Spelled in `snake_case` on the wire so the name in serialized
+/// [`JsonIndexParameters`] matches the one [`Self::as_json_name`] reports in
+/// index details; they are the same fact on two user-visible surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum JsonIndexTargetType {
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JsonIndexTargetType {
     Boolean,
     Int64,
     Float64,
     Utf8,
     LargeBinary,
+}
+
+impl JsonIndexTargetType {
+    /// The matching protobuf variant, for writing into `JsonIndexDetails`.
+    fn to_pb(self) -> crate::pb::JsonTargetDataType {
+        match self {
+            Self::Boolean => crate::pb::JsonTargetDataType::Boolean,
+            Self::Int64 => crate::pb::JsonTargetDataType::Int64,
+            Self::Float64 => crate::pb::JsonTargetDataType::Float64,
+            Self::Utf8 => crate::pb::JsonTargetDataType::Utf8,
+            Self::LargeBinary => crate::pb::JsonTargetDataType::LargeBinary,
+        }
+    }
+
+    /// The type recorded by a raw `JsonTargetDataType` value, or `None` if it
+    /// records no type.
+    ///
+    /// `None` covers both `Unspecified`, written by builds that predate the
+    /// field, and any variant added after this build, which it cannot act on
+    /// but must not mistake for a type it knows.
+    fn from_pb(value: i32) -> Option<Self> {
+        match crate::pb::JsonTargetDataType::try_from(value).ok()? {
+            crate::pb::JsonTargetDataType::Unspecified => None,
+            crate::pb::JsonTargetDataType::Boolean => Some(Self::Boolean),
+            crate::pb::JsonTargetDataType::Int64 => Some(Self::Int64),
+            crate::pb::JsonTargetDataType::Float64 => Some(Self::Float64),
+            crate::pb::JsonTargetDataType::Utf8 => Some(Self::Utf8),
+            crate::pb::JsonTargetDataType::LargeBinary => Some(Self::LargeBinary),
+        }
+    }
+
+    /// The name used for this type in `details_as_json`, and so in the details
+    /// a `list_indices` response reports.
+    fn as_json_name(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Int64 => "int64",
+            Self::Float64 => "float64",
+            Self::Utf8 => "utf8",
+            Self::LargeBinary => "large_binary",
+        }
+    }
 }
 
 impl TryFrom<&DataType> for JsonIndexTargetType {
@@ -959,6 +1073,11 @@ impl BasicTrainer for JsonIndexPlugin {
                 Self::extract_json_with_type_info(data, path.clone()).await?
             };
 
+        // Captured before `target_type` is consumed below. Recorded even when it
+        // was inferred from the data, so a later rebuild reproduces this type
+        // instead of inferring its own.
+        let recorded_target_data_type = JsonIndexTargetType::try_from(&target_type)?.to_pb() as i32;
+
         // Initial builds use the inferred type; rebuilds use the learned target
         // type carried in the derived parameters.
         let converted_stream =
@@ -1009,7 +1128,7 @@ impl BasicTrainer for JsonIndexPlugin {
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
-            target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_data_type: recorded_target_data_type,
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1082,7 +1201,10 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let target_index = target_plugin
             .load_index(index_store, target_details, frag_reuse_index, cache)
             .await?;
-        Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
+        Ok(Arc::new(
+            JsonIndex::new(target_index, json_details.path)
+                .with_target_data_type(json_details.target_data_type),
+        ))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -1091,10 +1213,21 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
         let target_details_json = target_plugin.details_as_json(target_details)?;
-        Ok(serde_json::json!({
+        let mut details_json = serde_json::json!({
             "path": json_details.path,
             "target_details": target_details_json,
-        }))
+        });
+        // Omitted rather than reported as null when the index records no type,
+        // so the details of an index built before the field existed read the
+        // same as they always have. An unrecognized value is reported as its
+        // raw number so an operator can still see that a type is recorded.
+        if json_details.target_data_type != crate::pb::JsonTargetDataType::Unspecified as i32 {
+            let reported = JsonIndexTargetType::from_pb(json_details.target_data_type)
+                .map(|target_type| target_type.as_json_name().to_string())
+                .unwrap_or_else(|| format!("unknown({})", json_details.target_data_type));
+            details_json["target_data_type"] = serde_json::json!(reported);
+        }
+        Ok(details_json)
     }
 }
 
@@ -1336,6 +1469,19 @@ mod tests {
         path: &str,
         json_docs: &[&str],
     ) -> Arc<dyn ScalarIndex> {
+        let (index, _) =
+            train_json_index(store, target_index_type, expected_ordering, path, json_docs).await;
+        index
+    }
+
+    /// Train a JSON index and return it alongside the details it produced.
+    async fn train_json_index(
+        store: Arc<dyn IndexStore>,
+        target_index_type: &str,
+        expected_ordering: TrainingOrdering,
+        path: &str,
+        json_docs: &[&str],
+    ) -> (Arc<dyn ScalarIndex>, prost_types::Any) {
         use crate::progress::noop_progress;
         use arrow_array::{LargeBinaryArray, UInt64Array};
         use futures::stream;
@@ -1393,10 +1539,11 @@ mod tests {
             .await
             .unwrap();
 
-        plugin
+        let index = plugin
             .load_index(store, &created.index_details, None, &LanceCache::no_cache())
             .await
-            .unwrap()
+            .unwrap();
+        (index, created.index_details)
     }
 
     fn local_json_index_store() -> (Arc<dyn IndexStore>, lance_core::utils::tempfile::TempObjDir) {
@@ -1644,13 +1791,23 @@ mod tests {
         assert!(message.contains("JSON type Boolean"), "{message}");
     }
 
+    /// `bitmap` covers the target types that do not implement
+    /// `training_data_type`, where the derived type can only come from the
+    /// details.
+    #[rstest]
+    #[case::btree("btree", true)]
+    #[case::bitmap("bitmap", false)]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_json_derived_params_preserve_wrapper() {
+    async fn test_json_derived_params_preserve_wrapper(
+        #[case] target_index_type: &str,
+        // Only some targets round-trip their own parameters; bitmap has none.
+        #[case] expect_target_parameters: bool,
+    ) {
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
             store,
-            "btree",
+            target_index_type,
             TrainingOrdering::None,
             "v",
             &[r#"{"v": 1}"#],
@@ -1659,14 +1816,376 @@ mod tests {
 
         let derived = index.derive_index_params().unwrap();
         assert_eq!(derived.index_type, "json");
-        let parameters: JsonIndexParameters =
-            serde_json::from_str(derived.params.as_deref().unwrap()).unwrap();
+        let raw_params = derived.params.as_deref().unwrap();
+        // The serialized spelling is the same one `details_as_json` reports, so
+        // the two user-visible surfaces do not disagree about the same fact.
+        assert!(
+            raw_params.contains(r#""target_data_type":"int64""#),
+            "unexpected parameter spelling: {raw_params}"
+        );
+        let parameters: JsonIndexParameters = serde_json::from_str(raw_params).unwrap();
         assert_eq!(parameters.path, "v");
-        assert_eq!(parameters.target_index_type, "btree");
-        assert!(parameters.target_index_parameters.is_some());
+        assert_eq!(parameters.target_index_type, target_index_type);
+        assert_eq!(
+            parameters.target_index_parameters.is_some(),
+            expect_target_parameters
+        );
         assert_eq!(
             parameters.target_data_type,
             Some(JsonIndexTargetType::Int64)
+        );
+    }
+
+    fn decode_target_data_type(details: &prost_types::Any) -> i32 {
+        crate::pb::JsonIndexDetails::decode(details.value.as_slice())
+            .unwrap()
+            .target_data_type
+    }
+
+    /// Rewrite `target_data_type` in `details`.
+    ///
+    /// With `Unspecified` this produces the details a build that predates the
+    /// field would have written; with an out-of-range value, the details a build
+    /// that added a variant this one does not know would have written.
+    fn details_with_target_data_type(details: &prost_types::Any, value: i32) -> prost_types::Any {
+        let mut decoded = crate::pb::JsonIndexDetails::decode(details.value.as_slice()).unwrap();
+        decoded.target_data_type = value;
+        prost_types::Any::from_msg(&decoded).unwrap()
+    }
+
+    async fn load_json_index(
+        store: Arc<dyn IndexStore>,
+        details: &prost_types::Any,
+    ) -> Arc<dyn ScalarIndex> {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        registry
+            .get_plugin_by_name("json")
+            .unwrap()
+            .load_index(store, details, None, &LanceCache::no_cache())
+            .await
+            .unwrap()
+    }
+
+    /// A fresh build records the type it trained on, including when it inferred
+    /// that type from the data, and including for targets that cannot report it
+    /// back afterwards. `expected_json_name` is the spelling that reaches
+    /// `list_indices`, which is user-visible and so pinned per variant.
+    #[rstest]
+    #[case::btree_int64("btree", r#"{"v": 1}"#, crate::pb::JsonTargetDataType::Int64, "int64")]
+    #[case::btree_float64(
+        "btree",
+        r#"{"v": 1.5}"#,
+        crate::pb::JsonTargetDataType::Float64,
+        "float64"
+    )]
+    #[case::btree_utf8("btree", r#"{"v": "a"}"#, crate::pb::JsonTargetDataType::Utf8, "utf8")]
+    #[case::btree_boolean(
+        "btree",
+        r#"{"v": true}"#,
+        crate::pb::JsonTargetDataType::Boolean,
+        "boolean"
+    )]
+    #[case::btree_nested(
+        "btree",
+        r#"{"v": {"nested": 1}}"#,
+        crate::pb::JsonTargetDataType::LargeBinary,
+        "large_binary"
+    )]
+    // Nothing to read a type tag from, so inference falls back to Utf8 and the
+    // build records the fallback rather than leaving the type unspecified.
+    #[case::btree_absent_path(
+        "btree",
+        r#"{"other": 1}"#,
+        crate::pb::JsonTargetDataType::Utf8,
+        "utf8"
+    )]
+    #[case::btree_explicit_null(
+        "btree",
+        r#"{"v": null}"#,
+        crate::pb::JsonTargetDataType::Utf8,
+        "utf8"
+    )]
+    #[case::bitmap_utf8("bitmap", r#"{"v": "a"}"#, crate::pb::JsonTargetDataType::Utf8, "utf8")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_details_record_target_data_type(
+        #[case] target_index_type: &str,
+        #[case] json_doc: &str,
+        #[case] expected: crate::pb::JsonTargetDataType,
+        #[case] expected_json_name: &str,
+    ) {
+        let (store, _tmpdir) = local_json_index_store();
+        let (_index, details) = train_json_index(
+            store,
+            target_index_type,
+            TrainingOrdering::None,
+            "v",
+            &[json_doc],
+        )
+        .await;
+
+        assert_eq!(decode_target_data_type(&details), expected as i32);
+
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let details_json = registry
+            .get_plugin_by_name("json")
+            .unwrap()
+            .details_as_json(&details)
+            .unwrap();
+        assert_eq!(details_json["target_data_type"], expected_json_name);
+    }
+
+    /// Compaction must not drop the recorded type. `bitmap` is the case that
+    /// re-deriving from the target index cannot serve.
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::bitmap("bitmap")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_details_target_data_type_survives_remap(#[case] target_index_type: &str) {
+        let (store, _tmpdir) = local_json_index_store();
+        let (index, details) = train_json_index(
+            store,
+            target_index_type,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": "a"}"#, r#"{"v": "b"}"#],
+        )
+        .await;
+        assert_eq!(
+            decode_target_data_type(&details),
+            crate::pb::JsonTargetDataType::Utf8 as i32
+        );
+
+        let (dest_store, _dest_dir) = local_json_index_store();
+        let remapped = index
+            .remap(&RowAddrRemap::empty(), dest_store.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            decode_target_data_type(&remapped.index_details),
+            crate::pb::JsonTargetDataType::Utf8 as i32
+        );
+    }
+
+    /// Details written before this field existed must keep working: the index
+    /// loads, answers queries, and can still be compacted.
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::bitmap("bitmap")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_legacy_details_without_target_data_type(#[case] target_index_type: &str) {
+        use crate::metrics::NoOpMetricsCollector;
+        use lance_select::RowAddrTreeMap;
+
+        let (store, _tmpdir) = local_json_index_store();
+        let (_index, details) = train_json_index(
+            store.clone(),
+            target_index_type,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#, r#"{"v": 2}"#],
+        )
+        .await;
+        let legacy_details = details_with_target_data_type(
+            &details,
+            crate::pb::JsonTargetDataType::Unspecified as i32,
+        );
+
+        let index = load_json_index(store, &legacy_details).await;
+
+        let query = JsonQuery::new(
+            Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(2)))),
+            "v".to_string(),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(
+            result,
+            SearchResult::exact(RowAddrTreeMap::from_iter([1u64])),
+            "a legacy index must still answer queries"
+        );
+
+        let (dest_store, _dest_dir) = local_json_index_store();
+        let remapped = index
+            .remap(&RowAddrRemap::empty(), dest_store.as_ref())
+            .await
+            .unwrap();
+
+        // BTree can report its training type, so compacting upgrades the details
+        // in passing. Targets that cannot report it stay as lossy as they were.
+        let expected = if target_index_type == "btree" {
+            crate::pb::JsonTargetDataType::Int64 as i32
+        } else {
+            crate::pb::JsonTargetDataType::Unspecified as i32
+        };
+        assert_eq!(decode_target_data_type(&remapped.index_details), expected);
+
+        // Same split for a rebuild: BTree recovers the type, and a target that
+        // cannot report one must derive no type so the rebuild re-infers it
+        // rather than being handed a wrong one.
+        let derived = index.derive_index_params().unwrap();
+        let parameters: JsonIndexParameters =
+            serde_json::from_str(derived.params.as_deref().unwrap()).unwrap();
+        let expected_derived = (target_index_type == "btree").then_some(JsonIndexTargetType::Int64);
+        assert_eq!(parameters.target_data_type, expected_derived);
+    }
+
+    /// A variant added after this build must survive a compaction this build
+    /// performs, rather than being erased on the way through.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_unknown_target_data_type_survives_remap() {
+        const FUTURE_VARIANT: i32 = 99;
+
+        let (store, _tmpdir) = local_json_index_store();
+        let (_index, details) = train_json_index(
+            store.clone(),
+            "btree",
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#],
+        )
+        .await;
+        let future_details = details_with_target_data_type(&details, FUTURE_VARIANT);
+
+        let index = load_json_index(store, &future_details).await;
+        let (dest_store, _dest_dir) = local_json_index_store();
+        let remapped = index
+            .remap(&RowAddrRemap::empty(), dest_store.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            decode_target_data_type(&remapped.index_details),
+            FUTURE_VARIANT
+        );
+    }
+
+    /// `update` rewrites the details without retraining the target, so it must
+    /// copy the recorded type through. An unrecognized variant is the case that
+    /// distinguishes copying from re-deriving: BTree would answer `Int64` here.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_unknown_target_data_type_survives_update() {
+        const FUTURE_VARIANT: i32 = 99;
+
+        let (store, _tmpdir) = local_json_index_store();
+        let (_index, details) = train_json_index(
+            store.clone(),
+            "btree",
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#],
+        )
+        .await;
+        let future_details = details_with_target_data_type(&details, FUTURE_VARIANT);
+
+        let index = load_json_index(store, &future_details).await;
+        let (dest_store, _dest_dir) = local_json_index_store();
+        let updated = index
+            .update(
+                json_update_stream(&[r#"{"v": 2}"#], vec![1]),
+                dest_store.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            decode_target_data_type(&updated.index_details),
+            FUTURE_VARIANT
+        );
+    }
+
+    /// An index built before the field existed is upgraded by an `update`,
+    /// which -- unlike `remap` -- already requires the target to report the type
+    /// it was trained on.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_update_records_target_data_type_for_legacy_details() {
+        let (store, _tmpdir) = local_json_index_store();
+        let (_index, details) = train_json_index(
+            store.clone(),
+            "btree",
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#],
+        )
+        .await;
+        let legacy_details = details_with_target_data_type(
+            &details,
+            crate::pb::JsonTargetDataType::Unspecified as i32,
+        );
+
+        let index = load_json_index(store, &legacy_details).await;
+        let (dest_store, _dest_dir) = local_json_index_store();
+        let updated = index
+            .update(
+                json_update_stream(&[r#"{"v": 2}"#], vec![1]),
+                dest_store.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            decode_target_data_type(&updated.index_details),
+            crate::pb::JsonTargetDataType::Int64 as i32
+        );
+    }
+
+    /// `details_as_json` feeds `list_indices`, so the recorded type has to be
+    /// visible there, and a legacy index's details have to read as they always
+    /// have.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_details_as_json_reports_target_data_type() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+
+        let (store, _tmpdir) = local_json_index_store();
+        let (_index, details) = train_json_index(
+            store,
+            "btree",
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#],
+        )
+        .await;
+
+        assert_eq!(
+            plugin.details_as_json(&details).unwrap(),
+            serde_json::json!({
+                "path": "v",
+                "target_details": {},
+                "target_data_type": "int64",
+            })
+        );
+
+        let legacy_details = details_with_target_data_type(
+            &details,
+            crate::pb::JsonTargetDataType::Unspecified as i32,
+        );
+        assert_eq!(
+            plugin.details_as_json(&legacy_details).unwrap(),
+            serde_json::json!({
+                "path": "v",
+                "target_details": {},
+            })
+        );
+
+        // A variant this build does not know is still reported, as a string so
+        // that the type of the field does not depend on who wrote the index.
+        let future_details = details_with_target_data_type(&details, 99);
+        assert_eq!(
+            plugin.details_as_json(&future_details).unwrap(),
+            serde_json::json!({
+                "path": "v",
+                "target_details": {},
+                "target_data_type": "unknown(99)",
+            })
         );
     }
 
