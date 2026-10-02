@@ -69,6 +69,10 @@ wiremock.workspace = true
 name = "scheduler"
 harness = false
 
+[[bench]]
+name = "throttle_delete"
+harness = false
+
 [features]
 default = ["aws", "azure", "gcp"]
 metrics = ["dep:metrics"]
