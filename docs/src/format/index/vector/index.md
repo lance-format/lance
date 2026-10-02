@@ -434,3 +434,95 @@ if storage_metadata:
         # Parse the tensor protobuf
         # codebook_tensor = parse_tensor_protobuf(codebook_buffer)
 ```
+
+### Layered RaBitQ prefix planes
+
+Layered storage is opt-in (`layered: true` in `lance:rabit`) and requires a
+reader supporting the layered layout. The default, including missing `layered`,
+is the existing single-plane layout. A layered index supports exactly these
+fixed widths: 5 bits stores sign + 2 + 2, 7 bits stores sign + 4 + 2, and 9 bits
+stores sign + 4 + 4. Widths are derived from `num_bits`; no list of planes is
+persisted. Older readers reject the shorter `__blocked_ex_codes` column with a
+byte-width mismatch instead of decoding it as the full ex code.
+
+The auxiliary file retains its IVF partition row ranges and rotation metadata.
+For a rotated dimension `d`, let `p = 64 * ceil(d / 64)` and `(h, l)` be the fixed
+high and low widths. Each partition has this schema:
+
+```python
+pa.schema([
+    pa.field("_rowid", pa.uint64()),
+    pa.field("_rabit_codes", pa.list_(pa.uint8(), (d + 7) // 8)),
+    pa.field("__add_factors", pa.float32()),
+    pa.field("__scale_factors", pa.float32()),
+    pa.field("__error_factors", pa.float32()),
+    pa.field("__rq_bounds_hi", pa.list_(pa.float32(), 3)),
+    pa.field("__rq_bounds_full", pa.list_(pa.float32(), 3)),
+    pa.field("__blocked_ex_codes", pa.list_(pa.uint8(), p * h // 8)),
+    pa.field("__add_factors_ex_hi", pa.float32()),
+    pa.field("__scale_factors_ex_hi", pa.float32()),
+    pa.field("__blocked_ex_codes_lo", pa.list_(pa.uint8(), p * l // 8)),
+    pa.field("__add_factors_ex", pa.float32()),
+    pa.field("__scale_factors_ex", pa.float32()),
+])
+```
+
+All fields retain the existing nullable schema convention. Null codes or factors
+are not valid encoded rows.
+
+Column order is resolved by name. Each ex plane uses its width's existing blocked
+packing, including zero padding to a 64-dimensional boundary. The sign plane
+retains its existing partition-local transposition. Selecting sign rows requires
+undoing that transposition before gathering rows and repacking the result.
+
+For each rotated residual, the encoder chooses the rescale factor `t` and
+quantizes at `(h+l)` ex bits exactly as the native index does. Splitting that
+code must preserve the full code values, binary factors and full factors.
+The high code is `code >> l`; the low code is
+`code & (2^l-1)`. Negative components use the existing complemented encoding
+`!code & (2^(h+l)-1)`, so truncation also preserves their prefix. The high code
+is the code obtained at `h` bits with scale `t / 2^l`. The scale is build-time
+state and is not stored; a change to the search policy does not change decoding.
+
+Full-precision queries use the native binary error factors and query error for
+pruning, including the native approximation-mode policy. Storage layout must
+not change that policy. High and full levels each store their own raw-query add/scale factors, computed with their own
+code bias and quantized residual/centroid inner products. Full scoring combines
+codes before accumulation as `2^l * high + low`; high scoring omits the low code
+and uses the high factor pair. Reusing full-level factors for a prefix is invalid.
+
+The two `__rq_bounds_*` columns belong to the sign-plane projection. For a
+level with `b` ex bits, let `s_j` be its sign bit, `e_j` its ex code,
+`w_j = scale_level * (2^b*s_j + e_j - (2^b - 1/2))`, and
+`w_sign_j = scale_sign * (s_j - 1/2)`. Each row stores three nonnegative
+float32 values, rounded upwards: `||w-w_sign||_2`,
+`|add_level-add_sign|`, and `|scale_sign| + 2^b*|scale_level|`.
+Nonfinite or negative bound hints disable pruning for the affected row; the
+code and factor columns still determine its score.
+
+For a rotated query `q` and the metric's add-factor multiplier `a`, the
+real-arithmetic score difference is bounded by
+`||w-w_sign||_2 * ||q||_2 + |a| * |add_level-add_sign|`.
+Readers must additionally allow for their sign-LUT quantization and floating
+point reconstruction error, using the third coefficient. Accurate mode uses
+the conservative norm bound. Normal mode applies the native RaBitQ angular
+confidence policy to the norm term, multiplying it by
+`min(1, 1.9 / sqrt(d - 1))` for `d > 1`. This statistical bound can lose
+candidates and must be evaluated together with recall; the add-factor and
+arithmetic margins are not multiplied by the angular confidence factor. When
+the rotated centroid is available, Normal L2/cosine mode may use the equivalent
+centered query `q-c`: the encoder's add-factor difference cancels the centroid dot of
+`w-w_sign`, with a separate floating-point margin for that cancellation.
+Dot and Accurate mode retain the generic norm-plus-add-factor bound. A reader skips a row when its chosen
+lower bound cannot beat the current top-k threshold or falls above the
+query's upper distance bound. A high-prefix query uses its estimator-difference
+bound instead of the native `__error_factors`, which bounds error relative to
+the original vector. Full queries retain native pruning and do not use
+`__rq_bounds_full`; that column does not determine full-query semantics.
+Neither policy reads original vectors or requires a fixed candidate expansion
+factor.
+
+Appending, merging, splitting, reassigning and remapping an index must preserve
+the layout flag and every plane's factors. All segments merged into a single
+index must agree on the layout and shared rotation. A missing required plane,
+factor column, or mismatched plane byte width is an invalid index.
