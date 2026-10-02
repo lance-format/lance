@@ -14,7 +14,7 @@ This example will show how to:
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{types::Float32Type, Array, FixedSizeListArray};
+use arrow::array::{Array, FixedSizeListArray, types::Float32Type};
 use arrow::array::{AsArray, FixedSizeListBuilder, Float32Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -25,7 +25,10 @@ use lance::Dataset;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{
     flat::storage::FlatFloatStorage,
-    hnsw::{builder::HnswBuildParams, HNSW},
+    hnsw::{
+        HNSW,
+        builder::{HnswBuildParams, HnswQueryParams},
+    },
 };
 use lance_linalg::distance::DistanceType;
 
@@ -81,15 +84,14 @@ async fn main() {
     let max_level = 7;
 
     // 1. Generate a synthetic test data of specified dimensions
-    let dataset = if uri.is_none() {
-        println!("No uri is provided, generating test dataset...");
-        let output = "test_vectors.lance";
-        create_test_vector_dataset(output, 1000, 64).await;
-        Dataset::open(output).await.expect("Failed to open dataset")
-    } else {
-        Dataset::open(uri.as_ref().unwrap())
-            .await
-            .expect("Failed to open dataset")
+    let dataset = match uri.as_deref() {
+        None => {
+            println!("No uri is provided, generating test dataset...");
+            let output = "test_vectors.lance";
+            create_test_vector_dataset(output, 1000, 64).await;
+            Dataset::open(output).await.expect("Failed to open dataset")
+        }
+        Some(uri) => Dataset::open(uri).await.expect("Failed to open dataset"),
     };
 
     println!("Dataset schema: {:#?}", dataset.schema());
@@ -127,8 +129,15 @@ async fn main() {
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
         // 3. Perform vector search with different parameters and compute the ground truth using L2 distance search
+        let params = HnswQueryParams {
+            ef,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
         let results: HashSet<u32> = hnsw
-            .search_basic(q.clone(), k, ef, None, vector_store.as_ref())
+            .search_basic(q.clone(), k, &params, None, vector_store.as_ref())
             .unwrap()
             .iter()
             .map(|node| node.id)
