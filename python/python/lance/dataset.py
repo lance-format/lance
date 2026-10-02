@@ -2098,6 +2098,25 @@ class LanceDataset(pa.dataset.Dataset):
             for f in self._ds.get_fragments()
         ]
 
+    def fragment_ids(self) -> Bitmap:
+        """Get the ids of all fragments in the currently checked out version.
+
+        Unlike :meth:`get_fragments`, this does not create an object for every
+        fragment.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": range(4)})
+        >>> dataset = lance.write_dataset(
+        ...     data, "memory://fragment_ids", max_rows_per_file=2
+        ... )
+        >>> list(dataset.fragment_ids())
+        [0, 1]
+        """
+        return self._ds.fragment_ids()
+
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
         raw_fragment = self._ds.get_fragment(fragment_id)

@@ -2992,6 +2992,10 @@ impl Dataset {
         self.ds.count_fragments()
     }
 
+    fn fragment_ids(&self) -> crate::bitmap::PyBitmap {
+        crate::bitmap::PyBitmap::new(self.ds.iter_fragments().map(|f| f.id as u32).collect())
+    }
+
     fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
         rt().block_on(None, self.ds.num_small_files(max_rows_per_group))
             .map_err(|err| PyIOError::new_err(err.to_string()))
