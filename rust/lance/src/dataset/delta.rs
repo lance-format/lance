@@ -1138,7 +1138,7 @@ mod tests {
             Err(lance_core::Error::VersionNotFound { message }) => {
                 assert!(message.contains("Can not find version"));
             }
-            _ => panic!("Expected VersionNotFound error."),
+            other => panic!("Expected VersionNotFound error, got {other:?}"),
         }
     }
 

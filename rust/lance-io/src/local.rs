@@ -41,6 +41,33 @@ pub fn to_local_path(path: &Path) -> String {
     }
 }
 
+/// Create a local writer's parent directory and persist any newly created path components.
+pub(crate) fn create_dir_all_durable(parent: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let first_existing = parent.ancestors().find(|path| path.exists());
+
+    std::fs::create_dir_all(parent)?;
+
+    #[cfg(unix)]
+    if let Some(first_existing) = first_existing.filter(|path| *path != parent) {
+        let mut directory = parent;
+        loop {
+            File::open(directory)?.sync_all()?;
+            if directory == first_existing {
+                break;
+            }
+            directory = directory.parent().ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "cannot find parent of newly created directory {}",
+                    directory.display()
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Recursively remove a directory, specified by [`object_store::path::Path`].
 pub fn remove_dir_all(path: &Path) -> Result<()> {
     std::fs::remove_dir_all(to_local_path(path)).map_err(|err| match err.kind() {

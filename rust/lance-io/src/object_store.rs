@@ -205,6 +205,8 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
+    // Whether local writes sync file data and directory entries before returning.
+    local_fsync: bool,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -234,6 +236,7 @@ impl std::fmt::Debug for ObjectStore {
         f.debug_struct("ObjectStore")
             .field("inner", &self.inner)
             .field("scheme", &self.scheme)
+            .field("local_fsync", &self.local_fsync)
             .field("block_size", &self.block_size)
             .field("max_iop_size", &self.max_iop_size)
             .field(
@@ -684,6 +687,7 @@ impl ObjectStore {
             let store = Self {
                 inner: tracked_store,
                 local_dir_operations: None,
+                local_fsync: false,
                 scheme: path.scheme().to_string(),
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -996,14 +1000,17 @@ impl ObjectStore {
             "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
-                if let Some(parent) = local_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
                 let parent = local_path
                     .parent()
                     .expect("file path must have parent")
                     .to_owned();
+                let local_fsync = self.local_fsync;
                 let named_temp = tokio::task::spawn_blocking(move || {
+                    if local_fsync {
+                        super::local::create_dir_all_durable(&parent)?;
+                    } else {
+                        std::fs::create_dir_all(&parent)?;
+                    }
                     #[cfg(unix)]
                     {
                         // NamedTempFile defaults to 0o600. Use ordinary file creation permissions so the published file honors the caller's umask.
@@ -1018,12 +1025,15 @@ impl ObjectStore {
                 .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
-                Ok(Box::new(LocalWriter::new(
-                    file,
-                    path.clone(),
-                    temp_path,
-                    Arc::new(self.io_tracker.clone()),
-                )))
+                Ok(Box::new(
+                    LocalWriter::new(
+                        file,
+                        path.clone(),
+                        temp_path,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .with_fsync(local_fsync),
+                ))
             }
             _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
         }
@@ -1736,6 +1746,24 @@ impl StorageOptions {
         Ok(Some(block_size))
     }
 
+    /// Whether local writes must sync files and directory entries before returning.
+    pub(crate) fn local_fsync(&self) -> Result<bool> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("local_fsync"))
+        else {
+            return Ok(false);
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(Error::invalid_input(format!(
+                "storage option local_fsync must be `true` or `false`, got `{value}`"
+            ))),
+        }
+    }
+
     /// Number of times to retry a download that fails
     pub fn download_retry_count(&self) -> usize {
         self.0
@@ -1860,6 +1888,7 @@ impl ObjectStore {
         Self {
             inner: tracked_store,
             local_dir_operations: None,
+            local_fsync: false,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
