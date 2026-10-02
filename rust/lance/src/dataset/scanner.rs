@@ -2029,7 +2029,10 @@ impl Scanner {
                     } else {
                         list_array.len()
                     };
-                    (list_array.values().clone(), query_count)
+                    let offsets = list_array.value_offsets();
+                    let start = offsets[0] as usize;
+                    let end = offsets[list_array.len()] as usize;
+                    (list_array.values().slice(start, end - start), query_count)
                 } else {
                     let fsl = q.as_fixed_size_list();
                     if fsl.value_length() as usize != dim {
@@ -8497,11 +8500,13 @@ mod test {
 
     use arrow::array::as_primitive_array;
     use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
-        PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
+        ListArray, PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array,
+        UInt32Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -11095,6 +11100,113 @@ mod test {
         assert!(
             err.contains("query dim(64) doesn't match the column vec vector dim(32)"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sliced_list_batch_nearest() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let query_values = (0..4)
+            .map(|query| {
+                (query * 32..(query + 1) * 32)
+                    .map(|value| Some(value as f32))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(
+            query_values.iter().cloned().map(Some),
+        );
+
+        for (start, length) in [(0, 4), (0, 2), (1, 2), (2, 2)] {
+            let sliced = queries.slice(start, length);
+            let equivalent = ListArray::from_iter_primitive::<Float32Type, _, _>(
+                query_values[start..start + length]
+                    .iter()
+                    .cloned()
+                    .map(Some),
+            );
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &sliced, 5).unwrap();
+            assert_eq!(scanner.nearest_query_count, length);
+            assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), length * 32);
+            assert_eq!(
+                scanner.nearest.as_ref().unwrap().key.as_ref(),
+                equivalent.values().as_ref()
+            );
+
+            for use_index in [false, true] {
+                let search = |query: &ListArray| {
+                    let mut scanner = dataset.scan();
+                    scanner.nearest("vec", query, 5).unwrap();
+                    scanner.use_index(use_index).nprobes(2);
+                    scanner.project(&["i"]).unwrap();
+                    scanner
+                };
+                let actual = search(&sliced).try_into_batch().await.unwrap();
+                let expected = search(&equivalent).try_into_batch().await.unwrap();
+                assert_eq!(
+                    actual[QUERY_INDEX_COL].as_ref(),
+                    expected[QUERY_INDEX_COL].as_ref()
+                );
+                assert_eq!(actual["i"].as_ref(), expected["i"].as_ref());
+                assert_eq!(actual[DIST_COL].as_ref(), expected[DIST_COL].as_ref());
+                assert_eq!(actual.num_rows(), length * 5);
+                let row_numbers = actual["i"].as_primitive::<Int32Type>();
+                assert!(row_numbers.iter().flatten().any(|value| value < 200));
+                assert!(row_numbers.iter().flatten().any(|value| value >= 200));
+            }
+        }
+
+        let fixed_size_queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..128).map(|value| value as f32).collect::<Vec<_>>()),
+            32,
+        )
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &fixed_size_queries.slice(1, 2), 5)
+            .unwrap();
+        assert_eq!(scanner.nearest_query_count, 2);
+        assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn test_sliced_list_multivector_nearest_key() {
+        let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2));
+        for value in [0.0, 1.0] {
+            vectors.values().values().append_value(value);
+            vectors.values().values().append_value(value);
+            vectors.values().append(true);
+            vectors.append(true);
+        }
+        let vectors = vectors.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            vectors.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+            Some(vec![Some(0.0), Some(0.0)]),
+            Some(vec![Some(1.0), Some(1.0)]),
+            Some(vec![Some(2.0), Some(2.0)]),
+            Some(vec![Some(3.0), Some(3.0)]),
+        ]);
+        let sliced = queries.slice(1, 2);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &sliced, 1).unwrap();
+        assert!(!scanner.is_batch_nearest);
+        assert_eq!(scanner.nearest_query_count, 1);
+        assert_eq!(
+            scanner.nearest.as_ref().unwrap().key.as_ref(),
+            &Float32Array::from(vec![1.0, 1.0, 2.0, 2.0])
         );
     }
 
