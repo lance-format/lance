@@ -251,6 +251,10 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
     fn data_type(&self) -> &DataType {
         &self.data_type
     }
+
+    fn plan_decoded_bytes(&self, rows_remaining: u64) -> Result<[u64; 8]> {
+        self.child.plan_decoded_bytes(rows_remaining)
+    }
 }
 
 #[derive(Debug)]
