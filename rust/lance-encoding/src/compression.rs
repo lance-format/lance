@@ -896,6 +896,14 @@ pub fn try_raw_block(data: &DataBlock) -> Option<Box<dyn BlockCompressor>> {
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Returns the output bit width when this is the single-buffer inline
+    /// bitpacking codec. The mini-block reader uses this optional capability
+    /// to unpack directly into a typed output buffer; other codecs keep the
+    /// generic path.
+    fn inline_bitpacking_width(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by

@@ -19,6 +19,7 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
 use lance_bitpacking::BitPackingUninit;
+use std::{borrow::Cow, ops::Range};
 
 use lance_core::{Error, Result};
 
@@ -186,11 +187,10 @@ impl InlineBitpacking {
         )
     }
 
-    fn unchunk<T: ArrowNativeType + BitPackingUninit + Pod>(
-        data: LanceBuffer,
+    fn parse_chunk<T: ArrowNativeType + BitPackingUninit + Pod>(
+        data: &LanceBuffer,
         num_values: u64,
-    ) -> Result<DataBlock> {
-        // This macro decompresses a chunk(1024 values) of bitpacked values.
+    ) -> Result<(usize, Cow<'_, [T]>)> {
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
         let word_size = std::mem::size_of::<T>();
 
@@ -262,11 +262,19 @@ impl InlineBitpacking {
             ));
         }
 
+        Ok((bit_width_value, chunk_words))
+    }
+
+    fn unchunk<T: ArrowNativeType + BitPackingUninit + Pod>(
+        data: LanceBuffer,
+        num_values: u64,
+    ) -> Result<DataBlock> {
+        let (bit_width_value, chunk_words) = Self::parse_chunk::<T>(&data, num_values)?;
         let mut decompressed = Vec::with_capacity(ELEMS_PER_CHUNK as usize);
         unsafe {
             BitPackingUninit::unchecked_unpack_uninit(
                 bit_width_value,
-                chunk,
+                &chunk_words[1..],
                 &mut decompressed.spare_capacity_mut()[..ELEMS_PER_CHUNK as usize],
             );
             // The bitpacking kernel initialized all 1024 decoded values.
@@ -276,10 +284,79 @@ impl InlineBitpacking {
         decompressed.truncate(num_values as usize);
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             data: LanceBuffer::reinterpret_vec(decompressed),
-            bits_per_value: uncompressed_bit_width as u64,
+            bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
             num_values,
             block_info: BlockInfo::new(),
         }))
+    }
+
+    /// Append a selected range from one inline bitpacked mini-block. The caller
+    /// owns `output` and keeps `scratch` across chunks in the same decode task.
+    pub(crate) fn append_selected<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
+        data: &LanceBuffer,
+        num_values: u64,
+        selection: Range<u64>,
+        chunk_idx: usize,
+        output: &mut Vec<T>,
+        scratch: &mut Vec<T>,
+        cached_chunk_idx: &mut Option<usize>,
+    ) -> Result<()> {
+        if selection.start > selection.end || selection.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "selection {:?} exceeds {} decoded values",
+                    selection, num_values
+                ),
+            ));
+        }
+        if num_values == 0 {
+            return Ok(());
+        }
+        let (width, words) = Self::parse_chunk::<T>(data, num_values)?;
+        if selection.is_empty() {
+            return Ok(());
+        }
+
+        if num_values == ELEMS_PER_CHUNK && selection == (0..ELEMS_PER_CHUNK) {
+            let previous_len = output.len();
+            let next_len = previous_len
+                .checked_add(ELEMS_PER_CHUNK as usize)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named("inline_bitpacking", "output size overflow")
+                })?;
+            let destination = output
+                .spare_capacity_mut()
+                .get_mut(..ELEMS_PER_CHUNK as usize)
+                .ok_or_else(|| {
+                    Error::internal(
+                        "inline bitpacking output capacity was underestimated".to_string(),
+                    )
+                })?;
+            unsafe {
+                // SAFETY: parse_chunk checked width and the exact packed input length.
+                // The kernel writes all 1024 typed slots before set_len exposes them.
+                T::unchecked_unpack_uninit(width, &words[1..], destination);
+                output.set_len(next_len);
+            }
+            *cached_chunk_idx = None;
+            return Ok(());
+        }
+
+        if *cached_chunk_idx != Some(chunk_idx) {
+            if scratch.is_empty() {
+                scratch.resize(ELEMS_PER_CHUNK as usize, T::default());
+            }
+            unsafe {
+                // SAFETY: parse_chunk checked width and packed length; scratch
+                // remains initialized and has room for the complete 1024-value
+                // decode even when the logical chunk is a shorter tail.
+                T::unchecked_unpack(width, &words[1..], scratch);
+            }
+            *cached_chunk_idx = Some(chunk_idx);
+        }
+        output.extend_from_slice(&scratch[selection.start as usize..selection.end as usize]);
+        Ok(())
     }
 
     /// An empty fixed-width block, used for the `num_values == 0` short-circuit in
@@ -339,6 +416,10 @@ impl BlockCompressor for InlineBitpacking {
 }
 
 impl MiniBlockDecompressor for InlineBitpacking {
+    fn inline_bitpacking_width(&self) -> Option<u64> {
+        Some(self.uncompressed_bit_width)
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
@@ -747,6 +828,134 @@ mod test {
             err.contains(expected_message),
             "expected error containing {expected_message:?}, got {err:?}"
         );
+    }
+
+    fn assert_direct_selection<T>(bit_width: usize, num_values: usize, unaligned: bool)
+    where
+        T: ArrowNativeType + BitPackingUninit + Pod + Default + std::fmt::Debug,
+    {
+        let mask = if bit_width == usize::BITS as usize {
+            usize::MAX
+        } else {
+            (1_usize << bit_width) - 1
+        };
+        let values: Vec<T> = (0..ELEMS_PER_CHUNK as usize)
+            .map(|i| T::from_usize((i * 31 + 7) & mask).unwrap())
+            .collect();
+        let packed_words = ELEMS_PER_CHUNK as usize * bit_width / (std::mem::size_of::<T>() * 8);
+        let mut chunk = vec![T::from_usize(bit_width).unwrap(); packed_words + 1];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &values, &mut chunk[1..]);
+        }
+        let data = if unaligned {
+            let bytes = bytemuck::cast_slice(&chunk);
+            let mut unaligned_data = vec![0_u8];
+            unaligned_data.extend_from_slice(bytes);
+            LanceBuffer::from(unaligned_data).slice_with_length(1, bytes.len())
+        } else {
+            LanceBuffer::reinterpret_vec(chunk)
+        };
+        let mut output = Vec::<T>::with_capacity(num_values + 40);
+        let mut scratch = Vec::<T>::new();
+        let mut cached_chunk_idx = None;
+        InlineBitpacking::append_selected(
+            &data,
+            num_values as u64,
+            0..num_values as u64,
+            7,
+            &mut output,
+            &mut scratch,
+            &mut cached_chunk_idx,
+        )
+        .unwrap();
+        assert_eq!(output, values[..num_values]);
+        if num_values == ELEMS_PER_CHUNK as usize {
+            assert!(scratch.is_empty());
+        } else {
+            assert_eq!(scratch.len(), ELEMS_PER_CHUNK as usize);
+        }
+        InlineBitpacking::append_selected(
+            &data,
+            num_values as u64,
+            10..20,
+            7,
+            &mut output,
+            &mut scratch,
+            &mut cached_chunk_idx,
+        )
+        .unwrap();
+        InlineBitpacking::append_selected(
+            &data,
+            num_values as u64,
+            15..25,
+            7,
+            &mut output,
+            &mut scratch,
+            &mut cached_chunk_idx,
+        )
+        .unwrap();
+        assert_eq!(
+            &output[num_values..],
+            [&values[10..20], &values[15..25]].concat()
+        );
+        assert_eq!(scratch.len(), ELEMS_PER_CHUNK as usize);
+    }
+
+    #[rstest]
+    #[case::u8_zero(8, 0, 1024, false)]
+    #[case::u8_full(8, 8, 1024, true)]
+    #[case::u16_partial(16, 9, 1023, true)]
+    #[case::u16_full(16, 16, 1024, false)]
+    #[case::u32_zero_tail(32, 0, 1023, false)]
+    #[case::u32_partial(32, 12, 1024, true)]
+    #[case::u32_full(32, 32, 1024, false)]
+    #[case::u64_partial(64, 23, 1023, true)]
+    #[case::u64_full(64, 64, 1024, false)]
+    fn direct_selection_matches_values(
+        #[case] output_width: usize,
+        #[case] packed_width: usize,
+        #[case] num_values: usize,
+        #[case] unaligned: bool,
+    ) {
+        match output_width {
+            8 => assert_direct_selection::<u8>(packed_width, num_values, unaligned),
+            16 => assert_direct_selection::<u16>(packed_width, num_values, unaligned),
+            32 => assert_direct_selection::<u32>(packed_width, num_values, unaligned),
+            64 => assert_direct_selection::<u64>(packed_width, num_values, unaligned),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn direct_selection_rejects_invalid_range_and_payload() {
+        let mut output = Vec::<u32>::with_capacity(1024);
+        let mut scratch = Vec::new();
+        let mut cached = None;
+        let data = LanceBuffer::reinterpret_vec(vec![33_u32]);
+        let error = InlineBitpacking::append_selected(
+            &data,
+            1,
+            0..2,
+            0,
+            &mut output,
+            &mut scratch,
+            &mut cached,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("selection"));
+        let error = InlineBitpacking::append_selected(
+            &data,
+            1,
+            0..1,
+            0,
+            &mut output,
+            &mut scratch,
+            &mut cached,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]
