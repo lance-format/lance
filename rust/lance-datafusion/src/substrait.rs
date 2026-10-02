@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use datafusion::{execution::SessionState, logical_expr::Expr};
+use datafusion::{
+    execution::SessionState,
+    logical_expr::{Expr, registry::FunctionRegistry},
+};
 
 use crate::aggregate::Aggregate;
+use crate::signed_zero::COMPARE_FLOATS_UDF;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -27,6 +31,14 @@ use lance_core::{Error, Result};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Copy `state` with the functions Lance's own rewrites emit, which the decoder
+/// has to resolve by name even when the caller registered none of Lance's UDFs.
+fn decode_state(state: &SessionState) -> Result<SessionState> {
+    let mut state = state.clone();
+    state.register_udf(COMPARE_FLOATS_UDF.clone())?;
+    Ok(state)
+}
 
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
@@ -528,7 +540,7 @@ pub async fn parse_substrait(
 
     let mut expr_container =
         datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
-            state,
+            &decode_state(state)?,
             &extended_expr,
         )
         .await?;
@@ -617,7 +629,8 @@ pub async fn parse_aggregate_rel_with_extensions(
     extensions: &Extensions,
 ) -> Result<Aggregate> {
     let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
-    let consumer = DefaultSubstraitConsumer::new(extensions, state);
+    let state = decode_state(state)?;
+    let consumer = DefaultSubstraitConsumer::new(extensions, &state);
     let group_by = parse_groupings(aggregate_rel, &df_schema, &consumer).await?;
     let aggregates = parse_measures(aggregate_rel, &df_schema, &consumer).await?;
 
@@ -733,6 +746,7 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::{Float64Array, ListArray, RecordBatch, cast::AsArray, types::Float64Type};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
@@ -1607,6 +1621,79 @@ mod tests {
             "Expected SUM aggregate, got: {}",
             agg.aggregates[1].schema_name()
         );
+    }
+
+    /// The float sign rewrites emit an internal UDF, which a plain session state
+    /// cannot resolve unless decoding registers it. Decoding also drops the
+    /// literal metadata that marks the rewrite's own ranges, and the scanner
+    /// optimizes the decoded filter again, so that second pass must not change
+    /// the answer either.
+    #[rstest]
+    #[case::column_comparison("a = b")]
+    #[case::nan_bound("a < CAST('NaN' AS DOUBLE)")]
+    #[case::array_has("array_has(l, 0.0)")]
+    #[case::upper_bound("a < 1.0")]
+    #[case::lower_bound("a > 1.0")]
+    #[case::two_sided_bound("a BETWEEN 0.0 AND 1.0")]
+    #[case::negative_infinity_lower_bound("a BETWEEN CAST('-inf' AS DOUBLE) AND 1.0")]
+    #[tokio::test]
+    async fn test_substrait_roundtrip_float_sign_rewrites(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+            Field::new_list("l", Field::new_list_field(DataType::Float64, true), true),
+        ]));
+        let nan = f64::NAN;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![
+                    Some(-nan),
+                    Some(nan),
+                    Some(-0.0),
+                    Some(f64::NEG_INFINITY),
+                    Some(2.0),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(nan),
+                    Some(-nan),
+                    Some(0.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                ])),
+                Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                    Some(vec![Some(-0.0)]),
+                    Some(vec![Some(0.0)]),
+                    Some(vec![]),
+                    Some(vec![None]),
+                    None,
+                    Some(vec![Some(1.0)]),
+                ])),
+            ],
+        )
+        .unwrap();
+        let planner = crate::planner::Planner::new(schema.clone());
+        let answers = |expr: &Expr| {
+            let result = planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            result.as_boolean().iter().collect::<Vec<_>>()
+        };
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        let reoptimized = planner.optimize_expr(decoded).unwrap();
+        assert_eq!(answers(&reoptimized), answers(&expr), "{reoptimized}");
     }
 
     // ==================== LIKE and starts_with tests ====================
