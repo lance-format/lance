@@ -127,3 +127,51 @@ impl CompressionStrategy for Strategy {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_schema::{DataType, Field as ArrowField};
+    use lance_encoding::buffer::LanceBuffer;
+    use lance_encoding::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use lance_encoding::statistics::ComputeStat;
+
+    /// A 128-bit block of low-magnitude values, the shape a `Decimal128` column produces.
+    fn decimal128_block() -> DataBlock {
+        let num_values = 2048u64;
+        let data: Vec<u128> = (0..num_values).map(|i| (i % 1000) as u128).collect();
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 128,
+            data: LanceBuffer::reinterpret_vec(data),
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        DataBlock::FixedWidth(block)
+    }
+
+    fn decimal_field() -> Field {
+        let arrow_field = ArrowField::new("decimal", DataType::Decimal128(38, 0), true);
+        let mut field = Field::try_from(&arrow_field).unwrap();
+        field.id = -1;
+        field
+    }
+
+    /// 128-bit bitpacking arrived in 2.3. A 2.2 reader decodes 8/16/32/64-bit bitpacking
+    /// alone, so this strategy must leave a 128-bit block to another codec.
+    #[test]
+    fn u128_values_are_not_bitpacked() {
+        let strategy = Strategy::new(CompressionParams::default());
+
+        let compressor = strategy
+            .create_block_compressor(&decimal_field(), &decimal128_block())
+            .unwrap();
+
+        let debug_str = format!("{compressor:?}");
+        assert!(
+            !debug_str.contains("Bitpacking"),
+            "2.2 must not bitpack 128-bit values, got: {debug_str}"
+        );
+    }
+}
