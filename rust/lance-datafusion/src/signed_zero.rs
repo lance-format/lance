@@ -1,18 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Rewrites of comparisons against a floating point zero literal.
+//! Rewrites of expressions whose floating point zero semantics differ under
+//! Arrow's total order.
 
+use std::sync::{Arc, LazyLock};
+
+use arrow_array::{
+    ArrayRef,
+    cast::AsArray,
+    types::{Float16Type, Float32Type, Float64Type},
+};
+use arrow_schema::DataType;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
+use datafusion::functions_nested::expr_fn::array_has_any;
+use datafusion::logical_expr::{
+    BinaryExpr, ColumnarValue, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility,
+    expr::{Between, InList, ScalarFunction},
+};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::{
+    DFSchema,
+    tree_node::{Transformed, TreeNode},
+};
 use half::f16;
 use lance_core::Result;
 
-/// Rewrite every comparison against a floating point zero literal into the form
-/// that Arrow's total-order kernels answer the way IEEE 754 and SQL define it.
+/// Rewrite expressions involving floating point zero into forms that Arrow's
+/// total-order kernels answer the way IEEE 754 and SQL define them.
 ///
 /// Arrow sorts `-0.0` strictly below `+0.0` and compares the two encodings for
 /// equality by bit pattern, while IEEE 754 and SQL treat them as one number.
@@ -26,8 +43,10 @@ use lance_core::Result;
 /// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
 /// | `x IN (0, ..)`               | the missing encoding is added |
 /// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
-/// | `x IS NOT DISTINCT FROM 0`   | `x IS NOT NULL AND x IN (-0.0, 0.0)` |
-/// | `x IS DISTINCT FROM 0`       | `x IS NULL OR x NOT IN (-0.0, 0.0)` |
+/// | `x IS NOT DISTINCT FROM 0`   | `(x IN (-0.0, 0.0)) IS TRUE` |
+/// | `x IS DISTINCT FROM 0`       | `(x IN (-0.0, 0.0)) IS NOT TRUE` |
+/// | `x <op> y`                   | normalize zeros in both operands before `<op>` |
+/// | `array_has(xs, 0)`           | `array_has_any(xs, [-0.0, 0.0])` |
 ///
 /// Equality has to name both encodings because a scalar index keys on the bit
 /// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
@@ -42,15 +61,170 @@ use lance_core::Result;
 /// NaN is out of scope. Arrow sorts it above every other value, so `x >= -0.0`
 /// admits NaN where IEEE would not, and that holds for every comparison rather
 /// than only the ones against zero.
-pub fn rewrite_signed_zero_comparisons(expr: Expr) -> Result<Expr> {
+pub fn rewrite_signed_zero_comparisons(expr: Expr, schema: &DFSchema) -> Result<Expr> {
     Ok(expr
         .transform_up(|node| {
-            Ok(match rewrite_node(&node) {
+            let rewritten = match rewrite_node(&node) {
+                Some(rewritten) => Some(rewritten),
+                None => rewrite_float_comparison(&node, schema)?,
+            };
+            Ok(match rewritten {
                 Some(rewritten) => Transformed::yes(rewritten),
                 None => Transformed::no(node),
             })
         })?
         .data)
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct NormalizeSignedZero {
+    signature: Signature,
+}
+
+impl NormalizeSignedZero {
+    fn new() -> Self {
+        Self {
+            signature: Signature::uniform(
+                1,
+                vec![DataType::Float16, DataType::Float32, DataType::Float64],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for NormalizeSignedZero {
+    fn name(&self) -> &str {
+        "_lance_normalize_signed_zero"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        arg_types.first().cloned().ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "_lance_normalize_signed_zero expected one argument".to_string(),
+            )
+        })
+    }
+
+    fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let [arg] = func_args.args.as_slice() else {
+            return Err(datafusion::error::DataFusionError::Internal(format!(
+                "_lance_normalize_signed_zero expected one argument, got {}",
+                func_args.args.len()
+            )));
+        };
+        Ok(match arg {
+            ColumnarValue::Array(array) => ColumnarValue::Array(normalize_signed_zero_array(array)),
+            ColumnarValue::Scalar(value) => {
+                ColumnarValue::Scalar(normalize_signed_zero_scalar(value))
+            }
+        })
+    }
+}
+
+fn normalize_signed_zero_scalar(value: &ScalarValue) -> ScalarValue {
+    match value {
+        Float16(Some(value)) if *value == f16::ZERO => Float16(Some(f16::ZERO)),
+        Float32(Some(value)) if *value == 0.0 => Float32(Some(0.0)),
+        Float64(Some(value)) if *value == 0.0 => Float64(Some(0.0)),
+        other => other.clone(),
+    }
+}
+
+fn normalize_signed_zero_array(array: &ArrayRef) -> ArrayRef {
+    match array.data_type() {
+        DataType::Float16 => {
+            let values = array.as_primitive::<Float16Type>();
+            if !values
+                .values()
+                .iter()
+                .any(|value| value.to_bits() == f16::NEG_ZERO.to_bits())
+            {
+                return Arc::clone(array);
+            }
+            Arc::new(values.unary::<_, Float16Type>(|value| {
+                if value == f16::ZERO { f16::ZERO } else { value }
+            }))
+        }
+        DataType::Float32 => {
+            let values = array.as_primitive::<Float32Type>();
+            if !values
+                .values()
+                .iter()
+                .any(|value| value.to_bits() == (-0.0_f32).to_bits())
+            {
+                return Arc::clone(array);
+            }
+            Arc::new(values.unary::<_, Float32Type>(|value| if value == 0.0 { 0.0 } else { value }))
+        }
+        DataType::Float64 => {
+            let values = array.as_primitive::<Float64Type>();
+            if !values
+                .values()
+                .iter()
+                .any(|value| value.to_bits() == (-0.0_f64).to_bits())
+            {
+                return Arc::clone(array);
+            }
+            Arc::new(values.unary::<_, Float64Type>(|value| if value == 0.0 { 0.0 } else { value }))
+        }
+        _ => Arc::clone(array),
+    }
+}
+
+pub static NORMALIZE_SIGNED_ZERO: LazyLock<Arc<ScalarUDF>> =
+    LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeSignedZero::new())));
+
+fn is_normalized_signed_zero(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::ScalarFunction(ScalarFunction { func, .. })
+            if func.name() == NORMALIZE_SIGNED_ZERO.name()
+    )
+}
+
+fn normalize_signed_zero_expr(expr: Expr) -> Expr {
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        Arc::clone(&NORMALIZE_SIGNED_ZERO),
+        vec![expr],
+    ))
+}
+
+/// Normalize both operands of a non-literal float comparison. Each operand is
+/// named once, so computed expressions and volatile functions keep their normal
+/// evaluation behavior.
+fn rewrite_float_comparison(expr: &Expr, schema: &DFSchema) -> DFResult<Option<Expr>> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return Ok(None);
+    };
+    if !is_zero_sensitive(*op)
+        || matches!(left.as_ref(), Expr::Literal(..))
+        || matches!(right.as_ref(), Expr::Literal(..))
+        || (is_normalized_signed_zero(left) && is_normalized_signed_zero(right))
+    {
+        return Ok(None);
+    }
+
+    let left_type = left.get_type(schema)?;
+    let right_type = right.get_type(schema)?;
+    if left_type != right_type
+        || !matches!(
+            left_type,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        )
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(Expr::BinaryExpr(BinaryExpr {
+        left: Box::new(normalize_signed_zero_expr((**left).clone())),
+        op: *op,
+        right: Box::new(normalize_signed_zero_expr((**right).clone())),
+    })))
 }
 
 /// Whether the rewrite acts on comparisons under `op`.
@@ -207,10 +381,9 @@ fn rewrite_bound(bound: &Expr, op: Operator) -> Option<Expr> {
 fn rewrite_node(expr: &Expr) -> Option<Expr> {
     match expr {
         // DataFusion's simplifier expands an `IN` list of three or fewer values
-        // over a bare column back into an OR chain of equalities, so a second
-        // `optimize_expr` splits this rewrite's own output and re-runs it on each
-        // half. Both halves then produce the same list, and dropping the repeat is
-        // what makes the rewrite survive that round trip.
+        // over a bare column back into an OR chain of equalities. Dropping only
+        // those repeated terms makes the rewrite survive that round trip without
+        // deduplicating arbitrary user expressions.
         Expr::BinaryExpr(BinaryExpr { op, .. }) if matches!(op, Operator::Or | Operator::And) => {
             let mut kept: Vec<&Expr> = Vec::new();
             flatten_chain(expr, *op, &mut kept);
@@ -291,6 +464,22 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                 op,
                 right: Box::new(Expr::Literal(zero, metadata.clone())),
             }))
+        }
+        Expr::ScalarFunction(ScalarFunction { func, args }) if func.name() == "array_has" => {
+            let [array, Expr::Literal(value, metadata)] = args.as_slice() else {
+                return None;
+            };
+            let (negative, positive) = zero_encodings(value)?;
+            let element_type = negative.data_type();
+            let zero_encodings = ScalarValue::List(ScalarValue::new_list(
+                &[negative, positive],
+                &element_type,
+                true,
+            ));
+            Some(array_has_any(
+                array.clone(),
+                Expr::Literal(zero_encodings, metadata.clone()),
+            ))
         }
         // `BETWEEN` normally reaches this rewrite already expanded into `>=` and
         // `<=` by the simplifier. It survives unexpanded when every operand is
@@ -396,13 +585,36 @@ fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow_array::{ListArray, RecordBatch, RecordBatchOptions};
+    use arrow_schema::{Field, Schema};
+    use datafusion::functions_nested::expr_fn::array_has;
+    use datafusion::logical_expr::create_udf;
     use datafusion::prelude::{col, lit};
     use rstest::rstest;
 
     use super::*;
 
     fn rewrite(expr: Expr) -> Expr {
-        rewrite_signed_zero_comparisons(expr).unwrap()
+        let schema = DFSchema::try_from(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("x", DataType::Float64, true),
+            arrow_schema::Field::new("a", DataType::Float64, true),
+            arrow_schema::Field::new("b", DataType::Float64, true),
+            arrow_schema::Field::new("i", DataType::Int64, true),
+            arrow_schema::Field::new("j", DataType::Int64, true),
+            arrow_schema::Field::new(
+                "l",
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                ))),
+                true,
+            ),
+        ]))
+        .unwrap();
+        rewrite_signed_zero_comparisons(expr, &schema).unwrap()
     }
 
     fn compare(left: Expr, op: Operator, right: Expr) -> Expr {
@@ -502,7 +714,7 @@ mod tests {
     #[case::integer_zero(col("x").eq(lit(0_i64)))]
     #[case::null(compare(col("x"), Operator::Eq, Expr::Literal(Float64(None), None)))]
     #[case::nan(col("x").lt(lit(f64::NAN)))]
-    #[case::column_on_both_sides(col("x").lt(col("y")))]
+    #[case::integer_columns(col("i").lt(col("j")))]
     #[case::both_encodings_listed(Expr::InList(InList {
         expr: Box::new(col("x")),
         list: vec![lit(-0.0), lit(0.0)],
@@ -617,6 +829,123 @@ mod tests {
         assert_ne!(Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO)));
     }
 
+    #[test]
+    fn normalizer_canonicalizes_every_float_width() {
+        use arrow_array::{Float16Array, Float32Array, Float64Array};
+
+        let float16: ArrayRef = Arc::new(Float16Array::from(vec![
+            Some(f16::NEG_ZERO),
+            Some(f16::ONE),
+            None,
+        ]));
+        let float16 = normalize_signed_zero_array(&float16);
+        assert_eq!(
+            float16.as_primitive::<Float16Type>().value(0).to_bits(),
+            f16::ZERO.to_bits()
+        );
+
+        let float32: ArrayRef = Arc::new(Float32Array::from(vec![Some(-0.0), Some(1.0), None]));
+        let float32 = normalize_signed_zero_array(&float32);
+        assert_eq!(
+            float32.as_primitive::<Float32Type>().value(0).to_bits(),
+            0.0_f32.to_bits()
+        );
+
+        let float64: ArrayRef = Arc::new(Float64Array::from(vec![Some(-0.0), Some(1.0), None]));
+        let float64 = normalize_signed_zero_array(&float64);
+        assert_eq!(
+            float64.as_primitive::<Float64Type>().value(0).to_bits(),
+            0.0_f64.to_bits()
+        );
+
+        assert_eq!(
+            normalize_signed_zero_scalar(&Float16(Some(f16::NEG_ZERO))),
+            Float16(Some(f16::ZERO))
+        );
+        assert_eq!(
+            normalize_signed_zero_scalar(&Float32(Some(-0.0))),
+            Float32(Some(0.0))
+        );
+        assert_eq!(
+            normalize_signed_zero_scalar(&Float64(Some(-0.0))),
+            Float64(Some(0.0))
+        );
+    }
+
+    #[test]
+    fn array_has_zero_evaluates_a_volatile_haystack_once() {
+        let schema = Arc::new(Schema::empty());
+        let planner = crate::planner::Planner::new(Arc::clone(&schema));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_udf = Arc::clone(&calls);
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
+        let volatile_zeros = create_udf(
+            "volatile_zeros",
+            vec![],
+            list_type,
+            Volatility::Volatile,
+            Arc::new(move |_| {
+                let value = if calls_in_udf
+                    .fetch_add(1, Ordering::SeqCst)
+                    .is_multiple_of(2)
+                {
+                    0.0
+                } else {
+                    -0.0
+                };
+                let list =
+                    ListArray::from_iter_primitive::<Float64Type, _, _>([Some(vec![Some(value)])]);
+                Ok(ColumnarValue::Scalar(ScalarValue::List(Arc::new(list))))
+            }),
+        );
+        let optimized = planner
+            .optimize_expr(array_has(volatile_zeros.call(vec![]), lit(0.0)))
+            .unwrap();
+        assert!(matches!(
+            &optimized,
+            Expr::ScalarFunction(ScalarFunction { func, .. })
+                if func.name() == "array_has_any"
+        ));
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .unwrap();
+        let values = planner
+            .create_physical_expr(&optimized)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(1)
+            .unwrap();
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(values.true_count(), 1);
+    }
+
+    #[rstest]
+    #[case::float16(DataType::Float16)]
+    #[case::float32(DataType::Float32)]
+    #[case::float64(DataType::Float64)]
+    fn non_literal_comparison_normalizes_every_float_width(#[case] data_type: DataType) {
+        let schema = DFSchema::try_from(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("a", data_type.clone(), true),
+            arrow_schema::Field::new("b", data_type, true),
+        ]))
+        .unwrap();
+        let rewritten = rewrite_signed_zero_comparisons(col("a").eq(col("b")), &schema).unwrap();
+        let Expr::BinaryExpr(BinaryExpr { left, right, .. }) = rewritten else {
+            panic!("expected a binary comparison");
+        };
+        assert!(is_normalized_signed_zero(&left));
+        assert!(is_normalized_signed_zero(&right));
+    }
+
     /// The scan path optimizes the same expression twice, and the simplifier
     /// expands a short `IN` list over a column back into an OR chain in between,
     /// so a fixed point of the rewrite alone would not be enough.
@@ -627,6 +956,9 @@ mod tests {
     #[case::lt("value < 0.0")]
     #[case::gt_eq("value >= 0.0")]
     #[case::between("value BETWEEN -0.0 AND 0.0")]
+    #[case::column_eq("a = b")]
+    #[case::column_lt("a < b")]
+    #[case::array_has("array_has(l, 0.0)")]
     // The dedup that makes the first three cases hold keys on the probe being a
     // bare column, which is also what DataFusion requires before it shortens a
     // list. This case fails if a release ever relaxes that.
@@ -635,12 +967,20 @@ mod tests {
     // it as unsupported SQL; that arm is reachable only from a programmatically
     // built expression, and `rewriting_twice_changes_nothing` covers it there.
     fn optimizing_twice_changes_nothing(#[case] filter: &str) {
-        let schema =
-            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "value",
-                arrow_schema::DataType::Float64,
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", arrow_schema::DataType::Float64, true),
+            arrow_schema::Field::new("a", arrow_schema::DataType::Float64, true),
+            arrow_schema::Field::new("b", arrow_schema::DataType::Float64, true),
+            arrow_schema::Field::new(
+                "l",
+                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Float64,
+                    true,
+                ))),
                 true,
-            )]));
+            ),
+        ]));
         let planner = crate::planner::Planner::new(schema);
         let once = planner
             .optimize_expr(planner.parse_filter(filter).unwrap())

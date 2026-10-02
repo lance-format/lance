@@ -684,6 +684,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_signed_zero_filter_substrait_roundtrip() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]));
+        let planner = lance_datafusion::planner::Planner::new(Arc::clone(&schema));
+        let expr = planner
+            .optimize_expr(planner.parse_filter("a = b").unwrap())
+            .unwrap();
+        let state = SessionContext::new().state();
+
+        let bytes = encode_substrait(expr.clone(), Arc::clone(&schema), &state).unwrap();
+        let decoded = parse_substrait(&bytes, schema, &state).await.unwrap();
+
+        assert_eq!(decoded, expr);
+    }
+
+    #[tokio::test]
     async fn test_options_roundtrip_with_filter() {
         let dataset = make_test_dataset().await;
         let ctx = SessionContext::new();
