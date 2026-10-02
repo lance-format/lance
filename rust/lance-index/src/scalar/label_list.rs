@@ -829,11 +829,11 @@ impl DeepSizeOf for LabelListIndexState {
 }
 
 impl LabelListIndexState {
-    fn from_index(index: &LabelListIndex) -> Result<Self> {
-        Ok(Self {
-            bitmap_state: BitmapIndexState::from_index(&index.values_index)?,
+    fn from_index(index: &LabelListIndex) -> Self {
+        Self {
+            bitmap_state: BitmapIndexState::from_index(&index.values_index),
             list_nulls: index.list_nulls.clone(),
-        })
+        }
     }
 
     fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
@@ -845,7 +845,7 @@ impl LabelListIndexState {
                     "LabelListIndexState::from_scalar_index called with a non-label-list index",
                 )
             })?;
-        Self::from_index(label_list)
+        Ok(Self::from_index(label_list))
     }
 
     fn into_label_list_index(
@@ -863,7 +863,9 @@ impl LabelListIndexState {
 
 impl CacheCodecImpl for LabelListIndexState {
     const TYPE_ID: &'static str = "lance.scalar.LabelListIndexState";
-    const CURRENT_VERSION: u32 = 1;
+    /// Bumped with the nested [`BitmapIndexState`] body, which version 2 writes
+    /// as several lookup batches that version-1 readers reject.
+    const CURRENT_VERSION: u32 = 2;
 
     /// Wire format:
     /// ```text
@@ -1165,8 +1167,7 @@ mod tests {
         }
         let mut bitmap_nulls = RowAddrTreeMap::new();
         bitmap_nulls.insert(RowAddress::new_from_parts(0, 3).into());
-        let bitmap_state =
-            BitmapIndexState::new_for_test(index_map, bitmap_nulls, DataType::Int32).unwrap();
+        let bitmap_state = BitmapIndexState::new_for_test(index_map, bitmap_nulls, DataType::Int32);
 
         let mut list_nulls = RowAddrTreeMap::new();
         list_nulls.insert(RowAddress::new_from_parts(0, 9).into());
@@ -1189,8 +1190,8 @@ mod tests {
 
         assert_eq!(&*restored.list_nulls, &*state.list_nulls);
         assert_eq!(
-            restored.bitmap_state.lookup_batch(),
-            state.bitmap_state.lookup_batch()
+            restored.bitmap_state.index_map(),
+            state.bitmap_state.index_map()
         );
         assert_eq!(
             restored.bitmap_state.null_map(),
@@ -1198,14 +1199,15 @@ mod tests {
         );
     }
 
-    /// The nested bitmap lookup batch must decode zero-copy through the full
-    /// envelope, proving the leading `list_nulls` RAW_BLOB does not knock the
-    /// nested IPC section off its 64-byte boundary.
+    /// The nested bitmap state must decode through the full envelope after the
+    /// leading `list_nulls` RAW_BLOB, from a buffer whose sections do not start
+    /// at the offsets the writer saw.
     #[test]
-    fn test_label_list_nested_lookup_is_zero_copy() {
+    fn test_label_list_state_codec_envelope_roundtrip() {
         const ALIGN: usize = 64;
+        let state = sample_state();
         let codec = CacheCodec::from_impl::<LabelListIndexState>();
-        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample_state());
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(state.clone());
         let mut buf = Vec::new();
         codec.serialize(&any, &mut buf).unwrap();
 
@@ -1216,18 +1218,11 @@ mod tests {
 
         let restored = codec.deserialize(&data).hit().unwrap();
         let restored = restored.downcast::<LabelListIndexState>().unwrap();
-
-        let base = data.as_ptr() as usize;
-        let end = base + data.len();
-        for col in restored.bitmap_state.lookup_batch().columns() {
-            for buffer in col.to_data().buffers() {
-                let ptr = buffer.as_ptr() as usize;
-                assert!(
-                    ptr >= base && ptr < end,
-                    "nested bitmap lookup buffer was realigned — misaligned IPC section",
-                );
-            }
-        }
+        assert_eq!(&*restored.list_nulls, &*state.list_nulls);
+        assert_eq!(
+            restored.bitmap_state.index_map(),
+            state.bitmap_state.index_map()
+        );
     }
 
     // One scan batch unnests to more bytes than the small pool can admit at once.
