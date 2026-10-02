@@ -3178,6 +3178,43 @@ mod tests {
             assert_eq!(response.num_inserted_rows, Some(1));
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_insert_into_table_returns_row_count_and_version() {
+            use lance_namespace::LanceNamespace;
+
+            let fixture = RestServerFixture::new().await;
+            let table_id = vec!["insert_ns".to_string(), "insert_table".to_string()];
+
+            let mut create_ns = CreateNamespaceRequest::new();
+            create_ns.id = Some(vec!["insert_ns".to_string()]);
+            fixture.namespace.create_namespace(create_ns).await.unwrap();
+
+            let create_table_req = CreateTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, create_test_arrow_data())
+                .await
+                .unwrap();
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id),
+                mode: Some("append".to_string()),
+                ..Default::default()
+            };
+            let response = fixture
+                .namespace
+                .insert_into_table(request, create_test_arrow_data())
+                .await
+                .unwrap();
+
+            assert_eq!(response.num_inserted_rows, Some(3));
+            assert_eq!(response.version, Some(2));
+        }
+
         // ============================================================================
         // DynamicContextProvider Integration Test
         // ============================================================================

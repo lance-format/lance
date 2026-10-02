@@ -1206,6 +1206,8 @@ public class DirectoryNamespaceTest {
         new InsertIntoTableRequest().id(Arrays.asList("workspace", "test_table")).mode("append");
     InsertIntoTableResponse insertResp = namespaceClient.insertIntoTable(insertReq, newData);
     assertNotNull(insertResp);
+    assertEquals(Long.valueOf(3), insertResp.getNumInsertedRows());
+    assertEquals(Long.valueOf(2), insertResp.getVersion());
 
     // Verify row count increased
     CountTableRowsRequest countReq =
