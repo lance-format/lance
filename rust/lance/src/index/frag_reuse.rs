@@ -4,6 +4,7 @@
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
@@ -12,12 +13,14 @@ use lance_index::frag_reuse::{
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
+use lance_io::object_store::ObjectStore;
 use lance_table::format::pb::fragment_reuse_index_details::{
     self as pb_fri, Content, InlineContent,
 };
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::transaction::RewriteGroup;
+use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
@@ -410,23 +413,45 @@ pub async fn load_frag_reuse_index_details(
             Ok(Arc::new(FragReuseIndexDetails::try_from(content.clone())?))
         }
         Some(Content::External(external_file)) => {
-            // the file content will be cached in the index cache later
-            // so we do not put it to the file cache
-            let data = read_fri_external_file(dataset, index, external_file).await?;
-
-            let pb_sequence = InlineContent::decode(data)?;
-            Ok(Arc::new(FragReuseIndexDetails::try_from(pb_sequence)?))
+            let (store, path) = fri_external_location(dataset, index, external_file).await?;
+            dataset
+                .index_cache
+                .get_or_insert_with_key(
+                    FragReuseDetailsKey {
+                        store_identity: &store.store_prefix,
+                        path: &path,
+                        offset: external_file.offset,
+                        size: external_file.size,
+                    },
+                    || async {
+                        let data = read_fri_external_range(&store, &path, external_file).await?;
+                        FragReuseIndexDetails::try_from(InlineContent::decode(data)?)
+                    },
+                )
+                .await
         }
     }
 }
 
-/// Resolve an FRI entry's external details bytes, honoring the entry's base:
+/// Where an FRI entry's external details live, honoring the entry's base:
 /// a shallow-cloned entry's `details.binpb` lives in the SOURCE dataset, so
 /// the path and store come from the entry's `base_id` (like every other
 /// base-aware index file) instead of the current dataset root.
-async fn read_fri_external_file(
+async fn fri_external_location(
     dataset: &Dataset,
     index: &IndexMetadata,
+    file: &ExternalFile,
+) -> lance_core::Result<(Arc<ObjectStore>, Path)> {
+    let path = dataset
+        .indice_files_dir(index)?
+        .join(index.uuid.to_string())
+        .join(file.path.as_str());
+    Ok((dataset.object_store_for_index(index).await?, path))
+}
+
+async fn read_fri_external_range(
+    store: &ObjectStore,
+    path: &Path,
     file: &ExternalFile,
 ) -> lance_core::Result<bytes::Bytes> {
     let end = file
@@ -434,18 +459,22 @@ async fn read_fri_external_file(
         .checked_add(file.size)
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| Error::corrupt_file_named("FRI details", "external FRI range overflow"))?;
-    let path = dataset
-        .indice_files_dir(index)?
-        .join(index.uuid.to_string())
-        .join(file.path.as_str());
-    dataset
-        .object_store_for_index(index)
-        .await?
-        .open(&path)
+    store
+        .open(path)
         .await?
         .get_range(file.offset as usize..end)
         .await
         .map_err(Error::from)
+}
+
+/// An FRI entry's raw external details bytes, read from storage.
+async fn read_fri_external_file(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    file: &ExternalFile,
+) -> lance_core::Result<bytes::Bytes> {
+    let (store, path) = fri_external_location(dataset, index, file).await?;
+    read_fri_external_range(&store, &path, file).await
 }
 
 /// open fragment reuse index based on its metadata details
@@ -456,13 +485,16 @@ pub(crate) async fn open_frag_reuse_index(
     CompactFragReuseIndex::try_new(uuid, details.clone())
 }
 
+/// `dataset_version` stamps both the new reuse version and the entry, which must agree.
 pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
     new_fragment_bitmap: RoaringBitmap,
+    dataset_version: u64,
 ) -> lance_core::Result<IndexMetadata> {
     let new_version = FragReuseVersion {
-        dataset_version: dataset.manifest.version,
+        // `finish_rewrite` restamps it if the rewrite publishes on a later version.
+        dataset_version,
         groups: frag_reuse_groups,
     };
 
@@ -473,33 +505,45 @@ pub(crate) async fn build_new_frag_reuse_index(
             .cloned()
     })?;
 
-    let new_index_details = match &index_meta {
-        None => FragReuseIndexDetails {
-            versions: Vec::from([new_version]),
-        },
+    let (new_index_details, fragment_bitmap) = match &index_meta {
+        None => (
+            FragReuseIndexDetails {
+                versions: Vec::from([new_version]),
+            },
+            new_fragment_bitmap,
+        ),
         Some(index_meta) => {
             let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
+            // Every version's new fragments, as a rebuild in `finish_rewrite` or a cleanup
+            // publishes, so the entry is the same whether or not its commit is restamped.
+            let fragment_bitmap = current_details.new_frag_bitmap() | new_fragment_bitmap;
             let mut versions = current_details.versions.clone();
             versions.push(new_version);
-            FragReuseIndexDetails { versions }
+            (FragReuseIndexDetails { versions }, fragment_bitmap)
         }
     };
 
-    build_frag_reuse_index_metadata(
+    let mut entry = build_frag_reuse_index_metadata(
         dataset,
         index_meta.as_ref(),
         new_index_details,
-        new_fragment_bitmap,
+        fragment_bitmap,
     )
-    .await
+    .await?;
+    entry.dataset_version = dataset_version;
+    Ok(entry)
 }
 
 pub(crate) async fn build_frag_reuse_index_metadata(
     dataset: &Dataset,
     index_meta: Option<&IndexMetadata>,
-    new_index_details: FragReuseIndexDetails,
+    mut new_index_details: FragReuseIndexDetails,
     new_fragment_bitmap: RoaringBitmap,
 ) -> lance_core::Result<IndexMetadata> {
+    // The encoding orders versions by stamp; the cached copy must match a read of the file.
+    new_index_details
+        .versions
+        .sort_by_key(|version| version.dataset_version);
     let index_id = uuid::Uuid::new_v4();
     let new_index_details_proto = InlineContent::from(&new_index_details);
     let proto = if new_index_details_proto.encoded_len() > 204800 {
@@ -526,7 +570,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         }
     };
 
-    Ok(IndexMetadata {
+    let entry = IndexMetadata {
         uuid: index_id,
         name: FRAG_REUSE_INDEX_NAME.to_string(),
         fields: vec![],
@@ -539,7 +583,24 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
-    })
+    };
+    // Spares the commit's history check from reading the file back.
+    if let Some(Content::External(file)) = &proto.content {
+        let (store, path) = fri_external_location(dataset, &entry, file).await?;
+        dataset
+            .index_cache
+            .insert_with_key(
+                &FragReuseDetailsKey {
+                    store_identity: &store.store_prefix,
+                    path: &path,
+                    offset: file.offset,
+                    size: file.size,
+                },
+                Arc::new(new_index_details),
+            )
+            .await;
+    }
+    Ok(entry)
 }
 
 /// One length-delimited protobuf field, the unit both the inline details
@@ -1162,11 +1223,8 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     transitions: &[pb_fri::Transition],
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
-    // The spec excludes tagged histories on stable-row-id tables: the FRI is
-    // address-based, and under stable row ids a rewrite's rows keep their
-    // ids, so there is no address translation to record. The planner blocks
-    // the deferred-compaction combination already; this covers a hand-built
-    // rewrite committed directly.
+    // Deferred compaction records v0 entries on stable-row-id tables, so only a
+    // hand-built tagged rewrite committed directly reaches this.
     if dataset.manifest.uses_stable_row_ids() {
         return Err(Error::not_supported(
             "Tagged fragment reuse histories are address-based and excluded on \

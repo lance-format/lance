@@ -242,14 +242,15 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // is evaluated against the fixed baseline (there are no intermediate
     // commits), and the new-fragment branch handles a bitmap that was already
     // coverage-remapped + persisted before the data was remapped (e.g. while
-    // remapping a *sibling* index).
+    // remapping a *sibling* index). The comparison is inclusive: an index built
+    // at a version's dataset_version predates its rewrite.
     let baseline_version = curr_index_meta.dataset_version;
     let has_unknown_coverage = curr_index_meta.fragment_bitmap.is_none();
     let (should_remap, mut bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
         Some(mut index_frag_bitmap) => {
             let mut should_remap = false;
             for version in frag_reuse_index.details.versions.iter() {
-                let data_predates_version = baseline_version < version.dataset_version;
+                let data_predates_version = baseline_version <= version.dataset_version;
                 for group in version.groups.iter() {
                     let mut old_frag_in_index = 0;
                     for old_frag in group.old_frags.iter() {
@@ -347,7 +348,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             index_details: curr_index_meta.index_details.clone(),
             index_version: curr_index_meta.index_version,
             created_at: curr_index_meta.created_at,
-            base_id: None,
+            base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
@@ -442,6 +443,16 @@ pub async fn remap_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::DatasetIndexInternalExt;
+    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::Int32Type;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_index::IndexType;
+    use lance_index::frag_reuse::{FragReuseGroup, FragReuseIndexDetails, FragReuseVersion};
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::ScalarIndexParams;
+    use roaring::RoaringBitmap;
 
     #[test]
     fn test_compact_matches_transpose() {
@@ -724,5 +735,88 @@ mod tests {
         );
         assert_eq!(after.covering_fields, vec![id_field_id]);
         assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+    }
+
+    #[tokio::test]
+    async fn test_remap_keep_preserves_base_id() {
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let clone_uri = format!("{clone_dir}/clone");
+
+        let mut source = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                &source_dir,
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        source
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let version = source.manifest.version;
+        let mut clone = source
+            .shallow_clone(&clone_uri, version, None)
+            .await
+            .unwrap();
+        let cloned_index = clone.load_index_by_name("i_idx").await.unwrap().unwrap();
+        assert!(cloned_index.base_id.is_some());
+
+        // Dropping every indexed row makes `index::remap_index` return `Keep`.
+        let mut no_survivors = Vec::new();
+        RoaringTreemap::new()
+            .serialize_into(&mut no_survivors)
+            .unwrap();
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: clone.manifest.version,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: no_survivors,
+                    old_frags: vec![FragDigest::from(&clone.manifest.fragments[0])],
+                    new_frags: vec![],
+                }],
+            }],
+        };
+        let frag_reuse_index =
+            build_frag_reuse_index_metadata(&clone, None, details, RoaringBitmap::new())
+                .await
+                .unwrap();
+        clone
+            .apply_commit(
+                Transaction::new(
+                    clone.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![frag_reuse_index],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        remap_column_index(&mut clone, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+
+        let reopened = Dataset::open(&clone_uri).await.unwrap();
+        let kept = reopened.load_index_by_name("i_idx").await.unwrap().unwrap();
+        assert_eq!(kept.uuid, cloned_index.uuid);
+        assert!(kept.dataset_version > cloned_index.dataset_version);
+        assert_eq!(kept.base_id, cloned_index.base_id);
+        reopened
+            .open_scalar_index("i", &kept.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
     }
 }
