@@ -2517,10 +2517,10 @@ impl DatasetIndexExt for Dataset {
         let mut indices = indices
             .iter()
             .filter(|idx| {
-                // We shouldn't have any indices with empty fields, but just in case, log an error
-                // but don't fail the operation (we might not be using that index)
+                // System indices are fieldless by design. Report malformed user indices,
+                // but don't fail the operation (we might not be using that index).
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    if !is_system_index(idx) {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
