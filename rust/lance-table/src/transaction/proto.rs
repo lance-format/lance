@@ -373,7 +373,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 }
             }
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement { replacements, .. },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
@@ -679,6 +679,7 @@ impl From<&Transaction> for pb::Transaction {
                         .iter()
                         .map(pb::transaction::DataReplacementGroup::from)
                         .collect(),
+                    replaced_offset_bitmaps: Default::default(),
                 })
             }
             Operation::DataOverlay { groups } => {
