@@ -53,6 +53,42 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
+### Index Details
+
+An index segment records its build parameters in the `index_details` field of the
+generic [index metadata](../index.md#loading-an-index), as a `VectorIndexDetails`
+message. These are the parameters an engine needs to rebuild the index without
+reading the index files: the distance metric, the quantization scheme, and the
+partitioning the index was asked for.
+
+`target_num_partitions` records the IVF partition count requested for building or
+rebuilding the index. The count an index actually holds may differ from it and is
+read from the index files. Where a segment covers no fragments and carries no
+index files, this field preserves an explicit partition-count request that has no
+built index to read it from.
+
+`target_partition_size` records the target number of vectors per partition, and is
+0 when unset. A positive `target_num_partitions` takes precedence over it. Absent
+or zero means no explicit count is available: a rebuild uses
+`target_partition_size` when that is positive, and the engine's own sizing
+otherwise. Absence does not imply the original build used automatic sizing, since
+a writer that predates this field records no count either way.
+
+Writers record only positive, representable counts, and omit a count they cannot
+represent rather than truncating it.
+
+`runtime_hints` carries optional build preferences that do not affect index
+structure, keyed by reverse-DNS name. Unrecognized keys must be silently ignored.
+
+<details>
+  <summary>Full protobuf definition</summary>
+
+```protobuf
+%%% proto.message.VectorIndexDetails %%%
+```
+
+</details>
+
 ## Storage Layout (V3)
 
 Each vector index is stored as 2 regular Lance files - index file and auxiliary file.
