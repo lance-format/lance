@@ -1750,6 +1750,36 @@ pub async fn build_ivf_model(
                 num_partitions * dim,
             )));
         }
+        // The flattened-length check alone accepts wrongly-shaped centroids
+        // (e.g. twice the rows at half the dimension), which then break the
+        // build far away from this boundary.
+        if centroids.value_length() as usize != dim {
+            return Err(Error::invalid_input(format!(
+                "IVF centroids dimension {} does not match the vector column dimension {}",
+                centroids.value_length(),
+                dim
+            )));
+        }
+        // Same-width centroids of a different dtype would be handed to a
+        // kmeans assignment pair that does not exist. Int8 columns are the
+        // exception: the trainer converts them to f32 (see the `Int8` arm of
+        // `train_ivf_kmeans_step`) and the only assignment pair implemented
+        // for them is (Float32 centroids, Int8 vectors), so f32 is the
+        // expected centroid type there.
+        let (_, element_type) = get_vector_type(dataset.schema(), column)?;
+        let expected_centroid_type = if element_type == DataType::Int8 {
+            DataType::Float32
+        } else {
+            element_type.clone()
+        };
+        if centroids.value_type() != expected_centroid_type {
+            return Err(Error::invalid_input(format!(
+                "IVF centroids type {} does not match the expected type {} for a vector column of type {}",
+                centroids.value_type(),
+                expected_centroid_type,
+                element_type
+            )));
+        }
         return Ok(IvfModel::new(centroids.clone(), None));
     }
     let sample_size_hint = num_partitions * params.sample_rate;
@@ -6411,6 +6441,108 @@ mod tests {
             !is_callback_active.load(Ordering::SeqCst),
             "progress callback remained active after streaming IVF returned"
         );
+    }
+
+    /// Pre-computed centroids whose flattened length matches but whose
+    /// per-row width disagrees with the column used to pass validation and
+    /// break the build far away; reject them at this boundary instead.
+    #[tokio::test]
+    async fn test_build_ivf_model_rejects_wrong_width_centroids() {
+        use lance_index::progress::NoopIndexBuildProgress;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let values = generate_random_array_with_seed::<Float32Type>(64 * 16, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 16).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            fsl.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        // 64 centroids of width 8 flatten to the same length as 32 rows of
+        // width 16, so the flattened check alone lets them through.
+        let values = generate_random_array_with_seed::<Float32Type>(64 * 8, [23; 32]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 8).unwrap();
+        let mut params = IvfBuildParams::new(32);
+        params.centroids = Some(Arc::new(centroids));
+
+        let err = build_ivf_model(
+            &dataset,
+            "vector",
+            16,
+            MetricType::L2,
+            &params,
+            None,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("centroids dimension 8"),
+            "got: {err}"
+        );
+
+        // Same width, different dtype: also rejected at the boundary.
+        let values = generate_random_array_with_seed::<Float16Type>(32 * 16, [24; 32]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 16).unwrap();
+        let mut params = IvfBuildParams::new(32);
+        params.centroids = Some(Arc::new(centroids));
+        let err = build_ivf_model(
+            &dataset,
+            "vector",
+            16,
+            MetricType::L2,
+            &params,
+            None,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("centroids type"), "got: {err}");
+    }
+
+    /// An Int8 column is trained as f32, and the only assignment pair the
+    /// kernels implement for it is (Float32 centroids, Int8 vectors), so f32
+    /// centroids must be accepted rather than rejected as a dtype mismatch.
+    #[tokio::test]
+    async fn test_build_ivf_model_accepts_f32_centroids_for_int8_column() {
+        use lance_index::progress::NoopIndexBuildProgress;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let values =
+            arrow_array::Int8Array::from_iter_values((0..64 * 16).map(|i| (i % 127) as i8));
+        let fsl = FixedSizeListArray::try_new_from_values(values, 16).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            fsl.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let values = generate_random_array_with_seed::<Float32Type>(4 * 16, [25; 32]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 16).unwrap();
+        let mut params = IvfBuildParams::new(4);
+        params.centroids = Some(Arc::new(centroids));
+
+        let model = build_ivf_model(
+            &dataset,
+            "vector",
+            16,
+            MetricType::L2,
+            &params,
+            None,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await
+        .expect("f32 centroids are the expected type for an Int8 column");
+        assert_eq!(model.num_partitions(), 4);
     }
 
     /// Regression test for a hang in the streaming *coreset* trainer
