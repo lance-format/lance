@@ -1815,6 +1815,13 @@ impl Dataset {
     }
 }
 
+/// Whether a fieldless index is worth reporting. The system indices (frag-reuse and
+/// MemWAL) carry no fields by design, and a dataset written through MemWAL has one on
+/// every scalar-index lookup, so only a fieldless *non-system* index is unexpected.
+fn is_unexpected_fieldless_index(idx: &IndexMetadata) -> bool {
+    idx.fields.is_empty() && !is_system_index(idx)
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -2520,7 +2527,7 @@ impl DatasetIndexExt for Dataset {
                 // We shouldn't have any indices with empty fields, but just in case, log an error
                 // but don't fail the operation (we might not be using that index)
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    if is_unexpected_fieldless_index(idx) {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
@@ -4164,6 +4171,7 @@ fn is_vector_field(data_type: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
@@ -14053,5 +14061,35 @@ mod tests {
             distance > 1_000.0,
             "nearest distance {distance} should reflect the rewritten vectors, not stale postings"
         );
+    }
+
+    #[test]
+    fn fieldless_system_indices_are_not_reported() {
+        let index = |name: &str, fields: Vec<i32>| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields,
+            covering_fields: vec![],
+            name: name.to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        // Fieldless by design: must not be reported (MemWAL was, on every lookup).
+        assert!(!is_unexpected_fieldless_index(&index(
+            MEM_WAL_INDEX_NAME,
+            vec![]
+        )));
+        assert!(!is_unexpected_fieldless_index(&index(
+            FRAG_REUSE_INDEX_NAME,
+            vec![]
+        )));
+        // A user index with no fields is still unexpected.
+        assert!(is_unexpected_fieldless_index(&index("my_index", vec![])));
+        // An index with fields is never reported.
+        assert!(!is_unexpected_fieldless_index(&index("my_index", vec![0])));
     }
 }
