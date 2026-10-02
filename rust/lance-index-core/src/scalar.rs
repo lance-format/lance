@@ -403,6 +403,16 @@ pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     fn to_expr(&self, col: String) -> Expr;
     /// Compare this query to another query
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
+    /// Whether every index answering this query reports the rows where the
+    /// predicate is SQL NULL in the `nulls` set of its [`SearchResult`].
+    ///
+    /// Reporting those rows as FALSE instead keeps the result exact under
+    /// `WHERE`, which drops NULL and FALSE rows alike, but `NOT` would turn them
+    /// into TRUE. The planner only pushes `NOT` down to queries that return
+    /// `true` here.
+    fn reports_null_rows(&self) -> bool {
+        true
+    }
 }
 
 impl PartialEq for dyn AnyQuery {
@@ -412,6 +422,13 @@ impl PartialEq for dyn AnyQuery {
 }
 
 /// The result of a search operation against a scalar index
+///
+/// A row is TRUE if it is in the set's selected rows but not its null rows,
+/// NULL if it is in the null rows, and FALSE otherwise. Rows where the
+/// predicate is SQL NULL, such as `x = 5` on a row where `x IS NULL`, belong in
+/// the null rows unless [`AnyQuery::reports_null_rows`] returns `false` for the
+/// query: reporting them as FALSE is harmless under `WHERE`, but `NOT` would
+/// turn them into TRUE.
 #[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
