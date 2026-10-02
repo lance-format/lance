@@ -16,6 +16,7 @@ on:
       - python/**
       - rust/**
       - protos/**
+      - skills/**
       - .github/workflows/python.yml
       - .github/workflows/build_linux_wheel/**
       - .github/workflows/build_mac_wheel/**
