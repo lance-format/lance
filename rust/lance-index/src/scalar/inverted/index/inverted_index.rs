@@ -706,7 +706,16 @@ impl Index for InvertedIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        // The posting lists store row ids (trained with `with_row_id`), which
+        // no longer identify a fragment once stable row ids are enabled; the
+        // fragment bitmap recorded in the index metadata is authoritative.
+        // Return not_supported like MinHash LSH rather than derive a wrong set
+        // (`migrate_indices` handles the error without failing the commit).
+        Err(Error::not_supported(
+            "inverted indices do not recalculate fragment coverage from their files; \
+             the fragment bitmap of the index metadata is authoritative"
+                .to_string(),
+        ))
     }
 }
 

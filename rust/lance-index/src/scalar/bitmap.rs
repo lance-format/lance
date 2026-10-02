@@ -749,7 +749,16 @@ impl Index for BitmapIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        // Trained with `with_row_id`, so the index keys its rows by row id,
+        // which no longer identifies a fragment once stable row ids are
+        // enabled; the fragment bitmap recorded in the index metadata is
+        // authoritative. Return not_supported like MinHash LSH rather than
+        // derive a wrong set here (`migrate_indices` handles the error).
+        Err(Error::not_supported(
+            "bitmap indices do not recalculate fragment coverage from their files; \
+             the fragment bitmap of the index metadata is authoritative"
+                .to_string(),
+        ))
     }
 }
 
@@ -2280,6 +2289,56 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_select::RowSetOps;
     use rstest::rstest;
+
+    /// `calculate_included_frags` reports that coverage cannot be rebuilt from
+    /// the index files rather than panicking (it was `unimplemented!()`): the
+    /// index keys its rows by row id, which does not identify a fragment once
+    /// stable row ids are enabled. `migrate_indices` relies on this error to
+    /// keep the authoritative fragment bitmap recorded in the index metadata.
+    #[tokio::test]
+    async fn test_bitmap_calculate_included_frags_is_unsupported() {
+        use arrow_array::UInt32Array;
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let values = vec![Some(1u32), Some(2u32), None];
+        let row_ids: Vec<u64> = vec![
+            RowAddress::new_from_parts(1, 0).into(),
+            RowAddress::new_from_parts(2, 0).into(),
+            RowAddress::new_from_parts(3, 0).into(),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::UInt32, true),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+        let batch = sort_batch_by_value(&batch);
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let err = index.calculate_included_frags().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("do not recalculate fragment coverage from their files"),
+            "bitmap coverage recovery must be not_supported, got: {err}"
+        );
+    }
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
         let mut buf = Vec::new();

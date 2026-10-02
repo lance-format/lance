@@ -3,6 +3,39 @@
 
 use super::*;
 
+use crate::Index;
+
+/// `calculate_included_frags` reports that coverage cannot be rebuilt from the
+/// index files rather than panicking (it was `unimplemented!()`): the posting
+/// lists store row ids, which do not identify a fragment once stable row ids
+/// are enabled. `migrate_indices` relies on this error to keep the
+/// authoritative fragment bitmap recorded in the index metadata.
+#[tokio::test]
+async fn test_calculate_included_frags_is_unsupported() -> Result<()> {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let index = write_single_partition_index(
+        store,
+        InvertedIndexParams::default(),
+        TokenSetFormat::default(),
+        "hello",
+        100,
+    )
+    .await?;
+
+    let err = index.calculate_included_frags().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("do not recalculate fragment coverage from their files"),
+        "inverted coverage recovery must be not_supported, got: {err}"
+    );
+    Ok(())
+}
+
 /// Build a multi-partition inverted index in `store` with `num_partitions`
 /// partitions, each carrying a handful of tokens/docs.
 async fn build_multi_partition_index(
