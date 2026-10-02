@@ -71,6 +71,24 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
     Some(field.data_type())
 }
 
+fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            (op.is_numerical_operators()
+                || matches!(
+                    op,
+                    Operator::BitwiseShiftLeft
+                        | Operator::BitwiseShiftRight
+                        | Operator::StringConcat
+                ))
+                && is_literal_only_same_type_expr(left)
+                && is_literal_only_same_type_expr(right)
+        }
+        Expr::Literal(..) => true,
+        _ => false,
+    }
+}
+
 /// Resolve logical expression `expr`.
 ///
 /// Parameters
@@ -110,15 +128,20 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                         op: *op,
                         right: Box::new(resolve_value(right.as_ref(), &left_type)?),
                     })),
-                    // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
-                    Expr::BinaryExpr(r) => Ok(Expr::BinaryExpr(BinaryExpr {
+                    // Constant expressions need the column type applied to all of their literals.
+                    Expr::BinaryExpr(_) if is_literal_only_same_type_expr(right) => {
+                        Ok(Expr::BinaryExpr(BinaryExpr {
+                            left: left.clone(),
+                            op: *op,
+                            right: Box::new(coerce_expr(right, &left_type)?),
+                        }))
+                    }
+                    // Expressions that reference columns have their own type context. Resolving
+                    // them recursively prevents their literals from inheriting the outer type.
+                    Expr::BinaryExpr(_) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
-                        right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                            left: coerce_expr(&r.left, &left_type).map(Box::new)?,
-                            op: r.op,
-                            right: coerce_expr(&r.right, &left_type).map(Box::new)?,
-                        })),
+                        right: Box::new(resolve_expr(right, schema)?),
                     })),
                     _ => Ok(expr.clone()),
                 }
