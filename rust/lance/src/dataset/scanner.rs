@@ -40,6 +40,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::joins::PartitionMode;
@@ -2765,9 +2766,6 @@ impl Scanner {
     }
 
     #[allow(clippy::type_complexity)]
-    // TODO(datafusion-54): migrate off the deprecated
-    // create_aggregate_expr_and_maybe_filter to LoweredAggregateBuilder.
-    #[allow(deprecated)]
     fn build_physical_aggregate_expr(
         &self,
         expr: &Expr,
@@ -2777,19 +2775,37 @@ impl Scanner {
         Arc<datafusion_physical_expr::aggregate::AggregateFunctionExpr>,
         Option<Arc<dyn PhysicalExpr>>,
     )> {
-        use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
-
         let coerced_expr = self.coerce_aggregate_expr(expr, df_schema)?;
 
-        // Note: order_by is already embedded in the AggregateFunctionExpr for ordered aggregates
-        let (agg_expr, filter, _order_by) = create_aggregate_expr_and_maybe_filter(
+        // Name and display the aggregate the way the deprecated
+        // `create_aggregate_expr_and_maybe_filter` did, so plans and their
+        // output column names stay the same.
+        let (name, human_display) = match &coerced_expr {
+            Expr::Alias(alias) => (
+                Some(alias.name.clone()),
+                coerced_expr.human_display().to_string(),
+            ),
+            Expr::AggregateFunction(_) => (
+                Some(coerced_expr.schema_name().to_string()),
+                coerced_expr.human_display().to_string(),
+            ),
+            _ => (None, String::new()),
+        };
+        let execution_props = ExecutionProps::default();
+        let mut builder = LoweredAggregateBuilder::new(
             &coerced_expr,
             df_schema,
             input_schema.as_ref(),
-            &ExecutionProps::default(),
-        )?;
+            &execution_props,
+        )
+        .with_human_display(human_display);
+        if let Some(name) = name {
+            builder = builder.with_name(name);
+        }
 
-        Ok((agg_expr, filter))
+        // Note: order_by is already embedded in the AggregateFunctionExpr for ordered aggregates
+        let lowered = builder.build()?;
+        Ok((lowered.aggregate, lowered.filter))
     }
 
     /// Apply type coercion to aggregate arguments for UserDefined signature functions.

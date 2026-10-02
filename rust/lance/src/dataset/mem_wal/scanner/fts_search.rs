@@ -722,9 +722,9 @@ impl LsmFtsSearchPlanner {
             ));
         }
 
-        // Any remaining schema divergence would panic inside `UnionExec::new`
-        // rather than erroring, so this is the last point where it is still a
-        // query error instead of a process failure.
+        // `UnionExec::try_new` only rejects inputs with different field counts
+        // and does not compare field types, so check the schemas here and report
+        // any divergence as an unsupported cross-column query.
         if let Some((first, rest)) = per_column_plans.split_first()
             && let Some(mismatch) = rest.iter().find(|plan| plan.schema() != first.schema())
         {
@@ -736,12 +736,8 @@ impl LsmFtsSearchPlanner {
             )));
         }
 
-        let merged: Arc<dyn ExecutionPlan> = if per_column_plans.len() == 1 {
-            per_column_plans.into_iter().next().unwrap()
-        } else {
-            #[allow(deprecated)]
-            Arc::new(UnionExec::new(per_column_plans))
-        };
+        // `try_new` returns a single plan as is instead of wrapping it in a union.
+        let merged = UnionExec::try_new(per_column_plans)?;
         // Order the candidates, collapse duplicates, *then* cut to k. Cutting
         // before the collapse spends the budget on repeat hits of the same row.
         // The input is sorted by `_score` descending, so keeping the first
@@ -931,17 +927,12 @@ impl LsmFtsSearchPlanner {
             per_source_plans.push(normalized);
         }
 
-        // Single source: skip Union and the merge.
-        let merged: Arc<dyn ExecutionPlan> = if per_source_plans.len() == 1 {
-            per_source_plans.into_iter().next().unwrap()
-        } else {
-            #[allow(deprecated)]
-            // The downstream `SortPreservingMergeExec` already spawns one driver
-            // task per input partition (one per union arm) via `spawn_buffered`,
-            // so each arm's per-arm CPU (posting decode, BM25) runs on its own
-            // task without an extra repartition.
-            Arc::new(UnionExec::new(per_source_plans))
-        };
+        // A single source is returned as is, without a union. Otherwise the
+        // downstream `SortPreservingMergeExec` already spawns one driver task per
+        // input partition (one per union arm) via `spawn_buffered`, so each arm's
+        // per-arm CPU (posting decode, BM25) runs on its own task without an
+        // extra repartition.
+        let merged = UnionExec::try_new(per_source_plans)?;
 
         self.sort_by_score(merged, limit)
     }
@@ -3948,9 +3939,9 @@ mod tests {
         );
     }
 
-    /// A list-element leaf makes one arm carry `_doc_index` and the other not,
-    /// which `UnionExec::new` panics on rather than erroring. Refuse first: the
-    /// on-disk cross-column contract is row documents only.
+    /// A list-element leaf makes one arm carry `_doc_index` and the other not.
+    /// Refuse it before building the union: the on-disk cross-column contract
+    /// is row documents only.
     #[tokio::test]
     async fn cross_column_list_element_granularity_is_refused() {
         use lance_index::scalar::inverted::query::{MatchQuery, MultiMatchQuery};

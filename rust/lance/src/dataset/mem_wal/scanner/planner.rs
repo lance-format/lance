@@ -274,8 +274,7 @@ impl LsmScanPlanner {
         let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
-            #[allow(deprecated)]
-            let union = Arc::new(UnionExec::new(source_plans));
+            let union = UnionExec::try_new(source_plans)?;
             Arc::new(CoalescePartitionsExec::new(union))
         };
 
