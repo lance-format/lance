@@ -545,6 +545,11 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "NOT (value = 99 OR value = 7)",
         "NOT (NOT (value = 7))",
         "value = 99 OR value = 7",
+        // Float operands are rewritten exactly onto the integer column.
+        "value > 6.5",
+        "value = 6.5",
+        "value BETWEEN 6.5 AND 7.5",
+        "value IN (6.5, 7)",
     ] {
         let mut indexed_scan = dataset.scan();
         indexed_scan
