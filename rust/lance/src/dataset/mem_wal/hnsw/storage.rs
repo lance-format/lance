@@ -13,7 +13,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use lance_core::{Error, ROW_ID, Result};
-use lance_linalg::distance::{DistanceType, cosine_distance, dot_f32, l2_f32};
+use lance_linalg::distance::{DistanceType, cosine_distance, dot_distance, l2_f32};
 
 use super::graph::ScoredPoint;
 
@@ -82,7 +82,9 @@ pub trait VectorSource: Send + Sync {
 pub fn compute_f32_distance(query: &[f32], vector: &[f32], distance_type: DistanceType) -> f32 {
     match distance_type {
         DistanceType::L2 => l2_f32(query, vector),
-        DistanceType::Dot => dot_f32(query, vector),
+        // The distance, not the product: the graph keeps whatever is smallest,
+        // and a raw product would rank the least similar rows first.
+        DistanceType::Dot => dot_distance(query, vector),
         DistanceType::Cosine => cosine_distance(query, vector),
         DistanceType::Hamming => f32::INFINITY,
     }

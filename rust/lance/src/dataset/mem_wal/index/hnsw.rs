@@ -584,6 +584,44 @@ mod tests {
         assert_eq!(best_pos, 5);
     }
 
+    /// A dot index ranks the larger product first, as the base table's dot
+    /// index does, and reports the same `1 - dot` distance so the two arms can
+    /// be merged.
+    #[test]
+    fn test_dot_index_ranks_the_larger_product_first() {
+        let dim = 3;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::Dot,
+            HnswBuildParams::default().num_edges(16).ef_construction(64),
+            2,
+            64,
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 1.0, 1.0, 10.0, 10.0, 10.0]),
+            dim,
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(vectors)],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let query =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 1.0, 1.0]), dim)
+                .unwrap();
+        let results = index.search(&query, 2, None, u64::MAX).unwrap();
+        // Products 3 and 30, so distances 1 - 3 and 1 - 30.
+        assert_eq!(results, vec![(-29.0, 1), (-2.0, 0)]);
+    }
+
     #[test]
     fn test_index_insert_batches_combines_hnsw_insert_range() {
         let dim = 8;
