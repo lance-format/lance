@@ -351,13 +351,225 @@ async fn write_versions(uri: &str, versions: usize, enable_v2_manifest_paths: bo
     ds
 }
 
+async fn recreated_serialized_handle() -> (tempfile::TempDir, Dataset) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file-object-store://{}", dir.path().display());
+    let dropped = Dataset::write(gen_rows(), &uri, None).await.unwrap();
+    let serialized = dropped.manifest().serialized();
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    let stored = Dataset::write(
+        gen_rows(),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.version_id(), dropped.version_id());
+    assert_eq!(stored.count_fragments(), 10);
+    let handle = DatasetBuilder::from_uri(&uri)
+        .with_serialized_manifest(&serialized)
+        .unwrap()
+        .load()
+        .await
+        .unwrap();
+    (dir, handle)
+}
+
+#[tokio::test]
+async fn unchanged_checkout_preserves_fragment_bitmap() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file-object-store://{}", dir.path().display());
+    let written = Dataset::write(
+        gen_rows(),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut reader = DatasetBuilder::from_uri(&uri)
+        .with_session(written.session())
+        .load()
+        .await
+        .unwrap();
+    let bitmap = reader.fragment_bitmap.clone();
+    let manifest = reader.manifest.clone();
+    let location = reader.manifest_location.clone();
+    assert!(location.e_tag.is_some());
+    assert!(location.size.is_some());
+    reader.manifest_location.size = None;
+
+    reader.checkout_latest().await.unwrap();
+
+    assert!(Arc::ptr_eq(&bitmap, &reader.fragment_bitmap));
+    assert!(Arc::ptr_eq(&manifest, &reader.manifest));
+    assert_eq!(reader.manifest_location.size, location.size);
+    assert_eq!(reader.manifest_location.e_tag, location.e_tag);
+    assert_eq!(reader.version_id(), 1);
+    assert_eq!(reader.count_fragments(), 2);
+}
+
+#[tokio::test]
+async fn serialized_handle_checkout_reads_the_stored_version() {
+    let (_dir, mut handle) = recreated_serialized_handle().await;
+    assert_eq!(handle.count_fragments(), 1);
+    assert!(handle.manifest_location.e_tag.is_none());
+    handle.checkout_latest().await.unwrap();
+    assert_eq!(handle.count_fragments(), 10);
+}
+
+#[tokio::test]
+async fn commit_through_a_serialized_handle_builds_on_the_stored_version() {
+    let (_dir, mut handle) = recreated_serialized_handle().await;
+    handle
+        .append(
+            gen_rows(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let fresh = DatasetBuilder::from_uri(handle.uri()).load().await.unwrap();
+    assert_eq!(handle.count_fragments(), 11);
+    assert_eq!(fresh.count_fragments(), 11);
+    assert_eq!(fresh.count_rows(None).await.unwrap(), 20);
+}
+
+#[tokio::test]
+async fn strict_overwrite_through_a_serialized_handle_uses_the_stored_frontier() {
+    let (_dir, handle) = recreated_serialized_handle().await;
+    let handle = Arc::new(handle);
+    let transaction = InsertBuilder::new(handle.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted_stream(
+            Box::new(gen_rows()) as Box<dyn arrow_array::RecordBatchReader + Send>
+        )
+        .await
+        .unwrap();
+    let committed = CommitBuilder::new(handle)
+        .with_max_retries(0)
+        .execute(transaction)
+        .await
+        .unwrap();
+    assert_eq!(committed.version_id(), 2);
+    assert_eq!(committed.count_fragments(), 1);
+    assert_eq!(committed.manifest.fragments[0].id, 10);
+    assert_eq!(committed.count_rows(None).await.unwrap(), 10);
+}
+
+#[rstest::rstest]
+#[case::stale(1)]
+#[case::future(3)]
+#[case::exhausted(u64::MAX)]
+#[tokio::test]
+async fn strict_overwrite_checks_the_current_version(#[case] read_version: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let current = Arc::new(write_versions(uri, 2, false).await);
+    let mut transaction = InsertBuilder::new(current.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted_stream(
+            Box::new(gen_rows()) as Box<dyn arrow_array::RecordBatchReader + Send>
+        )
+        .await
+        .unwrap();
+    transaction.read_version = read_version;
+    let error = CommitBuilder::new(current)
+        .with_max_retries(0)
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    if read_version > 2 {
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    } else {
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error}");
+    }
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("version {read_version}"))
+    );
+    let fresh = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    assert_eq!(fresh.version_id(), 2);
+    assert_eq!(fresh.count_rows(None).await.unwrap(), 20);
+}
+
+#[tokio::test]
+async fn unknown_etag_bypasses_manifest_and_transaction_caches() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file-object-store://{}", dir.path().display());
+    let mut dataset = Dataset::write(gen_rows(), &uri, None).await.unwrap();
+    let expected = dataset.read_transaction().await.unwrap().unwrap();
+    assert!(dataset.manifest_location.e_tag.is_some());
+    assert!(dataset.manifest_location.size.is_some());
+    dataset.manifest_location.e_tag = None;
+
+    let transaction_key = crate::session::caches::TransactionKey {
+        version: dataset.version_id(),
+    };
+    let stale_transaction = Arc::new(Transaction::new(
+        0,
+        Operation::Append { fragments: vec![] },
+        None,
+    ));
+    dataset
+        .metadata_cache
+        .insert_with_key(&transaction_key, stale_transaction.clone())
+        .await;
+    let mut stale_manifest = dataset.manifest.as_ref().clone();
+    stale_manifest.config.insert("stale".into(), "true".into());
+    dataset
+        .metadata_cache
+        .insert_with_key(
+            &crate::session::caches::ManifestKey {
+                version: dataset.version_id(),
+                e_tag: None,
+            },
+            Arc::new(stale_manifest),
+        )
+        .await;
+
+    let manifest = Dataset::get_manifest(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.uri,
+        &dataset.session,
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.config, dataset.manifest.config);
+    assert_eq!(dataset.read_transaction().await.unwrap().unwrap(), expected);
+    assert_eq!(
+        dataset
+            .metadata_cache
+            .get_with_key(&transaction_key)
+            .await
+            .unwrap()
+            .uuid,
+        stale_transaction.uuid
+    );
+}
+
 #[tokio::test]
 async fn test_inline_transaction() {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
-    async fn create_dataset(rows: i32) -> Arc<Dataset> {
+    async fn create_dataset(rows: i32) -> (TempDir, Arc<Dataset>) {
         let dir = TempDir::default();
         let uri = dir.path_str();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -377,7 +589,7 @@ async fn test_inline_transaction() {
         )
         .await
         .unwrap();
-        Arc::new(ds)
+        (dir, Arc::new(ds))
     }
 
     fn make_tx(read_version: u64) -> Transaction {
@@ -398,7 +610,7 @@ async fn test_inline_transaction() {
     let session = Arc::new(Session::default());
 
     // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
-    let ds = create_dataset(5).await;
+    let (_dir, ds) = create_dataset(5).await;
     let read_version = ds.manifest().version;
     let tx = make_tx(read_version);
     let ds2 = CommitBuilder::new(ds.clone())
@@ -426,7 +638,7 @@ async fn test_inline_transaction() {
     assert_eq!(inline_tx, tx);
 
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
-    let ds = create_dataset(2).await;
+    let (_dir, ds) = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file = crate::io::commit::write_transaction_file(
         ds.object_store.as_ref(),

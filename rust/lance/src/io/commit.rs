@@ -680,12 +680,14 @@ async fn record_new_dataset_commit(
     manifest: &Manifest,
     location: &ManifestLocation,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-    };
-    metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if location.e_tag.is_some() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+        };
+        metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -1536,13 +1538,15 @@ async fn record_successful_commit(
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-    };
-    dataset
-        .metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if location.e_tag.is_some() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+        };
+        dataset
+            .metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -1592,7 +1596,11 @@ pub(crate) async fn commit_transaction(
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
-    let mut target_version = read_version + 1;
+    let mut target_version = read_version.checked_add(1).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Transaction read version {read_version} cannot have a next version"
+        ))
+    })?;
     let original_dataset = dataset.clone();
 
     // read_version sometimes defaults to zero for overwrite.
@@ -1600,15 +1608,31 @@ pub(crate) async fn commit_transaction(
     // Strict overwrites are not subject to any sort of automatic conflict resolution.
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
-    let mut dataset =
-        if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
-            // If the dataset version is not the same as the read version, we need to
-            // checkout the read version.
-            dataset.checkout_version(read_version).await?
-        } else {
-            // If the dataset version is the same as the read version, we can use it directly.
-            dataset.clone()
-        };
+    let mut dataset = if strict_overwrite {
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await?;
+        if read_version > latest.manifest.version {
+            return Err(Error::invalid_input(format!(
+                "Transaction read version {read_version} exceeds current version {}",
+                latest.manifest.version
+            )));
+        }
+        if latest.manifest.version != read_version {
+            return Err(Error::commit_conflict_source(
+                target_version,
+                format!(
+                    "Strict overwrite expected version {read_version}, but current version is {}",
+                    latest.manifest.version
+                )
+                .into(),
+            ));
+        }
+        latest
+    } else if dataset.manifest.version != read_version && read_version != 0 {
+        dataset.checkout_version(read_version).await?
+    } else {
+        dataset.clone()
+    };
 
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
