@@ -14,6 +14,7 @@
 package org.lance.index.vector;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
 
 import java.util.Optional;
 
@@ -51,6 +52,7 @@ public class HnswBuildParams {
      * @return Builder
      */
     public Builder setMaxLevel(short maxLevel) {
+      Preconditions.checkArgument(maxLevel > 0, "maxLevel must be greater than 0");
       this.maxLevel = maxLevel;
       return this;
     }
@@ -60,6 +62,7 @@ public class HnswBuildParams {
      * @return Builder
      */
     public Builder setM(int m) {
+      Preconditions.checkArgument(m > 0, "m must be greater than 0");
       this.m = m;
       return this;
     }
@@ -69,6 +72,7 @@ public class HnswBuildParams {
      * @return Builder
      */
     public Builder setEfConstruction(int efConstruction) {
+      Preconditions.checkArgument(efConstruction > 0, "efConstruction must be greater than 0");
       this.efConstruction = efConstruction;
       return this;
     }
