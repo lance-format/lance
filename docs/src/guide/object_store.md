@@ -626,3 +626,87 @@ Environment variables keep the `GOOSEFS_*` form.
     cargo test -p lance-io --features "goosefs goosefs-test" \
         --test goosefs_integration -- --ignored --nocapture --test-threads=1
     ```
+
+### Apache Ozone Configuration
+
+[Apache Ozone](https://ozone.apache.org/) is a Scalable, reliable, distributed storage system 
+optimized for data analytics and object store workloads.  Its S3 Gateway service exposes the standard S3
+REST API, so Lance uses it through the existing S3 code path with no additional
+Rust features required.
+
+#### Prerequisites
+
+1. A secure Ozone cluster(>= 2.2.0 version) with the S3 Gateway service running (default HTTP port `9878`, HTTPS port `9879`).
+2. An Ozone bucket created for Lance datasets, for example:
+
+    ```bash
+    # both OBS (flat) and FSO (file-system-optimized) bucket layouts are supported
+    ozone sh bucket create /s3v/lance
+    ```
+
+3. Credential based on your kerberos keytab via:
+
+    ```bash
+    kinit -kt /etc/security/keytabs/<user>.keytab <user>@YOUR.REALM
+    ozone s3 getsecret
+    # → awsAccessKey=<user>@YOUR.REALM
+    #   awsSecret=<long‑hex‑string>
+    ```
+
+   The command prints an `awsAccessKey` / `awsSecret` pair
+   that maps to the Ozone user's S3 access credentials.
+
+#### Connection
+
+Point `endpoint` at the S3 Gateway address. By default, Ozone's S3 Gateway
+only handles path-style requests (`http://host:port/bucket/key`), so set
+`virtual_hosted_style_request` to `false`. Virtual-hosted style
+(`http://bucket.host:port/key`) is also supported when the gateway is
+configured with `ozone.s3g.domain.name`; in that case you can omit this
+option or set it to `true`.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "s3://lance/path/to/dataset.lance",
+    storage_options={
+        "endpoint": "http://ozone-s3g-host:9878",
+        "region": "us-east-1",               # any non-empty string
+        "access_key_id": "<ozone-access-key>",
+        "secret_access_key": "<ozone-secret-key>",
+        "virtual_hosted_style_request": "false",
+        "allow_http": "true",                # omit when TLS is enabled
+    },
+)
+```
+
+When writing a new dataset:
+
+```python
+import lance
+import pyarrow as pa
+
+table = pa.table({"id": [1, 2, 3], "value": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]})
+ds = lance.write_dataset(
+    table,
+    "s3://lance/path/to/dataset.lance",
+    storage_options={
+        "endpoint": "http://ozone-s3g-host:9878",
+        "region": "us-east-1",
+        "access_key_id": "<ozone-access-key>",
+        "secret_access_key": "<ozone-secret-key>",
+        "virtual_hosted_style_request": "false",
+        "allow_http": "true",
+    },
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `endpoint` | Ozone S3 Gateway address (for example, `http://ozone-s3g-host:9878`). Required. |
+| `region` | Any non-empty string (for example, `us-east-1`). Required for S3-compatible stores. |
+| `access_key_id` | Ozone S3 access key obtained via `ozone s3 getsecret`. Required. |
+| `secret_access_key` | Ozone S3 secret key obtained via `ozone s3 getsecret`. Required. |
+| `virtual_hosted_style_request` | Set to `false` for path-style requests (the default Ozone mode). Set to `true` when the gateway is configured with `ozone.s3g.domain.name`. Default, `false`. |
+| `allow_http` | Set to `true` for non-TLS connections. Omit when TLS is enabled. Default, `false`. |
