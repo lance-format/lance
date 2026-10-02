@@ -4,15 +4,16 @@
 pub mod frag_reuse;
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
+use crate::index::vector::ivf::compaction_vector_segment_merge_groups;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
@@ -66,6 +67,61 @@ struct DatasetIndexRemapper {
     indices: Arc<Vec<IndexMetadata>>,
 }
 
+pub(crate) async fn vector_segment_merge_groups_for_compaction<'a>(
+    dataset: &Dataset,
+    segments: &[&'a IndexMetadata],
+) -> Vec<Vec<&'a IndexMetadata>> {
+    let singleton_groups = || segments.iter().map(|segment| vec![*segment]).collect();
+    if segments.len() < 2
+        || segments.iter().any(|segment| {
+            !segment
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
+        })
+        || segments
+            .iter()
+            .any(|segment| segment.fields != segments[0].fields)
+        || segments[0].fields.len() != 1
+    {
+        return singleton_groups();
+    }
+
+    let Ok(column) = dataset.schema().field_path(segments[0].fields[0]) else {
+        return singleton_groups();
+    };
+    let Ok(logical_index) = dataset
+        .open_logical_vector_index(&column, &segments[0].name)
+        .await
+    else {
+        return singleton_groups();
+    };
+    let Ok(ivf) = logical_index.as_ivf() else {
+        return singleton_groups();
+    };
+
+    let mut segments_by_id = segments
+        .iter()
+        .map(|segment| (segment.uuid, *segment))
+        .collect::<HashMap<_, _>>();
+    let groups = compaction_vector_segment_merge_groups(&ivf)
+        .into_iter()
+        .filter_map(|group| {
+            let group = group
+                .into_iter()
+                .filter_map(|segment_id| segments_by_id.remove(&segment_id))
+                .collect::<Vec<_>>();
+            (!group.is_empty()).then_some(group)
+        })
+        .collect::<Vec<_>>();
+
+    if segments_by_id.is_empty() {
+        groups
+    } else {
+        singleton_groups()
+    }
+}
+
 impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
@@ -73,6 +129,158 @@ impl DatasetIndexRemapper {
         mapping: &RowAddrRemap,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
+    }
+
+    async fn remapped_index_from_result(
+        &self,
+        index: &IndexMetadata,
+        remap_result: RemapResult,
+    ) -> Result<Option<RemappedIndex>> {
+        match remap_result {
+            RemapResult::Drop => Ok(None),
+            RemapResult::Keep(id) => {
+                let index_details = match &index.index_details {
+                    Some(index_details) => index_details.as_ref().clone(),
+                    None => {
+                        // Migration path, if we didn't store details before then use the
+                        // default details. This only supports a single keyed field, not a
+                        // composite index.
+                        let Some(field) = index.keyed_field() else {
+                            return Err(Error::index(format!(
+                                "Index {} has fields {:?} (carried fields {:?}); the \
+                                 legacy index-details migration path only supports a \
+                                 single keyed field",
+                                index.uuid, index.fields, index.covering_fields
+                            )));
+                        };
+                        let field = self.dataset.schema().field_by_id(field).ok_or_else(|| {
+                            Error::internal(format!(
+                                "Index {} references field {} which does not exist",
+                                index.uuid, field
+                            ))
+                        })?;
+
+                        if matches!(field.data_type(), DataType::FixedSizeList(..)) {
+                            prost_types::Any::from_msg(&VectorIndexDetails::default())?
+                        } else {
+                            infer_scalar_index_details(&self.dataset, &field.name, index)
+                                .await?
+                                .as_ref()
+                                .clone()
+                        }
+                    }
+                };
+                Ok(Some(RemappedIndex {
+                    old_id: id,
+                    new_id: id,
+                    index_details,
+                    index_version: index.index_version as u32,
+                    files: index.files.clone(),
+                }))
+            }
+            RemapResult::Remapped(remapped_index) => Ok(Some(remapped_index)),
+        }
+    }
+
+    async fn remap_and_merge_vector_segments(
+        &self,
+        segments: &[&IndexMetadata],
+        mapping: &RowAddrRemap,
+    ) -> Result<Option<Vec<RemappedIndex>>> {
+        if segments.len() < 2
+            || segments.iter().any(|segment| {
+                !segment
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
+                    || segment.fragment_bitmap.is_none()
+            })
+        {
+            return Ok(None);
+        }
+
+        let mut segment_results = Vec::with_capacity(segments.len());
+        for segment in segments {
+            // See the call-site note in `remap_indices` about boxing this future.
+            let result = Box::pin(self.remap_index(segment, mapping)).await?;
+            segment_results.push((*segment, result));
+        }
+
+        if segment_results
+            .iter()
+            .any(|(_, result)| !matches!(result, RemapResult::Remapped(_)))
+        {
+            let mut remapped = Vec::with_capacity(segment_results.len());
+            for (segment, result) in segment_results {
+                if let Some(remapped_index) =
+                    self.remapped_index_from_result(segment, result).await?
+                {
+                    remapped.push(remapped_index);
+                }
+            }
+            return Ok(Some(remapped));
+        }
+
+        let mut remapped_segments = Vec::with_capacity(segments.len());
+        let mut remapped_results = Vec::with_capacity(segments.len());
+        for (segment, result) in segment_results {
+            let RemapResult::Remapped(remapped) = result else {
+                unreachable!("non-remapped results returned above")
+            };
+            let mut metadata = (*segment).clone();
+            metadata.uuid = remapped.new_id;
+            metadata.index_details = Some(Arc::new(remapped.index_details.clone()));
+            metadata.index_version = remapped.index_version as i32;
+            metadata.base_id = None;
+            metadata.files = remapped.files.clone();
+            remapped_segments.push(metadata);
+            remapped_results.push(remapped);
+        }
+
+        let merged =
+            crate::index::vector::ivf::merge_remapped_segments(&self.dataset, remapped_segments)
+                .await?;
+        let merged_details = merged.index_details.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "Merged vector index {} is missing index details",
+                merged.uuid
+            ))
+        })?;
+        let merged_version = u32::try_from(merged.index_version).map_err(|_| {
+            Error::internal(format!(
+                "Merged vector index {} has invalid version {}",
+                merged.uuid, merged.index_version
+            ))
+        })?;
+
+        for remapped in &remapped_results {
+            let intermediate_dir = self.dataset.indices_dir().join(remapped.new_id.to_string());
+            if let Err(error) = self
+                .dataset
+                .object_store
+                .remove_dir_all(intermediate_dir)
+                .await
+            {
+                log::warn!(
+                    "Failed to remove intermediate remapped index {}: {}",
+                    remapped.new_id,
+                    error
+                );
+            }
+        }
+
+        Ok(Some(
+            segments
+                .iter()
+                .map(|segment| RemappedIndex {
+                    old_id: segment.uuid,
+                    new_id: merged.uuid,
+                    index_details: merged_details.as_ref().clone(),
+                    index_version: merged_version,
+                    files: merged.files.clone(),
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -84,7 +292,7 @@ impl IndexRemapper for DatasetIndexRemapper {
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
-        let mut remapped = Vec::with_capacity(self.indices.len());
+        let mut affected_by_name = HashMap::<&str, Vec<&IndexMetadata>>::new();
         for index in self.indices.iter() {
             let needs_remapped = !is_system_index(index)
                 && match &index.fragment_bitmap {
@@ -94,56 +302,45 @@ impl IndexRemapper for DatasetIndexRemapper {
                         .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
                 };
             if needs_remapped {
-                // Box the remap future at the call site: inlining `remap_index` into this
-                // loop's async layout otherwise exceeds rustc's depth limit. It has to be
-                // boxed here, not inside `remap_index` — boxing internally turns the
-                // future's `Send` check into a `Box<Future>: Send` trait obligation that
-                // overflows the solver through the cache types (E0275 downstream).
-                let remap_result = Box::pin(self.remap_index(index, &mapping)).await?;
-                match remap_result {
-                    RemapResult::Drop => continue,
-                    RemapResult::Keep(id) => {
-                        let index_details = match &index.index_details {
-                            Some(index_details) => index_details.as_ref().clone(),
-                            None => {
-                                // Migration path, if we didn't store details before then use the
-                                // default details. This only supports a single keyed field, not a
-                                // composite index.
-                                let Some(field) = index.keyed_field() else {
-                                    return Err(Error::index(format!(
-                                        "Index {} has fields {:?} (carried fields {:?}); the \
-                                         legacy index-details migration path only supports a \
-                                         single keyed field",
-                                        index.uuid, index.fields, index.covering_fields
-                                    )));
-                                };
-                                let field =
-                                    self.dataset.schema().field_by_id(field).ok_or_else(|| {
-                                        Error::internal(format!(
-                                            "Index {} references field {} which does not exist",
-                                            index.uuid, field
-                                        ))
-                                    })?;
+                affected_by_name
+                    .entry(index.name.as_str())
+                    .or_default()
+                    .push(index);
+            }
+        }
 
-                                if matches!(field.data_type(), DataType::FixedSizeList(..)) {
-                                    prost_types::Any::from_msg(&VectorIndexDetails::default())?
-                                } else {
-                                    infer_scalar_index_details(&self.dataset, &field.name, index)
-                                        .await?
-                                        .as_ref()
-                                        .clone()
-                                }
-                            }
-                        };
-                        remapped.push(RemappedIndex {
-                            old_id: id,
-                            new_id: id,
-                            index_details,
-                            index_version: index.index_version as u32,
-                            files: index.files.clone(),
-                        });
-                    }
-                    RemapResult::Remapped(remapped_index) => {
+        let mut remapped = Vec::with_capacity(self.indices.len());
+        let mut visited_names = HashSet::new();
+        for index in self.indices.iter() {
+            let Some(segments) = affected_by_name.get(index.name.as_str()) else {
+                continue;
+            };
+            if !visited_names.insert(index.name.as_str()) {
+                continue;
+            }
+
+            for merge_group in
+                vector_segment_merge_groups_for_compaction(&self.dataset, segments).await
+            {
+                if let Some(merged) = self
+                    .remap_and_merge_vector_segments(&merge_group, &mapping)
+                    .await?
+                {
+                    remapped.extend(merged);
+                    continue;
+                }
+
+                for segment in merge_group {
+                    // Box the remap future at the call site: inlining `remap_index` into this
+                    // loop's async layout otherwise exceeds rustc's depth limit. It has to be
+                    // boxed here, not inside `remap_index` — boxing internally turns the
+                    // future's `Send` check into a `Box<Future>: Send` trait obligation that
+                    // overflows the solver through the cache types (E0275 downstream).
+                    let remap_result = Box::pin(self.remap_index(segment, &mapping)).await?;
+                    if let Some(remapped_index) = self
+                        .remapped_index_from_result(segment, remap_result)
+                        .await?
+                    {
                         remapped.push(remapped_index);
                     }
                 }
