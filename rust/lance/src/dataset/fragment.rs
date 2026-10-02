@@ -1753,7 +1753,7 @@ impl FileFragment {
             return Ok(physical_rows);
         }
 
-        // File-less fragments can occur; guard before indexing files[0] to avoid a panic.
+        // Without a trustworthy cached count, a data file must supply the length.
         if self.metadata.files.is_empty() {
             return Err(Error::not_found(format!(
                 "Fragment {} does not contain any data",
@@ -1938,7 +1938,9 @@ impl FileFragment {
                     self.dataset.base.clone(),
                     format!(
                         "Fragment metadata has incorrect physical_rows. Fragment: {} Actual: {} Metadata: {}",
-                        self.id(), first_length, physical_rows
+                        self.id(),
+                        first_length,
+                        physical_rows
                     ),
                 ));
             }
@@ -6794,21 +6796,27 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::empty(0)]
+    #[case::non_empty(7)]
     #[tokio::test]
-    async fn test_file_less_fragment_physical_rows_uses_cached_value() {
+    async fn test_file_less_fragment_physical_rows_uses_cached_value(#[case] physical_rows: usize) {
         let test_dir = TempStrDir::default();
         let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
         assert!(dataset.manifest.writer_version.is_some());
 
         let fragment = FileFragment::new(
             Arc::new(dataset.clone()),
-            Fragment::new(99).with_physical_rows(7),
+            Fragment::new(99).with_physical_rows(physical_rows),
         );
-        assert_eq!(fragment.physical_rows().await.unwrap(), 7);
+        assert_eq!(fragment.physical_rows().await.unwrap(), physical_rows);
+        fragment.validate().await.unwrap();
 
         Arc::make_mut(&mut dataset.manifest).writer_version = None;
-        let fragment =
-            FileFragment::new(Arc::new(dataset), Fragment::new(99).with_physical_rows(7));
+        let fragment = FileFragment::new(
+            Arc::new(dataset),
+            Fragment::new(99).with_physical_rows(physical_rows),
+        );
         let err = fragment.physical_rows().await.unwrap_err();
         assert!(matches!(err, Error::NotFound { .. }));
         assert_error_contains(err, "Fragment 99 does not contain any data");
@@ -6817,8 +6825,25 @@ mod tests {
         assert!(matches!(err, Error::CorruptFile { .. }));
         assert_error_contains(
             err,
-            "physical_rows=Some(7) cannot be trusted because manifest.writer_version is missing",
+            &format!(
+                "physical_rows=Some({physical_rows}) cannot be trusted because manifest.writer_version is missing"
+            ),
         );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_validate_checks_physical_rows_against_data_file() {
+        let test_dir = TempStrDir::default();
+        let dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        let mut metadata = dataset.manifest.fragments[0].clone();
+        let actual_rows = metadata.physical_rows.unwrap();
+        metadata.physical_rows = Some(actual_rows + 1);
+        let fragment = FileFragment::new(Arc::new(dataset), metadata);
+        assert_eq!(fragment.physical_rows().await.unwrap(), actual_rows + 1);
+
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(err, "Fragment metadata has incorrect physical_rows");
     }
 
     #[tokio::test]
@@ -6826,6 +6851,10 @@ mod tests {
         let test_dir = TempStrDir::default();
         let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
         let fragment = FileFragment::new(dataset, Fragment::new(99));
+
+        let err = fragment.physical_rows().await.unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
+        assert_error_contains(err, "Fragment 99 does not contain any data");
 
         let err = fragment.validate().await.unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }));

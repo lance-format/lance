@@ -3433,7 +3433,7 @@ mod test {
 
     #[rstest]
     #[case::single_fragment(9, None, None, &[9])]
-    #[case::multi_fragment(100, Some(50), Some(25), &[50, 50])]
+    #[case::multi_fragment(8, Some(4), Some(2), &[4, 4])]
     #[tokio::test]
     async fn test_scan_all_null_column_after_dropping_only_physical_column(
         #[case] num_rows: usize,
@@ -3464,7 +3464,13 @@ mod test {
         assert_eq!(x.null_count(), num_rows);
 
         let mut scanner = dataset.scan();
-        scanner.limit(Some(3), Some(2))?;
+        // Start in the first fragment and cross into the second when present.
+        let offset = if expected_fragment_rows.len() > 1 {
+            expected_fragment_rows[0] - 2
+        } else {
+            2
+        };
+        scanner.limit(Some(3), Some(offset as i64))?;
         let limited = scanner.try_into_batch().await?;
         assert_eq!(limited.num_rows(), 3);
         let x = limited["x"].as_any().downcast_ref::<Int64Array>().unwrap();
@@ -3475,7 +3481,7 @@ mod test {
 
     #[rstest]
     #[case::single_fragment(9, None, None, &[9])]
-    #[case::multi_fragment(100, Some(50), Some(25), &[50, 50])]
+    #[case::multi_fragment(8, Some(4), Some(2), &[4, 4])]
     #[tokio::test]
     async fn test_append_readded_column_after_dropping_only_physical_column(
         #[case] num_existing_rows: usize,
@@ -3518,6 +3524,8 @@ mod test {
             )
             .await?;
 
+        let dataset = Dataset::open(&test_dir).await?;
+        dataset.validate().await?;
         let data = dataset.scan().try_into_batch().await?;
 
         let expected_schema = ArrowSchema::new(vec![
@@ -3541,46 +3549,28 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
+    #[case::single_fragment(8, vec![8])]
+    #[case::multi_fragment(4, vec![4, 4])]
     #[tokio::test]
-    async fn test_scan_file_less_fragment_with_deletions_after_dropping_only_physical_column_single_fragment()
-    -> Result<()> {
-        let num_rows = 9;
-        let expected_fragment_rows = &[9];
-        let test_dir = TempStrDir::default();
-        let mut dataset = dataset_with_all_null_column(&test_dir, num_rows, None, None).await?;
-
-        let delete_result = dataset.delete("id = 3").await?;
-        assert_eq!(delete_result.num_deleted_rows, 1);
-
-        dataset.drop_columns(&["id"]).await?;
-
-        let dataset = Dataset::open(&test_dir).await?;
-        assert_file_less_fragments(&dataset, num_rows, expected_fragment_rows);
-        dataset.validate().await?;
-
-        let data = dataset.scan().try_into_batch().await?;
-        assert_eq!(data.num_rows(), num_rows - 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_scan_file_less_fragments_with_deletions_after_dropping_only_physical_column()
-    -> Result<()> {
-        let num_rows = 100;
-        let expected_fragment_rows = &[50, 50];
+    async fn test_scan_file_less_fragments_with_deletions_after_dropping_only_physical_column(
+        #[case] rows_per_fragment: usize,
+        #[case] expected_fragment_rows: Vec<usize>,
+    ) -> Result<()> {
+        let num_rows = 8;
         let test_dir = TempStrDir::default();
         let mut dataset =
-            dataset_with_all_null_column(&test_dir, num_rows, Some(50), Some(25)).await?;
+            dataset_with_all_null_column(&test_dir, num_rows, Some(rows_per_fragment), Some(2))
+                .await?;
 
-        let delete_result = dataset.delete("id = 10 OR id = 60").await?;
+        let delete_result = dataset.delete("id = 2 OR id = 6").await?;
         assert_eq!(delete_result.num_deleted_rows, 2);
         assert_eq!(dataset.count_deleted_rows().await?, 2);
 
         dataset.drop_columns(&["id"]).await?;
 
         let dataset = Dataset::open(&test_dir).await?;
-        assert_file_less_fragments(&dataset, num_rows, expected_fragment_rows);
+        assert_file_less_fragments(&dataset, num_rows, &expected_fragment_rows);
         assert_eq!(dataset.count_rows(None).await?, num_rows - 2);
 
         let fragments = dataset.get_fragments();
@@ -3600,6 +3590,14 @@ mod test {
         let x = data["x"].as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(x.len(), num_rows - 2);
         assert_eq!(x.null_count(), num_rows - 2);
+
+        let limited = dataset
+            .scan()
+            .limit(Some(3), Some(2))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(limited.num_rows(), 3);
+        assert_eq!(limited["x"].null_count(), 3);
 
         Ok(())
     }

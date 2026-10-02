@@ -850,14 +850,8 @@ async fn test_binary_copy_fallback_to_common_compaction() {
 async fn test_try_binary_copy_falls_back_for_file_less_fragment(
     #[case] enable_stable_row_ids: bool,
 ) {
-    do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_ids).await;
-}
-
-async fn do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_ids: bool) {
     let test_dir = TempStrDir::default();
-    let initial_batch =
-        arrow_array::record_batch!(("a", Int32, [1, 2]), ("b", Int32, [Some(10), Some(20)]))
-            .unwrap();
+    let initial_batch = arrow_array::record_batch!(("a", Int32, [1, 2])).unwrap();
     let initial_schema = initial_batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(initial_batch)], initial_schema),
@@ -870,6 +864,23 @@ async fn do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_
     )
     .await
     .unwrap();
+
+    // Put b in its own file so dropping a leaves the first fragment with an
+    // exact schema mapping and no extra physical columns.
+    let added_batch = arrow_array::record_batch!(("b", Int32, [Some(10), Some(20)])).unwrap();
+    let added_schema = added_batch.schema();
+    assert!(added_schema.field_with_name("b").unwrap().is_nullable());
+    dataset
+        .add_columns(
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(added_batch)],
+                added_schema,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
     let append_batch = arrow_array::record_batch!(("a", Int32, [3, 4])).unwrap();
     let append_schema = append_batch.schema();
@@ -895,6 +906,26 @@ async fn do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_
     assert!(!fragments[0].files.is_empty());
     assert!(fragments[1].files.is_empty());
 
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(can_use_binary_copy(&dataset, &options, &fragments[..1]).await);
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+    let error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..options.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("binary copy is not supported"));
+
     let before = dataset.scan().try_into_batch().await.unwrap();
     let expected =
         arrow_array::record_batch!(("b", Int32, [Some(10), Some(20), None, None])).unwrap();
@@ -905,15 +936,11 @@ async fn do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_
         None
     };
 
-    let options = CompactionOptions {
-        target_rows_per_fragment: 100_000,
-        compaction_mode: Some(CompactionMode::TryBinaryCopy),
-        ..Default::default()
-    };
-    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
-
     compact_files(&mut dataset, options, None).await.unwrap();
 
+    dataset.validate().await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let dataset = Dataset::open(&test_dir).await.unwrap();
     let after = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(after, expected);
     if let Some(row_ids_before) = row_ids_before {
@@ -1030,6 +1057,28 @@ async fn test_try_binary_copy_falls_back_after_physical_column_drop() {
 
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
     assert_eq!(dataset.get_fragments().len(), 1);
+}
+
+#[tokio::test]
+async fn test_can_use_binary_copy_rejects_extra_physical_columns() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_two_column_schema_evolution_dataset(&test_dir).await;
+    dataset.drop_columns(&["b"]).await.unwrap();
+    let mut fragments = dataset.manifest.fragments.as_ref().clone();
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let (fields, column_indices) =
+        lance_file::versions::data_file_columns(version, dataset.schema());
+    for fragment in &mut fragments {
+        // Even a mapping that only lists the surviving column cannot make
+        // binary copy discard the extra physical column in the source file.
+        fragment.files[0].fields = fields.clone().into();
+        fragment.files[0].column_indices = column_indices.clone().into();
+    }
+    let options = CompactionOptions {
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
 }
 
 #[tokio::test]
