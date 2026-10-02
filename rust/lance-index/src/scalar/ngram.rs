@@ -87,8 +87,11 @@ pub static POSTINGS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 pub static TEXT_PREPPER: LazyLock<TextAnalyzer> = LazyLock::new(|| {
     TextAnalyzer::builder(RawTokenizer::default())
-        .filter(LowerCaser)
+        // Fold before lower-casing: ASCII folding can emit UPPERCASE ASCII (e.g.
+        // '™' -> "TM", 'ℝ' -> "R"), and `ngram_to_token` only accepts [0-9a-z].
+        // Lower-casing after folding keeps every token in range.
         .filter(AsciiFoldingFilter)
+        .filter(LowerCaser)
         .build()
 });
 /// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
@@ -1980,6 +1983,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_tokenizer_folds_to_lowercase() {
+        let tokenizer = NGRAM_TOKENIZER.clone();
+        // ASCII folding can produce uppercase ASCII ('™' -> "TM"); tokens must still
+        // be lowercase so `ngram_to_token` stays within the alphabet.
+        let tokens = collect_tokens(&tokenizer, "a™b");
+        assert_eq!(tokens, vec!["atm", "tmb"]);
+        let tokens = collect_tokens(&tokenizer, "x№1");
+        assert_eq!(tokens, vec!["xno", "no1"]);
+    }
+
     async fn do_train(
         mut builder: NGramIndexBuilder,
         data: SendableRecordBatchStream,
@@ -2027,6 +2041,45 @@ mod tests {
             .await
             .unwrap();
         list.bitmap.iter().sorted().collect()
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_index_uppercase_folding() {
+        // Folding can produce uppercase ASCII; before the fix this overflowed in
+        // `ngram_to_token` (a panic under overflow checks).
+        let data = StringArray::from_iter_values(["abc™def", "x№1y", "plain"]);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _merges, _tmpdir) = do_train(builder, data).await;
+
+        let res = index
+            .search(
+                &TextQuery::StringContains("c™d".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(SearchResult::at_most(RowAddrTreeMap::from_iter([0])), res);
+
+        let res = index
+            .search(
+                &TextQuery::StringContains("№1y".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(SearchResult::at_most(RowAddrTreeMap::from_iter([1])), res);
     }
 
     #[test_log::test(tokio::test)]
