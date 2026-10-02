@@ -247,9 +247,78 @@ message HnswParameters {
   uint32 max_level = 3;
 }
 
+/* The data type a JSON index extracted its values as, before handing them to
+ * the target index.
+ *
+ * A JSON value has no fixed type, so a JSON index decodes the value at its path
+ * into a single Arrow type and trains the target index on that. The variants
+ * below are the image of the JSONB type tags: a JSON boolean becomes BOOLEAN, a
+ * JSON integer INT64, a JSON float FLOAT64, a JSON string UTF8, and a JSON array
+ * or object LARGE_BINARY holding the re-serialized JSONB value.
+ */
+enum JsonTargetDataType {
+  /* The type this index was trained on is not recorded here. An index built
+   * before this field existed carries UNSPECIFIED, and so does one whose type
+   * a later rewrite of these details could not recover.
+   *
+   * A reader that needs the type must first ask the target index: some target
+   * types retain the Arrow type they were trained on, and that answer is
+   * authoritative. Only a target that cannot report one leaves the type to be
+   * inferred by decoding the data again, reading the type tag of the first
+   * non-null value at the path and falling back to UTF8 when every value is
+   * null. Inference depends on which rows are read -- inferring over a
+   * different row set, or over disjoint subsets in separate workers, can
+   * produce a different type than the original index -- which is the
+   * inconsistency this field exists to prevent, so it is the last resort
+   * rather than the defined behavior for UNSPECIFIED.
+   *
+   * Because UNSPECIFIED records no type, there is nothing for a rewrite to
+   * preserve, and it is the one value the preservation rule on field 3 does
+   * not cover: an implementation rewriting these details may replace
+   * UNSPECIFIED with a type it recovered authoritatively, and should, so the
+   * index stops being ambiguous. It must not replace it with an inferred type,
+   * which would persist a row-dependent guess as though it were recorded fact.
+   *
+   * A build that understands this field always records it when training a new
+   * index, so UNSPECIFIED is only ever a legacy or unrecoverable state.
+   */
+  JSON_TARGET_DATA_TYPE_UNSPECIFIED = 0;
+  JSON_TARGET_DATA_TYPE_BOOLEAN = 1;
+  JSON_TARGET_DATA_TYPE_INT64 = 2;
+  JSON_TARGET_DATA_TYPE_FLOAT64 = 3;
+  JSON_TARGET_DATA_TYPE_UTF8 = 4;
+  JSON_TARGET_DATA_TYPE_LARGE_BINARY = 5;
+}
+
 message JsonIndexDetails {
+  // The JSON path whose value is indexed, e.g. `$.user.id`.
   string path = 1;
+  // Details of the index built over the extracted values.
   google.protobuf.Any target_details = 2;
+  /* The type the extracted values were decoded to, which is also the type the
+   * target index was trained on.
+   *
+   * Recording it closes the type gap: rebuilding from these details reproduces
+   * the original type instead of re-inferring it from whatever rows the
+   * rebuild happens to see. See JSON_TARGET_DATA_TYPE_UNSPECIFIED for how to
+   * recover the type when it is absent.
+   *
+   * This completes the description of the extracted values only. These details
+   * still do not record the target index's format version, so they are not a
+   * general, lossless description of the index and must not be read as one.
+   *
+   * An implementation that rewrites these details without retraining the target
+   * index -- compacting or updating it -- must preserve a recorded type
+   * exactly. Every value other than JSON_TARGET_DATA_TYPE_UNSPECIFIED is
+   * copied through unchanged, including one the implementation does not
+   * recognize; otherwise a variant added by a later revision is erased by any
+   * older reader that touches the index.
+   *
+   * JSON_TARGET_DATA_TYPE_UNSPECIFIED is the sole exception, because it
+   * records no type to preserve. See its own documentation for when a rewrite
+   * may replace it.
+   */
+  JsonTargetDataType target_data_type = 3;
 }
 message BloomFilterIndexDetails {}
 
