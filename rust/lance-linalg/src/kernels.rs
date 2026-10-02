@@ -37,6 +37,13 @@ pub fn argmax<T: Num + Bounded + PartialOrd>(iter: impl Iterator<Item = T>) -> O
     max_idx
 }
 
+/// Finds the index of the maximum value in an iterator of optional values.
+///
+/// `None` elements are skipped.
+///
+/// Returns `None` if the iterator is empty, contains only `None` values,
+/// or no value is strictly greater than the initial lower bound
+/// (`T::min_value()`).
 pub fn argmax_opt<T: Num + Bounded + PartialOrd>(
     iter: impl Iterator<Item = Option<T>>,
 ) -> Option<u32> {
@@ -89,6 +96,17 @@ pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> Option<(u3
     min_idx.map(|idx| (idx, min_value))
 }
 
+/// Finds the index and value of the element minimizing `value + bias`,
+/// where `bias` comes from an optional second iterator.
+///
+/// The comparison uses `value + bias`, but the returned value is the
+/// original `value` without the bias term. Passing `None` for `bias`
+/// is equivalent to [`argmin_value_float`].
+///
+/// The two iterators are zipped, so iteration stops at the shorter one.
+///
+/// Returns `None` if the zipped iterator is empty or no `value + bias`
+/// is strictly less than the initial bound (`T::infinity()`).
 #[inline]
 pub fn argmin_value_float_with_bias<T: Float>(
     iter: impl Iterator<Item = T>,
@@ -111,6 +129,14 @@ pub fn argmin_value_float_with_bias<T: Float>(
     min_idx.map(|idx| (idx, min_original_value))
 }
 
+/// Finds the index and value of the minimum element in an iterator of
+/// optional values.
+///
+/// `None` elements are skipped.
+///
+/// Returns `None` if the iterator is empty, contains only `None` values,
+/// or no value is strictly less than the initial upper bound
+/// (`T::max_value()`).
 pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
     iter: impl Iterator<Item = Option<T>>,
 ) -> Option<(u32, T)> {
