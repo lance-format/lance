@@ -600,6 +600,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                 // Create a NEW shard for each iteration
                                 let shard_id = Uuid::new_v4();
                                 let default_config = ShardWriterConfig::default();
+                                #[allow(deprecated)]
                                 let config = ShardWriterConfig {
                                     shard_id,
                                     shard_spec_id: 0,
