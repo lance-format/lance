@@ -12,6 +12,7 @@ on:
       - rust/**
       - python/**
       - protos/**
+      - java/**
 permissions:
   contents: read
 
