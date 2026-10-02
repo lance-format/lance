@@ -17,9 +17,9 @@ import org.lance.Dataset;
 import org.lance.JniLoader;
 import org.lance.LockManager;
 import org.lance.Transaction;
+import org.lance.ipc.LanceArrowReaders;
 
 import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -70,7 +70,7 @@ public class DatasetDelta implements Closeable {
       BufferAllocator allocator = dataset.allocator();
       try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
         nativeGetInsertedRows(s.memoryAddress());
-        return Data.importArrayStream(allocator, s);
+        return LanceArrowReaders.importArrayStream(allocator, s, "DatasetDelta.getInsertedRows");
       }
     }
   }
@@ -84,7 +84,7 @@ public class DatasetDelta implements Closeable {
       BufferAllocator allocator = dataset.allocator();
       try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
         nativeGetUpdatedRows(s.memoryAddress());
-        return Data.importArrayStream(allocator, s);
+        return LanceArrowReaders.importArrayStream(allocator, s, "DatasetDelta.getUpdatedRows");
       }
     }
   }
