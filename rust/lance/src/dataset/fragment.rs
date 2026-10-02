@@ -68,7 +68,7 @@ use super::hash_joiner::HashJoiner;
 use super::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
 use super::scanner::Scanner;
 
-use super::updater::Updater;
+use super::updater::{OutputSchema, Updater};
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
@@ -2222,10 +2222,8 @@ impl FileFragment {
     ///
     /// The columns `_rowaddr` and `_rowid` can be used to load the row id or row address
     ///
-    /// The `schemas` parameter is a tuple of the write schema (just the new fields)
-    /// and the full schema (the target schema after the update). If the write
-    /// schema is None, it is inferred from the first batch of results. The full
-    /// schema is inferred by appending the write schema to the existing schema.
+    /// The `output` parameter gives the new columns up front, or the maximum
+    /// field id to infer them from the first batch of results.
     ///
     /// The `batch_size` parameter can be used to influence how much data is processed
     /// at a time. This can be useful to control memory usage when processing very large
@@ -2237,7 +2235,7 @@ impl FileFragment {
     pub(crate) async fn updater<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
-        schemas: Option<(Schema, Schema)>,
+        output: OutputSchema,
         batch_size: Option<u32>,
         blob_handling: Option<BlobHandling>,
     ) -> Result<Updater> {
@@ -2246,14 +2244,14 @@ impl FileFragment {
             .manifest
             .data_storage_format
             .lance_file_format();
-        self.updater_with_version(columns, schemas, batch_size, blob_handling, write_version)
+        self.updater_with_version(columns, output, batch_size, blob_handling, write_version)
             .await
     }
 
     pub(crate) async fn updater_with_version<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
-        schemas: Option<(Schema, Schema)>,
+        output: OutputSchema,
         batch_size: Option<u32>,
         blob_handling: Option<BlobHandling>,
         write_version: ConcreteFileVersion,
@@ -2302,7 +2300,7 @@ impl FileFragment {
             self.clone(),
             reader,
             deletion_vector,
-            schemas,
+            output,
             batch_size,
             write_version,
         )
@@ -2348,20 +2346,32 @@ impl FileFragment {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        // Use the same starting id as the updater so schema and data file ids match.
-        new_schema.set_field_id(Some(self.dataset.manifest.max_field_id()));
+        let max_field_id = self.dataset.manifest.max_field_id();
+        new_schema.set_field_id(Some(max_field_id));
 
         let new_fragment = self
             .clone()
-            .merge(left_on, &joiner)
+            .merge(left_on, &joiner, max_field_id)
             .await
             .map(|f| f.metadata)?;
 
         Ok((new_fragment, new_schema))
     }
 
-    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None, None, None).await?;
+    pub(crate) async fn merge(
+        mut self,
+        join_column: &str,
+        joiner: &HashJoiner,
+        max_field_id: i32,
+    ) -> Result<Self> {
+        let mut updater = self
+            .updater(
+                Some(&[join_column]),
+                OutputSchema::Inferred { max_field_id },
+                None,
+                None,
+            )
+            .await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner
@@ -2466,7 +2476,10 @@ impl FileFragment {
         let mut updater = self
             .updater(
                 Some(&read_columns),
-                Some((write_schema.clone(), self.schema().clone())),
+                OutputSchema::Known {
+                    write: write_schema.clone(),
+                    complete: self.schema().clone(),
+                },
                 None,
                 blob_handling,
             )
@@ -6749,10 +6762,16 @@ mod tests {
                 .map(|f| f.id as usize)
                 .collect::<Vec<_>>();
             let mut merged_fragments = Vec::new();
+            let max_field_id = dataset.manifest.max_field_id();
             for fragment_id in fragment_ids {
                 let fragment = &mut dataset.get_fragment(fragment_id).unwrap();
                 let mut updater = fragment
-                    .updater(Some(&["i"]), None, None, None)
+                    .updater(
+                        Some(&["i"]),
+                        OutputSchema::Inferred { max_field_id },
+                        None,
+                        None,
+                    )
                     .await
                     .unwrap();
                 while let Some(batch) = updater.next().await.unwrap() {
@@ -6879,8 +6898,14 @@ mod tests {
             true,
         )]));
         let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let max_field_id = dataset.manifest.max_field_id();
         let mut updater = fragment
-            .updater(Some(&["i"]), None, None, None)
+            .updater(
+                Some(&["i"]),
+                OutputSchema::Inferred { max_field_id },
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -7146,7 +7171,15 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"]), None, None, None).await?;
+        let max_field_id = dataset.manifest.max_field_id();
+        let mut updater = fragment
+            .updater(
+                Some(&["i"]),
+                OutputSchema::Inferred { max_field_id },
+                None,
+                None,
+            )
+            .await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;

@@ -8,6 +8,7 @@ use std::{
 
 use super::fragment::FileFragment;
 use super::hash_joiner::HashJoiner;
+use super::updater::OutputSchema;
 use super::{
     Dataset,
     transaction::{Operation, Transaction},
@@ -256,6 +257,9 @@ pub(super) async fn add_columns_to_fragments(
         Ok::<(), Error>(())
     };
 
+    let max_field_id = dataset.manifest.max_field_id();
+    let inferred = OutputSchema::Inferred { max_field_id };
+
     // Optimize the transforms
     let mut optimizer = ChainedNewColumnTransformOptimizer::new(vec![]);
     super::versions::configure_new_column_optimizers(version, &mut optimizer);
@@ -270,7 +274,7 @@ pub(super) async fn add_columns_to_fragments(
                 udf.mapper,
                 batch_size,
                 udf.result_checkpoint,
-                None,
+                inferred,
             )
             .await?;
             Result::Ok((
@@ -341,20 +345,23 @@ pub(super) async fn add_columns_to_fragments(
 
             let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
             let result =
-                add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
+                add_columns_impl(fragments, read_columns, mapper, batch_size, None, inferred)
+                    .await?;
             Ok((output_schema, result.fragments, result.fragments_to_cleanup))
         }
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
-            let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            let fragments =
+                add_columns_from_stream(fragments, stream, inferred, batch_size).await?;
             Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
-            let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            let fragments =
+                add_columns_from_stream(fragments, stream, inferred, batch_size).await?;
             Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::AllNulls(output_schema) => {
@@ -390,7 +397,7 @@ pub(super) async fn add_columns_to_fragments(
             return Err(e);
         }
     };
-    schema.set_field_id(Some(dataset.manifest.max_field_id()));
+    schema.set_field_id(Some(max_field_id));
 
     let preserves_nullability = !merge_introduces_required_field(dataset.schema(), &schema);
 
@@ -639,7 +646,7 @@ async fn add_columns_impl(
     mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
     batch_size: Option<u32>,
     result_cache: Option<Arc<dyn UDFCheckpointStore>>,
-    schemas: Option<(Schema, Schema)>,
+    output: OutputSchema,
 ) -> Result<AddColumnFragments> {
     let read_columns_ref = read_columns.as_deref();
     let mapper_ref = mapper.as_ref();
@@ -664,7 +671,7 @@ async fn add_columns_impl(
         }
 
         let mut updater = match fragment
-            .updater(read_columns_ref, schemas.clone(), batch_size, None)
+            .updater(read_columns_ref, output.clone(), batch_size, None)
             .await
         {
             Ok(updater) => updater,
@@ -735,14 +742,14 @@ async fn add_columns_impl(
 async fn add_columns_from_stream(
     fragments: &[FileFragment],
     mut stream: SendableRecordBatchStream,
-    schemas: Option<(Schema, Schema)>,
+    output: OutputSchema,
     batch_size: Option<u32>,
 ) -> Result<Vec<Fragment>> {
     let mut new_fragments = Vec::with_capacity(fragments.len());
     let mut last_seen_batch: Option<RecordBatch> = None;
     for fragment in fragments {
         let mut updater = match fragment
-            .updater::<String>(Some(&[]), schemas.clone(), batch_size, None)
+            .updater::<String>(Some(&[]), output.clone(), batch_size, None)
             .await
         {
             Ok(updater) => updater,
@@ -1079,7 +1086,10 @@ pub(super) async fn alter_columns(
             mapper,
             None,
             None,
-            Some((new_col_schema, new_schema.clone())),
+            OutputSchema::Known {
+                write: new_col_schema,
+                complete: new_schema.clone(),
+            },
         )
         .await?;
 
@@ -4218,6 +4228,14 @@ mod test {
             ])
             .await?;
         dataset.validate().await?;
+        assert_eq!(dataset.schema().field("a").unwrap().id, 3);
+        assert_eq!(dataset.schema().field("b").unwrap().id, 2);
+        for fragment in dataset.fragments().iter() {
+            assert_eq!(fragment.files.len(), 1);
+            let mut field_ids = fragment.files[0].fields.to_vec();
+            field_ids.sort_unstable();
+            assert_eq!(field_ids, [2, 3]);
+        }
 
         let data = dataset.scan().try_into_batch().await?;
         assert_eq!(data["a"].as_ref(), &Int64Array::from(vec![1, 2]));
@@ -4736,10 +4754,12 @@ mod test {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
+                max_rows_per_file: 1,
                 ..Default::default()
             }),
         )
         .await?;
+        assert_eq!(dataset.fragments().len(), 2);
         assert_eq!(dataset.manifest.max_field_id(), 0);
 
         // Test we can add 1 column, drop it, then add another column. Validate
@@ -4792,6 +4812,7 @@ mod test {
         assert_eq!(dataset.manifest.max_field_id(), 2);
 
         dataset.drop_columns(&["b"]).await?;
+        assert_eq!(dataset.schema().max_field_id(), Some(1));
         // Even though we dropped a column, we still have the fragment with a and
         // b. So it should still act as if that field id is still in play.
         assert_eq!(dataset.manifest.max_field_id(), 2);
@@ -4804,6 +4825,11 @@ mod test {
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 3);
+        assert_eq!(dataset.schema().field("c").unwrap().id, 3);
+        for fragment in dataset.fragments().iter() {
+            assert_eq!(fragment.files.last().unwrap().fields.as_ref(), &[3]);
+        }
+        dataset.validate().await?;
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = Arc::new(ArrowSchema::new(vec![

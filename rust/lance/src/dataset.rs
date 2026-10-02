@@ -3790,15 +3790,20 @@ impl Dataset {
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
+        let max_field_id = self.manifest.max_field_id();
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(self.manifest.max_field_id()));
+        new_schema.set_field_id(Some(max_field_id));
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
         let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
             .then(|f| {
                 let joiner = joiner.clone();
-                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
+                async move {
+                    f.merge(left_on, &joiner, max_field_id)
+                        .await
+                        .map(|f| f.metadata)
+                }
             })
             .try_collect::<Vec<_>>()
             .await?;

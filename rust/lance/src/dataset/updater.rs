@@ -23,10 +23,8 @@ use crate::dataset::FileFragment;
 /// then call [`Updater::update`] to update the batch. Repeat until
 /// [`Updater::next`] returns `None`.
 ///
-/// `write_schema` dictates the schema of the new file, while `final_schema` is
-/// the schema of the full fragment after the update. These are optional and if
-/// not specified, the updater will infer the write schema from the first batch
-/// of results and will append them to the current schema to get the final schema.
+/// The schema of the written columns can be supplied up front or inferred
+/// from the first batch of results.
 pub struct Updater {
     fragment: FileFragment,
 
@@ -38,11 +36,7 @@ pub struct Updater {
 
     writer: Option<Box<dyn GenericWriter>>,
 
-    /// The final schema of the fragment after the update.
-    final_schema: Option<Schema>,
-
-    /// The schema the new files will be written in. This only contains new columns.
-    write_schema: Option<Schema>,
+    output: OutputSchema,
 
     allow_external_blob_outside_bases: bool,
 
@@ -55,17 +49,11 @@ pub struct Updater {
 
 impl Updater {
     /// Create a new updater with source reader, and destination writer.
-    ///
-    /// The `schemas` parameter is a tuple of the write schema (just the new fields)
-    /// and the final schema (all the fields).
-    ///
-    /// If the schemas are not known, they can be None and will be inferred from
-    /// the first batch of results.
     pub(super) async fn try_new(
         fragment: FileFragment,
         reader: FragmentReader,
         deletion_vector: DeletionVector,
-        schemas: Option<(Schema, Schema)>,
+        output: OutputSchema,
         batch_size: Option<u32>,
         write_version: ConcreteFileVersion,
     ) -> Result<Self> {
@@ -75,11 +63,6 @@ impl Updater {
                 fragment.id()
             )));
         }
-        let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
-            (Some(write_schema), Some(final_schema))
-        } else {
-            (None, None)
-        };
 
         let source_version = fragment
             .metadata()
@@ -113,10 +96,7 @@ impl Updater {
             input_stream,
             last_input: None,
             writer: None,
-            write_schema,
-            final_schema,
-            // The schema adapter needs the data schema, not the logical schema, so it can't be
-            // created until after the first batch is read.
+            output,
             allow_external_blob_outside_bases: false,
             write_version,
             finished: false,
@@ -220,24 +200,26 @@ impl Updater {
         let batch = self.deletion_restorer.restore(batch)?;
 
         if self.writer.is_none() {
-            if self.write_schema.is_none() {
-                // Need to infer the schema.
-                let output_schema = batch.schema();
-                let mut final_schema = self.fragment.schema().merge(output_schema.as_ref())?;
-                final_schema.set_field_id(Some(self.fragment.dataset().manifest.max_field_id()));
-                self.final_schema = Some(final_schema);
-                self.final_schema.as_ref().unwrap().validate()?;
-                self.write_schema = Some(self.final_schema.as_ref().unwrap().project_by_schema(
-                    output_schema.as_ref(),
-                    OnMissing::Error,
-                    OnTypeMismatch::Error,
-                )?);
-            }
-
-            self.writer = Some(
-                self.new_writer(self.write_schema.as_ref().unwrap().clone())
-                    .await?,
-            );
+            let write = match &self.output {
+                OutputSchema::Known { write, .. } => write.clone(),
+                OutputSchema::Inferred { max_field_id } => {
+                    let output_schema = batch.schema();
+                    let mut complete = self.fragment.schema().merge(output_schema.as_ref())?;
+                    complete.set_field_id(Some(*max_field_id));
+                    complete.validate()?;
+                    let write = complete.project_by_schema(
+                        output_schema.as_ref(),
+                        OnMissing::Error,
+                        OnTypeMismatch::Error,
+                    )?;
+                    self.output = OutputSchema::Known {
+                        write: write.clone(),
+                        complete,
+                    };
+                    write
+                }
+            };
+            self.writer = Some(self.new_writer(write).await?);
         }
 
         let writer = self.writer.as_mut().unwrap();
@@ -297,8 +279,23 @@ impl Updater {
     /// not specified up front and the first batch of results has not yet been
     /// processed.
     pub fn schema(&self) -> Option<&Schema> {
-        self.final_schema.as_ref()
+        match &self.output {
+            OutputSchema::Known { complete, .. } => Some(complete),
+            OutputSchema::Inferred { .. } => None,
+        }
     }
+}
+
+/// The columns an [`Updater`] writes.
+#[derive(Clone)]
+pub(crate) enum OutputSchema {
+    /// `write` holds only the new columns; `complete` is the fragment schema
+    /// after the update.
+    Known { write: Schema, complete: Schema },
+    /// Inferred from the first batch of results. New fields take ids above
+    /// `max_field_id`, the manifest-wide maximum that includes dropped fields.
+    /// Callers compute it once per operation because it scans every fragment.
+    Inferred { max_field_id: i32 },
 }
 
 /// Restores deleted rows.
