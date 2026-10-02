@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -2073,8 +2073,8 @@ impl Scanner {
 
         let key = match &element_type {
             dt if dt == q.data_type() => q,
-            dt if dt.is_floating() => coerce_float_vector(
-                q.as_any().downcast_ref::<Float32Array>().unwrap(),
+            dt if dt.is_floating() && q.data_type() == &DataType::Float32 => coerce_float_vector(
+                q.as_primitive::<arrow_array::types::Float32Type>(),
                 FloatType::try_from(dt)?,
             )?,
             _ => {
@@ -8172,8 +8172,8 @@ pub mod test_dataset {
     use std::{collections::HashMap, vec};
 
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
-        types::Float32Type,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+        StringArray, types::Float32Type,
     };
     use arrow_schema::{ArrowError, DataType};
     use lance_arrow::FixedSizeListArrayExt;
@@ -8500,8 +8500,9 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
-        PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
+        ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array,
+        Int32Array, LargeStringArray, ListArray, PrimitiveArray, RecordBatchIterator, StringArray,
+        StructArray, UInt8Array, UInt32Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -11096,6 +11097,75 @@ mod test {
             err.contains("query dim(64) doesn't match the column vec vector dim(32)"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nearest_query_element_type_conversion() {
+        let float16 = FixedSizeListArray::try_new_from_values(
+            Float16Array::from(vec![f16::from_f32(1.0), f16::from_f32(2.0)]),
+            2,
+        )
+        .unwrap();
+        let float32 =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let float64 =
+            FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("float16", float16.data_type().clone(), false),
+            ArrowField::new("float32", float32.data_type().clone(), false),
+            ArrowField::new("float64", float64.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(float16), Arc::new(float32), Arc::new(float64)],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let float16_query: ArrayRef = Arc::new(Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+        ]));
+        let float32_query: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0]));
+        let float64_query: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+        let integer_query: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let list_query: ArrayRef =
+            Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+            ]));
+
+        for (column, query) in [
+            ("float32", &float64_query),
+            ("float32", &float16_query),
+            ("float32", &integer_query),
+        ] {
+            let Err(error) = dataset.scan().nearest(column, query.as_ref(), 1) else {
+                panic!("expected {column} to reject {}", query.data_type());
+            };
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("Float32") && message.contains(&query.data_type().to_string()),
+                "unexpected error: {message}"
+            );
+        }
+
+        for (column, query, expected_type) in [
+            ("float16", &float32_query, DataType::Float16),
+            ("float64", &float32_query, DataType::Float64),
+            ("float32", &float32_query, DataType::Float32),
+            ("float64", &float64_query, DataType::Float64),
+            ("float16", &float16_query, DataType::Float16),
+            ("float64", &list_query, DataType::Float64),
+        ] {
+            let mut scan = dataset.scan();
+            scan.nearest(column, query.as_ref(), 1).unwrap();
+            assert_eq!(
+                scan.nearest.as_ref().unwrap().key.data_type(),
+                &expected_type
+            );
+        }
     }
 
     async fn dataset_with_query_index_column() -> (TempStrDir, Dataset) {
