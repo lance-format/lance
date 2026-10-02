@@ -300,8 +300,31 @@ mod zstd {
 }
 
 #[cfg(feature = "lz4")]
+pub use lz4::LZ4_MAX_INPUT_SIZE;
+
+#[cfg(feature = "lz4")]
 mod lz4 {
     use super::*;
+
+    /// The largest input a single LZ4 block compression call accepts
+    /// (`LZ4_MAX_INPUT_SIZE`). Beyond this `compress_bound` fails. The buffers we
+    /// write also prepend the uncompressed length as a `u32`, so this format cannot
+    /// represent larger inputs either way.
+    pub const LZ4_MAX_INPUT_SIZE: usize = 0x7E000000;
+
+    /// Reject oversized input up front. The underlying crate would otherwise fail
+    /// with a bare "Compression input too long" that names neither the actual size
+    /// nor the limit, which is hard to act on.
+    pub fn check_input_size(len: usize) -> Result<()> {
+        if len > LZ4_MAX_INPUT_SIZE {
+            return Err(Error::invalid_input(format!(
+                "LZ4 compression input is {} bytes which exceeds the maximum LZ4 input \
+                 size of {} bytes. Use zstd for buffers of this size.",
+                len, LZ4_MAX_INPUT_SIZE,
+            )));
+        }
+        Ok(())
+    }
 
     #[derive(Debug, Default)]
     pub struct Lz4BufferCompressor {}
@@ -310,6 +333,8 @@ mod lz4 {
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
             // Remember the starting position
             let start_pos = output_buf.len();
+
+            check_input_size(input_buf.len())?;
 
             // LZ4 needs space for the compressed data
             let max_size = ::lz4::block::compress_bound(input_buf.len())?;
@@ -809,6 +834,21 @@ mod tests {
                 check_round_trip_encoding_generated,
             },
         };
+
+        /// Guard the single-call LZ4 size limit. Checked as a pure function so the
+        /// test does not need to allocate multiple GiB.
+        #[test]
+        fn test_lz4_input_size_limit() {
+            use crate::encodings::physical::block::lz4::check_input_size;
+
+            assert!(check_input_size(LZ4_MAX_INPUT_SIZE).is_ok());
+            let err = check_input_size(LZ4_MAX_INPUT_SIZE + 1).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&LZ4_MAX_INPUT_SIZE.to_string()) && msg.contains("zstd"),
+                "error should name the limit and the alternative, got: {msg}"
+            );
+        }
 
         #[test]
         fn test_lz4_compress_decompress() {
