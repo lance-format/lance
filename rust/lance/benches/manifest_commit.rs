@@ -33,6 +33,9 @@
 //! - `DATASET_PREFIX`: Base URI for datasets (e.g. s3://bucket/prefix or /tmp/bench).
 //!   If not set, uses a temporary directory.
 //! - `NUM_ITERATIONS`: Number of small fragment writes to perform (default: 100).
+//! - `NUM_COLUMNS`: Number of columns in the dataset (default: 2: `id` + `name`).
+//!   Larger values measure how manifest size / commit cost scale with width
+//!   (the manifest is a full snapshot, so it grows with columns x fragments).
 //! - `ROWS_PER_FRAGMENT`: Number of rows per fragment (default: 10).
 //! - `DELETE_DATASET`: When "true", delete the dataset after benchmark completes.
 //! - `ENABLE_CACHE`: When "true", enable manifest caching for load measurements.
@@ -40,7 +43,7 @@
 
 #![allow(clippy::print_stdout)]
 
-use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::builder::DatasetBuilder;
@@ -55,6 +58,7 @@ use uuid::Uuid;
 
 const DEFAULT_ROWS_PER_FRAGMENT: usize = 10;
 const DEFAULT_NUM_ITERATIONS: usize = 100;
+const DEFAULT_NUM_COLUMNS: usize = 2;
 
 fn get_rows_per_fragment() -> usize {
     std::env::var("ROWS_PER_FRAGMENT")
@@ -68,6 +72,14 @@ fn get_num_iterations() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_NUM_ITERATIONS)
+}
+
+fn get_num_columns() -> usize {
+    std::env::var("NUM_COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_NUM_COLUMNS)
+        .max(2)
 }
 
 fn get_delete_dataset() -> bool {
@@ -107,12 +119,17 @@ fn get_storage_label(prefix: &str) -> &'static str {
 async fn create_initial_dataset(
     uri: &str,
     rows_per_fragment: usize,
+    num_columns: usize,
     session: Arc<Session>,
 ) -> Dataset {
-    let schema = Arc::new(ArrowSchema::new(vec![
+    let mut fields = vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
-    ]));
+    ];
+    for i in 0..num_columns.saturating_sub(2) {
+        fields.push(Field::new(format!("col_{:04}", i), DataType::Int64, true));
+    }
+    let schema = Arc::new(ArrowSchema::new(fields));
 
     let batch = create_batch(schema.clone(), 0, rows_per_fragment);
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -131,13 +148,30 @@ async fn create_initial_dataset(
 }
 
 fn create_batch(schema: Arc<ArrowSchema>, start_id: usize, num_rows: usize) -> RecordBatch {
-    let ids = Int64Array::from_iter_values((start_id as i64)..((start_id + num_rows) as i64));
-    let names = StringArray::from_iter_values(
-        (start_id..(start_id + num_rows)).map(|i| format!("name_{}", i)),
-    );
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let array: ArrayRef = match field.data_type() {
+            DataType::Int64 => {
+                if field.name() == "id" {
+                    Arc::new(Int64Array::from_iter_values(
+                        (start_id as i64)..((start_id + num_rows) as i64),
+                    ))
+                } else {
+                    // Filler column: small values for compact encoding
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..num_rows).map(|i| (i % 100) as i64),
+                    ))
+                }
+            }
+            DataType::Utf8 => Arc::new(StringArray::from_iter_values(
+                (start_id..(start_id + num_rows)).map(|i| format!("name_{}", i)),
+            )),
+            _ => panic!("unsupported bench field type: {}", field.data_type()),
+        };
+        columns.push(array);
+    }
 
-    RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names)])
-        .expect("failed to create batch")
+    RecordBatch::try_new(schema, columns).expect("failed to create batch")
 }
 
 fn bench_manifest_commit(c: &mut Criterion) {
@@ -146,6 +180,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let dataset_prefix = get_dataset_prefix();
     let num_iterations = get_num_iterations();
     let rows_per_fragment = get_rows_per_fragment();
+    let num_columns = get_num_columns();
     let delete_dataset = get_delete_dataset();
     let enable_cache = get_enable_cache();
     let storage_label = get_storage_label(&dataset_prefix);
@@ -160,6 +195,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     println!("=== Manifest Commit Benchmark Setup ===");
     println!("Storage: {} ({})", uri, storage_label);
     println!("Rows per fragment: {}", rows_per_fragment);
+    println!("Number of columns: {}", num_columns);
     println!("Number of iterations: {}", num_iterations);
     println!(
         "Total fragments (including initial): {}",
@@ -190,6 +226,7 @@ fn bench_manifest_commit(c: &mut Criterion) {
     let initial_dataset = runtime.block_on(create_initial_dataset(
         &uri,
         rows_per_fragment,
+        num_columns,
         session.clone(),
     ));
 
@@ -206,9 +243,11 @@ fn bench_manifest_commit(c: &mut Criterion) {
 
     let mut commit_latencies = Vec::with_capacity(num_iterations);
     let mut load_latencies = Vec::with_capacity(num_iterations);
+    let mut manifest_bytes = Vec::with_capacity(num_iterations + 1);
+    manifest_bytes.push(current_dataset.manifest().serialized().len());
 
     println!("Running commit and load benchmarks...");
-    println!("fragments,commit_ms,load_ms");
+    println!("fragments,columns,commit_ms,load_ms,manifest_bytes");
 
     for i in 1..=num_iterations {
         let num_fragments = i + 1;
@@ -263,15 +302,18 @@ fn bench_manifest_commit(c: &mut Criterion) {
         });
 
         current_dataset = new_dataset;
+        manifest_bytes.push(current_dataset.manifest().serialized().len());
 
         commit_latencies.push(commit_time);
         load_latencies.push(load_time);
 
         println!(
-            "{},{:.2},{:.2}",
+            "{},{},{:.2},{:.2},{}",
             num_fragments,
+            num_columns,
             commit_time.as_secs_f64() * 1000.0,
-            load_time.as_secs_f64() * 1000.0
+            load_time.as_secs_f64() * 1000.0,
+            manifest_bytes.last().unwrap()
         );
     }
 
@@ -346,6 +388,16 @@ fn bench_manifest_commit(c: &mut Criterion) {
         "Degradation ratio: commit={:.2}x, load={:.2}x",
         last_10_avg_commit / first_10_avg_commit,
         last_10_avg_load / first_10_avg_load
+    );
+
+    let first_manifest = manifest_bytes.first().copied().unwrap_or(0);
+    let last_manifest = manifest_bytes.last().copied().unwrap_or(0);
+    println!(
+        "Manifest size: first={}, last={} ({:.2}x growth, avg +{:.0} bytes/iteration)",
+        first_manifest,
+        last_manifest,
+        last_manifest as f64 / first_manifest.max(1) as f64,
+        (last_manifest.saturating_sub(first_manifest)) as f64 / manifest_bytes.len().max(1) as f64
     );
 
     let mut group = c.benchmark_group("manifest_commit");
