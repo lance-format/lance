@@ -33,6 +33,10 @@ pub use combined::{
     CombinedCorpusStats, CombinedFieldColumn, FlatFieldStats, build_combined_bm25_scorer,
     combined_fields_search, flat_combined_fields_search_stream, validate_combined_tokenizers,
 };
+/// The `combined_fields` MAXSCORE pruning counters, for tests and benches. Never
+/// reachable on a normal build; see the `test-scan-stats` feature.
+#[cfg(any(test, feature = "test-scan-stats"))]
+pub use combined::{MaxscoreStats, combined_fields_search_with_stats};
 pub use compound::{
     compound_search, compound_search_prepared_match,
     compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
