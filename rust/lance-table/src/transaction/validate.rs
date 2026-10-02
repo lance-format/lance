@@ -94,6 +94,24 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             }
             Ok(())
         }
+        // The offsets stamp version metadata by fragment id, so a key outside
+        // the replacements would corrupt an unrelated fragment's metadata.
+        Operation::DataReplacement {
+            replacements,
+            replaced_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            ..
+        } => {
+            let replaced_ids: HashSet<u64> = replacements.iter().map(|r| r.0).collect();
+            for &frag_id in off_map.keys() {
+                if !replaced_ids.contains(&frag_id) {
+                    return Err(Error::invalid_input(format!(
+                        "replacedOffsets key {frag_id} is not in replacements; \
+                         offsets must reference only fragments being replaced"
+                    )));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -425,6 +443,35 @@ mod tests {
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// An offsets key outside the replacements would stamp an unrelated
+    /// fragment's version metadata.
+    #[test]
+    fn test_data_replacement_offsets_must_name_a_replaced_fragment() {
+        use crate::format::DataFile;
+        use crate::transaction::DataReplacementGroup;
+        use roaring::RoaringBitmap;
+        use std::collections::HashMap;
+        let replacement = DataReplacementGroup(
+            3,
+            DataFile::new_legacy_from_fields("replacement.lance", vec![0], None),
+        );
+        let manifest =
+            crate::transaction::test_support::make_stable_row_id_manifest(vec![Fragment::new(3)]);
+        let with_offsets = |fragment_id: u64| Operation::DataReplacement {
+            replacements: vec![replacement.clone()],
+            replaced_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                fragment_id,
+                RoaringBitmap::from_iter([0u32]),
+            )]))),
+        };
+        assert!(validate_operation(Some(&manifest), &with_offsets(3)).is_ok());
+        let error = validate_operation(Some(&manifest), &with_offsets(4)).unwrap_err();
+        assert!(
+            error.to_string().contains("is not in replacements"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn test_merge_fragments_valid() {
