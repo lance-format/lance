@@ -24,7 +24,7 @@ use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Schema, TypeComparison};
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
@@ -542,6 +542,14 @@ impl Manifest {
     /// Whether the dataset uses stable row ids.
     pub fn uses_stable_row_ids(&self) -> bool {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    /// How this table compares field types for schema compatibility.
+    ///
+    /// Every table currently names exactly one Arrow type per `logical_type`,
+    /// so types are compared exactly.
+    pub fn type_comparison(&self) -> TypeComparison {
+        TypeComparison::Exact
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
