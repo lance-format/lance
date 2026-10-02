@@ -57,6 +57,7 @@ mod merge_insert;
 mod namespace;
 mod optimize;
 mod otel;
+mod rq_model;
 mod schema;
 mod session;
 mod sql;

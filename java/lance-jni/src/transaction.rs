@@ -420,10 +420,7 @@ fn key_existence_filter_from_java(
             FilterType::ExactSet(values.into_iter().map(|value| value as u64).collect())
         }
         "BLOOM" => {
-            let bitmap = env
-                .call_method(object, "getBloomBitmap", "()[B", &[])?
-                .l()?;
-            let bitmap = env.convert_byte_array(JByteArray::from(bitmap))?;
+            let bitmap = env.get_vec_u8_from_method(object, "getBloomBitmap")?;
             let num_bits = u32::try_from(
                 env.call_method(object, "getBloomNumBits", "()I", &[])?
                     .i()?,

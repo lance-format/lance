@@ -26,7 +26,7 @@ use crate::vector::bq::transform::{
 };
 use crate::vector::bq::{
     RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
-    rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
+    rotation::{apply_fast_rotation, random_fast_rotation_signs},
     validate_rq_num_bits,
 };
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
@@ -342,39 +342,7 @@ impl RabitQuantizer {
             )));
         }
 
-        match metadata.rotation_type {
-            RQRotationType::Fast => {
-                let signs = metadata.fast_rotation_signs.as_ref().ok_or_else(|| {
-                    Error::invalid_input(
-                        "rabitq_model fast rotation is missing fast_rotation_signs".to_string(),
-                    )
-                })?;
-                let expected_len = fast_rotation_signs_len(dim);
-                if signs.len() != expected_len {
-                    return Err(Error::invalid_input(format!(
-                        "rabitq_model fast_rotation_signs length={} does not match expected length={} for dimension={}",
-                        signs.len(),
-                        expected_len,
-                        dim
-                    )));
-                }
-            }
-            RQRotationType::Matrix => {
-                let rotate_mat = metadata.rotate_mat.as_ref().ok_or_else(|| {
-                    Error::invalid_input(
-                        "rabitq_model matrix rotation is missing rotate_mat".to_string(),
-                    )
-                })?;
-                if rotate_mat.len() != dim || rotate_mat.value_length() != dim as i32 {
-                    return Err(Error::invalid_input(format!(
-                        "rabitq_model matrix rotation shape=({}, {}) does not match vector dimension={}",
-                        rotate_mat.len(),
-                        rotate_mat.value_length(),
-                        dim
-                    )));
-                }
-            }
-        }
+        metadata.validate_rotation()?;
 
         Ok(Some(Self {
             metadata: metadata.clone(),
