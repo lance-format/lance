@@ -20,6 +20,7 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
+use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::transaction::TaggedRewriteAssembly;
@@ -40,7 +41,8 @@ pub struct TransactionRebase<'a> {
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowAddrTreeMap>,
-    conflicting_frag_reuse_indices: Vec<IndexMetadata>,
+    /// Boxed: the commit loop holds the rebase across awaits.
+    frag_reuse_base: Option<Box<FragReuseBase>>,
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
@@ -84,6 +86,69 @@ struct RewriteReuseState {
     /// a tagged entry. `None` for a v0 entry, which `finish_rewrite` converts
     /// only when the table turned out tagged at commit.
     added_transitions: Option<Vec<Transition>>,
+}
+
+/// The fragment reuse entry of the handle a replacement is committed through, fixed across
+/// attempts. Checked against the latest manifest since a Rewrite's transaction file omits it.
+#[derive(Debug)]
+struct FragReuseBase {
+    version: u64,
+    entry: Option<IndexMetadata>,
+}
+
+impl FragReuseBase {
+    async fn load(dataset: &Dataset) -> Result<Self> {
+        Ok(Self {
+            version: dataset.manifest.version,
+            entry: stored_frag_reuse_entry(dataset).await?,
+        })
+    }
+
+    fn is_current(&self, current: Option<&IndexMetadata>) -> bool {
+        self.entry.as_ref().map(|entry| entry.uuid) == current.map(|entry| entry.uuid)
+    }
+
+    fn changed_err(
+        &self,
+        operation: &Operation,
+        current: Option<&IndexMetadata>,
+        dataset: &Dataset,
+        retry: &str,
+    ) -> Error {
+        let describe = |entry: Option<&IndexMetadata>| {
+            entry.map_or_else(
+                || "no entry".to_string(),
+                |entry| format!("entry {}", entry.uuid),
+            )
+        };
+        Error::retryable_commit_conflict_source(
+            dataset.manifest.version,
+            format!(
+                "This {operation} transaction replaces the fragment reuse index, built from \
+                 {} at version {}, but version {} has {}: a concurrent commit changed the \
+                 fragment reuse history. {retry}",
+                describe(self.entry.as_ref()),
+                self.version,
+                dataset.manifest.version,
+                describe(current)
+            )
+            .into(),
+        )
+    }
+}
+
+async fn stored_frag_reuse_entry(dataset: &Dataset) -> Result<Option<IndexMetadata>> {
+    Ok(crate::index::load_all_indices(dataset)
+        .await?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .cloned())
+}
+
+fn is_ordered_subsequence(sub: &[FragReuseVersion], sup: &[FragReuseVersion]) -> bool {
+    let mut sup = sup.iter();
+    sub.iter()
+        .all(|version| sup.any(|candidate| candidate == version))
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -162,12 +227,22 @@ impl<'a> TransactionRebase<'a> {
                     matches!(transaction.operation, Operation::CreateIndex { .. });
                 let read_fragments = is_create_index.then(|| dataset.fragments().as_ref().clone());
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
+                let frag_reuse_base = match &transaction.operation {
+                    Operation::CreateIndex { new_indices, .. }
+                        if new_indices
+                            .iter()
+                            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME) =>
+                    {
+                        Some(Box::new(FragReuseBase::load(dataset).await?))
+                    }
+                    _ => None,
+                };
                 Ok(Self {
                     transaction,
                     affected_rows,
                     initial_fragments: HashMap::new(),
                     modified_fragment_ids: HashSet::new(),
-                    conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
                     current_live: None,
@@ -202,7 +277,7 @@ impl<'a> TransactionRebase<'a> {
                         initial_fragments: HashMap::new(),
                         modified_fragment_ids,
                         affected_rows: None,
-                        conflicting_frag_reuse_indices: Vec::new(),
+                        frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
                         current_live: None,
@@ -221,7 +296,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
-                    conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
                     current_live: None,
@@ -231,11 +306,23 @@ impl<'a> TransactionRebase<'a> {
                     reuse: Default::default(),
                 })
             }
-            Operation::Rewrite { groups, .. } => {
+            Operation::Rewrite {
+                groups,
+                frag_reuse_index,
+                ..
+            } => {
                 let modified_fragment_ids = groups
                     .iter()
                     .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                     .collect::<HashSet<_>>();
+                let frag_reuse_base = if frag_reuse_index
+                    .as_ref()
+                    .is_some_and(|entry| !is_tagged(entry))
+                {
+                    Some(Box::new(FragReuseBase::load(dataset).await?))
+                } else {
+                    None
+                };
 
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
@@ -246,7 +333,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
-                    conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
                     current_live: None,
@@ -267,7 +354,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
-                    conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
                     current_live: None,
@@ -288,7 +375,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
-                    conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
                     current_live: None,
@@ -308,7 +395,7 @@ impl<'a> TransactionRebase<'a> {
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
-                    conflicting_frag_reuse_indices: Vec::new(),
+                    frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
                     current_live: None,
@@ -1065,14 +1152,12 @@ impl<'a> TransactionRebase<'a> {
                 } => {
                     // if a reuse update is present, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
-                    // The only case that needs rebasing is when the frag_reuse_index cleanup
-                    // triggers a CreateIndex, and it needs to add the new reuse
-                    // version created by the rewrite. A tagged entry (an
-                    // in-process rewrite on a tagged history) takes the
-                    // durable-evidence path below instead.
-                    if let Some(committed_fri) = frag_reuse_index
+                    // A frag_reuse_index cleanup is checked against the latest entry in
+                    // `finish_create_index`. A tagged entry (an in-process rewrite on a
+                    // tagged history) takes the durable-evidence path below instead.
+                    if frag_reuse_index
                         .as_ref()
-                        .filter(|entry| !is_tagged(entry))
+                        .is_some_and(|entry| !is_tagged(entry))
                     {
                         let ngram_coverage = new_indices
                             .iter()
@@ -1105,13 +1190,8 @@ impl<'a> TransactionRebase<'a> {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
                             }
-
-                            self.conflicting_frag_reuse_indices
-                                .push(committed_fri.clone());
-                            Ok(())
-                        } else {
-                            Ok(())
                         }
+                        Ok(())
                     } else {
                         // `frag_reuse_index` is in-memory only: a committed
                         // rewrite read back from its transaction file always
@@ -1252,13 +1332,6 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &self.transaction.operation
         {
-            // A v0 snapshot: the whole-history replacement contract, on a
-            // table that has not (yet) turned tagged. A v0 entry a concurrent
-            // commit made tagged is converted by `finish_rewrite`.
-            let replaces_v0_entry = frag_reuse_index
-                .as_ref()
-                .is_some_and(|entry| !is_tagged(entry))
-                && self.reuse.added_transitions.is_none();
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
@@ -1304,11 +1377,7 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite {
-                    groups,
-                    frag_reuse_index: committed_frag_reuse_index,
-                    ..
-                } => {
+                Operation::Rewrite { groups, .. } => {
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement
@@ -1361,29 +1430,6 @@ impl<'a> TransactionRebase<'a> {
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
-                    } else if committed_frag_reuse_index
-                        .as_ref()
-                        .is_some_and(|entry| !is_tagged(entry))
-                        && replaces_v0_entry
-                    {
-                        // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexes.
-                        // The other rewrite must retry.
-                        // TODO: could potentially rebase to combine both frag_reuse_indexes,
-                        //   but today it is already rare to run concurrent rewrites.
-                        //
-                        // Known v0 limitation: `frag_reuse_index` is in-memory
-                        // only, so a committed transaction re-read from its
-                        // file (a fresh-session retry) always shows None here
-                        // and this rule cannot fire cross-process; the v0
-                        // entry built pre-commit can then splice away the
-                        // concurrent legacy version. The tagged path avoids
-                        // this by diffing the manifest's FRI entry between
-                        // the read version and the current version in
-                        // `finish_rewrite` -- the manifest is durable, so the
-                        // detection works from any process or session. Fixing
-                        // v0 the same way is left alone deliberately: v0
-                        // behavior stays untouched.
-                        Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
@@ -1424,37 +1470,18 @@ impl<'a> TransactionRebase<'a> {
                         defers_remap,
                     ) {
                         // The other transaction replaced the FRI entry (a v0
-                        // cleanup trim). A stable-partition rewrite needs no
-                        // carried state: `finish_rewrite` re-assembles from
-                        // the CURRENT manifest entry every attempt, so the
-                        // trimmed entry is reloaded, our transition
-                        // re-appended, and the result revalidated there.
-                        (Some(_), true) if self.reuse.added_transitions.is_some() => {
-                            // Same mixture sanity as the v0 arm: an FRI
-                            // replacement commits alone. A CreateIndex mixing
-                            // it with user indices is a shape this resolver
-                            // does not reason about (the user-index straddle
-                            // check below never runs for it), so refuse it
-                            // instead of guessing.
+                        // cleanup trim); `finish_rewrite` works from the
+                        // CURRENT manifest entry every attempt.
+                        (Some(_), true) => {
+                            // An FRI replacement commits alone. A CreateIndex
+                            // mixing it with user indices is a shape this
+                            // resolver does not reason about (the user-index
+                            // straddle check below never runs for it), so
+                            // refuse it instead of guessing.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
                             }
-                            Ok(())
-                        }
-                        // If the rewrite produces a frag_reuse_index, but frag_reuse_index was cleaned up
-                        // in the other transaction, the frag_reuse_index produced by the rewrite should
-                        // be cleaned up in the same way as a part of the rebase.
-                        (Some(committed_fri), true) => {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
-                            if new_indices.len() != 1 || removed_indices.len() != 1 {
-                                return Err(self
-                                    .incompatible_conflict_err(other_transaction, other_version));
-                            }
-
-                            self.conflicting_frag_reuse_indices
-                                .push(committed_fri.clone());
                             Ok(())
                         }
                         // If rewrite defers index remap, the FRI handles the
@@ -2514,46 +2541,17 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &mut self.transaction.operation
         {
-            // Handle FRAG_REUSE_INDEX rebasing
-            let has_frag_reuse = new_indices
-                .iter()
-                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
-
-            if has_frag_reuse && !self.conflicting_frag_reuse_indices.is_empty() {
-                // had at least 1 previous rewrite conflict
-                // get the max reuse version from each run to be added to the cleaned up index
-                let mut max_versions =
-                    Vec::with_capacity(self.conflicting_frag_reuse_indices.len());
-                for committed_fri in &self.conflicting_frag_reuse_indices {
-                    let committed_fri_details = Arc::unwrap_or_clone(
-                        load_frag_reuse_index_details(dataset, committed_fri).await?,
-                    );
-                    let max_version = committed_fri_details
-                        .versions
-                        .into_iter()
-                        .max_by_key(|v| v.dataset_version)
-                        .ok_or_else(|| Error::index("Cannot rebase an empty FRI history"))?;
-                    max_versions.push(max_version);
+            if let Some(base) = self.frag_reuse_base.take() {
+                let current = stored_frag_reuse_entry(dataset).await?;
+                // A tagged history is refused by the commit gate instead.
+                if !current.as_ref().is_some_and(is_tagged) && !base.is_current(current.as_ref()) {
+                    return Err(base.changed_err(
+                        &self.transaction.operation,
+                        current.as_ref(),
+                        dataset,
+                        "Run the cleanup again on the latest version.",
+                    ));
                 }
-
-                // there should be only 1 frag_reuse_index in new indices
-                let new_fri = &new_indices[0];
-                let mut new_fri_details =
-                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
-                new_fri_details.versions.extend(max_versions);
-
-                let new_frag_bitmap = new_fri_details.new_frag_bitmap();
-
-                let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
-                    dataset,
-                    Some(new_fri),
-                    new_fri_details,
-                    new_frag_bitmap,
-                )
-                .await?;
-
-                new_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
-                new_indices.push(new_frag_reuse_index_meta);
             }
 
             // Handle MEM_WAL_INDEX rebasing
@@ -2720,58 +2718,78 @@ impl<'a> TransactionRebase<'a> {
                 return Ok((self.transaction, Some(Arc::new(assembly))));
             }
 
-            // A v0 snapshot on a v0 table: the whole-history replacement
-            // contract, byte-identical to the historical behavior.
+            // A v0 snapshot on a v0 table: the whole-history replacement contract.
             {
                 let new_fri = proposed;
-                if self.conflicting_frag_reuse_indices.is_empty() {
+                let base = self.frag_reuse_base.take().ok_or_else(|| {
+                    Error::internal("a v0 fragment reuse entry was rebased without its base")
+                })?;
+                let current = stored_frag_reuse_entry(dataset).await?;
+                let mut new_fri_details =
+                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
+                let mut own = new_fri_details.versions.pop();
+                let base_versions = match &base.entry {
+                    Some(entry) => load_frag_reuse_index_details(dataset, entry)
+                        .await?
+                        .versions
+                        .clone(),
+                    None => Vec::new(),
+                };
+                let shape_err = || {
+                    Error::invalid_input(format!(
+                        "the rewrite's fragment reuse entry must be the entry at version {} \
+                         plus one version of its own",
+                        base.version
+                    ))
+                };
+                let is_trimmed = if base.is_current(current.as_ref()) {
+                    if new_fri_details.versions != base_versions {
+                        return Err(shape_err());
+                    }
+                    false
+                } else {
+                    // A cleanup only drops versions, so publishing the current ones
+                    // plus our own keeps every mapping.
+                    let current_versions = match (&base.entry, &current) {
+                        (Some(_), Some(current_entry)) => {
+                            load_frag_reuse_index_details(dataset, current_entry)
+                                .await?
+                                .versions
+                                .clone()
+                        }
+                        _ => Vec::new(),
+                    };
+                    if base.entry.is_none()
+                        || current.is_none()
+                        || !is_ordered_subsequence(&current_versions, &base_versions)
+                    {
+                        return Err(base.changed_err(
+                            &self.transaction.operation,
+                            current.as_ref(),
+                            dataset,
+                            "Commit the rewrite again through a dataset at the latest version.",
+                        ));
+                    }
+                    if !is_ordered_subsequence(&new_fri_details.versions, &base_versions) {
+                        return Err(shape_err());
+                    }
+                    new_fri_details.versions = current_versions;
+                    true
+                };
+                // Stamp the rewrite's own (last) version with the version this attempt
+                // publishes on top of; a retry may land on a newer one.
+                let is_restamped = match own.as_mut() {
+                    Some(version) if version.dataset_version != dataset.manifest.version => {
+                        version.dataset_version = dataset.manifest.version;
+                        true
+                    }
+                    _ => false,
+                };
+                new_fri_details.versions.extend(own);
+                if !is_trimmed && !is_restamped {
                     return Ok((self.transaction, None));
                 }
 
-                let mut new_fri_details =
-                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
-                let mut min_dataset_version = new_fri_details
-                    .versions
-                    .iter()
-                    .map(|v| v.dataset_version)
-                    .min()
-                    .ok_or_else(|| Error::index("Cannot rebase an empty FRI history"))?;
-                for committed_fri in self.conflicting_frag_reuse_indices.into_iter() {
-                    let committed_fri_details =
-                        load_frag_reuse_index_details(dataset, &committed_fri).await?;
-                    let committed_min_dataset_version = committed_fri_details
-                        .versions
-                        .iter()
-                        .map(|v| v.dataset_version)
-                        .min();
-
-                    // For example, if we have new_fri has reuse versions [1, 2, 3]
-                    // If committed_fri has versions [2], that means 1 is cleaned up,
-                    // then [2, 3] should be retained in the new_fri.
-                    // If committed_fri is empty, that means everything is cleaned up.
-                    // then only the last item in committed_fri should be retained, which is [3].
-                    // Note that this is under the assumption that the sequence of
-                    // conflicting_frag_reuse_indices all come from frag_reuse_index cleanup rebase.
-                    match committed_min_dataset_version {
-                        Some(committed_min_dataset_version) => {
-                            if committed_min_dataset_version > min_dataset_version {
-                                min_dataset_version = committed_min_dataset_version;
-                            }
-                        }
-                        None => {
-                            min_dataset_version = new_fri_details
-                                .versions
-                                .iter()
-                                .map(|v| v.dataset_version)
-                                .max()
-                                .unwrap();
-                        }
-                    }
-                }
-
-                new_fri_details
-                    .versions
-                    .retain(|v| v.dataset_version >= min_dataset_version);
                 let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
                 let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
@@ -2791,9 +2809,8 @@ impl<'a> TransactionRebase<'a> {
     }
 }
 
-/// See `RewriteReuseState`. `dataset` is the transaction's read version
-/// (the commit loop checks it out); its fragment reuse entry is the base the
-/// rewrite's complete entry is diffed against.
+/// See `RewriteReuseState`. `dataset` is the handle the transaction is committed
+/// through, not its read version.
 async fn rewrite_reuse_state(
     dataset: &Dataset,
     transaction: &Transaction,
@@ -2974,11 +2991,8 @@ mod tests {
             .unwrap()
     }
 
-    #[rstest::rstest]
-    #[case::rewrite(false)]
-    #[case::create_index(true)]
     #[tokio::test]
-    async fn tagged_fri_rebase_returns_error_instead_of_panicking(#[case] create_index: bool) {
+    async fn tagged_fri_rebase_returns_error_instead_of_panicking() {
         let dataset = test_dataset(4, 2).await;
         let tagged = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -2993,37 +3007,20 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let operation = if create_index {
-            Operation::CreateIndex {
-                new_indices: vec![tagged.clone()],
-                removed_indices: vec![tagged.clone()],
-            }
-        } else {
-            Operation::Rewrite {
-                groups: vec![],
-                rewritten_indices: vec![],
-                frag_reuse_index: Some(tagged.clone()),
-            }
+        let operation = Operation::Rewrite {
+            groups: vec![],
+            rewritten_indices: vec![],
+            frag_reuse_index: Some(tagged),
         };
         let transaction = Transaction::new_from_version(dataset.manifest.version, operation);
-        if !create_index {
-            // A rewrite's tagged entry is read for what it adds relative to
-            // the read version before anything is rebased: an entry without
-            // readable details is an error at that point, never a panic.
-            let Err(error) = TransactionRebase::try_new(&dataset, transaction, None).await else {
-                panic!("a tagged entry without details is refused");
-            };
-            assert!(matches!(error, Error::Index { .. }), "{error}");
-            assert!(error.to_string().contains("details"), "{error}");
-            return;
-        }
-        let mut rebase = TransactionRebase::try_new(&dataset, transaction, None)
-            .await
-            .unwrap();
-        rebase.conflicting_frag_reuse_indices.push(tagged);
-        let error = rebase.finish(&dataset).await.unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("index_version 1"));
+        // A rewrite's tagged entry is read for what it adds relative to the
+        // read version before anything is rebased: an entry without readable
+        // details is an error at that point, never a panic.
+        let Err(error) = TransactionRebase::try_new(&dataset, transaction, None).await else {
+            panic!("a tagged entry without details is refused");
+        };
+        assert!(matches!(error, Error::Index { .. }), "{error}");
+        assert!(error.to_string().contains("details"), "{error}");
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters
@@ -4152,7 +4149,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -4362,7 +4359,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(&overlay_op(1))
                     .collect::<HashSet<_>>(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -4427,7 +4424,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(&rewrite_op).collect::<HashSet<_>>(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -4574,7 +4571,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(&update_op).collect::<HashSet<_>>(),
                 affected_rows: affected_rows.as_ref(),
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -4622,7 +4619,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -4643,7 +4640,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::from_iter([0]),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -4729,7 +4726,7 @@ mod tests {
                         initial_fragments: HashMap::new(),
                         modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
                         affected_rows: None,
-                        conflicting_frag_reuse_indices: Vec::new(),
+                        frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
                         current_live: None,
@@ -4785,7 +4782,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(&rewrite).collect::<HashSet<_>>(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -4922,7 +4919,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -4988,7 +4985,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -5048,7 +5045,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -5075,7 +5072,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -5125,7 +5122,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -5186,7 +5183,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -5250,7 +5247,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -5297,7 +5294,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -5345,7 +5342,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -5420,7 +5417,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -6107,7 +6104,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: modified_fragment_ids(&op1).collect::<HashSet<_>>(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
@@ -6176,7 +6173,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6220,7 +6217,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6265,7 +6262,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6310,7 +6307,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6366,7 +6363,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6397,7 +6394,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6449,7 +6446,7 @@ mod tests {
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
             current_live: None,
@@ -6699,6 +6696,14 @@ mod tests {
         /// the deferred-compaction Rewrite exactly as the v0 writer does: the
         /// legacy FRI entry rides the in-memory `frag_reuse_index` field.
         async fn commit_v0_compaction(dataset: &mut Dataset, source_ids: &[u64], dest_id: u64) {
+            let transaction = v0_compaction(dataset, source_ids, dest_id).await;
+            dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+        }
+
+        async fn v0_compaction(dataset: &Dataset, source_ids: &[u64], dest_id: u64) -> Transaction {
             let old_fragments: Vec<Fragment> = source_ids
                 .iter()
                 .map(|id| {
@@ -6737,36 +6742,122 @@ mod tests {
             let mut serialized = Vec::new();
             changed_row_addrs.serialize_into(&mut serialized).unwrap();
             let entry = build_new_frag_reuse_index(
-                dataset,
+                &mut dataset.clone(),
                 vec![FragReuseGroup {
                     changed_row_addrs: serialized,
                     old_frags: old_fragments.iter().map(FragDigest::from).collect(),
                     new_frags: fragments.iter().map(FragDigest::from).collect(),
                 }],
                 RoaringBitmap::from_iter([dest_id as u32]),
+                dataset.manifest.version,
             )
             .await
             .unwrap();
             assert_eq!(entry.index_version, 0);
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: Some(entry),
+                },
+                None,
+            )
+        }
+
+        /// With `external`, a history whose details live in their own file, so a
+        /// session that did not build an entry has to read it from storage.
+        async fn reuse_fixture(uri: &str, external: bool) -> (Dataset, usize) {
+            use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
+            let mut dataset = disk_fixture(uri, 2, 4).await;
+            let padding = if external {
+                inline_padding_capacity() + 1
+            } else {
+                0
+            };
+            if external {
+                commit_padding_reuse_history(&mut dataset, padding).await;
+            }
+            reserve(&mut dataset, 5).await;
+            (dataset, padding)
+        }
+
+        fn take_reuse_details_reads(dataset: &Dataset) -> usize {
             dataset
-                .apply_commit(
-                    Transaction::new(
-                        dataset.manifest.version,
-                        Operation::Rewrite {
-                            groups: vec![RewriteGroup {
-                                old_fragments,
-                                new_fragments: fragments,
-                            }],
-                            rewritten_indices: vec![],
-                            frag_reuse_index: Some(entry),
-                        },
-                        None,
-                    ),
-                    &Default::default(),
-                    &Default::default(),
-                )
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.method.starts_with("get")
+                        && request
+                            .path
+                            .as_ref()
+                            .ends_with(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+                })
+                .count()
+        }
+
+        #[rstest::rstest]
+        #[tokio::test]
+        async fn v0_compaction_built_in_another_session_commits(
+            #[values(false, true)] external: bool,
+        ) {
+            let dir = TempStrDir::default();
+            let (dataset, padding) = reuse_fixture(dir.as_str(), external).await;
+            let dest_id = dataset.manifest.max_fragment_id.unwrap() as u64;
+            let compaction = v0_compaction(&dataset, &[0], dest_id).await;
+
+            let mut committer = fresh_session(dir.as_str()).await;
+            take_reuse_details_reads(&committer);
+            committer
+                .apply_commit(compaction, &Default::default(), &Default::default())
                 .await
                 .unwrap();
+            assert_eq!(take_reuse_details_reads(&committer) > 0, external);
+            let history = fresh_session(dir.as_str())
+                .await
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(history.details.versions.len(), padding + 1);
+            assert_eq!(history.details.versions[padding].old_frag_ids(), vec![0]);
+        }
+
+        #[rstest::rstest]
+        #[tokio::test]
+        async fn v0_compaction_built_from_an_older_snapshot_is_refused(
+            #[values(false, true)] external: bool,
+        ) {
+            let dir = TempStrDir::default();
+            let (dataset, padding) = reuse_fixture(dir.as_str(), external).await;
+            let dest_id = dataset.manifest.max_fragment_id.unwrap() as u64;
+            let stale = v0_compaction(&dataset, &[0], dest_id - 1).await;
+            let mut other = fresh_session(dir.as_str()).await;
+            commit_v0_compaction(&mut other, &[1], dest_id).await;
+
+            let mut latest = fresh_session(dir.as_str()).await;
+            let error = latest
+                .apply_commit(stale, &Default::default(), &Default::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains("plus one version of its own"),
+                "{error}"
+            );
+            let history = fresh_session(dir.as_str())
+                .await
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(history.details.versions.len(), padding + 1);
+            assert_eq!(history.details.versions[padding].old_frag_ids(), vec![1]);
         }
 
         /// Matrix row 1: append, an unrelated delete and a fragment

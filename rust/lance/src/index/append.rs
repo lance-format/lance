@@ -191,8 +191,9 @@ pub fn fragment_reuse_affects_segment(
                 .new_frags
                 .iter()
                 .any(|fragment| coverage.contains(fragment.id as u32));
-            (version.dataset_version >= dataset_version && covers_old)
-                || (version.dataset_version > dataset_version && covers_new)
+            // A segment built at or before `version.dataset_version` predates the
+            // rewrite, even if its coverage already moved onto the new fragments.
+            version.dataset_version >= dataset_version && (covers_old || covers_new)
         })
     })
 }
@@ -1570,7 +1571,7 @@ mod tests {
         ));
 
         let rebuilt_segment = IndexMetadata {
-            dataset_version: 5,
+            dataset_version: 6,
             fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
             ..segment
         };
@@ -1579,14 +1580,16 @@ mod tests {
             [&rebuilt_segment]
         ));
 
-        let stale_remapped_segment = IndexMetadata {
-            dataset_version: 4,
-            ..rebuilt_segment
-        };
-        assert!(fragment_reuse_affects_segments(
-            &frag_reuse_index,
-            [&stale_remapped_segment]
-        ));
+        for stale_version in [4, 5] {
+            let stale_remapped_segment = IndexMetadata {
+                dataset_version: stale_version,
+                ..rebuilt_segment.clone()
+            };
+            assert!(
+                fragment_reuse_affects_segments(&frag_reuse_index, [&stale_remapped_segment]),
+                "{stale_version}"
+            );
+        }
     }
 
     fn clustered_vector_batch(

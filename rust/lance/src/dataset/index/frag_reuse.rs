@@ -81,9 +81,9 @@ impl Dataset {
 /// 1. its coverage is disjoint from the fragments the reuse chain touches, so it
 ///    holds nothing the FRI would remap (the common multi-index case: a
 ///    compaction rewrote a sibling index's fragments, not this one); or
-/// 2. it is at or past the reuse version's dataset version and no old fragment
-///    in the version is still in its bitmap. A missing bitmap counts as caught
-///    up, else the version could never be cleaned up.
+/// 2. it is past the reuse version's dataset version and no old fragment in the
+///    version is still in its bitmap. A missing bitmap counts as caught up, else
+///    the version could never be cleaned up.
 ///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,
@@ -91,6 +91,11 @@ impl Dataset {
 ///
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
+///
+/// # Errors
+///
+/// Returns [`Error::RetryableCommitConflict`] if the fragment reuse index changed
+/// after `dataset`'s version; reload the latest version and run it again.
 ///
 /// # Example
 ///
@@ -209,7 +214,8 @@ fn is_index_remap_caught_up(
         return Ok(true);
     }
 
-    if index_meta.dataset_version < frag_reuse_version.dataset_version {
+    // Inclusive: an index built at dataset_version predates the rewrite.
+    if index_meta.dataset_version <= frag_reuse_version.dataset_version {
         return Ok(false);
     }
 
@@ -326,7 +332,12 @@ mod tests {
             is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain).unwrap()
         );
 
-        // Once remapped (version advanced): caught up.
+        // Built at version 10 itself: still pre-rewrite data, not caught up.
+        assert_false!(
+            is_index_remap_caught_up(&version, &index_covering(10, &[1, 6]), &chain).unwrap()
+        );
+
+        // Built or remapped after version 10: caught up.
         assert_true!(
             is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), &chain).unwrap()
         );
