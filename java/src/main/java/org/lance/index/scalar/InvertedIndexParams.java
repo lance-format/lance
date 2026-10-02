@@ -490,7 +490,7 @@ public final class InvertedIndexParams {
       if (maxNgramLength != null) {
         Preconditions.checkArgument(
             minNgramLength == null || maxNgramLength >= minNgramLength,
-            "maxNgramLength {} shouldn't less than minNgramLength {}",
+            "maxNgramLength %s must not be less than minNgramLength %s",
             maxNgramLength,
             minNgramLength);
         params.put("max_ngram_length", maxNgramLength);

@@ -162,4 +162,17 @@ class InvertedIndexParamsTest {
     assertThrows(
         IllegalArgumentException.class, () -> InvertedIndexParams.builder().numWorkers(-1));
   }
+
+  @Test
+  void ngramLengthMessageInterpolatesValues() {
+    // Guava's checkArgument uses %s, not {}: a "{}" template leaves the
+    // placeholders literal and appends the values in brackets instead, so assert
+    // the offending values are interpolated in place.
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> InvertedIndexParams.builder().minNgramLength(5).maxNgramLength(3).build());
+    assertTrue(error.getMessage().contains("maxNgramLength 3"));
+    assertTrue(error.getMessage().contains("minNgramLength 5"));
+  }
 }
