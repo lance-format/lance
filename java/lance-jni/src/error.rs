@@ -187,7 +187,9 @@ impl From<LanceError> for Error {
             .unwrap_or_default();
         let message = format!("{}{}", err, backtrace_suffix);
 
-        match &err {
+        // Classify by the root error so a coalesced `Error::Shared(..)` maps to
+        // the same Java exception as the error it wraps, not a RuntimeException.
+        match err.find_root() {
             LanceError::DatasetNotFound { .. }
             | LanceError::DatasetAlreadyExists { .. }
             | LanceError::CommitConflict { .. }
@@ -347,5 +349,17 @@ mod tests {
             "Expected no backtrace suffix, got: {}",
             jni_err.message
         );
+    }
+
+    #[test]
+    fn test_shared_io_maps_to_ioexception_not_runtime() {
+        // A coalesced cache/IO error arrives wrapped in Error::Shared; it must
+        // still map to IOException, not fall through to RuntimeException.
+        let lance_err = LanceError::Shared {
+            source: std::sync::Arc::new(LanceError::io("disk failure")),
+        };
+        let jni_err: Error = lance_err.into();
+        assert_eq!(*java_class(&jni_err), JavaExceptionClass::IOException);
+        assert!(jni_err.message.contains("disk failure"));
     }
 }
