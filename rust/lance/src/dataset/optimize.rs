@@ -2427,11 +2427,11 @@ async fn reserve_fragment_ids(
     .await?;
 
     // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
-    let new_max_exclusive = manifest.max_fragment_id.unwrap_or(0) + 1;
-    let reserved_ids = (new_max_exclusive - fragments.len() as u32)..(new_max_exclusive);
+    let new_max_exclusive = u64::from(manifest.max_fragment_id.unwrap_or(0)) + 1;
+    let reserved_ids = (new_max_exclusive - fragments.len() as u64)..new_max_exclusive;
 
     for (fragment, new_id) in fragments.zip(reserved_ids) {
-        fragment.id = new_id as u64;
+        fragment.id = new_id;
     }
 
     Ok(())
@@ -4545,6 +4545,71 @@ mod tests {
             .join(crate::dataset::TRANSACTIONS_DIR)
             .join(transaction_file);
         assert!(dataset.object_store.exists(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_reserve_fragment_ids_at_address_space_limit() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+        let original_fragments = dataset.manifest.fragments.clone();
+        let original_data = dataset.scan().try_into_batch().await.unwrap();
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::ReserveFragments {
+                num_fragments: u32::MAX - 3,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.max_fragment_id, Some(u32::MAX - 2));
+
+        let mut fragments = [Fragment::new(0), Fragment::new(0)];
+        reserve_fragment_ids(&dataset, fragments.iter_mut())
+            .await
+            .unwrap();
+        assert_eq!(fragments[0].id, u64::from(u32::MAX - 1));
+        assert_eq!(fragments[1].id, u64::from(u32::MAX));
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.max_fragment_id, Some(u32::MAX));
+        let version = dataset.manifest.version;
+
+        let mut excess = [Fragment::new(0)];
+        let error = reserve_fragment_ids(&dataset, excess.iter_mut())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot reserve 1 fragment IDs after 4294967295")
+        );
+        assert_eq!(excess[0].id, 0);
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, version);
+        assert_eq!(dataset.manifest.max_fragment_id, Some(u32::MAX));
+
+        let error = dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(original_data.clone())], original_data.schema()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Fragment ID 4294967296"));
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, version);
+        assert_eq!(dataset.manifest.fragments, original_fragments);
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            original_data
+        );
     }
 
     /// A failed ReserveFragments commit cannot reference the rewritten files,

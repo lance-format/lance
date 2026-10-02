@@ -1571,6 +1571,14 @@ impl Transaction {
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
+        if let Some(fragment) = final_fragments.last()
+            && fragment.id > u64::from(u32::MAX)
+        {
+            return Err(Error::invalid_input(format!(
+                "Fragment ID {} exceeds Lance's u32 address space",
+                fragment.id
+            )));
+        }
 
         // Clean up data files that only contain tombstoned fields
         Self::remove_tombstoned_data_files(&mut final_fragments);
@@ -1902,7 +1910,14 @@ impl Transaction {
         }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
-            manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
+            let max_fragment_id = manifest.max_fragment_id.unwrap_or(0);
+            manifest.max_fragment_id =
+                Some(max_fragment_id.checked_add(num_fragments).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Cannot reserve {num_fragments} fragment IDs after {max_fragment_id}: \
+                         allocation exceeds Lance's u32 address space"
+                    ))
+                })?);
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
@@ -1964,6 +1979,33 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[rstest::rstest]
+    #[case::last_valid_id(1, true)]
+    #[case::exhausted_ids(2, false)]
+    fn test_append_fragment_id_address_space(#[case] num_fragments: usize, #[case] succeeds: bool) {
+        let mut manifest = sample_manifest();
+        manifest.max_fragment_id = Some(u32::MAX - 1);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(0); num_fragments],
+            },
+            None,
+        );
+        let result =
+            transaction.build_manifest(Some(&manifest), vec![], "txn", &default_build_config());
+        if succeeds {
+            let (updated, _) = result.unwrap();
+            assert_eq!(updated.fragments.last().unwrap().id, u64::from(u32::MAX));
+            assert_eq!(updated.max_fragment_id, Some(u32::MAX));
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("Fragment ID 4294967296"));
+            assert!(error.to_string().contains("u32 address space"));
+        }
+    }
 
     /// Fragment 0 is the live destination of a rewrite that retired
     /// fragment 5; the entry carries that one transition inline.
