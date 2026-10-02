@@ -290,11 +290,11 @@ class ShardWriter:
     def lsm_scanner(
         self, shard_snapshots: Optional[List[ShardSnapshot]] = None
     ) -> "LsmScanner":
-        """Create an LSM scanner that includes the active MemTable.
+        """Create an LSM scanner that includes this writer's in-memory MemTables.
 
-        This scanner covers the base table, the given SSTables,
-        and the current active MemTable — providing strong read-your-writes
-        consistency.
+        This scanner covers the base table, the given SSTables, the current
+        active MemTable, and every frozen MemTable still awaiting flush —
+        providing strong read-your-writes consistency.
 
         Parameters
         ----------
