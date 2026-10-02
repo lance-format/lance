@@ -183,9 +183,17 @@ Represents large binary data stored externally.
 | Logical Type | Description |
 |---|---|
 | `blob` | Large binary data with external storage reference |
-| `json` | JSON-encoded data stored as binary |
 
 Blob types are stored as large binary data with metadata describing storage location.
+
+#### JSON Type
+
+The `json` logical type stores each value as JSONB in an Arrow `LargeBinary`
+field with `ARROW:extension:name = "lance.json"`. Its text-facing Arrow extension
+is `arrow.json`. JSONB is a value encoding and does not itself request external
+blob storage. See the [JSONB Format Specification](jsonb.md) for the logical value
+model, Arrow mapping, upstream encoding, numeric behavior, and compatibility
+requirements.
 
 #### BFloat16 Type
 
