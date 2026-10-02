@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from dataclasses import dataclass
+from enum import Enum
+from functools import singledispatch
+from typing import TYPE_CHECKING, Callable, Iterable, Optional, Union
 
 import pyarrow as pa
 from pyarrow import RecordBatch
 
-from . import dataset
 from .dependencies import (
     _check_for_hugging_face,
     _check_for_pandas,
@@ -19,6 +21,8 @@ from .dependencies import (
 from .dependencies import pandas as pd
 
 if TYPE_CHECKING:
+    from . import dataset
+
     ReaderLike = Union[
         pd.Timestamp,
         pa.Table,
@@ -28,6 +32,40 @@ if TYPE_CHECKING:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
+
+
+class SourceStrategy(Enum):
+    """How a write source can be consumed and replayed after a conflict."""
+
+    MATERIALIZED = "materialized"
+    """Already in memory; expose batches and statistics without spilling."""
+    RESCANNABLE = "rescannable"
+    """Each reader observes the same source snapshot without materialization."""
+    ONE_SHOT = "one_shot"
+    """Can be consumed once; retrying merges may buffer this input."""
+
+
+@dataclass(frozen=True)
+class WriteSource:
+    """A registered source's schema, reader factory, and replay strategy.
+
+    For ``RESCANNABLE``, ``reader_factory`` must return a fresh
+    :class:`pyarrow.RecordBatchReader` on every call, with the declared schema
+    (including field and schema metadata), the same data, and the same row
+    order. It may be called multiple times during one merge. Capture the source
+    version or file selection and scan options such as filters and projections
+    before returning the factory, and keep them valid until the write completes.
+    Lance checks each reader's schema; the adapter guarantees the data and order.
+    For the other strategies, the factory is called once per write.
+
+    Register a source with :func:`coerce_source` rather than passing this object
+    to a write API directly. Pass a reader from the factory to select the
+    one-shot buffering path for a merge with conflict retries enabled.
+    """
+
+    strategy: SourceStrategy
+    schema: pa.Schema
+    reader_factory: Callable[[], pa.RecordBatchReader]
 
 
 def _casting_recordbatch_iter(
@@ -58,103 +96,128 @@ def _casting_recordbatch_iter(
         yield batch
 
 
-def _is_materialized(data_obj: ReaderLike) -> bool:
-    """Whether ``data_obj`` is fully materialized in memory.
-
-    Materialized sources (tables, in-memory frames) can be wrapped in an
-    in-memory table for replay without spilling and to expose exact statistics.
-    Streaming or re-readable sources (readers, scanners, datasets, generators)
-    are not considered materialized.
-    """
-    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
-        return True
-    if isinstance(data_obj, (pa.Table, pa.RecordBatch)):
-        return True
-    if (
-        type(data_obj).__module__.startswith("polars")
-        and data_obj.__class__.__name__ == "DataFrame"
-    ):
-        return True
-    if isinstance(data_obj, dict):
-        return True
-    if (
-        isinstance(data_obj, list)
-        and len(data_obj) > 0
-        and isinstance(data_obj[0], dict)
-    ):
-        return True
-    return False
-
-
-def _coerce_reader(
+@singledispatch
+def coerce_source(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
-) -> pa.RecordBatchReader:
-    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
-        return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
-    elif isinstance(data_obj, pa.Table):
-        return data_obj.to_reader()
-    elif isinstance(data_obj, pa.RecordBatch):
-        return pa.Table.from_batches([data_obj]).to_reader()
-    elif isinstance(data_obj, dataset.LanceDataset):
-        return data_obj.scanner().to_reader()
-    elif isinstance(data_obj, pa.dataset.Dataset):
-        return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
-    elif isinstance(data_obj, pa.dataset.Scanner):
-        return data_obj.to_reader()
-    elif isinstance(data_obj, pa.RecordBatchReader):
-        return data_obj
-    elif (
+) -> WriteSource:
+    """Convert a write input to its reader and replay strategy.
+
+    A registration handles conversion and classification together. Optional
+    dependencies are registered on first use, without importing them for Arrow
+    inputs. Unregistered iterables retain the one-shot RecordBatch contract.
+
+    Third-party sources can register their own conversion, for example::
+
+        @coerce_source.register(MySnapshot)
+        def my_snapshot_source(snapshot, schema=None):
+            return WriteSource(
+                SourceStrategy.RESCANNABLE,
+                snapshot.schema,
+                snapshot.to_reader,
+            )
+
+    A re-scannable factory must return the same data, row order, and schema on
+    each call; see :class:`WriteSource`. Register only types that can honor that
+    contract. LanceDataset and LanceScanner inputs are re-scanned only when
+    their scan is repeatable, including any default scan options.
+
+    FileSystemDataset inputs without an attached filter are re-scanned on
+    retries: keep their source files unchanged until the write completes.
+    Filtered FileSystemDataset inputs use the one-shot strategy because their
+    filters may contain non-deterministic functions. Pass a reader, such as
+    ``data_obj.scanner().to_reader()``, to buffer the first scan of a repeatable
+    source when conflict retries are enabled.
+    """
+    if _check_for_pandas(data_obj):
+        if pd.DataFrame not in coerce_source.registry:
+            coerce_source.register(pd.DataFrame)(_coerce_pandas)
+        handler = coerce_source.dispatch(type(data_obj))
+        if handler is not coerce_source.__wrapped__:
+            return handler(data_obj, schema)
+    if (
         type(data_obj).__module__.startswith("polars")
         and data_obj.__class__.__name__ == "DataFrame"
     ):
-        return data_obj.to_arrow().to_reader()
-    elif _check_for_hugging_face(data_obj):
-        from .dependencies import datasets as hf_datasets
+        coerce_source.register(type(data_obj))(_coerce_polars)
+        return _coerce_polars(data_obj, schema)
+    if _check_for_hugging_face(data_obj):
+        return _coerce_hugging_face(data_obj, schema)
+    if isinstance(data_obj, Iterable):
+        return _coerce_batch_iterable(data_obj, schema)
+    raise TypeError(
+        f"Unknown data type {type(data_obj)}. "
+        "Please check "
+        "https://lance.org/guide/read_and_write/ "
+        "to see supported types."
+    )
 
-        if isinstance(data_obj, hf_datasets.Dataset):
-            if schema is None:
-                schema = data_obj.features.arrow_schema
-            return data_obj.data.to_reader()
-        elif isinstance(data_obj, hf_datasets.DatasetDict):
-            raise ValueError(
-                "DatasetDict is not yet supported. For now please "
-                "iterate through the DatasetDict and pass in single "
-                "Dataset instances (e.g., from dataset_dict.data) to "
-                "`write_dataset`. "
-            )
-        elif isinstance(data_obj, hf_datasets.IterableDataset):
-            if schema is None:
-                schema = data_obj.features.arrow_schema
 
-            def batch_iter():
-                # Try to provide a reasonable batch size. If the user needs to
-                # override this, they can do the conversion to a reader themselves.
-                for dict_batch in data_obj.iter(batch_size=1000):
-                    yield pa.RecordBatch.from_pydict(dict_batch, schema=schema)
+@coerce_source.register(pa.Table)
+def _coerce_table(data_obj, schema=None) -> WriteSource:
+    return WriteSource(SourceStrategy.MATERIALIZED, data_obj.schema, data_obj.to_reader)
 
-            return pa.RecordBatchReader.from_batches(schema, batch_iter())
-        else:
-            raise TypeError(
-                f"Unknown HuggingFace dataset type: {type(data_obj)}. "
-                "Please provide a single Dataset or DatasetDict."
-            )
 
-    elif isinstance(data_obj, dict):
-        batch = pa.RecordBatch.from_pydict(data_obj, schema=schema)
-        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
-    elif (
-        isinstance(data_obj, list)
-        and len(data_obj) > 0
-        and isinstance(data_obj[0], dict)
-    ):
-        # List of dictionaries
-        batch = pa.RecordBatch.from_pylist(data_obj, schema=schema)
-        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
-    elif (
-        isinstance(data_obj, list)
-        and len(data_obj) > 0
-        and _is_pydantic_base_model(data_obj[0])
-    ):
+@coerce_source.register(pa.RecordBatch)
+def _coerce_batch(data_obj, schema=None) -> WriteSource:
+    return coerce_source(pa.Table.from_batches([data_obj]))
+
+
+@coerce_source.register(pa.dataset.Dataset)
+def _coerce_dataset(data_obj, schema=None) -> WriteSource:
+    return coerce_source(pa.dataset.Scanner.from_dataset(data_obj))
+
+
+@coerce_source.register(pa.dataset.InMemoryDataset)
+def _coerce_in_memory_dataset(data_obj, schema=None) -> WriteSource:
+    scanner = data_obj.scanner()
+    return WriteSource(
+        SourceStrategy.MATERIALIZED, scanner.projected_schema, scanner.to_reader
+    )
+
+
+@coerce_source.register(pa.dataset.FileSystemDataset)
+def _coerce_filesystem_dataset(data_obj, schema=None) -> WriteSource:
+    scanner = data_obj.scanner()
+    # Arrow cannot enumerate fragments when a dataset has attached scan options.
+    # Keep those sources one-shot: a filter can contain non-deterministic
+    # functions, and Arrow has no public expression volatility inspection API.
+    try:
+        data_obj.get_fragments()
+    except ValueError:
+        return coerce_source(scanner)
+    return WriteSource(
+        SourceStrategy.RESCANNABLE, scanner.projected_schema, scanner.to_reader
+    )
+
+
+@coerce_source.register(pa.dataset.Scanner)
+def _coerce_scanner(data_obj, schema=None) -> WriteSource:
+    # Scanner.from_batches wraps a one-shot input, and PyArrow exposes no
+    # non-consuming replayability check for an arbitrary Scanner.
+    return WriteSource(
+        SourceStrategy.ONE_SHOT, data_obj.projected_schema, data_obj.to_reader
+    )
+
+
+@coerce_source.register(pa.RecordBatchReader)
+def _coerce_recordbatch_reader(data_obj, schema=None) -> WriteSource:
+    return WriteSource(SourceStrategy.ONE_SHOT, data_obj.schema, lambda: data_obj)
+
+
+@coerce_source.register(dict)
+def _coerce_dict(data_obj, schema=None) -> WriteSource:
+    # HuggingFace DatasetDict inherits dict; register it before Arrow attempts
+    # to interpret its datasets as column values.
+    if _check_for_hugging_face(data_obj):
+        return _coerce_hugging_face(data_obj, schema)
+    return coerce_source(pa.RecordBatch.from_pydict(data_obj, schema=schema))
+
+
+@coerce_source.register(list)
+def _coerce_list(data_obj, schema=None) -> WriteSource:
+    if data_obj and isinstance(data_obj[0], dict):
+        return coerce_source(pa.RecordBatch.from_pylist(data_obj, schema=schema))
+    if data_obj and _is_pydantic_base_model(data_obj[0]):
         model_class = type(data_obj[0])
         _validate_pydantic_list(data_obj, model_class)
         if schema is None:
@@ -163,20 +226,88 @@ def _coerce_reader(
             schema = pydantic_to_schema(model_class)
         dicts = [model_to_dict(item) for item in data_obj]
         batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
-        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
-    # for other iterables, assume they are of type Iterable[RecordBatch]
-    elif isinstance(data_obj, Iterable):
-        if schema is not None:
-            data = _casting_recordbatch_iter(data_obj, schema)
-            return pa.RecordBatchReader.from_batches(schema, data)
-        else:
-            raise ValueError(
-                "Must provide schema to write dataset from RecordBatch iterable"
-            )
-    else:
-        raise TypeError(
-            f"Unknown data type {type(data_obj)}. "
-            "Please check "
-            "https://lance.org/guide/read_and_write/ "
-            "to see supported types."
+        return coerce_source(pa.RecordBatchReader.from_batches(batch.schema, [batch]))
+    return _coerce_batch_iterable(data_obj, schema)
+
+
+def _coerce_batch_iterable(data_obj, schema) -> WriteSource:
+    if schema is None:
+        raise ValueError(
+            "Must provide schema to write dataset from RecordBatch iterable"
         )
+    data = _casting_recordbatch_iter(data_obj, schema)
+    return coerce_source(pa.RecordBatchReader.from_batches(schema, data))
+
+
+def _coerce_pandas(data_obj, schema=None) -> WriteSource:
+    return coerce_source(pa.Table.from_pandas(data_obj, schema=schema))
+
+
+def _coerce_polars(data_obj, schema=None) -> WriteSource:
+    return coerce_source(data_obj.to_arrow())
+
+
+def _coerce_hugging_face(data_obj, schema) -> WriteSource:
+    from .dependencies import datasets as hf_datasets
+
+    for source_type, adapter in (
+        (hf_datasets.Dataset, _coerce_hf_dataset),
+        (hf_datasets.DatasetDict, _coerce_hf_dataset_dict),
+        (hf_datasets.IterableDataset, _coerce_hf_iterable),
+    ):
+        if source_type not in coerce_source.registry:
+            coerce_source.register(source_type)(adapter)
+    handler = coerce_source.dispatch(type(data_obj))
+    if handler in (coerce_source.__wrapped__, _coerce_dict):
+        raise TypeError(
+            f"Unknown HuggingFace dataset type: {type(data_obj)}. "
+            "Please provide a single Dataset or DatasetDict."
+        )
+    return handler(data_obj, schema)
+
+
+def _coerce_hf_dataset(data_obj, schema=None) -> WriteSource:
+    return coerce_source(data_obj.data.to_reader())
+
+
+def _coerce_hf_dataset_dict(data_obj, schema=None) -> WriteSource:
+    raise ValueError(
+        "DatasetDict is not yet supported. For now please "
+        "iterate through the DatasetDict and pass in single "
+        "Dataset instances (e.g., from dataset_dict.data) to "
+        "`write_dataset`. "
+    )
+
+
+def _coerce_hf_iterable(data_obj, schema=None) -> WriteSource:
+    if schema is None:
+        schema = data_obj.features.arrow_schema
+
+    def batch_iter():
+        # Keep the existing default chunk size; callers can construct a reader
+        # themselves when they need a different size.
+        for dict_batch in data_obj.iter(batch_size=1000):
+            yield pa.RecordBatch.from_pydict(dict_batch, schema=schema)
+
+    return coerce_source(pa.RecordBatchReader.from_batches(schema, batch_iter()))
+
+
+def _coerce_lance_dataset(data_obj: dataset.LanceDataset, schema=None) -> WriteSource:
+    # Capture one scanner now: re-reading the mutable Python Dataset object on
+    # each retry could observe a newer version after another operation.
+    return _coerce_lance_scanner(data_obj.scanner())
+
+
+def _coerce_lance_scanner(data_obj: dataset.LanceScanner, schema=None) -> WriteSource:
+    strategy = (
+        SourceStrategy.RESCANNABLE
+        if data_obj._scanner.is_repeatable()
+        else SourceStrategy.ONE_SHOT
+    )
+    return WriteSource(strategy, data_obj.projected_schema, data_obj.to_reader)
+
+
+def _coerce_reader(
+    data_obj: ReaderLike, schema: Optional[pa.Schema] = None
+) -> pa.RecordBatchReader:
+    return coerce_source(data_obj, schema).reader_factory()

@@ -18,9 +18,10 @@ use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
-use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
+use datafusion::logical_expr::{Expr, ScalarUDF, Volatility, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -824,13 +825,39 @@ impl ExprFilter {
     #[allow(unused)]
     #[instrument(level = "trace", name = "filter_to_df", skip_all)]
     pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
+        if let Self::Datafusion(expr) = self {
+            return Ok(expr.clone());
+        }
+        let (expr, schema) = self.parse_expr_and_schema(dataset_schema, full_schema)?;
+        let planner = Planner::new(schema);
+        match self {
+            Self::Sql(sql) => planner.optimize_expr(expr).map_err(|e| {
+                Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
+            }),
+            Self::Substrait(_) => planner.optimize_expr(expr.clone()).map_err(|e| {
+                Error::invalid_input(format!("Error optimizing substrait filter: {expr:?} ({e})"))
+            }),
+            Self::Datafusion(_) => Ok(expr),
+        }
+    }
+
+    // Preserve the unoptimized expression so capability checks can see Stable
+    // functions before simplification folds them using the current query time.
+    fn parse_expr_and_schema(
+        &self,
+        dataset_schema: &Schema,
+        full_schema: &Schema,
+    ) -> Result<(Expr, SchemaRef)> {
+        let schema = Arc::new(ArrowSchema::from(match self {
+            Self::Substrait(_) => dataset_schema,
+            _ => full_schema,
+        }));
         match self {
             Self::Sql(sql) => {
-                let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema.clone());
                 let filter = planner.parse_filter(sql)?;
 
-                let df_schema = DFSchema::try_from(schema)?;
+                let df_schema = DFSchema::try_from(schema.clone())?;
                 let ret_field = filter.to_field(&df_schema)?.1;
                 let ret_type = ret_field.data_type();
                 if ret_type != &DataType::Boolean {
@@ -839,33 +866,25 @@ impl ExprFilter {
                     ));
                 }
 
-                let optimized = planner.optimize_expr(filter).map_err(|e| {
-                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
-                })?;
-                Ok(optimized)
+                Ok((filter, schema))
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
                 use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
-                let state = ctx.state();
-                let schema = Arc::new(ArrowSchema::from(dataset_schema));
                 let expr = parse_substrait(expr, schema.clone(), &ctx.state())
                     .now_or_never()
-                    .expect("could not parse the Substrait filter in a synchronous fashion")?;
-                let planner = Planner::new(schema);
-                planner.optimize_expr(expr.clone()).map_err(|e| {
-                    Error::invalid_input(format!(
-                        "Error optimizing substrait filter: {expr:?} ({e})"
-                    ))
-                })
+                    .ok_or_else(|| {
+                        Error::internal("Substrait filter parsing did not complete synchronously")
+                    })??;
+                Ok((expr, schema))
             }
             #[cfg(not(feature = "substrait"))]
             Self::Substrait(_) => Err(Error::not_supported_source(
                 "Substrait filter is not supported in this build".into(),
             )),
-            Self::Datafusion(expr) => Ok(expr.clone()),
+            Self::Datafusion(expr) => Ok((expr.clone(), schema)),
         }
     }
 }
@@ -2451,6 +2470,74 @@ impl Scanner {
     pub async fn schema(&self) -> Result<SchemaRef> {
         let plan = self.create_plan().await?;
         Ok(plan.schema())
+    }
+
+    /// Whether repeated scans preserve source values and encounter order.
+    ///
+    /// This is a conservative capability check for consumers that replay a
+    /// source after a failed attempt. It accepts ordered scans with immutable
+    /// filters and projections over this scanner's dataset snapshot. A `false`
+    /// result means that replay without buffering is not guaranteed; it does
+    /// not mean the scan necessarily produces different results.
+    ///
+    /// Unordered scans, explicit sorts, search, and aggregation are rejected
+    /// because their output or tie ordering is not guaranteed to be repeatable.
+    /// Stable filter functions are also rejected: filters are replanned for
+    /// each scan. Constants already folded into a projection when the scanner
+    /// was created remain fixed and are accepted.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # fn example(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// assert!(scanner.is_repeatable()?);
+    /// scanner.scan_in_order(false);
+    /// assert!(!scanner.is_repeatable()?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn is_repeatable(&self) -> Result<bool> {
+        if !self.ordered
+            || self.ordering.is_some()
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.minhash_query.is_some()
+            || self.filter.query_filter.is_some()
+            || self.aggregate.is_some()
+        {
+            return Ok(false);
+        }
+
+        let has_non_immutable_function = |expr: &Expr| {
+            expr.exists(|node| {
+                Ok(match node {
+                    Expr::ScalarFunction(function) => {
+                        function.func.signature().volatility != Volatility::Immutable
+                    }
+                    Expr::HigherOrderFunction(function) => {
+                        function.func.signature().volatility != Volatility::Immutable
+                    }
+                    _ => false,
+                })
+            })
+        };
+
+        for column in &self.projection_plan.requested_output_expr {
+            if has_non_immutable_function(&column.expr)? {
+                return Ok(false);
+            }
+        }
+
+        if let Some(filter) = &self.filter.expr_filter {
+            let filter_schema = self.filterable_schema()?;
+            let (expr, _) =
+                filter.parse_expr_and_schema(self.dataset.schema(), filter_schema.as_ref())?;
+            if has_non_immutable_function(&expr)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     /// Fetches the currently set expr filter
@@ -8505,9 +8592,13 @@ mod test {
     };
 
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::Fields;
+    use arrow_schema::{FieldRef, Fields};
     use arrow_select::take;
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::expr::HigherOrderFunction;
+    use datafusion::logical_expr::{
+        ColumnarValue, HigherOrderFunctionArgs, HigherOrderReturnFieldArgs, HigherOrderSignature,
+        HigherOrderUDF, HigherOrderUDFImpl, LambdaParametersProgress, ValueOrLambda, col, lit,
+    };
     use datafusion::physical_plan::ExecutionPlanProperties;
     use half::f16;
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
@@ -8547,6 +8638,167 @@ mod test {
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    async fn repeatability_dataset() -> Dataset {
+        let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        Dataset::write(reader, "memory://", None).await.unwrap()
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct RepeatabilityHigherOrderFunction(HigherOrderSignature);
+
+    impl HigherOrderUDFImpl for RepeatabilityHigherOrderFunction {
+        fn name(&self) -> &str {
+            "repeatability_test"
+        }
+
+        fn signature(&self) -> &HigherOrderSignature {
+            &self.0
+        }
+
+        fn lambda_parameters(
+            &self,
+            _step: usize,
+            _fields: &[ValueOrLambda<FieldRef, Option<FieldRef>>],
+        ) -> datafusion::common::Result<LambdaParametersProgress> {
+            panic!("Repeatability checks must not evaluate function parameters")
+        }
+
+        fn return_field_from_args(
+            &self,
+            _args: HigherOrderReturnFieldArgs,
+        ) -> datafusion::common::Result<FieldRef> {
+            panic!("Repeatability checks must not resolve a function's return type")
+        }
+
+        fn invoke_with_args(
+            &self,
+            _args: HigherOrderFunctionArgs,
+        ) -> datafusion::common::Result<ColumnarValue> {
+            panic!("Repeatability checks must not execute a function")
+        }
+    }
+
+    #[rstest]
+    #[case::immutable(Volatility::Immutable, true)]
+    #[case::stable(Volatility::Stable, false)]
+    #[case::volatile(Volatility::Volatile, false)]
+    #[tokio::test]
+    async fn test_scanner_repeatable_higher_order_function(
+        #[case] volatility: Volatility,
+        #[case] expected: bool,
+    ) {
+        let dataset = repeatability_dataset().await;
+        let function = HigherOrderUDF::new_from_impl(RepeatabilityHigherOrderFunction(
+            HigherOrderSignature::any(1, volatility),
+        ));
+        let expression =
+            Expr::HigherOrderFunction(HigherOrderFunction::new(Arc::new(function), vec![col("i")]));
+        let mut scanner = dataset.scan();
+        scanner.filter_expr(expression);
+
+        assert_eq!(scanner.is_repeatable().unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::immutable("i * 2", true)]
+    #[case::volatile("i + random()", false)]
+    #[case::fixed_stable("now()", true)]
+    #[tokio::test]
+    async fn test_scanner_repeatable_projection(#[case] expression: &str, #[case] expected: bool) {
+        let dataset = repeatability_dataset().await;
+        let mut scanner = dataset.scan();
+        scanner
+            .project_with_transform(&[("i", "i"), ("value", expression)])
+            .unwrap();
+
+        assert_eq!(scanner.is_repeatable().unwrap(), expected);
+        if expected {
+            let first = scanner.try_into_batch().await.unwrap();
+            let second = scanner.try_into_batch().await.unwrap();
+            assert_eq!(first, second);
+        }
+    }
+
+    #[rstest]
+    #[case::immutable("i > 0", true)]
+    #[case::volatile("i > random()", false)]
+    #[case::stable("now() > TIMESTAMP '2000-01-01 00:00:00'", false)]
+    #[tokio::test]
+    async fn test_scanner_repeatable_filter(#[case] filter: &str, #[case] expected: bool) {
+        let dataset = repeatability_dataset().await;
+        let mut scanner = dataset.scan();
+        scanner.filter(filter).unwrap();
+        assert_eq!(scanner.is_repeatable().unwrap(), expected);
+
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let expression = Planner::new(schema).parse_filter(filter).unwrap();
+        scanner.filter_expr(expression);
+        assert_eq!(scanner.is_repeatable().unwrap(), expected);
+    }
+
+    #[cfg(feature = "substrait")]
+    #[tokio::test]
+    async fn test_scanner_repeatable_substrait_filter() {
+        let dataset = repeatability_dataset().await;
+        let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+        let context =
+            lance_datafusion::exec::get_session_context(&LanceExecutionOptions::default());
+        let filter = lance_datafusion::substrait::encode_substrait(
+            col("i").gt(lit(0)),
+            schema,
+            &context.state(),
+        )
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter_substrait(&filter).unwrap();
+
+        assert!(scanner.is_repeatable().unwrap());
+        assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
+    }
+
+    #[rstest]
+    #[case::ordered(true, false, true)]
+    #[case::unordered(false, false, false)]
+    #[case::sort_ties(true, true, false)]
+    #[tokio::test]
+    async fn test_scanner_repeatable_order(
+        #[case] ordered: bool,
+        #[case] explicit_sort: bool,
+        #[case] expected: bool,
+    ) {
+        let dataset = repeatability_dataset().await;
+        let mut scanner = dataset.scan();
+        scanner.scan_in_order(ordered);
+        if explicit_sort {
+            scanner
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first("i".to_string())]))
+                .unwrap();
+        }
+        assert_eq!(scanner.is_repeatable().unwrap(), expected);
+        scanner.limit(Some(1), Some(1)).unwrap();
+        assert_eq!(scanner.is_repeatable().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_scanner_repeatable_search_and_aggregate() {
+        let dataset = repeatability_dataset().await;
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new("example".to_string()))
+            .unwrap();
+        assert!(!scanner.is_repeatable().unwrap());
+
+        let mut scanner = dataset.scan();
+        scanner
+            .aggregate(AggregateExpr::Datafusion {
+                group_by: Vec::new(),
+                aggregates: vec![functions_aggregate::expr_fn::count(col("i"))],
+            })
+            .unwrap();
+        assert!(!scanner.is_repeatable().unwrap());
+    }
 
     #[test]
     fn test_fts_query_contract_rejects_invalid_values() {

@@ -117,6 +117,12 @@ impl ScanStatistics {
 
 #[pymethods]
 impl Scanner {
+    fn is_repeatable(&self) -> PyResult<bool> {
+        self.scanner
+            .is_repeatable()
+            .map_err(|err| PyValueError::new_err(err.to_string()))
+    }
+
     #[getter(schema)]
     fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let scanner = self_.scanner.clone();
