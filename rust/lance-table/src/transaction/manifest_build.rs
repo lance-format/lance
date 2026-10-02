@@ -3745,6 +3745,7 @@ mod tests {
     fn test_proto_legacy_field_9_read() {
         // Simulate a manifest written by old Lance: only field 9, no field 10.
         let pb_tx = pb::Transaction {
+            preconditions: Vec::new(),
             read_version: 1,
             uuid: "test".to_string(),
             tag: String::new(),
@@ -3794,6 +3795,7 @@ mod tests {
             .unwrap();
 
         let pb_tx = pb::Transaction {
+            preconditions: Vec::new(),
             read_version: 1,
             uuid: "test".to_string(),
             tag: String::new(),
