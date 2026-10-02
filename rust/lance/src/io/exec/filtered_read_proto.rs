@@ -457,21 +457,21 @@ fn range_from_proto(proto: &pb::U64Range) -> Range<u64> {
     proto.start..proto.end
 }
 
-fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<Vec<Fragment>> {
+fn fragments_from_proto(fragment_ids: &[u64], dataset: &Dataset) -> Result<Vec<Fragment>> {
+    let fragments = dataset.manifest.fragments.as_slice();
+    // Duplicate IDs in legacy manifests must resolve to their first stored fragment.
+    let ids_are_unique = dataset.fragment_bitmap.len() == fragments.len() as u64;
     fragment_ids
         .iter()
         .map(|id| {
-            dataset
-                .manifest
-                .fragments
-                .iter()
-                .find(|f| f.id == *id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Fragment {} not found in dataset", id).into(),
-                    )
-                })
+            let fragment = if ids_are_unique && u32::try_from(*id).is_ok() {
+                dataset.find_fragment(*id)
+            } else {
+                fragments.iter().find(|f| f.id == *id)
+            };
+            fragment.cloned().ok_or_else(|| {
+                Error::invalid_input_source(format!("Fragment {} not found in dataset", id).into())
+            })
         })
         .collect()
 }
@@ -506,6 +506,7 @@ mod tests {
     use lance_datagen::{array, gen_batch};
     use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -746,6 +747,82 @@ mod tests {
         assert_eq!(
             back.fragments.as_ref().unwrap()[0].id,
             options.fragments.as_ref().unwrap()[0].id
+        );
+    }
+
+    // Physical row counts distinguish fragments with the same ID.
+    async fn make_test_dataset_with_stored_ids(stored_ids: &[u64]) -> Dataset {
+        let fragments: Vec<_> = stored_ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| {
+                let mut fragment = Fragment::new(*id);
+                fragment.physical_rows = Some(position);
+                fragment
+            })
+            .collect();
+        let mut dataset = (*make_test_dataset().await).clone();
+        dataset.fragment_bitmap = Arc::new(
+            fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect(),
+        );
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        dataset
+    }
+
+    #[rstest]
+    #[case::sorted(&[0, 1, 2, 5, 8])]
+    #[case::unsorted(&[5, 0, 8, 2, 1])]
+    #[case::sorted_repeated(&[0, 1, 2, 2, 5, 8])]
+    // A binary search for 2 lands on the copy at position 3 of this list.
+    #[case::unsorted_repeated(&[2, 0, 1, 2, 5, 8])]
+    #[tokio::test]
+    async fn fragments_from_proto_returns_first_stored_fragment_in_request_order(
+        #[case] stored_ids: &[u64],
+    ) {
+        let dataset = make_test_dataset_with_stored_ids(stored_ids).await;
+        let requested_ids = [8, 2, 5, 0, 2, 1];
+
+        let resolved = fragments_from_proto(&requested_ids, &dataset).unwrap();
+
+        let first_stored = requested_ids
+            .iter()
+            .map(|id| {
+                dataset
+                    .manifest
+                    .fragments
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resolved, first_stored);
+    }
+
+    #[tokio::test]
+    async fn fragments_from_proto_preserves_wide_fragment_ids() {
+        let id = u64::from(u32::MAX) + 1;
+        let dataset = make_test_dataset_with_stored_ids(&[id]).await;
+        let resolved = fragments_from_proto(&[id], &dataset).unwrap();
+        assert_eq!(resolved, dataset.manifest.fragments.as_ref().clone());
+    }
+
+    #[rstest]
+    #[case::sorted(&[0, 1, 2, 5, 8])]
+    #[case::unsorted_repeated(&[2, 0, 1, 2, 5, 8])]
+    #[tokio::test]
+    async fn fragments_from_proto_rejects_missing_id(#[case] stored_ids: &[u64]) {
+        let dataset = make_test_dataset_with_stored_ids(stored_ids).await;
+
+        let err = fragments_from_proto(&[1, 3], &dataset).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        assert!(
+            err.to_string().contains("Fragment 3 not found"),
+            "unexpected error: {err}"
         );
     }
 
