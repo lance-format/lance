@@ -444,6 +444,57 @@ def test_merge_columns(tmp_path: Path):
     )
 
 
+def test_merge_columns_cleanup_after_outer_commit_failure(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"a": range(100)}), base_dir, max_rows_per_file=25
+    )
+    read_version = dataset.version
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 4
+
+    def data_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir)
+            for path in (base_dir / "data").rglob("*")
+            if path.is_file()
+        }
+
+    def dataset_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+
+    files_before_staging = data_files()
+    staged_fragment, staged_schema, cleanup = fragments[0].merge_columns(
+        {"staged": "a * 2"}, return_cleanup=True
+    )
+    staged_files = data_files() - files_before_staging
+    assert staged_files
+
+    # Preserve every fragment in the outer Merge while replacing the one that
+    # carries the staged column data.
+    merged_fragments = [staged_fragment]
+    merged_fragments.extend(fragment.metadata for fragment in fragments[1:])
+
+    # A concurrent Delete updates the same fragment without changing field ids,
+    # so the staged Merge based on read_version conflicts before it can land.
+    dataset.delete("a = 0")
+    files_before_cleanup = data_files()
+    dataset_files_before_cleanup = dataset_files()
+    with pytest.raises(Exception, match="conflict"):
+        lance.LanceDataset.commit(
+            base_dir,
+            lance.LanceOperation.Merge(merged_fragments, staged_schema),
+            read_version=read_version,
+        )
+
+    cleanup.cleanup()
+    assert data_files() == files_before_cleanup - staged_files
+    assert dataset_files() == dataset_files_before_cleanup - staged_files
+    assert files_before_staging <= data_files()
+
+
 def test_merge_columns_from_reader(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
