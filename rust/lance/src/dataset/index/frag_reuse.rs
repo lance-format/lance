@@ -725,7 +725,7 @@ mod tests {
             RowAddress::from(before[&1250]).fragment_id(),
             RowAddress::from(before[&2250]).fragment_id(),
         ];
-        let untouched_addr = before[&5000];
+        let trailing_addr = before[&5000];
         // Offset 0 of the first rewritten fragment is i=1000, deleted above.
         let deleted_addr = u64::from(RowAddress::new_from_parts(rewritten_frags[0], 0));
 
@@ -777,11 +777,13 @@ mod tests {
         }
         assert_eq!(remap.get(deleted_addr), Some(None));
         assert_eq!(frag_reuse_index.remap_row_id(deleted_addr), None);
-        assert_eq!(remap.get(untouched_addr), None);
-        assert_eq!(after[&5000], untouched_addr);
+        // The trailing fragment keeps its data but receives a new ID so the
+        // ID-sorted manifest preserves row order after the earlier rewrites.
+        assert_ne!(after[&5000], trailing_addr);
+        assert_eq!(remap.get(trailing_addr), Some(Some(after[&5000])));
         assert_eq!(
-            frag_reuse_index.remap_row_id(untouched_addr),
-            Some(untouched_addr)
+            frag_reuse_index.remap_row_id(trailing_addr),
+            Some(after[&5000])
         );
 
         let pre_compaction = dataset

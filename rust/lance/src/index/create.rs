@@ -3134,13 +3134,14 @@ mod tests {
     /// surviving half made the coverage look healthy.
     #[tokio::test]
     async fn test_merge_uncommitted_segments_partly_retired_by_compaction() {
-        // Two undersized fragments and one already at the compaction target, so
-        // compaction rewrites the pair and leaves the third alone.
+        // One fragment at the compaction target followed by two undersized
+        // fragments. Rewriting the trailing pair leaves the first fragment's
+        // staged coverage live without relabeling it.
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(2),
-                lance_datagen::BatchCount::from(2),
+                lance_datagen::RowCount::from(4),
+                lance_datagen::BatchCount::from(1),
             );
         let test_dir = tempfile::tempdir().unwrap();
         let dataset_uri = test_dir.path().to_str().unwrap();
@@ -3148,7 +3149,7 @@ mod tests {
             reader,
             dataset_uri,
             Some(WriteParams {
-                max_rows_per_file: 2,
+                max_rows_per_file: 4,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3158,15 +3159,15 @@ mod tests {
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(4),
-                lance_datagen::BatchCount::from(1),
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
             );
         let mut dataset = Dataset::write(
             reader,
             dataset_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                max_rows_per_file: 4,
+                max_rows_per_file: 2,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3198,8 +3199,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Two rows per fragment against a four-row target pairs some fragments
-        // and leaves at least one alone.
+        // Two trailing two-row fragments compact while the leading four-row
+        // fragment keeps its identity.
         crate::dataset::optimize::compact_files(
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
@@ -3882,10 +3883,10 @@ mod tests {
         );
         assert_eq!(count_in_range(&dataset, &merged, 50, 100).await, 50);
 
-        // Phase 2 — retire fragment 0: delete >10% of its rows so compaction
-        // rewrites only frag 0 (frag 1 has no deletions and is at target size).
-        // The committed per-fragment segment now claims a fragment the dataset
-        // no longer has.
+        // Phase 2 — delete >10% of fragment 0's rows so compaction rewrites its
+        // data. Preserving row order in the ID-sorted manifest also relabels the
+        // untouched trailing fragment, so both committed segments must follow
+        // their stable row-id coverage to fresh fragment IDs.
         dataset.delete("id < 16").await.unwrap();
         crate::dataset::optimize::compact_files(
             &mut dataset,
@@ -3904,16 +3905,15 @@ mod tests {
             .collect();
         assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
-        // Filtered merge: coverage drops the retired fragment but keeps the
-        // live one, and the merged page data does not leak the retired row ids
-        // (ids < 16 lived only in frag 0, so the range now returns nothing).
+        // Filtered merge: coverage follows the current fragments, and the
+        // merged page data does not leak the retired row ids (ids < 16 lived
+        // only in frag 0, so the range now returns nothing).
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
             .await
             .unwrap();
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(!coverage.contains(0), "must drop retired frag 0");
-        assert!(coverage.contains(1), "must keep live frag 1");
+        assert_eq!(coverage, &live_frags);
         assert_eq!(
             count_in_range(&dataset, &merged, 0, 16).await,
             0,

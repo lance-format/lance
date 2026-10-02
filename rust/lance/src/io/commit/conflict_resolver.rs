@@ -1259,11 +1259,32 @@ impl<'a> TransactionRebase<'a> {
                 .as_ref()
                 .is_some_and(|entry| !is_tagged(entry))
                 && self.reuse.added_transitions.is_none();
+            // Compaction reserves a new ID suffix after planning. A concurrent
+            // row addition can then sort before its replacements, so retry the
+            // compaction. Stable-partition rewrites carry their own tagged row
+            // mapping and keep the existing append rebase behavior.
+            let is_stable_partition_rewrite = self.reuse.added_transitions.as_ref().is_some_and(
+                |transitions| {
+                    !transitions.is_empty()
+                        && transitions.iter().all(|transition| {
+                            matches!(
+                                transition.mapping,
+                                Some(lance_table::format::pb::fragment_reuse_index_details::transition::Mapping::StablePartition(_))
+                            )
+                        })
+                },
+            );
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
-                Operation::Append { .. }
-                | Operation::ReserveFragments { .. }
+                Operation::Append { .. } => {
+                    if !is_stable_partition_rewrite {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -1273,17 +1294,30 @@ impl<'a> TransactionRebase<'a> {
                     updated_fragments,
                     deleted_fragment_ids,
                     ..
-                }
-                | Operation::Update {
-                    updated_fragments,
-                    removed_fragment_ids: deleted_fragment_ids,
-                    ..
                 } => {
                     if updated_fragments
                         .iter()
                         .map(|f| f.id)
                         .chain(deleted_fragment_ids.iter().copied())
                         .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::Update {
+                    updated_fragments,
+                    removed_fragment_ids: deleted_fragment_ids,
+                    new_fragments,
+                    ..
+                } => {
+                    if (!is_stable_partition_rewrite && !new_fragments.is_empty())
+                        || updated_fragments
+                            .iter()
+                            .map(|f| f.id)
+                            .chain(deleted_fragment_ids.iter().copied())
+                            .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -3689,6 +3723,57 @@ mod tests {
         Retryable,
     }
 
+    #[rstest::rstest]
+    #[case::append(false)]
+    #[case::update(true)]
+    fn test_compaction_rewrite_retries_row_additions(#[case] is_update: bool) {
+        let operation = Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![Fragment::new(0)],
+                new_fragments: vec![Fragment::new(2)],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, operation.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&operation).collect::<HashSet<_>>(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            current_lineage: None,
+            current_live: None,
+            current_schema: None,
+            read_fragments: None,
+            read_schema: None,
+            reuse: Default::default(),
+        };
+        let other_operation = if is_update {
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![Fragment::new(3)],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            }
+        } else {
+            Operation::Append {
+                fragments: vec![Fragment::new(3)],
+            }
+        };
+        let other = Transaction::new(0, other_operation, None);
+
+        assert!(matches!(
+            rebase.check_txn(&other, 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
+    }
+
     #[test]
     fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
@@ -3885,7 +3970,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Compatible,    // delete
                     Retryable,     // merge
@@ -3907,7 +3992,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Retryable,     // delete
                     Retryable,     // merge
@@ -7640,16 +7725,24 @@ mod tests {
 
         /// An on-disk tagged fixture (fragments 10 and 11, four rows each,
         /// values 0..8) plus two two-row appended fragments (100..102 and
-        /// 102..104): with `target_rows_per_fragment: 4` only the appended
-        /// fragments are compaction candidates, so a real `compact_files`
-        /// stays disjoint from a stable-partition rewrite of 10 and 11.
-        async fn disk_tagged_fixture_with_small_fragments(uri: &str) -> Dataset {
+        /// 102..104). The appended fragments have higher IDs, so compacting
+        /// their suffix leaves the tagged fragments' identities intact.
+        async fn disk_tagged_fixture_with_small_fragments(
+            uri: &str,
+            extra_rows: Option<std::ops::Range<i32>>,
+        ) -> Dataset {
             // Order matters: the two-row fragments are appended and indexed
             // BEFORE the tagging rewrite, so deferred compaction of them
             // must record a transition (uncovered fragments would commit a
             // plain rewrite instead; see
             // `uncovered_deferred_compaction_commits_plain_rewrite`).
-            let dataset = disk_fixture(uri, 2, 4).await;
+            let mut dataset = disk_fixture(uri, 2, 4).await;
+            reserve(&mut dataset, 40).await;
+            let dataset = if let Some(rows) = extra_rows {
+                append_rows(&dataset, rows).await
+            } else {
+                dataset
+            };
             let dataset = append_rows(&dataset, 100..102).await;
             let mut dataset = append_rows(&dataset, 102..104).await;
             dataset
@@ -7662,7 +7755,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            reserve(&mut dataset, 40).await;
             let old_fragments: Vec<Fragment> = dataset
                 .fragments()
                 .iter()
@@ -7972,7 +8064,7 @@ mod tests {
         #[tokio::test]
         async fn real_deferred_compaction_rebases_over_concurrent_sp_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             // The compactor opens BEFORE the rewrite commits: its plan and
             // its commit read-version anchor at the pre-rewrite snapshot.
@@ -7985,7 +8077,7 @@ mod tests {
                 .filter(|f| f.id == 10 || f.id == 11)
                 .cloned()
                 .collect();
-            let (b_transition, b_destinations) = prepare_partition(&sp_writer, &[10, 11], 50).await;
+            let (b_transition, b_destinations) = prepare_partition(&sp_writer, &[10, 11], 20).await;
             let read_version = sp_writer.manifest.version;
             commit_sp(
                 &sp_writer,
@@ -8021,7 +8113,7 @@ mod tests {
         #[tokio::test]
         async fn sp_rebases_over_real_deferred_compaction_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let sp_writer = fresh_session(dir.as_str()).await;
             let b_old: Vec<Fragment> = sp_writer
@@ -8066,7 +8158,7 @@ mod tests {
         #[tokio::test]
         async fn tagged_compactions_disjoint_both_land_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let oc_writer = fresh_session(dir.as_str()).await;
             let b_old: Vec<Fragment> = oc_writer
@@ -8112,7 +8204,7 @@ mod tests {
         #[tokio::test]
         async fn tagged_compactions_overlapping_rejected_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let mut loser = fresh_session(dir.as_str()).await;
             let mut winner = fresh_session(dir.as_str()).await;
@@ -8207,7 +8299,7 @@ mod tests {
         #[tokio::test]
         async fn overlapping_compaction_and_sp_rejected_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let sp_writer = fresh_session(dir.as_str()).await;
             let small_ids: Vec<u64> = sp_writer
@@ -8258,11 +8350,25 @@ mod tests {
         #[tokio::test]
         async fn sp_compaction_sp_three_way_disjoint_merge() {
             let dir = TempStrDir::default();
-            let dataset = disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
-            // A fourth region for the second stable-partition writer.
-            let mut dataset = append_rows(&dataset, 200..204).await;
+            // A fourth region before the compactable suffix for the second
+            // stable-partition writer.
+            let mut dataset =
+                disk_tagged_fixture_with_small_fragments(dir.as_str(), Some(200..204)).await;
             reserve(&mut dataset, 100).await;
-            let extra_id = dataset.fragments().last().unwrap().id;
+            let small_id = dataset
+                .fragments()
+                .iter()
+                .find(|fragment| fragment.physical_rows == Some(2))
+                .unwrap()
+                .id;
+            let extra_id = dataset
+                .fragments()
+                .iter()
+                .find(|fragment| {
+                    fragment.id != 10 && fragment.id != 11 && fragment.physical_rows == Some(4)
+                })
+                .unwrap()
+                .id;
 
             // Both racing writers open before the first rewrite commits.
             let mut compactor = fresh_session(dir.as_str()).await;
@@ -8286,7 +8392,7 @@ mod tests {
                 .filter(|f| f.id == 10 || f.id == 11)
                 .cloned()
                 .collect();
-            let (w1_transition, w1_destinations) = prepare_partition(&dataset, &[10, 11], 80).await;
+            let (w1_transition, w1_destinations) = prepare_partition(&dataset, &[10, 11], 20).await;
             let w1_version = dataset.manifest.version;
             commit_sp(
                 &dataset,
@@ -8322,7 +8428,7 @@ mod tests {
             // Fixture rewrite + writers 1 and 3, plus the compaction.
             assert_eq!(count_mappings(&ledger), (3, 1));
             assert!(ledger.consumer(10).is_some());
-            assert!(ledger.consumer(2).is_some());
+            assert!(ledger.consumer(u32::try_from(small_id).unwrap()).is_some());
             assert!(ledger.consumer(extra_id as u32).is_some());
             let mut expected: Vec<i32> = (0..8).collect();
             expected.extend(100..104);
