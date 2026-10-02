@@ -40,6 +40,7 @@ use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -1729,7 +1730,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                     storage_ivf.add_partition(0);
                     index_ivf.add_partition(0);
-                    partition_index_metadata.push(String::new());
+                    // An empty HNSW partition must still round-trip through
+                    // `read_sub_index_batch` with parseable `lance:hnsw` metadata
+                    // (see `remap_hnsw_partition`); an empty string there panics.
+                    if S::name() == HNSW::name() {
+                        partition_index_metadata.push(
+                            serde_json::to_string(&HnswMetadata::default())
+                                .expect("valid HnswMetadata always serializes"),
+                        );
+                    } else {
+                        partition_index_metadata.push(String::new());
+                    }
 
                     continue;
                 };
@@ -1793,7 +1804,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let index_batch = index.to_batch()?;
                 if index_batch.num_rows() == 0 {
                     index_ivf.add_partition(0);
-                    partition_index_metadata.push(String::new());
+                    // An empty HNSW partition must still round-trip through
+                    // `read_sub_index_batch` with parseable `lance:hnsw` metadata;
+                    // an empty string there panics on read.
+                    if S::name() == HNSW::name() {
+                        partition_index_metadata.push(
+                            serde_json::to_string(&HnswMetadata::default())
+                                .expect("valid HnswMetadata always serializes"),
+                        );
+                    } else {
+                        partition_index_metadata.push(String::new());
+                    }
                 } else {
                     index_writer.write_batch(&index_batch).await?;
                     index_ivf.add_partition(index_batch.num_rows() as u32);
