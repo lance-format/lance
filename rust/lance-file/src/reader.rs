@@ -760,7 +760,8 @@ impl FileReader {
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
             return Err(Error::invalid_input(format!(
-                "file does not appear to be a Lance file (invalid magic: {:?})",
+                "file does not appear to be a Lance file (invalid magic: {:?}, expected {:?})",
+                magic_bytes.as_ref(),
                 MAGIC
             )));
         }
@@ -4404,6 +4405,29 @@ mod tests {
         assert_eq!(buf_index, 1);
 
         file_writer.finish().await.unwrap();
+    }
+
+    #[test]
+    fn test_decode_footer_reports_actual_magic_bytes_on_mismatch() {
+        // decode_footer only reads the trailing FOOTER_LEN bytes, so a buffer of
+        // zeros with a bad 4-byte magic at the end is enough to trigger the check.
+        let mut footer_bytes = vec![0u8; super::FOOTER_LEN];
+        let bad_magic = b"BAD!";
+        let len = footer_bytes.len();
+        footer_bytes[len - 4..].copy_from_slice(bad_magic);
+
+        let error = FileReader::decode_footer(&Bytes::from(footer_bytes))
+            .expect_err("footer with wrong magic must fail to decode");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{:?}", bad_magic.as_slice())),
+            "error should report the bytes actually read, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("{:?}", super::MAGIC)),
+            "error should still report the expected magic, got: {message}"
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
