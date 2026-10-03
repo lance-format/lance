@@ -2082,6 +2082,8 @@ mod tests {
         /// drop leaves the files it keeps as they are, so the data file still
         /// lists the ids of `i` and `j`, which the schema no longer has.
         Drop,
+        /// The remaining column is all null, leaving only the lineage carrier.
+        DropForNulls,
         /// `i` and `j` are cast. A cast rewrites the columns under new field
         /// ids into a new file and leaves their old ids, now dead, in the data
         /// file.
@@ -2100,6 +2102,7 @@ mod tests {
     /// rather than planning a task that fails.
     #[rstest]
     #[case::drop(CarrierChange::Drop)]
+    #[case::drop_for_nulls(CarrierChange::DropForNulls)]
     #[case::cast(CarrierChange::Cast)]
     #[case::replace(CarrierChange::Replace)]
     #[tokio::test]
@@ -2117,17 +2120,19 @@ mod tests {
 
         // The ids the data file lists for `i` and `j` once the change is made.
         let carrier_user_fields = match change {
-            CarrierChange::Drop => {
-                // `k` lives in a file of its own, so dropping `i` and `j`
-                // leaves the compacted file with no field in the schema.
-                dataset
-                    .add_columns(
-                        NewColumnTransform::SqlExpressions(vec![("k".into(), "i + 1".into())]),
-                        None,
-                        None,
-                    )
-                    .await
-                    .unwrap();
+            CarrierChange::Drop | CarrierChange::DropForNulls => {
+                // Dropping i and j leaves the carrier with no schema field.
+                // An all-null k needs no file, so only the carrier remains.
+                let transform = if matches!(change, CarrierChange::DropForNulls) {
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![Field::new(
+                        "k",
+                        DataType::Int32,
+                        true,
+                    )])))
+                } else {
+                    NewColumnTransform::SqlExpressions(vec![("k".into(), "i + 1".into())])
+                };
+                dataset.add_columns(transform, None, None).await.unwrap();
                 dataset.drop_columns(&["i", "j"]).await.unwrap();
                 [0, 1]
             }
@@ -2189,6 +2194,23 @@ mod tests {
                 .all(|field_id| dataset.schema().field_by_id(*field_id).is_none()),
             "the carrier must have lost every user column: {metadata:?}"
         );
+        if matches!(change, CarrierChange::DropForNulls) {
+            assert_eq!(metadata.files.len(), 1);
+            let reopened = Dataset::open(uri).await.unwrap();
+            reopened.validate().await.unwrap();
+            let batch = reopened.scan().try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), row_ids.len());
+            assert_eq!(batch["k"].null_count(), row_ids.len());
+
+            // With no user file to measure, validation must still read and
+            // check the length of the retained lineage.
+            let mut corrupt = Dataset::open(uri).await.unwrap();
+            Arc::make_mut(&mut Arc::make_mut(&mut corrupt.manifest).fragments)[0].physical_rows =
+                Some(row_ids.len() + 1);
+            let error = corrupt.validate().await.unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+            assert!(error.to_string().contains("physical rows"), "{error}");
+        }
         dataset.validate().await.unwrap();
         // A change may stamp every row as updated, so only the row ids and
         // created-at versions are compared.
