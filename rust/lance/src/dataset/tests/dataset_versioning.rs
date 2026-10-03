@@ -233,6 +233,52 @@ async fn test_version_id_fast_path() {
     assert_eq!(historical.latest_version_id().await.unwrap(), 2);
 }
 
+#[tokio::test]
+async fn test_versions_returns_all_in_ascending_order() {
+    // Manifests are read concurrently (buffer_unordered), so this guards that
+    // the final result is still complete and sorted ascending by version.
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let num_versions = 10u32;
+    let mut dataset = None;
+    for v in 0..num_versions {
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(v * 5..v * 5 + 5))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let params = if v == 0 {
+            None
+        } else {
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+        };
+        dataset = Some(Dataset::write(reader, &test_uri, params).await.unwrap());
+    }
+    let dataset = dataset.unwrap();
+
+    let versions = dataset.versions().await.unwrap();
+    assert_eq!(versions.len() as u32, num_versions);
+    // Version ids must be 1..=num_versions in ascending order.
+    let ids: Vec<u64> = versions.iter().map(|v| v.version).collect();
+    let expected: Vec<u64> = (1..=num_versions as u64).collect();
+    assert_eq!(ids, expected);
+    // Timestamps must be populated (non-decreasing across versions).
+    assert!(
+        versions
+            .windows(2)
+            .all(|w| w[0].timestamp <= w[1].timestamp)
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_stale_checks_cover_fast_successor_and_latest_version(
