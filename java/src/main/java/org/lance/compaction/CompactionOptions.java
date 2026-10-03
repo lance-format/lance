@@ -22,6 +22,7 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OptionalDataException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -54,7 +55,11 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceBytes;
   private List<Long> excludedFragmentIds;
   private Optional<DataStorageVersion> dataStorageVersion;
+  private Optional<Long> maxDataFilesPerFragment;
+  private List<List<String>> columnGroups;
+  private Optional<CompactionScope> scope;
 
+  // Also called from the native layer.
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,
@@ -70,7 +75,10 @@ public class CompactionOptions implements Serializable {
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
-      Optional<String> dataStorageVersion) {
+      Optional<String> dataStorageVersion,
+      Optional<Long> maxDataFilesPerFragment,
+      List<List<String>> columnGroups,
+      Optional<String> scope) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -86,6 +94,30 @@ public class CompactionOptions implements Serializable {
     this.maxSourceBytes = maxSourceBytes;
     this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
     this.dataStorageVersion = dataStorageVersion.map(DataStorageVersion::fromRustString);
+    this.maxDataFilesPerFragment = maxDataFilesPerFragment;
+    this.columnGroups = copyGroups(columnGroups);
+    this.scope = scope.map(CompactionOptions::scopeFromValue);
+  }
+
+  private static List<List<String>> copyGroups(List<List<String>> groups) {
+    List<List<String>> copy = new ArrayList<>(groups.size());
+    for (List<String> group : groups) {
+      copy.add(List.copyOf(group));
+    }
+    return Collections.unmodifiableList(copy);
+  }
+
+  public Optional<Long> getMaxDataFilesPerFragment() {
+    return maxDataFilesPerFragment;
+  }
+
+  public List<List<String>> getColumnGroups() {
+    return columnGroups;
+  }
+
+  /** Returns the scope as its string value for the native layer. */
+  public Optional<String> getScope() {
+    return scope.map(CompactionScope::getValue);
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -172,6 +204,9 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .add("excludedFragmentIds", excludedFragmentIds)
         .add("dataStorageVersion", dataStorageVersion.orElse(null))
+        .add("maxDataFilesPerFragment", maxDataFilesPerFragment.orElse(null))
+        .add("columnGroups", columnGroups)
+        .add("scope", scope.orElse(null))
         .toString();
   }
 
@@ -191,6 +226,9 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceBytes.orElse(null));
     output.writeObject(excludedFragmentIds);
     output.writeObject(getDataStorageVersion().orElse(null));
+    output.writeObject(maxDataFilesPerFragment.orElse(null));
+    output.writeObject(new ArrayList<>(columnGroups));
+    output.writeObject(getScope().orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -218,6 +256,32 @@ public class CompactionOptions implements Serializable {
     this.maxSourceBytes = readTrailingLong(input);
     this.excludedFragmentIds = readTrailingLongList(input);
     this.dataStorageVersion = readTrailingString(input).map(DataStorageVersion::fromRustString);
+    this.maxDataFilesPerFragment = readTrailingLong(input);
+    this.columnGroups = readTrailingGroups(input);
+    this.scope = readTrailingString(input).map(CompactionOptions::scopeFromValue);
+  }
+
+  private static CompactionScope scopeFromValue(String value) {
+    for (CompactionScope scope : CompactionScope.values()) {
+      if (scope.getValue().equals(value)) {
+        return scope;
+      }
+    }
+    throw new IllegalArgumentException("Unknown compaction scope: " + value);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static List<List<String>> readTrailingGroups(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      List<List<String>> groups = (List<List<String>>) input.readObject();
+      return groups == null ? Collections.emptyList() : copyGroups(groups);
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Collections.emptyList();
+    }
   }
 
   /**
@@ -280,6 +344,9 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceBytes = Optional.empty();
     private List<Long> excludedFragmentIds = Collections.emptyList();
     private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
+    private Optional<Long> maxDataFilesPerFragment = Optional.empty();
+    private List<List<String>> columnGroups = Collections.emptyList();
+    private Optional<CompactionScope> scope = Optional.empty();
 
     private Builder() {}
 
@@ -403,6 +470,38 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
+     * Maximum number of data files a fragment may hold columns in before its columns are repacked
+     * into fewer files. Each {@code addColumns} backfill adds one file per fragment. A repack
+     * rewrites only the columns that move and keeps rows, fragment ids and indices as they are.
+     * Unset means no file-count trigger.
+     *
+     * @throws IllegalArgumentException if {@code maxDataFilesPerFragment} is not positive
+     */
+    public Builder withMaxDataFilesPerFragment(long maxDataFilesPerFragment) {
+      this.maxDataFilesPerFragment =
+          Optional.of(positiveBudget("maxDataFilesPerFragment", maxDataFilesPerFragment));
+      return this;
+    }
+
+    /**
+     * Top-level columns to keep in their own data files. Each inner list becomes one data file per
+     * fragment; the columns no group names share one file. Fragments the compaction rewrites are
+     * written this way, and the others have their columns repacked to match. Names that are not
+     * top-level columns are ignored. An empty list keeps the {@code lance.compaction.column_groups}
+     * table config, if any.
+     */
+    public Builder withColumnGroups(List<List<String>> columnGroups) {
+      this.columnGroups = copyGroups(Objects.requireNonNull(columnGroups, "columnGroups"));
+      return this;
+    }
+
+    /** Which kinds of task to plan. Defaults to {@link CompactionScope#ALL}. */
+    public Builder withScope(CompactionScope scope) {
+      this.scope = Optional.of(Objects.requireNonNull(scope, "scope"));
+      return this;
+    }
+
+    /**
      * A max source budget of zero admits no work and a negative value would wrap around to an
      * effectively unlimited budget on the Rust side, so both are rejected here. Leave the option
      * unset for no limit.
@@ -431,7 +530,10 @@ public class CompactionOptions implements Serializable {
           maxSourceRows,
           maxSourceBytes,
           excludedFragmentIds,
-          dataStorageVersion.map(DataStorageVersion::toRustString));
+          dataStorageVersion.map(DataStorageVersion::toRustString),
+          maxDataFilesPerFragment,
+          columnGroups,
+          scope.map(CompactionScope::getValue));
     }
   }
 }

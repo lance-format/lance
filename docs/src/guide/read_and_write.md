@@ -497,8 +497,9 @@ ordering of the data will be preserved.
 
 !!! note
 
-    Compaction creates a new version of the table. It does not delete the old
-    version of the table and the files referenced by it.
+    Compaction creates a new version of the table, or two when it both
+    rewrites fragments and repacks columns (see below). It does not delete the
+    old versions of the table and the files referenced by them.
 
 ```python
 import lance
@@ -516,6 +517,41 @@ affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before re-building indices.
 
 <!-- TODO: remove this last comment once stable row ids are default. -->
+
+#### Repack columns
+
+Each `add_columns` backfill gives every fragment one more data file. A large
+fragment with few deletions is never rewritten, so those files pile up and slow
+down scans and random reads. Compaction can repack a fragment's columns into
+fewer data files instead. A repack moves no rows, so fragment ids, row
+addresses, deletions, data overlays and index coverage stay as they are.
+
+Repacking is off by default. Set either option, as a `compact_files` argument or
+as table config:
+
+- `max_data_files_per_fragment` (`lance.compaction.max_data_files_per_fragment`):
+  repack a fragment that holds its columns in more files than this.
+- `column_groups` (`lance.compaction.column_groups`, groups separated by `;` and
+  columns by `,`): keep these top-level columns together in a file of their
+  own. Fragments that compaction rewrites are written this way too.
+
+`scope` limits a run to one kind of work: `"rewrite_fragments"`,
+`"repack_columns"`, or `"all"` (the default).
+
+```python
+dataset.optimize.compact_files(max_data_files_per_fragment=2)
+
+# Only repack, and keep the embedding in a file of its own.
+dataset.optimize.compact_files(column_groups=[["embedding"]], scope="repack_columns")
+
+# Per fragment: live data files, file sizes, fields per file, dead field slots.
+dataset.stats.column_layout_stats()
+```
+
+A repack only merges files it can empty. Files holding a blob column, a column
+only partly present in the fragment, or spilled row lineage stay as they are,
+so a fragment can stay above the limit. Fragments with legacy (V1) data files
+are not repacked.
 
 ### Cleanup old versions
 

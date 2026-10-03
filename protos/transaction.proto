@@ -365,6 +365,12 @@ message Transaction {
   // An operation that replaces the data in a region of the table with new data.
   message DataReplacement {
     repeated DataReplacementGroup replacements = 1;
+    /* Whether the new files change any value. Absent means true, which is what
+     * a writer that predates this field meant. False means the values were only
+     * moved to new files: index coverage, overlays, and row update versions are
+     * left as they are.
+     */
+    optional bool data_change = 2;
   }
 
   /* Overlay files to append to a single fragment, in order (the last entry is

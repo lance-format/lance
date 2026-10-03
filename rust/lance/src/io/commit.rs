@@ -1487,7 +1487,8 @@ async fn prepare_attempt(
         Operation::Update {
             fields_modified, ..
         } => !fields_modified.is_empty(),
-        Operation::Merge { .. } | Operation::DataReplacement { .. } => true,
+        Operation::Merge { .. } => true,
+        Operation::DataReplacement { data_change, .. } => *data_change,
         _ => false,
     };
     let ledger = if may_rewrite_in_place {

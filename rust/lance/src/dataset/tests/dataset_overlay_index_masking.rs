@@ -255,6 +255,45 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
 }
 
+/// A column repack moves base values without changing them, so an overlay on
+/// the fragment keeps shadowing the base it was written over.
+#[tokio::test]
+async fn repack_columns_preserves_data_overlay() {
+    let dataset = create_base_dataset().await;
+    // Fragment 0, offset 1 is id=1, age=10; the overlay changes its age to 999.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Split `id` into a file of its own; the overlay on `age` must survive.
+    let options = crate::dataset::optimize::CompactionOptions {
+        column_groups: vec![vec!["id".into()]],
+        scope: crate::dataset::optimize::CompactionScope::RepackColumns,
+        ..Default::default()
+    };
+    crate::dataset::optimize::compact_files(&mut dataset, options, None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragment(0).unwrap().metadata().files.len(), 2);
+
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1,
+        "the data overlay must survive the rewrite"
+    );
+    // The overlaid value still shadows the base: age=999 for id=1, old 10 gone.
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    dataset.validate().await.unwrap();
+}
+
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is
 /// blocked from the index result and re-evaluated on the stale-Take path. Non-stale rows in
 /// the same fragment (including one that matches the predicate) remain on the indexed path.

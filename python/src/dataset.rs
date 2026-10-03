@@ -2103,6 +2103,24 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    /// Per-fragment column-layout stats, in manifest fragment order.
+    fn column_layout_stats(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        self.ds
+            .column_layout_stats()
+            .into_iter()
+            .map(|stats| {
+                let dict = PyDict::new(py);
+                dict.set_item("fragment_id", stats.fragment_id)?;
+                dict.set_item("live_file_count", stats.live_file_count)?;
+                dict.set_item("file_sizes", stats.file_sizes)?;
+                dict.set_item("fields_per_file", stats.fields_per_file)?;
+                dict.set_item("tombstoned_field_ratio", stats.tombstoned_field_ratio)?;
+                dict.set_item("overlay_count", stats.overlay_count)?;
+                Ok(dict.unbind())
+            })
+            .collect()
+    }
+
     #[pyo3(signature=(new_bases, transaction_properties=None))]
     fn add_bases(
         &mut self,

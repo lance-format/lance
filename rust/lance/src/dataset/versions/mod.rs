@@ -105,7 +105,21 @@ pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOpti
     }
 }
 
-async fn create_seed_writers(
+/// Reject a write schema whose blob columns don't match the file version, the
+/// same check [`write_fragments`] runs — exposed for callers that go straight to
+/// [`write_fragments_direct`] with a schema they built themselves.
+pub(super) fn validate_write_schema(version: ConcreteFileVersion, schema: &Schema) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
+            write::validate_legacy_blob_write_schema(schema, &format!("{version:?}"))
+        }
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            write::validate_blob_v2_write_schema(schema)
+        }
+    }
+}
+
+pub(super) async fn create_seed_writers(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     params: &WriteParams,

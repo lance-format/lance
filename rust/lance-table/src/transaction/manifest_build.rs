@@ -1247,7 +1247,10 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => {
                 log::warn!(
                     "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
                 );
@@ -1257,56 +1260,24 @@ impl Transaction {
                     .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
                     .unzip();
 
-                // 1. make sure the new files all have the same fields / or empty
-                // NOTE: arguably this requirement could be relaxed in the future
-                // for the sake of simplicity, we require the new files to have the same fields
-                if new_datafiles
-                    .iter()
-                    .map(|f| f.fields.clone())
-                    .collect::<HashSet<_>>()
-                    .len()
-                    > 1
-                {
-                    let field_info = new_datafiles
-                        .iter()
-                        .enumerate()
-                        .map(|(id, f)| (id, f.fields.clone()))
-                        .fold("".to_string(), |acc, (id, fields)| {
-                            format!("{}File {}: {:?}\n", acc, id, fields)
-                        });
-
-                    return Err(Error::invalid_input(format!(
-                        "All new data files must have the same fields, but found different fields:\n{field_info}"
-                    )));
-                }
-
                 let existing_fragments = maybe_existing_fragments?;
 
-                // Collect replaced field IDs before consuming new_datafiles
-                let replaced_fields: Vec<u32> = new_datafiles
-                    .first()
-                    .map(|f| {
-                        f.schema(&schema)
-                            .field_ids()
-                            .iter()
-                            .chain(f.fields.iter())
-                            .filter(|&&id| id >= 0)
-                            .map(|&id| id as u32)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
-                // 3. add modified fragments to final_fragments
+                // Apply the groups in order. Several groups may name the same
+                // fragment (one new file each), so each applies to the
+                // fragment as the previous ones left it.
+                let mut replaced: HashMap<u64, Fragment> = HashMap::new();
                 for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
-                    let frag = existing_fragments
-                        .iter()
-                        .find(|f| f.id == **frag_id)
-                        .ok_or_else(|| {
-                            Error::invalid_input(
-                                "Fragment being replaced not found in existing fragments",
-                            )
-                        })?;
+                    let frag = match replaced.get(*frag_id) {
+                        Some(frag) => frag,
+                        None => existing_fragments
+                            .iter()
+                            .find(|f| f.id == **frag_id)
+                            .ok_or_else(|| {
+                                Error::invalid_input(
+                                    "Fragment being replaced not found in existing fragments",
+                                )
+                            })?,
+                    };
                     let mut new_frag = frag.clone();
 
                     // Physical mappings differ across V2 encodings (a nested
@@ -1425,19 +1396,31 @@ impl Transaction {
                     // value though -- the conflict resolver rebases these two
                     // precisely because the overlay wins -- so it stays, and
                     // being newer it stays last, preserving the ordering.
-                    let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
-                        .overlays
-                        .drain(..)
-                        .partition(|overlay| overlay.committed_version <= self.read_version);
-                    crate::format::overlay::tombstone_overlay_fields(
-                        &mut superseded,
-                        &replaced_fields,
-                    );
-                    superseded.extend(newer);
-                    new_frag.overlays = superseded;
+                    // Values that only moved supersede nothing.
+                    if *data_change {
+                        let replaced_fields: Vec<u32> = new_file
+                            .schema(&schema)
+                            .field_ids()
+                            .iter()
+                            .chain(new_file.fields.iter())
+                            .filter(|&&id| id >= 0)
+                            .map(|&id| id as u32)
+                            .collect();
+                        let (mut superseded, newer): (Vec<_>, Vec<_>) = new_frag
+                            .overlays
+                            .drain(..)
+                            .partition(|overlay| overlay.committed_version <= self.read_version);
+                        crate::format::overlay::tombstone_overlay_fields(
+                            &mut superseded,
+                            &replaced_fields,
+                        );
+                        superseded.extend(newer);
+                        new_frag.overlays = superseded;
+                    }
 
-                    final_fragments.push(new_frag);
+                    replaced.insert(**frag_id, new_frag);
                 }
+                final_fragments.extend(replaced.into_values());
 
                 let fragments_changed = old_fragment_ids
                     .iter()
@@ -1457,7 +1440,7 @@ impl Transaction {
                 // A replacement changes what its rows read as, so stamp them
                 // updated. Without this, get_updated_rows never reports them and
                 // an incremental consumer skips them for good.
-                if next_row_id.is_some() {
+                if next_row_id.is_some() && *data_change {
                     let new_version = current_manifest.map_or(1, |m| m.version + 1);
                     for fragment in final_fragments
                         .iter_mut()
@@ -1470,8 +1453,8 @@ impl Transaction {
                     }
                 }
 
-                // The replaced fields' coverage of the modified fragments was
-                // withdrawn by `prepare_indices`.
+                // When the data changed, the replaced fields' coverage of the
+                // modified fragments was withdrawn by `prepare_indices`.
             }
             Operation::DataOverlay { groups } => {
                 // Stamp each overlay with the version this commit is producing.
@@ -2160,6 +2143,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             _ => unreachable!(),
         }
@@ -2865,6 +2849,33 @@ mod tests {
             prepared.prepared()[0].fragment_bitmap,
             Some(RoaringBitmap::from_iter([3u32]))
         );
+    }
+
+    /// A replacement whose values only moved to new files keeps every index's
+    /// coverage of the replaced fragment.
+    #[test]
+    fn prepare_indices_keeps_coverage_for_moved_values() {
+        let mut manifest = manifest_with_file("a.lance");
+        manifest.reader_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+        let mut segment = sample_index_metadata("id_idx");
+        segment.fragment_bitmap = Some([0u32, 3].into_iter().collect());
+        let mut operation = in_place_rewrite("data_replacement", &manifest, vec![0]);
+        let Operation::DataReplacement { data_change, .. } = &mut operation else {
+            unreachable!()
+        };
+        *data_change = false;
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let prepared = transaction
+            .prepare_indices(
+                Some(&manifest),
+                vec![segment.clone()],
+                &default_build_config(),
+                None,
+                FragReuseUpdate::None,
+            )
+            .unwrap();
+        assert_eq!(prepared.prepared(), &[segment]);
     }
 
     /// Operations that rewrite no column in place, `Restore` included,
@@ -4347,6 +4358,7 @@ mod tests {
                     0,
                     DataFile::new_legacy_from_fields("f5-new.lance", vec![5], None),
                 )],
+                data_change: true,
             },
             None,
         );
@@ -4362,6 +4374,109 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    #[test]
+    fn test_data_replacement_without_data_change_keeps_overlays() {
+        // Values that only moved to a new file supersede no overlay: both
+        // overlays keep shadowing the replaced field.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new_legacy_from_fields("f3.lance", vec![3], None),
+            DataFile::new_legacy_from_fields("f5.lance", vec![5], None),
+        ];
+        let overlay = |path: &str, fields: Vec<i32>| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields(path, fields, None),
+            coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+            committed_version: 1,
+        };
+        fragment.overlays = vec![overlay("o3.lance", vec![3]), overlay("o5.lance", vec![5])];
+        let overlays = fragment.overlays.clone();
+
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("f5-new.lance", vec![5], None),
+                )],
+                data_change: false,
+            },
+            None,
+        );
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let frag = &result.fragments[0];
+        assert!(frag.files.iter().any(|f| f.path == "f5-new.lance"));
+        assert_eq!(frag.overlays, overlays);
+    }
+
+    #[test]
+    fn test_data_replacement_applies_several_groups_to_one_fragment() {
+        // Two groups repack four single-field files of one fragment into two
+        // files. Each group applies to the fragment as the previous one left
+        // it, and the files left holding no schema field are dropped.
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("v", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let lance_schema = LanceSchema::try_from(&schema).unwrap();
+        let ids: Vec<i32> = lance_schema.fields.iter().map(|field| field.id).collect();
+        let file = |path: &str, fields: Vec<i32>| {
+            let indices = (0..fields.len() as i32).collect();
+            DataFile::new(path, fields, indices, ConcreteFileVersion::V2_0, None, None)
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = ids
+            .iter()
+            .map(|id| file(&format!("f{id}.lance"), vec![*id]))
+            .collect();
+        let manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment, Fragment::new(1)]),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![
+                    DataReplacementGroup(0, file("g0.lance", vec![ids[0], ids[1]])),
+                    DataReplacementGroup(0, file("g1.lance", vec![ids[2], ids[3]])),
+                ],
+                data_change: false,
+            },
+            None,
+        );
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(result.fragments.len(), 2, "the untouched fragment stays");
+        let layout: Vec<(&str, Vec<i32>)> = result.fragments[0]
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.fields.to_vec()))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                ("g0.lance", vec![ids[0], ids[1]]),
+                ("g1.lance", vec![ids[2], ids[3]]),
+            ]
+        );
     }
 
     /// Replace `fields` in `fragment` at `read_version`, against a manifest
@@ -4407,6 +4522,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             None,
         );

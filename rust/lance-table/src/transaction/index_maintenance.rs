@@ -98,9 +98,9 @@ impl Transaction {
     /// id, unexpanded: an update with `fields_modified` rewrites those
     /// fields in every updated fragment; a merge rewrites, in each fragment
     /// present in `previous_fragments`, the fields whose backing data file
-    /// changed (`merge_rewritten_fields`); a data replacement rewrites the
-    /// fields its new files carry, read through `schema`. Any other
-    /// operation rewrites nothing. `previous_fragments` is the caller's
+    /// changed (`merge_rewritten_fields`); a data replacement that changes
+    /// data rewrites the fields its new files carry, read through `schema`.
+    /// Any other operation rewrites nothing. `previous_fragments` is the caller's
     /// "before" list: the current manifest's for a commit, the read
     /// version's for a rebase.
     pub fn rewritten_physical_columns(
@@ -120,7 +120,11 @@ impl Transaction {
             Operation::Merge { fragments, .. } => {
                 Self::merge_rewritten_fields(previous_fragments, fragments)
             }
-            Operation::DataReplacement { replacements } => replacements
+            // Values that only moved to new files invalidate no index.
+            Operation::DataReplacement {
+                replacements,
+                data_change: true,
+            } => replacements
                 .iter()
                 .map(|DataReplacementGroup(fragment_id, new_file)| {
                     let mut fields: Vec<u32> = new_file

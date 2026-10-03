@@ -198,9 +198,15 @@ impl PartialEq for Operation {
                     && a_field == b_field
             }
             (
-                Self::DataReplacement { replacements: a },
-                Self::DataReplacement { replacements: b },
-            ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
+                Self::DataReplacement {
+                    replacements: a,
+                    data_change: a_change,
+                },
+                Self::DataReplacement {
+                    replacements: b,
+                    data_change: b_change,
+                },
+            ) => a_change == b_change && a.len() == b.len() && a.iter().all(|r| b.contains(r)),
             // Handle all remaining combinations.
             // We spell out all combinations explicitly to prevent
             // us accidentally handling a new case in the wrong way.
