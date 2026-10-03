@@ -195,15 +195,18 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
             Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
 
-        // Recurse into boolean contexts so nested regexp_match terms are also coerced
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(coerce_filter_type_to_boolean(*left)),
-            op,
-            right: Box::new(coerce_filter_type_to_boolean(*right)),
-        }),
+        // Only boolean operands need coercion. Null checks and comparisons must
+        // preserve regexp_match's nullable list result.
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::And | Operator::Or) =>
+        {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(coerce_filter_type_to_boolean(*left)),
+                op,
+                right: Box::new(coerce_filter_type_to_boolean(*right)),
+            })
+        }
         Expr::Not(inner) => Expr::Not(Box::new(coerce_filter_type_to_boolean(*inner))),
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(coerce_filter_type_to_boolean(*inner))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(coerce_filter_type_to_boolean(*inner))),
 
         // Pass-through for all other nodes
         other => other,
