@@ -34,7 +34,8 @@ from .lance import (
 from .types import _coerce_reader
 
 if TYPE_CHECKING:
-    import lance
+    from .dataset import LanceDataset
+    from .schema import LanceSchema
 
 __all__ = [
     "ShardingField",
@@ -94,7 +95,7 @@ class ShardingSpec:
 def evaluate_sharding_spec(
     batch: pa.RecordBatch,
     spec: Union[ShardingSpec, Mapping[str, object]],
-    schema: "lance.schema.LanceSchema",
+    schema: "LanceSchema",
 ) -> pa.RecordBatch:
     """Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 
@@ -341,7 +342,7 @@ class LsmScanner:
 
     @staticmethod
     def from_snapshots(
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
     ) -> "LsmScanner":
         """Create a scanner from dataset and shard snapshots.
@@ -469,7 +470,7 @@ class LsmPointLookupPlanner:
 
     def __init__(
         self,
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
         pk_columns: Optional[List[str]] = None,
     ) -> None:
@@ -538,7 +539,7 @@ class LsmVectorSearchPlanner:
 
     def __init__(
         self,
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
