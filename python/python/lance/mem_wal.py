@@ -394,6 +394,16 @@ class LsmScanner:
         """Execute the scan and return a list of :class:`~pyarrow.RecordBatch`."""
         return list(self._raw.to_batches())
 
+    def to_reader(self) -> pa.RecordBatchReader:
+        """Execute the scan and return a streaming reader.
+
+        Batches are produced as the reader is consumed, so the result is never
+        held in memory all at once. Prefer this over `to_batches` and
+        `to_table` when the result may not fit in memory. JSON columns are
+        returned as Arrow JSON, the same as `Dataset.to_table`.
+        """
+        return self._raw.to_reader()
+
     def to_table(self) -> pa.Table:
         """Execute the scan and return a :class:`~pyarrow.Table`."""
         batch = self.to_batch()

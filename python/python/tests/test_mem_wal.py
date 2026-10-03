@@ -145,6 +145,28 @@ def test_point_lookup_with_memtables(tmp_path):
     assert len(result_miss) == 0, "Non-existent key must return empty result"
 
 
+def test_lsm_scanner_to_reader_json_column(tmp_path):
+    """to_reader returns a JSON column as Arrow JSON, the same as
+    Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    reader = LsmScanner.from_snapshots(base_ds, [snap]).to_reader()
+    assert reader.read_all().sort_by("id") == expected
+
+
 def test_lsm_scanner_with_memtables(tmp_path):
     """
     Full-scan via LsmScanner.from_snapshots deduplicates rows across LSM
@@ -176,6 +198,11 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[1] == "base_1"
     assert name_by_id[2] == "gen1_2", "SSTable gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
+
+    reader = LsmScanner.from_snapshots(base_ds, [snap]).to_reader()
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert reader.schema == table.schema
+    assert reader.read_all().sort_by("id") == table.sort_by("id")
 
     offset_table = (
         LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
