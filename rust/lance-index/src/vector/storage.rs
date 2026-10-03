@@ -877,6 +877,16 @@ pub const LAZY_FAR_WINDOW_ENV: &str = "LANCE_RQ_LAZY_FAR_WINDOW";
 /// ordinary window under [`LAZY_FAR_WINDOW_ENV`] whose reads have not
 /// returned (default 64, at least 1). The pool is sized once per index.
 pub const LAZY_FAR_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_FAR_INFLIGHT";
+/// When the lazy scan publishes the heap's threshold to the gathers once a
+/// lazy probe's survivors first fill the heap to `k` rows: `on` (default) as
+/// soon as they do, partway through scoring the probe, or `off` only once the
+/// probe is scored whole, as every other probe publishes. A gather waiting
+/// for the threshold selects its survivors against the first one published;
+/// a mid-probe threshold is the `k`-th best of the rows scored so far, looser
+/// than the probe's final one, so such a gather reads more rows. Results are
+/// the same either way: the heap's top never increases, so a later threshold
+/// still covers every row stage 2, pruning on the live heap, scores.
+pub const LAZY_PARTIAL_PUBLISH_ENV: &str = "LANCE_RQ_LAZY_PARTIAL_PUBLISH";
 /// Benchmark knob (`0` or `1`, default `0`): `1` loads a layered partition's
 /// sign plane before its ex planes on backends that do not gate plane
 /// admission too, as gated backends always do, instead of loading all three
@@ -1460,6 +1470,9 @@ pub struct LayeredLazyConfig {
     pub far_window: usize,
     /// See [`LAZY_FAR_INFLIGHT_ENV`].
     pub far_inflight: usize,
+    /// See [`LAZY_PARTIAL_PUBLISH_ENV`]: `true` publishes the threshold as
+    /// soon as a probe's survivors fill the heap.
+    pub partial_publish: bool,
 }
 
 impl Default for LayeredLazyConfig {
@@ -1479,6 +1492,7 @@ impl Default for LayeredLazyConfig {
             dense_to_eager: DenseToEager::Origin,
             far_window: DEFAULT_LAZY_FAR_WINDOW,
             far_inflight: DEFAULT_LAZY_FAR_INFLIGHT,
+            partial_publish: true,
         }
     }
 }
@@ -1599,6 +1613,13 @@ impl LayeredLazyConfig {
                         &format!("an integer from 1 to {}", Semaphore::MAX_PERMITS),
                     )
                 })?;
+        }
+        if let Some(value) = lookup(LAZY_PARTIAL_PUBLISH_ENV) {
+            config.partial_publish = match value.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(invalid(LAZY_PARTIAL_PUBLISH_ENV, &value, "on or off")),
+            };
         }
         Ok(config)
     }
@@ -3616,13 +3637,13 @@ mod tests {
         HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES, IndexFileKey, LAZY_DENSE_BYTES_FRACTION_ENV,
         LAZY_DENSE_ENV, LAZY_DENSE_TO_EAGER_ENV, LAZY_EAGER_BEFORE_FULL_ENV, LAZY_FAR_INFLIGHT_ENV,
         LAZY_FAR_WINDOW_ENV, LAZY_FULL_ENV, LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV,
-        LAZY_ORIGIN_GAP_BYTES_ENV, LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PROMOTE_ENV,
-        LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig, LazyFarPermits,
-        LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV, OriginLatencyClass, PlaneSource,
-        QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV, RESIDENT_LIFETIME_ENV,
-        ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize, SEQUENTIAL_PLANE_LOADS_ENV,
-        SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches, entry_columns_from,
-        entry_columns_setting, origin_latency_from, origin_latency_setting,
+        LAZY_ORIGIN_GAP_BYTES_ENV, LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PARTIAL_PUBLISH_ENV,
+        LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig,
+        LazyFarPermits, LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV, OriginLatencyClass,
+        PlaneSource, QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV,
+        RESIDENT_LIFETIME_ENV, ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize,
+        SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches,
+        entry_columns_from, entry_columns_setting, origin_latency_from, origin_latency_setting,
         origin_reads_whole_plane, plan_plane_gather, resident_columns_from,
         resident_columns_setting, resident_lifetime_from, resident_lifetime_setting,
         resident_store_fits, sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from,
@@ -3801,6 +3822,7 @@ mod tests {
             (LAZY_DENSE_TO_EAGER_ENV, "0"),
             (LAZY_FAR_WINDOW_ENV, "8"),
             (LAZY_FAR_INFLIGHT_ENV, " 2 "),
+            (LAZY_PARTIAL_PUBLISH_ENV, " off "),
         ]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
@@ -3822,6 +3844,7 @@ mod tests {
                 dense_to_eager: DenseToEager::Off,
                 far_window: 8,
                 far_inflight: 2,
+                partial_publish: false,
             }
         );
         assert_eq!(
@@ -3835,6 +3858,16 @@ mod tests {
         assert_eq!(
             LayeredLazyConfig::default().dense_to_eager,
             DenseToEager::Origin
+        );
+        assert!(LayeredLazyConfig::default().partial_publish);
+        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_PARTIAL_PUBLISH_ENV, "on")]);
+        assert_eq!(
+            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
+                .unwrap(),
+            LayeredLazyConfig {
+                enabled: true,
+                ..Default::default()
+            }
         );
         // The origin run cap does not depend on the eager-before-full switch,
         // and dense probes whose planes are on a slow origin go to the eager
@@ -3883,6 +3916,8 @@ mod tests {
             (LAZY_DENSE_TO_EAGER_ENV, "on"),
             (LAZY_FAR_WINDOW_ENV, "wide"),
             (LAZY_FAR_INFLIGHT_ENV, "0"),
+            (LAZY_PARTIAL_PUBLISH_ENV, "1"),
+            (LAZY_PARTIAL_PUBLISH_ENV, "partial"),
         ] {
             let enabled = |key: &str| -> Option<String> {
                 if key == LAZY_FULL_ENV {

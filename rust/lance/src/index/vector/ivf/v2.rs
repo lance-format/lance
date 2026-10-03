@@ -8260,6 +8260,8 @@ mod tests {
         /// settings route every predicted-dense probe (`all`), and the far
         /// window never applies. Promotions are off unless set, so some
         /// settings that gather sparse rows promote a plane after one read.
+        /// Some settings publish the threshold only once a probe is scored
+        /// whole, never as soon as its survivors fill the heap.
         /// The count of settings is prime, so over the parity test's cases
         /// the rotation pairs every setting with every `k`, filter,
         /// approximation mode and bounds choice.
@@ -8335,6 +8337,20 @@ mod tests {
                     dense_to_eager: DenseToEager::Off,
                     ..enabled
                 },
+                // The first probe stays lazy, and its survivors filling the
+                // heap publish no threshold before it is scored whole.
+                LayeredLazyConfig {
+                    dense_to_eager: DenseToEager::Off,
+                    partial_publish: false,
+                    ..enabled
+                },
+                // Gathers wait for the heap to fill, which only whole probes publish.
+                LayeredLazyConfig {
+                    window: 4,
+                    eager_before_full: false,
+                    partial_publish: false,
+                    ..enabled
+                },
             ];
             // On a high-latency origin a probe whose high or low plane no
             // cache tier holds is gathered within the far window.
@@ -8362,6 +8378,21 @@ mod tests {
                 // window and the wide origin gap while promotions run.
                 LayeredLazyConfig {
                     promote: promote_once,
+                    ..enabled
+                },
+                // The defaults with whole-probe publishes only.
+                LayeredLazyConfig {
+                    partial_publish: false,
+                    ..enabled
+                },
+                // Far gathers released only by whole-probe publishes once the
+                // heap fills, beyond no window.
+                LayeredLazyConfig {
+                    window: 0,
+                    eager_before_full: false,
+                    dense_to_eager: DenseToEager::Off,
+                    far_window: usize::MAX,
+                    partial_publish: false,
                     ..enabled
                 },
             ];
@@ -8677,7 +8708,45 @@ mod tests {
             }
             assert_eq!(stats.needed_not_fetched, 0, "{context}");
             assert_lazy_chain_timing(&stats, context);
+            assert_partial_publish_counts(&stats, config, context);
             stats
+        }
+
+        /// Check the mid-probe publish counters of `stats`, taken over lazy
+        /// scans under `config`. A scan's heap fills once, so it publishes a
+        /// mid-probe threshold at most once, and never with partial
+        /// publishes off; the gathers that take one are among the gathers,
+        /// never the first probe's, which is issued before its scoring.
+        fn assert_partial_publish_counts(
+            stats: &LayeredLazyStats,
+            config: LayeredLazyConfig,
+            context: &str,
+        ) {
+            let publishes: u64 = stats.mid_probe_full_publishes.iter().sum();
+            let issues: u64 = stats.partial_threshold_issues.iter().sum();
+            assert!(publishes <= stats.lazy_queries, "{stats:?} {context}");
+            if !config.partial_publish {
+                assert_eq!(
+                    (
+                        publishes,
+                        issues,
+                        stats.partial_threshold_rows.iter().sum::<u64>()
+                    ),
+                    (0, 0, 0),
+                    "{context}"
+                );
+            }
+            if publishes == 0 {
+                assert_eq!(issues, 0, "{stats:?} {context}");
+            }
+            assert_eq!(stats.partial_threshold_issues[0], 0, "{context}");
+            for bucket in 0..RANK_BUCKETS {
+                assert!(
+                    stats.partial_threshold_issues[bucket] <= stats.lazy_probes[bucket]
+                        && stats.partial_threshold_rows[bucket] <= stats.rows_fetched[bucket],
+                    "bucket {bucket}: {stats:?} {context}"
+                );
+            }
         }
 
         /// Check the release-chain timings of `stats`, taken over lazy scans
@@ -10627,6 +10696,81 @@ mod tests {
             assert!(on.eager_before_full > 0, "{on:?}");
             assert!(on.serial_waits < off.serial_waits, "{on:?} {off:?}");
             assert_eq!(off.eager_before_full, 0, "{off:?}");
+        }
+
+        /// A lazy first probe whose survivors fill the heap publishes the
+        /// heap's top partway through its scoring, once per query at rank 0,
+        /// unless partial publishes are off; the probe stays certain dense
+        /// either way. Routed to the eager scan, which publishes only once a
+        /// probe is scored whole, it publishes no mid-probe threshold. Every
+        /// setting matches the eager scan, and the gathers that took a
+        /// mid-probe threshold are counted within the lazy gathers (see
+        /// `assert_partial_publish_counts`).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_layered_lazy_partial_publish_counts_mid_probe_thresholds() {
+            const PROBES: usize = 32;
+            const QUERIES: usize = 8;
+            const STAGING_STEPS: usize = 8;
+            const K: usize = 10;
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let (_dataset, index, _) =
+                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            let ivf = lazy_index(&index);
+            let vectors = batch["vector"].as_fixed_size_list();
+            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
+            let queries = queries_filled_by_first_probe(&index, vectors, K, PROBES, QUERIES);
+            let mut first_probe = [0; RANK_BUCKETS];
+            first_probe[0] = QUERIES as u64;
+            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
+            for (dense_to_eager, partial_publish) in [
+                (DenseToEager::Off, true),
+                (DenseToEager::Off, false),
+                (DenseToEager::All, true),
+            ] {
+                let config = LayeredLazyConfig {
+                    partial_publish,
+                    ..issue_policy(true, dense_to_eager)
+                };
+                let mut publishes = [0; RANK_BUCKETS];
+                let mut certain_dense = [0; RANK_BUCKETS];
+                let mut routed = [0; RANK_BUCKETS];
+                for (position, query) in queries.iter().enumerate() {
+                    let context = format!(
+                        "dense_to_eager={dense_to_eager} partial_publish={partial_publish} query={position}"
+                    );
+                    let stats =
+                        assert_lazy_matches_eager(&index, query, &filter, config, &context).await;
+                    assert_eq!(stats.lazy_queries, 1, "{context}");
+                    for (totals, counts) in [
+                        (&mut publishes, stats.mid_probe_full_publishes),
+                        (&mut certain_dense, stats.certain_dense),
+                        (&mut routed, stats.dense_to_eager),
+                    ] {
+                        for (total, count) in totals.iter_mut().zip(counts) {
+                            *total += count;
+                        }
+                    }
+                }
+                let context =
+                    format!("dense_to_eager={dense_to_eager} partial_publish={partial_publish}");
+                let lazy_first_probe = dense_to_eager == DenseToEager::Off;
+                let expected_publishes = if lazy_first_probe && partial_publish {
+                    first_probe
+                } else {
+                    [0; RANK_BUCKETS]
+                };
+                assert_eq!(publishes, expected_publishes, "{context}");
+                let (expected_dense, expected_routed) = if lazy_first_probe {
+                    (first_probe, [0; RANK_BUCKETS])
+                } else {
+                    ([0; RANK_BUCKETS], first_probe)
+                };
+                assert_eq!(certain_dense, expected_dense, "{context}");
+                assert_eq!(routed, expected_routed, "{context}");
+            }
+            ivf.set_lazy_prepare_parallelism_for_test(0);
         }
 
         /// A sparse gather the persistent tier cannot serve loads the whole
