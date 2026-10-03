@@ -2303,9 +2303,10 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
     // not intersect {10}).
     let scope_f10 = RoaringBitmap::from_iter([10]);
     let metrics = lance_index::metrics::LocalMetricsCollector::default();
-    let scoped = open_scalar_index_segments(&dataset, "i", "i_idx", Some(&scope_f10), &metrics)
-        .await
-        .unwrap();
+    let scoped =
+        open_scalar_index_segments(&dataset, "i", "i_idx", Some(&scope_f10), None, &metrics)
+            .await
+            .unwrap();
     assert_eq!(
         metrics
             .index_loads
@@ -2399,12 +2400,90 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
             "i",
             "i_idx",
             Some(&RoaringBitmap::from_iter([999])),
+            None,
             &lance_index::metrics::NoOpMetricsCollector,
         )
         .await
         .is_err(),
         "a scope disjoint from effective coverage must prune every segment"
     );
+}
+
+/// One reclustered source advertises both destinations, but it only stores half
+/// of their rows. Selecting that UUID alone must fail so the caller can pass
+/// every contributor; the complete UUID set still counts the destinations.
+#[tokio::test]
+async fn selected_segment_recluster_requires_every_contributor() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::default();
+    let source_fragments: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let mut segments = Vec::new();
+    for fragment in &source_fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("i_idx".into())
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("i_idx", "i", segments)
+        .await
+        .unwrap();
+    let stored = dataset.load_indices_by_name("i_idx").await.unwrap();
+    let selected_uuid = stored[0].uuid;
+    let sibling_uuid = stored[1].uuid;
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let current = dataset.load_indices_by_name("i_idx").await.unwrap();
+    let selected = current
+        .iter()
+        .find(|segment| segment.uuid == selected_uuid)
+        .unwrap();
+    assert_eq!(
+        selected.fragment_bitmap.as_ref(),
+        Some(dataset.fragment_bitmap.as_ref())
+    );
+
+    let message = dataset
+        .count_indexed_rows("i_idx", "i >= 0", Some(&[selected_uuid]), None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains(&sibling_uuid.to_string()), "{message}");
+    assert!(message.contains("[10, 11]"), "{message}");
+
+    let both = [selected_uuid, sibling_uuid];
+    let positive = dataset
+        .count_indexed_rows("i_idx", "i >= 0", Some(&both), None)
+        .await
+        .unwrap();
+    let greater = dataset
+        .count_indexed_rows("i_idx", "i > 0", Some(&both), None)
+        .await
+        .unwrap();
+    let negative = dataset
+        .count_indexed_rows("i_idx", "NOT (i = 0)", Some(&both), None)
+        .await
+        .unwrap();
+    let logical = dataset
+        .count_indexed_rows("i_idx", "i >= 0", None, None)
+        .await
+        .unwrap();
+    assert_eq!((positive, greater, negative, logical), (8, 7, 7, 8));
 }
 
 // Combination: the derived-listing cache holds the FULL effective listing per
