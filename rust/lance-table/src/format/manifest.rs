@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::{Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -76,6 +76,10 @@ pub struct Manifest {
     /// The max fragment id used so far
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
+
+    /// The highest field ID allocated since stable field identity was activated.
+    /// `None` means the dataset still uses the legacy live-reference allocator.
+    pub max_allocated_field_id: Option<i32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -192,6 +196,7 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: None,
+            max_allocated_field_id: None,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -220,9 +225,10 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
-            writer_feature_flags: previous.writer_feature_flags & STICKY_PAIRED_FLAGS,
+            reader_feature_flags: previous.reader_feature_flags & STICKY_READER_FLAGS,
+            writer_feature_flags: previous.writer_feature_flags & STICKY_WRITER_FLAGS,
             max_fragment_id: previous.max_fragment_id,
+            max_allocated_field_id: previous.max_allocated_field_id,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -287,10 +293,11 @@ impl Manifest {
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS),
             max_fragment_id: self.max_fragment_id,
+            max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
@@ -463,12 +470,17 @@ impl Manifest {
         }
     }
 
-    /// Get the max used field id
+    /// Get the highest field ID that may not be allocated again.
     ///
     /// This is different than [Schema::max_field_id] because it also considers
     /// the field ids in the data files that have been dropped from the schema,
     /// including overlay files referenced by fragments.
     pub fn max_field_id(&self) -> i32 {
+        self.max_allocated_field_id
+            .unwrap_or_else(|| self.max_referenced_field_id())
+    }
+
+    pub(crate) fn max_referenced_field_id(&self) -> i32 {
         let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
         let fragment_max_id = self
             .fragments
@@ -482,6 +494,26 @@ impl Manifest {
             .max()
             .unwrap_or(-1);
         schema_max_id.max(fragment_max_id)
+    }
+
+    /// Whether the stable-field-ID allocation contract is active.
+    pub fn uses_stable_field_ids(&self) -> bool {
+        self.max_allocated_field_id.is_some()
+    }
+
+    /// Activate stable field IDs at the maximum ID visible in this snapshot.
+    pub fn activate_stable_field_ids(&mut self) {
+        if self.max_allocated_field_id.is_none() {
+            self.max_allocated_field_id = Some(self.max_referenced_field_id());
+        }
+    }
+
+    /// Advance the persistent field-ID high-water mark to cover this manifest.
+    pub fn update_max_field_id(&mut self) {
+        let max_referenced_field_id = self.max_referenced_field_id();
+        if let Some(max_allocated_field_id) = &mut self.max_allocated_field_id {
+            *max_allocated_field_id = (*max_allocated_field_id).max(max_referenced_field_id);
+        }
     }
 
     /// Return the fragments that are newer than the given manifest.
@@ -750,6 +782,8 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
+    /// Whether this commit atomically activates stable field IDs.
+    pub activate_stable_field_ids: bool,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
@@ -1034,6 +1068,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            max_allocated_field_id: p.max_allocated_field_id,
             fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
@@ -1097,6 +1132,7 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            max_allocated_field_id: m.max_allocated_field_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
@@ -1183,8 +1219,8 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
-    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use crate::feature_flags::{FLAG_STABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
 
@@ -1680,6 +1716,99 @@ mod tests {
         );
 
         assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn stable_field_id_high_water_mark_survives_dropped_references_and_round_trip() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", arrow_schema::DataType::Int64, false),
+            ArrowField::new("b", arrow_schema::DataType::Int64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(DataFile::new(
+            "ab.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.activate_stable_field_ids();
+        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        assert_eq!(manifest.max_allocated_field_id, Some(1));
+
+        manifest.schema.fields.pop();
+        let file = &mut Arc::make_mut(&mut manifest.fragments)[0].files[0];
+        Arc::make_mut(&mut file.fields)[1] = TOMBSTONE_FIELD_ID;
+        manifest.update_max_field_id();
+
+        assert_eq!(manifest.max_referenced_field_id(), 0);
+        assert_eq!(manifest.max_field_id(), 1);
+
+        let encoded = manifest.serialized();
+        let mut recovered =
+            Manifest::try_from(pb::Manifest::decode(encoded.as_slice()).unwrap()).unwrap();
+        assert_eq!(recovered.max_allocated_field_id, Some(1));
+        assert_eq!(recovered.max_field_id(), 1);
+        assert_eq!(
+            recovered.fragments[0].files[0].fields.as_ref(),
+            &[0, TOMBSTONE_FIELD_ID]
+        );
+        assert_eq!(
+            recovered.fragments[0].files[0].column_indices.as_ref(),
+            &[0, 1]
+        );
+        assert_eq!(recovered.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(recovered.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+
+        recovered.schema.fields.push(
+            Field::try_from(ArrowField::new("c", arrow_schema::DataType::Int64, false)).unwrap(),
+        );
+        let max_field_id = recovered.max_field_id();
+        recovered
+            .schema
+            .try_set_field_id(Some(max_field_id))
+            .unwrap();
+        assert_eq!(recovered.schema.field("c").unwrap().id, 2);
+        recovered.update_max_field_id();
+        assert_eq!(recovered.max_allocated_field_id, Some(2));
+    }
+
+    #[test]
+    fn shallow_clone_preserves_stable_field_id_allocation_state() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.max_allocated_field_id = Some(41);
+        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        assert_eq!(cloned.max_allocated_field_id, Some(41));
+        assert_eq!(cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]

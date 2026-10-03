@@ -6248,8 +6248,6 @@ class LanceOperation:
         initial_bases: Optional[List[DatasetBasePath]] = None
 
         def __post_init__(self):
-            if isinstance(self.new_schema, pa.Schema):
-                self.new_schema = LanceSchema.from_pyarrow(self.new_schema)
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
@@ -6491,7 +6489,6 @@ class LanceOperation:
                     "Please use a LanceSchema instead.",
                     DeprecationWarning,
                 )
-                self.schema = LanceSchema.from_pyarrow(self.schema)
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass

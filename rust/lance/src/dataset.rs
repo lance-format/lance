@@ -136,7 +136,7 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    default_commit_retry_timeout, detect_overlapping_fragments,
+    default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -152,7 +152,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
     apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    validate_paired_feature_flags,
+    validate_paired_feature_flags, validate_stable_field_id_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -3271,6 +3271,51 @@ impl Dataset {
         Ok(())
     }
 
+    /// Activate monotonic, non-reusable field IDs for a legacy dataset.
+    ///
+    /// The activation commit records the current maximum referenced field ID as
+    /// a persistent high-water mark. Later schema changes allocate above it even
+    /// after fields and their files are dropped. Activation is one-way and
+    /// idempotent.
+    ///
+    /// Before calling this method, ensure that all clients that can write to the
+    /// dataset enforce writer feature flags, rejecting writes when they do not
+    /// support a required flag. Clients that ignore these flags must no longer
+    /// write to the dataset: they may discard the high-water mark and allow
+    /// field IDs to be reused. This method cannot enforce that client policy.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn activate(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.migrate_to_stable_field_ids().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn migrate_to_stable_field_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_stable_field_ids() {
+            return Ok(());
+        }
+
+        let mut repaired_manifest = self.manifest.as_ref().clone();
+        fix_schema(&mut repaired_manifest)?;
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
+                fragments: repaired_manifest.fragments.as_ref().clone(),
+                schema: repaired_manifest.schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_stable_field_id_migration_activation()
+            .execute(transaction)
+            .await?;
+        *self = new_ds;
+        Ok(())
+    }
+
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
@@ -3791,7 +3836,7 @@ impl Dataset {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(self.manifest.max_field_id()));
+        new_schema.try_set_field_id(Some(self.manifest.max_field_id()))?;
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -4127,6 +4172,8 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
+    /// Whether this commit activates stable field IDs.
+    activate_stable_field_ids: bool,
 }
 
 impl Default for ManifestWriteConfig {
@@ -4139,6 +4186,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
+            activate_stable_field_ids: false,
         }
     }
 }
@@ -4167,6 +4215,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            activate_stable_field_ids: self.activate_stable_field_ids,
             spilled_row_lineage: Default::default(),
         }
     }
@@ -4210,6 +4259,7 @@ pub(crate) async fn write_manifest_file(
     transaction: Option<lance_table::format::Transaction>,
     may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    manifest.update_max_field_id();
     validate_paired_feature_flags(manifest)?;
     if let Some(indices) = &indices {
         lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
@@ -4240,7 +4290,6 @@ pub(crate) async fn write_manifest_file(
         blob::validate_blob_threshold_metadata(&manifest.schema)
             .map_err(CommitError::OtherError)?;
     }
-
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
@@ -4263,6 +4312,7 @@ pub(crate) async fn write_manifest_file(
         indices.as_deref().unwrap_or_default(),
     )?;
 
+    validate_stable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));

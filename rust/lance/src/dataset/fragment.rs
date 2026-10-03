@@ -2349,7 +2349,7 @@ impl FileFragment {
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
         // Use the same starting id as the updater so schema and data file ids match.
-        new_schema.set_field_id(Some(self.dataset.manifest.max_field_id()));
+        new_schema.try_set_field_id(Some(self.dataset.manifest.max_field_id()))?;
 
         let new_fragment = self
             .clone()
