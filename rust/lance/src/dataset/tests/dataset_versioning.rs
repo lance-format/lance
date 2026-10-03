@@ -1337,6 +1337,41 @@ async fn test_branch() {
         "branch1"
     );
 
+    // Opening a branch version that main does not have (main only has version 1)
+    // must resolve the version on the branch chain.
+    let branch_version_open = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(3))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_version_open.manifest.branch.as_deref(),
+        Some("feature/nathan/branch3")
+    );
+    assert_eq!(branch_version_open.version().version, 3);
+    assert_eq!(
+        branch_version_open.count_rows(None).await.unwrap(),
+        checkout_branch3_at_version3.count_rows(None).await.unwrap()
+    );
+    // A version the branch does not have is still an error, not its latest version.
+    let err = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(99))
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::DatasetNotFound { .. }), "{err}");
+    assert!(err.to_string().contains("feature/nathan/branch3"), "{err}");
+
+    // From the branch's own directory, an older version of that branch is checked out on it.
+    let branch_dir_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_branch("branch1", Some(1))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_dir_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_dir_open.version().version, 1);
+    assert_eq!(branch_dir_open.count_rows(None).await.unwrap(), 50);
+
     // Opening at a branch-pointing tag through the builder must check out the
     // tag's branch chain, not main's chain at the tag's version number.
     let tag_open = DatasetBuilder::from_uri(&test_uri)
