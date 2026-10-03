@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Fragment Metadata Tree — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/fragment_metadata/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../">Lance Table Format</a>
+    <a href="../schema/">Schema</a>
+    <a href="../versioning/">Versioning</a>
+    <a href="../transaction/">Transactions</a>
+    <a href="../layout/">Layout</a>
+    <a href="../branch_tag/">Branch & Tag</a>
+    <a href="../row_id_lineage/">Row ID & Lineage</a>
+    <a href="../data_overlay_file/">Data Overlay Files</a>
+    <a class="active" href="./">Fragment Metadata Tree</a>
+    <a href="../mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/minhash_lsh/">MinHash LSH (experimental)</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>Fragment Metadata Tree</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="fragment-metadata-tree">Fragment Metadata Tree<a class="headerlink" href="#fragment-metadata-tree" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Experimental</p>
+<p>This layout is unstable. Readers and writers may change it without
+keeping compatibility with earlier unstable revisions. Flat manifests
+remain the default.</p>
+</div>
+<p><strong>This page specifies a proposed on-disk format for storing fragment state.
+Support for creating or reading tree tables is not yet available in released
+Lance versions.</strong></p>
+<div class="admonition note">
+<p class="admonition-title">Tree tables require feature flag 4096, <code>FLAG_FRAGMENT_TREE</code></p>
+<p>A reader or writer that does not understand this layout must refuse the
+dataset. The flat <code>fragments</code> list is empty on a tree table, so a reader
+that ignored the flag would see an empty table.</p>
+</div>
+<p>In the flat format, each Version Manifest carries the complete fragment list.
+Committing a change and opening a dataset both process that whole list, even
+when the change touches only a few fragments.</p>
+<p>The fragment metadata tree (fragment tree) stores those records in immutable
+Lance leaves keyed by fragment ID. Validated changes may remain above the leaves as
+mutations until enough work accumulates to rewrite them.</p>
+<p>The Version Manifest defines table-version state. Committing it makes that
+version visible.</p>
+<p><img alt="Fragment metadata tree" src="../fragment_metadata_tree.svg" /></p>
+<p><em>A shallow tree is shown. Larger trees may insert interior routing nodes between
+the root and leaves.</em></p>
+<h3 id="at-a-glance">At a glance<a class="headerlink" href="#at-a-glance" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read</td>
+<td>Read the leaf record, if any, then apply newer mutations for that fragment.</td>
+</tr>
+<tr>
+<td>Write</td>
+<td>Native Lance validates the change. The tree stores the resulting mutation.</td>
+</tr>
+<tr>
+<td>Publish</td>
+<td>Write immutable tree objects first, then commit the Version Manifest.</td>
+</tr>
+</tbody>
+</table>
+<p>Protobuf messages are in <code>protos/fragment_metadata.proto</code>.
+<code>Manifest.fragment_tree</code> is declared in <code>protos/table.proto</code>. Operation
+semantics, conflict rules, and native validation stay with
+<a href="../transaction/">transactions</a>. A storage action is the result of a successful
+native transaction.</p>
+<p>Readers must treat a violation of any requirement on this page as a corrupt
+snapshot.</p>
+<h2 id="snapshot">Snapshot<a class="headerlink" href="#snapshot" title="Permanent link">&para;</a></h2>
+<p>A tree table must set <code>Manifest.fragment_tree</code>, leave <code>Manifest.fragments</code>
+empty, and set flag 4096 in both <code>reader_feature_flags</code> and
+<code>writer_feature_flags</code>. These fields must agree. When <code>FLAG_FRAGMENT_TREE</code>
+is set, <code>FragmentTreeMetadata.layout</code> must select exactly one recognized layout.</p>
+<p>Each version stores fragment records either in the tree or in
+<code>Manifest.fragments</code>, never both. A writer may convert a flat table by
+publishing a new tree-backed version. Whether and when to convert is
+writer policy.</p>
+<p>A <code>FragmentTree</code> must contain exactly one of an inline root or a
+<code>root_uuid</code>.</p>
+<p>An inline root carries the complete <code>FragmentTreeRoot</code> in the Version
+Manifest. <code>mutations_since_root</code> must be empty.</p>
+<p>An external root named by <code>root_uuid</code> belongs to the current dataset.
+<code>root_uuid</code> must contain exactly 16 bytes, in the order of the UUID's hexadecimal
+digits. Its path is <code>_bt/root/{uuid}.root</code>, with lowercase hexadecimal digits and
+hyphens after digits 8, 12, 16, and 20. Readers must reject any other byte length.
+<code>mutations_since_root</code> contains every mutation in this version that is not
+represented by that root. Readers must not follow a mutation chain.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>Version Manifest N
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├─ root_uuid ──────────► Root R
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>└─ mutations_since_root
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>fragment state N = Root R + mutations_since_root
+</span></code></pre></div>
+<p>Opening a version requires its Version Manifest and at most one external root.
+Version history is not consulted.</p>
+<p><code>buffer</code> on a root or interior holds mutations already in the tree that have
+not been pushed to that node's children.</p>
+<h2 id="tree-objects">Tree objects<a class="headerlink" href="#tree-objects" title="Permanent link">&para;</a></h2>
+<p>Tree objects are immutable and stored under <code>_bt/</code> relative to a dataset root.
+Tree object paths must begin with <code>_bt/</code>. Readers must reject absolute paths
+and paths outside <code>_bt/</code>.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>{dataset_root}/
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    _bt/
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>        root/{uuid}.root     FragmentTreeRoot protobuf
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>        node/{uuid}.node     FragmentTreeNode protobuf
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>        leaf/{uuid}.lance    Lance file of complete fragment records
+</span></code></pre></div>
+<p>A <code>.root</code> file is a raw <code>FragmentTreeRoot</code> protobuf. A <code>.node</code> file is a
+raw <code>FragmentTreeNode</code> protobuf. Neither has an extra header or footer.</p>
+<p><code>FragmentTreeRoot</code> holds its children, buffer, and <code>next_action_sequence</code>.</p>
+<p><code>FragmentTreeNode</code> holds the child list and a mutation buffer for that
+subtree.</p>
+<p>Child <code>path</code> values must be non-empty. Resolved child locations within a child
+list must be unique. Equal paths in different datasets name different objects;
+different <code>base_id</code> values resolving to the same object do not make it unique.</p>
+<p>A leaf is a Lance file of complete fragment records for one fragment-ID range.</p>
+<h2 id="object-references">Object references<a class="headerlink" href="#object-references" title="Permanent link">&para;</a></h2>
+<p>The Version Manifest root belongs to the current dataset. It is either an
+inline <code>FragmentTreeRoot</code> or a <code>root_uuid</code> in the current dataset.</p>
+<p>A <code>FragmentTreeChild</code> contains a <code>path</code> relative to its resolved dataset
+and an optional <code>base_id</code>.</p>
+<p>When <code>base_id</code> is set, it must identify a <code>BasePath</code> in the Version Manifest
+with <code>is_dataset_root</code> set to true. When <code>base_id</code> is absent, the reference
+inherits the resolved dataset of the containing tree object.
+Look up entries by <code>BasePath.id</code>, not their position in <code>base_paths</code>. Zero is a
+valid ID, distinct from an absent <code>base_id</code>. IDs must be unique within the
+manifest, and readers must reject an unknown ID.</p>
+<p>A child object resolves to <code>{resolved_dataset}/{path}</code>. Tree object paths must
+begin with <code>_bt/</code> and must not be resolved under <code>data/</code>.</p>
+<p>A reference with <code>base_id</code> set may name an immutable tree object in another
+dataset. Descendant references with no <code>base_id</code> inherit that object's resolved
+dataset.</p>
+<p>New tree objects must belong to the current dataset. Tree objects owned by
+another dataset must not be modified.</p>
+<p>A shallow clone's root must belong to the clone dataset. Unchanged source
+subtrees may be referenced through <code>base_id</code>. The clone's <code>base_paths</code> must
+contain a <code>BasePath</code> for the source dataset root and preserve every <code>BasePath</code>
+entry referenced by a shared tree object at the same id. New base paths must
+use previously unused ids.
+If an ID already names a different base, the writer must copy the affected
+objects and remap their references, or reject the operation. It must not change
+the meaning of an ID used by a shared immutable object.</p>
+<p>When a tree object is copied into another dataset, references that inherited
+the source dataset must be rewritten with a <code>base_id</code> naming that dataset.
+Existing explicit <code>base_id</code> values must continue to resolve to the same
+<code>BasePath</code> entries.</p>
+<p>An <code>ExternalFile</code> embedded in <code>DataFragment</code> has no <code>base_id</code>. Its path is
+relative to the resolved dataset of the tree object or Version Manifest that
+contains the fragment state.</p>
+<p>When fragment state is written to a different dataset, each referenced
+<code>ExternalFile</code> must be copied to that dataset and its path rewritten before
+publication. The write must fail if any such reference cannot be preserved.</p>
+<h2 id="leaf-format">Leaf format<a class="headerlink" href="#leaf-format" title="Permanent link">&para;</a></h2>
+<p>A leaf is a Lance file with one row per fragment and the following schema.
+Any Lance file version may be used.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">mapping</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">dictionary</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">int32</span><span class="p">(),</span> <span class="n">pa</span><span class="o">.</span><span class="n">binary</span><span class="p">())</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">data_file</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">struct</span><span class="p">([</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"path"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">utf8</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"field_ids"</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"column_indices"</span><span class="p">,</span> <span class="n">mapping</span><span class="p">,</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"major_version"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint32</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"minor_version"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint32</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"file_size_bytes"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"base_id"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint32</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="p">])</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="n">overlay</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">struct</span><span class="p">([</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"data_file"</span><span class="p">,</span> <span class="n">data_file</span><span class="p">,</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"overlay_meta"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">binary</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="p">])</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="n">leaf_schema</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"id"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">uint64</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"fragment_meta"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">binary</span><span class="p">(),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"files"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">list_</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"item"</span><span class="p">,</span> <span class="n">data_file</span><span class="p">,</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">)),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"overlays"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">list_</span><span class="p">(</span><span class="n">pa</span><span class="o">.</span><span class="n">field</span><span class="p">(</span><span class="s2">"item"</span><span class="p">,</span> <span class="n">overlay</span><span class="p">,</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">)),</span> <span class="n">nullable</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="p">])</span>
+</span></code></pre></div>
+<p>The schema must match exactly, including field order, types, and nullability.
+Only <code>base_id</code> may be null; dictionary values must also be non-null. Empty lists
+represent no files or overlays.</p>
+<p>Rows must be ordered by strictly increasing <code>id</code>. Valid fragment IDs fit in
+<code>u32</code>. A fragment must not be split across leaves. Preserve file and overlay
+list order, including duplicate file paths and the overlay precedence defined
+in <a href="../data_overlay_file/">Data Overlay Files</a>.</p>
+<p><code>fragment_meta</code> contains the <code>DataFragment</code> protobuf with <code>id</code> set to 0 and
+<code>files</code> and <code>overlays</code> cleared. Readers must reject a nonzero protobuf <code>id</code> or
+nonempty <code>files</code> or <code>overlays</code>, then restore these fields from the row.
+All other fragment fields keep their protobuf representation and semantics.</p>
+<p>Each file struct represents a <code>DataFile</code>: <code>field_ids</code> maps to <code>fields</code>, and
+<code>major_version</code> and <code>minor_version</code> map to <code>file_major_version</code> and
+<code>file_minor_version</code>. Other fields use their protobuf names.</p>
+<p><code>overlay_meta</code> contains the <code>DataOverlayFile</code> protobuf with <code>data_file</code> absent.
+Readers must reject a populated <code>data_file</code>, then restore it from the sibling
+struct. Coverage and committed version retain their protobuf semantics.</p>
+<p>Each binary dictionary value stores a mapping vector as consecutive little-endian
+signed 32-bit integers, without a length prefix. Empty bytes mean an empty vector.
+Readers must reject lengths not divisible by 4 and out-of-bounds dictionary keys.
+Decoded vectors preserve element order and signed values, and must satisfy the
+<code>DataFile</code> mapping rules for that file version.</p>
+<p>Lance stores the dictionaries. Keys are local to their dictionary array; compare
+decoded vectors, not keys, across arrays, columns, batches, or leaves.</p>
+<p><code>file_size_bytes</code> of 0 means unknown. A null <code>base_id</code> inherits the leaf
+object's resolved dataset. A set <code>base_id</code> matches <code>BasePath.id</code> in this Version
+Manifest's <code>base_paths</code>. The same inheritance rule applies to deletion files, overlays,
+and other fragment-owned files. A null <code>base_id</code> in a buffered mutation
+inherits the resolved dataset of the structure containing that mutation.</p>
+<p>Counts in a leaf are known. <code>physical_rows</code> of 0 is zero rows. A deletion file
+must carry <code>num_deleted_rows</code>, which must not exceed <code>physical_rows</code>.</p>
+<p>After decoding a leaf, readers must verify the following fields against its
+parent <code>FragmentTreeChild</code>:</p>
+<ul>
+<li><code>num_keys</code> equals the number of rows</li>
+<li><code>total_rows</code> and <code>visible_rows</code> equal the counts recomputed from the
+  fragment records</li>
+<li><code>height</code> is 0</li>
+<li><code>num_children</code> is 0</li>
+</ul>
+<p><code>min_key</code> is an inherited routing bound. <code>object_size</code> is the stored byte
+length of the fetched object. <code>materialized_through_action_sequence</code> is stored
+on the child reference. Readers must validate those fields by the rules in
+Routing and Sequence numbers, not by recomputing them from the leaf file.</p>
+<h2 id="routing">Routing<a class="headerlink" href="#routing" title="Permanent link">&para;</a></h2>
+<p>A root may have zero or more children. With no children, mutations may remain
+in the root <code>buffer</code> or <code>FragmentTree.mutations_since_root</code>. Fragment
+resolution must not descend to a leaf. Once children exist, they route
+fragment IDs as follows.</p>
+<p>Interior nodes must have at least two children. The root may have zero, one,
+or more.</p>
+<p>Children are ordered by <code>min_key</code>. <code>min_key</code> is the inclusive lower bound of
+this child's fragment-ID range. It need not equal an ID currently stored in
+the child. The next child's <code>min_key</code> is the exclusive upper bound. The
+first child of the root must have <code>min_key</code> 0. An interior node's first
+child must begin at the lower bound assigned by its parent. Together, the
+children must partition the parent range. Routing a fragment ID selects the
+rightmost child whose <code>min_key</code> is at most that fragment ID.</p>
+<p>Ranges must not overlap. Each mutation buffered by an interior must belong to
+exactly one child range. The same rule applies to a root once it has children.</p>
+<p><code>height</code> is the number of edges from the referenced object to its leaves.
+Leaves have height 0. Every child of an interior must have height one less
+than that interior, so all leaves in a subtree occur at the same depth.</p>
+<p>A leaf must contain at least one fragment record and have <code>num_children</code> 0.
+Writers must not retain an empty child.</p>
+<p><code>num_children</code> is the number of direct children in the referenced object. It
+is 0 for leaves and at least 2 for interiors. After an interior is decoded,
+readers must verify that this value equals <code>children.len()</code>.</p>
+<p><code>num_keys</code> is the number of fragment records in the referenced subtree,
+including that object's own buffer. Mutations held by ancestors are excluded.
+After a leaf is decoded, it must equal the number of rows. After an
+interior is decoded, it must equal the sum of the children's <code>num_keys</code> plus
+the buffer <code>fragment_count_delta</code>s.</p>
+<p><code>total_rows</code> is the physical-row count in that subtree, including deleted
+rows. <code>visible_rows</code> is that count minus deleted rows. Both include that
+object's own buffer and exclude ancestor mutations. <code>visible_rows</code> must not
+exceed <code>total_rows</code>. After a leaf is decoded, both must equal the counts
+recomputed from fragment records. After an interior is decoded, both must
+equal the sum of the children's values plus the corresponding buffer deltas.</p>
+<p><code>object_size</code> is the stored byte length of the child object. It must be
+nonzero. It is known before the child is fetched and must equal the fetched
+object's byte length.</p>
+<p>A child's inherited range is <code>min_key</code> inclusive to the next sibling's
+<code>min_key</code> exclusive. The last child of the root uses <code>2^32</code> as that exclusive
+end. The last child of an interior uses the exclusive end assigned by its
+parent. <code>min_key</code> must be at most <code>2^32 - 1</code>.</p>
+<p>Every fragment ID decoded from a leaf must lie in that leaf's inherited
+range. Every mutation target decoded from a root or interior buffer must lie
+in that node's inherited range. Every descendant child range must be contained
+in its parent's range. Readers apply these checks as objects are decoded. The
+checks do not require opening the rest of the tree.</p>
+<h2 id="mutations">Mutations<a class="headerlink" href="#mutations" title="Permanent link">&para;</a></h2>
+<p><code>FragmentTreeMutation</code> wraps one <code>FragmentAction</code> with a sequence number
+and three count deltas. Every mutation must contain an action. The action must
+select exactly one recognized variant, and any message payload required by
+that variant must be present.</p>
+<p><code>fragment_count_delta</code> is 1 when the action creates a record, minus 1 when it
+removes one, and 0 otherwise. <code>total_rows_delta</code> and <code>visible_rows_delta</code> are
+the record after the action minus the record before it. An absent record
+counts as zero.</p>
+<p>When the prior fragment is available, readers must recompute the mutation
+deltas and verify that they match the stored values. Ancestor summaries are
+maintained from these deltas. After materialization, readers must recompute
+leaf summaries from records. Writers must not publish a materialization whose
+recomputed summaries disagree with the derived version totals.</p>
+<p>File and deletion-file actions must leave all other <code>DataFragment</code> fields
+unchanged. Use <code>upsert_fragment</code> when no other action can represent the change.
+This includes changes to overlay files, version sequences, and row-ID state.
+It replaces the complete fragment record.</p>
+<p>Removal actions are idempotent. Removing an absent fragment, file, or deletion
+file is a no-op where specified below. Actions that modify an existing
+fragment require that fragment to exist.</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Precondition</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>upsert_fragment</code></td>
+<td>None</td>
+<td>Install the complete record, replacing anything at that id</td>
+</tr>
+<tr>
+<td><code>remove_fragment</code></td>
+<td>None</td>
+<td>Remove the record at that id. An absent id is a no-op</td>
+</tr>
+<tr>
+<td><code>add_data_file</code></td>
+<td>Record present, else reject</td>
+<td>Append the file to the end of the ordered file list</td>
+</tr>
+<tr>
+<td><code>remove_data_file</code></td>
+<td>Record present, else reject</td>
+<td>Remove every file whose path matches, keeping survivor order. No match is a no-op</td>
+</tr>
+<tr>
+<td><code>add_deletion_file</code></td>
+<td>Record present, else reject</td>
+<td>Set the deletion file, replacing any existing one</td>
+</tr>
+<tr>
+<td><code>clear_deletion_file</code></td>
+<td>Record present, else reject</td>
+<td>Clear the deletion file. No deletion file is a no-op</td>
+</tr>
+<tr>
+<td><code>replace_data_file</code></td>
+<td>Record present and a file whose path equals <code>expected_path</code>, else reject</td>
+<td>On the first such file set <code>path</code>, <code>file_size_bytes</code>, and <code>base_id</code>. Keep its field ids, column indices, and file version</td>
+</tr>
+</tbody>
+</table>
+<p><code>Fragment.files</code> is an ordered list and paths may repeat. <code>replace_data_file</code>
+edits a slot, not a path. Writers must not fold two replacements that chain
+through a renamed path into one. Starting from files <code>[A, B]</code>, renaming B to
+A and then replacing the first A with C yields <code>[C, A]</code>. Folding them into
+one replacement of B with C yields <code>[A, C]</code>.</p>
+<p>To resolve a fragment, collect every mutation for its id from
+<code>mutations_since_root</code>, the root buffer, and each interior buffer on its
+routing path. Sort by sequence and apply in order to the leaf record, or to
+nothing if there is no leaf or the leaf has no record.</p>
+<p>Version fragment count, physical-row count, and visible-row count are derived
+from the root child summaries plus the root buffer deltas, then plus the
+<code>mutations_since_root</code> deltas. They are not stored on <code>FragmentTree</code>.
+Derived <code>visible_rows</code> must not exceed derived <code>total_rows</code>.</p>
+<h2 id="sequence-numbers">Sequence numbers<a class="headerlink" href="#sequence-numbers" title="Permanent link">&para;</a></h2>
+<p>Mutation sequences must be nonzero and unique.
+Each tree has one sequence namespace. Writers must not reuse a sequence number
+anywhere in the tree.</p>
+<ul>
+<li><code>FragmentTreeRoot.next_action_sequence</code> is at least 1. Every sequence in
+  the root buffer, in every interior buffer below it, and every leaf watermark
+  below it must be less than this value.</li>
+<li><code>FragmentTree.next_action_sequence</code> is at least the root's value.
+  Every <code>mutations_since_root</code> sequence must be at or above the root's value
+  and below <code>FragmentTree.next_action_sequence</code>.</li>
+<li>A leaf watermark of 0 means the leaf has applied nothing, so every mutation
+  routed to it replays.</li>
+</ul>
+<p>Readers must verify uniqueness across every mutation source decoded for the
+operation. Uniqueness across unread subtrees is a writer invariant.</p>
+<p>Mutations may be serialized in any order. Aggregate counts must not depend on
+serialization order; readers may apply checked deltas in action sequence order.</p>
+<p><code>materialized_through_action_sequence</code> records how far a leaf has been
+materialized. It is not part of the leaf contents. The same leaf may
+therefore be referenced with different watermarks. It must be 0 on an
+interior child.</p>
+<p>A leaf watermark <code>N</code> means every mutation for that leaf's range with a
+sequence at or below <code>N</code> has been incorporated into the leaf's records, with
+no holes, and no buffer above the leaf holds a mutation for its range with a
+sequence at or below <code>N</code>. Readers must reject a collected mutation whose
+sequence is at or below the owning leaf's
+<code>materialized_through_action_sequence</code>.</p>
+<h2 id="fragment-ids">Fragment IDs<a class="headerlink" href="#fragment-ids" title="Permanent link">&para;</a></h2>
+<p><code>Manifest.max_fragment_id</code> is authoritative for fragment ID allocation. The
+tree has no separate allocator.</p>
+<p><code>max_fragment_id</code> is absent only when no fragment ID has ever been allocated or
+reserved in the lineage. It must not decrease. Deletion does not make fragment
+IDs reusable, and restore must not lower the value.</p>
+<p>The first allocated fragment ID is 0. Otherwise, allocation uses
+<code>max_fragment_id + 1</code>. <code>ReserveFragments</code> advances the value. A value of
+<code>2^32 - 1</code> exhausts the fragment-ID space.</p>
+<p>Every fragment ID stored or targeted by the tree must be at most
+<code>Manifest.max_fragment_id</code>. If <code>max_fragment_id</code> is absent, the tree must
+contain no fragment records or fragment-targeting mutations.</p>
+<h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
+<p>Readers must validate every structure they decode before using it. They must
+not treat a corrupt snapshot as empty.</p>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>Additional checks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Manifest</td>
+<td>Feature flags set, <code>fragments</code> empty, <code>fragment_tree</code> present, layout selected</td>
+</tr>
+<tr>
+<td><code>FragmentTree</code></td>
+<td>Exactly one root representation, sequence range valid, tree object references valid, no target above <code>max_fragment_id</code></td>
+</tr>
+<tr>
+<td>Root</td>
+<td>Children and buffer valid, derived visible rows at most derived total rows</td>
+</tr>
+<tr>
+<td>Node / leaf</td>
+<td>Fetched byte length equals parent <code>object_size</code>. Shape and aggregate fields that can be recomputed from the object agree with the parent child reference. Routing bounds and the leaf watermark follow Routing and Sequence numbers.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="publication-and-cleanup">Publication and cleanup<a class="headerlink" href="#publication-and-cleanup" title="Permanent link">&para;</a></h2>
+<p>Writers compete for the next dataset version, even when changing different
+fragments. A writer that loses the version race must check intervening
+transactions and rebase compatible changes before retrying. Incompatible
+changes fail under the normal transaction rules.</p>
+<p>A retry may read the new manifest, transaction history, and affected tree
+objects, then write a transaction record, tree objects, and a new manifest.
+If changes fit in <code>mutations_since_root</code>, the external root can be reused without
+rewriting a leaf. Validation, flushing, splitting, or eager loading can require
+additional I/O.</p>
+<p>Every tree object reachable from a Version Manifest must be durable before that
+manifest is committed. The manifest commit is the visibility boundary.</p>
+<p>A failed attempt leaves unreachable objects that are eligible for cleanup.</p>
+<p>Whether to inline the root or publish a new external root is writer policy and
+may change between versions.</p>
+<p>Unchanged immutable subtrees may be reused. New tree objects must belong to
+the current dataset. Reused references must preserve their resolved dataset.</p>
+<p>Cleanup computes reachability from the fragment state of every
+retained manifest, applying buffers and <code>mutations_since_root</code>. The reachable
+set includes the external root named by <code>root_uuid</code>, if any, every <code>.node</code> and
+<code>.lance</code> reachable from that root after resolving child references, and every
+data file, deletion file, and related object that state names.
+A file named only by a pending mutation is reachable through that resolved
+state. A file named only by a mutation that a later mutation in the same
+snapshot supersedes is not. Objects under this dataset's <code>_bt/</code> outside the
+set follow the same age and in-progress rules as data files.</p>
+<p>An object reachable from any retained manifest of this dataset must not be
+removed. Tree object lifetime across datasets follows the same contract as
+data files named through <code>base_paths</code>.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../data_overlay_file/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Data Overlay Files</div>
+        </a>
+        <a class="next" href="../mem_wal/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">MemTable & WAL</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#at-a-glance">At a glance</a>
+      <a class="ld-toc__h2" href="#snapshot">Snapshot</a>
+      <a class="ld-toc__h2" href="#tree-objects">Tree objects</a>
+      <a class="ld-toc__h2" href="#object-references">Object references</a>
+      <a class="ld-toc__h2" href="#leaf-format">Leaf format</a>
+      <a class="ld-toc__h2" href="#routing">Routing</a>
+      <a class="ld-toc__h2" href="#mutations">Mutations</a>
+      <a class="ld-toc__h2" href="#sequence-numbers">Sequence numbers</a>
+      <a class="ld-toc__h2" href="#fragment-ids">Fragment IDs</a>
+      <a class="ld-toc__h2" href="#validation">Validation</a>
+      <a class="ld-toc__h2" href="#publication-and-cleanup">Publication and cleanup</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

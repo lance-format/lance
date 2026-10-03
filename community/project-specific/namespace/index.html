@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Lance Namespace — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/community/project-specific/namespace/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab active" href="../../">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Community
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Community</div>
+    <a href="../../">Lance Community Governance</a>
+    <a href="../../maintainers/">Maintainers</a>
+    <a href="../../pmc/">PMC</a>
+    <a href="../../communication/">Communication</a>
+    <a href="../../voting/">Voting</a>
+    <a href="../../contributing/">Contributing</a>
+    <a href="../../release/">Release</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Project Specific Guidelines</div>
+    <a href="../">Project Specific Guidelines</a>
+    <a class="active" href="./">Lance Namespace</a>
+    <a href="../namespace-impls/">Lance Namespace Impls</a>
+    <a href="../ray/">Lance Ray</a>
+    <a href="../spark/">Lance Spark</a>
+    <a href="../trino/">Lance Trino</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance</div>
+    <a href="../lance/general/">General</a>
+    <a href="../lance/release/">Release</a>
+    <a href="../lance/rust/">Rust</a>
+    <a href="../lance/python/">Python</a>
+    <a href="../lance/docs/">Docs</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Community</span>
+        <span>/</span><span>Project Specific Guidelines</span>
+        <span>/</span><b>Lance Namespace</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="contributing-to-lance-namespace">Contributing to Lance Namespace<a class="headerlink" href="#contributing-to-lance-namespace" title="Permanent link">&para;</a></h1>
+<p>The Lance Namespace codebase is at <a href="https://github.com/lance-format/lance-namespace">lance-format/lance-namespace</a>.
+This codebase contains:</p>
+<ul>
+<li>The Lance Namespace specification</li>
+<li>The core <code>LanceNamespace</code> interface and generic connect functionality for all languages except Rust
+  (for Rust, these are located in the <a href="https://github.com/lance-format/lance">lance-format/lance</a> repo)</li>
+<li>Generated clients and servers using OpenAPI generator</li>
+</ul>
+<p>This project should only be used to make spec and interface changes to Lance Namespace,
+or to add new clients and servers to be generated based on community demand.
+In general, we welcome more generated components to be added as long as 
+the contributor is willing to set up all the automations for generation and publication.</p>
+<p>For contributing changes to directory and REST namespaces, please go to the <a href="https://github.com/lance-format/lance">lance</a> repo.</p>
+<p>For contributing changes to implementations other than the directory and REST namespace, 
+or for adding new namespace implementations,
+please go to the <a href="https://github.com/lance-format/lance-namespace-impls">lance-namespace-impls</a> repo.</p>
+<h2 id="project-dependency">Project Dependency<a class="headerlink" href="#project-dependency" title="Permanent link">&para;</a></h2>
+<p>This project contains the core Lance Namespace specification, interface and generated modules across all languages.
+The dependency structure varies by language due to different build and distribution models.</p>
+<h3 id="rust">Rust<a class="headerlink" href="#rust" title="Permanent link">&para;</a></h3>
+<p>For Rust, the interface module <code>lance-namespace</code> and implementations (<code>lance-namespace-impls</code> for REST and directory namespaces)
+are located in the core <a href="https://github.com/lance-format/lance">lance-format/lance</a> repository.
+This is because Rust uses source code builds, and separating modules across repositories makes dependency management complicated.</p>
+<p>The dependency chain is: <code>lance-namespace</code> → <code>lance</code> → <code>lance-namespace-impls</code></p>
+<h3 id="other-languages-eg-python-java">Other Languages (e.g. Python, Java)<a class="headerlink" href="#other-languages-eg-python-java" title="Permanent link">&para;</a></h3>
+<p>For Python, Java, and other languages, the core <code>LanceNamespace</code> interface and generic connect functionality
+are maintained in <strong>this repository</strong> (e.g., <code>lance-namespace</code> for Python, <code>lance-namespace-core</code> for Java).
+The core <a href="https://github.com/lance-format/lance">lance-format/lance</a> repository then imports these modules.</p>
+<p>The reason for this import direction is that <code>lance-namespace-impls</code> (REST and directory namespace implementations)
+are used in the Lance Python and Java bindings, and are exposed back through the corresponding language interfaces.
+These language interfaces can also be imported dynamically without the need to have a dependency of the Lance core library bindings in those languages.</p>
+<h3 id="other-implementations">Other Implementations<a class="headerlink" href="#other-implementations" title="Permanent link">&para;</a></h3>
+<p>For namespace implementations other than directory and REST namespaces,
+those are stored in the <a href="https://github.com/lance-format/lance-namespace-impls">lance-format/lance-namespace-impls</a> repository,
+with one implementation per language.</p>
+<h3 id="dependency-diagram">Dependency Diagram<a class="headerlink" href="#dependency-diagram" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>flowchart TB
+    subgraph this_repo["lance-namespace repo"]
+        spec["Spec &amp; Generated Clients"]
+        py_core["Python: lance-namespace"]
+        java_core["Java: lance-namespace-core"]
+    end
+
+    subgraph lance_repo["lance repo"]
+        subgraph rust_modules["Rust Modules"]
+            rs_ns["lance-namespace"]
+            rs_lance["lance"]
+            rs_impls["lance-namespace-impls&lt;br/&gt;(dir, rest)"]
+        end
+        py_lance["Python: lance"]
+        java_lance["Java: lance"]
+    end
+
+    subgraph impls_repo["namespace-impls repo"]
+        polaris["Apache Polaris"] ~~~ hive["Apache Hive"] ~~~ iceberg_rest["Apache Iceberg REST"] ~~~ unity["Unity Catalog"] ~~~ glue["AWS Glue"]
+    end
+
+    %% Rust dependencies (source build)
+    rs_ns --&gt; rs_lance
+    rs_lance --&gt; rs_impls
+
+    %% Python/Java dependencies
+    py_core --&gt; py_lance
+    java_core --&gt; java_lance
+    rs_impls -.-&gt; py_lance
+    rs_impls -.-&gt; java_lance
+
+    %% Other implementations depend on core interfaces and lance bindings
+    py_core -.-&gt; impls_repo
+    java_core -.-&gt; impls_repo
+    py_lance -.-&gt; impls_repo
+    java_lance -.-&gt; impls_repo
+
+    style this_repo fill:#1565c0,color:#fff
+    style lance_repo fill:#e65100,color:#fff
+    style impls_repo fill:#7b1fa2,color:#fff
+    style rust_modules fill:#ff8a65,color:#000</code></pre>
+<h2 id="repository-structure">Repository structure<a class="headerlink" href="#repository-structure" title="Permanent link">&para;</a></h2>
+<p>This repository currently contains the following components:</p>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Language</th>
+<th>Path</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Spec</td>
+<td></td>
+<td>docs/src</td>
+<td>Lance Namespace Specification</td>
+</tr>
+<tr>
+<td>Python Core</td>
+<td>Python</td>
+<td>python/lance_namespace</td>
+<td>Core LanceNamespace interface and connect functionality</td>
+</tr>
+<tr>
+<td>Python UrlLib3 Client</td>
+<td>Python</td>
+<td>python/lance_namespace_urllib3_client</td>
+<td>Generated Python urllib3 client for Lance REST Namespace</td>
+</tr>
+<tr>
+<td>Java Core</td>
+<td>Java</td>
+<td>java/lance-namespace-core</td>
+<td>Core LanceNamespace interface and connect functionality</td>
+</tr>
+<tr>
+<td>Java Apache Client</td>
+<td>Java</td>
+<td>java/lance-namespace-apache-client</td>
+<td>Generated Java Apache HTTP client for Lance REST Namespace</td>
+</tr>
+<tr>
+<td>Java SpringBoot Server</td>
+<td>Java</td>
+<td>java/lance-namespace-springboot-server</td>
+<td>Generated Java SpringBoot server for Lance REST Namespace</td>
+</tr>
+<tr>
+<td>Rust Reqwest Client</td>
+<td>Rust</td>
+<td>rust/lance-namespace-reqwest-client</td>
+<td>Generated Rust reqwest client for Lance REST Namespace</td>
+</tr>
+</tbody>
+</table>
+<h2 id="install-uv">Install uv<a class="headerlink" href="#install-uv" title="Permanent link">&para;</a></h2>
+<p>We use <a href="https://docs.astral.sh/uv/getting-started/installation/">uv</a> for development.
+Make sure it is installed, and run:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>make<span class="w"> </span>sync
+</span></code></pre></div>
+<h2 id="lint">Lint<a class="headerlink" href="#lint" title="Permanent link">&para;</a></h2>
+<p>To ensure the OpenAPI definition is valid, you can use the lint command to check it.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>make<span class="w"> </span>lint
+</span></code></pre></div>
+<h2 id="build">Build<a class="headerlink" href="#build" title="Permanent link">&para;</a></h2>
+<p>There are 3 commands that is available at top level as well as inside each language folder:</p>
+<ul>
+<li><code>make clean</code>: remove all codegen modules</li>
+<li><code>make gen</code>: codegen and lint all modules (depends on <code>clean</code>)</li>
+<li><code>make build</code>: build all modules (depends on <code>gen</code>)</li>
+</ul>
+<p>You can also run <code>make &lt;command&gt;-&lt;language&gt;</code> to only run the command in the specific language, for example:</p>
+<ul>
+<li><code>make gen-python</code>: codegen and lint all Python modules</li>
+<li><code>make build-rust</code>: build all Rust modules</li>
+</ul>
+<p>You can also run <code>make &lt;command&gt;-&lt;language&gt;-&lt;module&gt;</code> inside a language folder to run the command against a specific module, for example:</p>
+<ul>
+<li><code>make gen-rust-reqwest-client</code>: codegen and lint the Rust reqwest client module</li>
+<li><code>make build-java-springboot-server</code>: build the Java Spring Boot server module</li>
+</ul>
+<h2 id="documentation">Documentation<a class="headerlink" href="#documentation" title="Permanent link">&para;</a></h2>
+<h3 id="setup">Setup<a class="headerlink" href="#setup" title="Permanent link">&para;</a></h3>
+<p>The documentation website is built using <a href="https://pypi.org/project/mkdocs-material">mkdocs-material</a>.
+Start the server with:</p>
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>make<span class="w"> </span>serve-docs
+</span></code></pre></div>
+<h3 id="generated-model-documentation">Generated Model Documentation<a class="headerlink" href="#generated-model-documentation" title="Permanent link">&para;</a></h3>
+<p>The operation request and response model documentation is generated from the Java Apache Client.
+When building or serving docs, the Java client must be generated first to produce the model Markdown files,
+which are then copied to <code>docs/src/operations/models/</code>.</p>
+<p>This happens automatically when running:</p>
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>make<span class="w"> </span>build-docs<span class="w">  </span><span class="c1"># or make serve-docs</span>
+</span></code></pre></div>
+<p>These commands depend on <code>gen-java</code> to ensure the Java client docs are up-to-date before building the documentation.</p>
+<h3 id="understanding-the-build-process">Understanding the Build Process<a class="headerlink" href="#understanding-the-build-process" title="Permanent link">&para;</a></h3>
+<p>The contents in <code>lance-namespace/docs</code> are for the ease of contributors to edit and preview.
+After code merge, the contents are added to the 
+<a href="https://github.com/lance-format/lance/tree/main/docs">main Lance documentation</a> 
+during the Lance doc CI build time, and is presented in the Lance website under 
+<a href="https://lance.org/lance/format/namespace">Lance Namespace Spec</a>.</p>
+<h2 id="release-process">Release Process<a class="headerlink" href="#release-process" title="Permanent link">&para;</a></h2>
+<p>This section describes the CI/CD workflows for automated version management, releases, and publishing.</p>
+<h3 id="version-scheme">Version Scheme<a class="headerlink" href="#version-scheme" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Stable releases:</strong> <code>X.Y.Z</code> (e.g., 1.2.3)</li>
+<li><strong>Preview releases:</strong> <code>X.Y.Z-beta.N</code> (e.g., 1.2.3-beta.1)</li>
+</ul>
+<h3 id="creating-a-release">Creating a Release<a class="headerlink" href="#creating-a-release" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong>Create Release Draft</strong></li>
+<li>Go to Actions → "Create Release"</li>
+<li>Select parameters:<ul>
+<li>Release type (major/minor/patch)</li>
+<li>Release channel (stable/preview)</li>
+<li>Dry run (test without pushing)</li>
+</ul>
+</li>
+<li>
+<p>Run workflow (creates a draft release)</p>
+</li>
+<li>
+<p><strong>Review and Publish</strong></p>
+</li>
+<li>Go to the <a href="../../releases">Releases page</a> to review the draft</li>
+<li>Edit release notes if needed</li>
+<li>Click "Publish release" to:<ul>
+<li>For stable releases: Trigger automatic publishing for Java, Python, Rust</li>
+<li>For preview releases: Create a beta release (not published)</li>
+</ul>
+</li>
+</ol>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../lance/docs/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Docs</div>
+        </a>
+        <a class="next" href="../namespace-impls/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Lance Namespace Impls</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#project-dependency">Project Dependency</a>
+      <a class="ld-toc__h3" href="#rust">Rust</a>
+      <a class="ld-toc__h3" href="#other-languages-eg-python-java">Other Languages (e.g. Python, Java)</a>
+      <a class="ld-toc__h3" href="#other-implementations">Other Implementations</a>
+      <a class="ld-toc__h3" href="#dependency-diagram">Dependency Diagram</a>
+      <a class="ld-toc__h2" href="#repository-structure">Repository structure</a>
+      <a class="ld-toc__h2" href="#install-uv">Install uv</a>
+      <a class="ld-toc__h2" href="#lint">Lint</a>
+      <a class="ld-toc__h2" href="#build">Build</a>
+      <a class="ld-toc__h2" href="#documentation">Documentation</a>
+      <a class="ld-toc__h3" href="#setup">Setup</a>
+      <a class="ld-toc__h3" href="#generated-model-documentation">Generated Model Documentation</a>
+      <a class="ld-toc__h3" href="#understanding-the-build-process">Understanding the Build Process</a>
+      <a class="ld-toc__h2" href="#release-process">Release Process</a>
+      <a class="ld-toc__h3" href="#version-scheme">Version Scheme</a>
+      <a class="ld-toc__h3" href="#creating-a-release">Creating a Release</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../format/">Specification</a>
+        <a href="../../../format/file/">File format</a>
+        <a href="../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>
