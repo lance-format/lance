@@ -82,7 +82,13 @@ async fn create_int_unique_index(
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
 
     (BitmapIndexPlugin
-        .load_index(store, &details, 0, None, &get_cache(use_cache, "int_unique"))
+        .load_index(
+            store,
+            &details,
+            0,
+            None,
+            &get_cache(use_cache, "int_unique"),
+        )
         .await
         .unwrap()) as _
 }
@@ -101,7 +107,13 @@ async fn create_int_low_card_index(
     let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap();
 
     (BitmapIndexPlugin
-        .load_index(store, &details, 0, None, &get_cache(use_cache, "int_low_card"))
+        .load_index(
+            store,
+            &details,
+            0,
+            None,
+            &get_cache(use_cache, "int_low_card"),
+        )
         .await
         .unwrap()) as _
 }

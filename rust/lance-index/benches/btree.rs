@@ -200,7 +200,7 @@ async fn create_int_many_fragment_index(
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
 
     (BTreeIndexPlugin
-        .load_index(store, &details, None, &cache)
+        .load_index(store, &details, 0, None, &cache)
         .await
         .unwrap()) as _
 }

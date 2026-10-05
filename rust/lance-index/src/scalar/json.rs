@@ -1405,7 +1405,13 @@ mod tests {
             .unwrap();
 
         plugin
-            .load_index(store, &created.index_details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap()
     }

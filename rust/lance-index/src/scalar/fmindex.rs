@@ -2840,7 +2840,13 @@ mod tests {
             .unwrap();
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -3269,7 +3275,13 @@ mod tests {
         assert_eq!(created.files[1].path, fmindex_partition_path(1));
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
         let r = index
