@@ -2751,4 +2751,54 @@ mod tests {
             );
         }
     }
+
+    /// Two children of one struct, selected in the reverse of declaration order.
+    /// The resolved output must follow the selection, as the canonical
+    /// projection does, or the later relabel pairs children positionally and
+    /// one child answers with the other's value.
+    ///
+    /// The resolved target still follows declaration order, so this fails: it
+    /// holds the reproduction until the target is built the way the canonical
+    /// projection builds it, which also settles the container shape a selection
+    /// reaching into a list element should keep.
+    #[ignore = "nested selection order is not yet carried into the resolved target"]
+    #[tokio::test]
+    async fn a_nested_projection_keeps_selection_order() {
+        let stored_schema = create_nested_schema();
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let active = active_memtable_ref(
+                &stored_schema,
+                &[create_nested_batch(&stored_schema, &[1])],
+                1,
+            );
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        crate::dataset::mem_wal::scanner::collector::InMemoryMemTables {
+                            active,
+                            frozen: vec![],
+                        },
+                    );
+            let planner =
+                LsmPointLookupPlanner::new(collector, vec!["id".to_string()], table_schema)
+                    .unwrap();
+            let row = planner
+                .lookup(
+                    &[ScalarValue::Int32(Some(1))],
+                    Some(&["meta.b".to_string(), "meta.a".to_string()]),
+                )
+                .await
+                .expect("a reversed nested selection still resolves")
+                .expect("the row is still present");
+            assert_eq!(
+                meta_children(&row),
+                vec!["b", "a"],
+                "the output follows the selection, not the declaration"
+            );
+        }
+    }
 }
