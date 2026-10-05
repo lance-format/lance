@@ -250,6 +250,16 @@ message HnswParameters {
 message JsonIndexDetails {
   string path = 1;
   google.protobuf.Any target_details = 2;
+
+  /* The target index's own persisted format version, i.e. the
+   * `CreatedIndex::index_version` it reported when it was built.
+   *
+   * Unset for details written before this field existed; readers should
+   * fall back to the target plugin's current version in that case, which
+   * matches those indexes' actual format since they always came from a
+   * fresh training pass in the same codebase.
+   */
+  optional uint32 target_index_version = 3;
 }
 message BloomFilterIndexDetails {}
 

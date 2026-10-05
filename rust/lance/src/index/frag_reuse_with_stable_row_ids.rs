@@ -317,6 +317,7 @@ mod tests {
         details(&pb::JsonIndexDetails {
             path: "x".to_string(),
             target_details: target,
+            target_index_version: None,
         })
     }
 
