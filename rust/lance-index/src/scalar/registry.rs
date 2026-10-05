@@ -191,6 +191,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -205,7 +206,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
                 self.name()
             )));
         }
-        self.load_index(index_store, index_details, None, cache)
+        self.load_index(index_store, index_details, index_version, None, cache)
             .await
     }
 
