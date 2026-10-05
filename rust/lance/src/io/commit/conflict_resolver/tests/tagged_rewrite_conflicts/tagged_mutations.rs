@@ -24,8 +24,8 @@ use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 /// Two fragments of four rows each, columns `i` (indexed key), `v` and `w`
-/// (payloads, initially equal to `i`), tagged by a stable partition.
-async fn tagged_two_column_fixture(uri: &str) -> Dataset {
+/// (payloads, initially equal to `i`), with `i_idx` built and not yet tagged.
+async fn indexed_two_column_fixture(uri: &str) -> Dataset {
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
         .col("v", lance_datagen::array::step::<Int32Type>())
@@ -43,7 +43,12 @@ async fn tagged_two_column_fixture(uri: &str) -> Dataset {
         )
         .await
         .unwrap();
-    let dataset = make_tagged(dataset).await;
+    dataset
+}
+
+/// [`indexed_two_column_fixture`] tagged by a stable partition.
+async fn tagged_two_column_fixture(uri: &str) -> Dataset {
+    let dataset = make_tagged(indexed_two_column_fixture(uri).await).await;
     assert_eq!(
         dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
         vec![10, 11]
@@ -1430,6 +1435,163 @@ async fn tagged_table_accepts_config_update() {
         vec![(6, 6)]
     );
     assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+}
+
+mod mem_wal_state {
+    //! The MemWAL system index and a tagged history coexist: the index is
+    //! installed on a tagged table (or tagged under), and recording SSTable
+    //! compaction progress on it (`UpdateMemWalState`) replaces only the
+    //! MemWAL entry. The history, the user segment and its derived coverage
+    //! are carried through unchanged.
+
+    use super::*;
+    use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
+    use lance_index::mem_wal::MemWalIndexDetails;
+
+    /// Installs `__lance_mem_wal` through the commit path, as MemWAL
+    /// initialization does.
+    async fn install_mem_wal_index(dataset: Dataset) -> Dataset {
+        let version = dataset.manifest.version;
+        let mem_wal_index = new_mem_wal_index_meta(version, MemWalIndexDetails::default()).unwrap();
+        commit_sp(
+            &dataset,
+            version,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn advance_mem_wal_state(
+        dataset: &Dataset,
+        shard: Uuid,
+        generation: u64,
+    ) -> Result<Dataset> {
+        commit_sp(
+            dataset,
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
+            },
+        )
+        .await
+    }
+
+    fn mem_wal_entry(indices: &[IndexMetadata]) -> &IndexMetadata {
+        indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+    }
+
+    /// Two state updates land on the tagged table carrying `i_idx` and the
+    /// MemWAL index; each replaces the MemWAL entry only.
+    async fn assert_mem_wal_state_advances_beside_the_history(uri: &str, dataset: Dataset) {
+        let before = crate::index::load_all_indices(&dataset).await.unwrap();
+        let derived_before = dataset.load_indices().await.unwrap();
+        let shard = Uuid::new_v4();
+
+        let committed = advance_mem_wal_state(&dataset, shard, 3).await.unwrap();
+        let dataset = fresh_session(uri).await;
+        assert_eq!(dataset.manifest.version, committed.manifest.version);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        assert_eq!(stored.len(), before.len());
+
+        let mem_wal = mem_wal_entry(&stored);
+        let details = load_mem_wal_index_details(mem_wal.clone()).unwrap();
+        assert_eq!(
+            details.compacted_sstables,
+            vec![CompactedSsTable::new(shard, 3)]
+        );
+        assert_eq!(mem_wal.dataset_version, dataset.manifest.version);
+        assert_ne!(
+            mem_wal.uuid,
+            mem_wal_entry(&before).uuid,
+            "a state update mints a new MemWAL entry identity"
+        );
+
+        let fri = fri_entry(&stored);
+        assert_eq!(fri.uuid, fri_entry(&before).uuid);
+        assert_eq!(fri.index_version, fri_entry(&before).index_version);
+        assert_eq!(fri.dataset_version, fri_entry(&before).dataset_version);
+        assert_eq!(
+            fri.index_details,
+            fri_entry(&before).index_details,
+            "the history's details bytes are carried through unchanged"
+        );
+
+        let segment = user_segment(&stored);
+        assert_eq!(
+            segment.dataset_version,
+            user_segment(&before).dataset_version
+        );
+        assert_eq!(segment.index_version, user_segment(&before).index_version);
+        assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+        let derived = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            user_segment(&derived).fragment_bitmap,
+            user_segment(&derived_before).fragment_bitmap
+        );
+        assert_eq!(
+            assert_index_agrees_with_scan(&dataset, "i = 6").await,
+            vec![(6, 6)]
+        );
+        assert_eq!(
+            rows(&dataset, None, true).await,
+            (0..8).map(|i| (i, i)).collect::<Vec<_>>()
+        );
+
+        // The generation keeps advancing on the same shard.
+        let committed = advance_mem_wal_state(&dataset, shard, 4).await.unwrap();
+        let dataset = fresh_session(uri).await;
+        assert_eq!(dataset.manifest.version, committed.manifest.version);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let details = load_mem_wal_index_details(mem_wal_entry(&stored).clone()).unwrap();
+        assert_eq!(
+            details.compacted_sstables,
+            vec![CompactedSsTable::new(shard, 4)]
+        );
+        assert_eq!(fri_entry(&stored).uuid, fri_entry(&before).uuid);
+        assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+        assert_eq!(
+            assert_index_agrees_with_scan(&dataset, "i = 6").await,
+            vec![(6, 6)]
+        );
+    }
+
+    /// The MemWAL index is installed on an already tagged table, then its
+    /// state is advanced.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn mem_wal_state_advances_on_a_tagged_table() {
+        let dir = TempStrDir::default();
+        let dataset = tagged_two_column_fixture(dir.as_str()).await;
+        let installed = install_mem_wal_index(dataset).await;
+        let dataset = fresh_session(dir.as_str()).await;
+        assert_eq!(dataset.manifest.version, installed.manifest.version);
+        assert_mem_wal_state_advances_beside_the_history(dir.as_str(), dataset).await;
+    }
+
+    /// The table is tagged after the MemWAL index exists, then the state is
+    /// advanced: the same order MemWAL initialization followed by a stable
+    /// partition produces.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn mem_wal_state_advances_on_a_table_tagged_after_the_index() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_two_column_fixture(dir.as_str()).await;
+        let dataset = install_mem_wal_index(dataset).await;
+        let dataset = make_tagged(dataset).await;
+        assert_eq!(
+            dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        let dataset = fresh_session(dir.as_str()).await;
+        assert_mem_wal_state_advances_beside_the_history(dir.as_str(), dataset).await;
+    }
 }
 
 /// Every commit attempt prepares the index list against the manifest it

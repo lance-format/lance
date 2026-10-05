@@ -39,6 +39,10 @@ pub enum Admission {
     TrimsEntry,
     /// Creates, replaces or drops user indices; the entry is untouched.
     MaintainsUserIndices,
+    /// Records MemWAL compaction progress: replaces the MemWAL system
+    /// index's own entry and nothing else (no fragment, no user segment,
+    /// not the history).
+    MaintainsMemWalState,
 }
 
 /// Classify `operation` against the table's current state.
@@ -307,14 +311,16 @@ pub fn classify(
         | Operation::DataReplacement { .. }
         | Operation::UpdateBases { .. } => Ok(Admission::MovesNoRows),
         Operation::Restore { .. } => Ok(Admission::RestoresManifest),
+        // Replaces only the MemWAL entry; fragments, user segments and the
+        // history are carried through unchanged.
+        Operation::UpdateMemWalState { .. } => Ok(Admission::MaintainsMemWalState),
         // A bare rewrite beside an entry of a newer version or carrying
         // rewritten indices, or a v0 snapshot, would misinterpret the
-        // history; MemWAL state, overlays, clones and base changes have no
-        // tagged semantics yet. A CreateIndex reaching here
-        // touches the entry without being its trim.
+        // history; overlays, clones and base changes have no tagged
+        // semantics yet. A CreateIndex reaching here touches the entry
+        // without being its trim.
         Operation::Rewrite { .. }
         | Operation::CreateIndex { .. }
-        | Operation::UpdateMemWalState { .. }
         | Operation::DataOverlay { .. }
         | Operation::Clone { .. } => Err(Error::not_supported(
             "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
@@ -729,7 +735,11 @@ mod tests {
     )]
     #[case("project", Table::Tagged, Verdict::Admit(Admission::MovesNoRows))]
     #[case("update_config", Table::Tagged, Verdict::Admit(Admission::MovesNoRows))]
-    #[case("update_mem_wal_state", Table::Tagged, Verdict::NotSupported)]
+    #[case(
+        "update_mem_wal_state",
+        Table::Tagged,
+        Verdict::Admit(Admission::MaintainsMemWalState)
+    )]
     #[case("clone", Table::Tagged, Verdict::NotSupported)]
     #[case("update_bases", Table::Tagged, Verdict::Admit(Admission::MovesNoRows))]
     fn every_operation_has_a_verdict(
@@ -747,6 +757,38 @@ mod tests {
             None,
         ));
         assert_eq!(got, expected, "{kind} on {state:?}");
+    }
+
+    /// Admitting MemWAL state updates does not widen the gate: an overlay
+    /// and a clone are still refused on every tagged table state.
+    #[rstest::rstest]
+    #[case(Table::Tagged)]
+    #[case(Table::TaggedWithDirectIndex)]
+    #[case(Table::TaggedWithTranslatingIndex)]
+    fn overlay_and_clone_stay_refused_on_a_tagged_table(#[case] state: Table) {
+        let (manifest, indices) = table(state);
+        for kind in ["data_overlay", "clone"] {
+            let got = verdict(classify(
+                &sample(kind, &manifest),
+                Some(&manifest),
+                &indices,
+                &frag_reuse_for(kind),
+                None,
+            ));
+            assert_eq!(got, Verdict::NotSupported, "{kind} on {state:?}");
+        }
+        let got = verdict(classify(
+            &sample("update_mem_wal_state", &manifest),
+            Some(&manifest),
+            &indices,
+            &frag_reuse_for("update_mem_wal_state"),
+            None,
+        ));
+        assert_eq!(
+            got,
+            Verdict::Admit(Admission::MaintainsMemWalState),
+            "update_mem_wal_state on {state:?}"
+        );
     }
 
     /// The trim intent may replace exactly the current entry, and nothing

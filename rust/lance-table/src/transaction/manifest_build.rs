@@ -2555,16 +2555,58 @@ mod tests {
         assert_eq!(carried.fragment_bitmap, fri.fragment_bitmap);
     }
 
+    /// Recording MemWAL compaction progress on a tagged table replaces the
+    /// MemWAL entry and carries the history and the user segment through
+    /// unchanged.
+    #[test]
+    fn tagged_history_allows_mem_wal_state_update() {
+        let (manifest, fri) = tagged_sample_manifest();
+        let user = sample_index_metadata("id_idx");
+        let mem_wal = new_mem_wal_index_meta(manifest.version, Default::default()).unwrap();
+        let shard = Uuid::new_v4();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
+            },
+            None,
+        );
+        let (built, indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![fri.clone(), user.clone(), mem_wal.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        assert_eq!(built.fragments.len(), manifest.fragments.len());
+        assert_eq!(indices.len(), 3);
+        let carried_fri = indices.iter().find(|idx| idx.uuid == fri.uuid).unwrap();
+        assert_eq!(carried_fri.index_details, fri.index_details);
+        assert_eq!(carried_fri.fragment_bitmap, fri.fragment_bitmap);
+        assert_eq!(carried_fri.index_version, fri.index_version);
+        let carried_user = indices.iter().find(|idx| idx.uuid == user.uuid).unwrap();
+        assert_eq!(carried_user.fragment_bitmap, user.fragment_bitmap);
+        assert_eq!(carried_user.dataset_version, user.dataset_version);
+        let updated = indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap();
+        assert_ne!(updated.uuid, mem_wal.uuid);
+        assert_eq!(updated.dataset_version, built.version);
+        let details = load_mem_wal_index_details(updated.clone()).unwrap();
+        assert_eq!(
+            details.compacted_sstables,
+            vec![CompactedSsTable::new(shard, 3)]
+        );
+    }
+
     #[rstest::rstest]
-    #[case::memwal("memwal")]
     #[case::bare_rewrite("bare_rewrite")]
     #[case::rewrite_with_v0_entry("rewrite_with_v0_entry")]
     fn tagged_history_rejects_unsupported_transactions(#[case] kind: &str) {
         let (manifest, fri) = tagged_sample_manifest();
         let operation = match kind {
-            "memwal" => Operation::UpdateMemWalState {
-                compacted_sstables: vec![],
-            },
             // A rewrite carrying no entry, or a v0 entry, would splice away
             // the tagged history; only a tagged entry may replace one. The
             // bare rewrite touches fragment 0, which the entry's bitmap
