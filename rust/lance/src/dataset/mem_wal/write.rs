@@ -1483,12 +1483,9 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    // The entry records the generation its batches belong to,
-                    // so replay rebuilds the boundaries the writer made instead
-                    // of re-deriving them from a row cap it may have been
-                    // reopened with a different value of. An entry written
-                    // before the key existed carries none, and the size rule
-                    // below still answers for it.
+                    // The entry names the generation its batches belong to, so
+                    // the boundary is read rather than measured. A WAL-only
+                    // entry names none; the size rule below answers for it.
                     if let Some(generation) = entry.generation
                         && generation != active.generation()
                         && !active.batch_store().is_empty()
@@ -1515,17 +1512,15 @@ async fn replay_memtable_from_wal(
                         } else {
                             active.generation() + 1
                         };
-                        // The target names the directory its payload is in, so
-                        // its generation is the authority and the rotation below
-                        // adopts it. A gap is legitimate: the writer also rotates
-                        // for reasons no entry records -- an index set replaced,
-                        // a schema evolved -- and replay cannot reconstruct
-                        // those. Going backwards is not: that generation has
-                        // been flushed, and reusing the number would write a
-                        // second one over it.
-                        if target.generation < expected_generation {
+                        // Every entry names its generation, so the rotation
+                        // above has already moved onto the one this target
+                        // belongs to. A disagreement means the two disagree
+                        // about which memtable wrote these rows, and the
+                        // payload directory this entry points into may not be
+                        // the one the memtable owns.
+                        if target.generation != expected_generation {
                             return Err(Error::io(format!(
-                                "WAL target generation {} at position {} precedes active generation {}",
+                                "WAL target generation {} at position {} does not follow active generation {}",
                                 target.generation,
                                 position,
                                 active.generation()
@@ -2178,7 +2173,6 @@ impl SharedWriterState {
         }
     }
 
-    /// `schema` is the one `memtable` was created under.
     async fn prepare_batches(
         &self,
         memtable: &MemTable,
@@ -3852,17 +3846,15 @@ impl ShardWriter {
         }
     }
 
-    /// Hold this writer to the schema `next` derives from the one it holds,
-    /// sealing so the following memtable is built under it.
+    /// Seal, and build the next memtable under the schema `next` returns.
     ///
-    /// `next` runs under the `state` write lock, against the schema the writer
-    /// actually holds, so it cannot overwrite a half some other caller changed
-    /// in between. The outgoing memtable keeps the schema and index set it was
-    /// built with and flushes as a generation of them; an empty one is replaced
-    /// rather than sealed, since it holds nothing to flush. `Ok(None)` when
-    /// nothing would change.
+    /// `next` is called under the `state` write lock and is given the schema the
+    /// writer holds, so a caller changing one half of it carries the other half
+    /// forward rather than overwriting it.
     ///
-    /// `op` names the caller in the errors this raises.
+    /// The outgoing memtable keeps what it was built with and flushes as a
+    /// generation of it. An empty one is replaced in place. `Ok(None)` when
+    /// nothing would change; `op` names the caller in any error.
     async fn replace_writer_schema(
         &self,
         op: &'static str,
@@ -4050,9 +4042,8 @@ impl ShardWriter {
         &self,
         configs: Vec<MemIndexConfig>,
     ) -> Result<Option<SealFence>> {
-        // Called on a timer, so almost every call finds the set already
-        // current. Answering that under the read lock skips the fence check,
-        // which costs a manifest read.
+        // Called on a timer and almost always already current. The read lock
+        // answers that without the fence check, which costs a manifest read.
         if let WriterMode::MemTable { state, .. } = &self.mode
             && same_index_set(&state.read().await.schema.index_configs, &configs)
         {

@@ -41,14 +41,8 @@ use super::memtable::batch_store::{BatchStore, StoredBatch};
 
 /// Key for storing writer epoch in Arrow IPC file schema metadata.
 pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
-/// The memtable generation an entry's batches belong to.
-///
-/// A writer rotates for reasons the batches do not reveal — a schema evolved,
-/// an index set replaced — and replay cannot reconstruct those. Recording the
-/// generation lets replay rebuild exactly the boundaries the writer made,
-/// rather than re-deriving them from the row cap it happens to reopen with.
-/// Absent on entries written before this key existed; replay then falls back to
-/// re-deriving.
+/// The memtable generation an entry's batches belong to. Absent in WAL-only
+/// mode, which holds no memtable.
 pub const GENERATION_KEY: &str = "generation";
 const TARGET_GENERATION_KEY: &str = "mem_wal_target_generation";
 const TARGET_GENERATION_DIR_KEY: &str = "mem_wal_target_generation_dir";
@@ -892,7 +886,7 @@ impl WalFlusher {
             .append_for_target(
                 record_batches,
                 batch_store.target(),
-                batch_store.generation(),
+                Some(batch_store.generation()),
             )
             .await?;
         let wal_io_duration = start.elapsed();
@@ -1237,14 +1231,14 @@ impl WalAppender {
 
     /// Append batches as one durable WAL entry.
     pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
-        self.append_for_target(batches, None, 0).await
+        self.append_for_target(batches, None, None).await
     }
 
     pub(crate) async fn append_for_target(
         &self,
         batches: Vec<RecordBatch>,
         target: Option<&MemTableDataTarget>,
-        generation: u64,
+        generation: Option<u64>,
     ) -> Result<WalAppendResult> {
         validate_appender_batches(&batches)?;
         let wal_data = Bytes::from(serialize_appender_batches(
@@ -1563,12 +1557,14 @@ fn serialize_appender_batches(
     batches: &[RecordBatch],
     writer_epoch: u64,
     target: Option<&MemTableDataTarget>,
-    generation: u64,
+    generation: Option<u64>,
 ) -> Result<Vec<u8>> {
     let schema = batches[0].schema();
     let mut metadata = schema.metadata().clone();
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
-    metadata.insert(GENERATION_KEY.to_string(), generation.to_string());
+    if let Some(generation) = generation {
+        metadata.insert(GENERATION_KEY.to_string(), generation.to_string());
+    }
     if let Some(target) = target {
         metadata.insert(
             TARGET_GENERATION_KEY.to_string(),
@@ -1637,7 +1633,6 @@ fn serialize_fence_sentinel(writer_epoch: u64) -> Result<Vec<u8>> {
 struct DecodedEntry {
     writer_epoch: u64,
     target: Option<MemTableDataTarget>,
-    /// Absent on entries written before the generation was recorded.
     generation: Option<u64>,
     batches: Vec<RecordBatch>,
 }
@@ -1659,8 +1654,6 @@ fn deserialize_appender_batches(bytes: Bytes) -> Result<DecodedEntry> {
             ))
         })?;
     let target = target_from_metadata(schema.metadata())?;
-    // Absent on entries written before the key existed; replay falls back to
-    // re-deriving the boundary for those.
     let generation = schema
         .metadata()
         .get(GENERATION_KEY)

@@ -246,16 +246,9 @@ impl GenerationRead {
         stored_field.data_type() == declared.data_type()
     }
 
-    /// Bring the scan's output back to the table's names and shapes: renames
-    /// followed, columns the generation never stored filled with nulls, nested
-    /// columns rebuilt to the shape the table declares.
-    ///
-    /// `scan` may produce more than was asked for (`_rowaddr`, `_tombstone`);
-    /// those pass through untouched, as does anything the generation has that
-    /// the table does not.
-    /// [`Self::reconcile`], then the predicate the stored schema could not
-    /// answer — a column it does not have, which only resolves once its rows
-    /// carry the table's names.
+    /// [`Self::reconcile`], then a predicate naming a column the generation does
+    /// not store, which can only be answered once the rows carry the table's
+    /// names.
     pub(super) fn reconcile_above(
         &self,
         scan: Arc<dyn ExecutionPlan>,
@@ -268,6 +261,13 @@ impl GenerationRead {
         }
     }
 
+    /// Bring the scan's output back to the table's names and shapes: renames
+    /// followed, columns the generation never stored filled with nulls, nested
+    /// columns rebuilt to the shape the table declares.
+    ///
+    /// `scan` may produce more than was asked for (`_rowaddr`, `_tombstone`);
+    /// those pass through untouched, as does anything the generation has that
+    /// the table does not.
     pub(super) fn reconcile(&self, scan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         let source =
             self.with_only_table_field_ids(with_ids_from(&scan.schema(), &self.stored_schema));
@@ -355,16 +355,12 @@ impl GenerationRead {
     }
 }
 
-/// Whether an in-memory memtable stores the table's columns exactly as the table
-/// declares them, so it can be read as it is, without [`GenerationRead`].
+/// Whether a memtable stores the table's columns exactly as the table declares
+/// them, so it can be read without [`GenerationRead`].
 ///
-/// True in the steady state, where every memtable was created under the
-/// schema the table has now. A memtable created before a schema change —
-/// a column since added, dropped, renamed, or reshaped — is false and is read
-/// through [`GenerationRead::for_memtable`] instead. Checked positionally, since
-/// a memtable created under the table's schema stores its columns in the same
-/// order followed only by `_tombstone`; anything else takes the resolving read,
-/// which is correct for every layout and only costs a projection.
+/// Checked positionally: a memtable created under the table's schema holds its
+/// columns in the same order, followed only by `_tombstone`. Anything else takes
+/// the resolving read, which is correct for every layout and costs a projection.
 pub(super) fn memtable_matches_table(memtable_schema: &Schema, table_schema: &Schema) -> bool {
     let stored = memtable_schema.fields();
     let declared = table_schema.fields();
@@ -446,19 +442,13 @@ fn nested_children(data_type: &DataType) -> Vec<&Arc<Field>> {
     }
 }
 
-/// Every field the schema stores, as the lance id stamped on it and the dotted
-/// path that names it.
+/// Every field the schema stores, as its lance id and the dotted path naming it.
 ///
-/// A struct's children, and a list's element and its children in turn, are
-/// fields in their own right: each carries its own id, and a rename moves one
-/// name without touching its parent's. Pairing only the top level leaves a path
-/// like `meta.body` relating to nothing, which reads as a column the generation
-/// never stored.
+/// A struct's child and a list's element are fields with ids of their own, so a
+/// path like `meta.body` only relates two schemas through the ids along it.
 ///
-/// A generation's own columns are numbered in its own schema, so their ids
-/// collide with whatever the table gave those numbers. They are not the table's
-/// columns and are never resolved to one, so they and their children are left
-/// out entirely.
+/// A generation numbers its own columns in its own schema, so those ids collide
+/// with the table's. They and their children are left out.
 fn field_paths(schema: &Schema) -> Vec<(Option<i32>, String)> {
     fn walk(field: &Field, prefix: &mut Vec<String>, out: &mut Vec<(Option<i32>, String)>) {
         prefix.push(field.name().clone());
