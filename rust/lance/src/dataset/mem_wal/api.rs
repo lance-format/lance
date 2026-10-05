@@ -767,32 +767,9 @@ impl DatasetMemWalExt for Dataset {
         shard_id: Uuid,
         mut config: ShardWriterConfig,
     ) -> Result<ShardWriter> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        // Load MemWalIndex to get maintained_indexes
-        let mem_wal_index = self
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                )
-            })?;
-
-        config.shard_spec_id =
-            resolve_writer_shard_spec_id(&mem_wal_index.details, config.shard_spec_id)?;
-
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
-
-        let index_configs = build_index_configs(
-            self,
-            &maintained_indexes,
-            &config.hnsw_params,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+        let details = require_mem_wal_details(self).await?;
+        config.shard_spec_id = resolve_writer_shard_spec_id(&details, config.shard_spec_id)?;
+        let index_configs = maintained_index_configs(self, &details, &config.hnsw_params).await?;
 
         // Set shard_id in config
         config.shard_id = shard_id;
@@ -825,26 +802,9 @@ impl DatasetMemWalExt for Dataset {
         &self,
         writer: &ShardWriter,
     ) -> Result<Option<SealFence>> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        let mem_wal_index = self
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                )
-            })?;
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
-        let index_configs = build_index_configs(
-            self,
-            &maintained_indexes,
-            &writer.config().hnsw_params,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+        let details = require_mem_wal_details(self).await?;
+        let index_configs =
+            maintained_index_configs(self, &details, &writer.config().hnsw_params).await?;
         writer.replace_index_configs(index_configs).await
     }
 }
@@ -877,27 +837,10 @@ impl ShardWriter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<()> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        let mem_wal_index = dataset
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on the dataset this writer evolves to",
-                )
-            })?;
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(dataset, &mem_wal_index.details).await?;
-        let index_configs = build_index_configs(
-            dataset,
-            &maintained_indexes,
-            &self.config().hnsw_params,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<SealFence>> {
+        let details = require_mem_wal_details(dataset).await?;
+        let index_configs =
+            maintained_index_configs(dataset, &details, &self.config().hnsw_params).await?;
         self.evolve_schema(
             Arc::new(super::arrow_schema_with_field_ids(dataset.schema())),
             index_configs,
@@ -917,6 +860,42 @@ enum OnMissingIndex {
     /// here would refuse every read on the table for something that costs only
     /// the fresh tier's copy of one index.
     Skip,
+}
+
+/// The MemWAL index details every writer operation on `dataset` needs.
+async fn require_mem_wal_details(dataset: &Dataset) -> Result<MemWalIndexDetails> {
+    use lance_index::metrics::NoOpMetricsCollector;
+
+    let index = dataset
+        .open_mem_wal_index(&NoOpMetricsCollector)
+        .await?
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
+            )
+        })?;
+    Ok(index.details.clone())
+}
+
+/// The index configs a writer on `dataset` maintains.
+///
+/// Every path that hands a set to a writer — opening one, refreshing its set,
+/// moving it onto a new schema — derives it here, so none of them can resolve
+/// the maintained-index intent differently from the others.
+async fn maintained_index_configs(
+    dataset: &Dataset,
+    details: &MemWalIndexDetails,
+    hnsw_params: &HashMap<String, HnswBuildParams>,
+) -> Result<Vec<MemIndexConfig>> {
+    let (index_names, on_unsupported) = resolve_maintained_indexes(dataset, details).await?;
+    build_index_configs(
+        dataset,
+        &index_names,
+        hnsw_params,
+        OnMissingIndex::Skip,
+        on_unsupported,
+    )
+    .await
 }
 
 /// The indexes a MemTable should carry, and how to treat one this writer cannot

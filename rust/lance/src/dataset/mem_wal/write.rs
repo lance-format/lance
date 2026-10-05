@@ -1982,15 +1982,9 @@ impl WriterSchema {
     /// Whether a writer holding `self` would store and index exactly what one
     /// holding `other` does, so moving from one to the other changes nothing.
     fn is_equivalent(&self, other: &Self) -> bool {
-        let index_key =
-            |c: &MemIndexConfig| (c.name().to_string(), c.field_id(), c.column().to_string());
         self.storage == other.storage
             && self.logical == other.logical
-            && self
-                .index_configs
-                .iter()
-                .map(index_key)
-                .eq(other.index_configs.iter().map(index_key))
+            && same_index_set(&self.index_configs, &other.index_configs)
     }
 
     /// A fresh, cursor-bound memtable under this schema at a given generation
@@ -2221,36 +2215,6 @@ impl SharedWriterState {
                 end_batch_position,
             })
             .map_err(|_| Error::io("index apply channel closed"))
-    }
-
-    /// Rebuild the active memtable's index store from the current set.
-    ///
-    /// Only valid while the memtable holds no rows: an index store starts empty,
-    /// so rows already resident would be left out of whatever is rebuilt. The
-    /// caller holds the `state` write lock, so no write can land in between.
-    fn rebind_active_indexes(&self, state: &mut WriterState) -> Result<()> {
-        if state.memtable.batch_count() != 0 {
-            // A fresh index store starts empty, so rows already resident would
-            // be indexed nowhere. Refuse rather than serve a memtable whose
-            // index silently omits them.
-            return Err(Error::internal(format!(
-                "cannot rebind indexes on a memtable holding {} batches",
-                state.memtable.batch_count()
-            )));
-        }
-        let global_offset = state.memtable.batch_store().global_end();
-        let schema = Arc::clone(&state.schema);
-        let mut indexes = IndexStore::from_configs(
-            &schema.index_configs,
-            self.max_memtable_rows,
-            self.max_memtable_batches,
-        )?;
-        if !schema.pk_columns.is_empty() {
-            indexes.enable_pk_index(&pk_index_columns(&schema.pk_columns, &schema.pk_field_ids));
-        }
-        indexes.set_durability(Arc::clone(self.wal_flusher.cursors()), global_offset);
-        state.memtable.set_indexes_arc(Arc::new(indexes));
-        Ok(())
     }
 
     /// Freeze the current memtable and send it to the flush handler.
@@ -3854,6 +3818,85 @@ impl ShardWriter {
         }
     }
 
+    /// Hold this writer to the schema `next` derives from the one it holds,
+    /// sealing so the following memtable is built under it.
+    ///
+    /// `next` runs under the `state` write lock, against the schema the writer
+    /// actually holds, so it cannot overwrite a half some other caller changed
+    /// in between. The outgoing memtable keeps the schema and index set it was
+    /// built with and flushes as a generation of them; an empty one is replaced
+    /// rather than sealed, since it holds nothing to flush. `Ok(None)` when
+    /// nothing would change.
+    ///
+    /// `op` names the caller in the errors this raises.
+    async fn replace_writer_schema(
+        &self,
+        op: &'static str,
+        next: impl FnOnce(&WriterSchema) -> Result<WriterSchema>,
+    ) -> Result<Option<SealFence>> {
+        let WriterMode::MemTable {
+            state,
+            writer_state,
+            ..
+        } = &self.mode
+        else {
+            return Err(Error::invalid_input(format!(
+                "{op} is not available in WAL-only mode (no MemTable)"
+            )));
+        };
+        self.check_fenced().await?;
+        self.wal_flusher.check_poisoned()?;
+
+        let mut state = state.write().await;
+        let current = Arc::clone(&state.schema);
+        let next = Arc::new(next(&current)?);
+        if next.is_equivalent(&current) {
+            return Ok(None);
+        }
+        if next.pk_field_ids != current.pk_field_ids {
+            return Err(Error::invalid_input(format!(
+                "{op} cannot change the primary key: the writer holds primary key field ids \
+                 {:?} ({:?}) and the new schema declares {:?} ({:?})",
+                current.pk_field_ids, current.pk_columns, next.pk_field_ids, next.pk_columns,
+            )));
+        }
+
+        let sealed_generation = if state.memtable.batch_count() == 0 {
+            // The replacement takes the same generation and coordinate, so the
+            // swap costs no generation and the schema moves only once it is
+            // built.
+            let generation = state.memtable.generation();
+            let global_offset = state.memtable.batch_store().global_end();
+            state.memtable = next.new_memtable(
+                generation,
+                global_offset,
+                None,
+                writer_state.epoch,
+                writer_state.max_memtable_rows,
+                writer_state.max_memtable_batches,
+                self.wal_flusher.cursors(),
+            )?;
+            state.schema = next;
+            publish_memory(&writer_state.memory, &state);
+            None
+        } else {
+            let sealed = state.memtable.generation();
+            writer_state.rotate_memtable(&mut state, next)?;
+            Some(sealed)
+        };
+        info!(
+            "{op} moved shard {} (epoch {}) onto a new schema: active generation {}, sealed {:?}",
+            self.config.shard_id,
+            self.epoch,
+            state.memtable.generation(),
+            sealed_generation,
+        );
+        Ok(Some(SealFence {
+            sealed_generation,
+            watchers: state.frozen_flush_watchers.iter().cloned().collect(),
+        }))
+    }
+
     /// Hold this writer to `schema` from now on, without reopening it.
     ///
     /// A schema change on the base table — a column added, dropped, or renamed
@@ -3876,7 +3919,8 @@ impl ShardWriter {
     /// reacting to the same change seal once. An empty active memtable is
     /// replaced rather than sealed: it holds nothing to flush.
     ///
-    /// MemTable mode only.
+    /// MemTable mode only. `Ok(None)` when the schema and index set are
+    /// already current; otherwise a [`SealFence`] covering whatever was sealed.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -3893,61 +3937,11 @@ impl ShardWriter {
         &self,
         schema: Arc<ArrowSchema>,
         index_configs: Vec<MemIndexConfig>,
-    ) -> Result<()> {
-        let WriterMode::MemTable {
-            state,
-            writer_state,
-            ..
-        } = &self.mode
-        else {
-            return Err(Error::invalid_input(
-                "evolve_schema is only supported in memtable mode (enable_memtable = true)",
-            ));
-        };
-        let next = Arc::new(WriterSchema::try_new(&schema, index_configs)?);
-        self.wal_flusher.check_poisoned()?;
-
-        let mut state = state.write().await;
-        if next.pk_field_ids != state.schema.pk_field_ids {
-            return Err(Error::invalid_input(format!(
-                "evolve_schema cannot change the primary key: the writer holds primary key \
-                 field ids {:?} ({:?}) and the new schema declares {:?} ({:?})",
-                state.schema.pk_field_ids,
-                state.schema.pk_columns,
-                next.pk_field_ids,
-                next.pk_columns,
-            )));
-        }
-        if next.is_equivalent(&state.schema) {
-            return Ok(());
-        }
-
-        if state.memtable.batch_count() == 0 {
-            // Nothing was written under the old schema, so there is nothing to
-            // seal: the replacement takes the same generation and coordinate.
-            let generation = state.memtable.generation();
-            let global_offset = state.memtable.batch_store().global_offset();
-            state.memtable = next.new_memtable(
-                generation,
-                global_offset,
-                None,
-                writer_state.epoch,
-                writer_state.max_memtable_rows,
-                writer_state.max_memtable_batches,
-                self.wal_flusher.cursors(),
-            )?;
-            state.schema = next;
-            publish_memory(&writer_state.memory, &state);
-        } else {
-            writer_state.rotate_memtable(&mut state, next)?;
-        }
-        info!(
-            "Evolved ShardWriter schema for shard {} (epoch {}): active generation {}",
-            self.config.shard_id,
-            self.epoch,
-            state.memtable.generation()
-        );
-        Ok(())
+    ) -> Result<Option<SealFence>> {
+        self.replace_writer_schema("evolve_schema", |_current| {
+            WriterSchema::try_new(&schema, index_configs)
+        })
+        .await
     }
 
     /// Seal the active memtable so it's queued for L0 flush. Errors in
@@ -4022,58 +4016,18 @@ impl ShardWriter {
         &self,
         configs: Vec<MemIndexConfig>,
     ) -> Result<Option<SealFence>> {
-        match &self.mode {
-            WriterMode::MemTable {
-                state,
-                writer_state,
-                ..
-            } => {
-                // Called on a timer, so almost every call finds the set
-                // already current. Answer that from memory: it mutates
-                // nothing, so it needs neither the write lock nor the fence
-                // check, which costs a manifest read.
-                if same_index_set(&state.read().await.schema.index_configs, &configs) {
-                    return Ok(None);
-                }
-                self.check_fenced().await?;
-                self.wal_flusher.check_poisoned()?;
-                let mut state = state.write().await;
-                let previous = Arc::clone(&state.schema);
-                if same_index_set(&previous.index_configs, &configs) {
-                    return Ok(None);
-                }
-                // The next memtable is built from the stored set, so the swap
-                // precedes the seal. Restore it if the seal fails, rather than
-                // leave the writer naming indexes its memtable does not carry.
-                state.schema = Arc::new(previous.with_index_configs(configs)?);
-                let sealed = if state.memtable.batch_count() == 0 {
-                    // Nothing written yet, so rebuilding in place costs nothing
-                    // and saves a generation that would hold no rows.
-                    writer_state
-                        .rebind_active_indexes(&mut state)
-                        .map(|()| None)
-                } else {
-                    let generation = state.memtable.generation();
-                    writer_state
-                        .freeze_memtable(&mut state)
-                        .map(|_| Some(generation))
-                };
-                let sealed_generation = match sealed {
-                    Ok(sealed) => sealed,
-                    Err(error) => {
-                        state.schema = previous;
-                        return Err(error);
-                    }
-                };
-                Ok(Some(SealFence {
-                    sealed_generation,
-                    watchers: state.frozen_flush_watchers.iter().cloned().collect(),
-                }))
-            }
-            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
-                "replace_index_configs not available in WAL-only mode (no MemTable)",
-            )),
+        // Called on a timer, so almost every call finds the set already
+        // current. Answering that under the read lock skips the fence check,
+        // which costs a manifest read.
+        if let WriterMode::MemTable { state, .. } = &self.mode
+            && same_index_set(&state.read().await.schema.index_configs, &configs)
+        {
+            return Ok(None);
         }
+        self.replace_writer_schema("replace_index_configs", |current| {
+            current.with_index_configs(configs)
+        })
+        .await
     }
 
     /// Block until every frozen memtable in the L0 flush queue has
@@ -7253,6 +7207,25 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // Nothing written yet, so the active memtable is rebuilt in place and
+        // the swap costs no generation.
+        let generation = writer.active_memtable_ref().await.unwrap().generation;
+        for set in [Vec::new(), vec![id_idx.clone()]] {
+            let fence = writer
+                .replace_index_configs(set)
+                .await
+                .unwrap()
+                .expect("the set changed, so a fence is returned");
+            assert!(
+                fence.sealed_generation.is_none(),
+                "an empty memtable is not sealed"
+            );
+            assert_eq!(
+                writer.active_memtable_ref().await.unwrap().generation,
+                generation,
+            );
+        }
 
         writer
             .put(vec![create_test_batch(&schema, 0, 10)])
@@ -13020,7 +12993,12 @@ mod shard_writer_tests {
     /// `id`/`vector`/`text` table with an inverted index on `text` maintained
     /// in memory, and frozen memtables held for an hour after they flush so a
     /// read sees them as memtables rather than generations.
-    async fn evolving_writer(name: &str) -> (Dataset, super::ShardWriter, Uuid, Arc<ArrowSchema>) {
+    /// `maintained` is the set the table is initialized with; `None` maintains
+    /// every index the table has.
+    async fn evolving_writer(
+        name: &str,
+        maintained: Option<&[&str]>,
+    ) -> (Dataset, super::ShardWriter, Uuid, Arc<ArrowSchema>) {
         let vector_dim = 4;
         let schema = create_test_schema(vector_dim);
         // `shared-memory`: the flush writes a generation the test reopens by URI.
@@ -13043,12 +13021,14 @@ mod shard_writer_tests {
             )
             .await
             .unwrap();
-        dataset
-            .initialize_mem_wal()
-            .maintained_indexes(["text_fts"])
-            .execute()
-            .await
-            .unwrap();
+        let init = dataset.initialize_mem_wal();
+        match maintained {
+            Some(names) => init.maintained_indexes(names.iter().copied()),
+            None => init,
+        }
+        .execute()
+        .await
+        .unwrap();
         let shard_id = Uuid::new_v4();
         let writer = dataset
             .mem_wal_writer(
@@ -13126,7 +13106,8 @@ mod shard_writer_tests {
     async fn test_evolve_schema_seals_under_the_old_schema_and_writes_under_the_new() {
         use crate::dataset::ColumnAlteration;
 
-        let (mut dataset, writer, shard_id, schema) = evolving_writer("evolve-seal").await;
+        let (mut dataset, writer, shard_id, schema) =
+            evolving_writer("evolve-seal", Some(&["text_fts"])).await;
         writer
             .put(vec![rows_under(&schema, &[(100, "before")])])
             .await
@@ -13203,11 +13184,77 @@ mod shard_writer_tests {
         writer.close().await.unwrap();
     }
 
+    /// A table maintaining every index carries no names in the intent — they
+    /// come from the table. Deriving the writer's set from the raw field drops
+    /// every one of them the first time a schema change moves the writer.
+    #[tokio::test]
+    async fn test_evolve_to_keeps_every_index_when_the_table_maintains_all() {
+        use crate::dataset::ColumnAlteration;
+
+        let (mut dataset, writer, _, _) = evolving_writer("evolve-all", None).await;
+        assert!(
+            dataset
+                .mem_wal_index_details()
+                .await
+                .unwrap()
+                .expect("initialized")
+                .maintained_indexes
+                .is_empty(),
+            "maintaining every index carries no names"
+        );
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["text_fts".to_string()]
+        );
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("text".into()).rename("body".into())])
+            .await
+            .unwrap();
+        writer.evolve_to(&dataset).await.unwrap();
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["text_fts".to_string()],
+            "the index the table maintains survives the schema the writer moved onto"
+        );
+        writer.close().await.unwrap();
+    }
+
+    /// `replace_index_configs` owns the index half only: a schema the writer was
+    /// moved onto has to survive it.
+    #[tokio::test]
+    async fn test_replace_index_configs_keeps_the_schema_the_writer_holds() {
+        use crate::dataset::ColumnAlteration;
+
+        let (mut dataset, writer, _, schema) =
+            evolving_writer("evolve-keep-schema", Some(&["text_fts"])).await;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("text".into()).rename("body".into())])
+            .await
+            .unwrap();
+        writer.evolve_to(&dataset).await.unwrap();
+        let renamed: ArrowSchema = dataset.schema().into();
+
+        writer.replace_index_configs(Vec::new()).await.unwrap();
+        assert!(writer.maintained_index_names().await.is_empty());
+
+        writer
+            .put(vec![rows_under(&renamed, &[(200, "after")])])
+            .await
+            .expect("the evolved schema survives an index-set change");
+        writer
+            .put(vec![rows_under(&schema, &[(201, "stale")])])
+            .await
+            .expect_err("the schema the writer moved off is still refused");
+        writer.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_evolve_schema_replaces_an_empty_memtable_and_keeps_the_key() {
         use crate::dataset::ColumnAlteration;
 
-        let (mut dataset, writer, _, _) = evolving_writer("evolve-empty").await;
+        let (mut dataset, writer, _, _) =
+            evolving_writer("evolve-empty", Some(&["text_fts"])).await;
         let generation = writer.active_memtable_ref().await.unwrap().generation;
         dataset
             .alter_columns(&[ColumnAlteration::new("text".into()).rename("body".into())])
@@ -13262,7 +13309,8 @@ mod shard_writer_tests {
         use arrow_array::types::Int64Type;
         use datafusion::prelude::{col, lit};
 
-        let (mut dataset, writer, shard_id, schema) = evolving_writer("evolve-read").await;
+        let (mut dataset, writer, shard_id, schema) =
+            evolving_writer("evolve-read", Some(&["text_fts"])).await;
         writer
             .put(vec![rows_under(
                 &schema,
