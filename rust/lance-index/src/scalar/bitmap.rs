@@ -10,6 +10,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::Debug,
     ops::Bound,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -32,6 +33,7 @@ use lance_core::{
     utils::tokio::get_num_compute_intensive_cpus,
 };
 use lance_io::object_store::ObjectStore;
+use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -600,21 +602,38 @@ impl BitmapIndex {
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
         let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
-        let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
-
-        if let Some(fri) = &self.frag_reuse_index {
-            // Legacy synchronous remapping path.
-            bitmap = fri.remap_row_addrs_tree_map(&bitmap);
-        } else if let Some(remapper) = &self.batch_remapper {
-            // Tagged asynchronous path.
-            bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
-        }
+        let bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
+        let bitmap = self.remap_stored_bitmap(bitmap).await?;
 
         self.index_cache
             .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
             .await;
 
         Ok(Arc::new(bitmap))
+    }
+
+    /// Translate a bitmap as stored in the lookup file into current row
+    /// addresses, through whichever remapping this index was loaded with.
+    async fn remap_stored_bitmap(&self, bitmap: RowAddrTreeMap) -> Result<RowAddrTreeMap> {
+        if let Some(fri) = &self.frag_reuse_index {
+            // Legacy synchronous remapping path.
+            Ok(fri.remap_row_addrs_tree_map(&bitmap))
+        } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await
+        } else {
+            Ok(bitmap)
+        }
+    }
+
+    /// Whether the lookup file stores this index's values in `index_map` order,
+    /// so that a merge can read the bitmaps in one pass over the file. Index
+    /// files written before spill-based builds may be unsorted on disk.
+    fn rows_follow_key_order(&self) -> bool {
+        self.index_map
+            .values()
+            .zip(self.index_map.values().skip(1))
+            .all(|(row, next_row)| row < next_row)
     }
 
     pub(crate) fn value_type(&self) -> &DataType {
@@ -1808,6 +1827,97 @@ pub(crate) fn merge_source_entry_count(sources: &[Arc<BitmapIndex>]) -> u64 {
     sources.iter().map(|s| s.index_map.len() as u64).sum()
 }
 
+/// Rows per batch when a merge streams a source's bitmaps column. A bitmap can
+/// be a few bytes on a high-cardinality column or large on a low-cardinality
+/// one, so batches stay small; the file reader plans the underlying reads over
+/// the whole range, so the batch size does not set the request count.
+const MERGE_BITMAP_BATCH_ROWS: u64 = 1024;
+/// Batches of a source's bitmaps a merge may decode ahead of the merge itself.
+const MERGE_BITMAP_READAHEAD: u32 = 2;
+
+/// Reads one source's bitmaps for a merge in a single pass over its lookup file.
+///
+/// A merge visits every key of every source in key order. Loading each bitmap
+/// with its own range read costs one object store request per key, which on a
+/// high-cardinality column is tens of millions of sequential round trips. When
+/// the file's rows follow key order, the merge's row offsets only ever move
+/// forward, so the bitmaps can be streamed instead. Rows the merge does not
+/// ask for (the null row) are skipped. The bitmaps are not added to the index
+/// cache: each one is read exactly once.
+struct SequentialBitmapReader<'a> {
+    index: &'a BitmapIndex,
+    batches: Pin<Box<dyn RecordBatchStream>>,
+    batch: Option<BinaryArray>,
+    /// Row offset of the first row of `batch`.
+    batch_start: usize,
+    /// Row offset of the first row after `batch`.
+    batch_end: usize,
+}
+
+impl<'a> SequentialBitmapReader<'a> {
+    async fn open(index: &'a BitmapIndex) -> Result<Self> {
+        let page_lookup_file = index.lazy_reader.get().await?;
+        let num_rows = page_lookup_file.num_rows();
+        let batches = page_lookup_file
+            .read_range_stream(
+                0..num_rows,
+                Some(&["bitmaps"]),
+                MERGE_BITMAP_BATCH_ROWS,
+                MERGE_BITMAP_READAHEAD,
+            )
+            .await?;
+        Ok(Self {
+            index,
+            batches,
+            batch: None,
+            batch_start: 0,
+            batch_end: 0,
+        })
+    }
+
+    /// Read the bitmap stored at `row_offset`. Offsets must be requested in
+    /// increasing order.
+    async fn read(&mut self, row_offset: usize) -> Result<RowAddrTreeMap> {
+        if row_offset < self.batch_start {
+            return Err(Error::internal(format!(
+                "sequential bitmap read went backwards: row {row_offset} requested after the \
+                 reader passed row {}",
+                self.batch_start
+            )));
+        }
+        while row_offset >= self.batch_end {
+            let Some(batch) = self.batches.try_next().await? else {
+                return Err(Error::corrupt_file(
+                    Path::from(BITMAP_LOOKUP_NAME),
+                    format!(
+                        "bitmap lookup file ended at row {} before row {row_offset}",
+                        self.batch_end
+                    ),
+                ));
+            };
+            let bitmaps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?
+                .clone();
+            self.batch_start = self.batch_end;
+            self.batch_end += bitmaps.len();
+            self.batch = Some(bitmaps);
+        }
+        let Some(bitmaps) = self.batch.as_ref() else {
+            return Err(Error::internal(format!(
+                "no bitmap batch loaded for row {row_offset}"
+            )));
+        };
+        let bitmap = deserialize_bitmap(
+            bitmaps.value(row_offset - self.batch_start),
+            BITMAP_LOOKUP_NAME,
+        )?;
+        self.index.remap_stored_bitmap(bitmap).await
+    }
+}
+
 /// Merge loaded bitmap indexes into `writer` without materializing all source
 /// bitmap payloads at once.
 ///
@@ -1822,8 +1932,12 @@ pub(crate) fn merge_source_entry_count(sources: &[Arc<BitmapIndex>]) -> u64 {
 ///
 /// The merge's transient aggregation state is the merged bitmap for the current
 /// key plus one loaded bitmap per participating source. Each source `index_map`,
-/// any bitmaps retained by the index cache, and the output writer remain outside
-/// that state.
+/// the batches a [`SequentialBitmapReader`] buffers, any bitmaps retained by the
+/// index cache, and the output writer remain outside that state.
+///
+/// A source whose lookup file stores its rows in key order is read in one pass
+/// through a [`SequentialBitmapReader`]; only unsorted legacy files are read
+/// one key at a time.
 ///
 /// `progress` reports source entries consumed, against the total from
 /// [`merge_source_entry_count`]. Not segments: the merge is key-driven and
@@ -1872,8 +1986,20 @@ pub(crate) async fn merge_index_maps(
 
     let mut key_iters: Vec<_> = sources
         .iter()
-        .map(|source| source.index_map.keys())
+        .map(|source| source.index_map.iter())
         .collect();
+    // Row offset of the key each source is currently positioned on in `heap`.
+    let mut positions = vec![0usize; sources.len()];
+    // A source whose file rows follow key order is streamed; an unsorted legacy
+    // file falls back to one read per key.
+    let mut readers = Vec::with_capacity(sources.len());
+    for source in sources {
+        readers.push(if source.rows_follow_key_order() {
+            Some(SequentialBitmapReader::open(source).await?)
+        } else {
+            None
+        });
+    }
 
     // Every source is sorted, so the smallest key any of them is currently
     // positioned on is the next key overall. A min-heap holding one entry per
@@ -1890,7 +2016,8 @@ pub(crate) async fn merge_index_maps(
     let mut heap: BinaryHeap<Reverse<(&OrderableScalarValue, usize)>> =
         BinaryHeap::with_capacity(key_iters.len());
     for (source_idx, keys) in key_iters.iter_mut().enumerate() {
-        if let Some(key) = keys.next() {
+        if let Some((key, row_offset)) = keys.next() {
+            positions[source_idx] = *row_offset;
             heap.push(Reverse((key, source_idx)));
         }
     }
@@ -1907,8 +2034,12 @@ pub(crate) async fn merge_index_maps(
             }
             heap.pop();
             consumed += 1;
-            merged |= sources[source_idx].load_bitmap(key, None).await?.as_ref();
-            if let Some(next) = key_iters[source_idx].next() {
+            match readers[source_idx].as_mut() {
+                Some(reader) => merged |= &reader.read(positions[source_idx]).await?,
+                None => merged |= sources[source_idx].load_bitmap(key, None).await?.as_ref(),
+            }
+            if let Some((next, row_offset)) = key_iters[source_idx].next() {
+                positions[source_idx] = *row_offset;
                 heap.push(Reverse((next, source_idx)));
             }
         }
@@ -3393,6 +3524,129 @@ mod tests {
         .unwrap();
 
         assert_eq!(expected, read_bitmap_contents(dest_store.as_ref()).await);
+    }
+
+    /// A merge reads each source's bitmaps in one pass over its lookup file: a
+    /// handful of object store requests whatever the key count, instead of at
+    /// least one request per key, which on a high-cardinality column is tens of
+    /// millions of sequential round trips.
+    #[tokio::test]
+    async fn test_bitmap_segment_merge_reads_sources_sequentially() {
+        const KEYS: u64 = 2_000;
+
+        async fn build(
+            object_store: &Arc<ObjectStore>,
+            first_row: u64,
+        ) -> (TempObjDir, Arc<BitmapIndex>) {
+            let tmpdir = TempObjDir::default();
+            let store = Arc::new(LanceIndexStore::new(
+                object_store.clone(),
+                tmpdir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            let values = (0..KEYS).map(|i| Some(format!("k-{i:05}")));
+            let stream = utf8_value_stream(values, (0..KEYS).map(|i| first_row + i));
+            BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+                .await
+                .unwrap();
+            let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+            (tmpdir, index)
+        }
+
+        let object_store = Arc::new(ObjectStore::local());
+        let (_left_dir, left) = build(&object_store, 0).await;
+        let (_right_dir, right) = build(&object_store, KEYS).await;
+
+        // Baseline: loading the bitmaps one key at a time costs a request per key.
+        object_store.io_stats_incremental();
+        for key in left.index_map.keys() {
+            left.load_bitmap(key, None).await.unwrap();
+        }
+        let per_key_iops = object_store.io_stats_incremental().read_iops;
+        assert!(
+            per_key_iops >= KEYS,
+            "expected >= {KEYS} requests for per-key reads, got {per_key_iops}"
+        );
+
+        let (_dest_dir, dest_store) = test_util::index_store();
+        object_store.io_stats_incremental();
+        merge_bitmap_indices(
+            &[left, right],
+            dest_store.as_ref(),
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+        let merge_iops = object_store.io_stats_incremental().read_iops;
+        assert!(
+            merge_iops < KEYS / 100,
+            "merging two sources of {KEYS} keys issued {merge_iops} requests \
+             (per-key path: {per_key_iops} for one source)"
+        );
+
+        let expected: Vec<(Option<String>, Vec<u64>)> = (0..KEYS)
+            .map(|i| (Some(format!("k-{i:05}")), vec![i, KEYS + i]))
+            .collect();
+        assert_eq!(expected, read_bitmap_contents(dest_store.as_ref()).await);
+    }
+
+    /// A lookup file whose rows are not in key order -- how LabelList wrote them
+    /// before spill-based builds -- cannot be streamed, so the merge reads that
+    /// source one key at a time and still produces the same result.
+    #[tokio::test]
+    async fn test_bitmap_segment_merge_reads_unsorted_source_by_key() {
+        let (_unsorted_dir, unsorted_store) = test_util::index_store();
+        let mut writer =
+            new_bitmap_batch_writer(unsorted_store.as_ref(), BITMAP_LOOKUP_NAME, &DataType::Utf8)
+                .await
+                .unwrap();
+        for (key, row) in [("c", 2u64), ("a", 0), ("b", 1)] {
+            writer
+                .emit(
+                    ScalarValue::Utf8(Some(key.to_string())),
+                    &RowAddrTreeMap::from_iter([row]),
+                )
+                .await
+                .unwrap();
+        }
+        writer.finish().await.unwrap();
+        let unsorted = BitmapIndex::load(unsorted_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(!unsorted.rows_follow_key_order());
+
+        let (_sorted_dir, sorted_store) = test_util::index_store();
+        BitmapIndexPlugin::train_bitmap_index(
+            utf8_value_stream([Some("a"), Some("b"), Some("d")], [10u64, 11, 12]),
+            sorted_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let sorted = BitmapIndex::load(sorted_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(sorted.rows_follow_key_order());
+
+        let (_dest_dir, dest_store) = test_util::index_store();
+        merge_bitmap_indices(
+            &[unsorted, sorted],
+            dest_store.as_ref(),
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_bitmap_contents(dest_store.as_ref()).await,
+            vec![
+                (Some("a".to_string()), vec![0, 10]),
+                (Some("b".to_string()), vec![1, 11]),
+                (Some("c".to_string()), vec![2]),
+                (Some("d".to_string()), vec![12]),
+            ]
+        );
     }
 
     /// The keys column counts toward the flush threshold, not just the bitmaps.
