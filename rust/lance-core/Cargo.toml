@@ -65,7 +65,16 @@ name = "cache_keys"
 harness = false
 
 [[bench]]
+name = "cache_metrics_regressions"
+harness = false
+
+[[bench]]
+name = "cache_metrics_allocations"
+harness = false
+
+[[bench]]
 name = "cache_metrics_export"
 harness = false
+
 [lints]
 workspace = true
