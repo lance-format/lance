@@ -5568,11 +5568,9 @@ mod tests {
         );
     }
 
-    /// Replay used to re-derive generation boundaries from the row cap it
-    /// reopened with, so a smaller cap split the same entries into more
-    /// generations than the writer made and the recorded Blob target no longer
-    /// followed. The entry carries its generation now, so the boundary is read
-    /// rather than guessed and the cap no longer takes part.
+    /// A generation boundary is read from the entry, not derived from the row
+    /// cap, so a writer reopened under a different cap rebuilds the generations
+    /// it had — and a Blob v2 target still names one replay reaches.
     #[tokio::test]
     async fn test_replay_follows_recorded_generations_under_a_smaller_row_cap() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -5640,10 +5638,8 @@ mod tests {
             std::mem::forget(writer);
         }
 
-        // Reopened with a cap the prefix does not fit under: re-deriving would
-        // split it into more generations than the writer made, and the recorded
-        // Blob target would no longer follow. Reading the record does not depend
-        // on the cap at all.
+        // A quarter of the cap the prefix was written under: a boundary derived
+        // from the cap would fall in different places, a recorded one does not.
         let reopened = ShardWriter::open(
             store,
             base_path,
