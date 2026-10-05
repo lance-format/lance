@@ -251,6 +251,21 @@ impl GenerationRead {
     /// `scan` may produce more than was asked for (`_rowaddr`, `_tombstone`);
     /// those pass through untouched, as does anything the generation has that
     /// the table does not.
+    /// [`Self::reconcile`], then the predicate the stored schema could not
+    /// answer — a column it does not have, which only resolves once its rows
+    /// carry the table's names.
+    pub(super) fn reconcile_above(
+        &self,
+        scan: Arc<dyn ExecutionPlan>,
+        above: &Option<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let reconciled = self.reconcile(scan)?;
+        match above {
+            Some(expr) => filter_above(reconciled, expr),
+            None => Ok(reconciled),
+        }
+    }
+
     pub(super) fn reconcile(&self, scan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         let source =
             self.with_only_table_field_ids(with_ids_from(&scan.schema(), &self.stored_schema));
@@ -349,10 +364,7 @@ pub(super) fn memtable_matches_table(memtable_schema: &Schema, table_schema: &Sc
 
 /// Run `expr` above `plan`, for a predicate that could not be pushed into the
 /// generation's own scan.
-pub(super) fn filter_above(
-    plan: Arc<dyn ExecutionPlan>,
-    expr: &Expr,
-) -> Result<Arc<dyn ExecutionPlan>> {
+fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = plan.schema();
     let df_schema = DFSchema::try_from(schema.as_ref().clone())
         .map_err(|e| Error::internal(format!("build a filter schema for `{expr}`: {e}")))?;

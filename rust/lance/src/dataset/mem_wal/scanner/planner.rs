@@ -18,7 +18,7 @@ use crate::dataset::mem_wal::TOMBSTONE;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
-use super::generation_read::{GenerationRead, filter_above, memtable_matches_table};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -425,11 +425,7 @@ impl LsmScanPlanner {
                 // generation's own planning nests deeply enough that leaving
                 // this future inlined pushes the `Send` proof past rustc's
                 // recursion limit for callers stacked above it.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -496,11 +492,7 @@ impl LsmScanPlanner {
                 }
                 let deduped =
                     Box::pin(scanner.create_dedup_plan(&generation.stored_pk_columns()?)).await?;
-                let reconciled = generation.reconcile(deduped)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(deduped, &above)
             }
         }
     }

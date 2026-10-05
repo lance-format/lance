@@ -58,7 +58,7 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
-use super::generation_read::{GenerationRead, filter_above, memtable_matches_table};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
 };
@@ -1244,11 +1244,7 @@ impl LsmFtsSearchPlanner {
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -1376,11 +1372,7 @@ impl LsmFtsSearchPlanner {
                     None => bound_query.limit(None),
                 };
                 scanner.full_text_search(bound_query)?;
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
         }
     }
