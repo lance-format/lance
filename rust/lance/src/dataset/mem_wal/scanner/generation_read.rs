@@ -21,7 +21,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
 use datafusion_physical_expr::create_physical_expr;
-use lance_core::datatypes::format_field_path;
+use lance_core::datatypes::format_field_path_minimal;
 use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
@@ -423,8 +423,12 @@ fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String
 fn field_paths(schema: &Schema) -> Vec<(Option<i32>, String)> {
     fn walk(field: &Field, prefix: &mut Vec<String>, out: &mut Vec<(Option<i32>, String)>) {
         prefix.push(field.name().clone());
+        // The minimal form, not the SQL-expression one: a caller asks for a
+        // column under the name its index metadata and its projection use, and
+        // SQL quoting would wrap anything with a hyphen in backticks and stop
+        // matching either.
         let segments: Vec<&str> = prefix.iter().map(String::as_str).collect();
-        out.push((field_id_of(field), format_field_path(&segments)));
+        out.push((field_id_of(field), format_field_path_minimal(&segments)));
         match field.data_type() {
             DataType::Struct(children) => {
                 for child in children {
