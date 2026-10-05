@@ -443,6 +443,8 @@ fn prune_to_selected(field: &Field, selected: &[Vec<String>]) -> Option<Field> {
     if selected.iter().any(|path| path.is_empty()) {
         return Some(field.clone());
     }
+    // Only a struct is pruned: a selection reaching into a list or map element
+    // takes the container whole, which is wider than asked for and never wrong.
     let DataType::Struct(children) = field.data_type() else {
         return Some(field.clone());
     };
@@ -458,6 +460,21 @@ fn prune_to_selected(field: &Field, selected: &[Vec<String>]) -> Option<Field> {
         })
         .collect();
     (!kept.is_empty()).then(|| field.clone().with_data_type(DataType::Struct(kept.into())))
+}
+
+/// The fields nested inside `data_type`, each one carrying an id of its own.
+///
+/// The same shape `arrow_schema_with_field_ids` stamps and `with_ids_from`
+/// restores, so a path exists for every field that has an id.
+fn nested_children(data_type: &DataType) -> Vec<&Arc<Field>> {
+    match data_type {
+        DataType::Struct(children) => children.iter().collect(),
+        DataType::List(element)
+        | DataType::LargeList(element)
+        | DataType::FixedSizeList(element, _)
+        | DataType::Map(element, _) => vec![element],
+        _ => Vec::new(),
+    }
 }
 
 /// Every field the schema stores, as the lance id stamped on it and the dotted
@@ -482,15 +499,8 @@ fn field_paths(schema: &Schema) -> Vec<(Option<i32>, String)> {
         // matching either.
         let segments: Vec<&str> = prefix.iter().map(String::as_str).collect();
         out.push((field_id_of(field), format_field_path_minimal(&segments)));
-        match field.data_type() {
-            DataType::Struct(children) => {
-                for child in children {
-                    walk(child, prefix, out);
-                }
-            }
-            DataType::List(element) | DataType::LargeList(element) => walk(element, prefix, out),
-            DataType::FixedSizeList(element, _) => walk(element, prefix, out),
-            _ => {}
+        for child in nested_children(field.data_type()) {
+            walk(child, prefix, out);
         }
         prefix.pop();
     }
