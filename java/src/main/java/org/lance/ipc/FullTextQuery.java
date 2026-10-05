@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.DocumentGranularity;
+
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
@@ -21,13 +23,20 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-/** Base type for full text search queries used by Lance scanner. */
+/**
+ * Base type for full text search queries used by Lance scanner.
+ *
+ * <p>Match and phrase overloads without a {@link DocumentGranularity} infer the unique indexed
+ * granularity for the field. They use row documents when no index exists and fail as ambiguous when
+ * row and list-element indexes coexist.
+ */
 public abstract class FullTextQuery {
   public enum Type {
     MATCH,
     MATCH_PHRASE,
     BOOST,
     MULTI_MATCH,
+    COMBINED_FIELDS,
     BOOLEAN
   }
 
@@ -37,8 +46,11 @@ public abstract class FullTextQuery {
   }
 
   public enum Occur {
+    /** The clause may match and contributes its score when it does. */
     SHOULD,
+    /** The clause must match and contributes its score. */
     MUST,
+    /** The clause must not match and never contributes to the score. */
     MUST_NOT
   }
 
@@ -63,7 +75,14 @@ public abstract class FullTextQuery {
   public abstract Type getType();
 
   public static FullTextQuery match(String queryText, String column) {
-    return match(queryText, column, 1.0f, Optional.empty(), 50, Operator.OR, 0);
+    return new MatchQuery(
+        queryText, column, 1.0f, Optional.empty(), 50, Operator.OR, 0, Optional.empty());
+  }
+
+  public static FullTextQuery match(
+      String queryText, String column, DocumentGranularity documentGranularity) {
+    return match(
+        queryText, column, 1.0f, Optional.empty(), 50, Operator.OR, 0, documentGranularity);
   }
 
   public static FullTextQuery match(
@@ -75,15 +94,58 @@ public abstract class FullTextQuery {
       Operator operator,
       int prefixLength) {
     return new MatchQuery(
-        queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
+        queryText,
+        column,
+        boost,
+        fuzziness,
+        maxExpansions,
+        operator,
+        prefixLength,
+        Optional.empty());
+  }
+
+  public static FullTextQuery match(
+      String queryText,
+      String column,
+      float boost,
+      Optional<Integer> fuzziness,
+      int maxExpansions,
+      Operator operator,
+      int prefixLength,
+      DocumentGranularity documentGranularity) {
+    return new MatchQuery(
+        queryText,
+        column,
+        boost,
+        fuzziness,
+        maxExpansions,
+        operator,
+        prefixLength,
+        Optional.of(
+            Objects.requireNonNull(documentGranularity, "documentGranularity must not be null")));
   }
 
   public static FullTextQuery phrase(String queryText, String column) {
-    return phrase(queryText, column, 0);
+    return new PhraseQuery(queryText, column, 0, Optional.empty());
+  }
+
+  public static FullTextQuery phrase(
+      String queryText, String column, DocumentGranularity documentGranularity) {
+    return phrase(queryText, column, 0, documentGranularity);
   }
 
   public static FullTextQuery phrase(String queryText, String column, int slop) {
-    return new PhraseQuery(queryText, column, slop);
+    return new PhraseQuery(queryText, column, slop, Optional.empty());
+  }
+
+  public static FullTextQuery phrase(
+      String queryText, String column, int slop, DocumentGranularity documentGranularity) {
+    return new PhraseQuery(
+        queryText,
+        column,
+        slop,
+        Optional.of(
+            Objects.requireNonNull(documentGranularity, "documentGranularity must not be null")));
   }
 
   public static FullTextQuery multiMatch(String queryText, List<String> columns) {
@@ -93,6 +155,15 @@ public abstract class FullTextQuery {
   public static FullTextQuery multiMatch(
       String queryText, List<String> columns, List<Float> boosts, Operator operator) {
     return new MultiMatchQuery(queryText, columns, boosts, operator);
+  }
+
+  public static FullTextQuery combinedFields(String queryText, List<String> columns) {
+    return combinedFields(queryText, columns, null, Operator.OR);
+  }
+
+  public static FullTextQuery combinedFields(
+      String queryText, List<String> columns, List<Float> boosts, Operator operator) {
+    return new CombinedFieldsQuery(queryText, columns, boosts, operator);
   }
 
   public static FullTextQuery boost(FullTextQuery positive, FullTextQuery negative) {
@@ -117,6 +188,7 @@ public abstract class FullTextQuery {
     private final int maxExpansions;
     private final Operator operator;
     private final int prefixLength;
+    private final Optional<DocumentGranularity> documentGranularity;
 
     MatchQuery(
         String queryText,
@@ -125,7 +197,8 @@ public abstract class FullTextQuery {
         Optional<Integer> fuzziness,
         int maxExpansions,
         Operator operator,
-        int prefixLength) {
+        int prefixLength,
+        Optional<DocumentGranularity> documentGranularity) {
       Preconditions.checkArgument(
           queryText != null && !queryText.isEmpty(), "queryText must not be null or empty");
       Preconditions.checkArgument(
@@ -140,6 +213,7 @@ public abstract class FullTextQuery {
       this.maxExpansions = maxExpansions;
       this.operator = operator == null ? Operator.OR : operator;
       this.prefixLength = prefixLength;
+      this.documentGranularity = Objects.requireNonNull(documentGranularity);
     }
 
     @Override
@@ -175,6 +249,11 @@ public abstract class FullTextQuery {
       return prefixLength;
     }
 
+    /** Returns the explicit granularity, or empty when query planning should infer it. */
+    public Optional<DocumentGranularity> getDocumentGranularity() {
+      return documentGranularity;
+    }
+
     @Override
     public boolean equals(Object o) {
       if (this == o) return true;
@@ -184,6 +263,7 @@ public abstract class FullTextQuery {
           && maxExpansions == other.maxExpansions
           && prefixLength == other.prefixLength
           && operator == other.operator
+          && Objects.equals(documentGranularity, other.documentGranularity)
           && Objects.equals(queryText, other.queryText)
           && Objects.equals(column, other.column)
           && Objects.equals(fuzziness, other.fuzziness);
@@ -192,7 +272,14 @@ public abstract class FullTextQuery {
     @Override
     public int hashCode() {
       return Objects.hash(
-          queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
+          queryText,
+          column,
+          boost,
+          fuzziness,
+          maxExpansions,
+          operator,
+          prefixLength,
+          documentGranularity);
     }
 
     @Override
@@ -206,6 +293,7 @@ public abstract class FullTextQuery {
           .add("maxExpansions", maxExpansions)
           .add("operator", operator)
           .add("prefixLength", prefixLength)
+          .add("documentGranularity", documentGranularity)
           .toString();
     }
   }
@@ -215,8 +303,13 @@ public abstract class FullTextQuery {
     private final String queryText;
     private final String column;
     private final int slop;
+    private final Optional<DocumentGranularity> documentGranularity;
 
-    PhraseQuery(String queryText, String column, int slop) {
+    PhraseQuery(
+        String queryText,
+        String column,
+        int slop,
+        Optional<DocumentGranularity> documentGranularity) {
       Preconditions.checkArgument(
           queryText != null && !queryText.isEmpty(), "queryText must not be null or empty");
       Preconditions.checkArgument(
@@ -226,6 +319,7 @@ public abstract class FullTextQuery {
       this.queryText = queryText;
       this.column = column;
       this.slop = slop;
+      this.documentGranularity = Objects.requireNonNull(documentGranularity);
     }
 
     @Override
@@ -245,19 +339,25 @@ public abstract class FullTextQuery {
       return slop;
     }
 
+    /** Returns the explicit granularity, or empty when query planning should infer it. */
+    public Optional<DocumentGranularity> getDocumentGranularity() {
+      return documentGranularity;
+    }
+
     @Override
     public boolean equals(Object o) {
       if (this == o) return true;
       if (!(o instanceof PhraseQuery)) return false;
       PhraseQuery other = (PhraseQuery) o;
       return slop == other.slop
+          && Objects.equals(documentGranularity, other.documentGranularity)
           && Objects.equals(queryText, other.queryText)
           && Objects.equals(column, other.column);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(queryText, column, slop);
+      return Objects.hash(queryText, column, slop, documentGranularity);
     }
 
     @Override
@@ -267,6 +367,7 @@ public abstract class FullTextQuery {
           .add("queryText", queryText)
           .add("column", column)
           .add("slop", slop)
+          .add("documentGranularity", documentGranularity)
           .toString();
     }
   }
@@ -317,6 +418,102 @@ public abstract class FullTextQuery {
       if (this == o) return true;
       if (!(o instanceof MultiMatchQuery)) return false;
       MultiMatchQuery other = (MultiMatchQuery) o;
+      return operator == other.operator
+          && Objects.equals(queryText, other.queryText)
+          && Objects.equals(columns, other.columns)
+          && Objects.equals(boosts, other.boosts);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(queryText, columns, operator, boosts);
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this)
+          .add("type", getType())
+          .add("queryText", queryText)
+          .add("columns", columns)
+          .add("boosts", boosts)
+          .add("operator", operator)
+          .toString();
+    }
+  }
+
+  /**
+   * Combined-fields (BM25F) query across multiple columns.
+   *
+   * <p>Unlike {@link MultiMatchQuery}, which scores each column independently and keeps the best
+   * field, this query treats the target columns as a single virtual field so that term statistics
+   * are blended across fields (Lucene {@code CombinedFieldQuery}). A term that is rare in one field
+   * but common in another then scores consistently, and a single query term can match across fields
+   * (for example a first name in one column and a last name in another).
+   *
+   * <p>Target columns must be unique and share the same tokenizer/index configuration. When {@code
+   * boosts} is given, its length must equal the number of columns and each per-column weight must
+   * be a finite value in {@code [1, 2^20]} (fractional weights allowed); when {@code null}, every
+   * column defaults to {@code 1.0}. A {@code null} operator defaults to {@link Operator#OR}. These
+   * constraints are validated in the Rust core and surface as an {@link IllegalArgumentException}
+   * from {@code Dataset.newScan}, which builds the query when the scanner is created.
+   *
+   * <p>At least one target column needs an FTS index. Columns without an index, and rows added
+   * since the last index build, are read from the data and scored together with the indexed rows.
+   *
+   * <p>BM25F adds up each column's contribution for a whole row, so a column indexed only with
+   * {@link DocumentGranularity#LIST_ELEMENT} granularity is rejected, because its element
+   * coordinates have no counterpart in the other columns. A column that has both indexes uses the
+   * row one.
+   */
+  public static final class CombinedFieldsQuery extends FullTextQuery {
+    private final String queryText;
+    private final List<String> columns;
+    private final Optional<List<Float>> boosts;
+    private final Operator operator;
+
+    CombinedFieldsQuery(
+        String queryText, List<String> columns, List<Float> boosts, Operator operator) {
+      Preconditions.checkArgument(
+          queryText != null && !queryText.isEmpty(), "queryText must not be null or empty");
+      Preconditions.checkArgument(
+          columns != null && !columns.isEmpty(), "columns must not be null or empty");
+
+      this.queryText = queryText;
+      this.columns =
+          Collections.unmodifiableList(new java.util.ArrayList<>(Objects.requireNonNull(columns)));
+      this.boosts =
+          boosts == null
+              ? Optional.empty()
+              : Optional.of(Collections.unmodifiableList(new java.util.ArrayList<>(boosts)));
+      this.operator = operator == null ? Operator.OR : operator;
+    }
+
+    @Override
+    public Type getType() {
+      return Type.COMBINED_FIELDS;
+    }
+
+    public String getQueryText() {
+      return queryText;
+    }
+
+    public List<String> getColumns() {
+      return columns;
+    }
+
+    public Optional<List<Float>> getBoosts() {
+      return boosts;
+    }
+
+    public Operator getOperator() {
+      return operator;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof CombinedFieldsQuery)) return false;
+      CombinedFieldsQuery other = (CombinedFieldsQuery) o;
       return operator == other.operator
           && Objects.equals(queryText, other.queryText)
           && Objects.equals(columns, other.columns)

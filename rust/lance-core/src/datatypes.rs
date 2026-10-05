@@ -18,13 +18,13 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+    BlobVersion, Encoding, Field, LANCE_FIELD_ID_KEY, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
     LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
-    escape_field_path_for_project, format_field_path, parse_field_path,
+    escape_field_path_for_project, format_field_path, format_field_path_minimal, parse_field_path,
     validate_fixed_size_list_dimensions,
 };
 
@@ -48,6 +48,84 @@ pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
+/// The minimal logical blob v2 fields accepted from writers.
+///
+/// Logical values may also use [`BLOB_V2_LOGICAL_FIELDS`] when an external
+/// object range is present.
+pub static BLOB_V2_LOGICAL_MINIMAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+    ])
+});
+
+/// The complete logical blob v2 fields used for writer input and rewrite output.
+///
+/// `position` and `size` are an optional range within the external object named
+/// by `uri`; when present, `size` must be greater than zero. Every non-null row
+/// must set exactly one of `data` and `uri`. These fields do not describe
+/// Lance-managed data, packed, or dedicated storage.
+pub static BLOB_V2_LOGICAL_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    let mut fields = BLOB_V2_LOGICAL_MINIMAL_FIELDS
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.extend([
+        Arc::new(ArrowField::new("position", DataType::UInt64, true)),
+        Arc::new(ArrowField::new("size", DataType::UInt64, true)),
+    ]);
+    Fields::from(fields)
+});
+
+/// The complete logical blob v2 struct type.
+pub static BLOB_V2_LOGICAL_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()));
+
+/// Writer-prepared blob v2 fields consumed by the structural encoder.
+///
+/// The populated fields depend on [`BlobKind`]:
+///
+/// - [`BlobKind::Inline`] carries `data`; the encoder derives the stored
+///   `position` and `size` from the out-of-line buffer it creates.
+/// - [`BlobKind::Packed`] carries `blob_id`, `position`, and `blob_size`.
+/// - [`BlobKind::Dedicated`] carries `blob_id` and `blob_size`; its stored
+///   `position` is zero.
+/// - [`BlobKind::External`] carries `uri`, optional `blob_id`, `position`, and
+///   `blob_size`. A zero `blob_size` is resolved to the complete external object
+///   length when read.
+///
+/// `blob_size` is distinct from the logical `size`, which is only an optional
+/// external-object range before preparation. For external blobs, `uri` is
+/// normalized into the stable stored `blob_uri` field.
+pub static BLOB_V2_PREPARED_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("kind", DataType::UInt8, true),
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("blob_id", DataType::UInt32, true),
+        ArrowField::new("blob_size", DataType::UInt64, true),
+        ArrowField::new("position", DataType::UInt64, true),
+    ])
+});
+
+/// The writer-prepared blob v2 struct type.
+pub static BLOB_V2_PREPARED_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_PREPARED_FIELDS.clone()));
+
+/// Stored blob v2 descriptor fields.
+///
+/// These field names are part of the stable file format. Their meaning depends
+/// on `kind`:
+///
+/// - [`BlobKind::Inline`]: `position` and `size` locate an out-of-line buffer in
+///   the Lance data file.
+/// - [`BlobKind::Packed`]: `blob_id` identifies a shared packed blob file, and
+///   `position` and `size` locate a range within it.
+/// - [`BlobKind::Dedicated`]: `blob_id` identifies a dedicated raw blob file,
+///   `position` is zero, and `size` is the complete file length.
+/// - [`BlobKind::External`]: `blob_uri` and `blob_id` identify the object, while
+///   `position` and `size` select a range. A zero `size` is resolved to the
+///   object's complete length when read.
 pub static BLOB_V2_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
         ArrowField::new("kind", DataType::UInt8, false),
@@ -71,25 +149,95 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
-/// Blob v2 user-view struct fields used by internal rewrite paths.
-///
-/// This schema converts the descriptor view back into the write-side view used
-/// by blob compaction.
-pub static BLOB_V2_USER_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
-    Fields::from(vec![
-        ArrowField::new("data", DataType::LargeBinary, true),
-        ArrowField::new("uri", DataType::Utf8, true),
-        ArrowField::new("position", DataType::UInt64, true),
-        ArrowField::new("size", DataType::UInt64, true),
-    ])
-});
+/// The in-memory representation of a blob v2 struct.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobV2Layout {
+    /// Writer input or rewrite output.
+    ///
+    /// Both the minimal `data, uri` fields and the complete
+    /// `data, uri, position, size` fields have this layout.
+    Logical,
+    /// Kind-aware writer intermediate consumed by the structural encoder.
+    Prepared,
+    /// Stable descriptor stored in Lance files and returned by descriptor scans.
+    Descriptor,
+}
 
-/// Blob v2 user-view struct type used by internal rewrite paths.
-///
-/// This schema converts the descriptor view back into the write-side view used
-/// by blob compaction.
-pub static BLOB_V2_USER_TYPE: LazyLock<DataType> =
-    LazyLock::new(|| DataType::Struct(BLOB_V2_USER_FIELDS.clone()));
+impl BlobV2Layout {
+    /// Classify blob v2 child fields by name, type, order, and layout-specific
+    /// nullability requirements.
+    ///
+    /// Child metadata is not part of the representation. The complete logical
+    /// layout also accepts non-nullable `position` and `size` fields, matching
+    /// the existing writer-input contract. Descriptor child nullability is
+    /// ignored because it changed across released schemas; row nullness has
+    /// been represented by either parent struct validity or a nullable `kind`
+    /// child.
+    pub fn classify(fields: &Fields) -> Option<Self> {
+        if logical_blob_v2_fields_match(fields) {
+            Some(Self::Logical)
+        } else if blob_v2_fields_match(fields, &BLOB_V2_PREPARED_FIELDS, true) {
+            Some(Self::Prepared)
+        } else if blob_v2_fields_match(fields, &BLOB_V2_DESC_FIELDS, false) {
+            Some(Self::Descriptor)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for BlobV2Layout {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Logical => write!(f, "logical"),
+            Self::Prepared => write!(f, "prepared"),
+            Self::Descriptor => write!(f, "descriptor"),
+        }
+    }
+}
+
+fn blob_v2_field_matches(
+    actual: &ArrowField,
+    expected: &ArrowField,
+    compare_nullability: bool,
+) -> bool {
+    actual.name() == expected.name()
+        && actual.data_type() == expected.data_type()
+        && (!compare_nullability || actual.is_nullable() == expected.is_nullable())
+}
+
+fn blob_v2_fields_match(actual: &Fields, expected: &Fields, compare_nullability: bool) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| {
+                blob_v2_field_matches(actual.as_ref(), expected.as_ref(), compare_nullability)
+            })
+}
+
+fn logical_blob_v2_fields_match(fields: &Fields) -> bool {
+    if blob_v2_fields_match(fields, &BLOB_V2_LOGICAL_MINIMAL_FIELDS, true) {
+        return true;
+    }
+    fields.len() == BLOB_V2_LOGICAL_FIELDS.len()
+        && fields
+            .iter()
+            .zip(BLOB_V2_LOGICAL_FIELDS.iter())
+            .enumerate()
+            .all(|(index, (actual, expected))| {
+                blob_v2_field_matches(actual.as_ref(), expected.as_ref(), index < 2)
+            })
+}
+
+/// Deprecated name for [`BLOB_V2_LOGICAL_FIELDS`].
+#[deprecated(note = "use BLOB_V2_LOGICAL_FIELDS")]
+pub use self::BLOB_V2_LOGICAL_FIELDS as BLOB_V2_USER_FIELDS;
+
+/// Deprecated name for [`BLOB_V2_LOGICAL_TYPE`].
+#[deprecated(note = "use BLOB_V2_LOGICAL_TYPE")]
+pub use self::BLOB_V2_LOGICAL_TYPE as BLOB_V2_USER_TYPE;
 
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
@@ -204,13 +352,21 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Duration(tu) => format!("duration:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
             DataType::Dictionary(key_type, value_type) => {
-                format!(
-                    "dict:{}:{}:{}",
-                    Self::try_from(value_type.as_ref())?.0,
-                    Self::try_from(key_type.as_ref())?.0,
-                    // Arrow C++ Dictionary has "ordered:bool" field, but it does not exist in `arrow-rs`.
-                    false
-                )
+                let value_logical = Self::try_from(value_type.as_ref())?.0;
+                let index_logical = Self::try_from(key_type.as_ref())?.0;
+                let logical_type = format!("dict:{value_logical}:{index_logical}:false");
+                // `dict:{value}:{index}:false` inlines both component strings, but
+                // the parser splits on ':', requires exactly four segments, and
+                // resolves only leaf types - so a component carrying ':' of its own
+                // (decimal, timestamp, ...) or a struct/list value composes a string
+                // it can never parse back. `Field::data_type` unwraps that parse, so
+                // without this check `Schema::try_from` panics instead of erroring.
+                if DataType::try_from(&Self::from(logical_type.as_str())).is_err() {
+                    return Err(Error::schema(format!(
+                        "Cannot encode dictionary type {dt:?}: the logical type \"{logical_type}\" does not parse back"
+                    )));
+                }
+                logical_type
             }
             DataType::List(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
@@ -381,14 +537,17 @@ impl TryFrom<&LogicalType> for DataType {
                     }
                 }
                 "timestamp" => {
-                    if splits.len() != 3 {
+                    if splits.len() < 3 {
                         Err(Error::schema(format!("Unsupported timestamp type: {}", lt)))
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
-                        let tz: Option<Arc<str>> = if splits[2] == "-" {
+                        // A fixed-offset timezone such as "+08:00" contains a colon, so the
+                        // trailing segments must be rejoined instead of read as a single one.
+                        let tz_str = splits[2..].join(":");
+                        let tz: Option<Arc<str>> = if tz_str == "-" {
                             None
                         } else {
-                            Some(splits[2].into())
+                            Some(tz_str.into())
                         };
                         Ok(Timestamp(timeunit, tz))
                     }
@@ -419,8 +578,15 @@ impl DeepSizeOf for Dictionary {
 
 impl PartialEq for Dictionary {
     fn eq(&self, other: &Self) -> bool {
+        // Compare the values when both sides have them: the write path leaves
+        // offset/length at 0 until the dictionary is persisted, so one append
+        // can legitimately hold the same dictionary at two positions.
+        // `From<&pb::Dictionary>` yields no values at all, and comparing only
+        // the values made that case non-reflexive, so there offset and length
+        // stand in for the content.
         match (&self.values, &other.values) {
             (Some(a), Some(b)) => a == b,
+            (None, None) => self.offset == other.offset && self.length == other.length,
             _ => false,
         }
     }
@@ -460,5 +626,360 @@ impl TryFrom<u8> for BlobKind {
                 format!("Unknown blob kind {other:?}").into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::Schema as ArrowSchema;
+    use rstest::rstest;
+
+    fn dict(offset: usize, length: usize, values: Option<Vec<&str>>) -> Dictionary {
+        Dictionary {
+            offset,
+            length,
+            values: values.map(|v| Arc::new(arrow_array::StringArray::from(v)) as ArrayRef),
+        }
+    }
+
+    /// The manifest schema stores a dictionary as offset/length with no attached
+    /// values, so equality has to be reflexive over value-less dictionaries and
+    /// still separate different positions. `set_dictionary_values` leaves
+    /// offset/length at 0 until the dictionary is persisted, so for an in-memory
+    /// pair the values array is all there is to compare.
+    #[rstest]
+    #[case::reflexive_default(Dictionary::default(), Dictionary::default(), true)]
+    #[case::same_position_no_values(dict(4, 2, None), dict(4, 2, None), true)]
+    #[case::different_offset(dict(4, 2, None), dict(8, 2, None), false)]
+    #[case::different_length(dict(4, 2, None), dict(4, 3, None), false)]
+    #[case::same_values(dict(0, 0, Some(vec!["a", "b"])), dict(0, 0, Some(vec!["a", "b"])), true)]
+    #[case::different_values(dict(0, 0, Some(vec!["a", "b"])), dict(0, 0, Some(vec!["a", "c"])), false)]
+    #[case::values_on_one_side_only(dict(4, 2, Some(vec!["a", "b"])), dict(4, 2, None), false)]
+    // One side of a V1 append holds the incoming dictionary at 0/0 and the other
+    // holds the persisted one at its real position, so equal values must win
+    // over the differing offsets.
+    #[case::same_values_different_offset(
+        dict(0, 0, Some(vec!["a", "b"])),
+        dict(8, 2, Some(vec!["a", "b"])),
+        true
+    )]
+    fn test_dictionary_partial_eq_contract(
+        #[case] left: Dictionary,
+        #[case] right: Dictionary,
+        #[case] is_equal: bool,
+    ) {
+        assert_eq!(left == right, is_equal, "{left:?} vs {right:?}");
+        assert_eq!(right == left, is_equal, "equality must be symmetric");
+    }
+
+    /// `From<&pb::Dictionary>` restores offset and length with no values, so two
+    /// schemas read back from a manifest have to compare equal. Otherwise merge
+    /// validation reports a phantom dictionary change for every such field.
+    #[test]
+    fn test_manifest_derived_dictionary_schemas_compare_equal() {
+        let arrow = ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )]);
+        let mut left = Schema::try_from(&arrow).unwrap();
+        left.fields[0].dictionary = Some(dict(12, 2, None));
+        let right = left.clone();
+
+        assert_eq!(left, right);
+        let compare_dictionary = SchemaCompareOptions {
+            compare_dictionary: true,
+            ..Default::default()
+        };
+        assert!(left.compare_with_options(&right, &compare_dictionary));
+        assert_eq!(left.explain_difference(&right, &compare_dictionary), None);
+    }
+
+    #[test]
+    fn test_classify_blob_v2_layouts() {
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_LOGICAL_MINIMAL_FIELDS),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_LOGICAL_FIELDS),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_PREPARED_FIELDS),
+            Some(BlobV2Layout::Prepared)
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&BLOB_V2_DESC_FIELDS),
+            Some(BlobV2Layout::Descriptor)
+        );
+    }
+
+    #[test]
+    fn test_classify_blob_v2_layout_uses_structural_contract() {
+        let logical_with_required_range = Fields::from(vec![
+            ArrowField::new("data", DataType::LargeBinary, true),
+            ArrowField::new("uri", DataType::Utf8, true),
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt64, false),
+        ]);
+        assert_eq!(
+            BlobV2Layout::classify(&logical_with_required_range),
+            Some(BlobV2Layout::Logical)
+        );
+
+        let prepared_with_child_metadata =
+            Fields::from(
+                BLOB_V2_PREPARED_FIELDS
+                    .iter()
+                    .map(|field| {
+                        Arc::new(field.as_ref().clone().with_metadata(HashMap::from([(
+                            "source".to_string(),
+                            "test".to_string(),
+                        )])))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        assert_eq!(
+            BlobV2Layout::classify(&prepared_with_child_metadata),
+            Some(BlobV2Layout::Prepared)
+        );
+
+        let nullable_descriptor = Fields::from(
+            BLOB_V2_DESC_FIELDS
+                .iter()
+                .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&nullable_descriptor),
+            Some(BlobV2Layout::Descriptor)
+        );
+
+        let malformed_descriptor = Fields::from(vec![
+            ArrowField::new("kind", DataType::UInt8, false),
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt32, false),
+            ArrowField::new("blob_id", DataType::UInt32, false),
+            ArrowField::new("blob_uri", DataType::Utf8, false),
+        ]);
+        assert_eq!(BlobV2Layout::classify(&malformed_descriptor), None);
+    }
+
+    /// The `timestamp:<unit>:<timezone>` encoding embeds the timezone verbatim, so a
+    /// fixed-offset zone such as `+08:00` contributes a colon of its own. Round-tripping
+    /// every timezone shape guards the parser against splitting on that colon.
+    #[rstest]
+    #[case::second_no_timezone(TimeUnit::Second, None)]
+    #[case::millisecond_no_timezone(TimeUnit::Millisecond, None)]
+    #[case::microsecond_no_timezone(TimeUnit::Microsecond, None)]
+    #[case::nanosecond_no_timezone(TimeUnit::Nanosecond, None)]
+    #[case::named_utc(TimeUnit::Microsecond, Some("UTC"))]
+    #[case::named_region(TimeUnit::Nanosecond, Some("America/Los_Angeles"))]
+    #[case::offset_without_colon(TimeUnit::Microsecond, Some("+0800"))]
+    #[case::offset_positive(TimeUnit::Microsecond, Some("+08:00"))]
+    #[case::offset_negative(TimeUnit::Millisecond, Some("-05:00"))]
+    #[case::offset_half_hour(TimeUnit::Nanosecond, Some("+05:30"))]
+    #[case::offset_zero(TimeUnit::Second, Some("+00:00"))]
+    fn test_timestamp_logical_type_round_trip(
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+    ) {
+        let data_type = DataType::Timestamp(timeunit, timezone.map(Arc::from));
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(
+            DataType::try_from(&logical_type).unwrap(),
+            data_type,
+            "logical type: {logical_type}"
+        );
+    }
+
+    /// The `dict:{value}:{index}:false` encoding inlines both component logical
+    /// strings, but the parser splits on ':' and requires exactly four segments.
+    /// These value types keep the count at four, so they must keep working.
+    #[rstest]
+    #[case::string(DataType::Utf8, DataType::Utf8)]
+    #[case::large_string(DataType::LargeUtf8, DataType::LargeUtf8)]
+    #[case::binary(DataType::Binary, DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary, DataType::LargeBinary)]
+    #[case::int32(DataType::Int32, DataType::Int32)]
+    #[case::double(DataType::Float64, DataType::Float64)]
+    // The View variants share the `string` and `binary` logical types, so they
+    // parse back as their non-View counterparts. That normalization is why the
+    // encoder checks whether the composed string parses, not whether it round
+    // trips to the same `DataType`.
+    #[case::utf8_view(DataType::Utf8View, DataType::Utf8)]
+    #[case::binary_view(DataType::BinaryView, DataType::Binary)]
+    fn test_dictionary_logical_type_round_trip(
+        #[case] value_type: DataType,
+        #[case] parsed_value_type: DataType,
+    ) {
+        let key = Box::new(DataType::UInt8);
+        let logical_type =
+            LogicalType::try_from(&DataType::Dictionary(key.clone(), Box::new(value_type)))
+                .unwrap();
+        assert_eq!(
+            DataType::try_from(&logical_type).unwrap(),
+            DataType::Dictionary(key, Box::new(parsed_value_type)),
+            "logical type: {logical_type}"
+        );
+    }
+
+    /// Every integer index type has a colon-free logical string, so none of them
+    /// may be caught by the rejection above.
+    #[rstest]
+    fn test_dictionary_logical_type_accepts_every_integer_index(
+        #[values(
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64
+        )]
+        key_type: DataType,
+    ) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(DataType::try_from(&logical_type).unwrap(), data_type);
+    }
+
+    #[rstest]
+    #[case::decimal(DataType::Decimal128(10, 2))]
+    #[case::date32(DataType::Date32)]
+    #[case::time32(DataType::Time32(TimeUnit::Second))]
+    #[case::timestamp(DataType::Timestamp(TimeUnit::Microsecond, None))]
+    #[case::timestamp_with_zone(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some(Arc::from("+08:00"))
+    ))]
+    #[case::duration(DataType::Duration(TimeUnit::Second))]
+    #[case::fixed_size_binary(DataType::FixedSizeBinary(16))]
+    #[case::nested_dict(DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)))]
+    // `struct` and `list` keep the segment count at four, but the parser has no
+    // arm for them: they only become a `DataType` through a field's children,
+    // which this encoding cannot carry.
+    #[case::struct_value(DataType::Struct(Fields::from(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        true
+    )])))]
+    #[case::list_value(DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))))]
+    fn test_dictionary_logical_type_rejects_unparsable_value(#[case] value_type: DataType) {
+        let data_type = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(value_type));
+        let err = LogicalType::try_from(&data_type)
+            .expect_err("a dictionary whose logical type cannot parse back must not encode");
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("does not parse back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The index type is inlined in the same string, so an index type carrying
+    /// ':' is just as unparsable as such a value type.
+    #[rstest]
+    #[case::decimal_index(DataType::Decimal128(10, 2))]
+    #[case::dict_index(DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)))]
+    fn test_dictionary_logical_type_rejects_unparsable_index(#[case] key_type: DataType) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        let err = LogicalType::try_from(&data_type)
+            .expect_err("a dictionary whose logical type cannot parse back must not encode");
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("does not parse back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Pins the on-disk spelling as well as the round trip: the timezone is written
+    /// verbatim, which is why the parser cannot assume a fixed segment count.
+    #[rstest]
+    #[case::no_timezone(TimeUnit::Second, None, "timestamp:s:-")]
+    #[case::named_utc(TimeUnit::Millisecond, Some("UTC"), "timestamp:ms:UTC")]
+    #[case::offset_positive(TimeUnit::Microsecond, Some("+08:00"), "timestamp:us:+08:00")]
+    #[case::offset_negative(TimeUnit::Nanosecond, Some("-05:00"), "timestamp:ns:-05:00")]
+    fn test_timestamp_logical_type_encoding(
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let data_type = DataType::Timestamp(timeunit, timezone.map(Arc::from));
+        assert_eq!(
+            LogicalType::try_from(&data_type).unwrap().to_string(),
+            expected
+        );
+    }
+
+    /// Opening an existing dataset parses the stored string directly, so cover that
+    /// direction on its own rather than only as half of a round trip.
+    #[rstest]
+    #[case::offset_positive("timestamp:us:+08:00", TimeUnit::Microsecond, Some("+08:00"))]
+    #[case::offset_negative("timestamp:ms:-05:00", TimeUnit::Millisecond, Some("-05:00"))]
+    #[case::offset_half_hour("timestamp:ns:+05:30", TimeUnit::Nanosecond, Some("+05:30"))]
+    #[case::named_utc("timestamp:s:UTC", TimeUnit::Second, Some("UTC"))]
+    #[case::no_timezone("timestamp:us:-", TimeUnit::Microsecond, None)]
+    fn test_parse_timestamp_logical_type(
+        #[case] encoded: &str,
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+    ) {
+        assert_eq!(
+            DataType::try_from(&LogicalType::from(encoded)).unwrap(),
+            DataType::Timestamp(timeunit, timezone.map(Arc::from))
+        );
+    }
+
+    /// `Field::data_type` unwraps the parse, so a timezone it cannot read surfaces as a
+    /// panic instead of an error. Walk the Arrow -> Lance -> Arrow trip end to end.
+    #[test]
+    fn test_field_round_trip_with_fixed_offset_timezone() {
+        let data_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+08:00".into()));
+        let arrow_field = ArrowField::new("ts", data_type.clone(), true);
+        let field = Field::try_from(&arrow_field).unwrap();
+        assert_eq!(field.data_type(), data_type);
+        assert_eq!(ArrowField::from(&field), arrow_field);
+    }
+
+    /// The conversion a write performs, mixing both timezone spellings in one schema.
+    #[test]
+    fn test_schema_round_trip_with_fixed_offset_timezone() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "ts_offset",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+08:00".into())),
+                true,
+            ),
+            ArrowField::new(
+                "ts_named",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(ArrowSchema::from(&schema), arrow_schema);
+    }
+
+    /// A timezone cannot be recovered from fewer than three segments, and an unknown
+    /// time unit is still an error, so neither becomes collateral damage of the rejoin.
+    #[rstest]
+    #[case::unit_and_timezone_missing("timestamp")]
+    #[case::timezone_missing("timestamp:us")]
+    #[case::unknown_timeunit("timestamp:decade:UTC")]
+    #[case::unknown_timeunit_with_offset("timestamp:decade:+08:00")]
+    fn test_malformed_timestamp_logical_type_is_rejected(#[case] encoded: &str) {
+        assert!(
+            DataType::try_from(&LogicalType::from(encoded)).is_err(),
+            "expected {encoded} to be rejected"
+        );
     }
 }

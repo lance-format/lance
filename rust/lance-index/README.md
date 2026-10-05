@@ -1,7 +1,7 @@
 # lance-index
 
 `lance-index` is an internal sub-crate, containing various vector index implementations
-used in [Lance](https://github.com/lancedb/lance).
+used in [Lance](https://github.com/lance-format/lance).
 
 **Important Note**: This crate is **not intended for external usage**.
 

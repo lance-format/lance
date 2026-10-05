@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
-use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
+use lance_file::datatypes::{Fields, FieldsWithMeta};
+use lance_file::version::{ConcreteFileVersion, stable_file_version};
+use lance_file::versions::v1::{
+    encoding::populate_schema_dictionaries, reader::FileReader as V1FileReader,
+};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -15,7 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{Fragment, InlineRowIds, RowIdMeta};
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -185,8 +189,8 @@ impl Manifest {
             index_section: None,
             timestamp_nanos: 0,
             tag: None,
-            reader_feature_flags: 0,
-            writer_feature_flags: 0,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: None,
             transaction_file: None,
             transaction_section: None,
@@ -216,8 +220,8 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
+            writer_feature_flags: previous.writer_feature_flags & STICKY_PAIRED_FLAGS,
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             transaction_section: None,
@@ -248,7 +252,7 @@ impl Manifest {
             .iter()
             .map(|fragment| {
                 let mut cloned_fragment = fragment.clone();
-                for file in &mut cloned_fragment.files {
+                for file in cloned_fragment.referenced_lance_files_mut() {
                     if file.base_id.is_none() {
                         file.base_id = Some(ref_base_id);
                     }
@@ -273,8 +277,19 @@ impl Manifest {
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            // Not derivable from the manifest, so it would be lost like any other
+            // zeroed word: a clone of a table with covering indexes would come
+            // back unfenced, and since the clone copies the index metadata
+            // wholesale -- `covering_fields` included -- a build that predates
+            // covering could then open it and read carried columns as keyed ones.
+            // Kept unconditionally rather than derived from the cloned indexes:
+            // over-fencing a clone is harmless, under-fencing one is not.
+            // Sticky capabilities are also retained because the clone keeps the
+            // source file identities that require them.
+            reader_feature_flags: self.reader_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
@@ -373,6 +388,36 @@ impl Manifest {
         }
     }
 
+    /// Copy inline row ids out of the manifest buffer they were decoded from
+    /// when they are a small share of it.
+    ///
+    /// Inline row ids decoded from a `Bytes` buffer are slices of that buffer
+    /// (see [`InlineRowIds`]), and a slice keeps the whole allocation alive.
+    /// That is the right trade when the row ids are most of the manifest, as
+    /// they are for a compacted stable-row-id table, but a manifest whose row
+    /// ids are a few percent of its bytes would pin the rest for nothing.
+    /// `buffer_len` is the size of the decoded buffer.
+    pub fn detach_sparse_inline_row_ids(&mut self, buffer_len: usize) {
+        let inline_bytes: usize = self
+            .fragments
+            .iter()
+            .filter_map(|fragment| match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(data)) => Some(data.len()),
+                _ => None,
+            })
+            .sum();
+        // Keep the slices while the row ids are at least a quarter of the buffer.
+        if inline_bytes == 0 || inline_bytes.saturating_mul(4) >= buffer_len {
+            return;
+        }
+        for fragment in Arc::make_mut(&mut self.fragments) {
+            if let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta {
+                let copied = InlineRowIds::from(Bytes::copy_from_slice(data));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(copied));
+            }
+        }
+    }
+
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
         // If there are no fragments, don't update max_fragment_id
@@ -421,16 +466,21 @@ impl Manifest {
     /// Get the max used field id
     ///
     /// This is different than [Schema::max_field_id] because it also considers
-    /// the field ids in the data files that have been dropped from the schema.
+    /// the field ids in the data files that have been dropped from the schema,
+    /// including overlay files referenced by fragments.
     pub fn max_field_id(&self) -> i32 {
         let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
         let fragment_max_id = self
             .fragments
             .iter()
-            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.iter()))
+            .flat_map(|fragment| {
+                fragment
+                    .referenced_lance_files()
+                    .flat_map(|file| file.fields.iter())
+            })
+            .copied()
             .max()
-            .copied();
-        let fragment_max_id = fragment_max_id.unwrap_or(-1);
+            .unwrap_or(-1);
         schema_max_id.max(fragment_max_id)
     }
 
@@ -501,10 +551,6 @@ impl Manifest {
         pb_manifest.encode_to_vec()
     }
 
-    pub fn should_use_legacy_format(&self) -> bool {
-        self.data_storage_format.version == LEGACY_FORMAT_VERSION
-    }
-
     /// Get the summary information of a manifest.
     ///
     /// This function calculates various statistics about the manifest, including:
@@ -550,6 +596,40 @@ impl Manifest {
 
         summary
     }
+}
+
+/// Populate dictionary values stored outside a V1 manifest.
+///
+/// Other exact file versions store their schema dictionaries inline, so this
+/// is a no-op for those manifests.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_io::traits::Reader;
+/// # use lance_table::format::{Manifest, populate_manifest_schema_dictionaries};
+/// # async fn hydrate_v1_manifest(
+/// #     manifest: &mut Manifest,
+/// #     reader: &dyn Reader,
+/// # ) -> Result<()> {
+/// populate_manifest_schema_dictionaries(manifest, reader).await
+/// # }
+/// ```
+pub async fn populate_manifest_schema_dictionaries(
+    manifest: &mut Manifest,
+    reader: &dyn Reader,
+) -> Result<()> {
+    match manifest.data_storage_format.version {
+        ConcreteFileVersion::V1 => {
+            populate_schema_dictionaries(&mut manifest.schema, reader).await?;
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -606,37 +686,77 @@ pub struct WriterVersion {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
-    pub version: String,
+    pub version: ConcreteFileVersion,
 }
 
 const LANCE_FORMAT_NAME: &str = "lance";
 
 impl DataStorageFormat {
-    pub fn new(version: LanceFileVersion) -> Self {
+    pub fn new(version: ConcreteFileVersion) -> Self {
         Self {
             file_format: LANCE_FORMAT_NAME.to_string(),
-            version: version.resolve().to_string(),
+            version,
         }
     }
 
-    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
-        self.version.parse::<LanceFileVersion>()
+    /// Return the exact file format version persisted by this manifest.
+    pub fn lance_file_format(&self) -> ConcreteFileVersion {
+        self.version
     }
 }
 
 impl Default for DataStorageFormat {
     fn default() -> Self {
-        Self::new(LanceFileVersion::default())
+        Self::new(stable_file_version())
     }
 }
 
-impl From<pb::manifest::DataStorageFormat> for DataStorageFormat {
-    fn from(pb: pb::manifest::DataStorageFormat) -> Self {
-        Self {
+impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
+    type Error = Error;
+
+    fn try_from(pb: pb::manifest::DataStorageFormat) -> Result<Self> {
+        Ok(Self {
             file_format: pb.file_format,
-            version: pb.version,
-        }
+            version: ConcreteFileVersion::from_manifest_string(&pb.version)?,
+        })
     }
+}
+
+/// Options controlling how a new [`Manifest`] is assembled from a transaction.
+///
+/// The timestamp arrives already resolved to nanoseconds since the Unix epoch.
+/// Callers own the clock so that a caller wanting a mockable one keeps it: the
+/// `lance` crate mocks `SystemTime` under `cfg(test)`, which only takes effect in
+/// that crate.
+#[derive(Debug, Clone)]
+pub struct ManifestBuildConfig {
+    /// Recompute the manifest's feature flags from the fragments and settings
+    /// below. False leaves whatever flags the previous manifest carried.
+    pub auto_set_feature_flags: bool,
+    /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
+    pub timestamp_nanos: u128,
+    /// Request the stable row id feature. The flag is also inherited from the
+    /// previous manifest, so false does not turn it off for a dataset that has it.
+    pub use_stable_row_ids: bool,
+    /// Overwrite only: force the legacy (true) or v2 (false) file format. `None`
+    /// keeps the format the dataset already had.
+    pub use_legacy_format: Option<bool>,
+    /// Overwrite only: force this storage format, taking precedence over
+    /// `use_legacy_format`. `None` keeps the format the dataset already had.
+    pub storage_format: Option<DataStorageFormat>,
+    /// Skip writing a detached transaction file for this commit.
+    pub disable_transaction_file: bool,
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    pub migration_next_row_id: Option<u64>,
+    /// Row lineage sequences of the current manifest's fragments that live
+    /// outside the manifest, read ahead of the build. An update that rewrites
+    /// rows needs the existing row ids and created-at versions to carry each
+    /// row's lineage over, and a partial column rewrite needs the existing
+    /// last-updated-at versions; the build cannot read a data file itself. Only
+    /// consulted for fragments whose sequences are spilled.
+    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -891,16 +1011,16 @@ impl TryFrom<pb::Manifest> for Manifest {
                 } else {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(LanceFileVersion::Stable)
+                        DataStorageFormat::new(stable_file_version())
                     } else {
-                        DataStorageFormat::new(LanceFileVersion::Legacy)
+                        DataStorageFormat::new(ConcreteFileVersion::V1)
                     }
                 }
             }
-            Some(format) => DataStorageFormat::from(format),
+            Some(format) => DataStorageFormat::try_from(format)?,
         };
 
-        let schema = Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta)?;
 
         Ok(Self {
             schema,
@@ -968,6 +1088,7 @@ impl From<&Manifest> for pb::Manifest {
                     build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragment_tree: None,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -980,7 +1101,11 @@ impl From<&Manifest> for pb::Manifest {
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
                 file_format: m.data_storage_format.file_format.clone(),
-                version: m.data_storage_format.version.clone(),
+                version: m
+                    .data_storage_format
+                    .version
+                    .to_manifest_string()
+                    .to_string(),
             }),
             config: m.config.clone(),
             base_paths: m
@@ -1028,7 +1153,7 @@ pub trait SelfDescribingFileReader {
 }
 
 #[async_trait]
-impl SelfDescribingFileReader for PreviousFileReader {
+impl SelfDescribingFileReader for V1FileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
         cache: Option<&LanceCache>,
@@ -1039,9 +1164,7 @@ impl SelfDescribingFileReader for PreviousFileReader {
             reader.path(),
         )))?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
-        if manifest.should_use_legacy_format() {
-            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
-        }
+        populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(
@@ -1060,13 +1183,188 @@ impl SelfDescribingFileReader for PreviousFileReader {
 
 #[cfg(test)]
 mod tests {
+    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
 
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+    use roaring::RoaringBitmap;
+
+    /// A shallow clone points every local file at the parent through `base_id`.
+    /// An overlay's data file lives in the parent too, so it needs the same
+    /// stamp; without it the clone looks for the overlay under its own root.
+    #[test]
+    fn shallow_clone_stamps_base_id_on_overlay_files() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let mut fragment = Fragment::with_file_legacy(0, "base.lance", &schema, Some(10));
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        }];
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        let fragment = &cloned.fragments[0];
+        assert_eq!(fragment.files[0].base_id, Some(7));
+        assert_eq!(
+            fragment.overlays[0].data_file.base_id,
+            Some(7),
+            "the overlay's data file resolves against the parent as well"
+        );
+    }
+
+    #[test]
+    fn old_empty_manifest_recovers_v1_or_current_stable() {
+        let old_manifest = pb::Manifest {
+            data_format: None,
+            ..Default::default()
+        };
+        let recovered_v1 = Manifest::try_from(old_manifest.clone()).unwrap();
+        assert_eq!(
+            recovered_v1.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+
+        let recovered_stable = Manifest::try_from(pb::Manifest {
+            writer_feature_flags: FLAG_USE_V2_FORMAT_DEPRECATED,
+            ..old_manifest
+        })
+        .unwrap();
+        assert_eq!(
+            recovered_stable.data_storage_format.lance_file_format(),
+            stable_file_version()
+        );
+    }
+
+    #[test]
+    fn manifest_persistence_rejects_selectors_and_public_aliases() {
+        for version in ["stable", "next", "legacy", "0.3"] {
+            let manifest = pb::Manifest {
+                data_format: Some(pb::manifest::DataStorageFormat {
+                    file_format: LANCE_FORMAT_NAME.to_string(),
+                    version: version.to_string(),
+                }),
+                ..Default::default()
+            };
+            assert!(Manifest::try_from(manifest).is_err(), "accepted {version}");
+        }
+    }
+
+    #[test]
+    fn manifest_codec_writes_canonical_exact_string() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(Vec::new()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.data_format.unwrap().version, "2.0");
+    }
+
+    #[test]
+    fn missing_format_infers_exact_version_and_rejects_mixed_files() {
+        let v2_0 = Fragment::new(0).with_file(
+            "v2_0.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![v2_0.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V1),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.data_format = None;
+        let recovered = Manifest::try_from(encoded).unwrap();
+        assert_eq!(
+            recovered.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+
+        let v2_1 = Fragment::new(1).with_file(
+            "v2_1.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+        );
+        let mixed_manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![v2_0, v2_1]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&mixed_manifest);
+        encoded.data_format = None;
+        let error = Manifest::try_from(encoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("All data files must have the same version")
+        );
+    }
+
+    #[test]
+    fn test_detach_sparse_inline_row_ids_copies_only_small_shares() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]);
+        // Two 10 byte row id sequences sliced out of one buffer.
+        let buffer = Bytes::from(vec![7u8; 64]);
+        let fragments = [0..10, 20..30].into_iter().enumerate().map(|(id, range)| {
+            let mut fragment = Fragment::new(id as u64);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(InlineRowIds::from(buffer.slice(range))));
+            fragment
+        });
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(fragments.collect()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let ptr = |manifest: &Manifest, i: usize| match &manifest.fragments[i].row_id_meta {
+            Some(RowIdMeta::Inline(data)) => data.bytes().as_ptr(),
+            _ => unreachable!(),
+        };
+        let in_buffer = |p: *const u8| buffer.as_ptr_range().contains(&p);
+
+        // 20 of 80 bytes is a quarter: the slices stay.
+        manifest.detach_sparse_inline_row_ids(80);
+        assert!(in_buffer(ptr(&manifest, 0)) && in_buffer(ptr(&manifest, 1)));
+
+        // 20 of 81 bytes is below a quarter: copied out, contents intact.
+        manifest.detach_sparse_inline_row_ids(81);
+        assert!(!in_buffer(ptr(&manifest, 0)) && !in_buffer(ptr(&manifest, 1)));
+        let Some(RowIdMeta::Inline(copied)) = &manifest.fragments[1].row_id_meta else {
+            unreachable!()
+        };
+        assert_eq!(&**copied, &buffer[20..30]);
+    }
 
     #[test]
     fn test_writer_version() {
@@ -1316,6 +1614,7 @@ mod tests {
                     vec![0, 1, 2],
                     None,
                 )],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1328,6 +1627,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 43], None),
                     DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1339,6 +1639,42 @@ mod tests {
         let manifest = Manifest::new(
             schema,
             Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn test_max_field_id_includes_overlay_files() {
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let schema = Schema {
+            fields: vec![field0],
+            metadata: Default::default(),
+        };
+
+        let mut fragment = Fragment {
+            id: 0,
+            files: vec![DataFile::new_legacy_from_fields("path1", vec![0], None)],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: None,
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![43], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        }];
+
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
@@ -1448,14 +1784,13 @@ mod tests {
         assert_eq!(real_data_summary.total_data_file_rows, 425);
         assert_eq!(real_data_summary.total_deletion_files, 0);
 
-        let file_version = LanceFileVersion::default();
         // Step 4: write deletion files and verify summary
         let mut fragment_with_deletion = Fragment::new(0)
             .with_file(
                 "data_with_deletion.lance",
                 vec![0, 1],
                 vec![0, 1],
-                &file_version,
+                stable_file_version(),
                 NonZero::new(1000),
             )
             .with_physical_rows(50);

@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::bitmap::{PyBitmap, bitmap_from_iterable, is_int, value_from_py};
 use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
-    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMap,
-    UpdateMapEntry, UpdateMode,
+    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::datatypes::Schema;
+use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -70,13 +71,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
         let fragment_ids = ob.getattr("fragment_ids")?;
         let created_at = ob.getattr("created_at")?.extract()?;
 
-        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.cast()?;
-        let fragment_bitmap = Some(
-            fragment_ids_ref
-                .into_iter()
-                .map(|id| id.extract::<u32>())
-                .collect::<PyResult<RoaringBitmap>>()?,
-        );
+        let fragment_bitmap = Some(extract_fragment_bitmap(&fragment_ids)?);
         let base_id: Option<u32> = ob
             .getattr("base_id")?
             .extract::<Option<i64>>()?
@@ -92,11 +87,18 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
                 .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
             Err(_) => None,
         };
+        // Tolerate an object predating this attribute, as with `index_details`
+        // above: absent means the index carries no covered columns.
+        let covering_fields: Vec<i32> = match ob.getattr("covering_fields") {
+            Ok(value) => value.extract()?,
+            Err(_) => Vec::new(),
+        };
 
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
+            covering_fields,
             dataset_version,
             fragment_bitmap,
             index_details,
@@ -121,18 +123,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let uuid = self.0.uuid.to_string();
         let name = &self.0.name;
         let fields = &self.0.fields;
+        let covering_fields = &self.0.covering_fields;
         let dataset_version = self.0.dataset_version;
         let index_version = self.0.index_version;
-        let fragment_ids = self.0.fragment_bitmap.as_ref().map_or_else(
-            || PySet::empty(py).unwrap(),
-            |bitmap| {
-                let set = PySet::empty(py).unwrap();
-                for id in bitmap.iter() {
-                    set.add(id).unwrap();
-                }
-                set
-            },
-        );
+        let fragment_ids = PyBitmap::new(self.0.fragment_bitmap.clone().unwrap_or_default());
         let created_at = self.0.created_at;
         let base_id = self.0.base_id.map(|id| id as i64);
         let files = self
@@ -161,6 +155,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             base_id,
             files,
             index_details,
+            covering_fields.clone(),
         ))
     }
 }
@@ -203,6 +198,198 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
             .getattr("DataReplacementGroup")
             .expect("Failed to get DataReplacementGroup class");
         cls.call1((fragment_id, new_file))
+    }
+}
+
+const OFFSETS_SHAPE_ERR: &str = "DataOverlayFile.offsets must be an iterable of ints (dense coverage shared by every \
+     field) or an iterable of per-field int iterables (sparse coverage)";
+
+// Fragment ids are just a set: accept a `Bitmap` or any other iterable of ints
+// (a `set`, `list`, ...) in whatever order it yields, since `RoaringBitmap`
+// defines the canonical ascending, deduplicated order. Unlike
+// `DataOverlayFile.offsets` below, a repeated fragment id means nothing here,
+// so it collapses rather than being rejected.
+fn extract_fragment_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
+    if let Ok(bitmap) = ob.extract::<PyBitmap>() {
+        return Ok((*bitmap.0).clone());
+    }
+    bitmap_from_iterable(ob)
+}
+
+// Add one covered offset, rejecting a repeat.
+//
+// Offsets map positionally to rows of the value file — the smallest covered
+// offset to row 0, the next to row 1, and so on — so a repeated offset would
+// shift every later offset onto the wrong row, producing wrong values with no
+// error at read time. A `RoaringBitmap` is a set and would swallow the repeat,
+// so it has to be caught on the way in.
+fn insert_offset(offsets: &mut RoaringBitmap, item: &Bound<'_, PyAny>) -> PyResult<()> {
+    let offset = value_from_py(item)?;
+    if !offsets.insert(offset) {
+        return Err(PyValueError::new_err(format!(
+            "DataOverlayFile.offsets must not repeat an offset, but {offset} appears more than \
+             once; each offset maps positionally to a row of the overlay's value file"
+        )));
+    }
+    Ok(())
+}
+
+// Collect one field's covered offsets: a `Bitmap` (shared, not copied) or any
+// iterable of ints.
+fn extract_offsets(ob: &Bound<'_, PyAny>) -> PyResult<Arc<RoaringBitmap>> {
+    if let Ok(bitmap) = ob.extract::<PyBitmap>() {
+        // Already a set, so it cannot carry a repeat.
+        return Ok(bitmap.0);
+    }
+    let mut offsets = RoaringBitmap::new();
+    for item in ob
+        .try_iter()
+        .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?
+    {
+        insert_offset(&mut offsets, &item?)?;
+    }
+    Ok(Arc::new(offsets))
+}
+
+// Resolve `offsets` into a dense (one coverage shared by every field) or
+// sparse (one per field) `OverlayCoverage`, deciding by shape: a `Bitmap` or
+// an iterable of ints is dense, an iterable of `Bitmap`s/int iterables is
+// sparse.
+//
+// The items are drained into a `Vec` before the shape is decided, because
+// `offsets` may be a one-shot iterable (a generator). Probing the dense shape
+// by iterating and then re-iterating for the sparse shape would silently drop
+// whatever the first pass consumed — committing truncated or empty coverage
+// that only fails much later, at read time.
+fn extract_coverage(offsets: &Bound<'_, PyAny>) -> PyResult<OverlayCoverage> {
+    if let Ok(bitmap) = offsets.extract::<PyBitmap>() {
+        return Ok(OverlayCoverage::Shared(bitmap.0));
+    }
+    let items = offsets
+        .try_iter()
+        .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?
+        .collect::<PyResult<Vec<_>>>()?;
+    let Some(first) = items.first() else {
+        // An empty iterable can't distinguish the two shapes; an empty dense
+        // coverage and an empty sparse one describe the same (no) rows.
+        return Ok(OverlayCoverage::Shared(Arc::new(RoaringBitmap::new())));
+    };
+    // The first item picks the shape, and every remaining item must match it —
+    // a mixed iterable like `[0, [1]]` is a caller mistake, not a shape. Only
+    // that mismatch is reported as a shape error; a bad offset within the
+    // chosen shape keeps the error that names it.
+    if is_int(first)? {
+        let mut dense = RoaringBitmap::new();
+        for item in &items {
+            if !is_int(item)? {
+                return Err(PyValueError::new_err(OFFSETS_SHAPE_ERR));
+            }
+            insert_offset(&mut dense, item)?;
+        }
+        Ok(OverlayCoverage::Shared(Arc::new(dense)))
+    } else {
+        let per_field = items
+            .iter()
+            .map(|item| {
+                if is_int(item)? {
+                    return Err(PyValueError::new_err(OFFSETS_SHAPE_ERR));
+                }
+                extract_offsets(item)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(OverlayCoverage::PerField(per_field))
+    }
+}
+
+impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        let data_file = ob.getattr("data_file")?.extract::<PyLance<DataFile>>()?.0;
+        let offsets = ob.getattr("offsets")?;
+
+        let coverage = extract_coverage(&offsets)?;
+
+        // Present (and preserved) when round-tripping an existing fragment's
+        // overlays; None/0 when creating an overlay to commit, since the
+        // DataOverlay commit stamps the effective version.
+        let committed_version = ob
+            .getattr("committed_version")?
+            .extract::<Option<u64>>()?
+            .unwrap_or(0);
+
+        Ok(Self(DataOverlayFile {
+            data_file,
+            coverage,
+            committed_version,
+        }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
+            .expect("Failed to import LanceOperation namespace");
+
+        let data_file = PyLance(&self.0.data_file).into_pyobject(py)?;
+        let cls = namespace
+            .getattr("DataOverlayFile")
+            .expect("Failed to get DataOverlayFile class");
+
+        let committed_version = self.0.committed_version;
+
+        // Mirror the read side: a dense overlay becomes a single Bitmap, a
+        // sparse overlay a list of per-field Bitmaps.
+        match &self.0.coverage {
+            OverlayCoverage::Shared(bitmap) => {
+                // `bitmap` is already an `Arc<RoaringBitmap>` — cloning it is a
+                // cheap refcount bump, not a deep copy.
+                let offsets = PyBitmap(bitmap.clone());
+                cls.call1((data_file, offsets, committed_version))
+            }
+            OverlayCoverage::PerField(bitmaps) => {
+                let offsets: Vec<PyBitmap> = bitmaps.iter().cloned().map(PyBitmap).collect();
+                cls.call1((data_file, offsets, committed_version))
+            }
+        }
+    }
+}
+
+impl FromPyObject<'_, '_> for PyLance<DataOverlayGroup> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
+        let overlays = extract_vec(&ob.getattr("overlays")?)?;
+        Ok(Self(DataOverlayGroup {
+            fragment_id,
+            overlays,
+        }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayGroup> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
+            .expect("Failed to import LanceOperation namespace");
+
+        let fragment_id = self.0.fragment_id;
+        let overlays = export_vec(py, self.0.overlays.as_slice())?;
+
+        let cls = namespace
+            .getattr("DataOverlayGroup")
+            .expect("Failed to get DataOverlayGroup class");
+        cls.call1((fragment_id, overlays))
     }
 }
 
@@ -290,16 +477,41 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .ok()
                     .map(|py_mode| py_mode.0);
 
+                // Absent on objects predating the field.
+                let updated_fragment_offsets = ob
+                    .getattr("updated_fragment_offsets")
+                    .ok()
+                    .map(|v| v.extract::<Option<HashMap<u64, Vec<u8>>>>())
+                    .transpose()?
+                    .flatten()
+                    .map(|offsets| {
+                        offsets
+                            .into_iter()
+                            .map(|(frag_id, bytes)| {
+                                RoaringBitmap::deserialize_from(&bytes[..])
+                                    .map(|bitmap| (frag_id, bitmap))
+                                    .map_err(|e| {
+                                        PyValueError::new_err(format!(
+                                            "updated_fragment_offsets[{frag_id}]: invalid \
+                                             portable RoaringBitmap bytes: {e}"
+                                        ))
+                                    })
+                            })
+                            .collect::<PyResult<HashMap<_, _>>>()
+                    })
+                    .transpose()?
+                    .map(UpdatedFragmentOffsets);
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    merged_generations: vec![],
+                    compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
-                    updated_fragment_offsets: None,
+                    updated_fragment_offsets,
                 };
                 Ok(Self(op))
             }
@@ -311,12 +523,38 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .extract::<Vec<PyLance<Fragment>>>()?;
                 let fragments = fragments.into_iter().map(|f| f.0).collect();
 
-                let op = Operation::Merge { schema, fragments };
+                // Absent on objects predating the field: no assertion, which
+                // conservatively conflicts.
+                let preserves_nullability = ob
+                    .getattr("preserves_nullability")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
+
+                let op = Operation::Merge {
+                    schema,
+                    fragments,
+                    preserves_nullability,
+                };
                 Ok(Self(op))
             }
             "Restore" => {
                 let version = ob.getattr("version")?.extract()?;
                 let op = Operation::Restore { version };
+                Ok(Self(op))
+            }
+            "Clone" => {
+                let is_shallow = ob.getattr("is_shallow")?.extract()?;
+                let ref_name = ob.getattr("ref_name")?.extract()?;
+                let ref_version = ob.getattr("ref_version")?.extract()?;
+                let ref_path = ob.getattr("ref_path")?.extract()?;
+                let branch_name = ob.getattr("branch_name")?.extract()?;
+                let op = Operation::Clone {
+                    is_shallow,
+                    ref_name,
+                    ref_version,
+                    ref_path,
+                    branch_name,
+                };
                 Ok(Self(op))
             }
             "Rewrite" => {
@@ -350,10 +588,26 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
 
                 Ok(Self(op))
             }
+            "DataOverlay" => {
+                let groups = extract_vec(&ob.getattr("groups")?)?;
+
+                let op = Operation::DataOverlay { groups };
+
+                Ok(Self(op))
+            }
             "Project" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
+                // Absent on objects predating the field: no assertion, which
+                // conservatively conflicts.
+                let preserves_nullability = ob
+                    .getattr("preserves_nullability")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(false);
 
-                let op = Operation::Project { schema };
+                let op = Operation::Project {
+                    schema,
+                    preserves_nullability,
+                };
                 Ok(Self(op))
             }
             "UpdateConfig" => {
@@ -451,6 +705,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_modified,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                updated_fragment_offsets,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -468,6 +723,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     },
                     None => "rewrite_rows",
                 };
+                let updated_fragment_offsets =
+                    updated_fragment_offsets
+                        .as_ref()
+                        .map(|UpdatedFragmentOffsets(offsets)| {
+                            offsets
+                                .iter()
+                                .map(|(frag_id, bitmap)| {
+                                    let mut buf = Vec::with_capacity(bitmap.serialized_size());
+                                    bitmap
+                                        .serialize_into(&mut buf)
+                                        .expect("RoaringBitmap serialization cannot fail");
+                                    (*frag_id, buf)
+                                })
+                                .collect::<HashMap<u64, Vec<u8>>>()
+                        });
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -478,6 +748,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_modified,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    updated_fragment_offsets,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -486,6 +757,13 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .getattr("DataReplacement")
                     .expect("Failed to get DataReplacement class");
                 cls.call1((replacements,))
+            }
+            Operation::DataOverlay { groups } => {
+                let groups = export_vec(py, groups.as_slice())?;
+                let cls = namespace
+                    .getattr("DataOverlay")
+                    .expect("Failed to get DataOverlay class");
+                cls.call1((groups,))
             }
             Operation::Delete {
                 updated_fragments,
@@ -499,19 +777,35 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Delete class");
                 cls.call1((updated_fragments, deleted_fragment_ids, predicate))
             }
-            Operation::Merge { fragments, schema } => {
+            Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability,
+            } => {
                 let fragments_py = export_vec(py, fragments.as_slice())?;
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Merge")
                     .expect("Failed to get Merge class");
-                cls.call1((fragments_py, schema_py))
+                cls.call1((fragments_py, schema_py, *preserves_nullability))
             }
             Operation::Restore { version } => {
                 let cls = namespace
                     .getattr("Restore")
                     .expect("Failed to get Restore class");
                 cls.call1((version,))
+            }
+            Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+                branch_name,
+            } => {
+                let cls = namespace
+                    .getattr("Clone")
+                    .expect("Failed to get Clone class");
+                cls.call1((is_shallow, ref_name, ref_version, ref_path, branch_name))
             }
             Operation::Rewrite {
                 groups,
@@ -528,6 +822,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
+                ..
             } => {
                 let new_indices_py = export_vec(py, new_indices.as_slice())?;
                 let removed_indices_py = export_vec(py, removed_indices.as_slice())?;
@@ -537,12 +832,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get CreateIndex class");
                 cls.call1((new_indices_py, removed_indices_py))
             }
-            Operation::Project { schema } => {
+            Operation::Project {
+                schema,
+                preserves_nullability,
+            } => {
                 let schema_py = LanceSchema(schema.clone());
                 let cls = namespace
                     .getattr("Project")
                     .expect("Failed to get Project class");
-                cls.call1((schema_py,))
+                cls.call1((schema_py, *preserves_nullability))
             }
             Operation::ReserveFragments { num_fragments } => {
                 if let Ok(cls) = namespace.getattr("ReserveFragments") {
@@ -595,7 +893,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            _ => todo!(),
+            unsupported => Err(PyValueError::new_err(format!(
+                "Unsupported operation: {}",
+                unsupported.name()
+            ))),
         }
     }
 }

@@ -306,6 +306,14 @@ impl CacheCodec {
         }
     }
 
+    /// Return the stable entry type identity.
+    ///
+    /// Persistent and tiered backends can use this metadata to route encoded
+    /// values without retaining a readable logical cache key.
+    pub const fn type_id(&self) -> &'static str {
+        self.type_id
+    }
+
     /// Serialize `value` into `writer`: envelope first, then the body.
     pub fn serialize(&self, value: &ArcAny, writer: &mut dyn Write) -> Result<()> {
         let body_offset = write_envelope(writer, self.type_id, self.version)?;

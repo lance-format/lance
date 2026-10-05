@@ -1,13 +1,13 @@
 ---
 title: Vector Search
-description: High-performance vector search with ANN indexes, including IVF_PQ, IVF_HNSW_PQ, and IVF_HNSW_SQ
+description: High-performance vector search with ANN indices, including IVF_PQ, IVF_HNSW_PQ, and IVF_HNSW_SQ
 ---
 
 # Vector Indexing and Vector Search With Lance
 
-Lance provides high-performance vector search capabilities with ANN (Approximate Nearest Neighbor) indexes.
+Lance provides high-performance vector search capabilities with ANN (Approximate Nearest Neighbor) indices.
 
-By the end of this tutorial, you'll be able to build and use ANN indexes to dramatically speed up vector search operations while maintaining high accuracy. You'll also learn how to tune search parameters for optimal performance and combine vector search with metadata queries in a single operation.
+By the end of this tutorial, you'll be able to build and use ANN indices to dramatically speed up vector search operations while maintaining high accuracy. You'll also learn how to tune search parameters for optimal performance and combine vector search with metadata queries in a single operation.
 
 ## Install the Python SDK
 
@@ -210,8 +210,6 @@ The latency vs recall is tunable via:
 - **refine_factor**: determines how many vectors are retrieved during re-ranking
 
 ```python
-%%time
-
 sift1m.to_table(
     nearest={
         "column": "vector",

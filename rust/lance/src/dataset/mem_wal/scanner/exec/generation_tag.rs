@@ -3,7 +3,6 @@
 
 //! MemTable generation tagging execution node.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -98,10 +97,6 @@ impl DisplayAs for MemtableGenTagExec {
 impl ExecutionPlan for MemtableGenTagExec {
     fn name(&self) -> &str {
         "MemtableGenTagExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

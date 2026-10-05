@@ -33,7 +33,6 @@
 //!   --cache-dir /tmp/fineweb-cache --output result.json
 //! ```
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::{HashMap, HashSet};
@@ -110,11 +109,6 @@ impl Mode {
     /// Each `put` waits for WAL durability before returning.
     fn durable_write(self) -> bool {
         matches!(self, Self::SyncNoIndex | Self::SyncIndexed)
-    }
-
-    /// Index update happens inline in `put` (only meaningful when indexed).
-    fn sync_indexed_write(self) -> bool {
-        matches!(self, Self::SyncIndexed)
     }
 }
 
@@ -428,7 +422,6 @@ fn shard_writer_config(args: &Args, shard_id: Uuid, disable_auto_flush: bool) ->
     };
     let mut config = ShardWriterConfig::new(shard_id)
         .with_durable_write(args.mode.durable_write())
-        .with_sync_indexed_write(args.mode.sync_indexed_write())
         .with_max_memtable_size(args.max_memtable_size)
         .with_max_unflushed_memtable_bytes(args.max_unflushed_memtable_bytes)
         .with_max_memtable_rows(max_rows)
@@ -638,7 +631,7 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
     let dataset = Dataset::open(uri).await?;
     let shard_id = Uuid::new_v4();
     // Auto-flush disabled so the MemTable holds the full read_rows.
-    // sync_indexed_write + durable_write are both forced on: the read
+    // durable_write is forced on: the read
     // panel measures FTS read latency and consistency, which are
     // properties of the *fully visible* MemTable. The MemTableScanner
     // respects the visibility watermark, and that watermark only advances
@@ -646,9 +639,7 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
     // would query a partially-visible MemTable and report garbage. Both
     // are properties of ingestion, not of the read path, so forcing them
     // does not bias the latency/consistency measurement.
-    let config = shard_writer_config(args, shard_id, true)
-        .with_sync_indexed_write(true)
-        .with_durable_write(true);
+    let config = shard_writer_config(args, shard_id, true).with_durable_write(true);
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     let ingest_pool = &corpus[read_seed..];

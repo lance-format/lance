@@ -10,6 +10,7 @@
 //! - Equality filters
 //! - Range filters with varying selectivity (few/many/most rows match)
 //! - IN filters with varying size (10, 20, 30 values)
+//! - Range filters over pages whose row ids span many fragments
 
 mod common;
 
@@ -79,6 +80,8 @@ static STRING_UNIQUE_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::
 static STRING_UNIQUE_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
 static STRING_LOW_CARD_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
 static STRING_LOW_CARD_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_MANY_FRAG_INDEX_NO_CACHE: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
+static INT_MANY_FRAG_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::new();
 
 // Keep temp directories alive for the lifetime of the program
 static TEMP_DIRS: OnceLock<Vec<tempfile::TempDir>> = OnceLock::new();
@@ -179,6 +182,55 @@ async fn create_string_low_card_index(
         .load_index(store, &details, None, &cache)
         .await
         .unwrap()) as _
+}
+
+/// Create and train a BTree index for int64 data whose row ids are spread
+/// across many fragments (each page spans every fragment)
+async fn create_int_many_fragment_index(
+    store: Arc<LanceIndexStore>,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let stream = common::generate_int_many_fragment_stream();
+
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+
+    let cache = get_cache(use_cache, "int_many_frag");
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+
+    (BTreeIndexPlugin
+        .load_index(store, &details, None, &cache)
+        .await
+        .unwrap()) as _
+}
+
+/// Setup function for int many-fragment index - creates it only once per cache variant
+fn setup_int_many_fragment_index(
+    rt: &tokio::runtime::Runtime,
+    use_cache: bool,
+) -> Arc<dyn ScalarIndex> {
+    let static_ref = if use_cache {
+        &INT_MANY_FRAG_INDEX_CACHED
+    } else {
+        &INT_MANY_FRAG_INDEX_NO_CACHE
+    };
+
+    static_ref
+        .get_or_init(|| {
+            rt.block_on(async {
+                let tempdir = tempfile::tempdir().unwrap();
+                let store = Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    Path::from_filesystem_path(tempdir.path()).unwrap(),
+                    get_cache(use_cache, "int_many_frag"),
+                ));
+                let index = create_int_many_fragment_index(store, use_cache).await;
+                let _ = tempdir.keep();
+                index
+            })
+        })
+        .clone()
 }
 
 /// Setup function for int unique index - creates it only once per cache variant
@@ -680,6 +732,63 @@ fn bench_in(c: &mut Criterion) {
     }
 }
 
+/// Range queries over an index whose pages each span all `NUM_FRAGMENTS`
+/// fragments: the result has to be assembled from `pages x fragments`
+/// (page, fragment) pieces, which is where per-page result construction
+/// used to dominate.
+fn bench_range_many_fragments(c: &mut Criterion) {
+    let rt = get_runtime();
+    let total_rows = common::many_fragment_total_rows();
+
+    let mut group = c.benchmark_group("btree_range_many_fragments");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+
+    for selectivity in [Selectivity::Few, Selectivity::Many, Selectivity::Most] {
+        let range_size = (total_rows as f64 * selectivity.percentage()) as u64;
+        let start = (total_rows / 2) - (range_size / 2);
+        let end = start + range_size;
+        let make_query = move || {
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(start as i64))),
+                Bound::Included(ScalarValue::Int64(Some(end as i64))),
+            )
+        };
+
+        for use_cache in [false, true] {
+            let cache_label = if use_cache { "cached" } else { "no_cache" };
+            let id = BenchmarkId::new(format!("int_{}", selectivity.name()), cache_label);
+            group.bench_function(id, |b| {
+                let index = setup_int_many_fragment_index(rt, use_cache);
+
+                // Sanity check: every row in [start, end] must come back,
+                // spread over all fragments.
+                let count = count_range_results(rt, &index, make_query());
+                let expected = (end - start + 1) as usize;
+                assert_eq!(
+                    count, expected,
+                    "many-fragment range count mismatch: expected {expected}, got {count}"
+                );
+
+                b.to_async(rt).iter(|| {
+                    let index = index.clone();
+                    async move {
+                        black_box(
+                            index
+                                .search(&make_query(), &NoOpMetricsCollector)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_btree(c: &mut Criterion) {
     // Run equality benchmarks
     bench_equality(c);
@@ -691,6 +800,9 @@ fn bench_btree(c: &mut Criterion) {
     bench_range(c, Selectivity::Few);
     bench_range(c, Selectivity::Many);
     bench_range(c, Selectivity::Most);
+
+    // Run range benchmarks over pages that span many fragments
+    bench_range_many_fragments(c);
 }
 
 #[cfg(target_os = "linux")]

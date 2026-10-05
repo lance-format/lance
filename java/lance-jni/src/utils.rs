@@ -12,7 +12,8 @@ use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -88,6 +89,25 @@ pub(crate) fn parse_approx_mode(value: &str) -> Result<ApproxMode> {
     }
 }
 
+pub(crate) fn extract_file_writer_options(
+    env: &mut JNIEnv,
+    file_write_options: &JObject,
+) -> Result<Option<FileWriterOptions>> {
+    let data_cache_bytes =
+        env.get_optional_u64_from_method(file_write_options, "getDataCacheBytes")?;
+    let max_page_bytes = env.get_optional_u64_from_method(file_write_options, "getMaxPageBytes")?;
+
+    if data_cache_bytes.is_none() && max_page_bytes.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(FileWriterOptions {
+        data_cache_bytes,
+        max_page_bytes,
+        ..Default::default()
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -104,6 +124,7 @@ pub fn extract_write_params(
     target_bases: &JObject,                      // Optional<String>
     allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: &JObject,     // Optional<Long>
+    file_write_options: &JObject,                // FileWriteOptions
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -157,6 +178,7 @@ pub fn extract_write_params(
     if let Some(max_bytes) = env.get_long_opt(blob_pack_file_size_threshold)? {
         write_params.blob_pack_file_size_threshold = Some(max_bytes as usize);
     }
+    write_params.file_writer_options = extract_file_writer_options(env, file_write_options)?;
 
     // Create storage options accessor from static storage_options
     let accessor = if storage_options.is_empty() {
@@ -191,6 +213,10 @@ pub fn build_compaction_options(
     compaction_mode: &JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
     max_source_fragments: &JObject,            // Optional<Long>
+    max_source_rows: &JObject,                 // Optional<Long>
+    max_source_bytes: &JObject,                // Optional<Long>
+    excluded_fragment_ids: &JObject,           // List<Long>
+    data_storage_version: &JObject,            // Optional<String>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -233,6 +259,28 @@ pub fn build_compaction_options(
     }
     if let Some(max_source_fragments_val) = env.get_long_opt(max_source_fragments)? {
         compaction_options.max_source_fragments = Some(max_source_fragments_val as usize);
+    }
+    if let Some(max_source_rows_val) = env.get_long_opt(max_source_rows)? {
+        compaction_options.max_source_rows = Some(max_source_rows_val as usize);
+    }
+    if let Some(max_source_bytes_val) = env.get_long_opt(max_source_bytes)? {
+        compaction_options.max_source_bytes = Some(max_source_bytes_val as u64);
+    }
+    compaction_options.excluded_fragment_ids = env
+        .get_longs(excluded_fragment_ids)?
+        .into_iter()
+        .map(|fragment_id| {
+            u32::try_from(fragment_id).map_err(|_| {
+                Error::input_error(format!(
+                    "excluded_fragment_ids must contain values between 0 and {}, got {}",
+                    u32::MAX,
+                    fragment_id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(version) = env.get_string_opt(data_storage_version)? {
+        compaction_options.data_storage_version = Some(LanceFileVersion::from_str(&version)?);
     }
 
     Ok(compaction_options)

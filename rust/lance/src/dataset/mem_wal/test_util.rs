@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Test-only object store that injects WAL-write failures, for exercising the
-//! WAL persistence-failure fencing path.
+//! Test-only object store that injects WAL-write failures (for the WAL
+//! persistence-failure fencing path) and records the paths it serves (for
+//! asserting which opens actually resolved through a given `ObjectStoreParams`).
 
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
@@ -33,6 +35,10 @@ pub struct FailControls {
     simulate_lost_ack: AtomicBool,
     /// WAL-entry `put_opts` attempts observed, for assertions.
     wal_put_attempts: AtomicUsize,
+    /// Every location written through this store.
+    put_paths: StdMutex<Vec<String>>,
+    /// Every location read through this store.
+    get_paths: StdMutex<Vec<String>>,
 }
 
 impl FailControls {
@@ -48,6 +54,26 @@ impl FailControls {
     pub fn attempts(&self) -> usize {
         self.wal_put_attempts.load(Ordering::SeqCst)
     }
+
+    /// Did any write land on a path containing `needle`? An open that resolved
+    /// its store from other params never reaches this store, so a `false` here
+    /// means the params under test did not reach that open.
+    pub fn wrote_under(&self, needle: &str) -> bool {
+        self.put_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains(needle))
+    }
+
+    /// Did any read land on a path containing `needle`? See [`Self::wrote_under`].
+    pub fn read_under(&self, needle: &str) -> bool {
+        self.get_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains(needle))
+    }
 }
 
 /// Wraps the inner store with [`FailingObjectStore`] at construction.
@@ -62,6 +88,15 @@ impl WrappingObjectStore for FailingWrapper {
             inner: original,
             controls: self.controls.clone(),
         })
+    }
+
+    // Injects behaviour into every request, so a listing must not go around it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
     }
 }
 
@@ -101,6 +136,11 @@ impl OSObjectStore for FailingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
+        self.controls
+            .put_paths
+            .lock()
+            .unwrap()
+            .push(location.to_string());
         if Self::is_wal_entry(location) {
             self.controls
                 .wal_put_attempts
@@ -124,14 +164,30 @@ impl OSObjectStore for FailingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn MultipartUpload>> {
+        // Data files (`*.lance`) are written multipart, not via `put_opts`.
+        self.controls
+            .put_paths
+            .lock()
+            .unwrap()
+            .push(location.to_string());
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.controls
+            .get_paths
+            .lock()
+            .unwrap()
+            .push(location.to_string());
         self.inner.get_opts(location, options).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.controls
+            .get_paths
+            .lock()
+            .unwrap()
+            .push(location.to_string());
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -167,9 +223,11 @@ impl OSObjectStore for FailingObjectStore {
     }
 }
 
-/// Build an in-memory `ObjectStore` whose WAL-entry writes can be failed on
-/// demand. Returns the store, its base path, and the shared controls.
-pub async fn failing_memory_store() -> (Arc<ObjectStore>, Path, Arc<FailControls>) {
+/// `ObjectStoreParams` carrying the observable store wrapper, plus the controls
+/// to drive and inspect it. Open a dataset with these and every store resolved
+/// *from these params* — the base and any derived URI they are threaded to —
+/// reports its traffic back through the controls.
+pub fn observable_store_params() -> (ObjectStoreParams, Arc<FailControls>) {
     let controls = Arc::new(FailControls::default());
     let params = ObjectStoreParams {
         object_store_wrapper: Some(Arc::new(FailingWrapper {
@@ -177,6 +235,13 @@ pub async fn failing_memory_store() -> (Arc<ObjectStore>, Path, Arc<FailControls
         })),
         ..Default::default()
     };
+    (params, controls)
+}
+
+/// Build an in-memory `ObjectStore` whose WAL-entry writes can be failed on
+/// demand. Returns the store, its base path, and the shared controls.
+pub async fn failing_memory_store() -> (Arc<ObjectStore>, Path, Arc<FailControls>) {
+    let (params, controls) = observable_store_params();
     let (store, base) = ObjectStore::from_uri_and_params(
         Arc::new(ObjectStoreRegistry::default()),
         "memory:///",

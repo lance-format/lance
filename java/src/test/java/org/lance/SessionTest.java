@@ -19,6 +19,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -66,6 +68,135 @@ public class SessionTest {
       assertNotNull(session);
       assertFalse(session.isClosed());
     }
+  }
+
+  @Test
+  void testCreateSessionWithCacheBackendUris() {
+    try (Session session =
+        Session.builder()
+            .indexCacheBackend("moka://?capacity=1048576")
+            .metadataCacheBackend("moka://?capacity=524288")
+            .build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+      assertEquals(0, session.metadataCacheStats().getNumEntries());
+    }
+  }
+
+  @Test
+  void testCreateSessionWithStructuredCacheBackendConfigs() {
+    CacheBackendConfig indexBackend =
+        CacheBackendConfig.builder("moka").option("capacity", "1048576").build();
+    CacheBackendConfig metadataBackend =
+        CacheBackendConfig.builder("moka")
+            .options(Collections.singletonMap("capacity", "524288"))
+            .build();
+
+    assertEquals("moka", indexBackend.getKind());
+    assertEquals(Collections.singletonMap("capacity", "1048576"), indexBackend.getOptions());
+    assertThrows(
+        UnsupportedOperationException.class, () -> indexBackend.getOptions().put("capacity", "1"));
+
+    try (Session session =
+        Session.builder()
+            .indexCacheBackend(indexBackend)
+            .metadataCacheBackend(metadataBackend)
+            .build()) {
+      assertNotNull(session);
+      assertFalse(session.isClosed());
+    }
+  }
+
+  @Test
+  void testCacheBackendReplacesPreviousDescriptorForSameTier() {
+    CacheBackendConfig structuredBackend =
+        CacheBackendConfig.builder("moka").option("capacity", "1048576").build();
+
+    try (Session session =
+        Session.builder()
+            .indexCacheBackend("missing://")
+            .indexCacheBackend(structuredBackend)
+            .build()) {
+      assertNotNull(session);
+    }
+
+    try (Session session =
+        Session.builder()
+            .metadataCacheBackend(structuredBackend)
+            .metadataCacheBackend("moka://?capacity=1048576")
+            .build()) {
+      assertNotNull(session);
+    }
+  }
+
+  @Test
+  void testCacheBackendRejectsSizeAndBackend() {
+    IllegalArgumentException indexError =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Session.builder()
+                    .indexCacheSizeBytes(1024)
+                    .indexCacheBackend("moka://?capacity=1048576")
+                    .build());
+    assertTrue(
+        indexError
+            .getMessage()
+            .contains("indexCacheSizeBytes and indexCacheBackend are mutually exclusive"));
+
+    IllegalArgumentException metadataError =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Session.builder()
+                    .metadataCacheBackend(
+                        CacheBackendConfig.builder("moka").option("capacity", "1048576").build())
+                    .metadataCacheSizeBytes(1024)
+                    .build());
+    assertTrue(
+        metadataError
+            .getMessage()
+            .contains("metadataCacheSizeBytes and metadataCacheBackend are mutually exclusive"));
+  }
+
+  @Test
+  void testCacheBackendRejectsUnknownKind() {
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Session.builder().indexCacheBackend("missing://").build());
+    assertTrue(error.getMessage().contains("unknown cache backend kind"));
+  }
+
+  @Test
+  void testCacheBackendRejectsInvalidMokaConfig() {
+    IllegalArgumentException missingCapacity =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Session.builder().indexCacheBackend("moka://").build());
+    assertTrue(missingCapacity.getMessage().contains("capacity is required"));
+
+    IllegalArgumentException unknownOption =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Session.builder()
+                    .metadataCacheBackend(
+                        CacheBackendConfig.builder("moka").option("unknown", "value").build())
+                    .build());
+    assertTrue(unknownOption.getMessage().contains("unknown option"));
+  }
+
+  @Test
+  void testCacheBackendConfigValidatesInputs() {
+    assertThrows(NullPointerException.class, () -> CacheBackendConfig.builder(null));
+    assertThrows(IllegalArgumentException.class, () -> CacheBackendConfig.builder(""));
+    assertThrows(
+        NullPointerException.class,
+        () -> CacheBackendConfig.builder("moka").options((Map<String, String>) null));
+    assertThrows(
+        NullPointerException.class,
+        () -> CacheBackendConfig.builder("moka").option("capacity", null));
   }
 
   @Test
@@ -247,6 +378,39 @@ public class SessionTest {
   }
 
   @Test
+  void testCheckedOutDatasetsShareInternalSession(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_checkout_session").toString();
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset source = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        source.tags().create("version-one", Ref.ofMain(1));
+        Session sourceSession = source.session();
+
+        try (Dataset byVersion = source.checkoutVersion(1);
+            Dataset byTag = source.checkoutTag("version-one");
+            Dataset byRef = source.checkout(Ref.ofMain(1))) {
+          assertNotNull(byVersion.session());
+          assertNotNull(byTag.session());
+          assertNotNull(byRef.session());
+          assertTrue(byVersion.session().isSameAs(sourceSession));
+          assertTrue(byTag.session().isSameAs(sourceSession));
+          assertTrue(byRef.session().isSameAs(sourceSession));
+
+          source.close();
+          assertTrue(sourceSession.isClosed());
+          assertFalse(byVersion.session().isClosed());
+          assertFalse(byTag.session().isClosed());
+          assertFalse(byRef.session().isClosed());
+        }
+      }
+    }
+  }
+
+  @Test
   void testSessionToString() {
     try (Session session = Session.builder().build()) {
       String str = session.toString();
@@ -257,6 +421,49 @@ public class SessionTest {
     Session closedSession = Session.builder().build();
     closedSession.close();
     assertEquals("Session(closed)", closedSession.toString());
+  }
+
+  @Test
+  void testMetadataCacheStats(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_metadata_cache_stats").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      CacheStats initialStats = session.metadataCacheStats();
+      assertEquals(0, initialStats.getHits());
+      assertEquals(0, initialStats.getMisses());
+      assertEquals(0, initialStats.getNumEntries());
+      assertEquals(0, initialStats.getSizeBytes());
+      assertEquals(0.0, initialStats.getHitRatio());
+
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // First open populates the metadata cache, producing misses
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterFirstOpen = session.metadataCacheStats();
+      assertTrue(statsAfterFirstOpen.getMisses() > 0);
+      assertTrue(statsAfterFirstOpen.getNumEntries() > 0);
+      assertTrue(statsAfterFirstOpen.getSizeBytes() > 0);
+
+      // Reopening the same dataset should hit the shared metadata cache
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterSecondOpen = session.metadataCacheStats();
+      assertTrue(statsAfterSecondOpen.getHits() > statsAfterFirstOpen.getHits());
+      assertTrue(statsAfterSecondOpen.getHitRatio() > 0.0);
+
+      // Stats are not accessible once the session is closed (close is idempotent,
+      // so the implicit close from try-with-resources remains safe)
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
+    }
   }
 
   @Test

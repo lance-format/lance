@@ -24,12 +24,16 @@ public class MemTableStats {
   private final long estimatedSizeBytes;
   private final long generation;
   private final Optional<Long> maxBufferedBatchPosition;
-  private final Optional<Long> maxFlushedBatchPosition;
+  private final long durableBatchCount;
+  private final long globalOffset;
   private final Optional<Long> pendingWalStartBatchPosition;
   private final Optional<Long> pendingWalEndBatchPosition;
   private final long pendingWalBatchCount;
   private final long pendingWalRowCount;
   private final long pendingWalEstimatedBytes;
+  private final long indexBytes;
+  private final long graceBytes;
+  private final long retainedBytes;
 
   public MemTableStats(
       long rowCount,
@@ -37,23 +41,31 @@ public class MemTableStats {
       long estimatedSizeBytes,
       long generation,
       Long maxBufferedBatchPosition,
-      Long maxFlushedBatchPosition,
+      long durableBatchCount,
+      long globalOffset,
       Long pendingWalStartBatchPosition,
       Long pendingWalEndBatchPosition,
       long pendingWalBatchCount,
       long pendingWalRowCount,
-      long pendingWalEstimatedBytes) {
+      long pendingWalEstimatedBytes,
+      long indexBytes,
+      long graceBytes,
+      long retainedBytes) {
     this.rowCount = rowCount;
     this.batchCount = batchCount;
     this.estimatedSizeBytes = estimatedSizeBytes;
     this.generation = generation;
     this.maxBufferedBatchPosition = Optional.ofNullable(maxBufferedBatchPosition);
-    this.maxFlushedBatchPosition = Optional.ofNullable(maxFlushedBatchPosition);
+    this.durableBatchCount = durableBatchCount;
+    this.globalOffset = globalOffset;
     this.pendingWalStartBatchPosition = Optional.ofNullable(pendingWalStartBatchPosition);
     this.pendingWalEndBatchPosition = Optional.ofNullable(pendingWalEndBatchPosition);
     this.pendingWalBatchCount = pendingWalBatchCount;
     this.pendingWalRowCount = pendingWalRowCount;
     this.pendingWalEstimatedBytes = pendingWalEstimatedBytes;
+    this.indexBytes = indexBytes;
+    this.graceBytes = graceBytes;
+    this.retainedBytes = retainedBytes;
   }
 
   /** Number of rows currently buffered in the active MemTable. */
@@ -66,7 +78,10 @@ public class MemTableStats {
     return batchCount;
   }
 
-  /** Estimated in-memory size of the active MemTable, in bytes. */
+  /**
+   * Row-data bytes of the active MemTable: the unit the flush trigger measures. Its in-memory
+   * indexes are reported separately by {@link #indexBytes()} and are <em>not</em> included here.
+   */
   public long estimatedSizeBytes() {
     return estimatedSizeBytes;
   }
@@ -81,9 +96,17 @@ public class MemTableStats {
     return maxBufferedBatchPosition;
   }
 
-  /** Highest WAL batch position flushed from the MemTable, if any. */
-  public Optional<Long> maxFlushedBatchPosition() {
-    return maxFlushedBatchPosition;
+  /**
+   * Writer-global count of WAL-durable batches (exclusive; 0 means none). Compare against {@code
+   * globalOffset() + batchCount()} to see what this MemTable still owes the WAL.
+   */
+  public long durableBatchCount() {
+    return durableBatchCount;
+  }
+
+  /** Writer-global coordinate of this MemTable's batch 0. */
+  public long globalOffset() {
+    return globalOffset;
   }
 
   /** First WAL batch position pending flush, if any. */
@@ -111,6 +134,31 @@ public class MemTableStats {
     return pendingWalEstimatedBytes;
   }
 
+  /**
+   * Bytes held by the active MemTable's in-memory indexes, its primary-key bloom filter included.
+   * Usually what explains a shard near its ceiling with few rows in it: an HNSW graph is
+   * pre-allocated in full from the configured row capacity.
+   */
+  public long indexBytes() {
+    return indexBytes;
+  }
+
+  /**
+   * Bytes held by generations that have flushed but are lingering out the configured
+   * frozen-MemTable grace. Resident, but no flush reclaims them — the sweeper does, on a timer.
+   */
+  public long graceBytes() {
+    return graceBytes;
+  }
+
+  /**
+   * Every resident byte this shard holds. The figure a process-wide budget meters, as opposed to
+   * what a flush can still give back.
+   */
+  public long retainedBytes() {
+    return retainedBytes;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -119,12 +167,16 @@ public class MemTableStats {
         .add("estimatedSizeBytes", estimatedSizeBytes)
         .add("generation", generation)
         .add("maxBufferedBatchPosition", maxBufferedBatchPosition.orElse(null))
-        .add("maxFlushedBatchPosition", maxFlushedBatchPosition.orElse(null))
+        .add("durableBatchCount", durableBatchCount)
+        .add("globalOffset", globalOffset)
         .add("pendingWalStartBatchPosition", pendingWalStartBatchPosition.orElse(null))
         .add("pendingWalEndBatchPosition", pendingWalEndBatchPosition.orElse(null))
         .add("pendingWalBatchCount", pendingWalBatchCount)
         .add("pendingWalRowCount", pendingWalRowCount)
         .add("pendingWalEstimatedBytes", pendingWalEstimatedBytes)
+        .add("indexBytes", indexBytes)
+        .add("graceBytes", graceBytes)
+        .add("retainedBytes", retainedBytes)
         .toString();
   }
 }

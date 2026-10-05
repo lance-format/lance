@@ -6,14 +6,16 @@ use arrow_buffer::{BooleanBufferBuilder, bit_util};
 use crate::buffer::LanceBuffer;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+    require_block_payload,
 };
 use crate::data::{
-    BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
+    AllNullDataBlock, BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+    NullableDataBlock,
 };
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -321,17 +323,18 @@ impl ValueEncoder {
     fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> CompressiveEncoding {
         let mut inner = fsl.child.as_ref();
         let mut has_validity = false;
-        inner = match inner {
-            DataBlock::Nullable(nullable) => {
-                has_validity = true;
-                nullable.data.as_ref()
-            }
-            DataBlock::AllNull(_) => {
-                return ProtobufUtils21::constant(None);
-            }
-            _ => inner,
-        };
+        if let DataBlock::Nullable(nullable) = inner {
+            has_validity = true;
+            inner = nullable.data.as_ref();
+        }
         let inner_encoding = match inner {
+            // All inner values are null.  Reserve validity bits (has_validity=true) so that
+            // the decoder knows one validity byte per cum_dim items is stored per row.
+            // constant(None) signals that every stored item decodes to null.
+            DataBlock::AllNull(_) => {
+                has_validity = true;
+                ProtobufUtils21::constant(None)
+            }
             DataBlock::FixedWidth(fixed_width) => {
                 ProtobufUtils21::flat(fixed_width.bits_per_value, None)
             }
@@ -410,6 +413,19 @@ impl ValueEncoder {
                     break;
                 }
                 DataBlock::AllNull(_) => {
+                    // All inner values are null.  Add all-zero validity bits so that
+                    // bytes_per_row > 0 and the FullZip layout doesn't write bits_per_value=0,
+                    // which would crash the reader when there are also no ctrl-word bytes.
+                    bytes_per_row += cum_dim.div_ceil(8) as usize;
+                    validity_iters.push(PerValueFslValidityIter {
+                        buffer: LanceBuffer::from(vec![
+                            0u8;
+                            cum_dim.div_ceil(8) as usize
+                                * num_values as usize
+                        ]),
+                        bits_per_row: cum_dim as usize,
+                        offset: 0,
+                    });
                     data_bytes_per_row = 0;
                     data_buffer = LanceBuffer::empty();
                     break;
@@ -458,20 +474,26 @@ impl ValueEncoder {
 }
 
 impl BlockCompressor for ValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let data = match data {
-            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
-            _ => unimplemented!(
-                "Cannot compress block of type {} with ValueEncoder",
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(format!(
+                "ValueEncoder cannot compress a {} block",
                 data.name()
-            ),
+            )));
         };
-        Ok(data)
+        Ok((
+            Some(fixed_width.data),
+            ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+        ))
     }
 }
 
 impl MiniBlockCompressor for ValueEncoder {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
@@ -521,7 +543,7 @@ impl ValueDecompressor {
         }
     }
 
-    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Self {
+    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Result<Self> {
         let mut layers = Vec::new();
         let mut cum_dim = 1;
         let mut bytes_per_value = 0;
@@ -534,28 +556,45 @@ impl ValueDecompressor {
             if description.has_validity {
                 bytes_per_value += cum_dim.div_ceil(8);
             }
-            match description
+            let encoding = description
                 .values
                 .as_ref()
-                .unwrap()
+                .ok_or_else(|| Error::invalid_input("FSL encoding missing inner values field"))?
                 .compression
                 .as_ref()
-                .unwrap()
-            {
+                .ok_or_else(|| {
+                    Error::invalid_input("FSL encoding missing inner compression field")
+                })?;
+            match encoding {
                 Compression::FixedSizeList(inner) => {
                     description = inner;
                 }
                 Compression::Flat(flat) => {
                     let mut bits_per_value = bytes_per_value * 8;
                     bits_per_value += flat.bits_per_value * cum_dim;
-                    return Self {
+                    return Ok(Self {
                         bits_per_item: flat.bits_per_value,
                         bits_per_value,
                         items_per_value: cum_dim,
                         layers,
-                    };
+                    });
                 }
-                _ => unreachable!(),
+                // All inner values are null: only validity bytes are stored per row.
+                // bits_per_item=0 signals unzip_decompress to emit AllNull for the values.
+                Compression::Constant(_) => {
+                    return Ok(Self {
+                        bits_per_item: 0,
+                        bits_per_value: bytes_per_value * 8,
+                        items_per_value: cum_dim,
+                        layers,
+                    });
+                }
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "Unexpected inner encoding type in FSL descriptor: {:?}",
+                        encoding
+                    )));
+                }
             }
         }
     }
@@ -571,7 +610,8 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Flat block")?;
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
@@ -605,6 +645,15 @@ impl MiniBlockDecompressor for ValueDecompressor {
 
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
+    }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
     }
 }
 
@@ -690,12 +739,23 @@ impl ValueDecompressor {
         }
 
         // Finally, restore the structure
-        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bits_per_item,
-            num_values: num_items as u64,
-            data: LanceBuffer::from(data_buffer),
-            block_info: BlockInfo::new(),
-        });
+        //
+        // bits_per_item=0 means the terminal encoding is constant-null (all inner values
+        // are null and only validity bits were stored).  Use AllNull so that into_arrow
+        // produces a properly typed all-null array without a zero-width data buffer.
+        let mut block = if self.bits_per_item == 0 {
+            debug_assert!(data_buffer.is_empty());
+            DataBlock::AllNull(AllNullDataBlock {
+                num_values: num_items as u64,
+            })
+        } else {
+            DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: self.bits_per_item,
+                num_values: num_items as u64,
+                data: LanceBuffer::from(data_buffer),
+                block_info: BlockInfo::new(),
+            })
+        };
 
         let mut validity_bufs = buffer_builders
             .into_iter()
@@ -734,6 +794,15 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     fn bits_per_value(&self) -> u64 {
         self.bits_per_value
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl PerValueCompressor for ValueEncoder {
@@ -756,10 +825,7 @@ impl PerValueCompressor for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, LazyLock},
-    };
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
@@ -767,7 +833,7 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, Seed, array, gen_batch};
 
     use crate::{
         compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
@@ -775,19 +841,21 @@ mod tests {
         encodings::{
             logical::primitive::{
                 fullzip::{PerValueCompressor, PerValueDataBlock},
-                miniblock::MiniBlockCompressor,
+                miniblock::{MiniBlockCompressionContext, MiniBlockCompressor},
             },
             physical::value::ValueDecompressor,
         },
         format::pb21::compressive_encoding::Compression,
         testing::{
-            FnArrayGeneratorProvider, TestCases, check_basic_random,
-            check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
+            TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
         },
-        version::LanceFileVersion,
     };
 
     use super::ValueEncoder;
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -834,7 +902,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
@@ -845,89 +913,114 @@ mod tests {
             (0..5000).map(|i| if i % 2 == 0 { Some(i) } else { None }),
         ));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_value_primitive() {
-        for data_type in PRIMITIVE_TYPES {
+        const NUM_ROWS: u32 = 1025;
+
+        let test_cases = TestCases::default()
+            .with_batch_size(NUM_ROWS)
+            .with_page_sizes(vec![4096])
+            .with_expected_encoding("flat");
+        let value_metadata =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+
+        for (seed, data_type) in PRIMITIVE_TYPES.iter().enumerate() {
             log::info!("Testing encoding for {:?}", data_type);
-            let field = Field::new("", data_type.clone(), false);
-            check_basic_random(field).await;
+            let data = gen_batch()
+                .with_seed(Seed::from(seed as u64))
+                .anon_col(array::rand_type(data_type))
+                .into_batch_rows(RowCount::from(NUM_ROWS as u64))
+                .unwrap()
+                .column(0)
+                .clone();
+
+            check_round_trip_encoding_of_data(vec![data], &test_cases, value_metadata.clone())
+                .await;
         }
     }
 
-    static LARGE_TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
-        vec![DataType::FixedSizeList(
-            Arc::new(Field::new("", DataType::Int32, false)),
-            128,
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_large_primitive(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
         )]
-    });
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_primitive() {
-        for data_type in LARGE_TYPES.iter() {
-            log::info!("Testing encoding for {:?}", data_type);
-            let field = Field::new("", data_type.clone(), false);
-            check_basic_random(field).await;
-        }
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let data_type =
+            DataType::FixedSizeList(Arc::new(Field::new("", DataType::Int32, false)), 128);
+        let field = Field::new("", data_type, false);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_decimal128_dictionary_encoding() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+    async fn test_decimal128_dictionary_encoding(
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        let test_cases = TestCases::default()
+            .with_encoding(encoding)
+            .with_expected_encoding("dictionary");
         let decimals: Vec<i32> = (0..100).collect();
         let repeated_strings: Vec<_> = decimals
             .iter()
             .cycle()
-            .take(decimals.len() * 10000)
+            .take(decimals.len() * 1000)
             .map(|&v| Some(v as i128))
             .collect();
         let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_miniblock_stress() {
+    async fn test_miniblock_stress(
+        #[values(false, true)] mixed_validity: bool,
+        #[values(10, 100, 1500, 15000)] batch_size: u32,
+        #[values(1000, 2000, 3000, 60000)] page_size: u64,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         // Tests for strange page sizes and batch sizes and validity scenarios for miniblock
 
-        // 10K integers, 100 per array, all valid
-        let data1 = (0..100)
-            .map(|_| Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>)
-            .collect::<Vec<_>>();
-
-        // Same as above but with mixed validity
-        let data2 = (0..100)
+        // 10K integers, 100 per array, either all valid or mixed validity.
+        let data = (0..100)
             .map(|_| {
-                Arc::new(Int32Array::from_iter(
-                    (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
-                )) as Arc<dyn Array>
+                if mixed_validity {
+                    Arc::new(Int32Array::from_iter(
+                        (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+                    )) as Arc<dyn Array>
+                } else {
+                    Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>
+                }
             })
             .collect::<Vec<_>>();
 
-        // Same as above but with all null for first half then all valid
-        // TODO: Re-enable once the all-null path is complete
-        let _data3 = (0..100)
-            .map(|chunk_idx| {
-                Arc::new(Int32Array::from_iter(
-                    (0..100).map(|i| if chunk_idx < 50 { None } else { Some(i) }),
-                )) as Arc<dyn Array>
-            })
-            .collect::<Vec<_>>();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![page_size])
+            .with_batch_size(batch_size)
+            .with_encoding(encoding);
 
-        for data in [data1, data2 /*data3*/] {
-            for batch_size in [10, 100, 1500, 15000] {
-                // 40000 bytes of data
-                let test_cases = TestCases::default()
-                    .with_page_sizes(vec![1000, 2000, 3000, 60000])
-                    .with_batch_size(batch_size)
-                    .with_min_file_version(LanceFileVersion::V2_1);
-
-                check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
-            }
-        }
+        check_round_trip_encoding_of_data(data, &test_cases, HashMap::new()).await;
     }
 
     fn create_simple_fsl() -> FixedSizeListArray {
@@ -969,7 +1062,8 @@ mod tests {
         let starting_data = DataBlock::from_array(sample_list.clone());
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 3);
@@ -981,7 +1075,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let decompressed =
             MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
@@ -1030,7 +1124,7 @@ mod tests {
         let starting_data = DataBlock::from_array(array);
 
         let encoder = ValueEncoder::default();
-        let result = MiniBlockCompressor::compress(&encoder, starting_data);
+        let result = MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data);
 
         let err = result.expect_err("wide values should not be encodable as miniblock");
         assert!(
@@ -1069,9 +1163,14 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let num_values = data.num_values;
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_values),
+            None,
+            "nullable FSL output uses multiple buffers and requires the fallback estimate"
+        );
         let decompressed =
             FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
 
@@ -1092,10 +1191,27 @@ mod tests {
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    // Regression: nullable_per_value_fsl wrote bits_per_value=0 when the child block was
+    // AllNull but the FSL had no outer null buffer (no ctrl-word bytes), making
+    // total_bytes_per_value=0 and crashing the reader with "per-row byte width must be > 0".
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_nullable_child_all_null_no_outer_nulls() {
+        // FSL<nullable Float32, dim=4>, 2 outer rows, no outer null buffer, all 8 child
+        // Float32 values are null.  DataBlock::from_arrays returns AllNull for the child,
+        // which routes into nullable_per_value_fsl.  Without this fix the encoder writes
+        // bits_per_value=0 and the decoder errors on read.
+        let items = new_null_array(&DataType::Float32, 8);
+        let items_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl = FixedSizeListArray::new(items_field, 4, items, None);
+
+        let test_cases = TestCases::default().with_structural_encodings();
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1110,7 +1226,7 @@ mod tests {
         let list_arr = ListArray::new(list_field, OffsetBuffer::new(offsets), Arc::new(fsl), None);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_structural_encodings()
             .with_batch_size(1);
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
@@ -1142,13 +1258,14 @@ mod tests {
         );
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let decompressed =
             MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
@@ -1178,7 +1295,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let PerValueDataBlock::Fixed(data) = data else {
             panic!()
@@ -1197,18 +1314,43 @@ mod tests {
         assert_eq!(decompressed.as_ref(), sample_array.as_ref());
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fsl_nullable_items() {
-        let datagen = Box::new(FnArrayGeneratorProvider::new(move || {
-            lance_datagen::array::rand_vec_nullable::<UInt32Type>(Dimension::from(128), 0.5)
-        }));
+    async fn test_fsl_nullable_items(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        let mut generator =
+            gen_batch()
+                .with_seed(Seed::from(0))
+                .anon_col(array::rand_vec_nullable::<UInt32Type>(
+                    Dimension::from(128),
+                    0.5,
+                ));
+        generator.with_random_nulls(0.2);
+        let source = generator
+            .into_batch_rows(RowCount::from(1026))
+            .unwrap()
+            .column(0)
+            .clone();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![4096])
+            .with_encoding(encoding)
+            .with_batch_size(257)
+            .with_range(510..515)
+            .with_indices(vec![0, 511, 512, 1024]);
 
-        let field = Field::new(
-            "",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, true)), 128),
-            false,
-        );
-        check_round_trip_encoding_generated(field, datagen, TestCases::default()).await;
+        check_round_trip_encoding_of_data(
+            vec![source.slice(1, 512), source.slice(513, 513)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1217,7 +1359,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("flat")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both explicit configuration and automatic fallback scenarios
         // 1. Test explicit "none" compression to force flat encoding

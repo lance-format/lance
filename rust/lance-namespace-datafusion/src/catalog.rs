@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -53,10 +52,6 @@ impl LanceCatalogProviderList {
 }
 
 impl CatalogProviderList for LanceCatalogProviderList {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Adds a new catalog to this catalog list.
     /// If a catalog of the same name existed before, it is replaced in the list and returned.
     fn register_catalog(
@@ -116,10 +111,6 @@ impl LanceCatalogProvider {
 }
 
 impl CatalogProvider for LanceCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas
             .iter()

@@ -9,8 +9,8 @@ dataset via an LSM-tree structure.  Data flows through three levels:
 
 1. **WAL** – append-only durable log (raw writes)
 2. **Active MemTable** – in-memory write buffer
-3. **Flushed MemTable** – Lance files written to object store
-4. **Base table** – canonical Lance dataset files (after merge_insert)
+3. **SSTable** – Lance files written to object store
+4. **Base table** – canonical Lance dataset files (after SSTable compaction)
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 import pyarrow as pa
 
 from .lance import (
+    _CompactedSsTable,
     _evaluate_sharding_spec,
     _ExecutionPlan,
     _LsmPointLookupPlanner,
     _LsmScanner,
     _LsmVectorSearchPlanner,
-    _MergedGeneration,
     _ShardSnapshot,
     _ShardWriter,
 )
@@ -40,7 +40,7 @@ __all__ = [
     "ShardingField",
     "ShardingSpec",
     "evaluate_sharding_spec",
-    "MergedGeneration",
+    "CompactedSsTable",
     "ShardSnapshot",
     "ShardWriter",
     "LsmScanner",
@@ -124,19 +124,19 @@ def _sharding_spec_to_dict(spec: Union[ShardingSpec, Mapping[str, object]]) -> d
 
 
 @dataclass
-class MergedGeneration:
-    """Identifies a flushed MemWAL generation that has been merged.
+class CompactedSsTable:
+    """Points to an SSTable compacted into the base table.
 
-    Pass a list of these to mark_generations_as_merged
-    so Lance knows which generations are now in the base table.
+    Pass a list of these to mark_sstables_as_compacted
+    so Lance can record compaction progress.
 
     Parameters
     ----------
     shard_id : str
         UUID string for the write shard.
     generation : int
-        Generation number (from
-        :attr:`ShardSnapshot.flushed_generations`).
+        Generation number of the compacted SSTable (as passed to
+        :meth:`ShardSnapshot.with_sstable`).
     """
 
     shard_id: str
@@ -170,9 +170,9 @@ class ShardSnapshot:
         self._raw = self._raw.with_current_generation(generation)
         return self
 
-    def with_flushed_generation(self, generation: int, path: str) -> "ShardSnapshot":
-        """Add a flushed generation with its storage path."""
-        self._raw = self._raw.with_flushed_generation(generation, path)
+    def with_sstable(self, generation: int, path: str) -> "ShardSnapshot":
+        """Add an SSTable with its storage path."""
+        self._raw = self._raw.with_sstable(generation, path)
         return self
 
     def __repr__(self) -> str:
@@ -283,7 +283,7 @@ class ShardWriter:
         -------
         dict
             Keys: ``row_count``, ``batch_count``, ``estimated_size_bytes``,
-            ``generation``.
+            ``generation``, ``frozen_count``, ``frozen_bytes``.
         """
         return self._raw.memtable_stats()
 
@@ -292,7 +292,7 @@ class ShardWriter:
     ) -> "LsmScanner":
         """Create an LSM scanner that includes the active MemTable.
 
-        This scanner covers the base table, the given flushed generations,
+        This scanner covers the base table, the given SSTables,
         and the current active MemTable — providing strong read-your-writes
         consistency.
 
@@ -321,10 +321,10 @@ class LsmScanner:
     """LSM-aware scanner covering all data levels.
 
     Deduplicates by primary key, always returning the newest version of
-    each row across base table, flushed MemTables, and the active MemTable.
+    each row across base table, SSTables, and the active MemTable.
 
     Obtain an instance from `ShardWriter.lsm_scanner` (includes
-    active MemTable) or `LsmScanner.from_snapshots` (flushed only).
+    active MemTable) or `LsmScanner.from_snapshots` (SSTables only).
 
     The builder methods (`project`, `filter`, `limit`)
     return ``self`` for chaining.
@@ -354,7 +354,7 @@ class LsmScanner:
         dataset : LanceDataset
             The base dataset to scan.
         shard_snapshots : list of ShardSnapshot
-            Shard snapshots specifying flushed generations to include.
+            Shard snapshots specifying SSTables to include.
         """
         raw = _LsmScanner.from_snapshots(dataset._ds, [s._raw for s in shard_snapshots])
         return LsmScanner(raw)
@@ -456,7 +456,7 @@ class LsmPointLookupPlanner:
     dataset : LanceDataset
         The base dataset.
     shard_snapshots : list of ShardSnapshot
-        Shard snapshots specifying flushed generations to include.
+        Shard snapshots specifying SSTables to include.
     pk_columns : list of str, optional
         Primary key column names.  Inferred from schema metadata if omitted.
 
@@ -515,7 +515,7 @@ class LsmVectorSearchPlanner:
     dataset : LanceDataset
         The base dataset.
     shard_snapshots : list of ShardSnapshot
-        Shard snapshots specifying flushed generations to include.
+        Shard snapshots specifying SSTables to include.
     vector_column : str
         Name of the ``FixedSizeList<float32>`` vector column.
     pk_columns : list of str, optional
@@ -627,8 +627,8 @@ def _unwrap_shard_id(shard_id: str) -> str:
     return shard_id
 
 
-def _to_raw_merged_generations(
-    generations: Iterable[MergedGeneration],
+def _to_raw_compacted_sstables(
+    sstables: Iterable[CompactedSsTable],
 ) -> list:
-    """Convert Python MergedGeneration list to PyO3 _MergedGeneration list."""
-    return [_MergedGeneration(g.shard_id, g.generation) for g in generations]
+    """Convert Python CompactedSsTable list to PyO3 _CompactedSsTable list."""
+    return [_CompactedSsTable(s.shard_id, s.generation) for s in sstables]

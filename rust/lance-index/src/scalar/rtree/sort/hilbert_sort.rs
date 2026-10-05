@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
 use crate::scalar::rtree::sort::Sorter;
 use arrow_array::{ArrayRef, UInt32Array};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Field as ArrowField, Field};
@@ -19,9 +18,9 @@ use datafusion_physical_expr::expressions::Column as DFColumn;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use geoarrow_array::array::from_arrow_array;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
+use lance_core::Result;
 use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
 use lance_geo::bbox::{BoundingBox, bounding_box};
-use std::any::Any;
 use std::sync::Arc;
 
 const HILBERT_FIELD_NAME: &str = "_hilbert";
@@ -149,10 +148,6 @@ impl HilbertUDF {
 }
 
 impl ScalarUDFImpl for HilbertUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         HILBERT_UDF_NAME
     }

@@ -12,6 +12,39 @@ ${system data directory}/lance/language_models
 It also supports configuring user dictionaries,
 which makes it convenient for users to expand their own dictionaries without retraining the language models.
 
+## Inspect Query Tokenization
+
+Use `lance.tokenize` to inspect the tokens that a full-text query will produce
+without creating a dataset or index:
+
+```python
+import lance
+
+tokens = lance.tokenize("the Cats and Dogs")
+[(token.text, token.position) for token in tokens]
+# [("cat", 0), ("dog", 2)]
+```
+
+Positions start at the first retained query token and preserve gaps left by stop
+word removal and other filters. This is the same representation used for phrase
+matching. The function accepts the tokenizer-related options supported by
+`LanceDataset.create_scalar_index`, including custom stop words, n-grams, and the
+code analyzer:
+
+```python
+tokens = lance.tokenize(
+    "getUserName::value42",
+    analyzer="code",
+    split_identifiers=True,
+    index_operators=True,
+)
+```
+
+Options set to `None` use the selected analyzer profile's default. For example,
+the code analyzer disables stemming and stop-word removal unless explicitly
+overridden. The exception is `max_token_length`: omitting it keeps the default
+length limit of 40, while `max_token_length=None` disables the limit.
+
 ## ICU Tokenizer
 
 ICU uses Unicode word boundary rules and bundled dictionary data for complex scripts. It is useful for mixed-language text and does not require downloading a language model.
@@ -54,7 +87,7 @@ Create a file named config.json in the root directory of the current model.
 ```
 
 - The "main" field is optional. If not filled, the default is "dict.txt".
-- "users" is the path of the user dictionary. For the format of the user dictionary, please refer to https://github.com/messense/jieba-rs/blob/main/src/data/dict.txt.
+- "users" is the path of the user dictionary. For the format of the user dictionary, please refer to https://github.com/messense/jieba-rs/blob/main/jieba/src/data/dict.txt.
 
 ## Language Models of Lindera
 

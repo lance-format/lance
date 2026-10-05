@@ -70,6 +70,26 @@ enum TaskState {
     },
 }
 
+impl TaskState {
+    fn backpressure_reservation(&self) -> Option<BackpressureReservation> {
+        match self {
+            Self::Reserved {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Running {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Finished {
+                backpressure_reservation,
+                ..
+            } => Some(*backpressure_reservation),
+            Self::Initial { .. } | Self::Broken => None,
+        }
+    }
+}
+
 /// A custom error type that might have a backpressure reservation
 ///
 /// This is used instead of Lance's standard error type so we can ensure
@@ -88,25 +108,14 @@ impl BrokenTaskError {
     // This will capture any backpressure reservation the task has and put it into the
     // error so we make sure to release it when returning the error.
     fn new(task_state: TaskState, message: String) -> Self {
-        match task_state {
-            TaskState::Reserved {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Running {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Finished {
-                backpressure_reservation,
-                ..
-            } => Self {
-                message,
-                backpressure_reservation: Some(backpressure_reservation),
-            },
-            TaskState::Broken | TaskState::Initial { .. } => Self {
+        match task_state.backpressure_reservation() {
+            None => Self {
                 message,
                 backpressure_reservation: None,
+            },
+            Some(reservation) => Self {
+                message,
+                backpressure_reservation: Some(reservation),
             },
         }
     }
@@ -600,9 +609,11 @@ impl IoQueue {
             let mut task_result = TaskResult::Ok(());
             while !state_ref.pending_tasks.is_empty() {
                 // Unwrap safe here since we just checked the queue is not empty
-                let next_task = state_ref.pending_tasks.peek().unwrap();
-                let Some(task) = state_ref.tasks.get_mut(&next_task.task_id) else {
-                    log::warn!("Task with id {} was lost", next_task.task_id);
+                let task_id = state_ref.pending_tasks.peek().unwrap().task_id;
+                let Some(task) = state_ref.tasks.get_mut(&task_id) else {
+                    // The caller dropped this task's handle (see `abandon`); discard the
+                    // stale queue entry instead of spinning on it.
+                    state_ref.pending_tasks.pop();
                     continue;
                 };
                 if !task.is_reserved() {
@@ -665,6 +676,26 @@ impl IoQueue {
         };
         emit_scheduler_state_event(event, &self.stats);
     }
+
+    // Called when a caller drops a task's handle before the task finishes.  Removes
+    // the task and returns any backpressure reservation it holds to the budget, then
+    // re-checks the queue so newly-affordable tasks can start.  Unlike the standard
+    // release path (`poll`), this runs without the task being polled to completion,
+    // so a cancelled read does not leak its reservation.
+    fn abandon(&self, task_id: u64) {
+        let mut state = self.state.lock().unwrap();
+        let Some(task) = state.tasks.remove(&task_id) else {
+            // Already consumed by `poll`; nothing to release.
+            return;
+        };
+
+        if let Some(reservation) = task.state.backpressure_reservation() {
+            state.backpressure_throttle.release(reservation);
+        }
+        // Freed budget may make queued tasks runnable; there is no caller to surface
+        // an error to here.
+        let _ = self.on_task_complete(state);
+    }
 }
 
 pub(super) struct TaskHandle {
@@ -676,6 +707,12 @@ impl Future for TaskHandle {
     type Output = Result<Bytes>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.queue.poll(self.task_id, cx)
+    }
+}
+
+impl Drop for TaskHandle {
+    fn drop(&mut self) {
+        self.queue.abandon(self.task_id);
     }
 }
 

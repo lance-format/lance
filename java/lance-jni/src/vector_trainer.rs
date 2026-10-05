@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::RT;
+use crate::block_on;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -122,7 +122,7 @@ fn inner_train_ivf_centroids<'local>(
 
         let dim = get_vector_dim(dataset.schema(), &column)?;
 
-        let ivf_model = RT.block_on(lance::index::vector::ivf::build_ivf_model(
+        let ivf_model = block_on(lance::index::vector::ivf::build_ivf_model(
             dataset,
             &column,
             dim,
@@ -185,7 +185,7 @@ fn inner_train_pq_codebook<'local>(
 
         let dim = get_vector_dim(dataset.schema(), &column)?;
 
-        let pq = RT.block_on(lance::index::vector::pq::build_pq_model(
+        let pq = block_on(lance::index::vector::pq::build_pq_model(
             dataset,
             &column,
             dim,

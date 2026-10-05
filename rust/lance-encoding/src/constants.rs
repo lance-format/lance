@@ -55,6 +55,8 @@ pub const STRUCTURAL_ENCODING_META_KEY: &str = "lance-encoding:structural-encodi
 pub const STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
 /// Value for fullzip structural encoding
 pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
+/// Value for sparse structural encoding
+pub const STRUCTURAL_ENCODING_SPARSE: &str = "sparse";
 
 // Byte stream split metadata keys
 /// Metadata key for byte stream split encoding configuration

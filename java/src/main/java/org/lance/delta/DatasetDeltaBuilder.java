@@ -15,6 +15,7 @@ package org.lance.delta;
 
 import org.lance.Dataset;
 import org.lance.JniLoader;
+import org.lance.LockManager;
 
 import java.util.Optional;
 
@@ -71,7 +72,9 @@ public class DatasetDeltaBuilder {
 
   /** Build the DatasetDelta after validating builder state. */
   public DatasetDelta build() {
-    return nativeBuild(dataset, comparedAgainst, beginVersion, endVersion);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeBuild(dataset, comparedAgainst, beginVersion, endVersion);
+    }
   }
 
   private static native DatasetDelta nativeBuild(

@@ -5,13 +5,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use lance_core::cache::CacheBackend;
 
 use super::refs::{Branches, Ref, Refs, check_valid_branch, normalize_branch, standardize_branch};
+use super::versions;
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{Dataset, Error, Result, session::Session};
-use futures::FutureExt;
+use futures::{FutureExt, TryStreamExt};
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
-use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
     DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -20,9 +20,10 @@ use lance_io::object_store::{
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
-    format::Manifest,
+    feature_flags::ensure_can_read_manifest,
+    format::{Manifest, populate_manifest_schema_dictionaries},
     io::commit::external_manifest::ExternalManifestCommitHandler,
-    io::commit::{CommitHandler, commit_handler_from_url},
+    io::commit::{CommitHandler, ManifestLocation, commit_handler_from_url},
 };
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
@@ -600,6 +601,36 @@ impl DatasetBuilder {
         Ok((object_store, base_path, commit_handler))
     }
 
+    /// List manifest locations without reading the manifest contents.
+    ///
+    /// The returned locations are not guaranteed to be ordered. This operation may list and
+    /// materialize the full manifest history. Explicit version, branch, and tag targets are not
+    /// supported. Custom commit handlers and externally managed version stores are also not
+    /// supported because listing physical manifest objects may omit committed versions whose
+    /// authoritative locations are held outside the object store.
+    pub async fn list_manifest_locations(mut self) -> Result<Vec<ManifestLocation>> {
+        if self.version.is_some() {
+            return Err(Error::invalid_input(
+                "list_manifest_locations does not support an explicit version, branch, or tag",
+            ));
+        }
+        let uses_external_or_custom_commit_handler = self.commit_handler.is_some()
+            || self.namespace_managed.is_some()
+            || Url::parse(&self.table_uri).is_ok_and(|url| url.scheme() == "s3+ddb");
+        if uses_external_or_custom_commit_handler {
+            return Err(Error::not_supported(
+                "list_manifest_locations does not support external or custom commit handlers; \
+                 object-store listing may omit committed manifest locations",
+            ));
+        }
+        self.apply_storage_options_override();
+        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        commit_handler
+            .list_manifest_locations(&base_path, object_store.as_ref(), false)
+            .try_collect()
+            .await
+    }
+
     #[instrument(skip_all)]
     pub async fn load(self) -> Result<Dataset> {
         let uri = self.table_uri.clone();
@@ -646,12 +677,16 @@ impl DatasetBuilder {
         merged_params
     }
 
+    fn apply_storage_options_override(&mut self) {
+        if let Some(override_options) = self.storage_options_override.take() {
+            self.options =
+                Self::merge_store_params_with_storage_options(&self.options, &override_options);
+        }
+    }
+
     async fn load_impl(mut self) -> Result<Dataset> {
         // Apply storage_options_override to merge namespace client options with any existing accessor
-        if let Some(override_opts) = self.storage_options_override.take() {
-            self.options =
-                Self::merge_store_params_with_storage_options(&self.options, &override_opts);
-        }
+        self.apply_storage_options_override();
 
         let index_cache_backend = self.index_cache_backend.take();
         let session = match self.session.as_ref() {
@@ -770,12 +805,20 @@ impl DatasetBuilder {
             (base_path, table_uri)
         };
 
+        // A delayed checkout resolves (branch, version) against the right chain
+        // afterwards, so the uri's chain only needs its latest version here: the
+        // requested version number may not exist on that chain at all.
+        let load_version = if need_delay_checkout {
+            None
+        } else {
+            version_number
+        };
         let dataset = Self::load_by_uri(
             session,
             manifest,
             file_reader_options,
             table_uri,
-            version_number,
+            load_version,
             object_store,
             base_path,
             commit_handler,
@@ -805,7 +848,10 @@ impl DatasetBuilder {
                 version_number = Some(tag_content.version);
             }
 
-            if branch.as_deref() != dataset.manifest.branch.as_deref() {
+            let branch_differs = branch.as_deref() != dataset.manifest.branch.as_deref();
+            let version_differs =
+                version_number.is_some() && version_number != Some(dataset.manifest.version);
+            if branch_differs || version_differs {
                 return dataset
                     .checkout_version((branch.as_deref(), version_number))
                     .await;
@@ -835,12 +881,14 @@ impl DatasetBuilder {
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
+            ensure_can_read_manifest(&manifest)?;
+            versions::check_manifest_storage_version(&mut manifest)?;
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;
-            if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
+            if manifest.schema.has_dictionary_types() {
                 let reader = object_store.open(&location.path).await?;
-                populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+                populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
             }
             (Arc::new(manifest), location)
         } else {
@@ -898,5 +946,99 @@ impl DatasetBuilder {
             store_params,
             base_store_params,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use lance_io::object_store::StorageOptionsProvider;
+    use lance_table::io::commit::UnsafeCommitHandler;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestStorageOptionsProvider;
+
+    #[derive(Debug)]
+    struct TestNamespace;
+
+    #[async_trait]
+    impl LanceNamespace for TestNamespace {
+        fn namespace_id(&self) -> String {
+            "test-namespace".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for TestStorageOptionsProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            Ok(None)
+        }
+
+        fn provider_id(&self) -> String {
+            "test-storage-options-provider".to_string()
+        }
+    }
+
+    #[test]
+    fn test_storage_options_override_wins_and_preserves_provider() {
+        let caller_options = HashMap::from([
+            ("endpoint".to_string(), "caller".to_string()),
+            ("caller-only".to_string(), "caller-value".to_string()),
+        ]);
+        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(TestStorageOptionsProvider);
+        let options = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(caller_options, provider),
+            )),
+            ..Default::default()
+        };
+        let mut builder = DatasetBuilder::from_uri("memory://table").with_store_params(options);
+        builder.storage_options_override = Some(HashMap::from([
+            ("endpoint".to_string(), "namespace".to_string()),
+            ("namespace-only".to_string(), "namespace-value".to_string()),
+        ]));
+
+        builder.apply_storage_options_override();
+
+        let merged = builder.options.storage_options().unwrap();
+        assert_eq!(merged.get("endpoint").unwrap(), "namespace");
+        assert_eq!(merged.get("caller-only").unwrap(), "caller-value");
+        assert_eq!(merged.get("namespace-only").unwrap(), "namespace-value");
+        assert_eq!(
+            builder
+                .options
+                .get_accessor()
+                .unwrap()
+                .provider()
+                .unwrap()
+                .provider_id(),
+            "test-storage-options-provider"
+        );
+        assert!(builder.storage_options_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_manifest_locations_rejects_external_and_custom_commit_handlers() {
+        let mut namespace_builder = DatasetBuilder::from_uri("memory://namespace-table");
+        namespace_builder.namespace_managed =
+            Some((Arc::new(TestNamespace), vec!["namespace-table".to_string()]));
+
+        let builders = [
+            DatasetBuilder::from_uri("memory://custom-handler-table")
+                .with_commit_handler(Arc::new(UnsafeCommitHandler)),
+            DatasetBuilder::from_uri("s3+ddb://bucket/table.lance?ddbTableName=manifest-table"),
+            namespace_builder,
+        ];
+
+        for builder in builders {
+            let err = builder.list_manifest_locations().await.unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }));
+            assert!(
+                err.to_string()
+                    .contains("does not support external or custom commit handlers")
+            );
+        }
     }
 }

@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{Error, Result};
 
@@ -65,7 +65,7 @@ impl FieldEncoder for FixedSizeListStructuralEncoder {
         } else {
             deep_copy_nulls(array.nulls())
         };
-        repdef.add_fsl(validity.clone(), dimension, num_rows as usize);
+        repdef.add_fsl(validity.clone(), dimension, fsl_arr.len());
 
         // FSL forces child elements to exist even under null rows. Normalize any
         // nested lists under null FSL rows to null empty lists.
@@ -123,6 +123,27 @@ impl StructuralFixedSizeListScheduler {
             dimension: dimension as u64,
         }
     }
+
+    fn child_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Range<u64>>> {
+        ranges
+            .iter()
+            .map(|range| {
+                let start = range.start.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list child range start overflowed: {} * {}",
+                        range.start, self.dimension
+                    ))
+                })?;
+                let end = range.end.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list child range end overflowed: {} * {}",
+                        range.end, self.dimension
+                    ))
+                })?;
+                Ok(start..end)
+            })
+            .collect()
+    }
 }
 
 impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
@@ -132,10 +153,7 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
         filter: &FilterExpression,
     ) -> Result<Box<dyn StructuralSchedulingJob + 'a>> {
         // Scale ranges by dimension for the child - each FSL row becomes `dimension` child rows
-        let child_ranges: Vec<Range<u64>> = ranges
-            .iter()
-            .map(|r| (r.start * self.dimension)..(r.end * self.dimension))
-            .collect();
+        let child_ranges = self.child_ranges(ranges)?;
         let child = self.child.schedule_ranges(&child_ranges, filter)?;
         Ok(Box::new(StructuralFixedSizeListSchedulingJob::new(
             child,
@@ -145,10 +163,21 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        let child_ranges = match requested_ranges.map(|ranges| self.child_ranges(ranges)) {
+            Some(Ok(child_ranges)) => Some(child_ranges),
+            Some(Err(error)) => return std::future::ready(Err(error)).boxed(),
+            None => None,
+        };
+        async move {
+            self.child
+                .initialize(child_ranges.as_deref(), filter, context)
+                .await
+        }
+        .boxed()
     }
 }
 
@@ -255,7 +284,7 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
                 let num_rows = self.num_rows as usize;
-                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize);
+                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize)?;
                 let fsl_array = arrow_array::FixedSizeListArray::try_new(
                     child_field.clone(),
                     *dimension,
@@ -533,8 +562,7 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{TestCases, check_specific_random},
-        version::LanceFileVersion,
+        testing::{TestCases, TestEncoding, check_specific_random},
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -688,20 +716,24 @@ mod tests {
     }
 
     #[rstest]
-    #[case::simple(simple_struct_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::nested_struct(nested_struct_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_list(struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_large_list(struct_with_large_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2, LanceFileVersion::V2_2)]
-    #[case::struct_with_map(struct_with_map_fields(), 2, LanceFileVersion::V2_2)]
+    #[case::simple(simple_struct_fields(), 2)]
+    #[case::nested_struct(nested_struct_fields(), 2)]
+    #[case::struct_with_list(struct_with_list_fields(), 2)]
+    #[case::struct_with_large_list(struct_with_large_list_fields(), 2)]
+    #[case::nested_struct_with_list(nested_struct_with_list_fields(), 2)]
+    #[case::struct_with_nested_fsl(struct_with_nested_fsl_fields(), 2)]
+    #[case::struct_with_map(struct_with_map_fields(), 2)]
     #[test_log::test(tokio::test)]
     async fn test_fsl_struct_random(
         #[case] struct_fields: Fields,
         #[case] dimension: i32,
-        #[case] min_version: LanceFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(TestEncoding::StructuralU32, TestEncoding::StructuralSparse)]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+        #[values(1, 5, 10)] ingest_batch_count: u32,
     ) {
         let data_type = make_fsl_struct_type(struct_fields, dimension);
         let mut field_metadata = HashMap::new();
@@ -710,7 +742,11 @@ mod tests {
             structural_encoding.into(),
         );
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        let test_cases = TestCases::basic().with_min_file_version(min_version);
+        let test_cases = TestCases::basic()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing])
+            .with_ingest_batch_counts([ingest_batch_count]);
         check_specific_random(field, test_cases).await;
     }
 

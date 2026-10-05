@@ -308,7 +308,8 @@ class LanceFileSession:
             If provided, creates a schema-bound writer; otherwise a lazy writer is
             created.
         data_cache_bytes : int, optional
-            Size of the row-group/page write cache in bytes.
+            Total bytes to buffer for column data before writing pages. The
+            budget is divided evenly across top-level columns.
         version : str, optional
             Lance file format version (e.g. "2"). Parsed by the Rust layer.
         keep_original_array : bool, optional
@@ -482,6 +483,12 @@ class LanceFileWriter:
     This class is used to write Lance data files, a low level structure
     optimized for storing multi-modal tabular data.  If you are working with
     Lance datasets then you should use the LanceDataset class instead.
+
+    Attributes
+    ----------
+    size_bytes: Optional[int]
+        The final size of the file in bytes.  This is None until `close` is
+        called.
     """
 
     def __init__(
@@ -511,8 +518,9 @@ class LanceFileWriter:
             the schema will be inferred from the first batch.  If the schema
             is not specified and no data is written then the write will fail.
         data_cache_bytes: int
-            How many bytes (per column) to cache before writing a page.  The
-            default is an appropriate value based on the filesystem.
+            Total bytes to buffer for column data before writing pages. The
+            budget is divided evenly across top-level columns. By default,
+            each column uses 8 MiB.
         version: str
             The version of the file format to write.  If not specified then
             the latest stable version will be used.  Newer versions are more
@@ -548,6 +556,7 @@ class LanceFileWriter:
                 **kwargs,
             )
         self.closed = False
+        self.size_bytes: Optional[int] = None
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
         """
@@ -569,11 +578,17 @@ class LanceFileWriter:
         Write the file metadata and close the file
 
         Returns the number of rows written to the file
+
+        After this returns, ``size_bytes`` holds the final size of the file.  This
+        is reported by the writer itself, so it is available for object stores
+        without issuing a separate metadata request.
         """
         if self.closed:
             return
         self.closed = True
-        return self._writer.finish()
+        summary = self._writer.finish()
+        self.size_bytes = summary.size_bytes
+        return summary.num_rows
 
     def add_schema_metadata(self, key: str, value: str) -> None:
         """

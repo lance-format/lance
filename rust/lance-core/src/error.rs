@@ -91,6 +91,41 @@ impl fmt::Display for FieldNotFoundError {
 
 impl std::error::Error for FieldNotFoundError {}
 
+/// A manifest commit returned an error and its final outcome could not be
+/// determined safely.
+///
+/// This is wrapped in [`Error::Wrapped`] so Lance can expose a structured
+/// source without adding a variant to the exhaustive public [`Error`] enum.
+#[derive(Debug)]
+pub struct CommitStatusUnknownError {
+    version: u64,
+    source: BoxedError,
+}
+
+impl CommitStatusUnknownError {
+    /// Return the manifest version whose commit outcome is unknown.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl std::fmt::Display for CommitStatusUnknownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Commit result for version {} is unknown: the commit may or may not have been \
+             applied; check the table state before retrying: {}",
+            self.version, self.source
+        )
+    }
+}
+
+impl std::error::Error for CommitStatusUnknownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -292,6 +327,7 @@ pub enum Error {
     Stop,
     #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
+        #[snafu(source)]
         error: BoxedError,
         #[snafu(implicit)]
         location: Location,
@@ -373,6 +409,19 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A write was refused to keep the writer inside its memory budget.
+    ///
+    /// Unlike every other write error this one is *expected* under load and
+    /// carries no data loss: the write was never accepted, so a caller that
+    /// retries once the flush pipeline drains loses nothing. Callers should
+    /// surface it as a retryable "busy" signal (HTTP 503), not a failure.
+    /// Match via [`Error::is_backpressure`] rather than on the message.
+    #[snafu(display("Write rejected by backpressure: {message}, {location}"))]
+    Backpressure {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -423,7 +472,8 @@ impl Error {
             | Self::FieldNotFound { .. }
             | Self::Timeout { .. }
             | Self::DiskCapExceeded { .. }
-            | Self::Fenced { .. } => None,
+            | Self::Fenced { .. }
+            | Self::Backpressure { .. } => None,
         }
     }
 
@@ -438,6 +488,18 @@ impl Error {
     #[track_caller]
     pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
         CorruptFileSnafu { path }.into_error(message.into().into())
+    }
+
+    /// Reports a corrupt file when the caller only has a logical/section name
+    /// rather than the real file path (for example, a decoder that validates an
+    /// in-memory buffer and does not know where it came from).
+    ///
+    /// `name` is carried in the `path` field of the resulting [`Error::CorruptFile`]
+    /// variant and is NOT a filesystem path; callers that have the real path should
+    /// use [`Self::corrupt_file`] instead.
+    #[track_caller]
+    pub fn corrupt_file_named(name: &str, message: impl Into<String>) -> Self {
+        Self::corrupt_file(object_store::path::Path::from(name), message)
     }
 
     #[track_caller]
@@ -485,6 +547,23 @@ impl Error {
         }
     }
 
+    /// A write was refused because the writer is at its memory ceiling; the
+    /// data was never accepted. See [`Error::Backpressure`].
+    #[track_caller]
+    pub fn backpressure(message: impl Into<String>) -> Self {
+        BackpressureSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Whether this is [`Error::Backpressure`] — i.e. a retryable "writer is
+    /// full" signal rather than a real failure. Prefer this over matching the
+    /// error message.
+    pub fn is_backpressure(&self) -> bool {
+        matches!(self, Self::Backpressure { .. })
+    }
+
     #[track_caller]
     pub fn io_source(source: BoxedError) -> Self {
         IOSnafu.into_error(source)
@@ -519,9 +598,25 @@ impl Error {
         NotFoundSnafu { uri: uri.into() }.build()
     }
 
+    /// Return whether this error or one of its typed sources is a missing object.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::NotFound { .. } => true,
+            Self::Wrapped { error, .. }
+                if error.downcast_ref::<CommitStatusUnknownError>().is_some() =>
+            {
+                false
+            }
+            Self::IO { source, .. } | Self::Wrapped { error: source, .. } => {
+                error_source_is_not_found(source.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     #[track_caller]
     pub fn wrapped(error: BoxedError) -> Self {
-        WrappedSnafu { error }.build()
+        WrappedSnafu.into_error(error)
     }
 
     #[track_caller]
@@ -651,6 +746,21 @@ impl Error {
     }
 
     #[track_caller]
+    pub fn commit_status_unknown_source(version: u64, source: BoxedError) -> Self {
+        Self::wrapped(box_error(CommitStatusUnknownError { version, source }))
+    }
+
+    /// Return whether this error represents a commit whose final outcome could
+    /// not be determined safely.
+    pub fn is_commit_status_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Wrapped { error, .. }
+                if error.downcast_ref::<CommitStatusUnknownError>().is_some()
+        )
+    }
+
+    #[track_caller]
     pub fn incompatible_transaction_source(source: BoxedError) -> Self {
         IncompatibleTransactionSnafu.into_error(source)
     }
@@ -698,6 +808,17 @@ impl Error {
             other => Err(other),
         }
     }
+}
+
+fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = source.downcast_ref::<Error>() {
+        return error.is_not_found();
+    }
+    if let Some(error) = source.downcast_ref::<object_store::Error>() {
+        return matches!(error, object_store::Error::NotFound { .. })
+            || std::error::Error::source(error).is_some_and(error_source_is_not_found);
+    }
+    source.source().is_some_and(error_source_is_not_found)
 }
 
 pub trait LanceOptionExt<T> {
@@ -862,6 +983,22 @@ impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
         match e {
+            // DataFusion wraps an error to attach end-user context and source
+            // spans (`Diagnostic`), a description of what was running
+            // (`Context`), or to report several failures at once
+            // (`Collection`). All three are display-transparent, so the
+            // category has to come from the error underneath; classifying the
+            // wrapper itself reports a malformed query as an internal failure.
+            datafusion_common::DataFusionError::Diagnostic(_, inner)
+            | datafusion_common::DataFusionError::Context(_, inner) => Self::from(*inner),
+            datafusion_common::DataFusionError::Collection(errors) => {
+                match errors.into_iter().next() {
+                    // `Collection` reports the first error's message, so take
+                    // its category too.
+                    Some(first) => Self::from(first),
+                    None => Self::execution("DataFusion returned an empty error collection"),
+                }
+            }
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
             | datafusion_common::DataFusionError::Configuration(..)
@@ -873,6 +1010,22 @@ impl From<datafusion_common::DataFusionError> for Error {
                 Self::not_supported_source(box_error(e))
             }
             datafusion_common::DataFusionError::Execution(..) => Self::execution(e.to_string()),
+            datafusion_common::DataFusionError::Shared(shared) => {
+                // DataFusion shares an error across consumers (e.g. a join's
+                // build-side error fanned out to every probe partition) behind an
+                // `Arc`. If we are the sole owner we can recurse for full fidelity;
+                // otherwise re-wrap in `Shared` so the concrete error type is still
+                // reachable via `Error::source` / `downcast_ref`.
+                match std::sync::Arc::try_unwrap(shared) {
+                    Ok(inner) => Self::from(inner),
+                    Err(shared) => {
+                        let rewrapped = datafusion_common::DataFusionError::Shared(shared);
+                        Self::External {
+                            source: box_error(rewrapped),
+                        }
+                    }
+                }
+            }
             datafusion_common::DataFusionError::External(source) => {
                 // Try to downcast to lance_core::Error first
                 match source.downcast::<Self>() {
@@ -905,14 +1058,82 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 /// Wrap an error in a new error type that implements Clone
 ///
 /// This is useful when two threads/streams share a common fallible source
-/// The base error will always have the full error.  Any cloned results will
-/// only have Error::Cloned with the to_string of the base error.
+/// The variants whose meaning callers read through an accessor rather than
+/// through the message survive the clone: definite not-found errors keep typed
+/// source-chain detection (`is_not_found`), fenced errors keep their
+/// [`FenceReason`] (`fence_reason`), backpressure stays backpressure
+/// (`is_backpressure`), and an unknown commit outcome keeps its version
+/// (`is_commit_status_unknown`) with the typed source degraded to its message.
+/// Timeout and I/O errors preserve their categories. Everything else becomes
+/// `Error::Cloned` carrying the string representation.
+///
+/// One gap: [`Error::External`] is not preserved, because its source is not
+/// cloneable and rebuilding it from a message would leave `external_source`
+/// returning `Some` while the downcast the caller wants fails. After a clone,
+/// `external_source` and `into_external` no longer recover the original error.
 pub struct CloneableError(pub Error);
+
+struct DisplayError(Error);
+
+impl fmt::Debug for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for DisplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
-        Self(Error::cloned(self.0.to_string()))
+        // Same reasoning for `is_commit_status_unknown`, but its typed source is
+        // not cloneable, so the rebuild keeps the version and carries the
+        // source's own message, as the `NotFound` arm does.
+        if let Error::Wrapped { error, .. } = &self.0
+            && let Some(unknown) = error.downcast_ref::<CommitStatusUnknownError>()
+        {
+            let source = std::error::Error::source(unknown)
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| unknown.to_string());
+            return Self(Error::commit_status_unknown_source(
+                unknown.version(),
+                box_error(DisplayError(Error::cloned(source))),
+            ));
+        }
+        match &self.0 {
+            Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(uri.clone()),
+            )))),
+            error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(error.to_string()),
+            )))),
+            Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
+            Error::IO { source, .. } => Self(Error::io(source.to_string())),
+            // Callers react to these via `fence_reason` / `is_backpressure`
+            // rather than the message; collapsing them into a cloned string
+            // would silently drop that signal across the clone boundary.
+            Error::Fenced {
+                reason, message, ..
+            } => Self(
+                FencedSnafu {
+                    reason: *reason,
+                    message: message.clone(),
+                }
+                .build(),
+            ),
+            Error::Backpressure { message, .. } => Self(Error::backpressure(message.clone())),
+            error => Self(Error::cloned(error.to_string())),
+        }
     }
 }
 
@@ -928,7 +1149,93 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::error::Error as _;
     use std::fmt;
+
+    /// The variants whose meaning lives in an accessor rather than in the
+    /// message: collapsing them into a cloned string drops the signal.
+    #[test]
+    fn cloneable_error_preserves_accessor_contracts() {
+        // Both reasons, because carrying `reason` through is the arm's whole job.
+        for (original, expected) in [
+            (
+                Error::fenced_by_peer("peer claimed epoch 7"),
+                FenceReason::PeerClaimedEpoch,
+            ),
+            (
+                Error::writer_poisoned("wal flush failed"),
+                FenceReason::PersistenceFailure,
+            ),
+        ] {
+            let original = CloneableError(original);
+            assert_eq!(original.0.fence_reason(), Some(expected));
+            assert_eq!(original.clone().0.fence_reason(), Some(expected));
+        }
+
+        let original = CloneableError(Error::backpressure("writer at memory ceiling"));
+        let cloned = original.clone();
+        assert!(original.0.is_backpressure());
+        assert!(cloned.0.is_backpressure());
+
+        let original = CloneableError(Error::commit_status_unknown_source(
+            7,
+            box_error(DisplayError(Error::timeout("put timed out"))),
+        ));
+        let cloned = original.clone();
+        // Cloning the clone must not degrade it further.
+        let twice = cloned.clone();
+        assert!(original.0.is_commit_status_unknown());
+        assert!(cloned.0.is_commit_status_unknown());
+        assert!(!cloned.0.is_not_found());
+        assert!(twice.0.is_commit_status_unknown());
+    }
+
+    #[test]
+    fn cloneable_error_preserves_not_found_contract() {
+        let original = CloneableError(Error::not_found("metadata.lance"));
+        let cloned = original.clone();
+        let cloned_again = cloned.clone();
+        assert!(matches!(original.0, Error::NotFound { .. }));
+        assert!(cloned.0.is_not_found());
+        assert!(cloned_again.0.is_not_found());
+        assert!(cloned.0.to_string().to_lowercase().contains("not found"));
+        assert!(
+            cloned_again
+                .0
+                .to_string()
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(
+            format!("{:?}", cloned.0)
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(cloned.0.source().is_some_and(|source| source.is::<Error>()
+            || source.source().is_some_and(|source| source.is::<Error>())));
+        let downstream_error = Error::wrapped(Box::new(Error::io_source(Box::new(
+            object_store::Error::Generic {
+                store: "N/A",
+                source: Box::new(cloned.0),
+            },
+        ))));
+        assert!(downstream_error.is_not_found());
+        assert!(
+            format!("{downstream_error:?}")
+                .to_lowercase()
+                .contains("not found")
+        );
+
+        let original = CloneableError(Error::timeout("metadata read timed out"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::Timeout { .. }));
+        assert!(matches!(cloned.0, Error::Timeout { .. }));
+
+        let original = CloneableError(Error::io("metadata read was denied"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::IO { .. }));
+        assert!(matches!(cloned.0, Error::IO { .. }));
+    }
 
     #[test]
     fn test_caller_location_capture() {
@@ -1026,6 +1333,25 @@ mod test {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
         let converted: Error = io_err.into();
         assert!(matches!(converted, Error::IO { .. }));
+    }
+
+    #[test]
+    fn test_commit_status_unknown_is_structured_without_masking_as_not_found() {
+        let error = Error::commit_status_unknown_source(
+            42,
+            box_error(Error::not_found("temporarily invisible manifest")),
+        );
+
+        assert!(error.is_commit_status_unknown());
+        assert!(!error.is_not_found());
+        assert!(error.to_string().contains("version 42 is unknown"));
+        let Error::Wrapped { error, .. } = error else {
+            panic!("commit-status-unknown must use the semver-compatible wrapper")
+        };
+        let status = error
+            .downcast_ref::<CommitStatusUnknownError>()
+            .expect("wrapper must retain the typed commit status");
+        assert_eq!(status.version(), 42);
     }
 
     #[test]
@@ -1151,6 +1477,86 @@ mod test {
         }
     }
 
+    /// DataFusion wraps errors to attach end-user context (`Diagnostic`), a
+    /// description of what was running (`Context`), or to report several at
+    /// once (`Collection`). All three are display-transparent, so a wrapped
+    /// user error looks exactly like an unwrapped one but would be classified
+    /// as an internal failure if the conversion matched on the wrapper.
+    #[cfg(feature = "datafusion")]
+    #[rstest::rstest]
+    #[case::diagnostic(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(inner),
+    ))]
+    #[case::context(|inner| datafusion_common::DataFusionError::Context(
+        "type_coercion".to_string(),
+        Box::new(inner),
+    ))]
+    #[case::collection(|inner| datafusion_common::DataFusionError::Collection(vec![inner]))]
+    #[case::nested(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(datafusion_common::DataFusionError::Context(
+            "type_coercion".to_string(),
+            Box::new(inner),
+        )),
+    ))]
+    fn test_datafusion_wrapped_plan_error_is_invalid_input(
+        #[case] wrap: fn(datafusion_common::DataFusionError) -> datafusion_common::DataFusionError,
+    ) {
+        let df_err = wrap(datafusion_common::DataFusionError::Plan(
+            "Invalid function 'no_such_function'".to_string(),
+        ));
+        let lance_err = Error::from(df_err);
+
+        assert!(
+            matches!(lance_err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {lance_err:?}"
+        );
+        assert!(
+            lance_err.to_string().contains("no_such_function"),
+            "expected the function name to survive, got: {lance_err}"
+        );
+    }
+
+    /// Unwrapping must classify by the inner error rather than assume the
+    /// wrapper always hides a user error.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_wrapped_internal_error_is_not_invalid_input() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while running".to_string(),
+            Box::new(datafusion_common::DataFusionError::Internal(
+                "invariant violated".to_string(),
+            )),
+        );
+
+        assert!(
+            matches!(Error::from(df_err), Error::IO { .. }),
+            "an internal DataFusion failure must not be reported as user input"
+        );
+    }
+
+    /// A Lance error that round-trips through DataFusion keeps its own
+    /// category even when DataFusion wraps it on the way back.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_wrapped_external_lance_error_keeps_its_category() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(datafusion_common::DataFusionError::from(Error::io(
+                "object store unavailable",
+            ))),
+        );
+
+        match Error::from(df_err) {
+            Error::IO { source, .. } => assert!(
+                source.to_string().contains("object store unavailable"),
+                "expected the original message, got: {source}"
+            ),
+            other => panic!("expected the original IO error, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "datafusion")]
     #[test]
     fn test_datafusion_external_error_conversion() {
@@ -1238,6 +1644,42 @@ mod test {
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
+    }
+
+    /// Test that a typed error survives a multiply-owned `DataFusionError::Shared`.
+    ///
+    /// When DataFusion fans one error out to multiple consumers via `Arc`, we
+    /// cannot move the inner error out.  The typed source must still be
+    /// reachable after conversion to `lance_core::Error`.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_shared_multi_owner_preserves_type() {
+        let custom_err = MyCustomError {
+            code: 42,
+            message: "shared typed error".to_string(),
+        };
+        let marker = datafusion_common::DataFusionError::External(Box::new(custom_err));
+        // Put it in an Arc and keep a second owner so try_unwrap fails.
+        let arc = std::sync::Arc::new(marker);
+        let _arc2 = arc.clone();
+        let shared = datafusion_common::DataFusionError::Shared(arc);
+
+        let lance_err: Error = shared.into();
+
+        // The concrete error must be discoverable via source chain.
+        let mut found = false;
+        let mut src: Option<&dyn std::error::Error> = Some(&lance_err);
+        while let Some(e) = src {
+            if e.downcast_ref::<MyCustomError>().is_some() {
+                found = true;
+                break;
+            }
+            src = e.source();
+        }
+        assert!(
+            found,
+            "MyCustomError not found in source chain: {lance_err:?}"
+        );
     }
 
     #[test]

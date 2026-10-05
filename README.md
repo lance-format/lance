@@ -56,6 +56,17 @@ For more details, see the full [Lance format specification](https://lance.org/fo
 > [!TIP]
 > Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lance.org/community/contributing/) for more information.
 
+## File format stability
+
+Lance releases frequently because the SDKs, integrations, and performance work are moving quickly. This does not mean the Lance file format changes incompatibly in every release. The Lance file format is identified by the `data_storage_version` stored in each dataset, and stable storage versions are a long-term compatibility contract.
+
+* Once a dataset is written with a stable `data_storage_version`, future Lance releases will continue to support reading that storage version.
+* SDK and API compatibility is separate from file format compatibility. SDK/API changes follow semantic versioning and are documented in the [migration guide](https://lance.org/guide/migration/).
+* Older Lance releases may not understand file format versions introduced later. If you run mixed Lance versions, pin `data_storage_version` for deterministic writes.
+* The `next` file format alias is unstable and should only be used for experimentation, never for production data.
+
+For production, write data with a stable `data_storage_version`. See the [format versioning guide](https://lance.org/format/file/versioning/) for the current compatibility matrix.
+
 ## Quick Start
 
 **Installation**

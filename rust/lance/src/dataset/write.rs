@@ -1,59 +1,66 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
+use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
     BLOB_V2_EXT_NAME,
 };
-use lance_core::datatypes::{
-    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+use lance_core::datatypes::{NullabilityComparison, OnMissing, OnTypeMismatch};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };
-use lance_core::error::LanceOptionExt;
-use lance_core::utils::tempfile::TempDir;
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::spill::{SpillReceiver, SpillSender, create_replay_spill};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::previous::writer::{
-    FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
+use lance_file::concat::{
+    FileConcatOptions, FileConcatReason, FileConcatResult, FileConcatTarget,
+    concat_data_file_parts as concat_parts,
 };
-use lance_file::version::LanceFileVersion;
-use lance_file::writer::{self as current_writer, FileWriterOptions};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::writer::{
+    FileWriter as V1FileWriter, ManifestProvider as V1ManifestProvider,
+};
+use lance_file::writer::{self as current_writer, FileWriteSummary};
+use lance_file::{versions as file_versions, writer::FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
-use lance_table::format::{BasePath, DataFile, Fragment};
+use lance_io::traits::Writer;
+use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::num::NonZero;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::num::{NonZero, NonZeroU64};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
-    blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
+    blob_pack_file_threshold_from_metadata,
 };
+use crate::index::scalar::{IndexDetails, fetch_index_details};
+use crate::index::{index_is_usable, load_all_indices};
 use crate::session::Session;
 
-use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
+use super::versions;
+use super::{DATA_DIR, DataFilePart, DataFileTarget};
 
 mod commit;
 pub mod delete;
@@ -66,6 +73,273 @@ pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
+
+impl Dataset {
+    pub(super) fn validate_data_file_target(&self, target: &DataFileTarget) -> Result<()> {
+        let dataset_version = self.manifest.data_storage_format.lance_file_format();
+        if target.version != dataset_version {
+            return Err(Error::invalid_input(format!(
+                "DataFileTarget.version is {}, but dataset version {} uses {}",
+                target.version,
+                self.version_id(),
+                dataset_version
+            )));
+        }
+        self.data_file_dir_for_base(target.base_id)?;
+
+        if target.schema.metadata != self.schema().metadata {
+            return Err(Error::invalid_input(
+                "DataFileTarget.schema metadata differs from the dataset schema metadata",
+            ));
+        }
+        for target_field in &target.schema.fields {
+            let Some(dataset_field) = self
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.id == target_field.id)
+            else {
+                return Err(Error::invalid_input(format!(
+                    "DataFileTarget.schema field ID {} is not a top-level dataset field",
+                    target_field.id
+                )));
+            };
+            if dataset_field != target_field {
+                return Err(Error::invalid_input(format!(
+                    "DataFileTarget.schema field ID {} differs from the current dataset field",
+                    target_field.id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Encode one managed part and return its serializable description.
+    ///
+    /// Lance generates a unique staging name in the target's base. Managed Blob
+    /// payloads are written directly beneath the sidecar directory selected by the final
+    /// target using IDs from `blob_ids`; every non-empty logical Inline value is
+    /// spilled to Packed or Dedicated storage so final concatenation never copies
+    /// Blob payload bytes.
+    /// Every use of `target` must refer to the same dataset and resolved base;
+    /// associating a target with that storage context is the caller's
+    /// responsibility.
+    /// Persist the target before writing. A failed write may leave files; after
+    /// stopping all users of the target, [`DataFileTarget::cleanup`] can
+    /// remove them without a completed part description. Retries must use fresh,
+    /// disjoint Blob ID ranges, including ranges from failed writes. Staging
+    /// `.part` files are only explicitly cleaned; ordinary dataset GC rules still
+    /// apply to uncommitted Blob sidecars and must be coordinated with checkpoints.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::RecordBatch;
+    /// use futures::stream;
+    /// use lance::{Dataset, dataset::DataFileTarget};
+    ///
+    /// # async fn write_part(
+    /// #     dataset: &Dataset,
+    /// #     target: &DataFileTarget,
+    /// #     batch: RecordBatch,
+    /// # ) -> lance_core::Result<()> {
+    /// let part = dataset
+    ///     .write_data_file_part(target, None, stream::iter([Ok(batch)]))
+    ///     .await?;
+    /// // Serialize part into the caller's checkpoint.
+    /// # let _ = part;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_data_file_part(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+    ) -> Result<DataFilePart> {
+        self.validate_data_file_target(target)?;
+        validate_blob_v2_write_schema(target.schema.as_ref())?;
+        let part_blob_ids = blob_ids.clone();
+        let has_blob = target
+            .schema
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+        if has_blob && blob_ids.is_none() {
+            return Err(Error::invalid_input(
+                "write_data_file_part requires a non-empty Blob ID range for a schema containing Blob v2 fields",
+            ));
+        }
+
+        let preprocessor = if let Some(blob_ids) = blob_ids {
+            let data_dir = self.data_file_dir_for_base(target.base_id)?;
+            let object_store = self.object_store(target.base_id).await?;
+            let external_base_resolver = blob_v2_external_base_resolver(
+                Some(self),
+                &WriteParams::default(),
+                target.schema.as_ref(),
+            )
+            .await?;
+            Some(
+                BlobPreprocessor::new(
+                    object_store.as_ref().clone(),
+                    data_dir,
+                    target.data_file_key().to_string(),
+                    target.schema.as_ref(),
+                    external_base_resolver,
+                    false,
+                    ExternalBlobMode::Reference,
+                    self.session().store_registry(),
+                    self.store_params().cloned().unwrap_or_default(),
+                    None,
+                )?
+                .with_part_blob_ids(blob_ids)?,
+            )
+        } else {
+            None
+        };
+
+        let file_name = format!("{}.part", generate_random_filename());
+        let path = target
+            .parts_dir(&self.data_file_dir_for_base(target.base_id)?)
+            .join(file_name.as_str());
+        let store = self.object_store(target.base_id).await?;
+        let mut writer = V2WriterAdapter::new(
+            file_versions::create_writer(
+                target.version,
+                store.create(&path).await?,
+                target.schema.as_ref().clone(),
+                FileWriterOptions::default(),
+            )?,
+            None,
+            preprocessor,
+            None,
+        );
+        let mut data = Box::pin(data);
+        let write_result = async {
+            while let Some(batch) = data.next().await {
+                writer.write_batch(&batch?).await?;
+            }
+            writer.finish_file().await
+        }
+        .await;
+
+        match write_result {
+            Ok(summary) => Ok(DataFilePart {
+                target_file_name: target.file_name.clone(),
+                base_id: target.base_id,
+                file_name,
+                blob_ids: part_blob_ids,
+                num_rows: summary.num_rows,
+                size_bytes: NonZeroU64::new(summary.size_bytes)
+                    .ok_or_else(|| Error::internal("completed part has zero file size"))?,
+            }),
+            Err(error) => {
+                writer.abort().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Reopen, validate, and concatenate parts into the final data file.
+    ///
+    /// Part order is the final physical row order. The operation copies
+    /// encoded page buffers and regenerates metadata and the footer; incompatible
+    /// inputs fail without a decode/re-encode fallback or dataset commit. The
+    /// caller owns cleanup of all durable part, Blob, and final-file objects.
+    /// The caller must also assemble the target through the same dataset and
+    /// resolved base used to write managed Blob payloads.
+    /// The target must still be uncommitted and have no concurrent assembler.
+    /// Assembly can overwrite a previous uncommitted output for the same target;
+    /// it does not check current or historical manifests for references.
+    ///
+    /// To replace a fragment's columns, wrap the returned file in a
+    /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup).
+    /// The caller must check that the ordered parts cover the fragment's physical
+    /// rows exactly, including deleted rows; this operation does not check
+    /// fragment coverage or commit the replacement.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lance::{Dataset, dataset::{DataFilePart, DataFileTarget}};
+    ///
+    /// # async fn concat(
+    /// #     dataset: &Dataset,
+    /// #     target: &DataFileTarget,
+    /// #     ordered_parts: &[DataFilePart],
+    /// # ) -> lance_core::Result<()> {
+    /// let data_file = dataset.concat_data_file_parts(target, ordered_parts).await?;
+    /// // The caller decides when and how to commit `data_file`.
+    /// # let _ = data_file;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn concat_data_file_parts(
+        &self,
+        target: &DataFileTarget,
+        ordered_parts: &[DataFilePart],
+    ) -> Result<DataFile> {
+        let opened = DataFilePart::open_all(self, target, ordered_parts).await?;
+        let data_dir = self.data_file_dir_for_base(target.base_id)?;
+        let output_path = target.object_path(&data_dir);
+        let object_store = self.object_store(target.base_id).await?;
+        let mut concat_target = FileConcatTarget::new(target.version, target.schema.clone());
+        if let Some(blob_target_id) = target.blob_target_id() {
+            concat_target = concat_target.with_blob_target_id(blob_target_id);
+        }
+        let result = concat_parts(
+            &concat_target,
+            &opened,
+            {
+                let object_store = object_store.clone();
+                let output_path = output_path.clone();
+                move || async move { object_store.create(&output_path).await }
+            },
+            FileConcatOptions::default(),
+        )
+        .await;
+
+        let output = match result {
+            Ok(FileConcatResult::Written(output)) => output,
+            Ok(FileConcatResult::Reused(_, _)) => {
+                return Err(Error::internal(
+                    "data-file part concatenation unexpectedly reused an input".to_string(),
+                ));
+            }
+            Ok(FileConcatResult::Unsupported(reason)) => {
+                let message = format!(
+                    "parts cannot be concatenated into target {:?}: {reason}",
+                    target.file_name
+                );
+                return Err(match reason {
+                    FileConcatReason::VersionMismatch { actual, .. } => {
+                        let (major, minor) = actual.to_standard_footer_numbers();
+                        Error::version_conflict(message, major, minor)
+                    }
+                    FileConcatReason::SchemaMismatch { .. } => Error::schema_mismatch(message),
+                    FileConcatReason::LegacyVersion
+                    | FileConcatReason::ColumnLayoutMismatch { .. }
+                    | FileConcatReason::ColumnEncodingMismatch { .. }
+                    | FileConcatReason::ColumnBuffers { .. }
+                    | FileConcatReason::ExtraGlobalBuffers { .. }
+                    | FileConcatReason::BlobColumns => Error::not_supported(message),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let (fields, column_indices) =
+            file_versions::data_file_columns(target.version, target.schema.as_ref());
+        Ok(DataFile::new(
+            target.file_name.clone(),
+            fields,
+            column_indices,
+            target.version,
+            NonZeroU64::new(output.size_bytes),
+            target.base_id,
+        ))
+    }
+}
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]
@@ -325,7 +599,9 @@ pub struct WriteParams {
     /// of lance.
     /// Lance file version 2.3 enables RLE v2 run length widths by default.
     ///
-    /// If not specified then the latest stable version will be used.
+    /// For an existing dataset, an explicit version is the exact target for
+    /// this operation; if omitted, the manifest default storage version is used.
+    /// New datasets default to the latest stable version.
     pub data_storage_version: Option<LanceFileVersion>,
 
     /// Experimental: if set to true, the writer will use stable row ids.
@@ -410,6 +686,13 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
+
+    /// File writer options to use when writing data files.
+    ///
+    /// Options set here apply to current-format data files. They have no effect
+    /// when writing legacy V1 files. If not set, the file writer uses its
+    /// configured defaults.
+    pub file_writer_options: Option<FileWriterOptions>,
 }
 
 impl Default for WriteParams {
@@ -440,6 +723,7 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
+            file_writer_options: None,
         }
     }
 }
@@ -454,8 +738,8 @@ impl WriteParams {
         }
     }
 
-    pub fn storage_version_or_default(&self) -> LanceFileVersion {
-        self.data_storage_version.unwrap_or_default()
+    pub fn storage_version_or_default(&self) -> ConcreteFileVersion {
+        self.data_storage_version.unwrap_or_default().resolve()
     }
 
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
@@ -594,40 +878,63 @@ pub async fn write_fragments(
         .await
 }
 
+fn take_batch_rows(batches: &mut VecDeque<RecordBatch>, max_rows: usize) -> Vec<RecordBatch> {
+    let mut output = Vec::with_capacity(batches.len());
+    let mut rows_remaining = max_rows;
+
+    while rows_remaining > 0 {
+        let Some(batch) = batches.pop_front() else {
+            break;
+        };
+        let batch_rows = batch.num_rows();
+        if batch_rows == 0 {
+            continue;
+        }
+        if batch_rows <= rows_remaining {
+            rows_remaining -= batch_rows;
+            output.push(batch);
+        } else {
+            output.push(batch.slice(0, rows_remaining));
+            batches.push_front(batch.slice(rows_remaining, batch_rows - rows_remaining));
+            rows_remaining = 0;
+        }
+    }
+
+    output
+}
+
+fn balanced_row_counts(total_rows: usize, max_rows_per_file: usize) -> VecDeque<usize> {
+    if total_rows == 0 {
+        return VecDeque::new();
+    }
+
+    let file_count = total_rows.div_ceil(max_rows_per_file);
+    let base_rows_per_file = total_rows / file_count;
+    let larger_file_count = total_rows % file_count;
+    (0..file_count)
+        .map(|file_index| base_rows_per_file + usize::from(file_index < larger_file_count))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn do_write_fragments(
+pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
-    data: SendableRecordBatchStream,
+    mut buffered_reader: futures::stream::BoxStream<'static, Result<Vec<RecordBatch>>>,
     params: WriteParams,
-    storage_version: LanceFileVersion,
+    open_writer: OpenWriter,
+    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-) -> Result<Vec<Fragment>> {
-    let adapter = SchemaAdapter::new(data.schema());
-    let data = adapter.to_physical_stream(data);
-
-    let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
-        // In v1 we split the stream into row group sized batches
-        chunk_stream(data, params.max_rows_per_group)
-    } else {
-        // In v2 we don't care about group size but we do want to break
-        // the stream on file boundaries
-        break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed()
-    };
-
-    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
-        && schema.fields_pre_order().any(|field| field.is_blob_v2())
-    {
-        Some(Arc::new(
-            build_external_base_resolver(dataset, &params).await?,
-        ))
-    } else {
-        None
-    };
+    mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
+) -> Result<Vec<Fragment>>
+where
+    OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
+    OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
+{
     let source_store_registry = dataset
         .map(|ds| ds.session.store_registry())
         .unwrap_or_else(|| params.store_registry());
@@ -635,11 +942,12 @@ pub async fn do_write_fragments(
 
     // Keep a copy so failure paths can clean up files written to target bases.
     let cleanup_bases = target_bases_info.clone();
+    let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
         base_dir,
         schema,
-        storage_version,
+        open_writer,
         target_bases_info,
         external_base_resolver,
         params.allow_external_blob_outside_bases,
@@ -647,6 +955,8 @@ pub async fn do_write_fragments(
         source_store_registry,
         source_store_params,
         params.blob_pack_file_size_threshold,
+        file_writer_options,
+        preassigned_data_file_name,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -654,58 +964,183 @@ pub async fn do_write_fragments(
     let mut bytes_completed: u64 = 0;
     let mut rows_completed: u64 = 0;
     let mut files_written: u32 = 0;
+    let has_file_row_counts = file_row_counts.is_some();
+    let max_planned_file_rows = file_row_counts
+        .as_ref()
+        .and_then(|row_counts| row_counts.iter().copied().max());
+    let mut planned_rows_remaining = file_row_counts
+        .as_ref()
+        .map(|row_counts| {
+            row_counts.iter().try_fold(0_usize, |total, &row_count| {
+                total
+                    .checked_add(row_count)
+                    .ok_or_else(|| Error::internal("Planned file row count total overflowed usize"))
+            })
+        })
+        .transpose()?;
+    let mut file_row_counts = file_row_counts.map(VecDeque::from);
+    let mut rows_remaining_in_planned_file = file_row_counts.as_mut().and_then(VecDeque::pop_front);
 
     // Wrap the loop in an async block so `?` returns into `loop_result` and we
     // can run cleanup before propagating the error.
     let loop_result: Result<()> = async {
         while let Some(batch_chunk) = buffered_reader.next().await {
-            let batch_chunk = batch_chunk?;
+            let mut pending_batches = VecDeque::from(batch_chunk?);
 
-            if writer.is_none() {
-                let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-                params.progress.begin(&new_fragment).await?;
-                writer = Some(new_writer);
-                fragments.push(new_fragment);
-            }
+            while !pending_batches.is_empty() {
+                let rows_to_take = if has_file_row_counts {
+                    rows_remaining_in_planned_file.ok_or_else(|| {
+                        Error::internal(
+                            "Writer received rows after all planned file boundaries were consumed",
+                        )
+                    })?
+                } else {
+                    usize::MAX
+                };
+                let batch_chunk = take_batch_rows(&mut pending_batches, rows_to_take);
+                if batch_chunk.is_empty() {
+                    continue;
+                }
+                // Seed observers must see the values the data file stores, so
+                // convert before handing the batches to both. The data file
+                // writer then finds nothing left to convert.
+                let batch_chunk = batch_chunk
+                    .into_iter()
+                    .map(|batch| SchemaAdapter::new(batch.schema()).to_physical_batch(batch))
+                    .collect::<Result<Vec<_>>>()?;
 
-            writer.as_mut().unwrap().write(&batch_chunk).await?;
-            for batch in &batch_chunk {
-                num_rows_in_current_file += batch.num_rows() as u32;
-            }
+                if writer.is_none() {
+                    let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+                    params.progress.begin(&new_fragment).await?;
+                    writer = Some(new_writer);
+                    fragments.push(new_fragment);
+                }
 
-            if let Some(cb) = &params.write_progress {
-                let current_bytes = writer.as_mut().unwrap().tell().await?;
-                cb.call(WriteStats {
-                    bytes_written: bytes_completed + current_bytes,
-                    rows_written: rows_completed + num_rows_in_current_file as u64,
-                    files_written,
-                });
-            }
+                let active_writer = writer.as_mut().ok_or_else(|| {
+                    Error::internal("Writer was not initialized before writing a batch")
+                })?;
+                active_writer.write(&batch_chunk).await?;
+                for seed_writer in seed_writers.iter_mut() {
+                    let col_name = seed_writer.column_name().to_owned();
+                    for batch in &batch_chunk {
+                        if let Some(col) = batch.column_by_name(&col_name) {
+                            seed_writer.observe_batch(col)?;
+                        }
+                    }
+                }
+                let batch_chunk_rows =
+                    batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
+                num_rows_in_current_file += batch_chunk_rows as u32;
 
-            if num_rows_in_current_file >= params.max_rows_per_file as u32
-                || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
-            {
-                let (num_rows, data_file) = writer.take().unwrap().finish().await?;
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-                debug_assert_eq!(num_rows, num_rows_in_current_file);
-                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
-                rows_completed += num_rows as u64;
-                files_written += 1;
-                let last_fragment = fragments.last_mut().unwrap();
-                last_fragment.physical_rows = Some(num_rows as usize);
-                last_fragment.files.push(data_file);
-                // Notify after pushing the data file so it's tracked for cleanup
-                // if the callback fails.
-                params.progress.complete(fragments.last().unwrap()).await?;
+                let reached_planned_file_boundary = if has_file_row_counts {
+                    let rows_remaining =
+                        rows_remaining_in_planned_file.as_mut().ok_or_else(|| {
+                            Error::internal(
+                                "Writer received rows without an active planned file boundary",
+                            )
+                        })?;
+                    *rows_remaining = rows_remaining.checked_sub(batch_chunk_rows).ok_or_else(|| {
+                        Error::internal(format!(
+                            "Writer chunk of {batch_chunk_rows} rows crossed a planned file boundary with {rows_remaining} rows remaining"
+                        ))
+                    })?;
+                    let total_remaining = planned_rows_remaining.as_mut().ok_or_else(|| {
+                        Error::internal("Writer lost the planned row count total")
+                    })?;
+                    *total_remaining =
+                        total_remaining.checked_sub(batch_chunk_rows).ok_or_else(|| {
+                            Error::internal(format!(
+                                "Writer consumed {batch_chunk_rows} rows after the planned row count total was exhausted"
+                            ))
+                        })?;
+                    *rows_remaining == 0
+                } else {
+                    false
+                };
+
+                let current_file_bytes = writer
+                    .as_mut()
+                    .ok_or_else(|| Error::internal("Writer disappeared after writing a batch"))?
+                    .tell()
+                    .await?;
                 if let Some(cb) = &params.write_progress {
                     cb.call(WriteStats {
-                        bytes_written: bytes_completed,
-                        rows_written: rows_completed,
+                        bytes_written: bytes_completed + current_file_bytes,
+                        rows_written: rows_completed + num_rows_in_current_file as u64,
                         files_written,
                     });
                 }
-                num_rows_in_current_file = 0;
+
+                let reached_row_limit = if has_file_row_counts {
+                    reached_planned_file_boundary
+                } else {
+                    num_rows_in_current_file >= params.max_rows_per_file as u32
+                };
+                let reached_byte_limit = current_file_bytes >= params.max_bytes_per_file as u64;
+
+                if reached_row_limit || reached_byte_limit {
+                    if has_file_row_counts {
+                        if reached_planned_file_boundary {
+                            rows_remaining_in_planned_file = file_row_counts
+                                .as_mut()
+                                .and_then(VecDeque::pop_front);
+                        } else {
+                            // A byte-driven close is an extra physical boundary. Rebalance all
+                            // unwritten rows under the original maximum instead of preserving a
+                            // tiny abandoned remainder or rolling it into an oversized tail.
+                            let total_remaining = planned_rows_remaining.ok_or_else(|| {
+                                Error::internal("Writer lost the planned row count total")
+                            })?;
+                            let max_rows_per_file = max_planned_file_rows.ok_or_else(|| {
+                                Error::internal(
+                                    "Writer cannot replan byte-limited files without a maximum planned row count",
+                                )
+                            })?;
+                            let mut replanned_counts =
+                                balanced_row_counts(total_remaining, max_rows_per_file);
+                            rows_remaining_in_planned_file = replanned_counts.pop_front();
+                            file_row_counts = Some(replanned_counts);
+                        }
+                    }
+
+                    let mut w = writer.take().ok_or_else(|| {
+                        Error::internal("Writer disappeared before completing a file")
+                    })?;
+                    flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
+                    let (num_rows, data_file) = w.finish().await?;
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+                    debug_assert_eq!(num_rows, num_rows_in_current_file);
+                    bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+                    rows_completed += num_rows as u64;
+                    files_written += 1;
+                    let last_fragment = fragments.last_mut().ok_or_else(|| {
+                        Error::internal("Writer completed a file without a pending fragment")
+                    })?;
+                    last_fragment.physical_rows = Some(num_rows as usize);
+                    last_fragment.files.push(data_file);
+                    // Notify after pushing the data file so it's tracked for cleanup
+                    // if the callback fails.
+                    let completed_fragment = fragments.last().ok_or_else(|| {
+                        Error::internal("Writer completed a file without a fragment")
+                    })?;
+                    params.progress.complete(completed_fragment).await?;
+                    if let Some(cb) = &params.write_progress {
+                        cb.call(WriteStats {
+                            bytes_written: bytes_completed,
+                            rows_written: rows_completed,
+                            files_written,
+                        });
+                    }
+                    num_rows_in_current_file = 0;
+                }
             }
+        }
+
+        if has_file_row_counts && planned_rows_remaining != Some(0) {
+            return Err(Error::internal(format!(
+                "Writer input ended with {} planned rows remaining",
+                planned_rows_remaining.unwrap_or_default()
+            )));
         }
         Ok(())
     }
@@ -727,6 +1162,17 @@ pub async fn do_write_fragments(
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
+        if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
+            drop(writer);
+            cleanup_data_fragments(
+                &object_store,
+                base_dir,
+                cleanup_bases.as_deref(),
+                &fragments,
+            )
+            .await;
+            return Err(e);
+        }
         match writer.finish().await {
             Ok((num_rows, data_file)) => {
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
@@ -761,6 +1207,23 @@ pub async fn do_write_fragments(
     Ok(fragments)
 }
 
+/// Flush all seed writers into the given file writer, embedding seed buffers
+/// and schema metadata before `finish()` is called.
+async fn flush_seed_writers(
+    writer: &mut dyn GenericWriter,
+    seed_writers: &mut [Box<dyn lance_index::scalar::seed::IndexSeedWriter>],
+) -> Result<()> {
+    for seed_writer in seed_writers.iter_mut() {
+        if let Some(bytes) = seed_writer.finish()? {
+            let buf_index = writer.add_global_buffer(bytes).await?;
+            let key = seed_writer.schema_metadata_key();
+            let value = seed_writer.schema_metadata_value(buf_index);
+            writer.add_schema_metadata(key, value);
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort cleanup of data files for fragments that were written but not committed.
 ///
 /// Contract:
@@ -781,6 +1244,11 @@ pub(crate) async fn cleanup_data_fragments(
     let data_dir = base_dir.clone().join(DATA_DIR);
     let mut skipped_external = 0usize;
     for fragment in fragments {
+        // Deliberately not `referenced_lance_files()`: callers decide which
+        // files belong to the failed write. `schema_evolution` passes a live
+        // fragment whose `files` it narrowed to the newly written ones while
+        // leaving `overlays` untouched, so including overlays here would delete
+        // live data.
         for file in &fragment.files {
             let (store, file_dir) = if let Some(base_id) = file.base_id {
                 match target_bases.and_then(|bases| bases.iter().find(|b| b.base_id == base_id)) {
@@ -802,8 +1270,13 @@ pub(crate) async fn cleanup_data_fragments(
             };
 
             let path = file_dir.clone().join(file.path.as_str());
-            if let Err(e) = store.delete(&path).await {
-                log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+            match store.delete(&path).await {
+                Ok(()) => {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = file.path.as_str());
+                }
+                Err(e) => {
+                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+                }
             }
 
             // Clean up any blob v2 sidecars that might exist for this data file.
@@ -1220,6 +1693,20 @@ async fn build_external_base_resolver(
     Ok(ExternalBaseResolver::new(candidates, store_registry))
 }
 
+pub(super) async fn blob_v2_external_base_resolver(
+    dataset: Option<&Dataset>,
+    params: &WriteParams,
+    schema: &Schema,
+) -> Result<Option<Arc<ExternalBaseResolver>>> {
+    if schema.fields_pre_order().any(|field| field.is_blob_v2()) {
+        Ok(Some(Arc::new(
+            build_external_base_resolver(dataset, params).await?,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Writes the given data to the dataset and returns fragments.
 ///
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
@@ -1229,8 +1716,13 @@ async fn build_external_base_resolver(
 /// This is a private variant that takes a `SendableRecordBatchStream` instead
 /// of a reader. We don't expose the stream at our interface because it is a
 /// DataFusion type.
+///
+/// The caller must resolve `storage_version` once for the operation. Operations
+/// that also select a commit format must reuse the same value when committing.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 pub async fn write_fragments_internal(
+    storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
@@ -1239,108 +1731,256 @@ pub async fn write_fragments_internal(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
-    let mut params = params;
-    let adapter = SchemaAdapter::new(data.schema());
+    write_fragments_internal_with_file_row_counts(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        target_bases_info,
+        None,
+    )
+    .await
+}
 
-    let (data, converted_schema) = if adapter.requires_physical_conversion() {
-        let data = adapter.to_physical_stream(data);
-        // Update the schema to match the converted data
-        let arrow_schema = data.schema();
-        let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
-        (data, converted_schema)
-    } else {
-        // No conversion needed, use original schema to preserve dictionary info
-        (data, schema)
-    };
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all)]
+pub(crate) async fn write_fragments_internal_with_file_row_counts(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
+) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_impl(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        target_bases_info,
+        file_row_counts,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_fragments_internal_to_file(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    preassigned_data_file_name: Arc<String>,
+) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_impl(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        None,
+        None,
+        Some(preassigned_data_file_name),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_fragments_internal_impl(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
+) -> Result<(Vec<Fragment>, Schema)> {
+    let mut params = params;
 
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
-    let normalized_converted_schema = normalize_prepared_blob_schema(&converted_schema)?;
+    let normalized_schema = prepared_to_logical_blob_schema(&schema)?;
 
-    let (schema, storage_version) = if let Some(dataset) = dataset {
-        match params.mode {
-            WriteMode::Append | WriteMode::Create => {
-                // Append mode, so we need to check compatibility
-                normalized_converted_schema.check_compatible(
-                    dataset.schema(),
-                    &SchemaCompareOptions {
-                        // We don't care if the user claims their data is nullable / non-nullable.  We will
-                        // verify against the actual data.
-                        compare_nullability: NullabilityComparison::Ignore,
-                        allow_missing_if_nullable: true,
-                        ignore_field_order: true,
-                        compare_dictionary: dataset.is_legacy_storage(),
-                        ..Default::default()
-                    },
-                )?;
-                validate_blob_threshold_metadata_for_append(
-                    &normalized_converted_schema,
-                    dataset.schema(),
-                )?;
-                let write_schema = dataset.schema().project_by_schema(
-                    &normalized_converted_schema,
-                    OnMissing::Error,
-                    OnTypeMismatch::Error,
-                )?;
-                // Use the storage version from the dataset, ignoring any version from the user.
-                let data_storage_version = dataset
-                    .manifest()
-                    .data_storage_format
-                    .lance_file_version()?;
-                (write_schema, data_storage_version)
-            }
-            WriteMode::Overwrite => {
-                // Overwrite, use the schema from the data.  If the user specified
-                // a storage version use that.  Otherwise use the version from the
-                // dataset.
-                let data_storage_version = params.data_storage_version.unwrap_or(
-                    dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?,
-                );
-                (normalized_converted_schema, data_storage_version)
+    versions::write_fragments(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        normalized_schema,
+        data,
+        params,
+        target_bases_info,
+        file_row_counts,
+        preassigned_data_file_name,
+    )
+    .await
+}
+
+pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
+    let mut schema = schema.clone();
+    for field in &mut schema.fields {
+        field.promote_blob_v2()?;
+    }
+    schema.set_field_id(schema.max_field_id());
+    Ok(schema)
+}
+
+pub(super) fn prepare_write_schema(
+    dataset: Option<&Dataset>,
+    normalized_converted_schema: Schema,
+    params: &WriteParams,
+    mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
+) -> Result<Schema> {
+    let schema = if let Some(dataset) = dataset
+        && matches!(params.mode, WriteMode::Append | WriteMode::Create)
+    {
+        schema_compare_options.compare_nullability = NullabilityComparison::Ignore;
+        schema_compare_options.allow_missing_if_nullable = true;
+        schema_compare_options.ignore_field_order = true;
+        validate_blob_threshold_metadata_for_append(
+            &normalized_converted_schema,
+            dataset.schema(),
+        )?;
+        if normalized_converted_schema
+            .check_compatible(dataset.schema(), &schema_compare_options)
+            .is_ok()
+        {
+            return dataset.schema().project_by_schema(
+                &normalized_converted_schema,
+                OnMissing::Error,
+                OnTypeMismatch::Error,
+            );
+        }
+        let comparison_schema = promote_legacy_blob_schema(&normalized_converted_schema)?;
+        let dataset_schema = promote_legacy_blob_schema(dataset.schema())?;
+        comparison_schema.check_compatible(&dataset_schema, &schema_compare_options)?;
+        let mut projected = dataset_schema.project_by_schema(
+            &comparison_schema,
+            OnMissing::Error,
+            OnTypeMismatch::Error,
+        )?;
+        // Inputs for 2.2+ were already promoted before schema preparation.
+        // Remaining byte inputs retain the legacy physical layout and the table's field IDs.
+        fn restore_legacy_blob_inputs(
+            field: &mut lance_core::datatypes::Field,
+            input: &lance_core::datatypes::Field,
+        ) {
+            if input.is_blob() && !input.is_blob_v2() {
+                field.logical_type = input.logical_type.clone();
+                field.children = input.children.clone();
+                field.metadata = input.metadata.clone();
+                field.encoding = input.encoding.clone();
+            } else if !field.is_blob() {
+                for child in &mut field.children {
+                    if let Some(input) =
+                        input.children.iter().find(|input| input.name == child.name)
+                    {
+                        restore_legacy_blob_inputs(child, input);
+                    }
+                }
             }
         }
+        for field in &mut projected.fields {
+            if let Some(input) = normalized_converted_schema
+                .fields
+                .iter()
+                .find(|input| input.name == field.name)
+            {
+                restore_legacy_blob_inputs(field, input);
+            }
+        }
+        projected
     } else {
-        // Brand new dataset, use the schema from the data and the storage version
-        // from the user or the default.
-        (
-            normalized_converted_schema,
-            params.storage_version_or_default(),
-        )
+        normalized_converted_schema
     };
+    Ok(schema)
+}
 
-    if storage_version < LanceFileVersion::V2_2 && schema.fields_pre_order().any(|f| f.is_blob_v2())
-    {
+pub(super) fn validate_legacy_blob_write_schema(
+    schema: &Schema,
+    version_debug: &str,
+) -> Result<()> {
+    if schema.fields_pre_order().any(|field| field.is_blob_v2()) {
         return Err(Error::invalid_input(format!(
-            "Blob v2 requires file version >= 2.2 (got {:?})",
-            storage_version
+            "Blob v2 requires file version >= 2.2 (got {version_debug})"
         )));
     }
+    Ok(())
+}
 
-    if storage_version >= LanceFileVersion::V2_2
-        && let Some(blob_field_path) = legacy_blob_field_path(&schema)
-    {
+pub(super) fn validate_blob_v2_write_schema(schema: &Schema) -> Result<()> {
+    if let Some(blob_field_path) = legacy_blob_field_path(schema) {
         return Err(Error::invalid_input(format!(
             "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Found legacy blob field: {blob_field_path}. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
         )));
     }
+    Ok(())
+}
 
-    let fragments = do_write_fragments(
-        dataset,
-        object_store,
-        base_dir,
-        &schema,
-        data,
-        params,
-        storage_version,
-        target_bases_info,
-    )
-    .await?;
+pub(crate) async fn create_seed_writers_current(
+    dataset: Option<&Dataset>,
+    params: &WriteParams,
+) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> {
+    // Seeds only make sense when appending to an existing dataset.
+    if !matches!(params.mode, WriteMode::Append) {
+        return Ok(Vec::new());
+    }
+    let Some(dataset) = dataset else {
+        return Ok(Vec::new());
+    };
 
-    Ok((fragments, schema))
+    // Seeds depend on index configuration, not FRI-derived query coverage.
+    let indices: Arc<Vec<IndexMetadata>> = load_all_indices(dataset).await?;
+    let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
+
+    for index in indices.iter().filter(|index| index_is_usable(index)) {
+        // A covered index lists its carried columns in `fields` too; the seed
+        // writer keys on the single keyed column. System indices commit no
+        // fields at all, so this also skips them.
+        let Some(field_id) = index.keyed_field() else {
+            continue;
+        };
+        let Ok(field_path) = dataset.schema().field_path(field_id) else {
+            continue;
+        };
+        let Some(data_type) = dataset.schema().field(&field_path).map(|f| f.data_type()) else {
+            continue;
+        };
+
+        let Ok(index_details) = fetch_index_details(dataset, &field_path, index).await else {
+            continue;
+        };
+        let details = IndexDetails(index_details.clone());
+        let Ok(plugin) = details.get_plugin() else {
+            continue;
+        };
+        if let Some(writer) = plugin
+            .create_seed_writer(&field_path, &data_type, &index_details)
+            .await?
+        {
+            writers.push(writer);
+        }
+    }
+
+    Ok(writers)
 }
 
 fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
@@ -1367,13 +2007,44 @@ pub trait GenericWriter: Send {
     async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
+
+    /// Append `array` to a single top-level column, leaving the others where
+    /// they are.
+    ///
+    /// `column_index` is the column's position in the writer's schema. Columns
+    /// advance independently, so a file written this way can end with a
+    /// different number of rows in each column, and the row count
+    /// [`finish`](Self::finish) reports is then the longest column rather than a
+    /// count every column shares. That raggedness is the point: it is what lets
+    /// an overlay carry a different subset of cells per field. Callers that want
+    /// every column to stay aligned should use [`Self::write`] instead.
+    ///
+    /// Only supported on V2 files without blob preprocessing. This is a
+    /// defaulted method rather than a required one so that the writers which
+    /// cannot offer it -- and any implementor outside this crate -- keep
+    /// compiling and reject it at runtime instead.
+    async fn write_column(&mut self, _column_index: usize, _array: ArrayRef) -> Result<()> {
+        Err(Error::not_supported(
+            "writing a single column: this writer only accepts whole batches",
+        ))
+    }
+
+    /// Add a global buffer to the current file. Returns the 1-based buffer index.
+    /// Must be called before `finish`. No-op on legacy (V1) files (returns `Ok(1)`).
+    async fn add_global_buffer(&mut self, _buffer: Bytes) -> Result<u32> {
+        Ok(1)
+    }
+
+    /// Add a key-value pair to the file's schema metadata.
+    /// Must be called before `finish`. No-op on legacy (V1) files.
+    fn add_schema_metadata(&mut self, _key: String, _value: String) {}
 }
 
 struct V1WriterAdapter<M>
 where
-    M: PreviousManifestProvider + Send + Sync,
+    M: V1ManifestProvider + Send + Sync,
 {
-    writer: PreviousFileWriter<M>,
+    writer: V1FileWriter<M>,
     path: String,
     base_id: Option<u32>,
 }
@@ -1381,7 +2052,7 @@ where
 #[async_trait::async_trait]
 impl<M> GenericWriter for V1WriterAdapter<M>
 where
-    M: PreviousManifestProvider + Send + Sync,
+    M: V1ManifestProvider + Send + Sync,
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
@@ -1406,38 +2077,163 @@ where
     }
 }
 
-struct V2WriterAdapter {
+/// Writes dataset data files in the current (V2) file formats.
+///
+/// Every current-format data file a dataset writes goes through this type, so
+/// it is the single write boundary: each batch is converted from the
+/// representation the caller supplied to the one Lance stores (Arrow JSON to
+/// Lance JSONB, top-level view arrays to offset arrays) before blob
+/// preprocessing and encoding. The file writer then rejects any array that
+/// still differs from the file schema.
+pub(in crate::dataset) struct V2WriterAdapter {
     writer: current_writer::FileWriter,
-    path: String,
-    base_id: Option<u32>,
+    data_file: Option<DataFile>,
     preprocessor: Option<BlobPreprocessor>,
+    promotion: Option<FilePromotion>,
+}
+
+pub(in crate::dataset) struct FilePromotion {
+    object_store: ObjectStore,
+    staging_path: Path,
+    final_path: Path,
+}
+
+impl FilePromotion {
+    async fn promote(&self) -> Result<()> {
+        match self
+            .object_store
+            .inner
+            .copy_if_not_exists(&self.staging_path, &self.final_path)
+            .await
+        {
+            Ok(()) => {}
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let staged = self
+                    .object_store
+                    .inner
+                    .head(&self.staging_path)
+                    .await
+                    .map_err(|error| Error::io(error.to_string()))?;
+                let existing = self
+                    .object_store
+                    .inner
+                    .head(&self.final_path)
+                    .await
+                    .map_err(|error| Error::io(error.to_string()))?;
+                if staged.size != existing.size {
+                    return Err(Error::io(format!(
+                        "fixed data file {} already exists with size {}, but the staged retry has size {}",
+                        self.final_path, existing.size, staged.size
+                    )));
+                }
+            }
+            Err(error) => return Err(Error::io(error.to_string())),
+        }
+        self.object_store
+            .inner
+            .delete(&self.staging_path)
+            .await
+            .map_err(|error| Error::io(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn abort(&self) {
+        let _ = self.object_store.inner.delete(&self.staging_path).await;
+    }
+}
+
+impl V2WriterAdapter {
+    /// `data_file` describes the file being written and is completed by
+    /// [`GenericWriter::finish`]. Writers that describe their output
+    /// themselves pass `None` and use [`Self::finish_file`].
+    pub(in crate::dataset) fn new(
+        writer: current_writer::FileWriter,
+        data_file: Option<DataFile>,
+        preprocessor: Option<BlobPreprocessor>,
+        promotion: Option<FilePromotion>,
+    ) -> Self {
+        Self {
+            writer,
+            data_file,
+            preprocessor,
+            promotion,
+        }
+    }
+
+    pub(in crate::dataset) async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone())?;
+        let batch = match self.preprocessor.as_mut() {
+            Some(pre) => pre.preprocess_batch(&batch).await?,
+            None => batch,
+        };
+        self.writer.write_batch(&batch).await
+    }
+
+    /// Finish the blob sidecars and the data file.
+    pub(in crate::dataset) async fn finish_file(&mut self) -> Result<FileWriteSummary> {
+        let result = async {
+            if let Some(pre) = self.preprocessor.as_mut() {
+                pre.finish().await?;
+            }
+            let summary = self.writer.finish().await?;
+            if let Some(promotion) = &self.promotion {
+                promotion.promote().await?;
+            }
+            Ok(summary)
+        }
+        .await;
+        if result.is_err()
+            && let Some(promotion) = &self.promotion
+        {
+            promotion.abort().await;
+        }
+        result
+    }
+
+    /// Abandon the data file and any blob sidecars in progress.
+    pub(in crate::dataset) async fn abort(&mut self) {
+        self.writer.abort().await;
+        if let Some(pre) = self.preprocessor.as_mut() {
+            pre.abort();
+        }
+        if let Some(promotion) = &self.promotion {
+            promotion.abort().await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl GenericWriter for V2WriterAdapter {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        if let Some(pre) = self.preprocessor.as_mut() {
-            let processed = preprocess_blob_batches(batches, pre).await?;
-            for batch in processed {
-                self.writer.write_batch(&batch).await?;
-            }
-        } else {
-            for batch in batches {
-                self.writer.write_batch(batch).await?;
-            }
+        for batch in batches {
+            self.write_batch(batch).await?;
         }
         Ok(())
     }
+    async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
+        if self.preprocessor.is_some() {
+            // The preprocessor rewrites a batch as a whole, splitting blob
+            // values out to a sidecar and replacing them with descriptions; it
+            // has no meaning applied to one column in isolation.
+            return Err(Error::not_supported(
+                "writing a single column: this file stores blob data in a sidecar",
+            ));
+        }
+        self.writer.write_column(column_index, array).await
+    }
     fn data_file_path(&self) -> (&str, Option<u32>) {
-        (&self.path, self.base_id)
+        self.data_file
+            .as_ref()
+            .map(|data_file| (data_file.path.as_str(), data_file.base_id))
+            .unwrap_or(("", None))
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
-        if let Some(pre) = self.preprocessor.as_mut() {
-            pre.finish().await?;
-        }
         let field_ids = self
             .writer
             .field_id_to_column_indices()
@@ -1450,162 +2246,235 @@ impl GenericWriter for V2WriterAdapter {
             .iter()
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
-        let (major, minor) = self.writer.version().to_numbers();
-        let write_summary = self.writer.finish().await?;
-        let data_file = DataFile::new(
-            std::mem::take(&mut self.path),
-            field_ids,
-            column_indices,
-            major,
-            minor,
-            NonZero::new(write_summary.size_bytes),
-            self.base_id,
-        );
+        let write_summary = self.finish_file().await?;
+        let mut data_file = self
+            .data_file
+            .take()
+            .ok_or_else(|| Error::internal("current writer was already finished"))?;
+        data_file.fields = field_ids.into();
+        data_file.column_indices = column_indices.into();
+        data_file.file_size_bytes = NonZero::new(write_summary.size_bytes).into();
         Ok((write_summary.num_rows as u32, data_file))
+    }
+
+    async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
+        self.writer.add_global_buffer(buffer).await
+    }
+
+    fn add_schema_metadata(&mut self, key: String, value: String) {
+        self.writer.add_schema_metadata(key, value);
     }
 }
 
-pub async fn open_writer(
-    object_store: &ObjectStore,
-    schema: &Schema,
-    base_dir: &Path,
-    storage_version: LanceFileVersion,
-) -> Result<Box<dyn GenericWriter>> {
-    open_writer_with_options(
-        object_store,
-        schema,
-        base_dir,
-        storage_version,
-        WriterOptions {
-            add_data_dir: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-pub(super) async fn open_update_writer(
-    dataset: &Dataset,
-    schema: &Schema,
-    storage_version: LanceFileVersion,
-) -> Result<Box<dyn GenericWriter>> {
-    // add_columns / alter_columns reuse the normal writer stack, but they do not
-    // flow through WriteParams. Rebuild the external base resolver here so blob
-    // v2 reference columns can resolve dataset-registered external URIs.
-    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
-        && schema.fields_pre_order().any(|f| f.is_blob_v2())
-    {
-        Some(Arc::new(
-            build_external_base_resolver(Some(dataset), &WriteParams::default()).await?,
-        ))
-    } else {
-        None
-    };
-
-    open_writer_with_options(
-        &dataset.object_store,
-        schema,
-        &dataset.base,
-        storage_version,
-        WriterOptions {
-            add_data_dir: true,
-            external_base_resolver,
-            source_store_registry: dataset.session.store_registry(),
-            ..Default::default()
-        },
-    )
-    .await
-}
-
 #[derive(Default)]
-struct WriterOptions {
+pub(crate) struct WriterOptions {
     add_data_dir: bool,
     base_id: Option<u32>,
+    preassigned_data_file_name: Option<Arc<String>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
 }
 
-async fn open_writer_with_options(
+impl WriterOptions {
+    pub(super) fn update(
+        source_store_registry: Arc<ObjectStoreRegistry>,
+        external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+        allow_external_blob_outside_bases: bool,
+    ) -> Self {
+        Self {
+            add_data_dir: true,
+            external_base_resolver,
+            allow_external_blob_outside_bases,
+            source_store_registry,
+            ..Default::default()
+        }
+    }
+}
+
+pub(crate) async fn open_v1_writer(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
-    storage_version: LanceFileVersion,
     options: WriterOptions,
 ) -> Result<Box<dyn GenericWriter>> {
     let WriterOptions {
         add_data_dir,
         base_id,
+        preassigned_data_file_name,
+        ..
+    } = options;
+    let (_data_file_key, filename, _data_dir, full_path) = prepare_data_file_path(
+        base_dir,
+        add_data_dir,
+        preassigned_data_file_name.as_deref().map(String::as_str),
+    );
+    Ok(Box::new(V1WriterAdapter {
+        writer: V1FileWriter::<ManifestDescribing>::try_new(
+            object_store,
+            &full_path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await?,
+        path: filename,
+        base_id,
+    }))
+}
+
+pub(in crate::dataset) async fn open_current_writer<F>(
+    create_file_writer: F,
+    object_store: &ObjectStore,
+    schema: &Schema,
+    base_dir: &Path,
+    options: WriterOptions,
+) -> Result<Box<dyn GenericWriter>>
+where
+    F: FnOnce(
+        Box<dyn Writer>,
+        Schema,
+        String,
+        Option<u32>,
+        FileWriterOptions,
+    ) -> Result<(current_writer::FileWriter, DataFile)>,
+{
+    let WriterOptions {
+        add_data_dir,
+        base_id,
+        preassigned_data_file_name,
+        file_writer_options,
+        ..
+    } = options;
+    let (_data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
+        base_dir,
+        add_data_dir,
+        preassigned_data_file_name.as_deref().map(String::as_str),
+    );
+    let (writer_path, promotion_target) =
+        staged_writer_path(data_dir, final_path, preassigned_data_file_name.is_some());
+    let writer = object_store.create(&writer_path).await?;
+    let promotion = promotion_target.map(|final_path| FilePromotion {
+        object_store: object_store.clone(),
+        staging_path: writer_path,
+        final_path,
+    });
+    let (file_writer, data_file) = create_file_writer(
+        writer,
+        schema.clone(),
+        filename,
+        base_id,
+        file_writer_options,
+    )?;
+    Ok(Box::new(V2WriterAdapter::new(
+        file_writer,
+        Some(data_file),
+        None,
+        promotion,
+    )))
+}
+
+pub(in crate::dataset) async fn open_current_blob_v2_writer<F>(
+    create_file_writer: F,
+    object_store: &ObjectStore,
+    schema: &Schema,
+    base_dir: &Path,
+    options: WriterOptions,
+) -> Result<Box<dyn GenericWriter>>
+where
+    F: FnOnce(
+        Box<dyn Writer>,
+        Schema,
+        String,
+        Option<u32>,
+        FileWriterOptions,
+    ) -> Result<(current_writer::FileWriter, DataFile)>,
+{
+    let WriterOptions {
+        add_data_dir,
+        base_id,
+        preassigned_data_file_name,
         external_base_resolver,
         allow_external_blob_outside_bases,
         external_blob_mode,
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
+        file_writer_options,
     } = options;
+    let (data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
+        base_dir,
+        add_data_dir,
+        preassigned_data_file_name.as_deref().map(String::as_str),
+    );
+    let (writer_path, promotion_target) = staged_writer_path(
+        data_dir.clone(),
+        final_path,
+        preassigned_data_file_name.is_some(),
+    );
+    let writer = object_store.create(&writer_path).await?;
+    let promotion = promotion_target.map(|final_path| FilePromotion {
+        object_store: object_store.clone(),
+        staging_path: writer_path,
+        final_path,
+    });
+    let (file_writer, data_file) = create_file_writer(
+        writer,
+        schema.clone(),
+        filename,
+        base_id,
+        file_writer_options,
+    )?;
+    let preprocessor = BlobPreprocessor::new(
+        object_store.clone(),
+        data_dir,
+        data_file_key,
+        schema,
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+        external_blob_mode,
+        source_store_registry,
+        source_store_params,
+        blob_pack_file_size_threshold,
+    )?;
+    Ok(Box::new(V2WriterAdapter::new(
+        file_writer,
+        Some(data_file),
+        Some(preprocessor),
+        promotion,
+    )))
+}
 
-    let data_file_key = generate_random_filename();
-    let filename = format!("{}.lance", data_file_key);
-
+fn prepare_data_file_path(
+    base_dir: &Path,
+    add_data_dir: bool,
+    preassigned_data_file_name: Option<&str>,
+) -> (String, String, Path, Path) {
+    let filename = preassigned_data_file_name
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{}.lance", generate_random_filename()));
+    let data_file_key = filename
+        .strip_suffix(".lance")
+        .unwrap_or(filename.as_str())
+        .to_string();
     let data_dir = if add_data_dir {
         base_dir.clone().join(DATA_DIR)
     } else {
         base_dir.clone()
     };
-
     let full_path = data_dir.clone().join(filename.as_str());
+    (data_file_key, filename, data_dir, full_path)
+}
 
-    let writer = if storage_version == LanceFileVersion::Legacy {
-        Box::new(V1WriterAdapter {
-            writer: PreviousFileWriter::<ManifestDescribing>::try_new(
-                object_store,
-                &full_path,
-                schema.clone(),
-                &Default::default(),
-            )
-            .await?,
-            path: filename,
-            base_id,
-        })
-    } else {
-        let writer = object_store.create(&full_path).await?;
-        let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
-        let file_writer = current_writer::FileWriter::try_new(
-            writer,
-            schema.clone(),
-            FileWriterOptions {
-                format_version: Some(storage_version),
-                ..Default::default()
-            },
-        )?;
-        let preprocessor = if enable_blob_v2 {
-            Some(BlobPreprocessor::new(
-                object_store.clone(),
-                data_dir.clone(),
-                data_file_key.clone(),
-                schema,
-                external_base_resolver,
-                allow_external_blob_outside_bases,
-                external_blob_mode,
-                source_store_registry,
-                source_store_params,
-                blob_pack_file_size_threshold,
-            )?)
-        } else {
-            None
-        };
-        let writer_adapter = V2WriterAdapter {
-            writer: file_writer,
-            path: filename,
-            base_id,
-            preprocessor,
-        };
-        Box::new(writer_adapter) as Box<dyn GenericWriter>
-    };
-    Ok(writer)
+fn staged_writer_path(data_dir: Path, final_path: Path, stage: bool) -> (Path, Option<Path>) {
+    if !stage {
+        return (final_path, None);
+    }
+    let staging_path = data_dir.join(format!("{}.lance-stage", generate_random_filename()));
+    (staging_path, Some(final_path))
 }
 
 /// Reserved base id that refers to the dataset's primary storage in
@@ -1630,13 +2499,13 @@ pub struct TargetBaseInfo {
     pub is_dataset_root: bool,
 }
 
-struct WriterGenerator {
+struct WriterGenerator<OpenWriter> {
     /// Default object store (used when no target bases specified)
     object_store: Arc<ObjectStore>,
     /// Default base directory (used when no target bases specified)
     base_dir: Path,
     schema: Schema,
-    storage_version: LanceFileVersion,
+    open_writer: OpenWriter,
     /// Target base information (if writing to specific bases)
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
@@ -1645,17 +2514,24 @@ struct WriterGenerator {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
+    preassigned_data_file_name: Option<Arc<String>>,
+    writers_created: AtomicUsize,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
 
-impl WriterGenerator {
+impl<OpenWriter, OpenWriterFuture> WriterGenerator<OpenWriter>
+where
+    OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
+    OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
+{
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
         schema: &Schema,
-        storage_version: LanceFileVersion,
+        open_writer: OpenWriter,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         external_base_resolver: Option<Arc<ExternalBaseResolver>>,
         allow_external_blob_outside_bases: bool,
@@ -1663,12 +2539,14 @@ impl WriterGenerator {
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
+        file_writer_options: FileWriterOptions,
+        preassigned_data_file_name: Option<Arc<String>>,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
-            storage_version,
+            open_writer,
             target_bases_info,
             external_base_resolver,
             allow_external_blob_outside_bases,
@@ -1676,6 +2554,9 @@ impl WriterGenerator {
             source_store_registry,
             source_store_params,
             blob_pack_file_size_threshold,
+            file_writer_options,
+            preassigned_data_file_name,
+            writers_created: AtomicUsize::new(0),
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1692,44 +2573,54 @@ impl WriterGenerator {
     }
 
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
+        let writer_index = self
+            .writers_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if writer_index > 0 && self.preassigned_data_file_name.is_some() {
+            return Err(Error::internal(
+                "a fixed data file name requires the write to produce exactly one fragment",
+            ));
+        }
         // Use temporary ID 0; will assign ID later.
         let fragment = Fragment::new(0);
 
         let writer = if let Some(base_info) = self.select_target_base() {
-            open_writer_with_options(
-                &base_info.object_store,
-                &self.schema,
-                &base_info.base_dir,
-                self.storage_version,
+            (self.open_writer)(
+                base_info.object_store.clone(),
+                self.schema.clone(),
+                base_info.base_dir.clone(),
                 WriterOptions {
                     add_data_dir: base_info.is_dataset_root,
                     // Primary-storage slots stamp no base id, like a write
                     // without target bases.
                     base_id: (base_info.base_id != PRIMARY_BASE_ID).then_some(base_info.base_id),
+                    preassigned_data_file_name: self.preassigned_data_file_name.clone(),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
         } else {
-            open_writer_with_options(
-                &self.object_store,
-                &self.schema,
-                &self.base_dir,
-                self.storage_version,
+            (self.open_writer)(
+                self.object_store.clone(),
+                self.schema.clone(),
+                self.base_dir.clone(),
                 WriterOptions {
                     add_data_dir: true,
                     base_id: None,
+                    preassigned_data_file_name: self.preassigned_data_file_name.clone(),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -1771,123 +2662,81 @@ async fn resolve_commit_handler(
     }
 }
 
-/// Create an iterator of record batch streams from the given source.
-///
-/// If `enable_retries` is true, then the source will be saved either in memory
-/// or spilled to disk to allow replaying the source in case of a failure. The
-/// source will be kept in memory if either (1) the size hint shows that
-/// there is only one batch or (2) the stream contains less than 100MB of
-/// data. Otherwise, the source will be spilled to a temporary file on disk.
-///
-/// This is used to support retries on write operations.
-async fn new_source_iter(
-    source: SendableRecordBatchStream,
-    enable_retries: bool,
-) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
-    if enable_retries {
-        let schema = source.schema();
-
-        // If size hint shows there is only one batch, spilling has no benefit, just keep that
-        // in memory. (This is a pretty common case.)
-        let size_hint = source.size_hint();
-        if size_hint.0 == 1 && size_hint.1 == Some(1) {
-            let batches: Vec<RecordBatch> = source.try_collect().await?;
-            Ok(Box::new(std::iter::repeat_with(move || {
-                Box::pin(RecordBatchStreamAdapter::new(
-                    schema.clone(),
-                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
-                )) as SendableRecordBatchStream
-            })))
-        } else {
-            // Allow buffering up to 100MB in memory before spilling to disk.
-            Ok(Box::new(
-                SpillStreamIter::try_new(source, 100 * 1024 * 1024).await?,
-            ))
-        }
-    } else {
-        Ok(Box::new(std::iter::once(source)))
-    }
-}
-
-struct SpillStreamIter {
-    receiver: SpillReceiver,
-    _sender_handle: tokio::task::JoinHandle<SpillSender>,
-    // This temp dir is used to store the spilled data. It is kept alive by
-    // this struct. When this struct is dropped, the Drop implementation of
-    // tempfile::TempDir will delete the temp dir.
-    _tmp_dir: TempDir,
-}
-
-impl SpillStreamIter {
-    pub async fn try_new(
-        mut source: SendableRecordBatchStream,
-        memory_limit: usize,
-    ) -> Result<Self> {
-        let tmp_dir = tokio::task::spawn_blocking(|| {
-            TempDir::try_new()
-                .map_err(|e| Error::invalid_input(format!("Failed to create temp dir: {}", e)))
-        })
-        .await
-        .ok()
-        .expect_ok()??;
-
-        let tmp_path = tmp_dir.std_path().join("spill.arrows");
-        let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
-
-        let sender_handle = tokio::task::spawn(async move {
-            while let Some(res) = source.next().await {
-                match res {
-                    Ok(batch) => match sender.write(batch).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            sender.send_error(e);
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        sender.send_error(e);
-                        break;
-                    }
-                }
-            }
-
-            if let Err(err) = sender.finish().await {
-                sender.send_error(err);
-            }
-            sender
-        });
-
-        Ok(Self {
-            receiver,
-            _tmp_dir: tmp_dir,
-            _sender_handle: sender_handle,
-        })
-    }
-}
-
-impl Iterator for SpillStreamIter {
-    type Item = SendableRecordBatchStream;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(self.receiver.read())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::DatasetIndexExt;
     use std::collections::HashMap;
+    #[cfg(windows)]
+    use std::path::{Component, Prefix};
 
-    use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
+    use arrow_array::{
+        Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
+        StringViewArray, StructArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
+    use lance_datafusion::chunker::chunk_stream;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-    use lance_file::previous::reader::FileReader as PreviousFileReader;
+    use lance_file::version::ConcreteFileVersion;
+    use lance_file::versions::v1::reader::FileReader as V1FileReader;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
+    use rstest::rstest;
+
+    async fn open_v2_1_test_writer(
+        object_store: Arc<ObjectStore>,
+        schema: Schema,
+        base_dir: Path,
+        options: WriterOptions,
+    ) -> Result<Box<dyn GenericWriter>> {
+        open_current_writer(
+            |object_writer, schema, filename, base_id, options| {
+                let writer =
+                    lance_file::versions::v2_1::create_writer(object_writer, schema, options)?
+                        .into();
+                let mut data_file = DataFile::new_unstarted(filename, ConcreteFileVersion::V2_1);
+                data_file.base_id = base_id;
+                Ok((writer, data_file))
+            },
+            &object_store,
+            &schema,
+            &base_dir,
+            options,
+        )
+        .await
+    }
+
+    async fn scan_sorted_ids(dataset: &Dataset) -> Vec<i32> {
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
 
     #[test]
     fn test_auto_cleanup_disabled_by_default() {
@@ -1897,6 +2746,51 @@ mod tests {
         let params = WriteParams::default();
         assert!(params.auto_cleanup.is_none());
         assert!(!params.skip_auto_cleanup);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_create_and_reopen_from_unc_uri() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let dataset_path = tempdir.path().join("dataset with spaces");
+        let mut components = dataset_path.components();
+        let drive_letter = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+                other => panic!("expected a disk path, found {other:?}"),
+            },
+            other => panic!("expected a disk path, found {other:?}"),
+        };
+        assert!(matches!(components.next(), Some(Component::RootDir)));
+
+        // The administrative disk share provides a real loopback UNC path without
+        // requiring an external SMB service.
+        let computer_name = std::env::var("COMPUTERNAME").unwrap();
+        let mut dataset_uri = url::Url::parse(&format!("file://{computer_name}/")).unwrap();
+        let share = format!("{}$", char::from(drive_letter));
+        {
+            let mut segments = dataset_uri.path_segments_mut().unwrap();
+            segments.pop_if_empty().push(&share);
+            for component in components {
+                let Component::Normal(segment) = component else {
+                    panic!("unexpected dataset path component: {component:?}");
+                };
+                segments.push(segment.to_str().unwrap());
+            }
+        }
+        assert!(dataset_uri.as_str().contains("%20"));
+
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let dataset = Dataset::write(reader, dataset_uri.as_str(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+        drop(dataset);
+
+        let reopened = Dataset::open(dataset_uri.as_str()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 3);
     }
 
     #[tokio::test]
@@ -2004,6 +2898,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2033,6 +2928,138 @@ mod tests {
         assert_eq!(fragments.len(), 2);
     }
 
+    #[rstest]
+    #[case::rebalance_pending_remainder(
+        &[9_999, 10_001],
+        &[10_000, 10_000],
+        2 * 1024,
+        &[9_999, 5_001, 5_000]
+    )]
+    #[case::replan_pending_boundary(
+        &[9_999, 1, 10_000, 10_000],
+        &[20_000, 10_000],
+        100 * 1024,
+        &[9_999, 10_001, 10_000]
+    )]
+    #[tokio::test]
+    async fn test_planned_file_boundary_with_byte_limit(
+        #[case] input_batch_sizes: &[usize],
+        #[case] file_row_counts: &[usize],
+        #[case] max_bytes_per_file: usize,
+        #[case] expected_file_rows: &[usize],
+    ) {
+        let value = vec![0_u8; 1024];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let total_rows = input_batch_sizes.iter().sum::<usize>();
+        let data = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter_values(
+                (0..total_rows).map(|_| value.as_slice()),
+            ))],
+        )
+        .unwrap();
+        let mut offset = 0;
+        let batches = input_batch_sizes
+            .iter()
+            .map(|&batch_rows| {
+                let batch = data.slice(offset, batch_rows);
+                offset += batch_rows;
+                Ok::<_, DataFusionError>(batch)
+            })
+            .collect::<Vec<_>>();
+        let stream =
+            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+
+        let (fragments, _) = write_fragments_internal_with_file_row_counts(
+            ConcreteFileVersion::V2_0,
+            None,
+            object_store,
+            &Path::from("planned_byte_boundary"),
+            schema,
+            Box::pin(stream),
+            WriteParams {
+                max_rows_per_file: file_row_counts[0],
+                max_bytes_per_file,
+                mode: WriteMode::Create,
+                ..Default::default()
+            },
+            None,
+            Some(file_row_counts.to_vec()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            expected_file_rows
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_byte_closes_rebalance_planned_rows() {
+        let large_value = vec![0_u8; 16 * 1024 * 1024];
+        let mut values = Vec::with_capacity(15);
+        values.extend(std::iter::repeat_n(large_value.as_slice(), 2));
+        values.extend(std::iter::repeat_n(&[][..], 13));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let data = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from_iter_values(values))],
+        )
+        .unwrap();
+        let input_batch_sizes = [1, 1, 3, 5, 5];
+        let mut offset = 0;
+        let batches = input_batch_sizes.map(|batch_rows| {
+            let batch = data.slice(offset, batch_rows);
+            offset += batch_rows;
+            Ok::<_, DataFusionError>(batch)
+        });
+        let stream =
+            RecordBatchStreamAdapter::new(arrow_schema.clone(), futures::stream::iter(batches));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+
+        let (fragments, _) = write_fragments_internal_with_file_row_counts(
+            ConcreteFileVersion::V2_0,
+            None,
+            object_store,
+            &Path::from("repeated_planned_byte_boundaries"),
+            schema,
+            Box::pin(stream),
+            WriteParams {
+                max_rows_per_file: 5,
+                max_bytes_per_file: 100 * 1024,
+                mode: WriteMode::Create,
+                ..Default::default()
+            },
+            None,
+            Some(vec![5, 5, 5]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows.unwrap())
+                .collect::<Vec<_>>(),
+            [1, 1, 5, 4, 4]
+        );
+    }
+
     #[tokio::test]
     async fn test_max_rows_per_file() {
         let reader_to_frags = |data_reader: Box<dyn RecordBatchReader + Send>| {
@@ -2057,6 +3084,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2118,6 +3146,7 @@ mod tests {
 
                 let object_store = Arc::new(ObjectStore::memory());
                 write_fragments_internal(
+                    write_params.storage_version_or_default(),
                     None,
                     object_store,
                     &Path::from("test"),
@@ -2214,7 +3243,8 @@ mod tests {
             LanceFileVersion::Next,
         ];
         for version in versions {
-            let (major, minor) = version.to_numbers();
+            let (major, minor) = version.resolve().to_data_file_numbers();
+
             let write_params = WriteParams {
                 data_storage_version: Some(version),
                 // This parameter should be ignored
@@ -2231,6 +3261,7 @@ mod tests {
 
             let object_store = Arc::new(ObjectStore::memory());
             let (fragments, _) = write_fragments_internal(
+                version.resolve(),
                 None,
                 object_store,
                 &Path::from("test"),
@@ -2306,6 +3337,7 @@ mod tests {
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
         let (fragments, _) = write_fragments_internal(
+            ConcreteFileVersion::V1,
             None,
             object_store.clone(),
             &base_path,
@@ -2327,7 +3359,7 @@ mod tests {
             .join(DATA_DIR)
             .join(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
-        let reader = PreviousFileReader::try_new_from_reader(
+        let reader = V1FileReader::try_new_from_reader(
             &path,
             file_reader,
             None,
@@ -2515,13 +3547,15 @@ mod tests {
             object_store.clone(),
             &base_dir,
             &schema,
-            LanceFileVersion::Stable,
+            open_v2_1_test_writer,
             Some(target_bases),
             None,
             false,
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
+            FileWriterOptions::default(),
             None,
         );
 
@@ -2561,11 +3595,11 @@ mod tests {
         let object_store = Arc::new(ObjectStore::memory());
         let base_dir = Path::from("test/bucket2");
 
-        let mut inner_writer = open_writer_with_options(
+        let mut inner_writer = versions::open_writer(
+            LanceFileVersion::Stable.resolve(),
             &object_store,
             &schema,
             &base_dir,
-            LanceFileVersion::Stable,
             WriterOptions {
                 add_data_dir: false, // Don't add /data
                 ..Default::default()
@@ -2633,13 +3667,15 @@ mod tests {
             Arc::new(ObjectStore::memory()),
             &Path::from("default"),
             &schema,
-            LanceFileVersion::Stable,
+            open_v2_1_test_writer,
             Some(target_bases),
             None,
             false,
             ExternalBlobMode::Reference,
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
+            None,
+            FileWriterOptions::default(),
             None,
         );
 
@@ -2785,7 +3821,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create dataset with multi-base configuration
-        let test_uri = "memory://multi_base_test";
+        let test_uri = "shared-memory://multi_base_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -2851,6 +3887,10 @@ mod tests {
                     .any(|file| file.base_id == Some(1))
             );
         }
+
+        assert_eq!(scan_sorted_ids(&dataset).await, (0..5).collect::<Vec<_>>());
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..5).collect::<Vec<_>>());
 
         // Test validation: cannot specify both target_bases and target_base_names_or_paths
         let mut data_gen2 =
@@ -2962,7 +4002,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create initial dataset
-        let test_uri = "memory://overwrite_test";
+        let test_uri = "shared-memory://overwrite_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -3045,6 +4085,9 @@ mod tests {
                 .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
         );
 
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..2).collect::<Vec<_>>());
+
         // Test validation: cannot specify initial_bases in OVERWRITE mode
         let mut data_gen3 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
@@ -3080,7 +4123,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create initial dataset with multi-base configuration
-        let test_uri = "memory://append_test";
+        let test_uri = "shared-memory://append_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -3166,6 +4209,11 @@ mod tests {
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
+
+        let mut expected: Vec<i32> = (0..3).chain(0..2).chain(0..4).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
 
         // Test validation: cannot specify initial_bases in APPEND mode
         let mut data_gen4 =
@@ -3467,6 +4515,7 @@ mod tests {
         };
 
         let result = write_fragments_internal(
+            write_params.storage_version_or_default(),
             None,
             object_store,
             &Path::from("test_empty"),
@@ -3632,6 +4681,7 @@ mod tests {
                 Ok(ListResult {
                     common_prefixes: vec![],
                     objects: vec![],
+                    extensions: Default::default(),
                 })
             }
 
@@ -3691,6 +4741,7 @@ mod tests {
 
         // Attempt to write data - should fail with IO error due to disk full
         let result = write_fragments_internal(
+            write_params.storage_version_or_default(),
             None,
             object_store,
             &Path::from("test_disk_full"),
@@ -3733,6 +4784,7 @@ mod tests {
     async fn test_write_interruption_recovery() {
         use super::commit::CommitBuilder;
         use arrow_array::record_batch;
+        use lance_core::utils::tempfile::TempDir;
 
         // Create a temporary directory for testing
         let temp_dir = TempDir::default();
@@ -3871,14 +4923,17 @@ mod tests {
             futures::stream::iter(items),
         ));
 
-        let result = do_write_fragments(
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
             None,
             object_store.clone(),
             &base_dir,
             &schema,
             stream,
             WriteParams::default(),
-            LanceFileVersion::V2_1,
+            None,
+            Vec::new(),
+            None,
             None,
         )
         .await;
@@ -3928,7 +4983,8 @@ mod tests {
             futures::stream::iter(items),
         ));
 
-        let result = do_write_fragments(
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
             None,
             object_store.clone(),
             &base_dir,
@@ -3938,7 +4994,9 @@ mod tests {
                 max_rows_per_file: 3,
                 ..Default::default()
             },
-            LanceFileVersion::V2_1,
+            None,
+            Vec::new(),
+            None,
             None,
         )
         .await;
@@ -3974,12 +5032,14 @@ mod tests {
         // Sanity check: file is on disk.
         assert_eq!(count_data_files(test_uri), 1);
 
-        let mut external_file = DataFile::new_unstarted("external.lance", 2, 1);
+        let mut external_file =
+            DataFile::new_unstarted("external.lance", ConcreteFileVersion::V2_1);
         external_file.base_id = Some(42);
-        let local_file = DataFile::new_unstarted(local_filename, 2, 1);
+        let local_file = DataFile::new_unstarted(local_filename, ConcreteFileVersion::V2_1);
         let fragments = vec![Fragment {
             id: 0,
             files: vec![external_file, local_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
@@ -4051,15 +5111,16 @@ mod tests {
         assert_eq!(count_data_files(base1_dir.as_str()), 1);
         assert_eq!(count_plain_files(base2_dir.as_str()), 1);
 
-        let mut base1_file = DataFile::new_unstarted("one.lance", 2, 1);
+        let mut base1_file = DataFile::new_unstarted("one.lance", ConcreteFileVersion::V2_1);
         base1_file.base_id = Some(1);
-        let mut base2_file = DataFile::new_unstarted("two.lance", 2, 1);
+        let mut base2_file = DataFile::new_unstarted("two.lance", ConcreteFileVersion::V2_1);
         base2_file.base_id = Some(2);
-        let mut unknown_file = DataFile::new_unstarted("unknown.lance", 2, 1);
+        let mut unknown_file = DataFile::new_unstarted("unknown.lance", ConcreteFileVersion::V2_1);
         unknown_file.base_id = Some(42);
         let fragments = vec![Fragment {
             id: 0,
             files: vec![base1_file, base2_file, unknown_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
@@ -4152,7 +5213,8 @@ mod tests {
             is_dataset_root: true,
         }];
 
-        let result = do_write_fragments(
+        let result = versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
             None,
             object_store.clone(),
             &base_dir,
@@ -4162,8 +5224,10 @@ mod tests {
                 max_rows_per_file: 3,
                 ..Default::default()
             },
-            LanceFileVersion::V2_1,
             Some(target_bases),
+            vec![],
+            None,
+            None,
         )
         .await;
 
@@ -4182,7 +5246,7 @@ mod tests {
     async fn test_multi_base_target_primary_and_bases() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
-        let test_uri = "memory://primary_slot_test";
+        let test_uri = "shared-memory://primary_slot_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4274,6 +5338,11 @@ mod tests {
         assert_eq!(file_bases, vec![None, Some(2)]);
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
+
+        let mut expected: Vec<i32> = (0..6).chain(0..9).chain(0..6).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
     }
 
     /// `target_all_bases` resolves to every registered base at execution
@@ -4282,7 +5351,7 @@ mod tests {
     async fn test_multi_base_target_all_bases() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
-        let test_uri = "memory://all_bases_test";
+        let test_uri = "shared-memory://all_bases_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4364,6 +5433,11 @@ mod tests {
             .collect();
         assert_eq!(file_bases, vec![Some(1), Some(2)]);
 
+        let mut expected: Vec<i32> = (0..3).chain(0..9).chain(0..6).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
+
         // Cannot be combined with explicit target bases.
         let mut data_gen4 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
@@ -4389,7 +5463,7 @@ mod tests {
 
         // On a dataset with no registered bases: include_primary=true is a
         // no-op rotation over primary, false is rejected.
-        let plain_uri = "memory://all_bases_plain";
+        let plain_uri = "shared-memory://all_bases_plain/primary";
         let mut data_gen5 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
         let plain = Dataset::write(data_gen5.batch(3), plain_uri, None)
@@ -4440,12 +5514,13 @@ mod tests {
 
         // CREATE mode: initial_bases join the rotation before their ids are
         // committed to a manifest.
-        let create_uri = "memory://all_bases_create";
+        let create_root = "shared-memory://all_bases_create";
+        let create_uri = format!("{}/primary", create_root);
         let mut data_gen8 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
         let dataset = Dataset::write(
             data_gen8.batch(9),
-            create_uri,
+            &create_uri,
             Some(
                 WriteParams {
                     mode: WriteMode::Create,
@@ -4455,13 +5530,13 @@ mod tests {
                             id: 0,
                             name: Some("base1".to_string()),
                             is_dataset_root: true,
-                            path: format!("{}/base1", create_uri),
+                            path: format!("{}/base1", create_root),
                         },
                         BasePath {
                             id: 0,
                             name: Some("base2".to_string()),
                             is_dataset_root: false,
-                            path: format!("{}/base2", create_uri),
+                            path: format!("{}/base2", create_root),
                         },
                     ]),
                     ..Default::default()
@@ -4478,5 +5553,264 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+        let reopened = Dataset::open(&create_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..9).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_zone_map_seeds_used_during_update() {
+        use crate::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::open_scalar_index;
+        use arrow::datatypes::Int32Type;
+        use lance_datagen::{BatchCount, RowCount};
+        use lance_datagen::{array, gen_batch};
+        use lance_file::reader::FileReaderOptions;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+        use lance_io::utils::CachedFileSize;
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmpdir.as_str();
+
+        // Step 1: Create initial dataset
+        let reader = gen_batch()
+            .col("val", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+        // Step 2: Create a zone map index with seeds explicitly enabled (Int32 defaults to off).
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        // Step 3: Append new data - seeds should be written automatically
+        let reader = gen_batch()
+            .col("val", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        let dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Step 4: Verify that the newly appended fragment has a seed embedded
+        let fragments = dataset.fragments();
+        let new_fragment = fragments.last().unwrap();
+        let data_file = new_fragment.files.first().unwrap();
+
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let path = dataset
+            .base
+            .clone()
+            .join(super::DATA_DIR)
+            .join(data_file.path.as_str());
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Default::default(),
+            &dataset.metadata_cache.file_metadata_cache(&path),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let meta_key = format!("{}val", SEED_META_KEY_PREFIX);
+        let has_seed = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .contains_key(&meta_key);
+        assert!(
+            has_seed,
+            "Newly appended fragment should have a zone map seed in metadata"
+        );
+
+        // Step 5: Optimize the index (should use seeds)
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Step 6: Query the updated index to verify it's correct
+        let dataset = Dataset::open(uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            !indices.is_empty(),
+            "Dataset should still have an index after optimization"
+        );
+
+        // Verify the index is a ZoneMap and covers all fragments
+        let index = indices.iter().find(|i| i.name.contains("val")).unwrap();
+        let scalar_index = open_scalar_index(&dataset, "val", index, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::ZoneMap,
+            "Index should still be a ZoneMap after optimization"
+        );
+        let frags = scalar_index.calculate_included_frags().await.unwrap();
+        assert_eq!(frags.len(), 2, "Index should cover both fragments");
+    }
+
+    /// Seed observers see the values the data file stores, so appending a
+    /// view array to a seeded string column succeeds.
+    #[tokio::test]
+    async fn test_append_view_array_to_seeded_string_column() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        assert!(
+            !create_seed_writers_current(Some(&dataset), &append_params)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the append must observe seeds for this test to cover them"
+        );
+
+        let view_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Utf8View,
+            false,
+        )]));
+        let view_batch = RecordBatch::try_new(
+            view_schema.clone(),
+            vec![Arc::new(StringViewArray::from(vec!["c", "d"]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(view_batch)], view_schema),
+            Arc::new(dataset),
+            Some(append_params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset
+                .count_rows(Some("val = 'c'".to_string()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+    }
+
+    /// A covered scalar index must still get a seed writer. The loop skipped any
+    /// index with more than one field, silently dropping seed writing for it.
+    #[tokio::test]
+    async fn test_seed_writers_for_a_covered_index() {
+        use crate::dataset::transaction::{Operation, Transaction};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let test_uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..256)),
+                Arc::new(Int32Array::from_iter_values(0..256)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+        // BTree (the default `ScalarIndexParams`) never writes seeds -- only ZoneMap
+        // does, and only when `use_seeds` is explicitly requested for a fixed-width
+        // type like Int32 (see `test_zone_map_seeds_used_during_update` above).
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["id"], IndexType::ZoneMap, None, &params, true)
+            .await
+            .unwrap();
+
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let baseline = create_seed_writers_current(Some(&dataset), &append_params)
+            .await
+            .unwrap();
+        assert!(
+            !baseline.is_empty(),
+            "a plain scalar index should produce a seed writer; if this is empty \
+             the rest of the test proves nothing"
+        );
+
+        // Declare `payload` as carried, then re-check.
+        let id_field = dataset.schema().field_id("id").unwrap();
+        let payload_field = dataset.schema().field_id("payload").unwrap();
+        let current = dataset.load_indices().await.unwrap();
+        let mut covered = current[0].clone();
+        covered.fields = vec![id_field, payload_field];
+        covered.covering_fields = vec![payload_field];
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let covered_writers = create_seed_writers_current(Some(&dataset), &append_params)
+            .await
+            .unwrap();
+        assert_eq!(
+            covered_writers.len(),
+            baseline.len(),
+            "a covered index must still produce a seed writer"
+        );
     }
 }

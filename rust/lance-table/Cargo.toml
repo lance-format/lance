@@ -24,6 +24,7 @@ arrow-ipc.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 aws-credential-types = { workspace = true, optional = true }
+blake3.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 byteorder.workspace = true
 bytes.workspace = true
@@ -56,7 +57,7 @@ rstest.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [features]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
@@ -72,6 +73,14 @@ harness = false
 
 [[bench]]
 name = "manifest_intern"
+harness = false
+
+[[bench]]
+name = "system_columns"
+harness = false
+
+[[bench]]
+name = "version_columns"
 harness = false
 
 [lints]

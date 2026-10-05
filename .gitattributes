@@ -1,3 +1,4 @@
 notebooks/** linguist-vendored
 Cargo.lock linguist-generated
 **/Cargo.lock linguist-generated
+rust/lance-file/test_data/**/*.lance binary

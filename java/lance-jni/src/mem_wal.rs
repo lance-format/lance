@@ -26,13 +26,13 @@ use jni::objects::{JClass, JMap, JObject, JString, JValueGen};
 use jni::sys::{jdouble, jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
-    FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr, write_pk_sidecar,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
-    evaluate_sharding_spec_with_source_columns,
+    arrow_schema_with_field_ids, evaluate_sharding_spec_with_source_columns,
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
@@ -41,7 +41,6 @@ use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
 
-use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -49,6 +48,7 @@ use crate::traits::{
     FromJString, IntoJava, export_vec, import_vec, import_vec_from_method, import_vec_to_rust,
 };
 use crate::utils::to_rust_map;
+use crate::{RT, block_on};
 
 const NATIVE_SHARD_WRITER: &str = "nativeShardWriterHandle";
 const NATIVE_LSM_SCANNER: &str = "nativeLsmScannerHandle";
@@ -126,7 +126,7 @@ fn inner_create_shard_writer<'local>(
         Arc::new(guard.inner.clone())
     };
 
-    let writer = RT.block_on(dataset.mem_wal_writer(uuid, writer_config))?;
+    let writer = block_on(dataset.mem_wal_writer(uuid, writer_config))?;
     let blocking = BlockingShardWriter {
         writer,
         shard_id: uuid,
@@ -177,7 +177,7 @@ fn inner_put(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> 
 
     let guard =
         unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-    RT.block_on(guard.writer.put(batches))?;
+    block_on(guard.writer.put(batches))?;
     Ok(())
 }
 
@@ -200,14 +200,14 @@ fn inner_delete(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<(
 
     let guard =
         unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-    RT.block_on(guard.writer.delete(batches))?;
+    block_on(guard.writer.delete(batches))?;
     Ok(())
 }
 
-/// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for a
-/// flushed-generation dataset already staged at `gen_path`, mirroring what
-/// production flush emits. Lets Java tests stage a *faithful* flushed
-/// generation (dataset + sidecar); production always writes the sidecar during
+/// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for an
+/// SSTable dataset already staged at `gen_path`, mirroring what
+/// production flush emits. Lets Java tests stage a *faithful* SSTable
+/// (dataset + sidecar); production always writes the sidecar during
 /// flush, so a dataset-without-sidecar is not a state the system produces.
 /// Mirrors the Python `_write_pk_sidecar` binding.
 #[unsafe(no_mangle)]
@@ -236,7 +236,7 @@ fn inner_write_pk_sidecar(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
     let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
-    RT.block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;
+    block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;
     Ok(())
 }
 
@@ -272,12 +272,16 @@ fn inner_memtable_stats<'local>(
     env: &mut JNIEnv<'local>,
     this: JObject<'local>,
 ) -> Result<JObject<'local>> {
-    let stats = {
+    let (stats, memory) = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
-        RT.block_on(guard.writer.memtable_stats())?
+        // Byte totals live on `memory()` now, not on `MemTableStats`.
+        (
+            block_on(guard.writer.memtable_stats())?,
+            guard.writer.memory(),
+        )
     };
-    memtable_stats_to_java(env, &stats)
+    memtable_stats_to_java(env, &stats, &memory)
 }
 
 #[unsafe(no_mangle)]
@@ -306,9 +310,8 @@ fn inner_writer_lsm_scanner<'local>(
         // Capture the active memtable *and* any frozen-awaiting-flush memtables
         // so a concurrent flush rollover cannot hide acknowledged writes from
         // this read-your-writes scanner.
-        let in_memory_memtables = RT.block_on(guard.writer.in_memory_memtable_refs())?;
-        let writer_snapshot = RT
-            .block_on(guard.writer.manifest())?
+        let in_memory_memtables = block_on(guard.writer.in_memory_memtable_refs())?;
+        let writer_snapshot = block_on(guard.writer.manifest())?
             .map(shard_snapshot_from_manifest)
             .unwrap_or_else(|| ShardSnapshot::new(guard.shard_id));
         (
@@ -339,7 +342,7 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_releaseNativeShardWrite
 
 fn inner_release_shard_writer(env: &mut JNIEnv, this: JObject) -> Result<()> {
     let blocking: BlockingShardWriter = unsafe { env.take_rust_field(&this, NATIVE_SHARD_WRITER) }?;
-    RT.block_on(blocking.writer.close())?;
+    block_on(blocking.writer.close())?;
     Ok(())
 }
 
@@ -498,7 +501,7 @@ fn inner_scanner_open_stream(env: &mut JNIEnv, this: JObject, stream_addr: jlong
         let scanner = guard.inner.as_ref().ok_or_else(|| {
             Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string())
         })?;
-        RT.block_on(scanner.try_into_stream())?
+        block_on(scanner.try_into_stream())?
     };
     let ffi_stream =
         to_ffi_arrow_array_stream(DatasetRecordBatchStream::new(stream), RT.handle().clone())?;
@@ -521,7 +524,7 @@ fn inner_scanner_count_rows(env: &mut JNIEnv, this: JObject) -> Result<u64> {
         .inner
         .as_ref()
         .ok_or_else(|| Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string()))?;
-    Ok(RT.block_on(scanner.count_rows())?)
+    Ok(block_on(scanner.count_rows())?)
 }
 
 #[unsafe(no_mangle)]
@@ -648,12 +651,11 @@ fn inner_plan_open_stream(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -
         guard.plan.clone()
     };
     let schema = plan.schema();
-    let batches = RT
-        .block_on(async move {
-            let ctx = SessionContext::new();
-            collect(plan, ctx.task_ctx()).await
-        })
-        .map_err(|e| Error::io_error(format!("Plan execution failed: {}", e)))?;
+    let batches = block_on(async move {
+        let ctx = SessionContext::new();
+        collect(plan, ctx.task_ctx()).await
+    })
+    .map_err(|e| Error::io_error(format!("Plan execution failed: {}", e)))?;
 
     let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
         batches.into_iter().map(Ok),
@@ -772,8 +774,13 @@ fn inner_create_lookup_planner(
         None => get_pk_columns(&dataset)?,
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    // A sealed generation stores the names it was written with, so the planner
+    // resolves its columns by id; `base_schema` carries none. Built before the
+    // collector takes the dataset.
+    let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
     let collector = LsmDataSourceCollector::new(dataset, snapshots);
-    let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone());
+    let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?
+        .with_identity_schema(identity_schema);
 
     let blocking = BlockingLsmPointLookupPlanner {
         planner,
@@ -813,7 +820,7 @@ fn inner_plan_lookup<'local>(
             env.get_rust_field::<_, _, BlockingLsmPointLookupPlanner>(&this, NATIVE_LOOKUP_PLANNER)
         }?;
         let pk_values = scalar_values_from_pk_value(pk_value.as_ref(), &guard.pk_columns)?;
-        let plan = RT.block_on(guard.planner.plan_lookup(&pk_values, columns.as_deref()))?;
+        let plan = block_on(guard.planner.plan_lookup(&pk_values, columns.as_deref()))?;
         (plan, guard.dataset_schema.clone())
     };
     attach_execution_plan(env, plan, dataset_schema)
@@ -890,6 +897,8 @@ fn inner_create_vector_planner(
         None => get_pk_columns(&dataset)?,
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    // See the point-lookup planner: a rename moves a name and keeps the id.
+    let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
     let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
     let vector_dim = get_vector_dim(&dataset, &vector_column)?;
     let filter = filter
@@ -905,6 +914,7 @@ fn inner_create_vector_planner(
         vector_column,
         dist_type,
     )
+    .with_identity_schema(identity_schema)
     .with_dataset(dataset);
     if let Some(filter) = filter {
         planner = planner.with_filter(Some(filter));
@@ -984,7 +994,7 @@ fn inner_plan_search<'local>(
             Arc::new(float32_array.clone()),
             None,
         )?;
-        let plan = RT.block_on(guard.planner.plan_search(
+        let plan = block_on(guard.planner.plan_search(
             &fsl,
             k as usize,
             nprobes as usize,
@@ -1026,10 +1036,10 @@ pub extern "system" fn Java_org_lance_Dataset_nativeInitializeMemWal(
 }
 
 fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject) -> Result<()> {
-    let maintained_list = env
-        .call_method(&params, "maintainedIndexes", "()Ljava/util/List;", &[])?
-        .l()?;
-    let maintained_indexes = env.get_strings(&maintained_list)?;
+    let maintained_indexes =
+        env.get_optional_from_method(&params, "maintainedIndexes", |env, list| {
+            env.get_strings(&list)
+        })?;
     let bucket_column = env.get_optional_string_from_method(&params, "bucketColumn")?;
     let num_buckets = env.get_optional_u32_from_method(&params, "numBuckets")?;
     let identity_column = env.get_optional_string_from_method(&params, "identityColumn")?;
@@ -1068,11 +1078,15 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
     } else if unsharded {
         builder = builder.unsharded();
     }
-    builder = builder.maintained_indexes(maintained_indexes);
+    // Flattening an absent list to an empty one here would ask for no index
+    // at all rather than every one.
+    if let Some(maintained_indexes) = maintained_indexes {
+        builder = builder.maintained_indexes(maintained_indexes);
+    }
     if let Some(config) = writer_config {
         builder = builder.writer_config_defaults(config);
     }
-    RT.block_on(builder.execute())?;
+    block_on(builder.execute())?;
     Ok(())
 }
 
@@ -1091,7 +1105,7 @@ fn inner_mem_wal_index_details<'local>(
     let details = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&jdataset, NATIVE_DATASET) }?;
-        RT.block_on(guard.inner.mem_wal_index_details())?
+        block_on(guard.inner.mem_wal_index_details())?
     };
     match details {
         Some(details) => index_details_to_java(env, &details),
@@ -1119,13 +1133,13 @@ fn read_shard_snapshots(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<Shar
             .with_spec_id(spec_id)
             .with_current_generation(current_generation);
 
-        let flushed_list = env
-            .call_method(&obj, "flushedGenerations", "()Ljava/util/List;", &[])?
+        let sstable_list = env
+            .call_method(&obj, "sstables", "()Ljava/util/List;", &[])?
             .l()?;
-        for flushed in import_vec(env, &flushed_list)? {
-            let generation = env.get_u64_from_method(&flushed, "generation")?;
-            let path = env.get_string_from_method(&flushed, "path")?;
-            snapshot = snapshot.with_flushed_generation(generation, path);
+        for sstable in import_vec(env, &sstable_list)? {
+            let generation = env.get_u64_from_method(&sstable, "generation")?;
+            let path = env.get_string_from_method(&sstable, "path")?;
+            snapshot = snapshot.with_sstable(generation, path);
         }
         Ok(snapshot)
     })
@@ -1137,12 +1151,12 @@ fn shard_snapshot_from_manifest(manifest: ShardManifest) -> ShardSnapshot {
         shard_id: manifest.shard_id,
         spec_id: manifest.shard_spec_id,
         current_generation: manifest.current_generation,
-        flushed_generations: manifest
-            .flushed_generations
+        sstables: manifest
+            .sstables
             .into_iter()
-            .map(|generation| FlushedGeneration {
-                generation: generation.generation,
-                path: generation.path,
+            .map(|sstable| SsTable {
+                generation: sstable.generation,
+                path: sstable.path,
             })
             .collect(),
     }
@@ -1265,9 +1279,6 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
     if let Some(v) = read_optional_bool(env, config, "durableWrite")? {
         writer_config = writer_config.with_durable_write(v);
     }
-    if let Some(v) = read_optional_bool(env, config, "syncIndexedWrite")? {
-        writer_config = writer_config.with_sync_indexed_write(v);
-    }
     if let Some(v) = read_optional_u64(env, config, "maxWalBufferSize")? {
         writer_config = writer_config.with_max_wal_buffer_size(v as usize);
     }
@@ -1288,12 +1299,6 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
     }
     if let Some(v) = read_optional_u64(env, config, "manifestScanBatchSize")? {
         writer_config = writer_config.with_manifest_scan_batch_size(v as usize);
-    }
-    if let Some(v) = read_optional_u64(env, config, "asyncIndexBufferRows")? {
-        writer_config = writer_config.with_async_index_buffer_rows(v as usize);
-    }
-    if let Some(v) = read_optional_u64(env, config, "asyncIndexIntervalMs")? {
-        writer_config = writer_config.with_async_index_interval(Duration::from_millis(v));
     }
     if let Some(v) = read_optional_u64(env, config, "backpressureLogIntervalMs")? {
         writer_config = writer_config.with_backpressure_log_interval(Duration::from_millis(v));
@@ -1366,26 +1371,33 @@ fn write_stats_to_java<'a>(
     )?)
 }
 
-fn memtable_stats_to_java<'a>(env: &mut JNIEnv<'a>, stats: &MemTableStats) -> Result<JObject<'a>> {
+fn memtable_stats_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    stats: &MemTableStats,
+    memory: &ShardMemory,
+) -> Result<JObject<'a>> {
     let max_buffered = box_u64_opt(env, stats.max_buffered_batch_position)?;
-    let max_flushed = box_u64_opt(env, stats.max_flushed_batch_position)?;
     let pending_start = box_u64_opt(env, stats.pending_wal_start_batch_position)?;
     let pending_end = box_u64_opt(env, stats.pending_wal_end_batch_position)?;
     Ok(env.new_object(
         "org/lance/memwal/MemTableStats",
-        "(JJJJLjava/lang/Long;Ljava/lang/Long;Ljava/lang/Long;Ljava/lang/Long;JJJ)V",
+        "(JJJJLjava/lang/Long;JJLjava/lang/Long;Ljava/lang/Long;JJJJJJ)V",
         &[
             JValueGen::Long(stats.row_count as i64),
             JValueGen::Long(stats.batch_count as i64),
-            JValueGen::Long(stats.estimated_size as i64),
+            JValueGen::Long(memory.row_bytes() as i64),
             JValueGen::Long(stats.generation as i64),
             JValueGen::Object(&max_buffered),
-            JValueGen::Object(&max_flushed),
+            JValueGen::Long(stats.durable_batch_count as i64),
+            JValueGen::Long(stats.global_offset as i64),
             JValueGen::Object(&pending_start),
             JValueGen::Object(&pending_end),
             JValueGen::Long(stats.pending_wal_batch_count as i64),
             JValueGen::Long(stats.pending_wal_row_count as i64),
             JValueGen::Long(stats.pending_wal_estimated_bytes as i64),
+            JValueGen::Long(memory.index_bytes() as i64),
+            JValueGen::Long(memory.grace_bytes() as i64),
+            JValueGen::Long(memory.retained_bytes() as i64),
         ],
     )?)
 }
@@ -1417,10 +1429,11 @@ fn index_details_to_java<'a>(
 
     Ok(env.new_object(
         "org/lance/memwal/MemWalIndexDetails",
-        "(JLjava/util/List;Ljava/util/Map;Ljava/util/List;)V",
+        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;)V",
         &[
             JValueGen::Long(details.num_shards as i64),
             JValueGen::Object(&maintained_indexes),
+            JValueGen::Bool(u8::from(details.maintain_all_indexes)),
             JValueGen::Object(&writer_config_defaults),
             JValueGen::Object(&sharding_specs),
         ],

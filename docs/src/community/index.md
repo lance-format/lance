@@ -72,7 +72,7 @@ Here is the list of current subprojects:
 | lance-huggingface | https://github.com/lance-format/lance-huggingface | Hugging Face integration for Lance                                     |
 | lance-namespace   | https://github.com/lance-format/lance-namespace   | Lance namespace format specification, Rust/Python/Java Codegen SDKs    |
 | lance-namespace-impls | https://github.com/lance-format/lance-namespace-impls | Lance Namespace Implementations - Apache Hive, Apache Polaris, Apache Gravitino, Unity Catalog, AWS Glue and more |
-| lance-python-docs | https://github.com/lance-format/lance-python-docs | Lance Python SDK generated docs and integration hook with readthedocs  |
+| lance-python-doc  | https://github.com/lance-format/lance-python-doc  | Lance Python SDK generated docs and integration hook with readthedocs  |
 | lance-ray         | https://github.com/lance-format/lance-ray         | Ray integration for Lance                                              |
 | lance-spark       | https://github.com/lance-format/lance-spark       | Apache Spark connector for Lance                                       |
 

@@ -32,6 +32,15 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     /// Return the schema of the sub index
     fn schema() -> arrow_schema::SchemaRef;
 
+    /// The subset of [`Self::schema`] that [`Self::load`] actually reads.
+    ///
+    /// Index files always carry the full `schema()`, so narrowing the read is
+    /// purely a storage optimization: it keeps write-only columns from being
+    /// fetched, without changing what is written. `None` reads every column.
+    fn read_columns() -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
     /// * `query` - The query vector

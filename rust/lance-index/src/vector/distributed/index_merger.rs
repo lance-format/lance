@@ -9,16 +9,17 @@ use crate::vector::shared::partition_merger::{
 };
 use arrow::{compute::concat_batches, datatypes::Float32Type};
 use arrow_array::cast::AsArray;
-use arrow_array::types::UInt8Type;
+use arrow_array::types::{UInt8Type, UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::{Error, ROW_ID_FIELD, Result};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
+use crate::scalar::OldIndexDataFilter;
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
     pack_codes, rabit_binary_code_field, rabit_ex_code_field,
@@ -39,8 +40,9 @@ use crate::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions;
 use lance_file::writer::{FileWriter as V2Writer, FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -91,6 +93,11 @@ fn fixed_size_list_equal(a: &FixedSizeListArray, b: &FixedSizeListArray) -> bool
             let vb = b.values().as_primitive::<arrow_array::types::Float16Type>();
             va.values() == vb.values()
         }
+        (DataType::UInt8, DataType::UInt8) => {
+            let va = a.values().as_primitive::<UInt8Type>();
+            let vb = b.values().as_primitive::<UInt8Type>();
+            va.values() == vb.values()
+        }
         _ => false,
     }
 }
@@ -112,6 +119,9 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
                 return false;
             }
             for i in 0..av.len() {
+                if av[i].is_nan() || bv[i].is_nan() {
+                    return false;
+                }
                 if (av[i] - bv[i]).abs() > tol {
                     return false;
                 }
@@ -127,6 +137,9 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
                 return false;
             }
             for i in 0..av.len() {
+                if av[i].is_nan() || bv[i].is_nan() {
+                    return false;
+                }
                 if (av[i] - bv[i]).abs() > tol as f64 {
                     return false;
                 }
@@ -144,6 +157,9 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
             for i in 0..av.len() {
                 let da = av[i].to_f32();
                 let db = bv[i].to_f32();
+                if da.is_nan() || db.is_nan() {
+                    return false;
+                }
                 if (da - db).abs() > tol {
                     return false;
                 }
@@ -152,6 +168,63 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
         }
         _ => false,
     }
+}
+
+fn ensure_fixed_size_list_compatible(
+    what: &str,
+    reference: &FixedSizeListArray,
+    candidate: &FixedSizeListArray,
+) -> Result<()> {
+    if !fixed_size_list_equal(reference, candidate) {
+        const TOL: f32 = 1e-5;
+        if !fixed_size_list_almost_equal(reference, candidate, TOL) {
+            return Err(Error::index(format!("{what} mismatch across shards")));
+        }
+        log::warn!("{what} differs within tolerance; proceeding with first shard value");
+    }
+    Ok(())
+}
+
+async fn try_read_ivf_proto(reader: &V2Reader) -> Result<Option<pb::Ivf>> {
+    let Some(ivf_idx) = reader.metadata().file_schema.metadata.get(IVF_METADATA_KEY) else {
+        return Ok(None);
+    };
+    let ivf_idx = ivf_idx
+        .parse()
+        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
+    let bytes = reader.read_global_buffer(ivf_idx).await?;
+    Ok(Some(pb::Ivf::decode(bytes)?))
+}
+
+fn ivf_centroids_from_proto(ivf: &pb::Ivf) -> Result<Option<FixedSizeListArray>> {
+    ivf.centroids_tensor
+        .as_ref()
+        .map(FixedSizeListArray::try_from)
+        .transpose()
+}
+
+async fn open_sibling_index_reader(
+    object_store: &lance_io::object_store::ObjectStore,
+    sched: &Arc<ScanScheduler>,
+    idx_path: &object_store::path::Path,
+) -> Result<Option<V2Reader>> {
+    if !object_store.exists(idx_path).await? {
+        return Ok(None);
+    }
+
+    let fh = sched
+        .open_file(idx_path, &CachedFileSize::unknown())
+        .await?;
+    Ok(Some(
+        V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?,
+    ))
 }
 
 /// Initialize schema-level metadata on a writer for a given storage.
@@ -183,7 +256,7 @@ pub async fn init_writer_for_flat(
     d0: usize,
     item_type: &DataType,
     dt: DistanceType,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let arrow_schema = ArrowSchema::new(vec![
         (*ROW_ID_FIELD).clone(),
@@ -197,13 +270,11 @@ pub async fn init_writer_for_flat(
         ),
     ]);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
     let meta_json = serde_json::to_string(&FlatMetadata { dim: d0 })?;
     init_writer_for_storage(&mut w, dt, &meta_json, "")?;
@@ -219,7 +290,7 @@ pub async fn init_writer_for_pq(
     aux_out: &object_store::path::Path,
     dt: DistanceType,
     pm: &ProductQuantizationMetadata,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let num_bytes = if pm.nbits == 4 {
         pm.num_sub_vectors / 2
@@ -238,13 +309,11 @@ pub async fn init_writer_for_pq(
         ),
     ]);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
     let mut pm_init = pm.clone();
     let cb = pm_init
@@ -266,7 +335,7 @@ pub async fn init_writer_for_sq(
     aux_out: &object_store::path::Path,
     dt: DistanceType,
     sq_meta: &ScalarQuantizationMetadata,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let d0 = sq_meta.dim;
     let arrow_schema = ArrowSchema::new(vec![
@@ -281,13 +350,11 @@ pub async fn init_writer_for_sq(
         ),
     ]);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
     let meta_json = serde_json::to_string(sq_meta)?;
     init_writer_for_storage(&mut w, dt, &meta_json, SQ_METADATA_KEY)?;
@@ -300,7 +367,7 @@ pub async fn init_writer_for_rq(
     aux_out: &object_store::path::Path,
     dt: DistanceType,
     rq_meta: &RabitQuantizationMetadata,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
@@ -318,13 +385,11 @@ pub async fn init_writer_for_rq(
     }
     let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
 
     let mut rq_meta_init = rq_meta.clone();
@@ -361,6 +426,35 @@ pub async fn write_partition_rows(
         w.write_batch(&rb).await?;
     }
     Ok(())
+}
+
+/// Stream a partition range, retain its owned rows, and return the number written.
+async fn write_filtered_partition_rows(
+    reader: &V2Reader,
+    w: &mut FileWriter,
+    range: Range<usize>,
+    row_filter: &OldIndexDataFilter,
+) -> Result<usize> {
+    let mut stream = reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(range),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
+    let mut written_rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = filter_batch_to_owned_rows(&batch?, row_filter)?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        written_rows = written_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+            Error::index("Filtered partition row count exceeds usize capacity".to_string())
+        })?;
+        w.write_batch(&batch).await?;
+    }
+    Ok(written_rows)
 }
 
 /// Transpose the PQ code column for a batch and write it to the unified writer.
@@ -460,6 +554,7 @@ struct ShardInfo {
     lengths: Vec<u32>,
     partition_offsets: Vec<usize>,
     total_rows: usize,
+    row_filter: Option<Arc<OldIndexDataFilter>>,
 }
 
 #[derive(Debug)]
@@ -469,6 +564,7 @@ struct ShardWindowReadJob {
     window_total_rows: usize,
     start_offset: usize,
     end_offset: usize,
+    row_filter: Option<Arc<OldIndexDataFilter>>,
 }
 
 #[derive(Debug)]
@@ -587,6 +683,7 @@ async fn read_partition_window(
                 window_total_rows,
                 start_offset,
                 end_offset,
+                row_filter: shard.row_filter.clone(),
             }
         })
         .collect();
@@ -674,7 +771,13 @@ async fn read_shard_window_partitions(
             }
 
             let to_take = std::cmp::min(remaining, rb.num_rows() - consumed);
-            per_partition_batches[rel_partition].push(rb.slice(consumed, to_take));
+            let mut partition_batch = rb.slice(consumed, to_take);
+            if let Some(row_filter) = shard_job.row_filter.as_deref() {
+                partition_batch = filter_batch_to_owned_rows(&partition_batch, row_filter)?;
+            }
+            if partition_batch.num_rows() > 0 {
+                per_partition_batches[rel_partition].push(partition_batch);
+            }
             consumed += to_take;
             remaining -= to_take;
         }
@@ -697,6 +800,19 @@ async fn read_shard_window_partitions(
     Ok(per_partition_batches)
 }
 
+fn filter_batch_to_owned_rows(
+    batch: &RecordBatch,
+    row_filter: &OldIndexDataFilter,
+) -> Result<RecordBatch> {
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::index(format!("Column {ROW_ID} missing in auxiliary shard")))?
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| Error::index(format!("Column {ROW_ID} is not UInt64 in auxiliary shard")))?;
+    let keep = row_filter.filter_row_ids(row_ids);
+    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+}
+
 /// Merge the selected segment auxiliary files into `target_dir`.
 ///
 /// This is the storage merge kernel for vector segment build. Callers choose
@@ -714,6 +830,42 @@ pub async fn merge_partial_vector_auxiliary_files(
     target_dir: &object_store::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<lance_table::format::IndexFile> {
+    merge_partial_vector_auxiliary_files_inner(object_store, aux_paths, target_dir, None, progress)
+        .await
+}
+
+/// Merge auxiliary files while retaining only rows owned by each source segment.
+pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
+    object_store: &lance_io::object_store::ObjectStore,
+    aux_paths: &[object_store::path::Path],
+    target_dir: &object_store::path::Path,
+    row_filters: &[OldIndexDataFilter],
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<lance_table::format::IndexFile> {
+    if aux_paths.len() != row_filters.len() {
+        return Err(Error::invalid_input(format!(
+            "Expected one row filter per auxiliary file, got {} files and {} filters",
+            aux_paths.len(),
+            row_filters.len()
+        )));
+    }
+    merge_partial_vector_auxiliary_files_inner(
+        object_store,
+        aux_paths,
+        target_dir,
+        Some(row_filters),
+        progress,
+    )
+    .await
+}
+
+async fn merge_partial_vector_auxiliary_files_inner(
+    object_store: &lance_io::object_store::ObjectStore,
+    aux_paths: &[object_store::path::Path],
+    target_dir: &object_store::path::Path,
+    row_filters: Option<&[OldIndexDataFilter]>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<lance_table::format::IndexFile> {
     if aux_paths.is_empty() {
         return Err(Error::index(
             "No partial auxiliary files were selected for merge".to_string(),
@@ -728,7 +880,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut dim: Option<usize> = None;
     let mut detected_index_type: Option<SupportedIvfIndexType> = None;
     // Inherit file format version from the first shard (set on first iteration)
-    let mut format_version: Option<LanceFileVersion> = None;
+    let mut format_version: Option<ConcreteFileVersion> = None;
 
     // Prepare output path; we'll create writer once when we know schema
     let aux_out = target_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
@@ -771,6 +923,12 @@ pub async fn merge_partial_vector_auxiliary_files(
         )
         .await?;
         let meta = reader.metadata();
+        let idx_path = aux
+            .parent()
+            .unwrap_or_default()
+            .join(crate::INDEX_FILE_NAME);
+        let mut idx_reader: Option<V2Reader> = None;
+        let mut idx_reader_checked = false;
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
@@ -795,45 +953,33 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Detect index type (first iteration only)
         if detected_index_type.is_none() {
             // Try to derive precise type from sibling partial index.idx metadata if available
-            let idx_path = aux
-                .parent()
-                .unwrap_or_default()
-                .join(crate::INDEX_FILE_NAME);
-            if object_store.exists(&idx_path).await.unwrap_or(false) {
-                let fh2 = sched
-                    .open_file(&idx_path, &CachedFileSize::unknown())
-                    .await?;
-                let idx_reader = V2Reader::try_open(
-                    fh2,
-                    None,
-                    Arc::default(),
-                    &lance_core::cache::LanceCache::no_cache(),
-                    V2ReaderOptions::default(),
-                )
-                .await?;
-                if let Some(idx_meta_json) = idx_reader
+            if !idx_reader_checked {
+                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+                idx_reader_checked = true;
+            }
+            if let Some(idx_reader) = idx_reader.as_ref()
+                && let Some(idx_meta_json) = idx_reader
                     .metadata()
                     .file_schema
                     .metadata
                     .get(INDEX_METADATA_SCHEMA_KEY)
-                {
-                    let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
-                    detected_index_type = Some(match idx_meta.index_type.as_str() {
-                        "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
-                        "IVF_PQ" => SupportedIvfIndexType::IvfPq,
-                        "IVF_SQ" => SupportedIvfIndexType::IvfSq,
-                        "IVF_RQ" => SupportedIvfIndexType::IvfRq,
-                        "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
-                        "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
-                        "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
-                        other => {
-                            return Err(Error::index(format!(
-                                "Unsupported index type in shard index.idx: {}",
-                                other
-                            )));
-                        }
-                    });
-                }
+            {
+                let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
+                detected_index_type = Some(match idx_meta.index_type.as_str() {
+                    "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
+                    "IVF_PQ" => SupportedIvfIndexType::IvfPq,
+                    "IVF_SQ" => SupportedIvfIndexType::IvfSq,
+                    "IVF_RQ" => SupportedIvfIndexType::IvfRq,
+                    "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
+                    "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
+                    "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
+                    other => {
+                        return Err(Error::index(format!(
+                            "Unsupported index type in shard index.idx: {}",
+                            other
+                        )));
+                    }
+                });
             }
             // Fallback: infer from auxiliary schema
             if detected_index_type.is_none() {
@@ -843,43 +989,60 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
 
         // Read IVF lengths from global buffer
-        let ivf_idx: u32 = reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(IVF_METADATA_KEY)
-            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?
-            .parse()
-            .map_err(|_| Error::index("IVF index parse error".to_string()))?;
-        let bytes = reader.read_global_buffer(ivf_idx).await?;
-        let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
+        let pb_ivf = try_read_ivf_proto(&reader)
+            .await?
+            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?;
         let lengths = pb_ivf.lengths.clone();
         let nlist = lengths.len();
 
+        let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
+        if current_centroids.is_none() {
+            if !idx_reader_checked {
+                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+            }
+            if let Some(idx_reader) = idx_reader.as_ref()
+                && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
+            {
+                current_centroids = ivf_centroids_from_proto(&index_ivf)?;
+            }
+        }
         if nlist_opt.is_none() {
             nlist_opt = Some(nlist);
             accumulated_lengths = vec![0; nlist];
-            // Try load centroids tensor if present
-            if let Some(tensor) = pb_ivf.centroids_tensor.as_ref() {
-                let arr = FixedSizeListArray::try_from(tensor)?;
-                first_centroids = Some(arr.clone());
+            if let Some(arr) = current_centroids {
                 let d0 = arr.value_length() as usize;
                 if dim.is_none() {
                     dim = Some(d0);
                 }
+                first_centroids = Some(arr);
             }
         } else if nlist_opt.as_ref().map(|v| *v != nlist).unwrap_or(false) {
             return Err(Error::index(
                 "IVF partition count mismatch across shards".to_string(),
             ));
+        } else {
+            match (&first_centroids, &current_centroids) {
+                (Some(reference), Some(candidate)) => {
+                    ensure_fixed_size_list_compatible("IVF centroids", reference, candidate)?;
+                }
+                (Some(_), None) => {
+                    return Err(Error::index("IVF centroids missing from shard".to_string()));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::index(
+                        "IVF centroids missing from first shard".to_string(),
+                    ));
+                }
+                (None, None) => {}
+            }
         }
 
         // Handle logic based on detected index type
         let idx_type = detected_index_type
             .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
 
-        // Compute format version once; defaults to V2_0 if no shards processed yet
-        let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
+        // Preserve the historical fallback while keeping the writer boundary exact.
+        let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
@@ -985,6 +1148,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
                 validate_rq_num_bits(rq_meta_parsed.num_bits)?;
+                if rq_meta_parsed.packed {
+                    return Err(Error::index(format!(
+                        "Distributed RQ merge: source shard {idx} stores packed RQ codes; expected row-major distributed shard"
+                    )));
+                }
 
                 let d0 = rq_meta_parsed.rotated_dim();
                 if d0 == 0 {
@@ -1001,7 +1169,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(existing_rq) = rq_meta.as_ref()
                     && (existing_rq.code_dim != rq_meta_parsed.code_dim
                         || existing_rq.num_bits != rq_meta_parsed.num_bits
-                        || existing_rq.rotation_type != rq_meta_parsed.rotation_type)
+                        || existing_rq.rotation_type != rq_meta_parsed.rotation_type
+                        || existing_rq.query_estimator != rq_meta_parsed.query_estimator
+                        || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
                 {
                     return Err(Error::index(format!(
                         "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
@@ -1012,6 +1182,24 @@ pub async fn merge_partial_vector_auxiliary_files(
                         rq_meta_parsed.num_bits,
                         rq_meta_parsed.rotation_type
                     )));
+                }
+                if let Some(existing_rq) = rq_meta.as_ref() {
+                    match (&existing_rq.rotate_mat, &rq_meta_parsed.rotate_mat) {
+                        (Some(reference), Some(candidate)) => {
+                            ensure_fixed_size_list_compatible(
+                                "RQ rotation matrix",
+                                reference,
+                                candidate,
+                            )?;
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            return Err(Error::index(
+                                "Distributed RQ merge: rotation matrix mismatch across shards"
+                                    .to_string(),
+                            ));
+                        }
+                        (None, None) => {}
+                    }
                 }
                 if rq_meta.is_none() {
                     rq_meta = Some(rq_meta_parsed.clone());
@@ -1061,6 +1249,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
+                if pm.transposed {
+                    return Err(Error::index(format!(
+                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
+                    )));
+                }
                 // Load codebook from global buffer if not present
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
@@ -1100,18 +1293,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                         .codebook
                         .as_ref()
                         .ok_or_else(|| Error::index("PQ codebook missing in shard".to_string()))?;
-                    if !fixed_size_list_equal(existing_cb, current_cb) {
-                        const TOL: f32 = 1e-5;
-                        if !fixed_size_list_almost_equal(existing_cb, current_cb, TOL) {
-                            return Err(Error::index(
-                                "PQ codebook content mismatch across shards".to_string(),
-                            ));
-                        } else {
-                            log::warn!(
-                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
-                            );
-                        }
-                    }
+                    ensure_fixed_size_list_compatible(
+                        "PQ codebook content",
+                        existing_cb,
+                        current_cb,
+                    )?;
                 }
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
@@ -1222,6 +1408,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
+                if pm.transposed {
+                    return Err(Error::index(format!(
+                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
+                    )));
+                }
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
                         .read_global_buffer(pm.codebook_position as u32)
@@ -1260,18 +1451,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                         .codebook
                         .as_ref()
                         .ok_or_else(|| Error::index("PQ codebook missing in shard".to_string()))?;
-                    if !fixed_size_list_equal(existing_cb, current_cb) {
-                        const TOL: f32 = 1e-5;
-                        if !fixed_size_list_almost_equal(existing_cb, current_cb, TOL) {
-                            return Err(Error::index(
-                                "PQ codebook content mismatch across shards".to_string(),
-                            ));
-                        } else {
-                            log::warn!(
-                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
-                            );
-                        }
-                    }
+                    ensure_fixed_size_list_compatible(
+                        "PQ codebook content",
+                        existing_cb,
+                        current_cb,
+                    )?;
                 }
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
@@ -1357,6 +1541,7 @@ pub async fn merge_partial_vector_auxiliary_files(
             lengths,
             partition_offsets,
             total_rows: running_offset,
+            row_filter: row_filters.map(|filters| Arc::new(filters[idx].clone())),
         });
         progress
             .stage_progress("read_shard_metadata", idx as u64 + 1)
@@ -1383,6 +1568,7 @@ pub async fn merge_partial_vector_auxiliary_files(
         .stage_start("merge_partitions", Some(total_rows), "rows")
         .await?;
     let mut merged_rows = 0u64;
+    let mut merged_lengths = vec![0u32; nlist];
 
     match idx_type_final {
         SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
@@ -1398,14 +1584,9 @@ pub async fn merge_partial_vector_auxiliary_files(
             );
 
             while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
-                if accumulated_lengths[pid] == 0 {
+                let partition_len = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                if partition_len == 0 {
                     continue;
-                }
-                if batches.is_empty() {
-                    return Err(Error::index(format!(
-                        "No merged batches found for non-empty partition {}",
-                        pid
-                    )));
                 }
 
                 let schema = batches[0].schema();
@@ -1413,7 +1594,10 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_pq_transposed(w, partition_batch).await?;
                 }
-                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                merged_lengths[pid] = u32::try_from(partition_len).map_err(|_| {
+                    Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
+                })?;
+                merged_rows = merged_rows.saturating_add(partition_len as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
@@ -1430,14 +1614,9 @@ pub async fn merge_partial_vector_auxiliary_files(
             );
 
             while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
-                if accumulated_lengths[pid] == 0 {
+                let partition_len = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                if partition_len == 0 {
                     continue;
-                }
-                if batches.is_empty() {
-                    return Err(Error::index(format!(
-                        "No merged batches found for non-empty partition {}",
-                        pid
-                    )));
                 }
 
                 // Shards written by older lance versions carry sequential ex
@@ -1464,30 +1643,58 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_rq_packed(w, partition_batch).await?;
                 }
-                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                merged_lengths[pid] = u32::try_from(partition_len).map_err(|_| {
+                    Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
+                })?;
+                merged_rows = merged_rows.saturating_add(partition_len as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
             }
         }
         _ => {
-            for (pid, total_part_len) in accumulated_lengths.iter().copied().enumerate().take(nlist)
-            {
-                for shard in shard_infos.iter() {
-                    let part_len = shard.lengths[pid] as usize;
-                    if part_len == 0 {
+            // FLAT, SQ, and their HNSW variants do not need whole-partition
+            // transforms. Stream one shard partition at a time so filtering
+            // never materializes a multi-partition window in memory.
+            for (pid, merged_length) in merged_lengths.iter_mut().enumerate() {
+                let mut partition_len = 0usize;
+                for shard in &shard_infos {
+                    let source_len = shard.lengths[pid] as usize;
+                    if source_len == 0 {
                         continue;
                     }
                     let offset = shard.partition_offsets[pid];
-                    if let Some(w) = v2w_opt.as_mut() {
-                        write_partition_rows(shard.reader.as_ref(), w, offset..offset + part_len)
-                            .await?;
-                    }
+                    let writer = v2w_opt.as_mut().ok_or_else(|| {
+                        Error::index("Failed to initialize unified writer".to_string())
+                    })?;
+                    let written = if let Some(row_filter) = shard.row_filter.as_deref() {
+                        write_filtered_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                            row_filter,
+                        )
+                        .await?
+                    } else {
+                        write_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                        )
+                        .await?;
+                        source_len
+                    };
+                    partition_len = partition_len.checked_add(written).ok_or_else(|| {
+                        Error::index(format!("Merged partition {pid} exceeds usize row capacity"))
+                    })?;
                 }
-                if total_part_len == 0 {
+                if partition_len == 0 {
                     continue;
                 }
-                merged_rows = merged_rows.saturating_add(total_part_len as u64);
+                *merged_length = u32::try_from(partition_len).map_err(|_| {
+                    Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
+                })?;
+                merged_rows = merged_rows.saturating_add(partition_len as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
@@ -1506,7 +1713,7 @@ pub async fn merge_partial_vector_auxiliary_files(
         } else {
             IvfStorageModel::empty()
         };
-        for len in accumulated_lengths.iter() {
+        for len in merged_lengths.iter() {
             ivf_model.add_partition(*len);
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
@@ -1554,6 +1761,31 @@ mod tests {
         lance_core::Result<()>
     );
 
+    #[test]
+    fn test_uint8_fixed_size_list_compatibility() {
+        let values = (0_u8..16).collect::<Vec<_>>();
+        let reference =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(values.clone()), 8).unwrap();
+        let matching =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(values.clone()), 8).unwrap();
+
+        ensure_fixed_size_list_compatible("IVF centroids", &reference, &matching).unwrap();
+
+        let mut differing_values = values;
+        differing_values[15] = 16;
+        let differing =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(differing_values), 8).unwrap();
+        let error =
+            ensure_fixed_size_list_compatible("IVF centroids", &reference, &differing).unwrap_err();
+
+        assert!(matches!(&error, Error::Index { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("IVF centroids mismatch across shards")
+        );
+    }
+
     async fn write_flat_partial_aux(
         store: &ObjectStore,
         aux_path: &Path,
@@ -1561,6 +1793,7 @@ mod tests {
         lengths: &[u32],
         base_row_id: u64,
         distance_type: DistanceType,
+        file_version: ConcreteFileVersion,
     ) -> Result<usize> {
         let arrow_schema = ArrowSchema::new(vec![
             (*ROW_ID_FIELD).clone(),
@@ -1572,7 +1805,8 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::create_writer(
+            file_version,
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -1642,7 +1876,7 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -1703,12 +1937,28 @@ mod tests {
         let lengths1 = vec![1_u32, 2_u32];
         let dim = 2_i32;
 
-        write_flat_partial_aux(&object_store, &aux0, dim, &lengths0, 0, DistanceType::L2)
-            .await
-            .unwrap();
-        write_flat_partial_aux(&object_store, &aux1, dim, &lengths1, 100, DistanceType::L2)
-            .await
-            .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            dim,
+            &lengths0,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_2,
+        )
+        .await
+        .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux1,
+            dim,
+            &lengths1,
+            100,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
 
         let progress = Arc::new(RecordingProgress::default());
         merge_partial_vector_auxiliary_files(
@@ -1812,6 +2062,7 @@ mod tests {
         .await
         .unwrap();
         let meta = reader.metadata();
+        assert_eq!(meta.version(), ConcreteFileVersion::V2_2);
 
         // Validate IVF lengths aggregation.
         let ivf_idx: u32 = meta
@@ -1859,6 +2110,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_ivf_flat_filters_each_source_by_ownership() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid");
+        let aux0 = index_dir
+            .clone()
+            .join("stale")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = index_dir
+            .clone()
+            .join("fresh")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let lengths = vec![2_u32, 1_u32];
+
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            2,
+            &lengths,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux1,
+            2,
+            &lengths,
+            100,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
+
+        merge_partial_vector_auxiliary_files_with_row_filters(
+            &object_store,
+            &[aux0, aux1],
+            &index_dir,
+            &[
+                OldIndexDataFilter::Fragments {
+                    to_keep: roaring::RoaringBitmap::new(),
+                    to_remove: roaring::RoaringBitmap::new(),
+                },
+                OldIndexDataFilter::RowIds(lance_select::RowAddrTreeMap::from_iter(100_u64..103)),
+            ],
+            Arc::new(RecordingProgress::default()),
+        )
+        .await
+        .unwrap();
+
+        let aux_out = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
+        let sched = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let reader = V2Reader::try_open(
+            sched
+                .open_file(&aux_out, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let merged_ivf = try_read_ivf_proto(&reader).await.unwrap().unwrap();
+        assert_eq!(merged_ivf.lengths, lengths);
+
+        let mut total_rows = 0;
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                4,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.unwrap().num_rows();
+        }
+        assert_eq!(total_rows, 3, "stale source rows must not be copied");
+    }
+
+    #[tokio::test]
     async fn test_merge_distance_type_mismatch() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
@@ -1871,9 +2211,17 @@ mod tests {
         let lengths = vec![2_u32, 2_u32];
         let dim = 2_i32;
 
-        write_flat_partial_aux(&object_store, &aux0, dim, &lengths, 0, DistanceType::L2)
-            .await
-            .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            dim,
+            &lengths,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
         write_flat_partial_aux(
             &object_store,
             &aux1,
@@ -1881,6 +2229,7 @@ mod tests {
             &lengths,
             100,
             DistanceType::Cosine,
+            ConcreteFileVersion::V2_1,
         )
         .await
         .unwrap();
@@ -1976,6 +2325,7 @@ mod tests {
         base_row_id: u64,
         distance_type: DistanceType,
         codebook: &FixedSizeListArray,
+        transposed: bool,
     ) -> Result<usize> {
         let num_bytes = if nbits == 4 {
             // Two 4-bit codes per byte.
@@ -1997,7 +2347,7 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -2014,7 +2364,7 @@ mod tests {
             dimension,
             codebook: Some(codebook.clone()),
             codebook_tensor: Vec::new(),
-            transposed: true,
+            transposed,
         };
 
         let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
@@ -2109,7 +2459,7 @@ mod tests {
         let arrow_schema = ArrowSchema::new(fields);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -2225,6 +2575,7 @@ mod tests {
             0,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();
@@ -2239,6 +2590,7 @@ mod tests {
             1_000,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();
@@ -2317,6 +2669,66 @@ mod tests {
         let merged_codebook = FixedSizeListArray::try_from(&cb_tensor).unwrap();
 
         assert!(fixed_size_list_equal(&codebook, &merged_codebook));
+    }
+
+    #[tokio::test]
+    async fn test_merge_ivf_pq_rejects_transposed_source_shard() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_pq_transposed");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let lengths = vec![2_u32, 1_u32];
+
+        let nbits = 4_u32;
+        let num_sub_vectors = 2_usize;
+        let dimension = 8_usize;
+        let num_centroids = 1_usize << nbits;
+        let num_codebook_vectors = num_centroids * num_sub_vectors;
+        let total_values = num_codebook_vectors * dimension;
+        let values = Float32Array::from_iter((0..total_values).map(|v| v as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
+
+        write_pq_partial_aux(
+            &object_store,
+            &aux0,
+            nbits,
+            num_sub_vectors,
+            dimension,
+            &lengths,
+            0,
+            DistanceType::L2,
+            &codebook,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            std::slice::from_ref(&aux0),
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::Index { message, .. }) => {
+                assert!(
+                    message.contains("source shard 0"),
+                    "unexpected message: {}",
+                    message
+                );
+                assert!(
+                    message.contains("transposed PQ codes"),
+                    "unexpected message: {}",
+                    message
+                );
+            }
+            other => panic!(
+                "expected Error::Index for transposed PQ source shard, got {:?}",
+                other
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2453,6 +2865,64 @@ mod tests {
         assert!(checked_code_width);
         let expected_total: usize = expected_lengths.iter().map(|v| *v as usize).sum();
         assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
+    async fn test_merge_ivf_rq_rejects_packed_source_shard() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_packed");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let lengths = vec![2_u32, 1_u32];
+
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 1,
+            packed: true,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+
+        write_rq_partial_aux(
+            &object_store,
+            &aux0,
+            &rq_meta,
+            &lengths,
+            0,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            std::slice::from_ref(&aux0),
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::Index { message, .. }) => {
+                assert!(
+                    message.contains("source shard 0"),
+                    "unexpected message: {}",
+                    message
+                );
+                assert!(
+                    message.contains("packed RQ codes"),
+                    "unexpected message: {}",
+                    message
+                );
+            }
+            other => panic!(
+                "expected Error::Index for packed RQ source shard, got {:?}",
+                other
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2612,6 +3082,7 @@ mod tests {
             0,
             DistanceType::L2,
             &codebook0,
+            false,
         )
         .await
         .unwrap();
@@ -2626,6 +3097,7 @@ mod tests {
             1_000,
             DistanceType::L2,
             &codebook1,
+            false,
         )
         .await
         .unwrap();
@@ -2691,6 +3163,7 @@ mod tests {
             0,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();
@@ -2706,6 +3179,7 @@ mod tests {
             1_000,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();

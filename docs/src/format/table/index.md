@@ -119,6 +119,17 @@ Field ids might be replaced with `-2`, a tombstone value.
 In this case that column should be ignored. This used, for example, when rewriting a column: 
 The old data file replaces the field id with `-2` to ignore the old data, and a new data file is appended to the fragment.
 
+Every negative field id is reserved for system use and never names a field of the
+dataset schema. A reader MUST skip any negative id when it projects the dataset schema
+onto a data file, rather than treat it as a schema field or reject the file. Besides
+`-1` (not yet assigned; only ever exists in memory and must not be written) and the
+`-2` tombstone above, `-3`, `-4` and `-5` are the hidden `_rowid`,
+`_row_created_at_version` and `_row_last_updated_at_version` columns that hold a
+fragment's row lineage sequences when they are not stored in the manifest; see
+[Row ID and Lineage](row_id_lineage.md). Such a column always lives in one of the
+fragment's `files`, next to user columns or in a file holding nothing else, and at
+most one file of a fragment may carry each of these ids.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.
@@ -167,6 +178,29 @@ However, this invalidates row addresses and requires rebuilding indices, which c
 ```
 
 </details>
+
+## Data Overlay Files
+
+!!! warning "Experimental"
+
+    This feature is currently experimental and not yet supported in any library.
+
+<!-- TODO: When overlay file support is implemented, update this note to state
+     the released version that first supports the feature. -->
+
+!!! note "Overlay files require feature flag 64 (data overlay files)"
+
+Overlay files supply new values for a subset of cells within
+a fragment without rewriting the base data files. They make updates cheap when only
+a small percentage of rows and/or columns change: a writer appends a small file
+carrying just the changed cells instead of rewriting whole columns or moving rows
+to a new fragment.
+
+For the full specification — coverage and resolution rules, dense vs. sparse layout,
+versioning, index integration, compaction, and a worked example — see the
+[Data Overlay Files Specification](data_overlay_file.md).
+
+
 
 ## Related Specifications
 

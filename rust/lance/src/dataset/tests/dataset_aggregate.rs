@@ -22,7 +22,7 @@ use datafusion_substrait::substrait::proto::{
         reference_segment::{self, StructField},
     },
     extensions::{
-        SimpleExtensionDeclaration, SimpleExtensionUri,
+        SimpleExtensionDeclaration, SimpleExtensionUrn,
         simple_extension_declaration::{ExtensionFunction, MappingType},
     },
     function_argument::ArgType,
@@ -95,17 +95,6 @@ fn create_aggregate_rel(
             git_hash: String::new(),
             producer: "lance-test".to_string(),
         }),
-        #[allow(deprecated)]
-        extension_uris: vec![
-            SimpleExtensionUri {
-                extension_uri_anchor: 1,
-                uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
-            },
-            SimpleExtensionUri {
-                extension_uri_anchor: 2,
-                uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_arithmetic.yaml".to_string(),
-            },
-        ],
         extensions,
         relations: vec![PlanRel {
             rel_type: Some(datafusion_substrait::substrait::proto::plan_rel::RelType::Root(
@@ -117,7 +106,16 @@ fn create_aggregate_rel(
         }],
         advanced_extensions: None,
         expected_type_urls: vec![],
-        extension_urns: vec![],
+        extension_urns: vec![
+            SimpleExtensionUrn {
+                extension_urn_anchor: 1,
+                urn: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
+            },
+            SimpleExtensionUrn {
+                extension_urn_anchor: 2,
+                urn: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_arithmetic.yaml".to_string(),
+            },
+        ],
         parameter_bindings: vec![],
         type_aliases: vec![],
     };
@@ -129,9 +127,7 @@ fn create_aggregate_rel(
 fn agg_extension(anchor: u32, name: &str) -> SimpleExtensionDeclaration {
     SimpleExtensionDeclaration {
         mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
-            #[allow(deprecated)]
-            extension_uri_reference: 1,
-            extension_urn_reference: 0,
+            extension_urn_reference: 1,
             function_anchor: anchor,
             name: name.to_string(),
         })),
@@ -1602,7 +1598,7 @@ async fn test_scanner_count_rows_with_fts() {
     assert_plan_node_equals(
         plan.clone(),
         "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  MatchQuery: column=text, query=document",
+  MatchQuery: column=text, query=[document]",
     )
     .await
     .unwrap();

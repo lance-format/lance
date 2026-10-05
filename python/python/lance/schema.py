@@ -12,17 +12,19 @@ from .lance import _json_to_schema, _schema_to_json
 
 def schema_to_json(schema: pa.Schema) -> Dict[str, Any]:
     """
-    Converts a pyarrow schema to a JSON string.
+    Converts a pyarrow schema to a JSON-compatible dict.
 
     Parameters
     ----------
+    schema: pa.Schema
+        The PyArrow schema to convert.
     """
     return json.loads(_schema_to_json(schema))
 
 
 def json_to_schema(schema_json: Dict[str, Any]) -> pa.Schema:
     """
-    Converts a JSON string to a PyArrow schema.
+    Converts a JSON-compatible dict to a PyArrow schema.
 
     Parameters
     ----------

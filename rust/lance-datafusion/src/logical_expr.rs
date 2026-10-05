@@ -3,15 +3,14 @@
 
 //! Extends logical expression.
 
-use std::sync::Arc;
-
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
-use datafusion::logical_expr::{Between, ScalarUDF, ScalarUDFImpl};
-use datafusion::logical_expr::{BinaryExpr, Operator, expr::ScalarFunction};
+use datafusion::logical_expr::{Between, ScalarUDFImpl};
+use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
+use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::DataTypeExt;
 
@@ -36,7 +35,7 @@ pub fn get_as_string_scalar_opt(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// Given a Expr::Column or Expr::GetIndexedField, get the data type of referenced
+/// Given a column or nested `get_field` expression, get the data type of the referenced
 /// field in the schema.
 ///
 /// If the column is not found in the schema, return None. If the expression is
@@ -51,14 +50,10 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
                 field_path.push(c.name.as_str());
                 break;
             }
-            Expr::ScalarFunction(udf) => {
-                if udf.name() == GetFieldFunc::default().name() {
-                    let name = get_as_string_scalar_opt(&udf.args[1])?;
-                    field_path.push(name);
-                    current_expr = &udf.args[0];
-                } else {
-                    return None;
-                }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                let name = get_as_string_scalar_opt(&udf.args[1])?;
+                field_path.push(name);
+                current_expr = &udf.args[0];
             }
             _ => return None,
         }
@@ -215,34 +210,6 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
     }
 }
 
-// As part of the DF 37 release there are now two different ways to
-// represent a nested field access in `Expr`.  The old way is to use
-// `Expr::field` which returns a `GetStructField` and the new way is
-// to use `Expr::ScalarFunction` with a `GetFieldFunc` UDF.
-//
-// Currently, the old path leads to bugs in DF.  This is probably a
-// bug and will probably be fixed in a future version.  In the meantime
-// we need to make sure we are always using the new way to avoid this
-// bug.  This trait adds field_newstyle which lets us easily create
-// logical `Expr` that use the new style.
-pub trait ExprExt {
-    // Helper function to replace Expr::field in DF 37 since DF
-    // confuses itself with the GetStructField returned by Expr::field
-    fn field_newstyle(&self, name: &str) -> Expr;
-}
-
-impl ExprExt for Expr {
-    fn field_newstyle(&self, name: &str) -> Expr {
-        Self::ScalarFunction(ScalarFunction {
-            func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
-            args: vec![
-                self.clone(),
-                Self::Literal(ScalarValue::Utf8(Some(name.to_string())), None),
-            ],
-        })
-    }
-}
-
 /// Convert a field path string into a DataFusion expression.
 ///
 /// This function handles:
@@ -285,10 +252,12 @@ pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
         )));
     }
 
-    // Build the column expression, handling nested fields
-    let mut expr = col(&parts[0]);
+    // Build the column expression, handling nested fields.
+    let mut expr = Expr::Column(datafusion::common::Column::new_unqualified(
+        parts[0].clone(),
+    ));
     for part in &parts[1..] {
-        expr = expr.field_newstyle(part);
+        expr = expr.field(part.as_str());
     }
 
     Ok(expr)
@@ -301,7 +270,38 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
-    use datafusion_functions::core::expr_ext::FieldAccessor;
+    use datafusion::common::Column;
+
+    #[test]
+    fn test_field_path_to_expr_preserves_case_sensitive_root_column() {
+        let expr = field_path_to_expr("VECTOR").unwrap();
+
+        assert_eq!(expr, Expr::Column(Column::new_unqualified("VECTOR")));
+    }
+
+    #[rstest::rstest]
+    #[case::nested("Parent.Child", "Parent", vec!["Child"])]
+    #[case::deeply_nested("Parent.Child.Leaf", "Parent", vec!["Child", "Leaf"])]
+    #[case::escaped_child("Parent.`Child.With.Dot`", "Parent", vec!["Child.With.Dot"])]
+    #[case::escaped_root("`Parent.With.Dot`.Child", "Parent.With.Dot", vec!["Child"])]
+    #[case::escaped_nested(
+        "`Parent.With.Dot`.`Child.With.Dot`.Leaf",
+        "Parent.With.Dot",
+        vec!["Child.With.Dot", "Leaf"]
+    )]
+    fn test_field_path_to_expr_preserves_nested_names(
+        #[case] path: &str,
+        #[case] root: &str,
+        #[case] children: Vec<&str>,
+    ) {
+        let expr = field_path_to_expr(path).unwrap();
+        let mut expected = Expr::Column(Column::new_unqualified(root));
+        for name in children {
+            expected = get_field(expected, name);
+        }
+
+        assert_eq!(expr, expected);
+    }
 
     #[test]
     fn test_resolve_large_utf8() {
@@ -399,6 +399,7 @@ mod tests {
                 DataType::Struct(
                     vec![
                         Field::new("str", DataType::Utf8, true),
+                        Field::new("Child.With.Dot", DataType::Int32, true),
                         Field::new(
                             "st",
                             DataType::Struct(
@@ -425,6 +426,11 @@ mod tests {
         assert_eq!(
             resolve_column_type(&col("st").field("st").field("float"), &schema),
             Some(DataType::Float64)
+        );
+
+        assert_eq!(
+            resolve_column_type(&field_path_to_expr("st.`Child.With.Dot`").unwrap(), &schema),
+            Some(DataType::Int32)
         );
 
         assert_eq!(resolve_column_type(&col("x"), &schema), None);

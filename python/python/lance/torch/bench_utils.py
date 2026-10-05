@@ -128,7 +128,7 @@ def recall(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
     ----------
     expected: ndarray
         The ground truth
-    results: ndarray
+    actual: ndarray
         The ANN results
     """
     assert expected.shape == actual.shape

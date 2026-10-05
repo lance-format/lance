@@ -1,0 +1,29 @@
+name: Issue Labeler
+
+# Applies bug / feature / performance labels to issues based on their title and
+# body. This complements the .github/ISSUE_TEMPLATE forms, which only apply
+# labels for issues opened through the web UI; this catches issues opened via
+# `gh issue create`, the REST API, or an agent, which bypass templates.
+#
+# Issues never originate from a fork, so unlike the PR labelers this uses a
+# plain `issues` trigger (no pull_request_target) with a scoped GITHUB_TOKEN.
+on:
+  issues:
+    types: [opened, edited]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Apply issue labels
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: srvaroa/labeler@bf262763a8a8e191f5847873aecc0f29df84f957 # v1.14.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config_path: .github/labeler-issues.yml

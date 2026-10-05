@@ -9,6 +9,7 @@ import json
 import operator
 import os
 import random
+import re
 import time
 import uuid
 import warnings
@@ -27,7 +28,6 @@ from typing import (
     Literal,
     Optional,
     Sequence,
-    Set,
     Tuple,
     TypedDict,
     Union,
@@ -40,10 +40,16 @@ from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
-from .blob import BlobFile
+# Imported at runtime, not only for the annotations below: importing it here
+# is what registers `Bitmap` as a `collections.abc.MutableSet`.
+from .bitmap import Bitmap  # noqa: TC001
+from .blob import DEFAULT_BLOB_BUFFER_SIZE, BlobFile, _validate_buffer_size
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
+    _is_pydantic_base_model_class,
+    _validate_pydantic_list,
+    model_to_dict,
     torch,
 )
 from .dependencies import numpy as np
@@ -65,17 +71,22 @@ from .lance import (
     _MergeInsertBuilder,
     _parse_field_path,
     _Scanner,
+    _serialize_row_addrs,
     _write_dataset,
     indices,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .query import FullTextQuery
-from .types import _coerce_reader
+from .query import DocumentGranularity, FullTextQuery, MinHashQuery
+from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import _target_partition_size_to_num_partitions, td_to_micros
+from .util import (
+    _normalize_index_segment_ids,
+    _target_partition_size_to_num_partitions,
+    td_to_micros,
+)
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -235,18 +246,10 @@ def _is_null_blob_description(description: Any) -> bool:
         return False
     if description.keys() == {"position", "size"}:
         return description["position"] == 1 and description["size"] == 0
-    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
-        return (
-            description["kind"] == 0
-            and description["position"] == 0
-            and description["size"] == 0
-            and description["blob_id"] == 0
-            and description["blob_uri"] == ""
-        )
     return False
 
 
-def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
+def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[Dict[str, Any]]]:
     segments = _parse_field_path(path)
     values = table.column(segments[0]).to_pylist()
 
@@ -257,10 +260,10 @@ def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
 
 
 def _replace_value_at_path(
-    parent: Optional[dict],
+    parent: Optional[Dict[str, Any]],
     segments: list[str],
     value: Any,
-) -> Optional[dict]:
+) -> Optional[Dict[str, Any]]:
     if parent is None:
         return None
 
@@ -393,6 +396,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         reader = _coerce_reader(data_obj, schema)
 
+        # Materialized sources are wrapped in an in-memory table so retries never
+        # spill and the source's statistics can drive the join; everything else is
+        # treated as a one-shot stream.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_batches(reader)
+
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -416,6 +425,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
+
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
@@ -515,6 +527,21 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def data_storage_version(self, version: str) -> "MergeInsertBuilder":
+        """Set the exact data storage version for files written by this operation.
+
+        If omitted, use the dataset's default write version without changing it.
+        Accepts "2.0", "2.1", "2.2", "2.3", "stable", or "next" for V2
+        datasets. Release selectors are resolved by the engine; V1/V2
+        cross-family targets are rejected.
+
+        Examples
+        --------
+        ``dataset.merge_insert("id").data_storage_version("2.2")`` selects V2.2
+        for the files written when the builder executes.
+        """
+        return super(MergeInsertBuilder, self).data_storage_version(version)
+
     def use_index(self, use_index: bool) -> "MergeInsertBuilder":
         """
         Controls whether to use indices for the merge operation.
@@ -535,6 +562,49 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The builder instance for method chaining.
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
+
+    def write_mode(
+        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
+    ) -> "MergeInsertBuilder":
+        """
+        Selects how the merged rows are written to disk.
+
+        For a partial-schema update (the source omits some dataset columns) the
+        two modes have different cost shapes. ``rewrite_columns`` never reads or
+        writes the columns the source omits, but its replacement column file
+        covers every row of each fragment it touches, so the bytes written barely
+        fall as fewer rows match. ``rewrite_rows`` instead scales with the number
+        of matched rows. Patching columns wins once the fraction of rows matched
+        exceeds roughly the fraction of each row's bytes the source columns
+        occupy: for a KB-scale update of a MB-per-row table that is nearly
+        always, and for a table whose columns are all narrow it may never be.
+
+        The per-fragment matched row count that decides this is only known once
+        the join has run, so the caller picks rather than the planner guessing.
+
+        Parameters
+        ----------
+        mode : {'auto', 'rewrite_rows', 'rewrite_columns'}
+            ``auto`` (default) lets the engine choose. It rewrites whole rows,
+            except on the one path that predates this parameter: a
+            partial-schema update whose join key carries a scalar index patches
+            columns. ``rewrite_rows`` deletes the matched rows and writes whole
+            rows into new fragments; for a partial-schema update it gives up
+            that index probe, since the indexed path only ever patches columns.
+            ``rewrite_columns`` attaches new data files holding the source
+            columns to the fragments that already hold the matched rows; it
+            raises if the merge cannot be expressed that way, which requires
+            updating matched rows only (no inserts, no matched deletes, no
+            delete-by-source) with a source that omits at least one dataset
+            column, carries at least one column besides the join key, and
+            carries no blob column.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).write_mode(mode)
 
     def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
         """
@@ -590,9 +660,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         Generate the execution plan for the merge insert operation.
 
-        This method creates the execution plan that would be used for the given
-        source schema and returns it as a formatted string for debugging and
-        analysis purposes.
+        This reports the plan a *streaming* source of the given schema would run.
+        It takes a schema rather than data, so it cannot know how ``execute`` would
+        wrap the source; see the note under the example.
 
         Parameters
         ----------
@@ -633,6 +703,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                   ProjectionExec: expr=[..., true as __merge_source_sentinel]
                     StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
+
+        This is always the streaming shape. `explain_plan` receives a schema rather
+        than data, so it cannot know how `execute` would wrap the source, and the
+        wrapping affects the plan. Use `analyze_plan`, which receives the real
+        source, when that matters. Note that `analyze_plan` runs the merge to
+        collect metrics and may write data files, whereas `explain_plan` writes
+        nothing.
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
@@ -708,11 +785,19 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                    RepartitionExec: ...
+                  RepartitionExec: ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        StreamingTableExec: ..., metrics=[]
+                        DataSourceExec: ..., metrics=[]
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+
+        The reported plan follows how the source was passed. `new_data` above is a
+        `pa.Table`, so it is wrapped in an in-memory table that reports exact
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
+        which side of the join to collect from those statistics and from the two
+        sides' sizes, so the same merge can plan differently depending on which one
+        you hand it. Use `explain_plan` only for the streaming shape: it takes a
+        schema rather than data, so it cannot know how the source would be wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -733,25 +818,39 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - requests: number of storage requests made
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
+
+        # Route exactly as execute() does, so the reported plan is the one that
+        # would run. A materialized source reports exact statistics where a stream
+        # reports none, which can change which side of the join is collected.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
+
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
-    def mark_generations_as_merged(
-        self, generations: "List[mem_wal.MergedGeneration]"
+    def mark_sstables_as_compacted(
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
-        """Mark MemWAL generations as merged into the base table.
+        """Mark MemWAL SSTables as compacted into the base table.
 
-        Call this before executing the merge_insert when the source data
-        includes rows from MemWAL flushed generations.
+        Call this before executing merge_insert when it compacts MemWAL SSTables.
+        The progress is recorded in the same commit as the data.
+
+        For multi-pass compaction, call this only on the final successful
+        data-changing pass. Intermediate passes must not carry compaction
+        progress. Lance cannot tell whether a caller has another pass planned,
+        so it cannot enforce this: if a delete pass carried the marker and the
+        process then died before the matching upsert, the recorded progress
+        would claim rows were copied in that never were.
 
         Parameters
         ----------
-        generations : list of MergedGeneration
-            Generations to mark as merged.
+        sstables : list of CompactedSsTable
+            SSTables to mark as compacted.
         """
-        from .mem_wal import _to_raw_merged_generations
+        from .mem_wal import _to_raw_compacted_sstables
 
-        raw_gens = _to_raw_merged_generations(generations)
-        super(MergeInsertBuilder, self).mark_generations_as_merged(raw_gens)
+        raw_sstables = _to_raw_compacted_sstables(sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
         return self
 
 
@@ -841,6 +940,55 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             base_store_params=base_store_params,
         )
+
+    @classmethod
+    def from_pydantic_model(
+        cls,
+        model_class,
+        data,
+        uri: Optional[Union[str, Path]] = None,
+        mode: str = "create",
+        **kwargs,
+    ) -> "LanceDataset":
+        """Create a LanceDataset from a Pydantic model class and a list of instances.
+
+        The table name is inferred from the model class name converted to snake_case.
+        The schema is inferred from the model class's field annotations, not from
+        the data, so optional fields are typed correctly even if every value in a
+        given batch happens to be None.
+
+        Parameters
+        ----------
+        model_class : type
+            A Pydantic BaseModel subclass.
+        data : list
+            A list of Pydantic model instances.
+        uri : str or Path, optional
+            The URI to write the dataset to. If not provided, the model class name
+            converted to snake_case is used as the path.
+        mode : str, optional
+            The write mode. One of "create", "overwrite", or "append".
+        **kwargs
+            Additional arguments passed to write_dataset().
+        """
+        if not _is_pydantic_base_model_class(model_class):
+            raise TypeError(
+                f"`model_class` must be a Pydantic BaseModel subclass, "
+                f"got {model_class!r}"
+            )
+        _validate_pydantic_list(data, model_class)
+        if not data:
+            raise ValueError(
+                "`data` must be a non-empty list of Pydantic model instances."
+            )
+        if uri is None:
+            uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
+        from .pydantic import pydantic_to_schema
+
+        dicts = [model_to_dict(item) for item in data]
+        schema = pydantic_to_schema(model_class)
+        table = pa.Table.from_pylist(dicts, schema=schema)
+        return write_dataset(table, uri, mode=mode, **kwargs)
 
     def __reduce__(self):
         return type(self).__deserialize__, (
@@ -975,12 +1123,14 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         branch: str
-            Name of the branch to create.
+            Name of the branch to create. ``"main"`` is reserved for the
+            default branch and cannot be used as a new branch name.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -1074,11 +1224,11 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[
-            Union[str, pa.compute.Expression, FullTextQuery, VectorSearchQuery, dict]
+            Union[str, Expression, FullTextQuery, VectorSearchQuery, Dict[str, Any]]
         ] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1086,7 +1236,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -1104,6 +1254,8 @@ class LanceDataset(pa.dataset.Dataset):
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -1161,8 +1313,13 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
-        nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors. Example:
+        nearest: dict or MinHashQuery, default None
+            Get the rows corresponding to the K most similar vectors, or, when a
+            :class:`~lance.query.MinHashQuery` is given, the ``limit`` rows most
+            similar to its text under the column's MinHash LSH index (adds a
+            ``_distance`` column equal to ``1 - estimated Jaccard similarity``;
+            unindexed rows are scored on the fly unless ``fast_search`` is set).
+            Vector search example:
 
             .. code-block:: python
 
@@ -1189,26 +1346,31 @@ class LanceDataset(pa.dataset.Dataset):
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
-            smaller than this size.  Note: this can be overridden by
-            ``batch_size_bytes`` or by a dataset-level ``batch_size_bytes``
-            configured via ``FileReaderOptions``.
+            smaller than this size. If a byte limit is also configured, both
+            limits apply and the one reached first determines the batch size.
         batch_size_bytes: int, default None
             If set, the scanner will produce batches whose total size in bytes
-            is approximately this value, overriding the row-based ``batch_size``.
+            is approximately this value. If ``batch_size`` is also set, both
+            limits apply and the one reached first determines the batch size.
+            This cannot be combined with ``strict_batch_size=True`` because
+            strict row batching can merge batches beyond the byte limit.
             This can also be configured at the dataset level via
             ``FileReaderOptions``.  A scanner-level setting takes precedence
             over the dataset-level default.
         io_buffer_size: int, default None
-            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
-            for more information.
+            The maximum number of bytes to buffer from storage before applying
+            backpressure. See ``ScannerBuilder.io_buffer_size`` for more information.
         batch_readahead: int, optional
-            The number of batches to read ahead.
+            The number of batches to decode concurrently.
         fragment_readahead: int, optional
-            The number of fragments to read ahead.
+            The number of fragments whose reads may be scheduled concurrently.
+            This applies even when ``scan_in_order`` is true. Set this to ``1``
+            to avoid overlapping I/O from multiple fragments.
         scan_in_order: bool, default True
-            Whether to read the fragments and batches in order. If false,
-            throughput may be higher, but batches will be returned out of order
-            and memory use might increase.
+            Whether to return fragments and batches in order. This does not make
+            storage reads sequential; use ``fragment_readahead=1`` for that. If
+            false, throughput may be higher, but batches will be returned out of
+            order and memory use might increase.
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
@@ -1272,6 +1434,10 @@ class LanceDataset(pa.dataset.Dataset):
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
             re-raised.
+        strict_batch_size: bool, default False
+            If True, all batches except the last batch will have exactly
+            ``batch_size`` rows. This cannot be combined with a byte limit,
+            including one configured through ``FileReaderOptions``.
         include_deleted_rows: bool, default False
             If True, then rows that have been deleted, but are still present in the
             fragment, will be returned.  These rows will have the _rowid column set
@@ -1294,6 +1460,14 @@ class LanceDataset(pa.dataset.Dataset):
 
             This parameter allows you to opt-in to the new behavior early, to avoid
             being subject to breaking changes in the future.
+        row_addr_allowlist: bytes, default None
+            Restrict the scan to these row addresses. A serialized roaring treemap
+            over ``_rowid`` (``RowAddrTreeMap::serialize_into`` output). Applied
+            before KNN / BM25 ranking, so top-k is computed over the surviving rows
+            rather than filtered afterwards.
+        row_addr_blocklist: bytes, default None
+            Exclude these row addresses, same encoding as ``row_addr_allowlist``.
+            Combined with it when both are given.
 
 
         .. note::
@@ -1336,6 +1510,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         setopt(builder.filter, filter)
         setopt(builder.prefilter, prefilter)
+        if row_addr_allowlist is not None or row_addr_blocklist is not None:
+            builder.row_addr_prefilter(row_addr_allowlist, row_addr_blocklist)
         setopt(builder.limit, limit)
         setopt(builder.offset, offset)
         setopt(builder.batch_size, batch_size)
@@ -1382,7 +1558,10 @@ class LanceDataset(pa.dataset.Dataset):
             elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
-            builder = builder.nearest(**nearest)
+            if isinstance(nearest, MinHashQuery):
+                builder = builder.minhash_search(nearest)
+            else:
+                builder = builder.nearest(**nearest)
         return builder.to_scanner()
 
     @property
@@ -1405,7 +1584,9 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def data_storage_version(self) -> str:
         """
-        The version of the data storage format this dataset is using
+        The default data file version for writes that omit ``data_storage_version``.
+        Existing files may use other V2 versions; this is not a snapshot version
+        summary.
         """
         return self._ds.data_storage_version
 
@@ -1429,10 +1610,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1444,7 +1625,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -1469,8 +1650,13 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
-        nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors. Example:
+        nearest: dict or MinHashQuery, default None
+            Get the rows corresponding to the K most similar vectors, or, when a
+            :class:`~lance.query.MinHashQuery` is given, the ``limit`` rows most
+            similar to its text under the column's MinHash LSH index (adds a
+            ``_distance`` column equal to ``1 - estimated Jaccard similarity``;
+            unindexed rows are scored on the fly unless ``fast_search`` is set).
+            Vector search example:
 
             .. code-block:: python
 
@@ -1586,10 +1772,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
@@ -1600,7 +1786,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
@@ -2003,10 +2189,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_batches(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -2017,7 +2203,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any]]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -2162,7 +2348,9 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
-    ) -> List[BlobFile]:
+        *,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
+    ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
 
@@ -2173,6 +2361,9 @@ class LanceDataset(pa.dataset.Dataset):
         If you plan to read each selected blob completely with ``read()`` or
         ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
         payloads with Lance's planned batched reader.
+
+        ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+        do not change the sequential cursor.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -2186,11 +2377,16 @@ class LanceDataset(pa.dataset.Dataset):
             The (unstable) row addresses to select in the dataset.
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
+        buffer_size : int, default 512 KiB
+            Sequential read-ahead size in bytes. ``0`` disables read-ahead.
 
         Returns
         -------
-        blob_files : List[BlobFile]
+        blob_files : List[Optional[BlobFile]]
+            One element per selected row. Null blob values return ``None``;
+            valid empty blobs return a ``BlobFile`` with size zero.
         """
+        buffer_size = _validate_buffer_size(buffer_size)
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
         )
@@ -2205,7 +2401,12 @@ class LanceDataset(pa.dataset.Dataset):
             lance_blob_files = self._ds.take_blobs_by_indices(
                 selection_values, blob_column
             )
-        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+        return [
+            BlobFile(lance_blob_file, buffer_size=buffer_size)
+            if lance_blob_file is not None
+            else None
+            for lance_blob_file in lance_blob_files
+        ]
 
     def read_blobs(
         self,
@@ -2216,7 +2417,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]:
+    ) -> List[Tuple[int, Optional[bytes]]]:
         """
         Read blobs directly into memory using Lance's planned blob reader.
 
@@ -2244,8 +2445,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blobs : List[Tuple[int, bytes]]
-            A list of ``(row_address, blob_bytes)`` pairs.
+        blobs : List[Tuple[int, Optional[bytes]]]
+            One ``(row_address, blob_bytes)`` pair per selected row. Null blob
+            values return ``None``; valid empty blobs return ``b""``.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2262,6 +2464,74 @@ class LanceDataset(pa.dataset.Dataset):
                 selection_values, blob_column, **kwargs
             )
         return self._ds.read_blobs_by_indices(selection_values, blob_column, **kwargs)
+
+    def read_blob_ranges(
+        self,
+        blob_column: str,
+        requests: Sequence[Tuple[int, int, int]],
+        *,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, Optional[bytes]]]:
+        """
+        Read row-specific blob-local byte ranges with one planned API call.
+
+        Each request is a ``(row, offset, length)`` tuple. ``selector`` defines
+        whether every ``row`` value is interpreted as a stable row ID, physical
+        row address, or dataset index. Repeat a row value to read multiple ranges
+        from the same blob. Planning, range validation, physical-source grouping,
+        request coalescing, and bounded I/O scheduling all happen in Rust; this
+        method does not use a Python thread pool.
+
+        Every request produces one result. Requests on null blobs return ``None``,
+        including when the requested range is empty. Empty ranges on non-null
+        blobs return empty bytes without issuing payload I/O. For every request,
+        offset plus length must fit in an unsigned 64-bit integer. Ranges on
+        non-null blobs must not extend beyond the logical blob size. Blob-local
+        bounds are not evaluated for null values because they have no logical
+        payload length. By default results preserve the input request order.
+
+        Parameters
+        ----------
+        blob_column : str
+            The name of the blob column to read.
+        requests : Sequence[Tuple[int, int, int]]
+            Complete ``(row, offset, length)`` requests.
+        selector : {"ids", "addresses", "indices"}
+            Interpretation of every request's ``row`` value.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing ranges.
+        preserve_order : bool, optional
+            If True, returned results follow request order. If False,
+            ``request_index`` still identifies every result.
+
+        Examples
+        --------
+        Read two disjoint ranges from the same row index:
+
+        .. code-block:: python
+
+            dataset.read_blob_ranges(
+                "images",
+                requests=[(7, 0, 1024), (7, 4096, 1024)],
+                selector="indices",
+            )
+
+        Returns
+        -------
+        results : List[Tuple[int, int, Optional[bytes]]]
+            One ``(request_index, row_address, data)`` tuple per request.
+            The Python list retains all returned payload bytes in memory; peak
+            result memory is therefore proportional to their total logical size.
+        """
+        return self._ds.read_blob_ranges(
+            list(requests),
+            blob_column,
+            selector,
+            io_buffer_size=io_buffer_size,
+            preserve_order=preserve_order,
+        )
 
     def head(self, num_rows, **kwargs):
         """
@@ -2281,8 +2551,54 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
+    def slice(
+        self,
+        start: int,
+        end: int,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    ) -> pa.Table:
+        """Select a contiguous range of rows by position.
+
+        Equivalent to ``dataset.take(list(range(start, end)))``, but pushed
+        down as an offset/limit scan instead of a materialized index list.
+
+        Parameters
+        ----------
+        start : int
+            The index of the first row to include (inclusive). Must be
+            non-negative.
+        end : int
+            The index to stop before (exclusive). Must be greater than or
+            equal to ``start``.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+
+        Returns
+        -------
+        table : pyarrow.Table
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tbl = pa.table({"id": range(100)})
+        >>> dataset = lance.write_dataset(tbl, "memory://slice_dataset")
+        >>> dataset.slice(10, 20)
+        pyarrow.Table
+        id: int64
+        ----
+        id: [[10,11,12,13,14,15,16,17,18,19]]
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        if end < start:
+            raise ValueError(f"end ({end}) must be >= start ({start})")
+        return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
+
     def count_rows(
-        self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
+        self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
         """Count rows matching the scanner filter.
 
@@ -2579,7 +2895,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def delete(
         self,
-        predicate: Union[str, pa.compute.Expression],
+        predicate: Union[str, Expression],
         *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
@@ -2619,9 +2935,12 @@ class LanceDataset(pa.dataset.Dataset):
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
         {'num_deleted_rows': 2}
         """
-        if isinstance(predicate, pa.compute.Expression):
-            predicate = str(predicate)
-        return self._ds.delete(predicate, conflict_retries, retry_timeout)
+        encoded_predicate = (
+            _serialize_expression(predicate, self._ds.schema)
+            if isinstance(predicate, pa.compute.Expression)
+            else predicate
+        )
+        return self._ds.delete(encoded_predicate, conflict_retries, retry_timeout)
 
     def truncate_table(self) -> None:
         """
@@ -2778,9 +3097,10 @@ class LanceDataset(pa.dataset.Dataset):
     def update(
         self,
         updates: Dict[str, str],
-        where: Optional[str] = None,
+        where: Optional[Union[str, Expression]] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
@@ -2789,8 +3109,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         updates : dict of str to str
             A mapping of column names to a SQL expression.
-        where : str, optional
-            A SQL predicate indicating which rows should be updated.
+        where : str or pa.compute.Expression, optional
+            A SQL predicate or pyarrow Expression indicating which rows should
+            be updated.
         conflict_retries : int, optional
             Number of times to retry the operation if there is contention.
             Default is 10.
@@ -2799,6 +3120,10 @@ class LanceDataset(pa.dataset.Dataset):
             the operation before giving up. At least one attempt will be made,
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
+        data_storage_version : str, optional
+            Output data file version, such as "2.2", "stable", or "next". If
+            omitted, use the dataset's default write version without changing it.
+            V1/V2 cross-family targets are rejected.
 
         Returns
         -------
@@ -2819,11 +3144,20 @@ class LanceDataset(pa.dataset.Dataset):
         1  4  b
         2  5  c
         """
-        if isinstance(where, pa.compute.Expression):
-            where = str(where)
-        return self._ds.update(updates, where, conflict_retries, retry_timeout)
+        encoded_where = (
+            _serialize_expression(where, self._ds.schema)
+            if isinstance(where, pa.compute.Expression)
+            else where
+        )
+        return self._ds.update(
+            updates,
+            encoded_where,
+            conflict_retries,
+            retry_timeout,
+            data_storage_version,
+        )
 
-    def versions(self):
+    def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
         """
@@ -2837,6 +3171,15 @@ class LanceDataset(pa.dataset.Dataset):
                 microseconds=(ts_nanos % 1e9) // 1e3
             )
         return versions
+
+    def version_refs(self) -> List[VersionRef]:
+        """
+        Return lightweight references to all attached versions in the current branch.
+
+        Unlike :meth:`versions`, this does not read or deserialize every manifest.
+        Use :attr:`latest_version` instead when only the latest version is needed.
+        """
+        return self._ds.version_refs()
 
     @property
     def version(self) -> int:
@@ -2933,7 +3276,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
 
         Returns
         -------
@@ -2951,6 +3295,47 @@ class LanceDataset(pa.dataset.Dataset):
         This creates a new commit.
         """
         self._ds.restore()
+
+    def base_paths(self) -> Dict[int, DatasetBasePath]:
+        """Return the base paths registered in the current dataset snapshot.
+
+        The returned dictionary maps each base path ID to an independent
+        :class:`DatasetBasePath` object. It includes registered bases that are not
+        referenced by any data files. The primary dataset storage is not added to
+        the result unless it was explicitly registered as a base path.
+
+        This method does not refresh the dataset to the latest version. Modifying
+        the returned dictionary does not modify the dataset, and previously
+        returned values do not change when the dataset is updated or checked out
+        at another version. The dictionary iteration order is unspecified.
+
+        Returns
+        -------
+        Dict[int, DatasetBasePath]
+            Registered base paths keyed by base path ID. Each value exposes
+            ``id``, ``name``, ``path``, and ``is_dataset_root`` as read-only
+            attributes. ``is_dataset_root`` describes the base's path layout; it
+            does not identify the dataset's current primary storage. Runtime
+            storage options are not included.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"x": [1]}),
+        ...     "memory://base-paths-example",
+        ...     initial_bases=[
+        ...         lance.DatasetBasePath(
+        ...             "memory://base-paths-data", name="data"
+        ...         )
+        ...     ],
+        ... )
+        >>> base_paths = dataset.base_paths()
+        >>> all(base_id == base.id for base_id, base in base_paths.items())
+        True
+        """
+        return self._ds.base_paths()
 
     def add_bases(
         self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
@@ -2986,6 +3371,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3006,7 +3392,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -3031,8 +3417,13 @@ class LanceDataset(pa.dataset.Dataset):
             deletions run at full speed. Set this to a positive integer to avoid
             hitting object store request rate limits (e.g. S3 HTTP 503 SlowDown).
             For example, ``delete_rate_limit=100`` limits to 100 operations/second.
+
+        versions: list[int], optional
+            Clean up only the specified dataset versions. The current version is
+            never removed, and tagged versions are still protected by
+            ``error_if_tagged_old_versions``.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
 
         return self._ds.cleanup_old_versions(
@@ -3041,6 +3432,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
         )
 
     def explain_cleanup_old_versions(
@@ -3051,6 +3443,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation:
@@ -3065,7 +3458,7 @@ class LanceDataset(pa.dataset.Dataset):
             ``retain_versions`` are not specified, this will default to two weeks.
 
         retain_versions: int, optional
-            Retain the last N versions of the dataset.
+            Retain the last N versions of the dataset. Must be positive.
 
         delete_unverified: bool, default False
             Include unverified files that cleanup would remove when this is set.
@@ -3078,6 +3471,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
             issued by explain.
 
+        versions: list[int], optional
+            Explain cleanup only for the specified dataset versions.
+
         include_files: bool, default False
             If `True`, include candidate files in the explanation up to
             ``max_files`` entries. Aggregate stats always include all candidates.
@@ -3086,7 +3482,7 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum number of candidate files to include when ``include_files``
             is `True`.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         if max_files <= 0:
             raise ValueError("max_files must be positive")
@@ -3097,6 +3493,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
             include_files,
             max_files,
         )
@@ -3120,8 +3517,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         column = column[0]
         lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
 
         if isinstance(index_type, str):
             index_type = index_type.upper()
@@ -3144,6 +3539,12 @@ class LanceDataset(pa.dataset.Dataset):
                     )
                 )
 
+            if lance_field is None:
+                if index_type in ["INVERTED", "FTS"]:
+                    # Rust resolves public FTS paths through intervening list layers.
+                    return column, index_type, index_type
+                raise KeyError(f"{column} not found in schema")
+
             field = lance_field.to_arrow()
 
             field_type = field.type
@@ -3151,23 +3552,32 @@ class LanceDataset(pa.dataset.Dataset):
             if hasattr(field_type, "storage_type"):
                 field_type = field_type.storage_type
 
-            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+            if index_type in ["BTREE", "BITMAP"]:
                 if (
                     not pa.types.is_integer(field_type)
                     and not pa.types.is_floating(field_type)
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
                     and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_decimal128(field_type)
+                    and not pa.types.is_decimal256(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
-                        f"BTREE/BITMAP/ZONEMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
+                        f"BTREE/BITMAP index column {column} must be int",
+                        ", float, bool, str, large_str, binary, large_binary, "
+                        "decimal, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+                if not (
+                    pa.types.is_list(field_type) or pa.types.is_large_list(field_type)
+                ):
+                    raise TypeError(
+                        f"LABEL_LIST index column {column} must be a list or large list"
+                    )
             elif index_type == "NGRAM":
                 if not pa.types.is_string(field_type) and not pa.types.is_large_string(
                     field_type
@@ -3190,14 +3600,15 @@ class LanceDataset(pa.dataset.Dataset):
                         f" or list of strings, or json, but got {value_type}"
                     )
 
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
-            config = json.dumps(index_type.parameters)
+            if lance_field is None and logical_index_type not in ["INVERTED", "FTS"]:
+                raise KeyError(f"{column} not found in schema")
+            parameters = dict(index_type.parameters)
+            if logical_index_type in ["INVERTED", "FTS"]:
+                parameters["document_granularity"] = kwargs["document_granularity"]
+            config = json.dumps(parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             return column, "scalar", logical_index_type
         else:
@@ -3221,7 +3632,11 @@ class LanceDataset(pa.dataset.Dataset):
             "BITMAP",
             "INVERTED",
             "FTS",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
+            "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     @classmethod
@@ -3232,7 +3647,11 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
+            "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     def create_scalar_index(
@@ -3258,8 +3677,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
-        **kwargs,
-    ):
+        document_granularity: DocumentGranularity = DocumentGranularity.ROW,
+        **kwargs: Any,
+    ) -> None:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -3324,9 +3744,21 @@ class LanceDataset(pa.dataset.Dataset):
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
 
-        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
-        bypass spilling to disk. Setting this to true can avoid memory exhaustion
-        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
+        Index training sorts can spill to disk under memory pressure.
+        ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
+        on the process's total memory usage. Spilling still requires memory for
+        individual input batches and for sorting and merging them, so large
+        batches or a small pool can cause memory reservation failures.
+
+        Setting ``LANCE_BYPASS_SPILLING`` to any value (including ``0`` or
+        ``false``) bypasses the bounded memory pool for these sorts. Sorting then
+        stays in memory, ignoring ``LANCE_MEM_POOL_SIZE``. This can avoid pool
+        reservation failures but increases memory use and can exhaust system
+        memory; use it only when the sort fits in available memory. The historical
+        SortExec allocation issues in
+        https://github.com/apache/datafusion/issues/10073 were fixed upstream by
+        https://github.com/apache/datafusion/pull/14644; that fix does not remove
+        the batch-size and memory-pool constraints above.
 
         **Experimental API**
 
@@ -3334,7 +3766,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+            string, binary, decimal, fixed-size-binary, or
+            supported temporal column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
@@ -3366,8 +3799,15 @@ class LanceDataset(pa.dataset.Dataset):
         format_version: int or str, optional
             This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
             format version to write when creating a new index. Accepts ``1``,
-            ``2``, ``"v1"``, or ``"v2"``. If unset, Lance chooses the current
-            default format.
+            ``2``, ``3``, ``"v1"``, ``"v2"``, or ``"v3"``.
+            If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
+            otherwise writes v2 for text analysis with ``block_size=128`` and
+            v3 for code analysis or ``block_size=256``.
+
+        document_granularity: DocumentGranularity, default ROW
+            This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
+            selected text in one dataset row as one document. ``LIST_ELEMENT``
+            treats each element of the deepest list on ``column`` as one document.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3375,6 +3815,12 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        block_size: int, default 128
+            This is for the ``INVERTED`` index. Number of documents per compressed
+            posting block. Must be one of ``128`` or ``256``.
+            ``block_size=256`` is experimental and may introduce breaking changes.
+            Use ``128`` when stable compatibility with the legacy posting layout is
+            required.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
             If set, Lance divides this budget evenly across the workers. If unset,
@@ -3396,6 +3842,7 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
@@ -3407,10 +3854,10 @@ class LanceDataset(pa.dataset.Dataset):
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
-        stem: bool, default True
+        stem: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will stem the
             tokens.
-        remove_stop_words: bool, default True
+        remove_stop_words: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
         custom_stop_words: Optional[List[str]], default None
@@ -3456,6 +3903,11 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
+        if not isinstance(document_granularity, DocumentGranularity):
+            raise TypeError(
+                "document_granularity must be a lance.query.DocumentGranularity"
+            )
+        kwargs["document_granularity"] = document_granularity.value
         column, index_type, logical_index_type = self._prepare_scalar_index_request(
             column, index_type, kwargs
         )
@@ -3477,7 +3929,6 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
         if format_version is not None:
             kwargs["format_version"] = format_version
-
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def _create_index_impl(
@@ -3770,13 +4221,25 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(ivf_centroids) and isinstance(
                     ivf_centroids, np.ndarray
                 ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
+                    if len(ivf_centroids.shape) != 2:
                         raise ValueError(
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.shape[0] == 0:
+                        # num_partitions was derived from shape[0] above, and
+                        # zero partitions panics in the Rust residual step.
+                        raise ValueError(
+                            "Ivf centroids must have at least one cluster, "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if (
+                        num_partitions is not None
+                        and ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids has {ivf_centroids.shape[0]} clusters, "
+                            f"but num_partitions={num_partitions}"
                         )
                     if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
@@ -3930,8 +4393,9 @@ class LanceDataset(pa.dataset.Dataset):
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
             :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_partitions x dimension`` array of existing K-mean centroids
-            for IVF clustering. If not provided, a new KMeans model will be trained.
+            A ``num_clusters x dimension`` array of existing K-mean centroids
+            for IVF clustering. The row count determines the number of IVF
+            partitions. If not provided, a new KMeans model will be trained.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
@@ -4040,7 +4504,7 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for `IVF_RQ`:
 
             - num_bits
-                The number of bits for RQ (Rabit Quantization). Default is 1.
+                The number of bits for RQ (Rabit Quantization). Default is 5.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -4144,7 +4608,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_index_uncommitted(
         self,
         column: Union[str, List[str]],
-        index_type: str,
+        index_type: Union[str, IndexConfig],
         name: Optional[str] = None,
         metric: str = "L2",
         replace: bool = False,
@@ -4180,10 +4644,10 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, and ZONEMAP scalar index
-        construction. Unlike
-        :meth:`create_index`, this method does not publish the index into the
-        dataset manifest. Instead, it writes one segment under
+        canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
+        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        Unlike :meth:`create_index`, this method does not publish the index into
+        the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
@@ -4197,8 +4661,11 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, and ZONEMAP segments may
-        be merged with :meth:`merge_existing_index_segments` before commit.
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
+        LABEL_LIST segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        built before a deferred compaction must be merged before commit so
+        their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -4324,20 +4791,10 @@ class LanceDataset(pa.dataset.Dataset):
             named logical index. Use :meth:`describe_indices` to inspect logical
             indices and obtain segment UUIDs from ``IndexDescription.segments``.
         """
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
         return self._ds.prewarm_index(
-            name, with_position=with_position, index_segments=index_segments
+            name,
+            with_position=with_position,
+            index_segments=_normalize_index_segment_ids(index_segments),
         )
 
     def merge_index_metadata(
@@ -4786,7 +5243,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -4807,6 +5265,47 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.shallow_clone(target_uri, reference, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+
+    def deep_clone(
+        self,
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "LanceDataset":
+        """
+        Deep clone the specified version into a new dataset at target_path.
+
+        This operation copies the data, deletion, and index files referenced by
+        the selected version before committing the destination dataset.
+
+        Parameters
+        ----------
+        target_path : str or Path
+            The URI or filesystem path to clone the dataset into.
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch.
+        storage_options : dict, optional
+            Object store configuration for the destination dataset. If omitted,
+            the source dataset's storage options are used.
+
+        Returns
+        -------
+        LanceDataset
+            The deep-cloned dataset.
+        """
+        if isinstance(target_path, Path):
+            target_uri = os.fspath(target_path)
+        else:
+            target_uri = target_path
+
+        if storage_options is None:
+            storage_options = self._storage_options
+        self._ds.deep_clone(target_uri, reference, storage_options)
+
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
 
     def migrate_manifest_paths_v2(self):
@@ -5013,6 +5512,31 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         ignore_not_found: Optional[bool] = None,
     ) -> None:
+        """Delete a dataset and everything under ``base_uri``.
+
+        To limit the damage a mistyped or misconfigured path can do, ``base_uri``
+        must be a dataset root, meaning it holds a manifest that can be read, or a
+        namespace declare/deregister marker. Anything else raises
+        :class:`ValueError`, including a path that holds only data files or only
+        unreadable manifests: such leftovers need an explicit storage-level delete.
+
+        Note that a path which passes this check is deleted in full, including any
+        unmanaged files kept next to the dataset.
+
+        Parameters
+        ----------
+        base_uri : str or Path
+            Root of the dataset to delete.
+        storage_options : optional, dict
+            Extra options for the storage backend.
+        ignore_not_found : optional, bool
+            If True, return successfully when ``base_uri`` does not exist.
+
+        Raises
+        ------
+        ValueError
+            If ``base_uri`` is not a Lance dataset root.
+        """
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
     def get_ivf_model(self, index_name: str):
@@ -5084,7 +5608,6 @@ class LanceDataset(pa.dataset.Dataset):
         identity_column: Optional[str] = None,
         unsharded: bool = False,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5092,8 +5615,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5120,6 +5641,8 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+            Omitted (the default) keeps every index on the table updated,
+            including ones created later; an empty list keeps none.
         hnsw_params : dict, optional
             Per-index HNSW build-parameter overrides recorded as writer-config
             defaults, keyed by maintained vector index name. Each value is a dict
@@ -5154,7 +5677,6 @@ class LanceDataset(pa.dataset.Dataset):
             identity_column=identity_column,
             unsharded=unsharded,
             durable_write=durable_write,
-            sync_indexed_write=sync_indexed_write,
             max_wal_buffer_size=max_wal_buffer_size,
             max_wal_flush_interval_ms=max_wal_flush_interval_ms,
             max_memtable_size=max_memtable_size,
@@ -5162,14 +5684,12 @@ class LanceDataset(pa.dataset.Dataset):
             max_memtable_batches=max_memtable_batches,
             max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
             manifest_scan_batch_size=manifest_scan_batch_size,
-            async_index_buffer_rows=async_index_buffer_rows,
-            async_index_interval_ms=async_index_interval_ms,
             backpressure_log_interval_ms=backpressure_log_interval_ms,
             stats_log_interval_ms=stats_log_interval_ms,
             hnsw_params=hnsw_params,
         )
 
-    def mem_wal_index_details(self) -> Optional[dict]:
+    def mem_wal_index_details(self) -> Optional[Dict[str, Any]]:
         """Return the MemWAL index details, or ``None`` if not initialized.
 
         Returns
@@ -5186,7 +5706,6 @@ class LanceDataset(pa.dataset.Dataset):
         shard_id: str,
         *,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5194,8 +5713,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5213,8 +5730,6 @@ class LanceDataset(pa.dataset.Dataset):
             ``str(uuid.uuid4())``).
         durable_write : bool, optional
             Whether to fsync WAL writes (default: ``True``).
-        sync_indexed_write : bool, optional
-            Whether index updates are synchronous (default: ``True``).
         max_wal_buffer_size : int, optional
             Maximum WAL buffer size in bytes (default: 10 MB).
         max_wal_flush_interval_ms : int, optional
@@ -5229,10 +5744,6 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum unflushed bytes before backpressure (default: 1 GB).
         manifest_scan_batch_size : int, optional
             Batch size for manifest scans (default: 2).
-        async_index_buffer_rows : int, optional
-            Buffer rows for async index updates (default: 10 000).
-        async_index_interval_ms : int, optional
-            Interval for async index updates in milliseconds (default: 1000).
         backpressure_log_interval_ms : int, optional
             Interval for backpressure log messages in milliseconds
             (default: 30 000).
@@ -5280,7 +5791,6 @@ class LanceDataset(pa.dataset.Dataset):
             name: val
             for name, val in [
                 ("durable_write", durable_write),
-                ("sync_indexed_write", sync_indexed_write),
                 ("max_wal_buffer_size", max_wal_buffer_size),
                 ("max_wal_flush_interval_ms", max_wal_flush_interval_ms),
                 ("max_memtable_size", max_memtable_size),
@@ -5288,8 +5798,6 @@ class LanceDataset(pa.dataset.Dataset):
                 ("max_memtable_batches", max_memtable_batches),
                 ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
                 ("manifest_scan_batch_size", manifest_scan_batch_size),
-                ("async_index_buffer_rows", async_index_buffer_rows),
-                ("async_index_interval_ms", async_index_interval_ms),
                 ("backpressure_log_interval_ms", backpressure_log_interval_ms),
                 ("stats_log_interval_ms", stats_log_interval_ms),
                 ("hnsw_params", hnsw_params),
@@ -5441,6 +5949,41 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def blob_handling(
+        self,
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
+    ) -> "SqlQueryBuilder":
+        """
+        Control how blob columns are returned by this SQL query.
+
+        - ``"all_binary"`` materializes blob columns as binary values.
+        - ``"blobs_descriptions"`` returns blob descriptors (the default).
+        - ``"all_descriptions"`` returns descriptions for all binary-like
+          columns.
+        """
+        self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
+    def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
+        """
+        Set the maximum number of rows produced by each query batch.
+
+        If :meth:`batch_size_bytes` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size(batch_size)
+        return self
+
+    def batch_size_bytes(self, batch_size_bytes: int) -> "SqlQueryBuilder":
+        """
+        Set the approximate maximum bytes produced by each scan batch.
+
+        If :meth:`batch_size` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size_bytes(batch_size_bytes)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -5481,6 +6024,14 @@ class DatasetDelta:
         Return a streaming RecordBatchReader for updated rows.
         """
         return self._delta.get_updated_rows()
+
+    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader of the row ids deleted in the range.
+
+        The batches carry a single ``_rowid`` column. Requires stable row ids.
+        """
+        return self._delta.get_deleted_row_ids()
 
 
 class _DatasetDeltaBuilder:
@@ -5547,6 +6098,10 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+class VersionRef(TypedDict):
+    version: int
+
+
 class UpdateResult(TypedDict):
     num_rows_updated: int
 
@@ -5584,12 +6139,15 @@ class Index:
     name: str
     fields: List[int]
     dataset_version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
+    """The fragments covered by this index. A ``Set[int]``/``List[int]`` is
+    also accepted when constructing an ``Index``."""
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    covering_fields: List[int] = dataclasses.field(default_factory=list)
 
 
 class IndexInformation(TypedDict):
@@ -5601,7 +6159,7 @@ class IndexInformation(TypedDict):
     uuid: str
     fields: List[str]
     version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
     base_id: Optional[int]
 
 
@@ -5642,7 +6200,13 @@ class LanceOperation:
         new_schema: pyarrow.Schema
             The schema of the new dataset.
         fragments: list[FragmentMetadata]
-            The fragments that make up the new dataset.
+            The newly written fragments that make up the new dataset. They are
+            assigned fresh ids when the operation is committed, continuing from
+            the highest id the dataset has ever used, so any id they carry is
+            ignored. Since we reassign fragment ids, a fragment with a deletion
+            file is rejected: use :class:`LanceOperation.Delete` to commit
+            deletions, or :class:`LanceOperation.Merge` to change the schema of
+            existing fragments.
         initial_bases: list[DatasetBasePath], optional
             Base paths to register when creating a new dataset (CREATE mode only).
             **Only valid in CREATE mode**. Will raise an error if used with
@@ -5813,8 +6377,15 @@ class LanceOperation:
             The ids of the fragments that have been removed entirely.
         updated_fragments: list[FragmentMetadata]
             The fragments that have been updated with new deletion vectors.
+            These are used as given, so pass back the metadata read from the
+            dataset rather than a freshly constructed object, or the fragment
+            loses its row id and version metadata.
         new_fragments: list[FragmentMetadata]
-            The fragments that contain the new rows.
+            The fragments that contain the new rows. On a dataset that uses
+            stable row ids, set ``row_id_meta`` on these to carry the ids of
+            rewritten rows over; see :class:`lance.fragment.RowIdSequence`. The
+            created-at and last-updated-at version metadata are derived during
+            the commit and should be left as None.
         fields_modified: list[int]
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
@@ -5822,6 +6393,11 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        updated_fragment_offsets: dict[int, bytes], optional
+            Physical row offsets that matched the update, keyed by fragment id,
+            each serialized in the portable RoaringBitmap format. Set on
+            ``rewrite_columns`` updates over stable row ids so the commit
+            refreshes row-level version metadata for the matched rows only.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -5834,6 +6410,7 @@ class LanceOperation:
             default_factory=list
         )
         update_mode: str = ""
+        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -5852,6 +6429,14 @@ class LanceOperation:
         schema: LanceSchema or pyarrow.Schema
             The schema of the new dataset. Passing a LanceSchema is preferred,
             and passing a pyarrow.Schema is deprecated.
+        preserves_nullability: bool
+            True when this merge makes no nullability-affecting schema change:
+            it introduces no field that data staged against an earlier schema
+            could not safely omit. Without the assertion (the default) the
+            merge conservatively conflicts with concurrent appends, whose
+            fragments would omit new columns and read as null; that can only
+            cause a retry. Pass True when every column this merge introduces
+            is nullable to let concurrent appends commit without conflict.
 
         Warning
         -------
@@ -5897,6 +6482,7 @@ class LanceOperation:
 
         fragments: Iterable[FragmentMetadata]
         schema: LanceSchema | pa.Schema
+        preserves_nullability: bool = False
 
         def __post_init__(self):
             if isinstance(self.schema, pa.Schema):
@@ -5915,6 +6501,38 @@ class LanceOperation:
         """
 
         version: int
+
+    @dataclass
+    class Clone(BaseOperation):
+        """Operation that creates a clone or branch from a dataset reference.
+
+        This operation is created internally by clone and branch APIs. It is
+        exposed so transactions returned by :meth:`LanceDataset.get_transactions`
+        can represent clone metadata without losing information.
+
+        Only a shallow clone can be committed directly. A deep clone must copy
+        the source files first, so committing one raises ``OSError``; use
+        :meth:`LanceDataset.deep_clone` instead.
+
+        Attributes
+        ----------
+        is_shallow: bool
+            Whether data files are shared with the source dataset.
+        ref_name: str, optional
+            Source branch name, or ``None`` for the main branch.
+        ref_version: int
+            Source dataset version.
+        ref_path: str
+            Source dataset URI.
+        branch_name: str, optional
+            Destination branch name, when the clone creates a branch.
+        """
+
+        is_shallow: bool
+        ref_name: Optional[str]
+        ref_version: int
+        ref_path: str
+        branch_name: Optional[str]
 
     @dataclass
     class RewriteGroup:
@@ -5990,6 +6608,80 @@ class LanceOperation:
         replacements: List[LanceOperation.DataReplacementGroup]
 
     @dataclass
+    class DataOverlayFile:
+        """
+        An overlay file supplying new values for a subset of
+        ``(physical offset, field)`` cells of a fragment, resolved on read and
+        layered over the base data without rewriting the base files.
+
+        The overlay is dense or sparse depending on the shape of ``offsets``:
+        pass a single iterable of ints (e.g. a :class:`~lance.bitmap.Bitmap`
+        or a ``List[int]``) for a dense overlay (one offset set shared by
+        every field in ``data_file``), or a list of int iterables for a
+        sparse overlay (one offset set per field, in the order of the file's
+        fields). Offsets are **physical** row offsets (positions in the base
+        files, counting deleted rows), like deletion vectors.
+
+        Attributes
+        ----------
+        data_file : DataFile
+            The Lance data file storing the overlay's new cell values — one
+            value column per covered field. The value at each covered offset is
+            stored at the rank (0-based count of covered offsets below it) of
+            that offset in the field's coverage.
+        offsets : Iterable[int] | List[Iterable[int]]
+            The covered physical row offsets. A single int iterable is dense
+            coverage (shared by every field); a list of int iterables is
+            sparse coverage (in field order). Offsets are always resolved in
+            ascending order — the smallest covered offset maps to row 0 of
+            ``data_file``, the next-smallest to row 1, and so on — regardless
+            of the order values are given in, so a plain ``List[int]`` need
+            not be pre-sorted. A repeated offset raises ``ValueError``: it
+            would shift every later offset onto the wrong row.
+        committed_version : Optional[int]
+            The dataset version at which this overlay became effective. Leave as
+            ``None`` when creating an overlay to commit — the commit stamps it.
+            It is populated when reading an existing fragment's overlays so they
+            round-trip through :class:`FragmentMetadata`.
+        """
+
+        data_file: DataFile
+        offsets: Union[Iterable[int], List[Iterable[int]]]
+        committed_version: Optional[int] = None
+
+    @dataclass
+    class DataOverlayGroup:
+        """
+        Overlay files to append to a single fragment.
+
+        Attributes
+        ----------
+        fragment_id : int
+            The id of the fragment the overlays apply to.
+        overlays : List[LanceOperation.DataOverlayFile]
+            The overlay files to append, ordered oldest-first (a later entry is
+            newer and wins where coverage overlaps).
+        """
+
+        fragment_id: int
+        overlays: List[LanceOperation.DataOverlayFile]
+
+    @dataclass
+    class DataOverlay(BaseOperation):
+        """
+        Operation that appends data overlay files to fragments.
+
+        Overlays are appended to each fragment's existing overlays (overlays
+        written by concurrent commits are preserved) and resolved on read
+        over the base data without rewriting it.
+
+        If multiple groups target the same data then the values in the
+        latest group take precedence.
+        """
+
+        groups: List[LanceOperation.DataOverlayGroup]
+
+    @dataclass
     class Project(BaseOperation):
         """
         Operation that project columns.
@@ -5999,6 +6691,11 @@ class LanceOperation:
         ----------
         schema: LanceSchema
             The lance schema of the new dataset.
+        preserves_nullability: bool
+            True when this projection makes no nullability-affecting schema
+            change, as a rename or a drop does not. Without the assertion
+            (the default) the projection conservatively conflicts with
+            concurrent writes, which can only cause a retry.
 
         Examples
         --------
@@ -6027,6 +6724,7 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+        preserves_nullability: bool = False
 
     @dataclass
     class UpdateMap:
@@ -6116,6 +6814,46 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def _serialize_expression(
+    expression: pa.compute.Expression, schema: pa.Schema
+) -> bytes:
+    from pyarrow.substrait import serialize_expressions
+
+    # Keep each field's position so Substrait references still resolve against
+    # the stored schema when PyArrow cannot serialize an unrelated field's type.
+    scalar_schema = pa.schema(
+        [
+            (
+                pa.field(f"__unlikely_name_placeholder_{i}", pa.int8())
+                if _needs_substrait_placeholder(field.type)
+                else field
+            )
+            for i, field in enumerate(schema)
+        ]
+    )
+    serialized = serialize_expressions([expression], ["my_filter"], scalar_schema)
+    if isinstance(serialized, memoryview):
+        return serialized.tobytes()
+    try:
+        return serialized.to_pybytes()
+    except AttributeError:
+        raise TypeError(
+            f"serialize_expressions returned unexpected type {type(serialized)}"
+        )
+
+
+def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
+    """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
+
+    Those parameters take a serialized roaring treemap over ``_rowid``; this is
+    the way to produce one from Python.
+
+    >>> blob = serialize_row_addrs([0, 2, 4])                    # doctest: +SKIP
+    >>> ds.scanner(row_addr_allowlist=blob).to_table()           # doctest: +SKIP
+    """
+    return _serialize_row_addrs(list(addrs))
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -6124,12 +6862,15 @@ class ScannerBuilder:
         self._search_filter = None
         self._substrait_filter = None
         self._prefilter = False
+        self._row_addr_allowlist: Optional[bytes] = None
+        self._row_addr_blocklist: Optional[bytes] = None
         self._late_materialization = None
         self._blob_handling = None
         self._offset = None
         self._columns = None
         self._columns_with_transform = None
         self._nearest = None
+        self._minhash_query: Optional[Dict[str, str]] = None
         self._batch_size: Optional[int] = None
         self._batch_size_bytes: Optional[int] = None
         self._io_buffer_size: Optional[int] = None
@@ -6165,9 +6906,8 @@ class ScannerBuilder:
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set the maximum number of rows per batch.
 
-        Note: this can be overridden by ``batch_size_bytes`` or by a
-        dataset-level ``batch_size_bytes`` configured via
-        ``FileReaderOptions``.
+        If a byte limit is also configured, both limits apply and the one
+        reached first determines the batch size.
         """
         self._batch_size = batch_size
         return self
@@ -6176,7 +6916,8 @@ class ScannerBuilder:
         """Set the target batch size in bytes.
 
         When set, the scanner will produce batches whose total size in bytes
-        is approximately this value, overriding the row-based ``batch_size``.
+        is approximately this value. If ``batch_size`` is also set, both
+        limits apply and the one reached first determines the batch size.
 
         This can also be configured at the dataset level via
         ``FileReaderOptions``.  A scanner-level setting takes precedence
@@ -6209,10 +6950,12 @@ class ScannerBuilder:
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         """
-        This parameter is ignored when reading v2 files
+        Set the maximum number of batches to decode concurrently.
+
+        This parameter must be greater than zero.
         """
-        if nbatches is not None and int(nbatches) < 0:
-            raise ValueError("batch_readahead must be non-negative")
+        if nbatches is not None and int(nbatches) <= 0:
+            raise ValueError("batch_readahead must be greater than 0")
         self._batch_readahead = nbatches
         return self
 
@@ -6285,47 +7028,7 @@ class ScannerBuilder:
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
-            try:
-                from pyarrow.substrait import serialize_expressions
-
-                fields_without_lists = []
-                counter = 0
-                # Pyarrow cannot handle certain types when converting to
-                # Substrait (e.g. fixed_size_list at any nesting depth, or
-                # struct fields with non-None metadata left by extension types
-                # after a lance round-trip).  We replace any top-level field
-                # whose type tree contains such a type with an int8 placeholder
-                # so that ordinal field references in the filter remain correct.
-                for field in self.ds.schema:
-                    if _needs_substrait_placeholder(field.type):
-                        pos = counter
-                        counter += 1
-                        fields_without_lists.append(
-                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
-                        )
-                    else:
-                        fields_without_lists.append(field)
-                        # Serialize the pyarrow compute expression toSubstrait and use
-                        # that as a filter.
-                        counter += 1
-                scalar_schema = pa.schema(fields_without_lists)
-                substrait_filter = serialize_expressions(
-                    [filter], ["my_filter"], scalar_schema
-                )
-                if isinstance(substrait_filter, memoryview):
-                    self._substrait_filter = substrait_filter.tobytes()
-                else:
-                    try:
-                        self._substrait_filter = substrait_filter.to_pybytes()
-                    except AttributeError:
-                        raise TypeError(
-                            "serialize_expressions returned unexpected"
-                            f"type {type(substrait_filter)}"
-                        )
-            except ImportError:
-                # serialize_expressions was introduced in pyarrow 14.  Fallback to
-                # stringifying the expression if pyarrow is too old
-                self._filter = str(filter)
+            self._substrait_filter = _serialize_expression(filter, self.ds._ds.schema)
         else:
             expr_filter = filter.get("expr_filter")
             if expr_filter is not None:
@@ -6335,6 +7038,25 @@ class ScannerBuilder:
             if search_filter is not None:
                 self.filter(search_filter)
 
+        return self
+
+    def row_addr_prefilter(
+        self,
+        allowlist: Optional[bytes] = None,
+        blocklist: Optional[bytes] = None,
+    ) -> ScannerBuilder:
+        """Restrict the scan to an externally supplied set of row addresses.
+
+        allowlist / blocklist are serialized roaring treemaps over ``_rowid``
+        (``RowAddrTreeMap::serialize_into`` output); passing neither clears the
+        mask. Applied before KNN / BM25 ranking, so top-k is computed over the
+        surviving rows rather than filtered afterwards.
+
+        Bytes rather than an object so the mask can be produced by a different
+        extension module -- nothing Rust-typed crosses the boundary.
+        """
+        self._row_addr_allowlist = allowlist
+        self._row_addr_blocklist = blocklist
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
@@ -6421,19 +7143,7 @@ class ScannerBuilder:
     def with_index_segments(
         self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
     ) -> ScannerBuilder:
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
-        self._index_segments = index_segments
+        self._index_segments = _normalize_index_segment_ids(index_segments)
         return self
 
     def nearest(
@@ -6546,6 +7256,33 @@ class ScannerBuilder:
             }
         return self
 
+    def minhash_search(self, query: MinHashQuery) -> ScannerBuilder:
+        """
+        Find the rows most similar to ``query.text`` using the MinHash LSH index
+        on ``query.column``.
+
+        The number of rows comes from :meth:`limit` (default 10). Results carry
+        a ``_distance`` column equal to ``1 - estimated Jaccard similarity`` and
+        are ordered by ascending distance. Cannot be combined with
+        :meth:`nearest` or :meth:`full_text_search`.
+
+        Rows the index does not cover (fragments appended after the index was
+        built, or rows changed by a data overlay) are scored on the fly, which
+        costs a scan of those rows per query; run ``optimize_indices`` to index
+        them, or enable :meth:`fast_search` to search only the indexed rows.
+
+        Parameters
+        ----------
+        query : MinHashQuery
+            The query text and the column to search.
+        """
+        if not isinstance(query, MinHashQuery):
+            raise TypeError(
+                f"minhash_search expects a MinHashQuery, got {type(query).__name__}"
+            )
+        self._minhash_query = {"column": query.column, "text": query.text}
+        return self
+
     def scan_stats_callback(
         self, callback: Callable[[ScanStatistics], None]
     ) -> ScannerBuilder:
@@ -6565,6 +7302,9 @@ class ScannerBuilder:
         If this is true then small batches will need to be merged together
         which will require a data copy and incur a (typically very small)
         performance penalty.
+
+        This cannot be combined with ``batch_size_bytes`` because merging
+        batches to the strict row count can exceed the byte limit.
         """
         self._strict_batch_size = strict_batch_size
         return self
@@ -6638,6 +7378,9 @@ class ScannerBuilder:
             self._orderings,
             self._disable_scoring_autoprojection,
             self._substrait_aggregate,
+            self._row_addr_allowlist,
+            self._row_addr_blocklist,
+            self._minhash_query,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 
@@ -6794,7 +7537,7 @@ class LanceScanner(pa.dataset.Scanner):
         """
         return self.to_table()[:num_rows]
 
-    def count_rows(self):
+    def count_rows(self) -> int:
         """Count rows matching the scanner filter.
 
         Returns
@@ -6821,6 +7564,9 @@ class LanceScanner(pa.dataset.Scanner):
 
     def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
+
+        Full-text-search nodes include the execution-time ``tokenized_query``
+        text and positions.
 
         Parameters
         ----------
@@ -6856,6 +7602,11 @@ class DatasetOptimizer:
             Literal["reencode", "try_binary_copy", "force_binary_copy"]
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
+        max_source_fragments: Optional[int] = None,
+        max_source_rows: Optional[int] = None,
+        max_source_bytes: Optional[int] = None,
+        excluded_fragment_ids: Optional[list[int]] = None,
+        data_storage_version: Optional[str] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -6886,7 +7637,11 @@ class DatasetOptimizer:
         ``lance.compaction.defer_index_remap``,
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
-        ``lance.compaction.binary_copy_read_batch_bytes``.
+        ``lance.compaction.binary_copy_read_batch_bytes``,
+        ``lance.compaction.max_source_fragments``,
+        ``lance.compaction.max_source_rows``,
+        ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.data_storage_version``.
 
         Parameters
         ----------
@@ -6939,6 +7694,34 @@ class DatasetOptimizer:
             The batch size in bytes for reading during binary copy operations.
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
+        max_source_fragments: int, optional
+            Maximum number of source fragments to compact in a single run.
+            Compaction tasks are included until adding the next task would
+            exceed this limit, allowing compaction to proceed incrementally.
+            Fragments are processed oldest first. If not specified, uses the
+            manifest config value, or applies no limit.
+        max_source_rows: int, optional
+            Maximum number of source rows to compact in a single run. Rows are
+            counted as live rows (physical rows minus soft-deleted rows).
+            Tasks are included until adding the next task would exceed this
+            limit.
+        max_source_bytes: int, optional
+            Maximum number of source bytes to compact in a single run,
+            measured as the total size of the source fragments' data and
+            overlay files. Tasks are included until adding the next task
+            would exceed this limit. Blob v2 payloads live in separate
+            blob files and are not counted, so this is not a cap on total
+            compaction I/O for datasets with blob columns.
+        excluded_fragment_ids: list[int], optional
+            Fragment IDs to exclude from compaction planning. Excluded
+            fragments remain unchanged and act as boundaries, so fragments
+            on opposite sides are not combined into the same compaction task.
+            Duplicate and unknown IDs are ignored.
+        data_storage_version: str, optional
+            Output data file version, such as "2.2", "stable", or "next".
+            Uses the compaction config target when set, otherwise the dataset's
+            default write version. Does not change that default or the versions
+            of unselected files. V1/V2 cross-family targets are rejected.
 
         Returns
         -------
@@ -6962,12 +7745,17 @@ class DatasetOptimizer:
                 batch_size=batch_size,
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+                max_source_fragments=max_source_fragments,
+                max_source_rows=max_source_rows,
+                max_source_bytes=max_source_bytes,
+                excluded_fragment_ids=excluded_fragment_ids,
+                data_storage_version=data_storage_version,
             ).items()
             if v is not None
         }
         return Compaction.execute(self._dataset, opts)
 
-    def optimize_indices(self, **kwargs):
+    def optimize_indices(self, **kwargs) -> None:
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -6975,10 +7763,10 @@ class DatasetOptimizer:
         an expensive unindexed search on the new data.  As the amount of new
         unindexed data grows this can have an impact on search latency.
         This function will add the new data to existing indexes, restoring the
-        performance.  This function does not retrain the index, it only assigns
-        the new data to existing partitions.  This means an update is much quicker
-        than retraining the entire index but may have less accuracy (especially
-        if the new data exhibits new patterns, concepts, or trends)
+        performance. By default, this function does not retrain the index, it only
+        assigns the new data to existing partitions. This means an update is much
+        quicker than retraining the entire index but may have less accuracy
+        (especially if the new data exhibits new patterns, concepts, or trends)
 
         Parameters
         ----------
@@ -6988,7 +7776,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False, deprecated
+        retrain: bool, default False
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
@@ -6996,7 +7784,7 @@ class DatasetOptimizer:
 
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
-            This would be faster than re-create the index from scratch.
+            This rebuilds the index from the source data and may be expensive.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
@@ -7045,7 +7833,7 @@ class Tags:
         """
         return self._ds.tags()
 
-    def get_version(self, tag: str) -> Optional[int]:
+    def get_version(self, tag: str) -> int:
         """
         Get the version of a specific tag by name.
 
@@ -7056,8 +7844,13 @@ class Tags:
 
         Returns
         -------
-        int or None
-            The version number of the tag if it exists, otherwise None.
+        int
+            The version number of the tag.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist. Use :meth:`list` to check for presence.
         """
         return self._ds.get_version(tag)
 
@@ -7096,7 +7889,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.create_tag(tag, reference)
 
@@ -7128,7 +7922,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.update_tag(tag, reference)
 
@@ -7249,6 +8044,8 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    data_cache_bytes: Optional[int] = None,
+    max_page_bytes: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -7270,6 +8067,7 @@ def write_dataset(
     blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    session: Optional[Session] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -7301,6 +8099,13 @@ def write_dataset(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    data_cache_bytes : int, optional
+        Total bytes to buffer for column data before writing pages. The budget
+        is divided evenly across top-level columns. If not set, the current
+        file writer uses 8 MiB per column. Ignored for legacy V1 files.
+    max_page_bytes : int, optional
+        Best-effort maximum page size in bytes. If not set, the current file
+        writer uses its configured default. Ignored for legacy V1 files.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -7320,8 +8125,10 @@ def write_dataset(
         shared.
     data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default (None)
-        will use the latest stable version.  See the user guide for more details.
+        efficient but require newer versions of lance to read. For create and
+        overwrite, None uses the latest stable version. For append, None uses
+        the dataset's default write version; an explicit V2 version applies
+        only to new files and does not change that default.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
@@ -7515,6 +8322,8 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
+        "data_cache_bytes": data_cache_bytes,
+        "max_page_bytes": max_page_bytes,
         "progress": progress,
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
@@ -7529,6 +8338,7 @@ def write_dataset(
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
+        "session": session,
     }
 
     # Add namespace_client and table_id for storage options provider and managed
@@ -7656,8 +8466,7 @@ def _build_vector_search_query(
     metric: str, optional
         The distance metric to use (e.g., "L2", "cosine", "dot", "hamming").
     nprobes: int, optional
-        The number of partitions to search. Sets both minimum_nprobes and
-        maximum_nprobes to the same value.
+        The number of partitions to search, setting both the minimum and maximum.
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
@@ -7727,15 +8536,6 @@ def _build_vector_search_query(
     if maximum_nprobes is not None and int(maximum_nprobes) < 0:
         raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
 
-    if nprobes is not None:
-        if minimum_nprobes is not None or maximum_nprobes is not None:
-            raise ValueError(
-                "nprobes cannot be set in combination with minimum_nprobes or "
-                "maximum_nprobes"
-            )
-        else:
-            minimum_nprobes = nprobes
-            maximum_nprobes = nprobes
     if (
         minimum_nprobes is not None
         and maximum_nprobes is not None
@@ -7771,6 +8571,7 @@ def _build_vector_search_query(
         "q": q,
         "k": k,
         "metric": metric,
+        "nprobes": nprobes,
         "minimum_nprobes": minimum_nprobes,
         "maximum_nprobes": maximum_nprobes,
         "refine_factor": refine_factor,

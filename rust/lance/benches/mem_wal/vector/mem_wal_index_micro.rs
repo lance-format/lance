@@ -10,7 +10,9 @@
 //!    index maintained, opens `mem_wal_writer` with a `ShardWriterConfig`
 //!    sized to hold the largest checkpoint without flushing, and times
 //!    `writer.put(batch)` calls. Index updates therefore go through the
-//!    parallel `IndexStore::insert_batches_parallel` path. At each
+//!    `IndexStore::insert_batches` path, which indexes inline at or below
+//!    `PARALLEL_INDEX_MIN_ROWS` rows and spawns a thread per index above it —
+//!    so the checkpoint sizes here straddle that crossover. At each
 //!    checkpoint, queries are issued against `active_memtable_ref()` via
 //!    `MemTableScanner::nearest`.
 //!
@@ -212,7 +214,6 @@ async fn main() -> lance_core::Result<()> {
         wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write,
-        sync_indexed_write: true,
         max_memtable_size: max_rows.saturating_mul(row_size_estimate).saturating_mul(4),
         max_memtable_rows: max_rows.saturating_mul(2),
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
@@ -253,7 +254,7 @@ async fn main() -> lance_core::Result<()> {
 
         while next_cp_idx < checkpoints.len() && total_inserted >= checkpoints[next_cp_idx] {
             let cp = checkpoints[next_cp_idx];
-            let target_batch_pos = (cp / batch_size).saturating_sub(1);
+            let target_indexed_count = cp / batch_size;
             // The WAL flush handler only updates the index watermark when a
             // flush is triggered, and the time-based trigger inside the
             // writer runs only when `put()` is called. After the final put
@@ -265,7 +266,7 @@ async fn main() -> lance_core::Result<()> {
             let mut spins = 0u64;
             loop {
                 let active = writer.active_memtable_ref().await?;
-                if active.index_store.max_visible_batch_position() >= target_batch_pos {
+                if active.index_store.indexed_count() >= target_indexed_count {
                     break;
                 }
                 drop(active);
@@ -375,12 +376,11 @@ async fn measure_flush(
     memtable.set_indexes(registry);
 
     let total_batches = cp.div_ceil(batch_size);
-    for (wal_pos, i) in (0_u64..).zip(0..total_batches) {
+    for i in 0..total_batches {
         let start = (i * batch_size) as i64;
         let rows = batch_size.min(cp - i * batch_size);
         let batch = make_batch(start, rows, dim);
-        let frag_id = memtable.insert(batch).await?;
-        memtable.mark_wal_flushed(&[frag_id], wal_pos + 1, &[i]);
+        let _frag_id = memtable.insert(batch).await?;
     }
 
     let temp_dir =
@@ -406,11 +406,19 @@ async fn measure_flush(
     let flusher = MemTableFlusher::new(store, base_path, uri, shard_id, manifest_store);
 
     // total_batches WAL entries were stamped at positions 1..=total_batches
-    // by the mark_wal_flushed loop above (1-based positions).
+    // by the loop above (1-based positions).
     let covered_wal_entry_position = total_batches as u64;
+    // Every batch was appended above, so the writer-global durable count is all of them.
+    let durable = total_batches;
     let t = Instant::now();
     let _result = flusher
-        .flush_with_indexes(&memtable, epoch, index_configs, covered_wal_entry_position)
+        .flush_with_indexes(
+            &memtable,
+            epoch,
+            index_configs,
+            covered_wal_entry_position,
+            durable,
+        )
         .await?;
     let elapsed = t.elapsed();
 

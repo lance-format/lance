@@ -23,15 +23,16 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
@@ -49,6 +50,17 @@ use crate::scalar::{
     RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
+
+/// Schema of one FM-index block batch.
+static BLOCK_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("node_id", DataType::UInt32, false),
+        Field::new("block_id", DataType::UInt32, false),
+        Field::new("words", DataType::LargeBinary, false),
+        Field::new("prefix_rank", DataType::UInt64, false),
+        Field::new("bit_len", DataType::UInt64, false),
+    ]))
+});
 
 const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
@@ -90,12 +102,7 @@ static LANCE_FMINDEX_WRITE_QUEUE_SIZE: std::sync::LazyLock<usize> =
 static LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         std::env::var("LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS")
-            .map(|value| {
-                matches!(
-                    value.as_str(),
-                    "1" | "true" | "TRUE" | "True" | "yes" | "YES"
-                )
-            })
+            .map(|value| str_is_truthy(&value))
             .unwrap_or(false)
     });
 static LANCE_FMINDEX_PREWARM_CHUNK_BYTES: std::sync::LazyLock<usize> =
@@ -178,7 +185,6 @@ struct RankBitVec {
     len: usize,
 }
 
-#[allow(dead_code)]
 impl RankBitVec {
     fn new(len: usize) -> Self {
         Self {
@@ -193,11 +199,6 @@ impl RankBitVec {
         self.words[pos / 64] |= 1u64 << (pos % 64);
     }
 
-    #[inline]
-    fn get(&self, pos: usize) -> bool {
-        (self.words[pos / 64] >> (pos % 64)) & 1 != 0
-    }
-
     fn build_rank_index(&mut self) {
         let num_sb = self.words.len().div_ceil(WORDS_PER_SUPERBLOCK) + 1;
         self.superblocks = Vec::with_capacity(num_sb);
@@ -209,29 +210,6 @@ impl RankBitVec {
             }
         }
         self.superblocks.push(cum);
-    }
-
-    #[inline]
-    fn rank1(&self, pos: usize) -> usize {
-        if pos == 0 {
-            return 0;
-        }
-        let word_idx = pos / 64;
-        let bit_idx = pos % 64;
-        let sb_idx = word_idx / WORDS_PER_SUPERBLOCK;
-        let mut count = self.superblocks[sb_idx] as usize;
-        for i in (sb_idx * WORDS_PER_SUPERBLOCK)..word_idx {
-            count += self.words[i].count_ones() as usize;
-        }
-        if bit_idx > 0 {
-            count += (self.words[word_idx] & ((1u64 << bit_idx) - 1)).count_ones() as usize;
-        }
-        count
-    }
-
-    #[inline]
-    fn rank0(&self, pos: usize) -> usize {
-        pos - self.rank1(pos)
     }
 
     fn deep_size(&self) -> usize {
@@ -285,7 +263,6 @@ impl Ord for HuffNode {
     }
 }
 
-#[allow(dead_code)]
 impl HuffmanWaveletTree {
     fn build(data: &[u8]) -> Self {
         let n = data.len();
@@ -401,73 +378,6 @@ impl HuffmanWaveletTree {
             children: children_map,
             len: n,
         }
-    }
-
-    /// Retrieve the byte at position `pos` in the original BWT.
-    #[inline]
-    fn access(&self, mut pos: usize) -> u8 {
-        if self.nodes.is_empty() {
-            return 0;
-        }
-        let mut node_idx = 0;
-        loop {
-            let bit = self.nodes[node_idx].get(pos);
-            let (ref left, ref right) = self.children[node_idx];
-            if bit {
-                pos = self.nodes[node_idx].rank1(pos);
-                match right {
-                    WaveletChild::Leaf(b) => return *b,
-                    WaveletChild::Node(next) => node_idx = *next,
-                }
-            } else {
-                pos = self.nodes[node_idx].rank0(pos);
-                match left {
-                    WaveletChild::Leaf(b) => return *b,
-                    WaveletChild::Node(next) => node_idx = *next,
-                }
-            }
-        }
-    }
-
-    /// Count occurrences of byte `c` in positions `[0, pos)`.
-    #[inline]
-    fn rank(&self, c: u8, pos: usize) -> usize {
-        let code = &self.codes[c as usize];
-        if code.length == 0 {
-            return 0;
-        }
-        let (mut lo, mut hi) = (0, pos);
-        for (level, &nid) in code.node_path.iter().enumerate() {
-            if (code.bits >> (code.length - 1 - level as u8)) & 1 == 0 {
-                lo = self.nodes[nid].rank0(lo);
-                hi = self.nodes[nid].rank0(hi);
-            } else {
-                lo = self.nodes[nid].rank1(lo);
-                hi = self.nodes[nid].rank1(hi);
-            }
-        }
-        hi - lo
-    }
-
-    #[inline]
-    fn rank_pair(&self, c: u8, lo: usize, hi: usize) -> (usize, usize) {
-        let code = &self.codes[c as usize];
-        if code.length == 0 {
-            return (0, 0);
-        }
-        let (mut s, mut l, mut h) = (0, lo, hi);
-        for (level, &nid) in code.node_path.iter().enumerate() {
-            if (code.bits >> (code.length - 1 - level as u8)) & 1 == 0 {
-                s = self.nodes[nid].rank0(s);
-                l = self.nodes[nid].rank0(l);
-                h = self.nodes[nid].rank0(h);
-            } else {
-                s = self.nodes[nid].rank1(s);
-                l = self.nodes[nid].rank1(l);
-                h = self.nodes[nid].rank1(h);
-            }
-        }
-        (l - s, h - s)
     }
 
     fn deep_size(&self) -> usize {
@@ -641,8 +551,10 @@ impl LazyRankBitVec {
     }
 
     fn decode_words(raw: &[u8]) -> Vec<u64> {
-        raw.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect()
     }
 
@@ -1008,7 +920,6 @@ impl DeepSizeOf for FMIndex {
     }
 }
 
-#[allow(dead_code)]
 impl FMIndex {
     fn build(texts: &[(u64, &[u8])]) -> Result<Self> {
         if texts.is_empty() {
@@ -1078,89 +989,6 @@ impl FMIndex {
             c_table: counts,
             alphabet_size: 256,
         })
-    }
-
-    /// Locate: resolve SA[pos] by walking LF-mapping until hitting a sampled position.
-    /// For large data (N >> SA_SAMPLE_RATE), converges within SA_SAMPLE_RATE steps.
-    /// For small data with short LF cycles, may need up to N steps.
-    #[inline]
-    fn locate(&self, mut pos: usize) -> usize {
-        let mut steps = 0;
-        let n = self.wavelet.len;
-        loop {
-            if pos.is_multiple_of(SA_SAMPLE_RATE) && (pos / SA_SAMPLE_RATE) < self.sa_samples.len()
-            {
-                return (self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps) % n;
-            }
-            let c = self.wavelet.access(pos);
-            pos = self.c_table[c as usize] + self.wavelet.rank(c, pos);
-            steps += 1;
-            if steps >= n {
-                log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
-                return 0;
-            }
-        }
-    }
-
-    /// Map a text position to document index via binary search on doc_start_positions.
-    #[inline]
-    fn doc_for_position(&self, text_pos: usize) -> usize {
-        let tp = text_pos as u64;
-        match self.doc_start_positions.binary_search(&tp) {
-            Ok(idx) => idx,
-            Err(idx) => idx - 1,
-        }
-    }
-
-    fn backward_search(&self, pattern: &[u8]) -> (usize, usize) {
-        if pattern.is_empty() || self.wavelet.len == 0 {
-            return (0, 0);
-        }
-        let (mut lo, mut hi) = (0, self.wavelet.len);
-        for &b in pattern.iter().rev() {
-            let c = self.c_table[b as usize];
-            let (occ_lo, occ_hi) = self.wavelet.rank_pair(b, lo, hi);
-            lo = c + occ_lo;
-            hi = c + occ_hi;
-            if lo >= hi {
-                return (0, 0);
-            }
-        }
-        (lo, hi)
-    }
-
-    #[cfg(test)]
-    fn search(&self, pattern: &[u8]) -> RoaringBitmap {
-        let (lo, hi) = self.backward_search(pattern);
-        if lo >= hi {
-            return RoaringBitmap::new();
-        }
-        let mut result = RoaringBitmap::new();
-        for i in lo..hi {
-            let text_pos = self.locate(i);
-            let doc_idx = self.doc_for_position(text_pos);
-            result.insert(self.row_ids[doc_idx] as u32);
-        }
-        result
-    }
-
-    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
-    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
-        let (lo, hi) = self.backward_search(pattern);
-        if lo >= hi {
-            return Vec::new();
-        }
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        for i in lo..hi {
-            let text_pos = self.locate(i);
-            let doc_idx = self.doc_for_position(text_pos);
-            let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
-                result.push(row_addr);
-            }
-        }
-        result
     }
 
     fn serialize_huffman_codes(&self) -> Vec<u8> {
@@ -1252,8 +1080,10 @@ impl FMIndex {
     }
 
     fn deserialize_c_table(data: &[u8]) -> Vec<usize> {
-        data.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as usize)
+        data.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c) as usize)
             .collect()
     }
 
@@ -1289,7 +1119,7 @@ impl FMIndex {
             }
         }
         let refs: Vec<&[u8]> = words_b.iter().map(|v| v.as_slice()).collect();
-        let schema = Arc::new(Self::block_schema());
+        let schema = BLOCK_SCHEMA.clone();
         Ok(RecordBatch::try_new(
             schema,
             vec![
@@ -1300,16 +1130,6 @@ impl FMIndex {
                 Arc::new(UInt64Array::from(bl_b)),
             ],
         )?)
-    }
-
-    fn block_schema() -> arrow_schema::Schema {
-        arrow_schema::Schema::new(vec![
-            Field::new("node_id", DataType::UInt32, false),
-            Field::new("block_id", DataType::UInt32, false),
-            Field::new("words", DataType::LargeBinary, false),
-            Field::new("prefix_rank", DataType::UInt64, false),
-            Field::new("bit_len", DataType::UInt64, false),
-        ])
     }
 }
 
@@ -1567,8 +1387,8 @@ impl LazyFMIndex {
             .unwrap();
         for i in 0..sa_batch.num_rows() {
             let raw = words_col.value(i);
-            for chunk in raw.chunks_exact(8) {
-                sa_samples.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in raw.as_chunks::<8>().0 {
+                sa_samples.push(u64::from_le_bytes(*chunk));
             }
         }
         sa_samples.truncate(sa_samples_len);
@@ -1654,8 +1474,10 @@ impl FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("missing row_ids"))?;
         let row_ids_bytes = hex_decode(row_ids_hex)?;
         let row_ids: Vec<u64> = row_ids_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let doc_starts_hex = md
@@ -1663,8 +1485,10 @@ impl FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("missing doc_start_positions"))?;
         let doc_starts_bytes = hex_decode(doc_starts_hex)?;
         let doc_start_positions: Vec<u64> = doc_starts_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let fm = Box::pin(LazyFMIndex::from_reader(
@@ -1701,7 +1525,7 @@ impl FMIndexScalarIndex {
         }
         pfiles.sort_by_key(|(id, _)| *id);
         let io_parallelism = store.io_parallelism().max(1);
-        let mut parts = futures::stream::iter(pfiles.into_iter())
+        let mut parts = futures::stream::iter(pfiles)
             .map(|(id, name)| {
                 let store = Arc::clone(&store);
                 async move {
@@ -1826,6 +1650,11 @@ impl ScalarIndex for FMIndexScalarIndex {
             )),
         }
     }
+
+    fn results_are_row_addresses(&self) -> bool {
+        true
+    }
+
     fn can_remap(&self) -> bool {
         false
     }
@@ -2285,7 +2114,7 @@ async fn write_fmindex(
     filename: &str,
     partition_fingerprint: Option<&str>,
 ) -> Result<IndexFile> {
-    let schema = Arc::new(FMIndex::block_schema());
+    let schema = BLOCK_SCHEMA.clone();
 
     let mut writer = store.new_index_file(filename, schema.clone()).await?;
 
@@ -2492,6 +2321,8 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             false,
             // supports_regex: regex acceleration is only implemented for ngram.
             false,
+            // min_contains_chars: the FM-index can match a needle of any length.
+            0,
         )))
     }
     async fn load_index(
@@ -2617,107 +2448,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fmindex_build_and_search() {
-        let texts: Vec<(u64, &[u8])> = vec![
-            (0, b"hello world"),
-            (1, b"hello rust"),
-            (2, b"goodbye world"),
-        ];
-        let fm = FMIndex::build(&texts).unwrap();
-
-        let r = fm.search(b"hello");
-        assert!(r.contains(0));
-        assert!(r.contains(1));
-        assert!(!r.contains(2));
-
-        let r = fm.search(b"world");
-        assert!(r.contains(0));
-        assert!(!r.contains(1));
-        assert!(r.contains(2));
-
-        let r = fm.search(b"goodbye");
-        assert!(!r.contains(0));
-        assert!(!r.contains(1));
-        assert!(r.contains(2));
-
-        assert!(fm.search(b"xyz").is_empty());
-    }
-
-    #[test]
-    fn test_fmindex_empty() {
-        let fm = FMIndex::build(&[]).unwrap();
-        assert!(fm.search(b"anything").is_empty());
-    }
-
-    #[test]
-    fn test_fmindex_single_char_search() {
-        let texts: Vec<(u64, &[u8])> = vec![(0, b"abc"), (1, b"def")];
-        let fm = FMIndex::build(&texts).unwrap();
-        assert!(fm.search(b"a").contains(0));
-        assert!(!fm.search(b"a").contains(1));
-        assert!(!fm.search(b"d").contains(0));
-        assert!(fm.search(b"d").contains(1));
-    }
-
-    #[test]
-    fn test_fmindex_repeated_pattern() {
-        let texts: Vec<(u64, &[u8])> = vec![(0, b"ababab"), (1, b"cdcd")];
-        let fm = FMIndex::build(&texts).unwrap();
-        assert!(fm.search(b"ab").contains(0));
-        assert!(!fm.search(b"ab").contains(1));
-        assert!(!fm.search(b"cd").contains(0));
-        assert!(fm.search(b"cd").contains(1));
-    }
-
-    #[test]
-    fn test_early_exit_all_docs_match() {
-        let texts: Vec<(u64, &[u8])> = vec![(0, b"the cat"), (1, b"the dog"), (2, b"the bird")];
-        let fm = FMIndex::build(&texts).unwrap();
-        assert_eq!(fm.search(b"the").len(), 3);
-    }
-
-    #[test]
-    fn test_locate_correctness() {
-        let texts: Vec<(u64, &[u8])> = vec![
-            (0, b"the quick brown fox jumps over the lazy dog"),
-            (1, b"pack my box with five dozen liquor jugs"),
-            (2, b"how vexingly quick daft zebras jump"),
-        ];
-        let fm = FMIndex::build(&texts).unwrap();
-
-        let r = fm.search(b"quick");
-        assert!(r.contains(0));
-        assert!(!r.contains(1));
-        assert!(r.contains(2));
-
-        let r = fm.search(b"the");
-        assert!(r.contains(0));
-        assert!(!r.contains(1));
-        assert!(!r.contains(2));
-
-        let r = fm.search(b"jump");
-        assert!(r.contains(0));
-        assert!(r.contains(2));
-    }
-
-    #[test]
-    fn test_many_documents() {
-        let docs: Vec<Vec<u8>> = (0..100)
-            .map(|i| format!("document number {} with hello world data xyz", i).into_bytes())
-            .collect();
-        let texts: Vec<(u64, &[u8])> = docs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (i as u64, d.as_slice()))
-            .collect();
-        let fm = FMIndex::build(&texts).unwrap();
-
-        assert_eq!(fm.search(b"hello world").len(), 100);
-        assert_eq!(fm.search(b"document number 42").len(), 1);
-        assert_eq!(fm.search(b"nonexistent").len(), 0);
-    }
-
-    #[test]
     fn test_index_size_ratio() {
         let docs: Vec<Vec<u8>> = (0..200)
             .map(|i| {
@@ -2745,42 +2475,6 @@ mod tests {
             ratio < 1.5,
             "index should be much smaller than text, got ratio={ratio:.2}"
         );
-    }
-
-    #[test]
-    fn test_wavelet_access_consistency() {
-        let docs: Vec<Vec<u8>> = (0..50)
-            .map(|i| format!("document {i} hello world test").into_bytes())
-            .collect();
-        let texts: Vec<(u64, &[u8])> = docs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (i as u64, d.as_slice()))
-            .collect();
-
-        let mut concat = Vec::new();
-        for (_, text) in &texts {
-            concat.extend_from_slice(text);
-            concat.push(SENTINEL_BYTE);
-        }
-        concat.push(0x00);
-        let sa = build_suffix_array(&concat);
-        let n = concat.len();
-        let bwt: Vec<u8> = sa
-            .iter()
-            .map(|&pos| {
-                if pos == 0 {
-                    concat[n - 1]
-                } else {
-                    concat[pos - 1]
-                }
-            })
-            .collect();
-        let wavelet = HuffmanWaveletTree::build(&bwt);
-
-        for (i, &expected) in bwt.iter().enumerate().take(n.min(500)) {
-            assert_eq!(wavelet.access(i), expected, "access mismatch at {i}");
-        }
     }
 
     #[test]
@@ -2828,43 +2522,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sentinel_sanitization() {
-        // Text containing \xFF should be sanitized to space during training.
-        let texts: Vec<(u64, &[u8])> = vec![(0, b"hello\xFFworld")];
-        let fm = FMIndex::build(&texts).unwrap();
-        // Build itself does not sanitize, but search should still work.
-        let r = fm.search(b"hello");
-        assert!(r.contains(0));
-    }
-
-    #[test]
-    fn test_wavelet_rank_pair_consistency() {
-        let docs: Vec<Vec<u8>> = (0..30)
-            .map(|i| format!("doc {i} with repeated words hello world test data").into_bytes())
-            .collect();
-        let texts: Vec<(u64, &[u8])> = docs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (i as u64, d.as_slice()))
-            .collect();
-        let fm = FMIndex::build(&texts).unwrap();
-
-        let n = fm.wavelet.len;
-        for b in [b'a', b'e', b' ', SENTINEL_BYTE] {
-            for &(lo, hi) in &[(0usize, 1usize), (0, n), (n / 4, n / 2)] {
-                if lo >= n || hi > n || lo >= hi {
-                    continue;
-                }
-                let (pl, ph) = fm.wavelet.rank_pair(b, lo, hi);
-                let rl = fm.wavelet.rank(b, lo);
-                let rh = fm.wavelet.rank(b, hi);
-                assert_eq!(pl, rl, "rank_pair lo mismatch for b={b} [{lo},{hi})");
-                assert_eq!(ph, rh, "rank_pair hi mismatch for b={b} [{lo},{hi})");
-            }
-        }
-    }
-
-    #[test]
     fn test_large_sa_sampling() {
         // Test with enough documents to have multiple SA sample points
         let docs: Vec<Vec<u8>> = (0..50)
@@ -2884,9 +2541,6 @@ mod tests {
         let fm = FMIndex::build(&texts).unwrap();
 
         assert!(fm.sa_samples.len() > 1, "should have multiple SA samples");
-        assert_eq!(fm.search(b"document number 25").len(), 1);
-        assert_eq!(fm.search(b"document number").len(), 50);
-        assert_eq!(fm.search(b"nonexistent pattern").len(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

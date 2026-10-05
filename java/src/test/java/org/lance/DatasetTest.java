@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.compaction.CompactionOptions;
+import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
@@ -80,6 +81,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -120,14 +122,42 @@ public class DatasetTest {
   }
 
   @Test
+  void testWriteRejectsNegativeDataCacheBytes(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("negative_data_cache_bytes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      WriteParams params =
+          new WriteParams.Builder()
+              .withFileWriteOptions(FileWriteOptions.builder().dataCacheBytes(-1).build())
+              .build();
+
+      assertThrows(
+          IllegalArgumentException.class, () -> testDataset.createDatasetWithWriteParams(params));
+    }
+  }
+
+  @Test
+  void testWriteDatasetBuilderRejectsNullFileWriteOptions() {
+    NullPointerException error =
+        assertThrows(
+            NullPointerException.class, () -> new WriteDatasetBuilder().fileWriteOptions(null));
+
+    assertEquals("fileWriteOptions must not be null", error.getMessage());
+  }
+
+  @Test
   void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      // Test default version (V2_1)
+      // Test default version (V2_2)
       String defaultPath = tempDir.resolve("default_version").toString();
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_2, dataset.getLanceFileFormatVersion());
+        WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertFalse(writerVersion.getVersion().isEmpty());
       }
 
       // Test LEGACY version
@@ -142,6 +172,67 @@ public class DatasetTest {
               .execute()) {
         assertEquals(
             LanceConstants.FILE_FORMAT_VERSION_0_1, legacyDataset.getLanceFileFormatVersion());
+      }
+
+      // This dataset was written before writer_version was added to the manifest.
+      String historicalPath =
+          Path.of("..", "test_data", "v0.7.5", "with_deletions")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset historicalDataset = Dataset.open(historicalPath, allocator)) {
+        assertTrue(historicalDataset.getWriterVersion().isEmpty());
+      }
+
+      // This fixture was written by lance 2.0.0-beta.1. Reading it through Dataset verifies
+      // that the manifest's prerelease qualifier survives the Rust-to-Java JNI mapping.
+      String prereleasePath =
+          Path.of("..", "test_data", "pre_file_sizes", "index_without_file_sizes")
+              .toAbsolutePath()
+              .normalize()
+              .toString();
+      try (Dataset prereleaseDataset = Dataset.open(prereleasePath, allocator)) {
+        WriterVersion writerVersion =
+            prereleaseDataset.getWriterVersion().orElseThrow(AssertionError::new);
+        assertEquals("lance", writerVersion.getLibrary());
+        assertEquals("2.0.0", writerVersion.getVersion());
+        assertEquals("beta.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+        assertTrue(writerVersion.getBuildMetadata().isEmpty());
+      }
+    }
+  }
+
+  @Test
+  void testWriterVersionPreservesOpaqueAndOptionalFields() {
+    WriterVersion writerVersion =
+        new WriterVersion("custom-writer", "release-2026", "preview.1", "build.42");
+
+    assertEquals("custom-writer", writerVersion.getLibrary());
+    assertEquals("release-2026", writerVersion.getVersion());
+    assertEquals("preview.1", writerVersion.getPrerelease().orElseThrow(AssertionError::new));
+    assertEquals("build.42", writerVersion.getBuildMetadata().orElseThrow(AssertionError::new));
+  }
+
+  @Test
+  void testListManifestLocations(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("manifest_locations").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 1).close();
+
+      List<ManifestLocation> manifests = Dataset.listManifestLocations(datasetPath);
+      assertEquals(2, manifests.size());
+      assertEquals(
+          Set.of(1L, 2L),
+          manifests.stream().map(ManifestLocation::getVersion).collect(Collectors.toSet()));
+      for (ManifestLocation manifest : manifests) {
+        assertTrue(manifest.getPath().contains("manifest_locations/_versions/"));
+        assertFalse(manifest.getPath().startsWith("_versions/"));
+        assertTrue(manifest.getPath().endsWith(".manifest"));
+        assertTrue(manifest.getSizeBytes() > 0);
+        assertNotNull(manifest.getNamingScheme());
       }
     }
   }
@@ -240,6 +331,9 @@ public class DatasetTest {
 
             List<Version> versions = dataset.listVersions();
             assertEquals(3, versions.size());
+            assertEquals(3, dataset.getVersionCount());
+            assertEquals(3, dataset2.getVersionCount());
+            assertEquals(3, dataset3.getVersionCount());
             assertEquals(1, versions.get(0).getId());
             assertEquals(2, versions.get(1).getId());
             assertEquals(3, versions.get(2).getId());
@@ -660,6 +754,40 @@ public class DatasetTest {
   }
 
   @Test
+  void testAlterColumnsCastType(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Widen "id" from Int32 to Int64. The cast target type is a parameterized ArrowType, which
+      // must survive the trip to the native side; regression test for a dropped cast that left the
+      // stored type unchanged.
+      ColumnAlteration widenId =
+          new ColumnAlteration.Builder("id").castTo(new ArrowType.Int(64, true)).build();
+      dataset.alterColumns(Collections.singletonList(widenId));
+
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id").getType());
+
+      // A cast combined with rename must apply both.
+      ColumnAlteration renameAndWiden =
+          new ColumnAlteration.Builder("id")
+              .rename("id_long")
+              .castTo(new ArrowType.Int(64, true))
+              .build();
+      dataset.alterColumns(Collections.singletonList(renameAndWiden));
+
+      List<String> fieldNames =
+          dataset.getSchema().getFields().stream().map(Field::getName).collect(Collectors.toList());
+      assertFalse(fieldNames.contains("id"));
+      assertTrue(fieldNames.contains("id_long"));
+      assertEquals(new ArrowType.Int(64, true), dataset.getSchema().findField("id_long").getType());
+    }
+  }
+
+  @Test
   void testAddColumnBySqlExpressions(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -880,6 +1008,23 @@ public class DatasetTest {
   }
 
   @Test
+  void testDropRejectsNonDatasetPath(@TempDir Path tempDir) {
+    Path warehouse = tempDir.resolve("warehouse");
+    Path tablePath = warehouse.resolve("table.lance");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tablePath.toString());
+      dataset = testDataset.createEmptyDataset();
+
+      // Pointing at the parent of a dataset must not wipe out the whole warehouse.
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> Dataset.drop(warehouse.toString(), new HashMap<>()));
+      assertTrue(Files.exists(tablePath));
+    }
+  }
+
+  @Test
   void testTake(@TempDir Path tempDir) throws IOException, ClosedChannelException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -1030,7 +1175,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(108, dataset2.calculateDataSize());
+        assertEquals(112, dataset2.calculateDataSize());
       }
     }
   }
@@ -1944,6 +2089,69 @@ public class DatasetTest {
                     assertEquals(2, branch2V4New.version());
                     assertEquals(5, branch2V4New.countRows()); // A(5)
                   }
+
+                  // Step 8. open the dataset directly at a reference
+                  mainV2.tags().create("main_tag", Ref.ofMain(2));
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofBranch("branch1"))) {
+                    assertEquals(3, opened.version());
+                    assertEquals(8, opened.countRows()); // A(5) + B(3)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  try (Dataset opened =
+                      openAt(allocator, datasetPath, Ref.ofBranch("branch1", 2))) {
+                    assertEquals(2, opened.version());
+                    assertEquals(5, opened.countRows()); // A(5)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  // main has no version 3, only branch1 does.
+                  try (Dataset opened =
+                      openAt(allocator, datasetPath, Ref.ofBranch("branch1", 3))) {
+                    assertEquals(3, opened.version());
+                    assertEquals(8, opened.countRows()); // A(5) + B(3)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofMain(1))) {
+                    assertEquals(1, opened.version());
+                    assertEquals(0, opened.countRows());
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofMain())) {
+                    assertEquals(2, opened.version());
+                    assertEquals(5, opened.countRows()); // A(5)
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofBranch("main", 1))) {
+                    assertEquals(1, opened.version());
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofTag("main_tag"))) {
+                    assertEquals(2, opened.version());
+                    assertEquals(5, opened.countRows()); // A(5)
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  // "tag" points at branch1:3, so it opens branch1, not version 3 of main.
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofTag("tag"))) {
+                    assertEquals(3, opened.version());
+                    assertEquals(8, opened.countRows()); // A(5) + B(3)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  IOException missing =
+                      assertThrows(
+                          IOException.class,
+                          () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
+                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  RuntimeException missingTag =
+                      assertThrows(
+                          RuntimeException.class,
+                          () -> openAt(allocator, datasetPath, Ref.ofTag("no_such_tag")));
+                  assertTrue(
+                      missingTag.getMessage().contains("no_such_tag"), missingTag.getMessage());
+                  IllegalArgumentException missingVersion =
+                      assertThrows(
+                          IllegalArgumentException.class,
+                          () -> openAt(allocator, datasetPath, Ref.ofBranch("branch1", 99)));
+                  assertTrue(
+                      missingVersion.getMessage().contains("branch1"), missingVersion.getMessage());
                 }
               }
             }
@@ -1951,6 +2159,25 @@ public class DatasetTest {
         }
       }
     }
+  }
+
+  private static Dataset openAt(BufferAllocator allocator, String path, Ref ref) {
+    return Dataset.open(allocator, path, new ReadOptions.Builder().setRef(ref).build());
+  }
+
+  @Test
+  void testReadOptionsRejectsConflictingRef() {
+    ReadOptions.Builder withVersion =
+        new ReadOptions.Builder().setVersion(1).setRef(Ref.ofBranch("branch1"));
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class, withVersion::build);
+    assertTrue(e.getMessage().contains("both version (1) and ref"), e.getMessage());
+
+    ReadOptions.Builder withManifest =
+        new ReadOptions.Builder()
+            .setSerializedManifest(ByteBuffer.allocateDirect(1))
+            .setRef(Ref.ofBranch("branch1"));
+    e = assertThrows(IllegalArgumentException.class, withManifest::build);
+    assertTrue(e.getMessage().contains("serialized manifest and ref"), e.getMessage());
   }
 
   @Test
@@ -2027,6 +2254,16 @@ public class DatasetTest {
   }
 
   @Test
+  void testTakeNullBlobPreservesSelection(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testTakeNullBlobPreservesSelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(15L), "blobs");
+      assertEquals(1, blobs.size());
+      assertNull(blobs.get(0));
+    }
+  }
+
+  @Test
   void testReadLargeBlobAndRanges(@TempDir Path tempDir) throws Exception {
     String base = tempDir.resolve("testReadLargeBlobAndRanges").toString();
     try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
@@ -2072,6 +2309,69 @@ public class DatasetTest {
       byte[] allData = blobFile.read();
       assertArrayEquals(allData, combined);
       blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadUpToFillsAcrossReadAheadBoundary(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadUpToFillsAcrossReadAheadBoundary").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 16L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(4);
+      assertEquals(4, first.length);
+      byte[] second = blobFile.readUpTo(20);
+      assertEquals(20, second.length);
+      assertEquals(24L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 4), first);
+      assertArrayEquals(Arrays.copyOfRange(all, 4, 24), second);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testSetReadBufferSizeZeroStillReadsPayload(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeZeroStillReadsPayload").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 0L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(64);
+      byte[] rest = blobFile.read();
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      byte[] combined = new byte[first.length + rest.length];
+      System.arraycopy(first, 0, combined, 0, first.length);
+      System.arraycopy(rest, 0, combined, first.length, rest.length);
+      assertArrayEquals(all, combined);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testTakeBlobsRejectsNegativeBufferSizeForEmptySelection(@TempDir Path tempDir)
+      throws Exception {
+    String base =
+        tempDir.resolve("testTakeBlobsRejectsNegativeBufferSizeForEmptySelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobsByIndices(Collections.emptyList(), "blobs", -1L));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobs(Collections.emptyList(), "blobs", -1L));
+    }
+  }
+
+  @Test
+  void testSetReadBufferSizeFailureClosesOpenedHandles(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeFailureClosesOpenedHandles").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Arrays.asList(0L, 1L), "blobs");
+      blobs.get(1).close();
+      assertThrows(RuntimeException.class, () -> Dataset.setBlobReadBufferSize(blobs, 1024L));
+      assertThrows(RuntimeException.class, () -> blobs.get(0).readUpTo(1));
     }
   }
 
@@ -2142,6 +2442,17 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertEquals(
+            Collections.emptyList(),
+            desc.getSegments().get(0).coveringFields(),
+            "no covering columns are declared yet");
+        assertTrue(
+            desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
+            "segment size should be positive");
+        assertEquals(
+            desc.getSegments().get(0).getSizeBytes(),
+            desc.getTotalSizeBytes(),
+            "single-segment size should equal the logical index size");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
@@ -2154,6 +2465,8 @@ public class DatasetTest {
               indexDesc.getSegments(),
               "segments alias should match metadata");
           assertNotNull(indexDesc.getDetailsJson(), "Details JSON should not be null");
+          assertTrue(
+              indexDesc.getTotalSizeBytes().orElse(0L) > 0, "total index size should be positive");
         }
       }
     }

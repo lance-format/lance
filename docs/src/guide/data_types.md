@@ -408,7 +408,7 @@ This maps to Lance's `FixedSizeList(Float32, 384)` type, which is optimized for:
 
 3. **Align dimensions for SIMD**: Vector dimensions divisible by 8 enable optimal SIMD acceleration. Common dimensions: 128, 256, 384, 512, 768, 1024, 1536.
 
-4. **Create indexes for large datasets**: For datasets with more than ~10,000 vectors, create an ANN index for fast search:
+4. **Create indices for large datasets**: For datasets with more than ~10,000 vectors, create an ANN index for fast search:
 
     ```python
     # IVF_PQ is recommended for most use cases

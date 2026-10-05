@@ -2,7 +2,8 @@
 language: en-US
 early_access: false
 reviews:
-  profile: assertive
+  profile: quiet
+  high_level_summary: false
   poem: false
   review_status: true
   auto_review:

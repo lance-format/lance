@@ -10,7 +10,7 @@ use arrow_array::{
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
 };
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use rstest::rstest;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -317,13 +317,12 @@ async fn prepare_initial_dataset_with_struct_col(
     assert_eq!(dataset.schema().fields.len(), 1);
 
     // add conflict sub-column
-    let res = dataset
-        .add_columns(
-            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))),
-            None,
-            None,
-        )
-        .await;
+    let res = Box::pin(dataset.add_columns(
+        NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))),
+        None,
+        None,
+    ))
+    .await;
     assert!(res.is_err());
 
     dataset

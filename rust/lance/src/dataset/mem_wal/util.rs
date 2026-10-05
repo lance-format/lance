@@ -3,6 +3,7 @@
 
 //! Utility functions for MemWAL operations.
 
+use lance_io::object_store::ObjectStoreParams;
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -91,7 +92,8 @@ impl<T: Clone + std::fmt::Debug> WatchableOnceCellReader<T> {
 /// optimizing S3 throughput by spreading sequential writes across internal partitions.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// # use lance::dataset::mem_wal::util::bit_reverse_u64;
 /// // 5 in binary: 000...101
 /// // Reversed:    101...000
 /// assert_eq!(bit_reverse_u64(5), 0xa000000000000000);
@@ -129,6 +131,26 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
     Some(bit_reverse_u64(reversed))
 }
 
+/// Adapt the store params a base dataset was opened with for use on a URI
+/// *derived* from it (an SSTable under `_mem_wal/`).
+///
+/// The deprecated `object_store` binding pins a store to one location: given
+/// `Some((store, url))`, both `ObjectStore::from_uri_and_params` and
+/// `DatasetBuilder::build_object_store` take the path from `url` and ignore the
+/// URI they were asked to open. Carried onto a generation URI it would silently
+/// redirect the open — and, on the flush path, the write — at the base table
+/// itself. Drop it so the generation URI resolves its own store; everything
+/// else (storage options, wrapper, credentials, block size) still carries over.
+///
+/// Only the base's *own* URI may reuse the params verbatim.
+pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStoreParams {
+    #[allow(deprecated)]
+    ObjectStoreParams {
+        object_store: None,
+        ..params.clone()
+    }
+}
+
 /// Path to the MemWAL root directory.
 ///
 /// Returns: `{base_path}/_mem_wal/`
@@ -157,29 +179,24 @@ pub fn shard_manifest_path(base_path: &Path, shard_id: &Uuid) -> Path {
     shard_base_path(base_path, shard_id).join("manifest")
 }
 
-/// Path to a flushed MemTable directory.
+/// Path to an SSTable directory.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/{random_hash}_gen_{generation}/`
-pub fn flushed_memtable_path(
-    base_path: &Path,
-    shard_id: &Uuid,
-    random_hash: &str,
-    generation: u64,
-) -> Path {
+pub fn sstable_path(base_path: &Path, shard_id: &Uuid, random_hash: &str, generation: u64) -> Path {
     shard_base_path(base_path, shard_id).join(format!("{}_gen_{}", random_hash, generation))
 }
 
-/// Subdirectory of a flushed generation holding its standalone primary-key
+/// Subdirectory of an SSTable holding its standalone primary-key
 /// dedup index (a sidecar BTree, not registered in the manifest). Both the
 /// flush writer and the block-list probe join this onto the generation path.
 pub const PK_INDEX_DIR: &str = "_pk_index";
 
-/// Path to a flushed generation's standalone primary-key dedup index.
+/// Path to an SSTable's standalone primary-key dedup index.
 pub fn pk_index_path(gen_path: &Path) -> Path {
     gen_path.clone().join(PK_INDEX_DIR)
 }
 
-/// Generate an 8-character random hex string for flushed MemTable directories.
+/// Generate an 8-character random hex string for SSTable directories.
 pub fn generate_random_hash() -> String {
     let bytes: [u8; 4] = rand::random();
     format!(
@@ -288,7 +305,7 @@ mod tests {
         );
 
         assert_eq!(
-            flushed_memtable_path(&base_path, &shard_id, "a1b2c3d4", 5).as_ref(),
+            sstable_path(&base_path, &shard_id, "a1b2c3d4", 5).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/a1b2c3d4_gen_5"
         );
 
@@ -371,5 +388,41 @@ mod tests {
         let handle = tokio::spawn(async move { reader.await_value().await });
         drop(cell);
         assert_eq!(handle.await.unwrap(), None);
+    }
+
+    /// The path-bound store binding is the only thing dropped — credentials and
+    /// storage options must still reach the generation's store.
+    #[test]
+    fn test_derived_store_params_drops_only_the_path_bound_store() {
+        let accessor = lance_io::object_store::StorageOptionsAccessor::with_static_options(
+            std::collections::HashMap::from([("access_key_id".to_string(), "key".to_string())]),
+        );
+        #[allow(deprecated)]
+        let params = ObjectStoreParams {
+            object_store: Some((
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+                url::Url::parse("memory:///base").unwrap(),
+            )),
+            block_size: Some(1234),
+            storage_options_accessor: Some(std::sync::Arc::new(accessor)),
+            ..Default::default()
+        };
+
+        let derived = derived_store_params(&params);
+
+        #[allow(deprecated)]
+        {
+            assert!(
+                derived.object_store.is_none(),
+                "a store pinned to the base path must not be reused for a generation URI"
+            );
+        }
+        assert_eq!(derived.block_size, Some(1234));
+        assert_eq!(
+            derived
+                .storage_options()
+                .and_then(|o| o.get("access_key_id")),
+            Some(&"key".to_string()),
+        );
     }
 }

@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+
+{% block container %}
+  <main class="ld-home">
+    <section class="ld-hero">
+      <div class="ld-kicker"><span>Lance format</span> · <span>Open source</span> · <span>Apache-2.0</span> · <a href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">VLDB '25 paper ↗</a></div>
+      <h1>The open lakehouse format for multimodal AI.</h1>
+      <p class="ld-hero__lead">A file format, table format, and catalog spec for building a complete lakehouse on object storage — powering vector and full-text search, feature engineering, and model training with the fast random access and scans that AI workloads need.</p>
+      <div class="ld-hero__cta">
+        <a class="ld-btn ld-btn--primary ld-btn--lg" href="{{ 'quickstart/' | url }}">Get started</a>
+        <a class="ld-btn ld-btn--outline ld-btn--lg" href="{{ 'format/' | url }}">Read the spec</a>
+        <a class="ld-btn ld-btn--outline ld-btn--lg" href="{{ 'examples/python/llm_training/' | url }}">Train an LLM</a>
+        <a class="ld-btn ld-btn--text ld-btn--lg" href="https://discord.gg/lance" target="_blank" rel="noopener">Join Discord →</a>
+      </div>
+    </section>
+
+    <section class="ld-band">
+      <div class="ld-stats">
+        <div class="ld-stat">
+          <div class="ld-stat__value">100×</div>
+          <div class="ld-stat__label">Faster random access than Parquet</div>
+        </div>
+        <div class="ld-stat">
+          <div class="ld-stat__value">1 line</div>
+          <div class="ld-stat__label">To convert Parquet to Lance</div>
+        </div>
+        <a class="ld-stat ld-stat--link" href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">
+          <div class="ld-stat__value ld-stat__value--beam">VLDB '25</div>
+          <div class="ld-stat__label">Peer-reviewed research paper →</div>
+        </a>
+      </div>
+    </section>
+
+    <section class="ld-what">
+      <h2>What is Lance?</h2>
+      <p class="ld-what__body">Lance is a modern, open source lakehouse format for multimodal AI. It brings high-performance vector and full-text search, feature engineering, and model training to the lakehouse, powered by fast random access and scans — while keeping SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, PyTorch, Trino, DuckDB) and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino, Hive Metastore).</p>
+      <p class="ld-what__more">Learn more in the <a class="ld-inline-link" href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">research paper</a> published at VLDB 2025.</p>
+    </section>
+
+    <section class="ld-features">
+      <div class="ld-feature">
+        <div class="ld-feature__num">01</div>
+        <div class="ld-feature__body">
+          <h3>Expressive hybrid search</h3>
+          <p>Combine vector similarity, full-text search (BM25), and SQL analytics on the same dataset. All query types are accelerated by secondary indexes that are part of the Lance specification.</p>
+          <a class="ld-more" href="{{ 'quickstart/vector-search/' | url }}">Learn more →</a>
+        </div>
+        <div class="ld-feature__code">
+          <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
+          <pre><code><span class="tok-kw">import</span> lance
+
+ds = lance.dataset(<span class="tok-str">"s3://my-bucket/docs"</span>)
+
+<span class="tok-com"># Full text search</span>
+ds.to_table(<span class="tok-arg">full_text_query=</span><span class="tok-str">"machine learning"</span>)
+
+<span class="tok-com"># Hybrid search</span>
+ds.to_table(
+    <span class="tok-arg">nearest=</span>{
+        <span class="tok-str">"column"</span>: <span class="tok-str">"embedding"</span>, <span class="tok-str">"q"</span>: query_vec, <span class="tok-str">"k"</span>: <span class="tok-num">10</span>
+    },
+    <span class="tok-arg">filter=</span><span class="tok-str">"year &gt; 2020"</span>,
+)</code></pre>
+        </div>
+      </div>
+
+      <div class="ld-feature">
+        <div class="ld-feature__num">02</div>
+        <div class="ld-feature__body">
+          <h3>Lightning-fast random access</h3>
+          <p>100x faster random access than Parquet or Iceberg. An optimized file format plus row addressing and secondary indexes let you fetch individual records across files instantly — for ML serving, sampling, and interactive apps.</p>
+          <a class="ld-more" href="{{ 'guide/read_and_write/' | url }}">Learn more →</a>
+        </div>
+        <div class="ld-feature__code">
+          <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
+          <pre><code><span class="tok-kw">import</span> lance
+
+ds = lance.dataset(<span class="tok-str">"s3://my-bucket/embeddings.lance"</span>)
+
+<span class="tok-com"># Access the 2nd &amp; 51st rows</span>
+ds.take([<span class="tok-num">2</span>, <span class="tok-num">51</span>], <span class="tok-arg">columns=</span>[<span class="tok-str">"id"</span>, <span class="tok-str">"vec_gemma3"</span>])
+
+<span class="tok-com"># Take 1000 random samples</span>
+ds.sample(<span class="tok-num">1000</span>, <span class="tok-arg">columns=</span>[<span class="tok-str">"id"</span>, <span class="tok-str">"vec_llama"</span>])</code></pre>
+        </div>
+      </div>
+
+      <div class="ld-feature">
+        <div class="ld-feature__num">03</div>
+        <div class="ld-feature__body">
+          <h3>Native multimodal data</h3>
+          <p>Store images, videos, audio, text, and embeddings alongside tabular data in one format. Blob encoding handles large binary objects with lazy loading; optimized vector storage accelerates similarity search.</p>
+          <a class="ld-more" href="{{ 'guide/blob/' | url }}">Learn more →</a>
+        </div>
+        <div class="ld-feature__code">
+          <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
+          <pre><code><span class="tok-kw">import</span> lance
+<span class="tok-kw">import</span> av
+
+ds = lance.dataset(<span class="tok-str">"s3://my-bucket/videos.lance"</span>)
+
+<span class="tok-com"># Get blobs from the 2nd and 51st rows</span>
+blobs = ds.take_blobs(<span class="tok-str">"video"</span>, <span class="tok-arg">ids=</span>[<span class="tok-num">2</span>, <span class="tok-num">51</span>])
+
+<span class="tok-kw">for</span> blob <span class="tok-kw">in</span> blobs:
+    <span class="tok-kw">with</span> av.open(blob) <span class="tok-kw">as</span> container:
+        stream = container.streams.video[<span class="tok-num">0</span>]
+        container.seek(<span class="tok-arg">start_time=</span><span class="tok-num">500</span>, <span class="tok-arg">stream=</span>stream)</code></pre>
+        </div>
+      </div>
+
+      <div class="ld-feature">
+        <div class="ld-feature__num">04</div>
+        <div class="ld-feature__body">
+          <h3>Data evolution &gt; schema evolution</h3>
+          <p>Backfilling column values normally forces a full table rewrite. Lance supports efficient schema evolution with backfill — adding a column with data is just writing new Lance files to the table.</p>
+          <a class="ld-more" href="{{ 'guide/data_evolution/' | url }}">Learn more →</a>
+        </div>
+        <div class="ld-feature__code">
+          <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
+          <pre><code><span class="tok-kw">import</span> lance
+
+dataset = lance.dataset(<span class="tok-str">"my_data.lance"</span>)
+
+<span class="tok-fn">@lance.batch_udf</span>()
+<span class="tok-kw">def</span> <span class="tok-fn">add_embeddings</span>(batch):
+    vectors = model.encode(batch[<span class="tok-str">"text"</span>])
+    <span class="tok-kw">return</span> {<span class="tok-str">"embedding"</span>: vectors}
+
+dataset.add_columns(add_embeddings)</code></pre>
+        </div>
+      </div>
+
+      <div class="ld-feature">
+        <div class="ld-feature__num">05</div>
+        <div class="ld-feature__body">
+          <h3>Rich ecosystem integrations</h3>
+          <p>Works with Pandas, Polars, Ray, and PyTorch for processing and ML. Connects to Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink for SQL analytics and distributed processing.</p>
+          <a class="ld-more" href="{{ 'integrations/' | url }}">View integrations →</a>
+        </div>
+        <div class="ld-feature__img">
+          <img src="{{ 'assets/images/ecosystem-integrations.png' | url }}" alt="Lance ecosystem integrations" loading="lazy">
+        </div>
+      </div>
+    </section>
+  </main>
+{% endblock %}

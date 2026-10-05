@@ -8,24 +8,19 @@ migrate.
 
 ## 9.0.0
 
-* Newly created FTS / inverted indexes now default to format v2 instead of v1.
-  The `LANCE_FTS_FORMAT_VERSION` environment variable no longer controls the
-  format used for newly created indexes. Users who need a specific index layout
-  should pass the index creation parameter `format_version` explicitly.
+* Unless overridden, newly created FTS indexes use format v2. The code analyzer
+  and `block_size=256` require format v3, so readers must support v3 before an
+  index using either option is created. `document_granularity="list_element"`
+  also requires v3 reader capability, independently of the posting format.
 
-* This affects users who create FTS / inverted indexes and need those indexes to
-  be readable by older Lance versions, or who depend on the v1 index layout. In
-  those cases, pass `format_version=1` when creating the index. Otherwise, newly
-  created indexes will use v2 by default, and older Lance readers may not be able
-  to read them.
+* To keep new indexes readable by nodes that support at most format v1 or v2,
+  set `format_version` in the index creation parameters, or set
+  `LANCE_FTS_FORMAT_VERSION` for a rollout-wide override. Formats v1 and v2
+  require the text analyzer and `block_size=128`.
 
-  ```python
-  dataset.create_scalar_index("text", "INVERTED", format_version=1)
-  ```
-
-* Existing v1 FTS indexes remain queryable. Operations that maintain an existing
-  v1 index, including append, incremental indexing, optimize, and mem-wal
-  maintained-index flush, should continue preserving the v1 format.
+* Operations that maintain an existing FTS index, including append, incremental
+  indexing, optimize, and mem-wal maintained-index flush, preserve its format
+  version.
 
 ## 7.2.0
 

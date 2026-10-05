@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block container %}
+  <main class="ld-notfound">
+    <div class="ld-kicker">404 · Page not found</div>
+    <h1>This page doesn't exist.</h1>
+    <p>The page you're looking for may have moved.</p>
+    <div class="ld-hero__cta">
+      <a class="ld-btn ld-btn--primary ld-btn--lg" href="{{ 'index.html' | url }}">Back to home</a>
+      <a class="ld-btn ld-btn--outline ld-btn--lg" href="{{ 'quickstart/' | url }}">Getting started</a>
+    </div>
+  </main>
+{% endblock %}

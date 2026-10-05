@@ -14,9 +14,13 @@ class PqModel:
     Can be saved / loaded to checkpoint progress.
     """
 
-    def __init__(self, num_subvectors: int, codebook: pa.FixedSizeListArray):
+    def __init__(
+        self, num_subvectors: int, codebook: pa.FixedSizeListArray, *, num_bits: int = 8
+    ):
         self.num_subvectors = num_subvectors
         """The number of subvectors to divide source vectors into"""
+        self.num_bits = num_bits
+        """The number of bits used to encode each PQ centroid"""
         self.codebook = codebook
         """The centroids of the PQ clusters"""
 
@@ -42,7 +46,10 @@ class PqModel:
             uri,
             pa.schema(
                 [pa.field("codebook", self.codebook.type)],
-                metadata={b"num_subvectors": str(self.num_subvectors).encode()},
+                metadata={
+                    b"num_subvectors": str(self.num_subvectors).encode(),
+                    b"num_bits": str(self.num_bits).encode(),
+                },
             ),
             storage_options=storage_options,
         ) as writer:
@@ -65,9 +72,10 @@ class PqModel:
         """
         reader = LanceFileReader(uri, storage_options=storage_options)
         num_rows = reader.metadata().num_rows
-        metadata = reader.metadata().schema.metadata
+        metadata = reader.metadata().schema.metadata or {}
         num_subvectors = int(metadata[b"num_subvectors"].decode())
+        num_bits = int(metadata.get(b"num_bits", b"8").decode())
         codebook = (
             reader.read_all(batch_size=num_rows).to_table().column("codebook").chunk(0)
         )
-        return cls(num_subvectors, codebook)
+        return cls(num_subvectors, codebook, num_bits=num_bits)

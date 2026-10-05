@@ -24,6 +24,18 @@ use super::{
     redact_credential,
 };
 
+/// Render an error together with its full `source()` chain.
+fn full_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// Configuration for AWS credential vending.
 #[derive(Debug, Clone)]
 pub struct AwsCredentialVendorConfig {
@@ -60,6 +72,17 @@ pub struct AwsCredentialVendorConfig {
     /// When an API key is provided, its hash is looked up in this map.
     /// If found, the mapped permission is used instead of the default permission.
     pub api_key_hash_permissions: HashMap<String, VendedPermission>,
+
+    /// Optional path to the pod's projected service-account OIDC token file (typically the
+    /// EKS-injected `AWS_WEB_IDENTITY_TOKEN_FILE`).
+    /// This is the recommended method when running in Kubernetes.
+    /// When set, the scoped assume is performed with `AssumeRoleWithWebIdentity`
+    /// using this token instead of a role-chained `AssumeRole` from the process's
+    /// ambient credentials. A web-identity assumption is *not* role chaining, so
+    /// STS honors the role's `MaxSessionDuration` (up to 12h) and the returned
+    /// expiration is accurate. When `None`, the `AssumeRole` path
+    /// is used and `duration_millis` is subject to the source role duration and may be invalid
+    pub pod_web_identity_token_file: Option<String>,
 }
 
 impl AwsCredentialVendorConfig {
@@ -74,6 +97,7 @@ impl AwsCredentialVendorConfig {
             permission: VendedPermission::default(),
             api_key_salt: None,
             api_key_hash_permissions: HashMap::new(),
+            pod_web_identity_token_file: None,
         }
     }
 
@@ -98,6 +122,14 @@ impl AwsCredentialVendorConfig {
     /// Set the AWS region for the STS client.
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
+        self
+    }
+
+    /// Set the pod web-identity token file, enabling direct (non-chained)
+    /// `AssumeRoleWithWebIdentity` for the scoped assume. See
+    /// [`AwsCredentialVendorConfig::pod_web_identity_token_file`].
+    pub fn with_pod_web_identity_token_file(mut self, path: impl Into<String>) -> Self {
+        self.pod_web_identity_token_file = Some(path.into());
         self
     }
 
@@ -407,7 +439,8 @@ impl AwsCredentialVendor {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
                         "AssumeRoleWithWebIdentity failed for role '{}': {}",
-                        self.config.role_arn, e
+                        self.config.role_arn,
+                        full_error_chain(&e)
                     ),
                 })
             })?;
@@ -421,6 +454,95 @@ impl AwsCredentialVendor {
     }
 
     /// Vend credentials using AssumeRole with API key validation.
+    /// Perform the scoped assume for `(bucket, prefix, permission)`, attaching the
+    /// per-table session policy.
+    ///
+    /// When [`AwsCredentialVendorConfig::pod_web_identity_token_file`] is set this
+    /// uses `AssumeRoleWithWebIdentity` with the pod's projected SA OIDC token -- a
+    /// *direct*, non-chained assumption that honors the role's `MaxSessionDuration`
+    /// (so `expires_at_millis` is accurate). Otherwise it falls back to the legacy
+    /// role-chained `AssumeRole` from ambient credentials (STS-capped at 1h).
+    ///
+    /// `external_id` is only applied on the chained `AssumeRole` path;
+    /// `AssumeRoleWithWebIdentity` has no external-id parameter (the OIDC
+    /// `sub`/`aud` trust condition is the binding instead).
+    async fn assume_scoped(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        permission: VendedPermission,
+        session_name: &str,
+        external_id: Option<&str>,
+    ) -> Result<VendedCredentials> {
+        let policy = Self::build_policy(bucket, prefix, permission);
+        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
+
+        let credentials = if let Some(token_file) = &self.config.pod_web_identity_token_file {
+            // DIRECT (non-chained): AssumeRoleWithWebIdentity with the pod's SA
+            // OIDC token. Re-read the file every vend -- kubelet rotates it.
+            let token = tokio::fs::read_to_string(token_file).await.map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "failed to read pod web identity token '{}': {}",
+                        token_file, e
+                    ),
+                })
+            })?;
+            debug!(
+                "AWS AssumeRoleWithWebIdentity (pod): role={}, session={}, permission={}",
+                self.config.role_arn, session_name, permission
+            );
+            let response = self
+                .sts_client
+                .assume_role_with_web_identity()
+                .role_arn(&self.config.role_arn)
+                .web_identity_token(token.trim())
+                .role_session_name(session_name)
+                .policy(&policy)
+                .duration_seconds(duration_secs)
+                .send()
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "AssumeRoleWithWebIdentity (pod) failed for role '{}': {}",
+                            self.config.role_arn,
+                            full_error_chain(&e)
+                        ),
+                    })
+                })?;
+            response.credentials().cloned()
+        } else {
+            // LEGACY chained path: AssumeRole from ambient credentials (1h cap).
+            debug!(
+                "AWS AssumeRole (chained): role={}, session={}, permission={}",
+                self.config.role_arn, session_name, permission
+            );
+            let mut request = self
+                .sts_client
+                .assume_role()
+                .role_arn(&self.config.role_arn)
+                .role_session_name(session_name)
+                .policy(&policy)
+                .duration_seconds(duration_secs);
+            if let Some(external_id) = external_id {
+                request = request.external_id(external_id);
+            }
+            let response = request.send().await.map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "AssumeRole failed for role '{}': {}",
+                        self.config.role_arn,
+                        full_error_chain(&e)
+                    ),
+                })
+            })?;
+            response.credentials().cloned()
+        };
+
+        self.extract_credentials(credentials.as_ref(), bucket, prefix, permission)
+    }
+
     async fn vend_with_api_key(
         &self,
         bucket: &str,
@@ -452,42 +574,19 @@ impl AwsCredentialVendor {
                 })
             })?;
 
-        let policy = Self::build_policy(bucket, prefix, permission);
+        // The api_key authorizes the client and picks the permission; the AWS
+        // assume itself goes through `assume_scoped` (pod web-identity when
+        // configured, else chained AssumeRole with the key hash as external_id).
         let session_name = Self::cap_session_name(&format!("lance-api-{}", &key_hash[..16]));
-        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
-
-        debug!(
-            "AWS AssumeRole with API key: role={}, session={}, permission={}",
-            self.config.role_arn, session_name, permission
-        );
-
-        let request = self
-            .sts_client
-            .assume_role()
-            .role_arn(&self.config.role_arn)
-            .role_session_name(&session_name)
-            .policy(&policy)
-            .duration_seconds(duration_secs)
-            .external_id(&key_hash); // Use hash as external_id
-
-        let response = request.send().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!(
-                    "AssumeRole with API key failed for role '{}': {}",
-                    self.config.role_arn, e
-                ),
-            })
-        })?;
-
-        self.extract_credentials(response.credentials(), bucket, prefix, permission)
+        self.assume_scoped(bucket, prefix, permission, &session_name, Some(&key_hash))
+            .await
     }
 
-    /// Vend credentials using AssumeRole with static configuration.
+    /// Vend credentials using the vendor's static (default) permission.
     async fn vend_with_static_config(
         &self,
         bucket: &str,
         prefix: &str,
-        policy: &str,
     ) -> Result<VendedCredentials> {
         let role_session_name = self
             .config
@@ -496,40 +595,14 @@ impl AwsCredentialVendor {
             .unwrap_or_else(|| "lance-credential-vending".to_string());
         let role_session_name = Self::cap_session_name(&role_session_name);
 
-        let duration_secs = self.config.duration_millis.div_ceil(1000).clamp(900, 43200) as i32;
-
-        debug!(
-            "AWS AssumeRole (static): role={}, session={}, permission={}",
-            self.config.role_arn, role_session_name, self.config.permission
-        );
-
-        let mut request = self
-            .sts_client
-            .assume_role()
-            .role_arn(&self.config.role_arn)
-            .role_session_name(&role_session_name)
-            .policy(policy)
-            .duration_seconds(duration_secs);
-
-        if let Some(ref external_id) = self.config.external_id {
-            request = request.external_id(external_id);
-        }
-
-        let response = request.send().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!(
-                    "AssumeRole failed for role '{}': {}",
-                    self.config.role_arn, e
-                ),
-            })
-        })?;
-
-        self.extract_credentials(
-            response.credentials(),
+        self.assume_scoped(
             bucket,
             prefix,
             self.config.permission,
+            &role_session_name,
+            self.config.external_id.as_deref(),
         )
+        .await
     }
 }
 
@@ -575,10 +648,8 @@ impl CredentialVendor for AwsCredentialVendor {
                 .into())
             }
             None => {
-                // Use AssumeRole with static configuration
-                let policy = Self::build_policy(&bucket, &prefix, self.config.permission);
-                self.vend_with_static_config(&bucket, &prefix, &policy)
-                    .await
+                // Use the vendor's static (default) permission
+                self.vend_with_static_config(&bucket, &prefix).await
             }
         }
     }
@@ -743,6 +814,41 @@ mod tests {
         assert_eq!(config.duration_millis, 7200000);
         assert_eq!(config.role_session_name, Some("my-session".to_string()));
         assert_eq!(config.region, Some("us-west-2".to_string()));
+        // Defaults to the legacy chained AssumeRole path.
+        assert_eq!(config.pod_web_identity_token_file, None);
+
+        let pod_config = AwsCredentialVendorConfig::new("arn:aws:iam::123456789012:role/MyRole")
+            .with_pod_web_identity_token_file("/var/run/secrets/.../token");
+        assert_eq!(
+            pod_config.pod_web_identity_token_file,
+            Some("/var/run/secrets/.../token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pod_web_identity_path_reads_token_file() {
+        // When pod_web_identity_token_file is set, the scoped assume takes the
+        // AssumeRoleWithWebIdentity branch and reads the token file first. Point
+        // it at a missing file so we deterministically hit the read error without
+        // needing a live STS -- this proves the branch selection + file read.
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-2"))
+            .build();
+        let sts_client = StsClient::new(&sdk_config);
+        let config = AwsCredentialVendorConfig::new("arn:aws:iam::123456789012:role/MyRole")
+            .with_pod_web_identity_token_file("/nonexistent/pod/web-identity-token");
+        let vendor = AwsCredentialVendor::with_sts_client(config, sts_client);
+
+        let err = vendor
+            .vend_credentials("s3://bucket/prefix", None)
+            .await
+            .expect_err("missing token file must fail before any STS call");
+        assert!(
+            err.to_string()
+                .contains("failed to read pod web identity token"),
+            "unexpected error: {err}"
+        );
     }
 
     // ============================================================================

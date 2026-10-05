@@ -15,6 +15,8 @@
 
 use std::sync::OnceLock;
 
+use super::assert_equal_lengths;
+
 /// Intermediate results from the fused u8 cosine kernel: (dot_ab, norm_a², norm_b²).
 ///
 /// Separated from the final normalization so SIMD backends can be tested
@@ -29,7 +31,7 @@ pub struct CosineAccumulators {
 /// Portable scalar fused cosine accumulation.
 #[inline]
 pub fn cosine_u8_accum_scalar(a: &[u8], b: &[u8]) -> CosineAccumulators {
-    debug_assert_eq!(a.len(), b.len());
+    assert_equal_lengths(a.len(), b.len());
     let (mut dot_ab, mut norm_a_sq, mut norm_b_sq) = (0u32, 0u32, 0u32);
     for (&x, &y) in a.iter().zip(b.iter()) {
         let (xu, yu) = (x as u32, y as u32);
@@ -199,6 +201,10 @@ fn select_backend() -> CosineU8AccumFn {
         if is_x86_feature_detected!("avx2") {
             return |a, b| unsafe { x86::cosine_u8_accum_avx2(a, b) };
         }
+        // AvxFma and Avx hosts (AMD Piledriver / Steamroller, Intel Sandy
+        // Bridge / Ivy Bridge) fall through to scalar: the AVX2 inner uses
+        // `vpmaddubsw` / `vpmaddwd` integer ops which neither AVX nor
+        // AVX+FMA provides.
     }
 
     cosine_u8_accum_scalar
@@ -207,6 +213,7 @@ fn select_backend() -> CosineU8AccumFn {
 /// Dispatched fused u8 cosine accumulation.
 #[inline]
 fn cosine_u8_accum(a: &[u8], b: &[u8]) -> CosineAccumulators {
+    assert_equal_lengths(a.len(), b.len());
     (DISPATCH.get_or_init(select_backend))(a, b)
 }
 
@@ -221,6 +228,18 @@ pub fn cosine_u8(a: &[u8], b: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::shorter_right(64, 1)]
+    #[case::longer_right(1, 64)]
+    fn rejects_mismatched_lengths(#[case] a_len: usize, #[case] b_len: usize) {
+        let a = vec![1; a_len];
+        let b = vec![1; b_len];
+
+        assert!(std::panic::catch_unwind(|| cosine_u8_accum_scalar(&a, &b)).is_err());
+        assert!(std::panic::catch_unwind(|| cosine_u8_scalar(&a, &b)).is_err());
+        assert!(std::panic::catch_unwind(|| cosine_u8(&a, &b)).is_err());
+    }
 
     fn fill_random(buf: &mut [u8], seed: &mut u32) {
         for slot in buf.iter_mut() {

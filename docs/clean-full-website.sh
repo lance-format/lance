@@ -15,6 +15,7 @@ rm -rf "$docs_src/integrations/duckdb"
 rm -rf "$docs_src/integrations/spark"
 rm -rf "$docs_src/integrations/ray"
 rm -rf "$docs_src/integrations/trino"
+rm -rf "$docs_src/integrations/context"
 rm -f "$docs_src/community/project-specific/.pages"
 rm -rf "$docs_src/community/project-specific/lance"
 rm -f "$docs_src/community/project-specific/namespace.md"
@@ -22,6 +23,7 @@ rm -f "$docs_src/community/project-specific/namespace-impls.md"
 rm -f "$docs_src/community/project-specific/ray.md"
 rm -f "$docs_src/community/project-specific/spark.md"
 rm -f "$docs_src/community/project-specific/trino.md"
+rm -f "$docs_src/community/project-specific/context.md"
 
 cat > "$docs_src/format/.pages" <<'EOF'
 nav:
@@ -37,7 +39,7 @@ cat > "$docs_src/integrations/.pages" <<'EOF'
 nav:
   - Overview: index.md
   - Apache DataFusion: datafusion.md
-  - PostgreSQL: https://github.com/lancedb/pglance
+  - PostgreSQL: https://github.com/lance-format/pglance
   - PyTorch: pytorch.md
   - TensorFlow: tensorflow.md
 EOF

@@ -10,7 +10,7 @@ use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
 use lance_linalg::distance::DistanceType;
@@ -30,7 +30,7 @@ use crate::{Error, Result};
 /// - Simple column names: "column"
 /// - Nested paths: "parent.child" or "parent.child.grandchild"
 /// - Backtick-escaped field names: "parent.`field.with.dots`"
-fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+pub(crate) fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
     // Try to get the column directly first (fast path for simple columns)
     if let Some(col) = batch.column_by_name(column) {
         return Ok(col.clone());
@@ -85,7 +85,7 @@ fn get_column_from_batch(batch: &RecordBatch, column: &str) -> Result<ArrayRef> 
     Ok(current_array)
 }
 
-async fn estimate_multivector_vectors_per_row(
+pub(crate) async fn estimate_multivector_vectors_per_row(
     dataset: &Dataset,
     column: &str,
     num_rows: usize,
@@ -265,38 +265,7 @@ fn infer_vector_element_type_impl(
 async fn count_rows(dataset: &Dataset, fragment_ids: Option<&[u32]>) -> Result<usize> {
     match fragment_ids {
         None => dataset.count_rows(None).await,
-        Some(fragment_ids) => {
-            let sorted_ids: Vec<u32>;
-            let sorted_fragment_ids = if fragment_ids.windows(2).all(|w| w[0] <= w[1]) {
-                fragment_ids
-            } else {
-                sorted_ids = {
-                    let mut v = fragment_ids.to_vec();
-                    v.sort_unstable();
-                    v
-                };
-                &sorted_ids
-            };
-            let fragments = dataset.get_frags_from_ordered_ids(sorted_fragment_ids);
-            let valid_fragments = fragments
-                .into_iter()
-                .enumerate()
-                .map(|(i, frag)| {
-                    frag.ok_or_else(|| {
-                        Error::index(format!(
-                            "Unexpectedly missing fragment {}",
-                            sorted_fragment_ids[i]
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let cnts = stream::iter(valid_fragments)
-                .map(|f| async move { f.count_rows(None).await })
-                .buffer_unordered(16)
-                .try_collect::<Vec<usize>>()
-                .await?;
-            Ok(cnts.iter().sum::<usize>())
-        }
+        Some(fragment_ids) => dataset.count_rows_in_fragments(fragment_ids).await,
     }
 }
 
@@ -310,8 +279,6 @@ pub async fn maybe_sample_training_data(
     sample_size_hint: usize,
     fragment_ids: Option<&[u32]>,
 ) -> Result<FixedSizeListArray> {
-    let num_rows = count_rows(dataset, fragment_ids).await?;
-
     let vector_field = dataset.schema().field(column).ok_or(Error::index(format!(
         "Sample training data: column {} does not exist in schema",
         column
@@ -328,6 +295,8 @@ pub async fn maybe_sample_training_data(
         );
         return Ok(new_empty_array(&fsl_type).as_fixed_size_list().clone());
     }
+
+    let num_rows = count_rows(dataset, fragment_ids).await?;
 
     let is_nullable = vector_field.nullable;
 
@@ -600,21 +569,7 @@ fn sample_training_data_scan_from_fragments(
         ));
     }
 
-    let mut ordered_ids = fragment_ids.to_vec();
-    ordered_ids.sort_unstable();
-    ordered_ids.dedup();
-    let selected_fragments = dataset
-        .get_frags_from_ordered_ids(&ordered_ids)
-        .into_iter()
-        .zip(ordered_ids.iter())
-        .map(|(fragment, fragment_id)| {
-            fragment.ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "Unknown fragment id {fragment_id} in training fragment filter"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let selected_fragments = dataset.get_fragments_from_ids(fragment_ids)?;
     let dataset = Arc::new(dataset.clone());
     let projection = Arc::new(
         ProjectionRequest::from(dataset.schema().project(&[column])?)
@@ -707,22 +662,7 @@ fn resolve_scan_fragments(
     dataset: &Dataset,
     fragment_ids: &[u32],
 ) -> Result<Vec<lance_table::format::Fragment>> {
-    let mut ordered_ids = fragment_ids.to_vec();
-    ordered_ids.sort_unstable();
-    let fragments = dataset.get_frags_from_ordered_ids(&ordered_ids);
-    if let Some(missing_id) = fragments
-        .iter()
-        .zip(ordered_ids.iter())
-        .find_map(|(fragment, fragment_id)| fragment.is_none().then_some(*fragment_id))
-    {
-        return Err(Error::invalid_input(format!(
-            "Unknown fragment id {missing_id} in training fragment filter"
-        )));
-    }
-    Ok(fragments
-        .into_iter()
-        .map(|fragment| fragment.unwrap().metadata().clone())
-        .collect())
+    dataset.get_fragment_metadata_from_ids(fragment_ids)
 }
 
 /// Build a FixedSizeListArray from raw flat value bytes.

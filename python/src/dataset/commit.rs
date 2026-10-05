@@ -23,8 +23,7 @@ use pyo3::{exceptions::PyIOError, prelude::*};
 
 static PY_CONFLICT_ERROR: LazyLock<PyResult<Py<PyAny>>> = LazyLock::new(|| {
     Python::attach(|py| {
-        py.import("lance")
-            .and_then(|lance| lance.getattr("commit"))
+        py.import("lance.commit")
             .and_then(|commit| commit.getattr("CommitConflictError"))
             .map(|err| err.unbind())
     })

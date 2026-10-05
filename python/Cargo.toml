@@ -1,10 +1,10 @@
 [package]
 name = "pylance"
-version = "9.0.0-beta.19"
+version = "13.1.0-beta.2"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
-rust-version = "1.91"
+rust-version = "1.94"
 exclude = ["python/lance/conftest.py"]
 publish = false
 
@@ -24,10 +24,11 @@ arrow-array = "58.0.0"
 arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
-object_store = "0.13.2"
-datafusion = { version = "53.0.0", default-features = false }
-datafusion-ffi = "53.0.0"
-datafusion-common = "53.0.0"
+object_store = "0.14.1"
+url = "2.5.7"
+datafusion = { version = "54.0.0", default-features = false }
+datafusion-ffi = "54.0.0"
+datafusion-common = "54.0.0"
 # Keep the Python FFI build on the working Brotli allocator resolution until
 # datafusion-ffi no longer enables datafusion-proto/default.
 # See https://github.com/lance-format/lance/issues/7271.
@@ -68,7 +69,6 @@ metrics-util = "0.19"
 prost = "0.14.1"
 prost-types = "0.14.1"
 pyo3 = { version = "0.28", features = [
-    "extension-module",
     "abi3-py310",
     "py-clone",
     "chrono",
@@ -83,11 +83,12 @@ serde_yaml = "0.9.34"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
-bytes = "1.4"
+bytes = "1.11.1"
 
 [features]
-default = []
+default = ["extension-module"]
 datagen = ["lance-datagen"]
+extension-module = ["pyo3/extension-module"]
 fp16kernels = ["lance/fp16kernels"]
 
 [profile.ci]

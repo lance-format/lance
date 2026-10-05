@@ -193,7 +193,7 @@ def maybe_sample(
         This is employed to minimize the number of random reads necessary for sampling.
         A sufficiently large value can provide an effective random sample without
         the need for excessive random reads.
-    filter : str, optional
+    filt : str, optional
         The filter to apply to the dataset, by default None.  If a filter is provided,
         then we will first load all row ids in memory and then batch through the ids
         in random order until enough matches have been found.

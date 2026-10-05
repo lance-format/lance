@@ -5,7 +5,7 @@ use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc, sync::Lazy
 
 use arrow::{
     array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
-    buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
+    buffer::{BooleanBuffer, Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
         IntervalMonthDayNano, UInt32Type,
@@ -569,7 +569,19 @@ where
         };
         self.leftover_count = ((self.leftover_count as u64 + length.0) % self.repeat as u64) as u32;
         self.leftover = values.last().copied().unwrap_or(T::default());
-        Ok(Arc::new(ArrayType::from(values)))
+        let array = ArrayType::from(values);
+        // `ArrayType::from` uses the primitive type's default metadata. For
+        // timezone-aware timestamps this drops the timezone, so restore the
+        // generator's declared type when it differs.
+        if array.data_type() == &self.data_type {
+            return Ok(Arc::new(array));
+        }
+        let data = array
+            .into_data()
+            .into_builder()
+            .data_type(self.data_type.clone())
+            .build()?;
+        Ok(make_array(data))
     }
 
     fn data_type(&self) -> &DataType {
@@ -814,9 +826,9 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         let num_bytes = length.0 * Self::byte_width()?;
-        let mut bytes = vec![0; num_bytes as usize];
-        rng.fill_bytes(&mut bytes);
-        let bytes = ScalarBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        let mut bytes = MutableBuffer::from_len_zeroed(num_bytes as usize);
+        rng.fill_bytes(bytes.as_slice_mut());
+        let bytes = ScalarBuffer::new(bytes.into(), 0, length.0 as usize);
         Ok(Arc::new(
             PrimitiveArray::<T>::new(bytes, None).with_data_type(self.data_type.clone()),
         ))
@@ -2818,14 +2830,29 @@ pub mod array {
         Box::new(RandomIntervalGenerator::new(unit))
     }
 
+    /// The default sampling range for temporal generators: the 365 days ending at
+    /// 2024-01-01T00:00:00Z (exclusive)
+    ///
+    /// The range must be a fixed anchor and not derived from the wall clock
+    /// (e.g. `Utc::now()`), otherwise the same RNG seed would generate different
+    /// values depending on when the generator was created, breaking
+    /// reproducibility (e.g. of saved fuzz inputs).  Callers that need a
+    /// time-relative range can use the `*_in_range` variants.
+    fn default_temporal_range() -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+        let end = chrono::DateTime::<Utc>::from_timestamp(1_704_067_200, 0)
+            .expect("2024-01-01T00:00:00Z is a valid timestamp");
+        let start = end - chrono::TimeDelta::try_days(365).expect("TimeDelta try_days");
+        (start, end)
+    }
+
     /// Create a generator of randomly sampled date32 values
     ///
-    /// Instead of sampling the entire range, all values will be drawn from the last year as this
-    /// is a more common use pattern
+    /// Instead of sampling the entire range, all values will be drawn from a fixed
+    /// one-year range (the 365 days ending at 2024-01-01 UTC) as this is a more
+    /// common use pattern.  Use [`rand_date32_in_range`] to control the range.
     pub fn rand_date32() -> Box<dyn ArrayGenerator> {
-        let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try days");
-        rand_date32_in_range(one_year_ago, now)
+        let (start, end) = default_temporal_range();
+        rand_date32_in_range(start, end)
     }
 
     /// Create a generator of randomly sampled date32 values in the given range
@@ -2853,12 +2880,12 @@ pub mod array {
 
     /// Create a generator of randomly sampled date64 values
     ///
-    /// Instead of sampling the entire range, all values will be drawn from the last year as this
-    /// is a more common use pattern
+    /// Instead of sampling the entire range, all values will be drawn from a fixed
+    /// one-year range (the 365 days ending at 2024-01-01 UTC) as this is a more
+    /// common use pattern.  Use [`rand_date64_in_range`] to control the range.
     pub fn rand_date64() -> Box<dyn ArrayGenerator> {
-        let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::TimeDelta::try_days(365).expect("TimeDelta try_days");
-        rand_date64_in_range(one_year_ago, now)
+        let (start, end) = default_temporal_range();
+        rand_date64_in_range(start, end)
     }
 
     /// Create a generator of randomly sampled timestamp values in the given range
@@ -2914,10 +2941,14 @@ pub mod array {
         }
     }
 
+    /// Create a generator of randomly sampled timestamp values
+    ///
+    /// Instead of sampling the entire range, all values will be drawn from a fixed
+    /// one-year range (the 365 days ending at 2024-01-01 UTC) as this is a more
+    /// common use pattern.  Use [`rand_timestamp_in_range`] to control the range.
     pub fn rand_timestamp(data_type: &DataType) -> Box<dyn ArrayGenerator> {
-        let now = chrono::Utc::now();
-        let one_year_ago = now - chrono::Duration::try_days(365).unwrap();
-        rand_timestamp_in_range(one_year_ago, now, data_type)
+        let (start, end) = default_temporal_range();
+        rand_timestamp_in_range(start, end, data_type)
     }
 
     /// Create a generator of randomly sampled date64 values
@@ -3214,10 +3245,54 @@ pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
 #[cfg(test)]
 mod tests {
 
-    use arrow::datatypes::{Float32Type, Int8Type, Int16Type, UInt32Type};
-    use arrow_array::{BooleanArray, Float32Array, Int8Array, Int16Array, Int32Array, UInt32Array};
+    use arrow::datatypes::{Float32Type, Int8Type, Int16Type, TimeUnit, UInt32Type};
+    use arrow_array::{
+        BooleanArray, Date32Array, Date64Array, Float32Array, Int8Array, Int16Array, Int32Array,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt32Array,
+    };
+    use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::float16(DataType::Float16)]
+    #[case::decimal128(DataType::Decimal128(38, 10))]
+    #[case::decimal256(DataType::Decimal256(76, 10))]
+    fn test_random_bytes_generator_alignment(#[case] data_type: DataType) {
+        for length in [0, 3] {
+            let generated = array::rand_type(&data_type)
+                .generate_default(RowCount::from(length))
+                .unwrap();
+            assert_eq!(generated.data_type(), &data_type);
+            assert_eq!(generated.len(), length as usize);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_timezone_is_preserved() {
+        let data_type = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let mut generator = array::rand_type(&data_type);
+        let generated = generator.generate_default(RowCount::from(2)).unwrap();
+        assert_eq!(generated.data_type(), &data_type);
+
+        let fields = Fields::from(vec![Field::new("timestamp", data_type, true)]);
+        let mut generator = array::rand_struct(fields.clone());
+        let generated = generator.generate_default(RowCount::from(2)).unwrap();
+        assert_eq!(generated.data_type(), &DataType::Struct(fields));
+    }
+
+    #[test]
+    fn test_fn_gen_propagates_array_data_build_error() {
+        // FnGen constructors are internal. Use an incompatible declared type to
+        // verify that ArrayDataBuilder validation failures are propagated.
+        let mut generator = FnGen::<i32, Int32Array, _>::new_unknown_size(DataType::Utf8, |_| 0, 1);
+
+        assert!(matches!(
+            generator.generate_default(RowCount::from(1)),
+            Err(ArrowError::InvalidArgumentError(_))
+        ));
+    }
 
     #[test]
     fn test_step() {
@@ -3391,6 +3466,72 @@ mod tests {
                 vec![111, 9, 80],
                 vec![86, 118, 13, 209],
                 vec![68, 33, 202]
+            ])
+        );
+    }
+
+    #[test]
+    fn test_rng_temporal_deterministic() {
+        // The default temporal generators must not depend on the wall clock: the
+        // same seed must produce the same values no matter when the generator is
+        // created (https://github.com/lance-format/lance/issues/7913).  These
+        // exact values pin both the RNG stream and the fixed default sampling
+        // range (the 365 days ending at 2024-01-01 UTC).
+        fn gen_values(mut genn: Box<dyn ArrayGenerator>) -> Arc<dyn Array> {
+            let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+            genn.generate(RowCount::from(3), &mut rng).unwrap()
+        }
+
+        assert_eq!(
+            *gen_values(array::rand_date32()),
+            Date32Array::from(vec![19655, 19474, 19717])
+        );
+        assert_eq!(
+            *gen_values(array::rand_date64()),
+            Date64Array::from(vec![
+                1_698_192_000_000,
+                1_682_553_600_000,
+                1_703_548_800_000
+            ])
+        );
+        assert_eq!(
+            *gen_values(array::rand_timestamp(&DataType::Timestamp(
+                TimeUnit::Second,
+                None
+            ))),
+            TimestampSecondArray::from(vec![1_698_211_127, 1_682_585_540, 1_703_559_286])
+        );
+        assert_eq!(
+            *gen_values(array::rand_timestamp(&DataType::Timestamp(
+                TimeUnit::Millisecond,
+                None
+            ))),
+            TimestampMillisecondArray::from(vec![
+                1_698_211_127_056,
+                1_682_585_540_319,
+                1_703_559_286_487
+            ])
+        );
+        assert_eq!(
+            *gen_values(array::rand_timestamp(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                None
+            ))),
+            TimestampMicrosecondArray::from(vec![
+                1_698_211_127_056_596,
+                1_682_585_540_319_384,
+                1_703_559_286_487_645
+            ])
+        );
+        assert_eq!(
+            *gen_values(array::rand_timestamp(&DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                None
+            ))),
+            TimestampNanosecondArray::from(vec![
+                1_698_211_127_056_596_085,
+                1_682_585_540_319_384_548,
+                1_703_559_286_487_645_287
             ])
         );
     }

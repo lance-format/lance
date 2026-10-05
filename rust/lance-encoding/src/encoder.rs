@@ -6,43 +6,71 @@
 //! Lance files are encoded using a [`FieldEncodingStrategy`] which choose
 //! what encoder to use for each field.
 //!
-//! The current strategy is the [`StructuralEncodingStrategy`] which uses "structural"
-//! encoding.  A tree of encoders is built up for each field.  The struct & list encoders
-//! simply pull off the validity and offsets and collect them.  Then, in the primitive leaf
-//! encoder the validity, offsets, and values are accumulated in an accumulation buffer.  Once
-//! enough data has been collected the primitive encoder will either use a miniblock encoding
-//! or a full zip encoding to create a page of data from the accumulation buffer.
+//! Structural strategies build a tree of encoders for each field from the
+//! version-free builders in [`structural`]. Struct and list encoders collect
+//! validity and offsets; primitive leaf encoders accumulate values and emit
+//! miniblock or full-zip pages.
 
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_core::datatypes::{Field, Schema};
-use lance_core::error::LanceOptionExt;
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
-use crate::compression_config::CompressionParams;
+use crate::data::DataBlock;
 use crate::decoder::PageEncoding;
-use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
-use crate::encodings::logical::fixed_size_list::FixedSizeListStructuralEncoder;
-use crate::encodings::logical::list::ListStructuralEncoder;
-use crate::encodings::logical::map::MapStructuralEncoder;
-use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
-use crate::encodings::logical::r#struct::StructStructuralEncoder;
 use crate::repdef::RepDefBuilder;
-use crate::version::LanceFileVersion;
 use crate::{
     decoder::{ColumnInfo, PageInfo},
     format::pb,
 };
 
+pub use crate::array_encoding::ArrayFieldEncodingStrategy;
+
+pub mod structural;
+
 /// The minimum alignment for a page buffer.  Writers must respect this.
 pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
+
+/// An array encoded with the `pb::ArrayEncoding` grammar.
+#[derive(Debug)]
+pub struct EncodedArray {
+    pub data: DataBlock,
+    pub encoding: pb::ArrayEncoding,
+}
+
+impl EncodedArray {
+    pub fn new(data: DataBlock, encoding: pb::ArrayEncoding) -> Self {
+        Self { data, encoding }
+    }
+
+    pub fn into_buffers(self) -> (Vec<LanceBuffer>, pb::ArrayEncoding) {
+        (self.data.into_buffers(), self.encoding)
+    }
+}
+
+/// Encodes one data block and describes it with `pb::ArrayEncoding`.
+pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &arrow_schema::DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray>;
+}
+
+/// Selects an `ArrayEncoder` for one page.
+pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
+    fn create_array_encoder(
+        &self,
+        arrays: &[ArrayRef],
+        field: &Field,
+    ) -> Result<Box<dyn ArrayEncoder>>;
+}
 
 /// An encoded page of data
 ///
@@ -145,6 +173,15 @@ pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 /// tensor field) the tensor field is likely to emit encoded pages much more frequently
 /// than the boolean field.
 pub trait FieldEncoder: Send {
+    /// Validate and prepare an array before any encoder state is mutated.
+    ///
+    /// Batch-oriented callers invoke this for every root field before calling
+    /// [`Self::maybe_encode`], so a later validation failure cannot leave an
+    /// earlier field encoder partially advanced.
+    fn prepare_array(&mut self, array: ArrayRef) -> Result<ArrayRef> {
+        Ok(array)
+    }
+
     /// Buffer the data and, if there is enough data in the buffer to form a page, return
     /// an encoding task to encode the data.
     ///
@@ -235,9 +272,6 @@ pub struct EncodingOptions {
     /// The encoder needs to know this so it figures the position of out-of-line
     /// buffers correctly
     pub buffer_alignment: u64,
-
-    /// The Lance file version being written
-    pub version: LanceFileVersion,
 }
 
 impl Default for EncodingOptions {
@@ -247,17 +281,7 @@ impl Default for EncodingOptions {
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: 64,
-            version: LanceFileVersion::default(),
         }
-    }
-}
-
-impl EncodingOptions {
-    /// If true (for Lance file version 2.2+), miniblock chunk sizes are u32,
-    /// to allow storing larger chunks and their sizes for better compression.
-    /// For Lance file version 2.1, miniblock chunk sizes are u16.
-    pub fn support_large_chunk(&self) -> bool {
-        self.version >= LanceFileVersion::V2_2
     }
 }
 
@@ -267,330 +291,34 @@ impl EncodingOptions {
 /// chosen before any data is generated and the same field encoder is
 /// used for all data in the field.
 pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
+    /// Validate one top-level array before any field encoder state is mutated.
+    fn validate_array(&self, _array: &dyn Array, _field: &Field) -> Result<()> {
+        Ok(())
+    }
+
     /// Choose and create an appropriate field encoder for the given
     /// field.
     ///
     /// The field encoder can be chosen on the data type as well as
     /// any metadata that is attached to the field.
     ///
-    /// The `encoding_strategy_root` is the encoder that should be
-    /// used to encode any inner data in struct / list / etc. fields.
-    ///
-    /// Initially it is the same as `self` and generally should be
-    /// forwarded to any inner encoding strategy.
     fn create_field_encoder(
         &self,
-        encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
-        options: &EncodingOptions,
+        context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>>;
 }
 
-pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEncodingStrategy> {
-    match version.resolve() {
-        LanceFileVersion::Legacy => panic!(),
-        LanceFileVersion::V2_0 => Box::new(
-            crate::previous::encoder::CoreFieldEncodingStrategy::new(version),
-        ),
-        _ => Box::new(StructuralEncodingStrategy::with_version(version)),
-    }
-}
-
-/// Create an encoding strategy with user-configured compression parameters
-pub fn default_encoding_strategy_with_params(
-    version: LanceFileVersion,
-    params: CompressionParams,
-) -> Result<Box<dyn FieldEncodingStrategy>> {
-    match version.resolve() {
-        LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
-            "Compression parameters are only supported in Lance file version 2.1 and later",
-        )),
-        _ => {
-            let compression_strategy =
-                Arc::new(DefaultCompressionStrategy::with_params(params).with_version(version));
-            Ok(Box::new(StructuralEncodingStrategy {
-                compression_strategy,
-                version,
-            }))
-        }
-    }
-}
-
-/// An encoding strategy used for 2.1+ files
-#[derive(Debug)]
-pub struct StructuralEncodingStrategy {
-    pub compression_strategy: Arc<dyn CompressionStrategy>,
-    pub version: LanceFileVersion,
-}
-
-// For some reason, clippy thinks we can add Default to the above derive but
-// rustc doesn't agree (no default for Arc<dyn Trait>)
-#[allow(clippy::derivable_impls)]
-impl Default for StructuralEncodingStrategy {
-    fn default() -> Self {
-        Self {
-            compression_strategy: Arc::new(DefaultCompressionStrategy::new()),
-            version: LanceFileVersion::default(),
-        }
-    }
-}
-
-impl StructuralEncodingStrategy {
-    pub fn with_version(version: LanceFileVersion) -> Self {
-        Self {
-            compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
-            version,
-        }
-    }
-
-    fn is_primitive_type(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::FixedSizeList(inner, _) => Self::is_primitive_type(inner.data_type()),
-            _ => matches!(
-                data_type,
-                DataType::Boolean
-                    | DataType::Date32
-                    | DataType::Date64
-                    | DataType::Decimal128(_, _)
-                    | DataType::Decimal256(_, _)
-                    | DataType::Duration(_)
-                    | DataType::Float16
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Int8
-                    | DataType::Interval(_)
-                    | DataType::Null
-                    | DataType::Time32(_)
-                    | DataType::Time64(_)
-                    | DataType::Timestamp(_, _)
-                    | DataType::UInt16
-                    | DataType::UInt32
-                    | DataType::UInt64
-                    | DataType::UInt8
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::Binary
-                    | DataType::LargeBinary
-                    | DataType::Utf8
-                    | DataType::LargeUtf8,
-            ),
-        }
-    }
-
-    fn do_create_field_encoder(
-        &self,
-        _encoding_strategy_root: &dyn FieldEncodingStrategy,
-        field: &Field,
-        column_index: &mut ColumnIndexSequence,
-        options: &EncodingOptions,
-        root_field_metadata: &HashMap<String, String>,
-    ) -> Result<Box<dyn FieldEncoder>> {
-        let data_type = field.data_type();
-
-        // Check if field is marked as blob
-        if field.is_blob() {
-            match data_type {
-                DataType::Binary | DataType::LargeBinary => {
-                    return Ok(Box::new(BlobStructuralEncoder::new(
-                        field,
-                        column_index.next_column_index(field.id as u32),
-                        options,
-                        self.compression_strategy.clone(),
-                    )?));
-                }
-                DataType::Struct(_) if self.version >= LanceFileVersion::V2_2 => {
-                    return Ok(Box::new(BlobV2StructuralEncoder::new(
-                        field,
-                        column_index.next_column_index(field.id as u32),
-                        options,
-                        self.compression_strategy.clone(),
-                    )?));
-                }
-                DataType::Struct(_) => {
-                    return Err(Error::invalid_input_source(
-                        "Blob v2 struct input requires file version >= 2.2".into(),
-                    ));
-                }
-                _ => {
-                    return Err(Error::invalid_input_source(
-                        format!(
-                            "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
-                            data_type
-                        )
-                        .into(),
-                    ));
-                }
-            }
-        }
-
-        if Self::is_primitive_type(&data_type) {
-            Ok(Box::new(PrimitiveStructuralEncoder::try_new(
-                options,
-                self.compression_strategy.clone(),
-                column_index.next_column_index(field.id as u32),
-                field.clone(),
-                Arc::new(root_field_metadata.clone()),
-            )?))
-        } else {
-            match data_type {
-                DataType::List(_) | DataType::LargeList(_) => {
-                    let child = field.children.first().expect_ok()?;
-                    let child_encoder = self.do_create_field_encoder(
-                        _encoding_strategy_root,
-                        child,
-                        column_index,
-                        options,
-                        root_field_metadata,
-                    )?;
-                    Ok(Box::new(ListStructuralEncoder::new(
-                        options.keep_original_array,
-                        child_encoder,
-                    )))
-                }
-                DataType::FixedSizeList(inner, _)
-                    if matches!(inner.data_type(), DataType::Struct(_)) =>
-                {
-                    if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::not_supported_source(format!(
-                            "FixedSizeList<Struct> is only supported in Lance file format 2.2+, current version: {}",
-                            self.version
-                        )
-                        .into()));
-                    }
-                    // Complex FixedSizeList needs structural encoding
-                    let child = field.children.first().expect_ok()?;
-                    let child_encoder = self.do_create_field_encoder(
-                        _encoding_strategy_root,
-                        child,
-                        column_index,
-                        options,
-                        root_field_metadata,
-                    )?;
-                    Ok(Box::new(FixedSizeListStructuralEncoder::new(
-                        options.keep_original_array,
-                        child_encoder,
-                    )))
-                }
-                DataType::Map(_, keys_sorted) => {
-                    // TODO: We only support keys_sorted=false for now,
-                    //  because converting a rust arrow map field to the python arrow field will
-                    //  lose the keys_sorted property.
-                    if keys_sorted {
-                        return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", keys_sorted).into()));
-                    }
-                    if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::not_supported_source(format!(
-                            "Map data type is only supported in Lance file format 2.2+, current version: {}",
-                            self.version
-                        )
-                        .into()));
-                    }
-                    let entries_child = field.children.first().ok_or_else(|| {
-                        Error::schema("Map should have an entries child".to_string())
-                    })?;
-                    let DataType::Struct(struct_fields) = entries_child.data_type() else {
-                        return Err(Error::schema(
-                            "Map entries field must be a Struct<key, value>".to_string(),
-                        ));
-                    };
-                    if struct_fields.len() < 2 {
-                        return Err(Error::schema(
-                            "Map entries struct must contain both key and value fields".to_string(),
-                        ));
-                    }
-                    let key_field = &struct_fields[0];
-                    if key_field.is_nullable() {
-                        return Err(Error::schema(format!(
-                            "Map key field '{}' must be non-nullable according to Arrow Map specification",
-                            key_field.name()
-                        )));
-                    }
-                    let child_encoder = self.do_create_field_encoder(
-                        _encoding_strategy_root,
-                        entries_child,
-                        column_index,
-                        options,
-                        root_field_metadata,
-                    )?;
-                    Ok(Box::new(MapStructuralEncoder::new(
-                        options.keep_original_array,
-                        child_encoder,
-                    )))
-                }
-                DataType::Struct(fields) => {
-                    if field.is_packed_struct() || fields.is_empty() {
-                        // Both packed structs and empty structs are encoded as primitive
-                        Ok(Box::new(PrimitiveStructuralEncoder::try_new(
-                            options,
-                            self.compression_strategy.clone(),
-                            column_index.next_column_index(field.id as u32),
-                            field.clone(),
-                            Arc::new(root_field_metadata.clone()),
-                        )?))
-                    } else {
-                        let children_encoders = field
-                            .children
-                            .iter()
-                            .map(|field| {
-                                self.do_create_field_encoder(
-                                    _encoding_strategy_root,
-                                    field,
-                                    column_index,
-                                    options,
-                                    root_field_metadata,
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok(Box::new(StructStructuralEncoder::new(
-                            options.keep_original_array,
-                            children_encoders,
-                        )))
-                    }
-                }
-                DataType::Dictionary(_, value_type) => {
-                    // A dictionary of primitive is, itself, primitive
-                    if Self::is_primitive_type(&value_type) {
-                        Ok(Box::new(PrimitiveStructuralEncoder::try_new(
-                            options,
-                            self.compression_strategy.clone(),
-                            column_index.next_column_index(field.id as u32),
-                            field.clone(),
-                            Arc::new(root_field_metadata.clone()),
-                        )?))
-                    } else {
-                        // A dictionary of logical is, itself, logical and we don't support that today
-                        // It could be possible (e.g. store indices in one column and values in remaining columns)
-                        // but would be a significant amount of work
-                        //
-                        // An easier fallback implementation would be to decode-on-write and encode-on-read
-                        Err(Error::not_supported_source(format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into()))
-                    }
-                }
-                _ => todo!("Implement encoding for field {}", field),
-            }
-        }
-    }
-}
-
-impl FieldEncodingStrategy for StructuralEncodingStrategy {
-    fn create_field_encoder(
-        &self,
-        encoding_strategy_root: &dyn FieldEncodingStrategy,
-        field: &Field,
-        column_index: &mut ColumnIndexSequence,
-        options: &EncodingOptions,
-    ) -> Result<Box<dyn FieldEncoder>> {
-        self.do_create_field_encoder(
-            encoding_strategy_root,
-            field,
-            column_index,
-            options,
-            &field.metadata,
-        )
-    }
+/// Context shared while one top-level field and all of its children are mapped
+/// to concrete field encoders.
+pub struct FieldEncodingContext<'a> {
+    /// The complete strategy composition used for recursive child fields.
+    pub strategy: &'a dyn FieldEncodingStrategy,
+    /// Runtime-only writer options.
+    pub options: &'a EncodingOptions,
+    /// Metadata inherited from the top-level field.
+    pub root_field_metadata: &'a HashMap<String, String>,
 }
 
 /// A batch encoder that encodes RecordBatch objects by delegating
@@ -612,12 +340,13 @@ impl BatchEncoder {
             .fields
             .iter()
             .map(|field| {
-                let encoder = strategy.create_field_encoder(
+                let context = FieldEncodingContext {
                     strategy,
-                    field,
-                    &mut col_idx_sequence,
                     options,
-                )?;
+                    root_field_metadata: &field.metadata,
+                };
+                let encoder =
+                    strategy.create_field_encoder(field, &mut col_idx_sequence, &context)?;
                 col_idx += encoder.as_ref().num_columns();
                 Ok(encoder)
             })
@@ -693,17 +422,23 @@ pub async fn encode_batch(
         keep_original_array: true,
         ..*options
     };
-    let batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
+    let mut batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
+    let arrays = batch
+        .columns()
+        .iter()
+        .cloned()
+        .zip(batch_encoder.field_encoders.iter_mut())
+        .map(|(array, encoder)| encoder.prepare_array(array))
+        .collect::<Result<Vec<_>>>()?;
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
-    for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
+    for (arr, mut encoder) in arrays.into_iter().zip(batch_encoder.field_encoders) {
         let mut external_buffers =
             OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let repdef = RepDefBuilder::default();
         let encoder = encoder.as_mut();
         let num_rows = arr.len() as u64;
-        let mut tasks =
-            encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0, num_rows)?;
+        let mut tasks = encoder.maybe_encode(arr, &mut external_buffers, repdef, 0, num_rows)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);
@@ -768,47 +503,65 @@ pub async fn encode_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compression_config::{CompressionFieldParams, CompressionParams};
+    use crate::testing::{TestEncoding, create_test_field_encoder, test_encoding_strategy};
+    use arrow_array::make_array;
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayData;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields};
+    use rstest::rstest;
 
-    #[test]
-    fn test_configured_encoding_strategy() {
-        // Create test parameters
-        let mut params = CompressionParams::new();
-        params.columns.insert(
-            "*_id".to_string(),
-            CompressionFieldParams {
-                rle_threshold: Some(0.5),
-                compression: Some("lz4".to_string()),
-                compression_level: None,
-                bss: None,
-                minichunk_size: None,
-            },
-        );
+    #[rstest]
+    fn test_nested_variable_width_offsets_are_validated_before_dispatch(
+        #[values(TestEncoding::Array, TestEncoding::StructuralU32)] encoding: TestEncoding,
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8)] item_type: ArrowDataType,
+    ) {
+        let offsets = match &item_type {
+            ArrowDataType::Utf8 => Buffer::from_slice_ref([0_i32, 2, 1, 3]),
+            ArrowDataType::LargeUtf8 => Buffer::from_slice_ref([0_i64, 2, 1, 3]),
+            _ => unreachable!(),
+        };
+        let child_data = unsafe {
+            ArrayData::builder(item_type.clone())
+                .len(3)
+                .add_buffer(offsets)
+                .add_buffer(Buffer::from(b"abc"))
+                .build_unchecked()
+        };
+        let item_field = Arc::new(ArrowField::new("item", item_type, false));
+        let data_type = ArrowDataType::FixedSizeList(item_field, 1);
+        let array_data = unsafe {
+            ArrayData::builder(data_type.clone())
+                .len(3)
+                .add_child_data(child_data)
+                .build_unchecked()
+        };
+        let array = make_array(array_data);
+        let field = Field::try_from(&ArrowField::new("payload", data_type, false)).unwrap();
+        let strategy = test_encoding_strategy(encoding);
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions {
+            cache_bytes_per_column: 0,
+            ..Default::default()
+        };
+        let mut encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
 
-        // Test with V2.1 - should succeed
-        let strategy =
-            default_encoding_strategy_with_params(LanceFileVersion::V2_1, params.clone())
-                .expect("Should succeed for V2.1");
+        let error = encoder
+            .maybe_encode(array, &mut external_buffers, RepDefBuilder::default(), 0, 3)
+            .err()
+            .expect("malformed nested offsets should fail before task dispatch");
 
-        // Verify it's a StructuralEncodingStrategy
-        assert!(format!("{:?}", strategy).contains("StructuralEncodingStrategy"));
-        assert!(format!("{:?}", strategy).contains("DefaultCompressionStrategy"));
-
-        // Test with V2.0 - should fail
-        let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
-            .expect_err("Should fail for V2.0");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
         assert!(
-            err.to_string()
-                .contains("only supported in Lance file version 2.1")
+            message.contains("field 'payload'"),
+            "unexpected message: {message}"
         );
-
-        // Test with Legacy - should fail
-        let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
-            .expect_err("Should fail for Legacy");
         assert!(
-            err.to_string()
-                .contains("only supported in Lance file version 2.1")
+            message.contains("non-monotonic offset at position 2"),
+            "unexpected message: {message}"
         );
     }
 
@@ -830,11 +583,12 @@ mod tests {
         );
         let field = Field::try_from(&arrow_field).unwrap();
 
-        let strategy = StructuralEncodingStrategy::with_version(LanceFileVersion::V2_1);
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU16);
         let mut column_index = ColumnIndexSequence::default();
         let options = EncodingOptions::default();
 
-        let result = strategy.create_field_encoder(&strategy, &field, &mut column_index, &options);
+        let result =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options);
         assert!(
             result.is_err(),
             "FixedSizeList<Struct> should be rejected for file version 2.1"
@@ -843,7 +597,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("FixedSizeList<Struct> is only supported in Lance file format 2.2+")
+                .contains("FixedSizeList<Struct> is not enabled by the selected file format")
         );
     }
 }

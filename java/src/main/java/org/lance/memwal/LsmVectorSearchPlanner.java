@@ -44,7 +44,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    */
   public LsmVectorSearchPlanner(
@@ -54,7 +54,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
    * @param distanceType distance metric, one of {@code "l2"}, {@code "cosine"}, {@code "dot"},
@@ -71,7 +71,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
    * @param distanceType distance metric, one of {@code "l2"}, {@code "cosine"}, {@code "dot"},
@@ -90,13 +90,15 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
     Preconditions.checkNotNull(vectorColumn, "vectorColumn must not be null");
     this.allocator = dataset.allocator();
-    nativeCreate(
-        dataset,
-        shardSnapshots,
-        vectorColumn,
-        Optional.ofNullable(pkColumns),
-        Optional.ofNullable(distanceType),
-        Optional.ofNullable(filter));
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      nativeCreate(
+          dataset,
+          shardSnapshots,
+          vectorColumn,
+          Optional.ofNullable(pkColumns),
+          Optional.ofNullable(distanceType),
+          Optional.ofNullable(filter));
+    }
   }
 
   private native void nativeCreate(

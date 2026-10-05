@@ -9,7 +9,13 @@ import pyarrow as pa
 from pyarrow import RecordBatch
 
 from . import dataset
-from .dependencies import _check_for_hugging_face, _check_for_pandas
+from .dependencies import (
+    _check_for_hugging_face,
+    _check_for_pandas,
+    _is_pydantic_base_model,
+    _validate_pydantic_list,
+    model_to_dict,
+)
 from .dependencies import pandas as pd
 
 if TYPE_CHECKING:
@@ -50,6 +56,34 @@ def _casting_recordbatch_iter(
                     f"Got:\n{batch.schema}"
                 )
         yield batch
+
+
+def _is_materialized(data_obj: ReaderLike) -> bool:
+    """Whether ``data_obj`` is fully materialized in memory.
+
+    Materialized sources (tables, in-memory frames) can be wrapped in an
+    in-memory table for replay without spilling and to expose exact statistics.
+    Streaming or re-readable sources (readers, scanners, datasets, generators)
+    are not considered materialized.
+    """
+    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
+        return True
+    if isinstance(data_obj, (pa.Table, pa.RecordBatch)):
+        return True
+    if (
+        type(data_obj).__module__.startswith("polars")
+        and data_obj.__class__.__name__ == "DataFrame"
+    ):
+        return True
+    if isinstance(data_obj, dict):
+        return True
+    if (
+        isinstance(data_obj, list)
+        and len(data_obj) > 0
+        and isinstance(data_obj[0], dict)
+    ):
+        return True
+    return False
 
 
 def _coerce_reader(
@@ -115,6 +149,20 @@ def _coerce_reader(
     ):
         # List of dictionaries
         batch = pa.RecordBatch.from_pylist(data_obj, schema=schema)
+        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
+    elif (
+        isinstance(data_obj, list)
+        and len(data_obj) > 0
+        and _is_pydantic_base_model(data_obj[0])
+    ):
+        model_class = type(data_obj[0])
+        _validate_pydantic_list(data_obj, model_class)
+        if schema is None:
+            from .pydantic import pydantic_to_schema
+
+            schema = pydantic_to_schema(model_class)
+        dicts = [model_to_dict(item) for item in data_obj]
+        batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
         return pa.RecordBatchReader.from_batches(batch.schema, [batch])
     # for other iterables, assume they are of type Iterable[RecordBatch]
     elif isinstance(data_obj, Iterable):

@@ -20,7 +20,7 @@ Usage:
 
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 
 import pytest
 
@@ -90,6 +90,7 @@ class IOMemoryBenchmark:
         func: Callable,
         dataset: Any,
         warmup: bool = True,
+        setup: Optional[Callable[[], Any]] = None,
     ) -> Any:
         """
         Run a benchmark function with IO and memory tracking.
@@ -102,28 +103,47 @@ class IOMemoryBenchmark:
             The dataset to pass to the function.
         warmup : bool, default True
             Whether to run a warmup iteration before measuring.
+        setup : Callable, optional
+            Called before the warmup run and again before the measured run.
+            Required for workloads that mutate the dataset, so each run starts
+            from the same state. Setup runs before IO stats are reset, so its
+            own IO is never attributed to the benchmark. If it returns a value,
+            that value is passed to ``func`` instead of ``dataset`` -- use this
+            when the reset produces a new dataset handle.
 
         Returns
         -------
         Any
             The return value of the benchmark function.
         """
+
+        def prepare() -> Any:
+            if setup is None:
+                return dataset
+            replacement = setup()
+            return dataset if replacement is None else replacement
+
         # Warmup run (not measured)
         if warmup:
-            func(dataset)
+            func(prepare())
 
-        # Reset IO stats before the measured run
+        target = prepare()
+
+        # Reset IO stats before the measured run. Stats are tracked on the
+        # ObjectStore, which is shared by every handle from the same session,
+        # so resetting/reading through `dataset` also captures work that `func`
+        # performs through a handle returned by `setup`.
         dataset.io_stats_incremental()
 
         # Run with memory tracking if available
         if MEMTEST_AVAILABLE:
             memtest.reset_stats()
-            result = func(dataset)
+            result = func(target)
             mem_stats = memtest.get_stats()
             self._stats.peak_bytes = mem_stats["peak_bytes"]
             self._stats.total_allocations = mem_stats["total_allocations"]
         else:
-            result = func(dataset)
+            result = func(target)
 
         # Capture IO stats
         io_stats = dataset.io_stats_incremental()
@@ -159,7 +179,11 @@ def io_mem_benchmark(request):
     if marker is None:
         # Not an io_memory_benchmark test, return a simple passthrough
         class PassthroughBenchmark:
-            def __call__(self, func, dataset, warmup=True):
+            def __call__(self, func, dataset, warmup=True, setup=None):
+                if setup is not None:
+                    replacement = setup()
+                    if replacement is not None:
+                        dataset = replacement
                 return func(dataset)
 
         yield PassthroughBenchmark()

@@ -6,10 +6,9 @@ use arrow_array::{Array, LargeBinaryArray};
 
 use super::{
     CompressedPositionStorage, PostingList, PostingTailCodec,
-    builder::BLOCK_SIZE,
     encoding::{
-        decode_position_stream_block, decompress_positions, decompress_posting_block,
-        decompress_posting_remainder,
+        MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
+        decompress_posting_block, decompress_posting_remainder,
     },
 };
 
@@ -28,6 +27,7 @@ impl<'a> PostingListIterator<'a> {
                     posting.blocks.clone(),
                     posting.posting_tail_codec,
                     posting.positions.clone(),
+                    posting.block_size,
                 )))
             }
         }
@@ -82,13 +82,14 @@ pub struct CompressedPostingListIterator {
     next_block_idx: usize,
     posting_tail_codec: PostingTailCodec,
     positions: Option<CompressedPositionStorage>,
+    block_size: usize,
     idx: usize,
     doc_ids: Vec<u32>,
     frequencies: Vec<u32>,
     doc_idx_in_block: usize,
     decoded_positions: Vec<u32>,
     position_offsets: Vec<usize>,
-    buffer: [u32; BLOCK_SIZE],
+    buffer: [u32; MAX_POSTING_BLOCK_SIZE],
 }
 
 impl CompressedPostingListIterator {
@@ -97,10 +98,11 @@ impl CompressedPostingListIterator {
         blocks: LargeBinaryArray,
         posting_tail_codec: PostingTailCodec,
         positions: Option<CompressedPositionStorage>,
+        block_size: usize,
     ) -> Self {
         debug_assert!(length > 0, "length: {}", length);
         debug_assert_eq!(
-            length.div_ceil(BLOCK_SIZE),
+            length.div_ceil(block_size),
             blocks.len(),
             "length: {}, num_blocks: {}",
             length,
@@ -108,18 +110,19 @@ impl CompressedPostingListIterator {
         );
 
         Self {
-            remainder: length % BLOCK_SIZE,
+            remainder: length % block_size,
             blocks,
             next_block_idx: 0,
             posting_tail_codec,
             positions,
+            block_size,
             idx: 0,
             doc_ids: Vec::new(),
             frequencies: Vec::new(),
             doc_idx_in_block: 0,
             decoded_positions: Vec::new(),
             position_offsets: Vec::new(),
-            buffer: [0; BLOCK_SIZE],
+            buffer: [0; MAX_POSTING_BLOCK_SIZE],
         }
     }
 }
@@ -163,6 +166,7 @@ impl Iterator for CompressedPostingListIterator {
                 compressed,
                 self.remainder,
                 self.posting_tail_codec,
+                self.block_size,
                 &mut self.doc_ids,
                 &mut self.frequencies,
             );
@@ -172,6 +176,7 @@ impl Iterator for CompressedPostingListIterator {
                 &mut self.buffer,
                 &mut self.doc_ids,
                 &mut self.frequencies,
+                self.block_size,
             );
         }
         self.doc_idx_in_block = 0;

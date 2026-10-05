@@ -214,14 +214,15 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Once, OnceLock};
+use std::sync::{LazyLock, Mutex, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
-use futures::future::{BoxFuture, MaybeDone, maybe_done};
+use futures::channel::oneshot;
+use futures::future::{BoxFuture, MaybeDone, Shared, maybe_done};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
@@ -236,10 +237,16 @@ use prost::Message;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
-use lance_core::error::LanceOptionExt;
+use lance_core::error::{CloneableError, LanceOptionExt};
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
 
+use crate::array_encoding::logical::list::OffsetPageInfo;
+use crate::array_encoding::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
+use crate::array_encoding::logical::{
+    binary::BinaryFieldScheduler, blob::BlobFieldScheduler, list::ListFieldScheduler,
+    primitive::PrimitiveFieldScheduler,
+};
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
@@ -250,16 +257,135 @@ use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
 use crate::format::pb21;
-use crate::previous::decoder::LogicalPageDecoder;
-use crate::previous::encodings::logical::list::OffsetPageInfo;
-use crate::previous::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
-use crate::previous::encodings::logical::{
-    binary::BinaryFieldScheduler, blob::BlobFieldScheduler, list::ListFieldScheduler,
-    primitive::PrimitiveFieldScheduler,
-};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
-use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
+
+/// Candidate batch sizes evaluated during byte-budget planning.
+/// Powers of 4, covering 1–16Ki rows in 8 probes.
+pub const CANDIDATE_BATCH_SIZES: [u32; 8] = [1, 4, 16, 64, 256, 1024, 4096, 16384];
+
+pub trait SchedulingJob: std::fmt::Debug {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+        priority: &dyn PriorityRange,
+    ) -> Result<ScheduledScanLine>;
+
+    fn num_rows(&self) -> u64;
+}
+
+/// Schedules the I/O needed to decode one field.
+pub trait FieldScheduler: Send + Sync + std::fmt::Debug {
+    fn initialize<'a>(
+        &'a self,
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn SchedulingJob + 'a>>;
+
+    fn num_rows(&self) -> u64;
+}
+
+#[derive(Debug)]
+pub struct DecoderReady {
+    pub decoder: Box<dyn LogicalPageDecoder>,
+    pub path: VecDeque<u32>,
+}
+
+/// Stateful decoder for one logical page.
+pub trait LogicalPageDecoder: std::fmt::Debug + Send {
+    fn accept_child(&mut self, _child: DecoderReady) -> Result<()> {
+        Err(Error::internal(format!(
+            "The decoder {:?} does not expect children but received a child",
+            self
+        )))
+    }
+
+    fn wait_for_loaded(&'_ mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>>;
+
+    fn rows_loaded(&self) -> u64;
+
+    fn rows_unloaded(&self) -> u64 {
+        self.num_rows() - self.rows_loaded()
+    }
+
+    fn num_rows(&self) -> u64;
+
+    fn rows_drained(&self) -> u64;
+
+    fn rows_left(&self) -> u64 {
+        self.num_rows() - self.rows_drained()
+    }
+
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
+
+    /// Returns how many of the requested rows can be decoded into one Arrow array
+    /// while keeping every i32 offset buffer within `byte_budget` bytes.
+    ///
+    /// Most page decoders can always drain the full request and consume no budget.
+    /// Decoders that build arrays with i32 offsets (Utf8 / Binary / List) may return
+    /// fewer rows so that the concatenated array's offsets stay representable, and
+    /// report the budget those rows consume so callers can accumulate across pages.
+    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: 0,
+        })
+    }
+
+    fn data_type(&self) -> &DataType;
+}
+
+/// Result of limiting a drain request to a variable-width byte budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainLimit {
+    /// How many of the requested rows can be decoded into one Arrow array
+    pub rows: u64,
+    /// The variable-width bytes (at the most constrained i32-offset nesting level)
+    /// those rows consume from the caller's budget
+    pub bytes: u64,
+}
+
+/// The byte budget applied to each output batch of an i32-offset column.
+///
+/// Concatenating decoded pages into one Arrow array fails when a variable-width
+/// buffer's offsets exceed `i32::MAX`, so batches are split before that point.
+pub(crate) const I32_OFFSET_BYTE_BUDGET: u64 = i32::MAX as u64;
+
+/// Clamp a batch's row count to the byte-budgeted limit.
+///
+/// A batch always advances by at least one row: a first row whose (possibly
+/// over-estimated) size exceeds the whole budget is emitted alone.  A genuinely
+/// oversized row then surfaces the same arrow-level offset error it always did,
+/// while an over-estimated one decodes fine.
+fn clamp_rows_to_i32_budget(limit: DrainLimit, to_take: u64) -> u64 {
+    if to_take == 0 {
+        return 0;
+    }
+    limit.rows.clamp(1, to_take)
+}
+
+/// Returns whether concatenating arrays of this type can overflow an i32 offset buffer.
+pub(crate) fn has_i32_offsets(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Binary | DataType::Utf8 | DataType::List(_) | DataType::ListView(_) => true,
+        DataType::Map(_, _) => true,
+        DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => has_i32_offsets(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_i32_offsets(field.data_type())),
+        DataType::Dictionary(_, values) => has_i32_offsets(values),
+        DataType::RunEndEncoded(_, values) => has_i32_offsets(values.data_type()),
+        _ => false,
+    }
+}
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
@@ -288,13 +414,13 @@ fn inline_scheduling_threshold() -> u64 {
     })
 }
 
-/// Top-level encoding message for a page.  Wraps both the
-/// legacy pb::ArrayEncoding and the newer pb::PageLayout
+/// Top-level encoding message for a page. Wraps both the v2.0
+/// [`pb::ArrayEncoding`] grammar and the structural [`pb21::PageLayout`] grammar.
 ///
 /// A file should only use one or the other and never both.
 /// 2.0 decoders can always assume this is pb::ArrayEncoding
 /// and 2.1+ decoders can always assume this is pb::PageLayout
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
     Structural(pb21::PageLayout),
@@ -402,21 +528,21 @@ impl ColumnInfo {
 
 enum RootScheduler {
     Structural(Box<dyn StructuralFieldScheduler>),
-    Legacy(Arc<dyn crate::previous::decoder::FieldScheduler>),
+    Array(Arc<dyn FieldScheduler>),
 }
 
 impl RootScheduler {
-    fn as_legacy(&self) -> &Arc<dyn crate::previous::decoder::FieldScheduler> {
+    fn as_array(&self) -> &Arc<dyn FieldScheduler> {
         match self {
-            Self::Structural(_) => panic!("Expected a legacy scheduler"),
-            Self::Legacy(s) => s,
+            Self::Structural(_) => panic!("Expected an array scheduler"),
+            Self::Array(s) => s,
         }
     }
 
     fn as_structural(&self) -> &dyn StructuralFieldScheduler {
         match self {
             Self::Structural(s) => s.as_ref(),
-            Self::Legacy(_) => panic!("Expected a structural scheduler"),
+            Self::Array(_) => panic!("Expected a structural scheduler"),
         }
     }
 }
@@ -606,14 +732,14 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn is_primitive_legacy(data_type: &DataType) -> bool {
+    fn is_array_primitive(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive_legacy(inner.data_type()),
+                DataType::FixedSizeList(inner, _) => Self::is_array_primitive(inner.data_type()),
                 _ => false,
             }
         }
@@ -624,7 +750,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column: &ColumnInfo,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn FieldScheduler>> {
         Self::ensure_values_encoded(column, &field.name)?;
         // Primitive fields map to a single column
         let column_buffers = ColumnBuffers {
@@ -667,52 +793,57 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         offsets_column: &ColumnInfo,
-    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn FieldScheduler>> {
         Self::ensure_values_encoded(offsets_column, &list_field.name)?;
         let offsets_column_buffers = ColumnBuffers {
             file_buffers: buffers,
             positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
         };
         let items_scheduler =
-            self.create_legacy_field_scheduler(&list_field.children[0], column_infos, buffers)?;
+            self.create_array_field_scheduler(&list_field.children[0], column_infos, buffers)?;
 
-        let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
+        let mut inner_infos = Vec::with_capacity(offsets_column.page_infos.len());
+        let mut null_offset_adjustments = Vec::with_capacity(offsets_column.page_infos.len());
+        for (page_index, offsets_page) in offsets_column
             .page_infos
             .iter()
-            .filter(|offsets_page| offsets_page.num_rows > 0)
-            .map(|offsets_page| {
-                if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
-                    &offsets_page.encoding.as_legacy().array_encoding
-                {
-                    let inner = PageInfo {
-                        buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
-                        encoding: PageEncoding::Legacy(
-                            list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
-                        ),
-                        num_rows: offsets_page.num_rows,
-                        priority: 0,
-                    };
-                    (
-                        inner,
-                        OffsetPageInfo {
-                            offsets_in_page: offsets_page.num_rows,
-                            null_offset_adjustment: list_encoding.null_offset_adjustment,
-                            num_items_referenced_by_page: list_encoding.num_items,
-                        },
-                    )
-                } else {
-                    // TODO: Should probably return Err here
-                    panic!("Expected a list column");
-                }
-            })
-            .unzip();
+            .enumerate()
+            .filter(|(_, offsets_page)| offsets_page.num_rows > 0)
+        {
+            let PageEncoding::Legacy(pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::List(list_encoding)),
+            }) = &offsets_page.encoding
+            else {
+                return Err(Error::invalid_input(format!(
+                    "expected list encoding for field '{}' in column {}, page {} but got {:?}",
+                    list_field.name, offsets_column.index, page_index, offsets_page.encoding
+                )));
+            };
+            let offsets_encoding = list_encoding.offsets.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "list encoding for field '{}' in column {}, page {} is missing its offsets encoding",
+                    list_field.name, offsets_column.index, page_index
+                ))
+            })?;
+            inner_infos.push(PageInfo {
+                buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
+                encoding: PageEncoding::Legacy(offsets_encoding.as_ref().clone()),
+                num_rows: offsets_page.num_rows,
+                priority: 0,
+            });
+            null_offset_adjustments.push(OffsetPageInfo {
+                offsets_in_page: offsets_page.num_rows,
+                null_offset_adjustment: list_encoding.null_offset_adjustment,
+                num_items_referenced_by_page: list_encoding.num_items,
+            });
+        }
         let inner = Arc::new(PrimitiveFieldScheduler::new(
             offsets_column.index,
             DataType::UInt64,
             Arc::from(inner_infos.into_boxed_slice()),
             offsets_column_buffers,
             self.validate_data,
-        )) as Arc<dyn crate::previous::decoder::FieldScheduler>;
+        )) as Arc<dyn FieldScheduler>;
         let items_field = match list_field.data_type() {
             DataType::List(inner) => inner,
             DataType::LargeList(inner) => inner,
@@ -753,9 +884,9 @@ impl CoreFieldDecoderStrategy {
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                column_info.as_ref(),
-                self.decompressor_strategy.as_ref(),
+            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
+                column_info.clone(),
+                self.decompressor_strategy.clone(),
                 self.cache_repetition_index,
                 field,
             )?);
@@ -770,9 +901,9 @@ impl CoreFieldDecoderStrategy {
                 if field.is_packed_struct() {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                        column_info.as_ref(),
-                        self.decompressor_strategy.as_ref(),
+                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
+                        column_info.clone(),
+                        self.decompressor_strategy.clone(),
                         self.cache_repetition_index,
                         field,
                     )?);
@@ -794,9 +925,9 @@ impl CoreFieldDecoderStrategy {
                         )
                     }) {
                         let column_info = column_infos.expect_next()?;
-                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                            column_info.as_ref(),
-                            self.decompressor_strategy.as_ref(),
+                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
+                            column_info.clone(),
+                            self.decompressor_strategy.clone(),
                             self.cache_repetition_index,
                             field,
                         )?);
@@ -853,15 +984,15 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn create_legacy_field_scheduler(
+    fn create_array_field_scheduler(
         &self,
         field: &Field,
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn FieldScheduler>> {
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
-        if Self::is_primitive_legacy(&data_type) {
+        if Self::is_array_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
@@ -920,7 +1051,7 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, _dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
-                if Self::is_primitive_legacy(inner.data_type()) {
+                if Self::is_array_primitive(inner.data_type()) {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -930,7 +1061,7 @@ impl CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive_legacy(value_type) || value_type.is_binary_like() {
+                if Self::is_array_primitive(value_type) || value_type.is_binary_like() {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -974,7 +1105,7 @@ impl CoreFieldDecoderStrategy {
                     for field in &field.children {
                         column_infos.next_top_level();
                         let field_scheduler =
-                            self.create_legacy_field_scheduler(field, column_infos, buffers)?;
+                            self.create_array_field_scheduler(field, column_infos, buffers)?;
                         child_schedulers.push(Arc::from(field_scheduler));
                     }
 
@@ -1008,7 +1139,7 @@ fn root_column(num_rows: u64) -> ColumnInfo {
                     pb::SimpleStruct {},
                 )),
             }),
-            priority: 0, // not used in legacy scheduler
+            priority: 0, // not used by the array scheduler
             buffer_offsets_and_sizes: Arc::new([]),
         })
         .collect::<Vec<_>>();
@@ -1024,21 +1155,21 @@ fn root_column(num_rows: u64) -> ColumnInfo {
 
 pub enum RootDecoder {
     Structural(StructuralStructDecoder),
-    Legacy(SimpleStructDecoder),
+    Array(SimpleStructDecoder),
 }
 
 impl RootDecoder {
     pub fn into_structural(self) -> StructuralStructDecoder {
         match self {
             Self::Structural(decoder) => decoder,
-            Self::Legacy(_) => panic!("Expected a structural decoder"),
+            Self::Array(_) => panic!("Expected a structural decoder"),
         }
     }
 
-    pub fn into_legacy(self) -> SimpleStructDecoder {
+    pub fn into_array(self) -> SimpleStructDecoder {
         match self {
-            Self::Legacy(decoder) => decoder,
-            Self::Structural(_) => panic!("Expected a legacy decoder"),
+            Self::Array(decoder) => decoder,
+            Self::Structural(_) => panic!("Expected an array decoder"),
         }
     }
 }
@@ -1053,9 +1184,43 @@ impl DecodeBatchScheduler {
         column_infos: &[Arc<ColumnInfo>],
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
         num_rows: u64,
+        decoder_plugins: Arc<DecoderPlugins>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+        filter: &FilterExpression,
+        decoder_config: &DecoderConfig,
+    ) -> Result<Self> {
+        Self::try_new_with_ranges(
+            schema,
+            column_indices,
+            column_infos,
+            file_buffer_positions_and_sizes,
+            num_rows,
+            decoder_plugins,
+            io,
+            cache,
+            None,
+            filter,
+            decoder_config,
+        )
+        .await
+    }
+
+    /// Creates a decode scheduler and initializes only pages overlapping known ranges.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_new_with_ranges<'a>(
+        schema: &'a Schema,
+        column_indices: &[u32],
+        column_infos: &[Arc<ColumnInfo>],
+        file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
+        num_rows: u64,
         _decoder_plugins: Arc<DecoderPlugins>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
+        // The top-level row ranges that will be scheduled, if known. This lets
+        // the structural path initialize only the pages those ranges touch.
+        // `None` preserves `try_new`'s eager initialization behavior.
+        requested_ranges: Option<&[Range<u64>]>,
         filter: &FilterExpression,
         decoder_config: &DecoderConfig,
     ) -> Result<Self> {
@@ -1083,7 +1248,9 @@ impl DecodeBatchScheduler {
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
-            root_scheduler.initialize(filter, &context).await?;
+            root_scheduler
+                .initialize(requested_ranges, filter, &context)
+                .await?;
 
             Ok(Self {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
@@ -1104,27 +1271,27 @@ impl DecodeBatchScheduler {
             let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
             let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
             let root_scheduler =
-                strategy.create_legacy_field_scheduler(&root_field, &mut column_iter, buffers)?;
+                strategy.create_array_field_scheduler(&root_field, &mut column_iter, buffers)?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
 
             Ok(Self {
-                root_scheduler: RootScheduler::Legacy(root_scheduler.into()),
+                root_scheduler: RootScheduler::Array(root_scheduler.into()),
                 root_fields,
                 cache,
             })
         }
     }
 
-    #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
+    #[deprecated(since = "0.29.1", note = "This is for v2.0 array-encoding paths")]
     pub fn from_scheduler(
-        root_scheduler: Arc<dyn crate::previous::decoder::FieldScheduler>,
+        root_scheduler: Arc<dyn FieldScheduler>,
         root_fields: Fields,
         cache: Arc<LanceCache>,
     ) -> Self {
         Self {
-            root_scheduler: RootScheduler::Legacy(root_scheduler),
+            root_scheduler: RootScheduler::Array(root_scheduler),
             root_fields,
             cache,
         }
@@ -1153,6 +1320,7 @@ impl DecodeBatchScheduler {
                 return;
             }
             let next_scan_lines = maybe_next_scan_lines.unwrap();
+            context.flush_io();
             if next_scan_lines.is_empty() {
                 return;
             }
@@ -1174,7 +1342,7 @@ impl DecodeBatchScheduler {
         }
     }
 
-    fn do_schedule_ranges_legacy(
+    fn do_schedule_ranges_array(
         &mut self,
         ranges: &[Range<u64>],
         filter: &FilterExpression,
@@ -1185,7 +1353,7 @@ impl DecodeBatchScheduler {
         // tasks are scheduled at the same top level row.
         priority: Option<Box<dyn PriorityRange>>,
     ) {
-        let root_scheduler = self.root_scheduler.as_legacy();
+        let root_scheduler = self.root_scheduler.as_array();
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         trace!(
             "Scheduling {} ranges across {}..{} ({} rows){}",
@@ -1217,6 +1385,7 @@ impl DecodeBatchScheduler {
                 return;
             }
             let next_scan_line = maybe_next_scan_line.unwrap();
+            context.flush_io();
             priority.advance(next_scan_line.rows_scheduled);
             num_rows_scheduled += next_scan_line.rows_scheduled;
             rows_to_schedule -= next_scan_line.rows_scheduled;
@@ -1249,8 +1418,8 @@ impl DecodeBatchScheduler {
         priority: Option<Box<dyn PriorityRange>>,
     ) {
         match &self.root_scheduler {
-            RootScheduler::Legacy(_) => {
-                self.do_schedule_ranges_legacy(ranges, filter, io, schedule_action, priority)
+            RootScheduler::Array(_) => {
+                self.do_schedule_ranges_array(ranges, filter, io, schedule_action, priority)
             }
             RootScheduler::Structural(_) => {
                 self.do_schedule_ranges_structural(ranges, filter, io, schedule_action)
@@ -1351,29 +1520,22 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
         if indices.is_empty() {
             return;
         }
         trace!("Scheduling take of {} rows", indices.len());
-        let ranges = Self::indices_to_ranges(indices);
-        self.schedule_ranges(&ranges, filter, sink, scheduler)
-    }
-
-    // coalesce continuous indices if possible (the input indices must be sorted and non-empty)
-    fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
-        let mut ranges = Vec::new();
-        let mut start = indices[0];
-
-        for window in indices.windows(2) {
-            if window[1] != window[0] + 1 {
-                ranges.push(start..window[0] + 1);
-                start = window[1];
+        let ranges = match RequestedRows::indices_to_ranges(indices) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                if let Err(SendError { .. }) = sink.send(Err(error)) {
+                    debug!(
+                        "schedule_take could not report invalid indices because the decoder was dropped"
+                    );
+                }
+                return;
             }
-        }
-
-        ranges.push(start..*indices.last().unwrap() + 1);
-        ranges
+        };
+        self.schedule_ranges(&ranges, filter, sink, scheduler)
     }
 }
 
@@ -1392,6 +1554,7 @@ pub struct BatchDecodeStream {
     rows_drained: u64,
     scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
+    limit_i32_offset_batch_size: bool,
 }
 
 impl BatchDecodeStream {
@@ -1410,6 +1573,16 @@ impl BatchDecodeStream {
         num_rows: u64,
         root_decoder: SimpleStructDecoder,
     ) -> Self {
+        Self::new_with_i32_offset_limit(scheduled, rows_per_batch, num_rows, root_decoder, true)
+    }
+
+    fn new_with_i32_offset_limit(
+        scheduled: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+        rows_per_batch: u32,
+        num_rows: u64,
+        root_decoder: SimpleStructDecoder,
+        limit_i32_offset_batch_size: bool,
+    ) -> Self {
         Self {
             context: DecoderContext::new(scheduled),
             root_decoder,
@@ -1419,10 +1592,11 @@ impl BatchDecodeStream {
             rows_drained: 0,
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
+            limit_i32_offset_batch_size,
         }
     }
 
-    fn accept_decoder(&mut self, decoder: crate::previous::decoder::DecoderReady) -> Result<()> {
+    fn accept_decoder(&mut self, decoder: DecoderReady) -> Result<()> {
         if decoder.path.is_empty() {
             // The root decoder we can ignore
             Ok(())
@@ -1443,7 +1617,7 @@ impl BatchDecodeStream {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for message in scan_line.decoders {
-                        self.accept_decoder(message.into_legacy())?;
+                        self.accept_decoder(message.into_array())?;
                     }
                 }
                 None => {
@@ -1501,6 +1675,17 @@ impl BatchDecodeStream {
         );
         self.root_decoder.wait_for_loaded(loaded_need).await?;
 
+        if self.limit_i32_offset_batch_size && has_i32_offsets(self.root_decoder.data_type()) {
+            let limit = LogicalPageDecoder::max_rows_to_drain(
+                &self.root_decoder,
+                to_take,
+                I32_OFFSET_BYTE_BUDGET,
+            )?;
+            let clamped = clamp_rows_to_i32_budget(limit, to_take);
+            self.rows_remaining += to_take - clamped;
+            to_take = clamped;
+        }
+
         let next_task = self.root_decoder.drain(to_take)?;
         self.rows_drained += to_take;
         Ok(Some(next_task))
@@ -1552,12 +1737,20 @@ impl BatchDecodeStream {
 // we can have a single implementation of the batch decode iterator
 enum RootDecoderMessage {
     LoadedPage(LoadedPageShard),
-    LegacyPage(crate::previous::decoder::DecoderReady),
+    ArrayPage(DecoderReady),
 }
 trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
     fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
     fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()>;
+    /// See [`LogicalPageDecoder::max_rows_to_drain`].  Decoders without i32-offset
+    /// accounting place no limit.
+    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: 0,
+        })
+    }
 }
 impl RootDecoderType for StructuralStructDecoder {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
@@ -1576,16 +1769,25 @@ impl RootDecoderType for StructuralStructDecoder {
 }
 impl RootDecoderType for SimpleStructDecoder {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
-        let RootDecoderMessage::LegacyPage(legacy_page) = message else {
+        let RootDecoderMessage::ArrayPage(array_page) = message else {
             unreachable!()
         };
-        self.accept_child(legacy_page)
+        self.accept_child(array_page)
     }
     fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         self.drain(num_rows)
     }
     fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()> {
         runtime.block_on(self.wait_for_loaded(loaded_need))
+    }
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        if !has_i32_offsets(LogicalPageDecoder::data_type(self)) {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+            });
+        }
+        LogicalPageDecoder::max_rows_to_drain(self, num_rows, byte_budget)
     }
 }
 
@@ -1663,7 +1865,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                         // The root decoder we can ignore
                         if !decoder_ready.path.is_empty() {
                             self.root_decoder
-                                .accept_message(RootDecoderMessage::LegacyPage(decoder_ready))?;
+                                .accept_message(RootDecoderMessage::ArrayPage(decoder_ready))?;
                         }
                     }
                 }
@@ -1712,6 +1914,13 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             return Ok(None);
         }
 
+        let limit = self
+            .root_decoder
+            .max_rows_to_drain(to_take, I32_OFFSET_BYTE_BUDGET)?;
+        let clamped = clamp_rows_to_i32_budget(limit, to_take);
+        self.rows_remaining += to_take - clamped;
+        to_take = clamped;
+
         let next_task = self.root_decoder.drain_batch(to_take)?;
 
         self.rows_drained += to_take;
@@ -1726,9 +1935,12 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_batch_task()
-            .transpose()
-            .map(|r| r.map_err(ArrowError::from))
+        let next = self.next_batch_task().transpose();
+        if let Some(Err(_)) = &next {
+            // Fuse after an error instead of re-attempting every remaining batch
+            self.rows_remaining = 0;
+        }
+        next.map(|r| r.map_err(ArrowError::from))
     }
 }
 
@@ -1748,7 +1960,12 @@ impl<T: RootDecoderType> RecordBatchReader for BatchDecodeIterator<T> {
 /// This estimate ignores validity bitmaps at the moment.  We can't infer
 /// their presence simply from the data_type and their impact is probably
 /// fairly negligible.
-fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
+/// Returns a schema-based estimate of the decoded bytes per row for `data_type`.
+///
+/// Fixed-width types are exact. Variable-width types (strings, lists, etc.) use
+/// heuristic constants. This estimate is used both in batch-size planning and as
+/// a fallback for V1 files that lack structural decoders.
+pub fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
     if let Some(w) = data_type.byte_width_opt() {
         return w as f64;
     }
@@ -1789,7 +2006,8 @@ pub struct StructuralBatchDecodeStream {
     // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
     //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
-    /// If set, target this many bytes per batch instead of `rows_per_batch` rows.
+    /// If set, target this many bytes per batch while retaining `rows_per_batch`
+    /// as an independent upper bound.
     batch_size_bytes: Option<u64>,
     /// Schema-based estimate of bytes per row, computed once at construction.
     /// Only meaningful when `batch_size_bytes` is `Some`.
@@ -1877,6 +2095,7 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
+        let row_limit = self.rows_remaining.min(self.rows_per_batch as u64);
         let mut to_take = if let Some(batch_size_bytes) = self.batch_size_bytes {
             let feedback = self.bytes_per_row_feedback.load(Ordering::Relaxed);
             let bpr = if feedback > 0 {
@@ -1885,9 +2104,9 @@ impl StructuralBatchDecodeStream {
                 self.schema_bytes_per_row
             };
             let rows = (batch_size_bytes as f64 / bpr) as u64;
-            self.rows_remaining.min(rows.max(1))
+            row_limit.min(rows.max(1))
         } else {
-            self.rows_remaining.min(self.rows_per_batch as u64)
+            row_limit
         };
         self.rows_remaining -= to_take;
 
@@ -1949,8 +2168,7 @@ impl StructuralBatchDecodeStream {
                     next_task.into_batch(emitted_batch_size_warning)?
                 };
                 let num_rows = batch.num_rows() as u64;
-                if num_rows > 0 {
-                    let bpr = data_size / num_rows;
+                if let Some(bpr) = data_size.checked_div(num_rows) {
                     let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
                     let next = if prev == 0 || bpr >= prev {
                         // First batch or actual size is larger than estimate:
@@ -1999,6 +2217,47 @@ impl RequestedRows {
             ranges.retain(|r| !r.is_empty());
         }
         self
+    }
+
+    fn into_ranges(self) -> Result<Vec<Range<u64>>> {
+        match self {
+            Self::Ranges(ranges) => Ok(ranges),
+            Self::Indices(indices) => Self::indices_to_ranges(&indices),
+        }
+    }
+
+    // coalesce continuous indices if possible (the input indices must be sorted)
+    fn indices_to_ranges(indices: &[u64]) -> Result<Vec<Range<u64>>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ranges = Vec::with_capacity(indices.len());
+        let mut start = indices[0];
+
+        for (index, pair) in indices.windows(2).enumerate() {
+            if pair[0] >= pair[1] {
+                return Err(Error::invalid_input(format!(
+                    "Requested row indices are not strictly increasing at index {index}: {} then {}",
+                    pair[0], pair[1]
+                )));
+            }
+            let end = pair[0]
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("Requested row index cannot equal u64::MAX"))?;
+            if pair[1] != end {
+                ranges.push(start..end);
+                start = pair[1];
+            }
+        }
+
+        let end = indices
+            .last()
+            .copied()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| Error::invalid_input("Requested row index cannot equal u64::MAX"))?;
+        ranges.push(start..end);
+        Ok(ranges)
     }
 }
 
@@ -2052,7 +2311,8 @@ pub struct SchedulerDecoderConfig {
     pub cache: Arc<LanceCache>,
     /// Decoder configuration
     pub decoder_config: DecoderConfig,
-    /// If set, target this many bytes per batch instead of using `batch_size` rows.
+    /// If set, target this many bytes per batch while retaining `batch_size` as
+    /// an independent row-count upper bound.
     ///
     /// Only supported for v2.1+ (structural) files. For v2.0 files this
     /// option is ignored and a warning is logged.
@@ -2103,12 +2363,38 @@ pub fn create_decode_stream(
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
     batch_size_bytes: Option<u64>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
+    create_decode_stream_with_i32_offset_limit(
+        schema,
+        num_rows,
+        batch_size,
+        is_structural,
+        should_validate,
+        spawn_structural_batch_decode_tasks,
+        rx,
+        batch_size_bytes,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_decode_stream_with_i32_offset_limit(
+    schema: &Schema,
+    num_rows: u64,
+    batch_size: u32,
+    is_structural: bool,
+    should_validate: bool,
+    spawn_structural_batch_decode_tasks: bool,
+    rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
+    batch_size_bytes: Option<u64>,
+    limit_i32_offset_batch_size: bool,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
         let structural_decoder = StructuralStructDecoder::new(
             arrow_schema.fields,
             should_validate,
             /*is_root=*/ true,
+            /*nullable=*/ false,
         )?;
         Ok(StructuralBatchDecodeStream::new(
             rx,
@@ -2127,7 +2413,14 @@ pub fn create_decode_stream(
         let root_fields = arrow_schema.fields;
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
-        Ok(BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream())
+        Ok(BatchDecodeStream::new_with_i32_offset_limit(
+            rx,
+            batch_size,
+            num_rows,
+            simple_struct_decoder,
+            limit_i32_offset_batch_size,
+        )
+        .into_stream())
     }
 }
 
@@ -2145,8 +2438,12 @@ pub fn create_decode_iterator(
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
     if is_structural {
-        let simple_struct_decoder =
-            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true)?;
+        let simple_struct_decoder = StructuralStructDecoder::new(
+            root_fields,
+            should_validate,
+            /*is_root=*/ true,
+            /*nullable=*/ false,
+        )?;
         Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
@@ -2175,13 +2472,14 @@ async fn create_scheduler_decoder(
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     let num_rows = requested_rows.num_rows();
+    let is_range_request = matches!(&requested_rows, RequestedRows::Ranges(_));
 
     let is_structural = column_infos[0].is_structural();
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = match mode.ok().as_deref() {
         Some("always") => true,
         Some("never") => false,
-        _ => matches!(requested_rows, RequestedRows::Ranges(_)),
+        _ => is_range_request,
     };
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -2200,8 +2498,10 @@ async fn create_scheduler_decoder(
     // The scheduler's `initialize` may perform I/O to load column metadata
     // unless that metadata is already in the cache.  This metadata loading
     // happens as part of this call and should be parallelized if reading
-    // multiple files.
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+    // multiple files.  We pass the rows we are about to schedule so that the
+    // structural path only initializes the pages those rows touch.
+    let requested_ranges = requested_rows.into_ranges()?;
+    let mut decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2210,6 +2510,7 @@ async fn create_scheduler_decoder(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
+        Some(&requested_ranges),
         &filter,
         &config.decoder_config,
     )
@@ -2226,28 +2527,14 @@ async fn create_scheduler_decoder(
         .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
 
     if inline_scheduling {
-        match requested_rows {
-            RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-            }
-            RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-            }
-        }
+        decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io);
         Ok(decode_stream)
     } else {
         // Spawn the (still synchronous) scheduling work so that decoder
         // messages can stream into the channel while the consumer is
         // already pulling from the decode stream.
         let scheduling = async move {
-            match requested_rows {
-                RequestedRows::Ranges(ranges) => {
-                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-                }
-                RequestedRows::Indices(indices) => {
-                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-                }
-            }
+            decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io)
         };
         let scheduler_handle = tokio::task::spawn(scheduling);
         Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
@@ -2334,14 +2621,17 @@ pub fn schedule_and_decode_blocking(
         return Ok(Box::new(RecordBatchIterator::new(vec![], arrow_schema)));
     }
 
+    let requested_rows = requested_rows.trim_empty_ranges();
     let num_rows = requested_rows.num_rows();
     let is_structural = column_infos[0].is_structural();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
-    // runtime.
-    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new(
+    // runtime.  Pass the rows we are about to schedule so the structural path
+    // only initializes the pages those rows touch.
+    let requested_ranges = requested_rows.into_ranges()?;
+    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2350,19 +2640,13 @@ pub fn schedule_and_decode_blocking(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
+        Some(&requested_ranges),
         &filter,
         &config.decoder_config,
     ))?;
 
     // Schedule the requested rows
-    match requested_rows {
-        RequestedRows::Ranges(ranges) => {
-            decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-        }
-        RequestedRows::Indices(indices) => {
-            decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-        }
-    }
+    decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io);
 
     // Drain the scheduler queue into a vec of decode messages
     let mut messages = Vec::new();
@@ -2430,6 +2714,16 @@ pub trait PrimitivePageDecoder: Send + Sync {
     /// * `num_rows` - how many rows to decode
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock>;
+
+    /// Returns the variable-width **value** bytes (the bytes an offsets buffer
+    /// indexes into) that decoding `num_rows` rows starting at `rows_to_skip`
+    /// will produce, or `None` when the encoding cannot report sizes without
+    /// decoding.  An upper bound is acceptable; callers use this to keep i32
+    /// offset values within capacity, so over-estimating only splits batches
+    /// earlier while under-estimating would let them overflow.
+    fn variable_width_bytes(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// A scheduler for single-column encodings of primitive data
@@ -2568,9 +2862,212 @@ impl PriorityRange for ListPriorityRange {
 }
 
 /// Contains the context for a scheduler
+/// The writer accumulates about this many bytes of values per column before it
+/// cuts pages (`EncodingOptions::cache_bytes_per_column`), and the rep/def
+/// budget of a mini-block chunk then splits that block into many small pages
+/// for nested columns. Batching reads back up to this size restores one
+/// I/O request per accumulated block.
+pub(crate) const IO_REQUEST_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+
+type SharedRead = Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, CloneableError>>>;
+
+/// What a pending read receives once its batch is submitted.
+enum SubmittedRead {
+    /// The read was alone in its batch and owns the request.
+    Alone(BoxFuture<'static, Result<Vec<Bytes>>>),
+    /// The batched request and the position of each of the read's ranges in it.
+    Shared(SharedRead, Vec<usize>),
+}
+
+struct PendingRead {
+    ranges: Vec<Range<u64>>,
+    priority: u64,
+    tx: oneshot::Sender<SubmittedRead>,
+}
+
+/// Collects the reads submitted while one scheduling step runs and sends them
+/// to the I/O layer as a single request.
+///
+/// The I/O scheduler only coalesces the ranges of one request, so the reads a
+/// step issues for different pages, or for different columns, cost one request
+/// each even when they sit next to each other in the file. A take of a few rows
+/// reads a few bytes per column, and a file's small pages are packed together,
+/// so batching them turns dozens of requests into a handful.
+///
+/// A batch is submitted by [`Self::flush`] when the step ends, as soon as the
+/// queued reads reach [`IO_REQUEST_BATCH_BYTES`] (a page that shards its own
+/// reads to bound buffering keeps every shard in a bounded read), or when a
+/// caller awaits one of its reads, so a read queued outside a step (indirect
+/// I/O issued from a load future) never waits for a flush that does not come.
+/// That last flush waits for one yield first: sibling futures polled in the
+/// same pass (a struct's columns initializing their pages, a scan line's list
+/// columns fetching their items) all queue their reads before the first of
+/// them resumes and submits the lot.
+pub(crate) struct RequestBatch {
+    inner: Arc<dyn EncodingsIo>,
+    pending: Arc<Mutex<Vec<PendingRead>>>,
+}
+
+impl std::fmt::Debug for RequestBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestBatch").finish_non_exhaustive()
+    }
+}
+
+impl RequestBatch {
+    pub(crate) fn new(inner: Arc<dyn EncodingsIo>) -> Self {
+        Self {
+            inner,
+            pending: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn queued_bytes(pending: &[PendingRead]) -> u64 {
+        pending
+            .iter()
+            .flat_map(|read| &read.ranges)
+            .map(|range| range.end - range.start)
+            .sum()
+    }
+
+    /// Bytes requested by the reads collected so far.
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        Self::queued_bytes(&self.pending.lock().unwrap())
+    }
+
+    /// Submits the collected reads as one request.
+    pub(crate) fn flush(&self) {
+        Self::flush_pending(&self.inner, &self.pending);
+    }
+
+    fn flush_pending(inner: &Arc<dyn EncodingsIo>, pending: &Mutex<Vec<PendingRead>>) {
+        let pending = std::mem::take(&mut *pending.lock().unwrap());
+        Self::submit_batch(inner, pending);
+    }
+
+    /// Submits `pending` as one request, sorted by file offset, and hands each
+    /// read its own slice of the result.
+    fn submit_batch(inner: &Arc<dyn EncodingsIo>, pending: Vec<PendingRead>) {
+        if pending.is_empty() {
+            return;
+        }
+        if pending.len() == 1 {
+            let read = pending.into_iter().next().unwrap();
+            let _ = read.tx.send(SubmittedRead::Alone(
+                inner.submit_request(read.ranges, read.priority),
+            ));
+            return;
+        }
+        // The lowest row number any of the batched reads delivers data for.
+        let priority = pending.iter().map(|read| read.priority).min().unwrap();
+        let mut ordered = pending
+            .iter()
+            .enumerate()
+            .flat_map(|(read_idx, read)| {
+                read.ranges
+                    .iter()
+                    .enumerate()
+                    .map(move |(range_idx, range)| (range.clone(), read_idx, range_idx))
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(range, _, _)| (range.start, range.end));
+        let ranges = ordered
+            .iter()
+            .map(|(range, _, _)| range.clone())
+            .collect::<Vec<_>>();
+        // For every read, where each of its ranges landed in the sorted request.
+        let mut positions = pending
+            .iter()
+            .map(|read| vec![0; read.ranges.len()])
+            .collect::<Vec<_>>();
+        for (position, (_, read_idx, range_idx)) in ordered.iter().enumerate() {
+            positions[*read_idx][*range_idx] = position;
+        }
+        let batched: SharedRead = inner
+            .submit_request(ranges, priority)
+            .map(|result| result.map(Arc::new).map_err(CloneableError))
+            .boxed()
+            .shared();
+        for (read, read_positions) in pending.into_iter().zip(positions) {
+            // The receiver is gone only when the read's future was dropped.
+            let _ = read
+                .tx
+                .send(SubmittedRead::Shared(batched.clone(), read_positions));
+        }
+    }
+}
+
+impl EncodingsIo for RequestBatch {
+    fn submit_request(
+        &self,
+        ranges: Vec<Range<u64>>,
+        priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        let mut pending = self.pending.lock().unwrap();
+        // Keep every batch within the budget: a page that shards its reads
+        // must not have all its shards collapse into one unbounded read.
+        let bytes = ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>();
+        if !pending.is_empty() && Self::queued_bytes(&pending) + bytes > IO_REQUEST_BATCH_BYTES {
+            Self::submit_batch(&self.inner, std::mem::take(&mut *pending));
+        }
+        let (tx, mut rx) = oneshot::channel();
+        pending.push(PendingRead {
+            ranges,
+            priority,
+            tx,
+        });
+        drop(pending);
+        let inner = self.inner.clone();
+        let pending = self.pending.clone();
+        async move {
+            let submitted = match rx.try_recv() {
+                // The step that queued this read already flushed it.
+                Ok(Some(submitted)) => submitted,
+                _ => {
+                    // Awaiting a read is the end of whatever step queued it.
+                    // Yield once so the siblings polled in the same pass get
+                    // to queue too, then submit them all.
+                    tokio::task::yield_now().await;
+                    Self::flush_pending(&inner, &pending);
+                    rx.await.map_err(|_| {
+                        Error::internal("a batched read was dropped before the batch was submitted")
+                    })?
+                }
+            };
+            match submitted {
+                SubmittedRead::Alone(request) => request.await,
+                SubmittedRead::Shared(batched, positions) => {
+                    let bytes = batched.await.map_err(|err| err.0)?;
+                    Ok(positions
+                        .into_iter()
+                        .map(|position| bytes[position].clone())
+                        .collect())
+                }
+            }
+        }
+        .boxed()
+    }
+
+    fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
+        self.inner.with_bypass_backpressure()
+    }
+
+    fn with_io_stats(
+        &self,
+        stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
+    ) -> Option<Arc<dyn EncodingsIo>> {
+        self.inner.with_io_stats(stats)
+    }
+}
+
 pub struct SchedulerContext {
     recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
     io: Arc<dyn EncodingsIo>,
+    /// `io`, as the batch that collects one scheduling step's reads.
+    batch: Arc<RequestBatch>,
     cache: Arc<LanceCache>,
     name: String,
     path: Vec<u32>,
@@ -2590,8 +3087,10 @@ impl<'a> ScopedSchedulerContext<'a> {
 
 impl SchedulerContext {
     pub fn new(io: Arc<dyn EncodingsIo>, cache: Arc<LanceCache>) -> Self {
+        let batch = Arc::new(RequestBatch::new(io));
         Self {
-            io,
+            io: batch.clone(),
+            batch,
             cache,
             recv: None,
             name: "".to_string(),
@@ -2602,6 +3101,11 @@ impl SchedulerContext {
 
     pub fn io(&self) -> &Arc<dyn EncodingsIo> {
         &self.io
+    }
+
+    /// Submits the reads the schedulers queued since the last step as one request.
+    pub fn flush_io(&self) {
+        self.batch.flush();
     }
 
     pub fn cache(&self) -> &Arc<LanceCache> {
@@ -2632,17 +3136,14 @@ impl SchedulerContext {
         VecDeque::from_iter(self.path.iter().copied())
     }
 
-    #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
-    pub fn locate_decoder(
-        &mut self,
-        decoder: Box<dyn crate::previous::decoder::LogicalPageDecoder>,
-    ) -> crate::previous::decoder::DecoderReady {
+    #[deprecated(since = "0.29.1", note = "This is for v2.0 array-encoding paths")]
+    pub fn locate_decoder(&mut self, decoder: Box<dyn LogicalPageDecoder>) -> DecoderReady {
         trace!(
             "Scheduling decoder of type {:?} for {:?}",
             decoder.data_type(),
             self.path,
         );
-        crate::previous::decoder::DecoderReady {
+        DecoderReady {
             decoder,
             path: self.current_path(),
         }
@@ -2698,8 +3199,14 @@ impl FilterExpression {
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
+    /// Loads the per-page metadata this column needs before scheduling.
+    ///
+    /// When `requested_ranges` is present, only pages overlapping those
+    /// top-level row ranges are initialized. `None` initializes the complete
+    /// field.
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>>;
@@ -2718,8 +3225,9 @@ pub trait DecodeArrayTask: Send {
 
 impl DecodeArrayTask for Box<dyn StructuralDecodeArrayTask> {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
-        StructuralDecodeArrayTask::decode(*self)
-            .map(|decoded_array| (decoded_array.array, decoded_array.data_size))
+        let decoded_array = StructuralDecodeArrayTask::decode(*self)?;
+        decoded_array.repdef.ensure_exhausted()?;
+        Ok((decoded_array.array, decoded_array.data_size))
     }
 }
 
@@ -2741,10 +3249,7 @@ impl NextDecodeTask {
     // suggesting the user try a smaller batch size.
     #[instrument(name = "task_to_batch", level = "debug", skip_all)]
     fn into_batch(self, emitted_batch_size_warning: Arc<Once>) -> Result<(RecordBatch, u64)> {
-        let (struct_arr, data_size) = self
-            .task
-            .decode()
-            .map_err(|e| Error::internal(format!("Error decoding batch: {}", e)))?;
+        let (struct_arr, data_size) = self.task.decode()?;
         let batch = RecordBatch::from(struct_arr.as_struct());
         if data_size > BATCH_SIZE_BYTES_WARNING {
             emitted_batch_size_warning.call_once(|| {
@@ -2765,7 +3270,7 @@ pub enum MessageType {
     // decoder itself.  The messages were not sent in priority order and the decoder
     // had to wait for I/O, figuring out the correct priority.  This was a lot of
     // complexity.
-    DecoderReady(crate::previous::decoder::DecoderReady),
+    DecoderReady(DecoderReady),
     // Starting in 2.1 we use a simpler scheme where the scheduling happens in priority
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
@@ -2773,7 +3278,7 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    pub fn into_legacy(self) -> crate::previous::decoder::DecoderReady {
+    pub fn into_array(self) -> DecoderReady {
         match self {
             Self::DecoderReady(decoder) => decoder,
             Self::UnloadedPage(_) => {
@@ -2820,6 +3325,13 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
+    /// Returns the exact decoded byte count for the next `num_rows` rows
+    /// from this decoder's current position, without consuming any rows.
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this page decoder".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -2868,10 +3380,33 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>>;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
+    /// Returns the exact decoded byte count for each of [`CANDIDATE_BATCH_SIZES`]
+    /// row counts, clamped to `rows_remaining`.
+    ///
+    /// Implementations should do their best to estimate the exact size required for
+    /// the uncompressed data.  In cases where this is not possible they should return
+    /// a worst-case estimate.
+    ///
+    /// The default implementation simply returns a "not supported" error though this
+    /// will hopefully be removed once implementation is complete.
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> Result<[u64; 8]> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this field decoder".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct DecoderPlugins {}
+
+/// The top-level column layout used by an in-memory encoded batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedBatchLayout {
+    /// Array pages include structural columns.
+    Array,
+    /// Structural pages include only leaf columns.
+    Structural,
+}
 
 /// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
 pub async fn decode_batch(
@@ -2879,7 +3414,7 @@ pub async fn decode_batch(
     filter: &FilterExpression,
     decoder_plugins: Arc<DecoderPlugins>,
     should_validate: bool,
-    version: LanceFileVersion,
+    layout: EncodedBatchLayout,
     cache: Option<Arc<LanceCache>>,
 ) -> Result<RecordBatch> {
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
@@ -2909,10 +3444,12 @@ pub async fn decode_batch(
     .await?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
-    let is_structural = version >= LanceFileVersion::V2_1;
+    let is_structural = layout == EncodedBatchLayout::Structural;
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = !matches!(mode.ok().as_deref(), Some("never"));
-    let mut decode_stream = create_decode_stream(
+    // `EncodedBatch` is created from one RecordBatch, so every i32-offset array is
+    // already known to fit in one Arrow array. Preserve the single-batch contract here.
+    let mut decode_stream = create_decode_stream_with_i32_offset_limit(
         &batch.schema,
         batch.num_rows,
         batch.num_rows as u32,
@@ -2921,6 +3458,7 @@ pub async fn decode_batch(
         spawn_structural_batch_decode_tasks,
         rx,
         None,
+        false,
     )?;
     decode_stream.next().await.unwrap().task.await
 }
@@ -2929,8 +3467,200 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use crate::previous::decoder::{DecoderReady, LogicalPageDecoder};
+    use arrow_array::StringArray;
     use std::collections::VecDeque;
+
+    struct StaticArrayDecodeTask(ArrayRef);
+
+    impl DecodeArrayTask for StaticArrayDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Ok((self.0, 0))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaticArrayPageDecoder {
+        array: ArrayRef,
+        rows_drained: u64,
+        /// Pretend each row decodes to this many bytes instead of its real size,
+        /// so budget exhaustion can be tested without gigabyte allocations.
+        fake_bytes_per_row: Option<u64>,
+    }
+
+    impl StaticArrayPageDecoder {
+        fn new(values: &[&str]) -> Self {
+            Self {
+                array: Arc::new(StringArray::from(values.to_vec())),
+                rows_drained: 0,
+                fake_bytes_per_row: None,
+            }
+        }
+
+        fn with_fake_bytes_per_row(values: &[&str], fake_bytes_per_row: u64) -> Self {
+            Self {
+                fake_bytes_per_row: Some(fake_bytes_per_row),
+                ..Self::new(values)
+            }
+        }
+
+        fn row_bytes(&self, row: usize) -> u64 {
+            self.fake_bytes_per_row.unwrap_or_else(|| {
+                self.array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(row)
+                    .len() as u64
+            })
+        }
+    }
+
+    impl LogicalPageDecoder for StaticArrayPageDecoder {
+        fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<'_, Result<()>> {
+            std::future::ready(Ok(())).boxed()
+        }
+
+        fn rows_loaded(&self) -> u64 {
+            self.array.len() as u64
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.array.len() as u64
+        }
+
+        fn rows_drained(&self) -> u64 {
+            self.rows_drained
+        }
+
+        fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+            let array = self
+                .array
+                .slice(self.rows_drained as usize, num_rows as usize);
+            self.rows_drained += num_rows;
+            Ok(NextDecodeTask {
+                task: Box::new(StaticArrayDecodeTask(array)),
+                num_rows,
+            })
+        }
+
+        fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+            let start = self.rows_drained as usize;
+            let mut rows = 0u64;
+            let mut bytes = 0u64;
+            for row in start..start + num_rows as usize {
+                let row_bytes = self.row_bytes(row);
+                if bytes + row_bytes > byte_budget {
+                    break;
+                }
+                bytes += row_bytes;
+                rows += 1;
+            }
+            Ok(DrainLimit { rows, bytes })
+        }
+
+        fn data_type(&self) -> &DataType {
+            self.array.data_type()
+        }
+    }
+
+    async fn array_stream_batch_sizes(
+        pages: Vec<StaticArrayPageDecoder>,
+        batch_size: u32,
+    ) -> Vec<usize> {
+        let num_rows = pages.iter().map(|page| page.num_rows()).sum::<u64>();
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let root_decoder = SimpleStructDecoder::new(fields, num_rows);
+        let (tx, rx) = unbounded_channel();
+        let pages = pages
+            .into_iter()
+            .map(|page| {
+                MessageType::DecoderReady(DecoderReady {
+                    decoder: Box::new(page),
+                    path: VecDeque::from([0]),
+                })
+            })
+            .collect();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: num_rows,
+            decoders: pages,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream =
+            BatchDecodeStream::new(rx, batch_size, num_rows, root_decoder).into_stream();
+        let mut batch_sizes = Vec::new();
+        while let Some(task) = stream.next().await {
+            batch_sizes.push(task.task.await.unwrap().num_rows());
+        }
+        batch_sizes
+    }
+
+    #[tokio::test]
+    async fn test_array_stream_spans_i32_offset_pages_within_budget() {
+        // Small variable-width pages must NOT split the batch at page boundaries.
+        let batch_sizes = array_stream_batch_sizes(
+            vec![
+                StaticArrayPageDecoder::new(&["a", "b"]),
+                StaticArrayPageDecoder::new(&["c", "d"]),
+            ],
+            4,
+        )
+        .await;
+        assert_eq!(batch_sizes, vec![4]);
+    }
+
+    #[tokio::test]
+    async fn test_array_stream_splits_when_i32_offset_budget_exhausted() {
+        // Three single-row pages pretending to hold 800MiB each: two fit the
+        // i32 offset budget (~2GiB), the third starts a new batch.
+        const FAKE_ROW_BYTES: u64 = 800 * 1024 * 1024;
+        let batch_sizes = array_stream_batch_sizes(
+            vec![
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["a"], FAKE_ROW_BYTES),
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["b"], FAKE_ROW_BYTES),
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["c"], FAKE_ROW_BYTES),
+            ],
+            4,
+        )
+        .await;
+        assert_eq!(batch_sizes, vec![2, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_array_stream_emits_over_budget_rows_alone() {
+        // Rows whose (possibly over-estimated) size exceeds the whole budget are
+        // emitted as single-row batches rather than failing the scan.
+        const FAKE_ROW_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+        let batch_sizes = array_stream_batch_sizes(
+            vec![
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["a"], FAKE_ROW_BYTES),
+                StaticArrayPageDecoder::with_fake_bytes_per_row(&["b"], FAKE_ROW_BYTES),
+            ],
+            4,
+        )
+        .await;
+        assert_eq!(batch_sizes, vec![1, 1]);
+    }
+
+    #[test]
+    fn requested_row_indices_convert_to_checked_ranges() {
+        let requested_rows = RequestedRows::Indices(vec![1, 2, 5, 8, 9]);
+        let ranges = requested_rows.into_ranges().unwrap();
+        assert_eq!(ranges, [1..3, 5..6, 8..10]);
+
+        let error = RequestedRows::Indices(vec![2, 2])
+            .into_ranges()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not strictly increasing"));
+
+        let error = RequestedRows::Indices(vec![u64::MAX])
+            .into_ranges()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("u64::MAX"));
+    }
 
     #[derive(Debug)]
     struct FailingPageDecoder {
@@ -2984,6 +3714,25 @@ mod tests {
         }
     }
 
+    struct InvalidInputDecodeTask;
+
+    impl DecodeArrayTask for InvalidInputDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Err(Error::invalid_input_source("malformed sparse page".into()))
+        }
+    }
+
+    #[test]
+    fn next_decode_task_preserves_invalid_input_errors() {
+        let err = NextDecodeTask {
+            task: Box::new(InvalidInputDecodeTask),
+            num_rows: 0,
+        }
+        .into_batch(Arc::new(Once::new()))
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
     #[test]
     fn test_read_zero_dimension_fsl_errors_instead_of_panicking() {
         // Simulates reading a column whose stored schema declares a
@@ -3012,11 +3761,11 @@ mod tests {
             err
         );
 
-        let mut legacy_columns = ColumnInfoIter::new(vec![], &[]);
+        let mut array_columns = ColumnInfoIter::new(vec![], &[]);
         let err = strategy
-            .create_legacy_field_scheduler(
+            .create_array_field_scheduler(
                 &field,
-                &mut legacy_columns,
+                &mut array_columns,
                 FileBuffers {
                     positions_and_sizes: &[],
                 },
@@ -3030,8 +3779,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_list_page_with_non_list_encoding_returns_error() {
+        let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let list = DataType::List(item);
+        let field = Field::try_from(&ArrowField::new("values", list, true)).unwrap();
+        let values_encoding = pb::ColumnEncoding {
+            column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+        };
+        let offsets_column = Arc::new(ColumnInfo::new(
+            0,
+            Arc::new([PageInfo {
+                num_rows: 1,
+                priority: 0,
+                encoding: PageEncoding::Legacy(pb::ArrayEncoding {
+                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(
+                        pb::Flat::default(),
+                    )),
+                }),
+                buffer_offsets_and_sizes: Arc::new([]),
+            }]),
+            vec![],
+            values_encoding.clone(),
+        ));
+        let items_column = Arc::new(ColumnInfo::new(1, Arc::new([]), vec![], values_encoding));
+        let column_indices = [0, 1];
+        let mut columns = ColumnInfoIter::new(vec![offsets_column, items_column], &column_indices);
+
+        let err = CoreFieldDecoderStrategy::default()
+            .create_array_field_scheduler(
+                &field,
+                &mut columns,
+                FileBuffers {
+                    positions_and_sizes: &[],
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("expected list encoding for field 'values' in column 0, page 0 but got"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
-    async fn test_legacy_stream_stops_on_load_error() {
+    async fn test_array_stream_stops_on_load_error() {
         use arrow_schema::Field as ArrowField;
 
         let rows_per_batch = 1;
@@ -3065,7 +3859,7 @@ mod tests {
         let err = batches
             .next()
             .await
-            .expect("stream should emit the legacy page-load error")
+            .expect("stream should emit the array page-load error")
             .unwrap_err();
         assert!(
             err.to_string().contains(load_error_message),
@@ -3074,7 +3868,7 @@ mod tests {
         );
         assert!(
             batches.next().await.is_none(),
-            "stream should stop after the legacy page-load error"
+            "stream should stop after the array page-load error"
         );
     }
 
@@ -3086,7 +3880,10 @@ mod tests {
         let batch_readahead = 2;
         let load_error_message = "simulated page load failure";
         let fields = Fields::from(vec![ArrowField::new("vector", DataType::Float32, true)]);
-        let root_decoder = StructuralStructDecoder::new(fields, false, /*is_root=*/ true).unwrap();
+        let root_decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap();
         let (tx, rx) = unbounded_channel();
         let failed_page = async move { Err(Error::io(load_error_message)) }.boxed();
 
@@ -3127,21 +3924,21 @@ mod tests {
     #[test]
     fn test_coalesce_indices_to_ranges_with_single_index() {
         let indices = vec![1];
-        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        let ranges = RequestedRows::indices_to_ranges(&indices).unwrap();
         assert_eq!(ranges, vec![1..2]);
     }
 
     #[test]
     fn test_coalesce_indices_to_ranges() {
         let indices = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        let ranges = RequestedRows::indices_to_ranges(&indices).unwrap();
         assert_eq!(ranges, vec![1..10]);
     }
 
     #[test]
     fn test_coalesce_indices_to_ranges_with_gaps() {
         let indices = vec![1, 2, 3, 5, 6, 7, 9];
-        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        let ranges = RequestedRows::indices_to_ranges(&indices).unwrap();
         assert_eq!(ranges, vec![1..4, 5..8, 9..10]);
     }
 
@@ -3170,15 +3967,14 @@ mod tests {
         batch_size: u32,
         batch_size_bytes: Option<u64>,
     ) -> Vec<RecordBatch> {
-        use crate::encoder::{EncodingOptions, default_encoding_strategy, encode_batch};
-        use crate::version::LanceFileVersion;
-
-        let version = LanceFileVersion::V2_1;
-        let options = EncodingOptions {
-            version,
-            ..Default::default()
+        use crate::{
+            encoder::{EncodingOptions, encode_batch},
+            testing::{TestEncoding, test_encoding_strategy},
         };
-        let strategy = default_encoding_strategy(version);
+
+        let version = TestEncoding::StructuralU16;
+        let options = EncodingOptions::default();
+        let strategy = test_encoding_strategy(version);
         let schema = Schema::try_from(batch.schema().as_ref()).unwrap();
         let encoded = encode_batch(batch, Arc::new(schema.clone()), strategy.as_ref(), &options)
             .await
@@ -3316,6 +4112,29 @@ mod tests {
                 batch.num_rows()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_respect_row_limit() {
+        use arrow_array::Int32Array;
+
+        let num_rows: i32 = 1000;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+
+        // The byte limit can hold every row, so the 100-row limit must win.
+        let batches =
+            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 100, Some(10_000)).await;
+        assert_eq!(batches.len(), 10);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 100));
     }
 
     #[tokio::test]

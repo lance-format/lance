@@ -1,24 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, hint::black_box, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt32Array};
+#[cfg(feature = "bitpacking")]
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
+#[cfg(feature = "bitpacking")]
+use bytemuck::Pod;
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
+#[cfg(feature = "bitpacking")]
+use lance_bitpacking::BitPacking;
 use lance_core::cache::LanceCache;
 use lance_datagen::ArrayGeneratorExt;
+#[cfg(feature = "bitpacking")]
+use lance_encoding::buffer::LanceBuffer;
+#[cfg(feature = "bitpacking")]
+use lance_encoding::compression::BlockDecompressor;
+#[cfg(feature = "bitpacking")]
+use lance_encoding::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+#[cfg(feature = "bitpacking")]
+use lance_encoding::encodings::physical::bitpacking::{ELEMS_PER_CHUNK, InlineBitpacking};
 use lance_encoding::{
     decoder::{
-        DecodeBatchScheduler, DecoderConfig, DecoderPlugins, FilterExpression, create_decode_stream,
+        DecodeBatchScheduler, DecoderConfig, DecoderPlugins, EncodedBatchLayout, FilterExpression,
+        create_decode_stream,
     },
-    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
-    version::LanceFileVersion,
+    encoder::{EncodingOptions, encode_batch},
 };
 use tokio::sync::mpsc::unbounded_channel;
 
 use rand::Rng;
+
+pub mod common;
+use common::{BenchEncoding, encoding_strategy};
 
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
@@ -49,6 +66,15 @@ const PRIMITIVE_TYPES: &[DataType] = &[
 // schema doesn't yet parse them in the context of a fixed size list.
 const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[DataType::Int8, DataType::Float32];
 
+fn encoded_batch_layout(encoding: BenchEncoding) -> EncodedBatchLayout {
+    match encoding {
+        BenchEncoding::Array => EncodedBatchLayout::Array,
+        BenchEncoding::StructuralU16 | BenchEncoding::StructuralU32 => {
+            EncodedBatchLayout::Structural
+        }
+    }
+}
+
 fn bench_decode(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
@@ -64,7 +90,7 @@ fn bench_decode(c: &mut Criterion) {
                 .unwrap();
             let lance_schema =
                 Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-            let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+            let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU16);
             let encoded = rt
                 .block_on(encode_batch(
                     &data,
@@ -81,7 +107,7 @@ fn bench_decode(c: &mut Criterion) {
                         &FilterExpression::no_filter(),
                         Arc::<DecoderPlugins>::default(),
                         false,
-                        LanceFileVersion::default(),
+                        EncodedBatchLayout::Structural,
                         Some(Arc::new(LanceCache::no_cache())),
                     ))
                     .unwrap();
@@ -95,14 +121,14 @@ fn bench_decode_fsl(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_fsl");
     const NUM_BYTES: u64 = 1024 * 1024 * 128;
-    for version in [
-        LanceFileVersion::V2_0,
-        LanceFileVersion::V2_1,
-        LanceFileVersion::V2_2,
+    for encoding in [
+        BenchEncoding::Array,
+        BenchEncoding::StructuralU16,
+        BenchEncoding::StructuralU32,
     ] {
         for data_type in PRIMITIVE_TYPES_FOR_FSL {
             for dimension in [4, 16, 32, 64, 128] {
-                let nullable_choices: &[bool] = if version == LanceFileVersion::V2_0 {
+                let nullable_choices: &[bool] = if encoding == BenchEncoding::Array {
                     &[false]
                 } else {
                     &[false, true]
@@ -110,7 +136,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                 for nullable in nullable_choices {
                     let func_name = format!(
                         "{:?}_{}_v{}_null{}",
-                        data_type, dimension, version, nullable
+                        data_type, dimension, encoding, nullable
                     )
                     .to_lowercase();
                     group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
@@ -133,7 +159,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                             lance_core::datatypes::Schema::try_from(data.schema().as_ref())
                                 .unwrap(),
                         );
-                        let encoding_strategy = default_encoding_strategy(version);
+                        let encoding_strategy = encoding_strategy(encoding);
                         let encoded = rt
                             .block_on(encode_batch(
                                 &data,
@@ -149,7 +175,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                                     &FilterExpression::no_filter(),
                                     Arc::<DecoderPlugins>::default(),
                                     false,
-                                    version,
+                                    encoded_batch_layout(encoding),
                                     Some(Arc::new(LanceCache::no_cache())),
                                 ))
                                 .unwrap();
@@ -199,7 +225,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
 
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU16);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -215,7 +241,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::default(),
+                    EncodedBatchLayout::Structural,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -274,7 +300,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             RecordBatch::try_new(Arc::new(new_schema.clone()), data.columns().to_vec()).unwrap();
 
         let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -291,7 +317,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::V2_2,
+                    EncodedBatchLayout::Structural,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -331,7 +357,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
 
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU16);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -347,7 +373,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::default(),
+                    EncodedBatchLayout::Structural,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -398,7 +424,7 @@ fn bench_decode_compressed(c: &mut Criterion) {
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
         // V2_2+ required for general compression
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
 
         // Encode once during setup
         let encoded = rt
@@ -423,7 +449,7 @@ fn bench_decode_compressed(c: &mut Criterion) {
                             &FilterExpression::no_filter(),
                             Arc::<DecoderPlugins>::default(),
                             false,
-                            LanceFileVersion::V2_2,
+                            EncodedBatchLayout::Structural,
                             Some(Arc::new(LanceCache::no_cache())),
                         ))
                         .unwrap();
@@ -476,7 +502,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
 
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
 
         let encoded = rt
             .block_on(encode_batch(
@@ -563,6 +589,136 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
     }
 }
 
+#[cfg(feature = "bitpacking")]
+fn make_inline_bitpacking_chunk<T>(bit_width: usize) -> LanceBuffer
+where
+    T: ArrowNativeType + BitPacking + Pod,
+{
+    let value_range = 1_usize << bit_width;
+    let values: Vec<T> = (0..ELEMS_PER_CHUNK as usize)
+        .map(|i| T::from_usize((i * 31 + 7) % value_range).unwrap())
+        .collect();
+    let packed_words = ELEMS_PER_CHUNK as usize * bit_width / (std::mem::size_of::<T>() * 8);
+
+    let mut chunk = Vec::with_capacity(1 + packed_words);
+    chunk.push(T::from_usize(bit_width).unwrap());
+    let payload_start = chunk.len();
+    chunk.resize(payload_start + packed_words, T::from_usize(0).unwrap());
+    unsafe {
+        BitPacking::unchecked_pack(bit_width, &values, &mut chunk[payload_start..]);
+    }
+
+    LanceBuffer::reinterpret_vec(chunk)
+}
+
+#[cfg(feature = "bitpacking")]
+fn read_little_endian_header<T>(bytes: &[u8]) -> usize {
+    bytes[..std::mem::size_of::<T>()]
+        .iter()
+        .enumerate()
+        .fold(0_u64, |value, (idx, byte)| {
+            value | ((*byte as u64) << (idx * 8))
+        }) as usize
+}
+
+#[cfg(feature = "bitpacking")]
+fn legacy_copy_unchunk<T>(data: LanceBuffer, num_values: u64) -> DataBlock
+where
+    T: ArrowNativeType + BitPacking + Pod,
+{
+    assert!(data.len() >= std::mem::size_of::<T>());
+    assert!(num_values <= ELEMS_PER_CHUNK);
+
+    let chunk_in_u8 = data.to_vec();
+    let bit_width_value = read_little_endian_header::<T>(&chunk_in_u8);
+    let chunk = bytemuck::cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
+    assert!(std::mem::size_of_val(chunk) == bit_width_value * ELEMS_PER_CHUNK as usize / 8);
+
+    let mut decompressed = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+    unsafe {
+        BitPacking::unchecked_unpack(bit_width_value, chunk, &mut decompressed);
+    }
+
+    decompressed.truncate(num_values as usize);
+    DataBlock::FixedWidth(FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(decompressed),
+        bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
+        num_values,
+        block_info: BlockInfo::new(),
+    })
+}
+
+#[cfg(feature = "bitpacking")]
+fn typed_view_unchunk(buffer: LanceBuffer, uncompressed_bits: u64, num_values: u64) -> DataBlock {
+    InlineBitpacking::new(uncompressed_bits)
+        .decompress(Some(buffer), num_values)
+        .unwrap()
+}
+
+#[cfg(feature = "bitpacking")]
+fn assert_same_fixed_width_payloads(legacy: &DataBlock, typed_view: &DataBlock) {
+    let legacy = legacy.as_fixed_width_ref().unwrap();
+    let typed_view = typed_view.as_fixed_width_ref().unwrap();
+
+    assert_eq!(legacy.num_values, typed_view.num_values);
+    assert_eq!(legacy.bits_per_value, typed_view.bits_per_value);
+    assert_eq!(legacy.data.as_ref(), typed_view.data.as_ref());
+}
+
+#[cfg(feature = "bitpacking")]
+fn bench_inline_bitpacking_case<T>(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    name: &str,
+    bit_width: usize,
+) where
+    T: ArrowNativeType + BitPacking + Pod,
+{
+    let buffer = make_inline_bitpacking_chunk::<T>(bit_width);
+    let compressed_bytes = buffer.len() as u64;
+    let uncompressed_bits = (std::mem::size_of::<T>() * 8) as u64;
+    group.throughput(criterion::Throughput::Bytes(compressed_bytes));
+
+    let legacy = legacy_copy_unchunk::<T>(buffer.clone(), ELEMS_PER_CHUNK);
+    let typed_view = typed_view_unchunk(buffer.clone(), uncompressed_bits, ELEMS_PER_CHUNK);
+    assert_same_fixed_width_payloads(&legacy, &typed_view);
+
+    group.bench_function(format!("{name}/legacy_copy/compressed_bytes"), |b| {
+        b.iter(|| {
+            let decoded =
+                legacy_copy_unchunk::<T>(black_box(buffer.clone()), black_box(ELEMS_PER_CHUNK));
+            let fixed = decoded.as_fixed_width().unwrap();
+            black_box(fixed.data.as_ref());
+        })
+    });
+
+    group.bench_function(format!("{name}/typed_view/compressed_bytes"), |b| {
+        b.iter(|| {
+            let decoded = typed_view_unchunk(
+                black_box(buffer.clone()),
+                black_box(uncompressed_bits),
+                black_box(ELEMS_PER_CHUNK),
+            );
+            let fixed = decoded.as_fixed_width().unwrap();
+            black_box(fixed.data.as_ref());
+        })
+    });
+}
+
+#[cfg(feature = "bitpacking")]
+fn bench_decode_inline_bitpacking_unchunk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_inline_bitpacking_unchunk");
+    bench_inline_bitpacking_case::<u32>(&mut group, "u32_bw12_1024", 12);
+    bench_inline_bitpacking_case::<u64>(&mut group, "u64_bw23_1024", 23);
+    group.finish();
+}
+
+#[cfg(not(feature = "bitpacking"))]
+fn bench_decode_inline_bitpacking_unchunk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_inline_bitpacking_unchunk");
+    group.bench_function("bitpacking_feature_disabled", |b| b.iter(|| black_box(())));
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
@@ -570,7 +726,7 @@ criterion_group!(
         .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding, bench_decode_compressed,
-                bench_decode_compressed_parallel);
+                bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -578,5 +734,5 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
-                bench_decode_compressed, bench_decode_compressed_parallel);
+                bench_decode_compressed, bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
 criterion_main!(benches);

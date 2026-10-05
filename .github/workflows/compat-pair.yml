@@ -21,7 +21,7 @@ on:
         required: false
         default: ""
       kinds:
-        description: "Comma-separated index kinds (INVERTED,BTREE,...) or 'all'."
+        description: "Comma-separated index kinds (INVERTED,BTREE,IVF_PQ,...) or 'all'."
         required: false
         default: "all"
       max_length:
@@ -51,10 +51,10 @@ jobs:
       # Toolchain for the build-from-source provisioning path (refs without a wheel).
       - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install build deps
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install host deps
         run: pip install pytest pytest-xdist pyarrow packaging maturin
       - name: Resolve kinds
@@ -63,7 +63,7 @@ jobs:
           KINDS_IN: ${{ inputs.kinds }}
         run: |
           if [ -z "$KINDS_IN" ] || [ "$KINDS_IN" = "all" ]; then
-            echo "value=INVERTED,BTREE,BITMAP,LABEL_LIST,NGRAM,ZONEMAP,BLOOMFILTER" >> "$GITHUB_OUTPUT"
+            echo "value=INVERTED,BTREE,BITMAP,LABEL_LIST,NGRAM,ZONEMAP,BLOOMFILTER,IVF_PQ" >> "$GITHUB_OUTPUT"
           else
             echo "value=$KINDS_IN" >> "$GITHUB_OUTPUT"
           fi

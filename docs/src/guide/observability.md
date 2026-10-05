@@ -2,8 +2,8 @@
 
 Lance can publish operational metrics to your monitoring stack. The table below
 is the authoritative catalogue of the metrics Lance emits, shared verbatim with
-the Rust [`lance::metrics`](https://docs.rs/lance/latest/lance/metrics/) module
-documentation.
+the Rust [`lance::metrics`](https://github.com/lance-format/lance/blob/main/rust/lance/src/metrics.md)
+module documentation.
 
 --8<-- "rust/lance/src/metrics.md"
 
@@ -11,8 +11,8 @@ documentation.
 
 Lance emits through the [`metrics`](https://docs.rs/metrics) crate facade, so it
 is not tied to a specific backend — you install a recorder/exporter and route
-the metrics wherever you like. Metrics are available from **both** the Rust and
-Python APIs.
+the metrics wherever you like. Metrics are available from the Rust, Python, and
+Java APIs.
 
 ### Rust
 
@@ -56,6 +56,37 @@ from lance.otel import instrument_lance_metrics
 # Uses the global MeterProvider; pass meter_provider=... to target a specific one.
 instrument_lance_metrics()
 ```
+
+### Java
+
+The Java SDK includes an OpenTelemetry bridge in `org.lance.otel`. Register it
+before opening datasets or performing Lance IO so the process-global Rust
+recorder sees every emitted metric:
+
+```java
+import org.lance.otel.LanceMetrics;
+
+LanceMetrics.instrument();
+```
+
+The OpenTelemetry API is a dependency of the Java SDK. The application must
+still configure an OpenTelemetry SDK, metric reader, and exporter for collection
+and delivery.
+
+The no-argument method uses OpenTelemetry's global `MeterProvider`. To register
+with an explicitly configured provider, pass it directly:
+
+```java
+SdkMeterProvider provider = SdkMeterProvider.builder()
+    .registerMetricReader(metricReader)
+    .build();
+LanceMetrics.instrument(provider);
+```
+
+Repeated calls with the same provider are idempotent. Passing a different
+provider unregisters the existing callback before registering the new one. Call
+`LanceMetrics.close()` to stop exporting while retaining the process-global Rust
+metric state.
 
 From there the metrics flow through whatever OpenTelemetry pipeline you have
 configured (OTLP, Prometheus, console, …). Because OpenTelemetry has no

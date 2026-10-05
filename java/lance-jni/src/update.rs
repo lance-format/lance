@@ -5,10 +5,12 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::IntoJava;
 use crate::utils::to_rust_map;
-use crate::{JNIEnvExt, RT};
+use crate::{JNIEnvExt, block_on};
 use jni::JNIEnv;
 use jni::objects::{JMap, JObject, JValueGen};
 use lance::dataset::UpdateBuilder;
+use lance_file::version::LanceFileVersion;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ fn inner_update<'local>(
     let where_clause = extract_where(env, &jparam)?;
     let conflict_retries = extract_conflict_retries(env, &jparam)?;
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
+    let data_storage_version = extract_data_storage_version(env, &jparam)?;
 
     // Clone the inner Dataset out of the `get_rust_field` guard and drop the
     // guard before running the long-lived async update. Otherwise the guard
@@ -44,6 +47,10 @@ fn inner_update<'local>(
         .conflict_retries(conflict_retries)
         .retry_timeout(Duration::from_millis(retry_timeout_ms));
 
+    if let Some(version) = data_storage_version {
+        builder = builder.data_storage_version(LanceFileVersion::from_str(&version)?);
+    }
+
     if let Some(predicate) = where_clause {
         builder = builder.update_where(&predicate)?;
     }
@@ -53,7 +60,7 @@ fn inner_update<'local>(
     }
 
     let job = builder.build()?;
-    let update_result = RT.block_on(job.execute())?;
+    let update_result = block_on(job.execute())?;
 
     // Avoid panicking if Lance core retains a clone of the Arc; fall back to a
     // deep clone so the JNI boundary stays panic-free.
@@ -94,6 +101,21 @@ fn extract_conflict_retries<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) 
 fn extract_retry_timeout_ms<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<u64> {
     let timeout_ms = env.call_method(jparam, "retryTimeoutMs", "()J", &[])?.j()? as u64;
     Ok(timeout_ms)
+}
+
+fn extract_data_storage_version<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<Option<String>> {
+    let version = env
+        .call_method(
+            jparam,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    env.get_string_opt(&version)
 }
 
 const UPDATE_RESULT_CLASS: &str = "org/lance/update/UpdateResult";

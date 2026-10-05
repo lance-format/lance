@@ -18,25 +18,27 @@
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
-use byteorder::{ByteOrder, LittleEndian};
-use lance_bitpacking::BitPacking;
+use lance_bitpacking::BitPackingUninit;
 
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor};
+use crate::compression::{
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+};
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::{ProtobufUtils21, pb21};
 use crate::statistics::{GetStat, Stat};
-use bytemuck::{AnyBitPattern, cast_slice};
+use bytemuck::Pod;
 
-const LOG_ELEMS_PER_CHUNK: u8 = 10;
-const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
+pub(crate) const LOG_ELEMS_PER_CHUNK: u8 = 10;
+/// Number of values encoded in each inline bitpacking chunk.
+pub const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
 
 #[derive(Debug, Default)]
 pub struct InlineBitpacking {
@@ -70,7 +72,7 @@ impl InlineBitpacking {
     /// Each chunk can have a different bit width
     ///
     /// Each chunk has the compressed bit width stored inline in the chunk itself.
-    fn bitpack_chunked<T: ArrowNativeType + BitPacking>(
+    fn bitpack_chunked<T: ArrowNativeType + BitPackingUninit>(
         data: FixedWidthDataBlock,
     ) -> MiniBlockCompressed {
         debug_assert!(data.num_values > 0);
@@ -111,12 +113,13 @@ impl InlineBitpacking {
             output.push(T::from_usize(bit_width).unwrap());
             let output_len = output.len();
             unsafe {
-                output.set_len(output_len + *packed_chunk_size);
-                BitPacking::unchecked_pack(
+                BitPackingUninit::unchecked_pack_uninit(
                     bit_width,
                     &data_buffer[start_elem..][..ELEMS_PER_CHUNK as usize],
-                    &mut output[output_len..][..*packed_chunk_size],
+                    &mut output.spare_capacity_mut()[..*packed_chunk_size],
                 );
+                // The bitpacking kernel initialized every reserved output word.
+                output.set_len(output_len + *packed_chunk_size);
             }
             chunks.push(MiniBlockChunk {
                 buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u32],
@@ -137,13 +140,15 @@ impl InlineBitpacking {
         let bit_width = bit_widths_array.value(bit_widths_array.len() - 1) as usize;
         output.push(T::from_usize(bit_width).unwrap());
         let output_len = output.len();
+        let packed_chunk_size = packed_chunk_sizes[bit_widths_array.len() - 1];
         unsafe {
-            output.set_len(output_len + packed_chunk_sizes[bit_widths_array.len() - 1]);
-            BitPacking::unchecked_pack(
+            BitPackingUninit::unchecked_pack_uninit(
                 bit_width,
                 &last_chunk,
-                &mut output[output_len..][..packed_chunk_sizes[bit_widths_array.len() - 1]],
+                &mut output.spare_capacity_mut()[..packed_chunk_size],
             );
+            // The bitpacking kernel initialized every reserved output word.
+            output.set_len(output_len + packed_chunk_size);
         }
         chunks.push(MiniBlockChunk {
             buffer_sizes: vec![
@@ -181,27 +186,91 @@ impl InlineBitpacking {
         )
     }
 
-    fn unchunk<T: ArrowNativeType + BitPacking + AnyBitPattern>(
+    fn unchunk<T: ArrowNativeType + BitPackingUninit + Pod>(
         data: LanceBuffer,
         num_values: u64,
     ) -> Result<DataBlock> {
-        // Ensure at least the header is present
-        assert!(data.len() >= std::mem::size_of::<T>());
-        assert!(num_values <= ELEMS_PER_CHUNK);
-
         // This macro decompresses a chunk(1024 values) of bitpacked values.
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
-        let mut decompressed = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+        let word_size = std::mem::size_of::<T>();
 
-        // Copy for memory alignment
-        let chunk_in_u8: Vec<u8> = data.to_vec();
-        let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
-        let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
-        let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
-        // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
-        assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
+        if data.len() < word_size {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking chunk is too small for {}-byte header: {} bytes",
+                    word_size,
+                    data.len()
+                ),
+            ));
+        }
+        if !data.len().is_multiple_of(word_size) {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking chunk size must be a multiple of {} bytes, got {} bytes",
+                    word_size,
+                    data.len()
+                ),
+            ));
+        }
+        if num_values > ELEMS_PER_CHUNK {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking chunk has {} values, expected at most {}",
+                    num_values, ELEMS_PER_CHUNK
+                ),
+            ));
+        }
+
+        let chunk_words = data.borrow_to_typed_view::<T>();
+        let bit_width_value = chunk_words[0].as_usize();
+        if bit_width_value > uncompressed_bit_width {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking width {} exceeds {}-bit values",
+                    bit_width_value, uncompressed_bit_width
+                ),
+            ));
+        }
+        let chunk = &chunk_words[1..];
+        // bit_width_value has already been verified to be <= uncompressed_bit_width
+        // (8/16/32/64), so bit_width_value * ELEMS_PER_CHUNK (1024) can never
+        // overflow usize on supported targets. Keep checked_mul as defense in depth.
+        let expected_num_bits = bit_width_value
+            .checked_mul(ELEMS_PER_CHUNK as usize)
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "inline_bitpacking",
+                    format!(
+                        "Inline bitpacking width {} overflows chunk bit count",
+                        bit_width_value
+                    ),
+                )
+            })?;
+        let expected_num_bytes = expected_num_bits / 8;
+        let actual_num_bytes = std::mem::size_of_val(chunk);
+        if actual_num_bytes != expected_num_bytes {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "Inline bitpacking payload has {} bytes, expected {} bytes for bit width {}",
+                    actual_num_bytes, expected_num_bytes, bit_width_value
+                ),
+            ));
+        }
+
+        let mut decompressed = Vec::with_capacity(ELEMS_PER_CHUNK as usize);
         unsafe {
-            BitPacking::unchecked_unpack(bit_width_value as usize, chunk, &mut decompressed);
+            BitPackingUninit::unchecked_unpack_uninit(
+                bit_width_value,
+                chunk,
+                &mut decompressed.spare_capacity_mut()[..ELEMS_PER_CHUNK as usize],
+            );
+            // The bitpacking kernel initialized all 1024 decoded values.
+            decompressed.set_len(ELEMS_PER_CHUNK as usize);
         }
 
         decompressed.truncate(num_values as usize);
@@ -212,10 +281,25 @@ impl InlineBitpacking {
             block_info: BlockInfo::new(),
         }))
     }
+
+    /// An empty fixed-width block, used for the `num_values == 0` short-circuit in
+    /// both decompressor entry points so empty blocks skip chunk validation entirely.
+    fn empty_block(&self) -> DataBlock {
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::empty(),
+            bits_per_value: self.uncompressed_bit_width,
+            num_values: 0,
+            block_info: BlockInfo::new(),
+        })
+    }
 }
 
 impl MiniBlockCompressor for InlineBitpacking {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
             _ => Err(Error::invalid_input_source(
@@ -230,10 +314,27 @@ impl MiniBlockCompressor for InlineBitpacking {
 }
 
 impl BlockCompressor for InlineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let fixed_width = data.as_fixed_width().unwrap();
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(
+                "Inline bitpacking requires fixed-width data",
+            ));
+        };
+        if fixed_width.bits_per_value != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Inline bitpacking expects {}-bit values, got {}",
+                self.uncompressed_bit_width, fixed_width.bits_per_value
+            )));
+        }
         let (chunked, _) = self.chunk_data(fixed_width);
-        Ok(chunked.data.into_iter().next().unwrap())
+        let payload =
+            chunked.data.into_iter().next().ok_or_else(|| {
+                Error::internal("Inline bitpacking produced no payload".to_string())
+            })?;
+        Ok((
+            Some(payload),
+            ProtobufUtils21::inline_bitpacking(self.uncompressed_bit_width, None),
+        ))
     }
 }
 
@@ -241,6 +342,10 @@ impl MiniBlockDecompressor for InlineBitpacking {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
+        if num_values == 0 {
+            // Empty mini-blocks have no inline bit-width header to decode.
+            return Ok(self.empty_block());
+        }
         match self.uncompressed_bit_width {
             8 => Self::unchunk::<u8>(data, num_values),
             16 => Self::unchunk::<u16>(data, num_values),
@@ -249,10 +354,23 @@ impl MiniBlockDecompressor for InlineBitpacking {
             _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
         }
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values
+            .checked_mul(self.uncompressed_bit_width)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl BlockDecompressor for InlineBitpacking {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Inline bitpacking")?;
+        if num_values == 0 {
+            // Empty blocks carry no inline bit-width header to decode; avoid
+            // spurious "too small for header" corrupt-file errors and mirror
+            // the MiniBlockDecompressor path. See #7794.
+            return Ok(self.empty_block());
+        }
         match self.uncompressed_bit_width {
             8 => Self::unchunk::<u8>(data, num_values),
             16 => Self::unchunk::<u16>(data, num_values),
@@ -268,7 +386,7 @@ impl BlockDecompressor for InlineBitpacking {
 /// Each chunk of 1024 values is packed with a constant bit width. For the tail we compare the
 /// cost of padding and packing against storing the raw values: if padding yields a smaller
 /// representation we pack; otherwise we append the raw tail.
-fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
+fn bitpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     data: FixedWidthDataBlock,
     compressed_bits_per_value: usize,
 ) -> LanceBuffer {
@@ -279,12 +397,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let last_chunk_is_runt = data_buffer.len() % ELEMS_PER_CHUNK as usize != 0;
     let words_per_chunk = (ELEMS_PER_CHUNK as usize * compressed_bits_per_value)
         .div_ceil(data.bits_per_value as usize);
-    #[allow(clippy::uninit_vec)]
     let mut output: Vec<T> = Vec::with_capacity(num_chunks * words_per_chunk);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        output.set_len(num_chunks * words_per_chunk);
-    }
 
     let num_whole_chunks = if last_chunk_is_runt {
         num_chunks - 1
@@ -296,14 +409,15 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     for i in 0..num_whole_chunks {
         let input_start = i * ELEMS_PER_CHUNK as usize;
         let input_end = input_start + ELEMS_PER_CHUNK as usize;
-        let output_start = i * words_per_chunk;
-        let output_end = output_start + words_per_chunk;
+        let output_start = output.len();
         unsafe {
-            BitPacking::unchecked_pack(
+            BitPackingUninit::unchecked_pack_uninit(
                 compressed_bits_per_value,
                 &data_buffer[input_start..input_end],
-                &mut output[output_start..output_end],
+                &mut output.spare_capacity_mut()[..words_per_chunk],
             );
+            // The bitpacking kernel initialized this complete packed chunk.
+            output.set_len(output_start + words_per_chunk);
         }
     }
 
@@ -312,10 +426,6 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     }
 
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
-    // Safety: output ensures to have those values.
-    unsafe {
-        output.set_len(num_whole_chunks * words_per_chunk);
-    }
     let remaining_items = data_buffer.len() - last_chunk_start;
 
     let uncompressed_bits = data.bits_per_value as usize;
@@ -331,13 +441,13 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
         last_chunk[..remaining_items].copy_from_slice(&data_buffer[last_chunk_start..]);
         let start = output.len();
         unsafe {
-            // Capacity reserves a full chunk for each block; extend the visible length and fill it immediately.
-            output.set_len(start + words_per_chunk);
-            BitPacking::unchecked_pack(
+            BitPackingUninit::unchecked_pack_uninit(
                 compressed_bits_per_value,
                 &last_chunk,
-                &mut output[start..start + words_per_chunk],
+                &mut output.spare_capacity_mut()[..words_per_chunk],
             );
+            // The bitpacking kernel initialized the padded tail chunk.
+            output.set_len(start + words_per_chunk);
         }
     } else {
         // Padding would waste space; append tail values as-is.
@@ -352,7 +462,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
 /// The compressed bit width is provided while the uncompressed width comes from `T`.
 /// Depending on the encoding decision the final chunk may be fully packed (with padding)
 /// or stored as raw tail values. We infer the layout from the buffer length.
-fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
+fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     data: FixedWidthDataBlock,
     num_values: usize,
     compressed_bits_per_value: usize,
@@ -368,25 +478,21 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let tail_is_raw = tail_values > 0 && compressed_words.len() == expected_new_len;
 
     let extra_tail_capacity = ELEMS_PER_CHUNK as usize;
-    #[allow(clippy::uninit_vec)]
     let mut decompressed: Vec<T> =
         Vec::with_capacity(num_values.saturating_add(extra_tail_capacity));
-    let chunk_value_len = num_whole_chunks * ELEMS_PER_CHUNK as usize;
-    unsafe {
-        decompressed.set_len(chunk_value_len);
-    }
 
     for chunk_idx in 0..num_whole_chunks {
         let input_start = chunk_idx * words_per_chunk;
         let input_end = input_start + words_per_chunk;
-        let output_start = chunk_idx * ELEMS_PER_CHUNK as usize;
-        let output_end = output_start + ELEMS_PER_CHUNK as usize;
+        let output_start = decompressed.len();
         unsafe {
-            BitPacking::unchecked_unpack(
+            BitPackingUninit::unchecked_unpack_uninit(
                 compressed_bits_per_value,
                 &compressed_words[input_start..input_end],
-                &mut decompressed[output_start..output_end],
+                &mut decompressed.spare_capacity_mut()[..ELEMS_PER_CHUNK as usize],
             );
+            // The bitpacking kernel initialized this complete decoded chunk.
+            decompressed.set_len(output_start + ELEMS_PER_CHUNK as usize);
         }
     }
 
@@ -400,14 +506,13 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
             let tail_start = expected_full_words;
             let output_start = decompressed.len();
             unsafe {
-                decompressed.set_len(output_start + ELEMS_PER_CHUNK as usize);
-            }
-            unsafe {
-                BitPacking::unchecked_unpack(
+                BitPackingUninit::unchecked_unpack_uninit(
                     compressed_bits_per_value,
                     &compressed_words[tail_start..tail_start + words_per_chunk],
-                    &mut decompressed[output_start..output_start + ELEMS_PER_CHUNK as usize],
+                    &mut decompressed.spare_capacity_mut()[..ELEMS_PER_CHUNK as usize],
                 );
+                // The kernel initialized a full chunk; only the requested tail stays visible.
+                decompressed.set_len(output_start + ELEMS_PER_CHUNK as usize);
             }
             decompressed.truncate(output_start + tail_values);
         }
@@ -464,21 +569,43 @@ impl OutOfLineBitpacking {
 }
 
 impl BlockCompressor for OutOfLineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let fixed_width = data.as_fixed_width().unwrap();
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(
+                "Out-of-line bitpacking requires fixed-width data",
+            ));
+        };
+        if fixed_width.bits_per_value != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Out-of-line bitpacking expects {}-bit values, got {}",
+                self.uncompressed_bit_width, fixed_width.bits_per_value
+            )));
+        }
         let compressed = match fixed_width.bits_per_value {
             8 => bitpack_out_of_line::<u8>(fixed_width, self.compressed_bit_width as usize),
             16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width as usize),
             32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width as usize),
             64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width as usize),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Bitpacking word size must be 8, 16, 32, or 64, got {}",
+                    fixed_width.bits_per_value
+                )));
+            }
         };
-        Ok(compressed)
+        Ok((
+            Some(compressed),
+            ProtobufUtils21::out_of_line_bitpacking(
+                self.uncompressed_bit_width,
+                ProtobufUtils21::flat(self.compressed_bit_width, None),
+            ),
+        ))
     }
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Out-of-line bitpacking")?;
         let word_size = match self.uncompressed_bit_width {
             8 => std::mem::size_of::<u8>(),
             16 => std::mem::size_of::<u16>(),
@@ -527,19 +654,134 @@ mod test {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{Array, Int8Array, Int64Array};
+    use arrow_buffer::ArrowNativeType;
     use arrow_schema::DataType;
+    use bytemuck::Pod;
+    use lance_bitpacking::{BitPacking, BitPackingUninit};
+    use rstest::rstest;
 
-    use super::{ELEMS_PER_CHUNK, bitpack_out_of_line, unpack_out_of_line};
+    use super::{ELEMS_PER_CHUNK, InlineBitpacking, bitpack_out_of_line, unpack_out_of_line};
     use crate::{
         buffer::LanceBuffer,
-        data::{BlockInfo, FixedWidthDataBlock},
+        compression::{BlockDecompressor, MiniBlockDecompressor},
+        data::{BlockInfo, DataBlock, FixedWidthDataBlock},
         testing::{TestCases, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
     };
+
+    #[rstest]
+    #[case::u8(8)]
+    #[case::u16(16)]
+    #[case::u32(32)]
+    #[case::u64(64)]
+    fn test_inline_bitpacking_decompress_empty_miniblock(#[case] bit_width: u64) {
+        let decompressor = InlineBitpacking::new(bit_width);
+        let decompressed =
+            MiniBlockDecompressor::decompress(&decompressor, vec![LanceBuffer::empty()], 0)
+                .unwrap();
+
+        let DataBlock::FixedWidth(block) = decompressed else {
+            panic!("Expected FixedWidth block");
+        };
+        assert_eq!(block.bits_per_value, bit_width);
+        assert_eq!(block.num_values, 0);
+        assert_eq!(block.data.len(), 0);
+    }
+
+    // Regression test for #7794: the block-level decompressor must short-circuit
+    // on num_values == 0 the same way the mini-block decompressor does, instead
+    // of reporting a spurious "too small for header" corrupt-file error.
+    #[rstest]
+    #[case::u8(8)]
+    #[case::u16(16)]
+    #[case::u32(32)]
+    #[case::u64(64)]
+    fn test_inline_bitpacking_decompress_empty_block(#[case] bit_width: u64) {
+        let decompressor = InlineBitpacking::new(bit_width);
+        let decompressed =
+            BlockDecompressor::decompress(&decompressor, Some(LanceBuffer::empty()), 0).unwrap();
+
+        let DataBlock::FixedWidth(block) = decompressed else {
+            panic!("Expected FixedWidth block");
+        };
+        assert_eq!(block.bits_per_value, bit_width);
+        assert_eq!(block.num_values, 0);
+        assert_eq!(block.data.len(), 0);
+    }
+
+    fn roundtrip_unchunk<T>(values: &[T], bit_width: usize)
+    where
+        T: ArrowNativeType + BitPackingUninit + Pod,
+    {
+        assert!(values.len() <= ELEMS_PER_CHUNK as usize);
+        let num_values = values.len() as u64;
+
+        let mut padded = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+        padded[..values.len()].copy_from_slice(values);
+
+        let packed_words = ELEMS_PER_CHUNK as usize * bit_width / (std::mem::size_of::<T>() * 8);
+        let mut chunk: Vec<T> = Vec::with_capacity(1 + packed_words);
+        chunk.push(T::from_usize(bit_width).unwrap());
+        let out_len = chunk.len();
+        chunk.resize(out_len + packed_words, T::from_usize(0).unwrap());
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &padded, &mut chunk[out_len..]);
+        }
+
+        let data = LanceBuffer::reinterpret_vec(chunk);
+        let decoded = InlineBitpacking::unchunk::<T>(data, num_values).unwrap();
+        let DataBlock::FixedWidth(fixed) = decoded else {
+            panic!("expected FixedWidth DataBlock");
+        };
+        let decoded_values = fixed.data.borrow_to_typed_view::<T>();
+        assert_eq!(decoded_values.as_ref(), values);
+    }
+
+    fn assert_corrupt_unchunk<T>(data: LanceBuffer, num_values: u64, expected_message: &str)
+    where
+        T: ArrowNativeType + BitPackingUninit + Pod,
+    {
+        let err = InlineBitpacking::unchunk::<T>(data, num_values).unwrap_err();
+        assert!(matches!(err, lance_core::Error::CorruptFile { .. }));
+        let err = err.to_string();
+        assert!(
+            err.contains(expected_message),
+            "expected error containing {expected_message:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unchunk_u32_bw12_tail() {
+        let values: Vec<u32> = (0..500).map(|i| ((i * 7) % (1 << 12)) as u32).collect();
+        roundtrip_unchunk(&values, 12);
+    }
+
+    #[test]
+    fn unchunk_u64_bw23_full() {
+        let values: Vec<u64> = (0..1024).map(|i| ((i * 3) % (1 << 23)) as u64).collect();
+        roundtrip_unchunk(&values, 23);
+    }
+
+    #[rstest]
+    #[case::too_small_header(LanceBuffer::from(vec![1, 2, 3]), 1, "too small")]
+    #[case::misaligned_chunk_size(LanceBuffer::from(vec![0, 0, 0, 0, 0]), 1, "multiple")]
+    #[case::too_many_values(
+        LanceBuffer::reinterpret_vec(vec![0_u32]),
+        ELEMS_PER_CHUNK + 1,
+        "expected at most"
+    )]
+    #[case::payload_size_mismatch(LanceBuffer::reinterpret_vec(vec![12_u32]), 1, "payload")]
+    #[case::invalid_bit_width(LanceBuffer::reinterpret_vec(vec![33_u32]), 1, "exceeds")]
+    fn unchunk_rejects(
+        #[case] data: LanceBuffer,
+        #[case] num_values: u64,
+        #[case] expected_message: &str,
+    ) {
+        assert_corrupt_unchunk::<u32>(data, num_values, expected_message);
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_miniblock_bitpack() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         let arrays = vec![
             Arc::new(Int8Array::from(vec![100; 1024])) as Arc<dyn Array>,
@@ -578,7 +820,7 @@ mod test {
         // Test bitpacking encoding verification with varied small values that should trigger bitpacking
         let test_cases = TestCases::default()
             .with_expected_encoding("inline_bitpacking")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Generate data with varied small values to avoid RLE
         // Mix different values but keep them small to trigger bitpacking
@@ -602,7 +844,7 @@ mod test {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("inline_bitpacking")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Build 2048 values: first 1024 all zeros (bit_width=0),
         // next 1024 small varied values to avoid RLE and trigger bitpacking.

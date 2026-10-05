@@ -134,3 +134,28 @@ def test_delta_validation_errors():
         "and with_end_version",
     ):
         ds.delta(end_version=2)
+
+
+def test_delta_get_deleted_row_ids():
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4], type=pa.int32()),
+            "val": pa.array(["a", "b", "c", "d"], type=pa.string()),
+        }
+    )
+    ds = write_dataset(
+        table, "memory://delta_api_test_delete", enable_stable_row_ids=True
+    )
+    row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+
+    ds.delete("id in (2, 3)")
+
+    delta = ds.delta(compared_against=1)
+    reader = delta.get_deleted_row_ids()
+
+    deleted = []
+    for batch in reader:
+        assert batch.schema.names == ["_rowid"]
+        deleted.extend(batch.column("_rowid").to_pylist())
+
+    assert sorted(deleted) == sorted([row_ids[1], row_ids[2]])

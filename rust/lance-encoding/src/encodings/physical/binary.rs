@@ -15,13 +15,15 @@ use core::panic;
 
 use crate::compression::{
     BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
+    require_block_payload,
 };
 
 use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
+    MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -245,7 +247,11 @@ impl BinaryMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
             _ => Err(Error::invalid_input_source(
@@ -288,52 +294,144 @@ impl BinaryMiniBlockDecompressor {
     }
 }
 
+/// Cold path: pinpoint why the chunk-relative offsets of a binary mini-block
+/// chunk failed validation.
+fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: usize) -> Error {
+    let mut previous: u64 = offsets[0].into();
+    for (position, &offset) in offsets.iter().enumerate().skip(1) {
+        let offset: u64 = offset.into();
+        if offset < previous {
+            return Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "value offset at position {position} decreases: {offset} < {previous} \
+                     (chunk is {chunk_len} bytes)"
+                ),
+            );
+        }
+        previous = offset;
+    }
+    Error::corrupt_file_named(
+        "binary mini-block",
+        format!("value offset {previous} is out of bounds for a chunk of {chunk_len} bytes"),
+    )
+}
+
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure
     // `num_values` <= number of values in the chunk.
+    //
+    // The chunk-relative value offsets at the front of the chunk come straight
+    // from the file and are used to slice the chunk buffer, so corrupt values
+    // must surface as a typed error instead of a panic or an out-of-bounds
+    // read.  The monotonicity check rides along the existing rebase loop (the
+    // `&=` accumulation keeps it branchless) so validation adds no extra pass.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
 
+        let bytes_per_offset = self.bits_per_offset as usize / 8;
+        if !data.len().is_multiple_of(bytes_per_offset) {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "chunk size {} is not a multiple of the {}-byte offset width",
+                    data.len(),
+                    bytes_per_offset
+                ),
+            ));
+        }
+        let num_offsets = (num_values as usize).checked_add(1).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "binary mini-block",
+                format!("cannot decode {num_values} values from a single chunk"),
+            )
+        })?;
+        if data.len() / bytes_per_offset < num_offsets {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "chunk of {} bytes holds {} offsets but decoding {} values requires {}",
+                    data.len(),
+                    data.len() / bytes_per_offset,
+                    num_values,
+                    num_offsets
+                ),
+            ));
+        }
+
+        // The value region must start past the offsets being decoded, otherwise
+        // the offset table itself aliases into the value bytes.  A lower bound
+        // (not equality) because a prefix read of the chunk legitimately leaves
+        // unrequested offsets between the requested prefix and the values.
+        let min_value_region_start = num_offsets * bytes_per_offset;
+        let value_region_overlap_error = |first: u64| {
+            Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "value region starts at offset {first} which overlaps the {num_offsets} \
+                     requested offsets ({min_value_region_start} bytes)"
+                ),
+            )
+        };
+
         if self.bits_per_offset == 64 {
-            // offset and at least one value
-            assert!(data.len() >= 16);
-
             let offsets_buffer = data.borrow_to_typed_slice::<u64>();
-            let offsets = offsets_buffer.as_ref();
+            let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
-            let result_offsets = offsets[0..(num_values + 1) as usize]
+            let first = offsets[0];
+            if first < min_value_region_start as u64 {
+                return Err(value_region_overlap_error(first));
+            }
+            let mut previous = first;
+            let mut is_monotonic = true;
+            let result_offsets = offsets
                 .iter()
-                .map(|offset| offset - offsets[0])
+                .map(|&offset| {
+                    is_monotonic &= previous <= offset;
+                    previous = offset;
+                    offset.wrapping_sub(first)
+                })
                 .collect::<Vec<u64>>();
+            let last = offsets[num_offsets - 1];
+            if !is_monotonic || last as usize > data.len() {
+                return Err(chunk_offset_violation_error(offsets, data.len()));
+            }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 64,
                 num_values,
                 block_info: BlockInfo::new(),
             }))
         } else {
-            // offset and at least one value
-            assert!(data.len() >= 8);
-
             let offsets_buffer = data.borrow_to_typed_slice::<u32>();
-            let offsets = offsets_buffer.as_ref();
+            let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
-            let result_offsets = offsets[0..(num_values + 1) as usize]
+            let first = offsets[0];
+            if (first as u64) < min_value_region_start as u64 {
+                return Err(value_region_overlap_error(first as u64));
+            }
+            let mut previous = first;
+            let mut is_monotonic = true;
+            let result_offsets = offsets
                 .iter()
-                .map(|offset| offset - offsets[0])
+                .map(|&offset| {
+                    is_monotonic &= previous <= offset;
+                    previous = offset;
+                    offset.wrapping_sub(first)
+                })
                 .collect::<Vec<u32>>();
+            let last = offsets[num_offsets - 1];
+            if !is_monotonic || last as usize > data.len() {
+                return Err(chunk_offset_violation_error(offsets, data.len()));
+            }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
                 num_values,
@@ -356,7 +454,15 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 pub struct VariableEncoder {}
 
 impl BlockCompressor for VariableEncoder {
-    fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
+    fn compress(&self, mut data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let bits_per_offset = match &data {
+            DataBlock::VariableWidth(data) => data.bits_per_offset,
+            _ => {
+                return Err(Error::invalid_input(
+                    "BinaryBlockEncoder requires a variable-width block",
+                ));
+            }
+        };
         match data {
             DataBlock::VariableWidth(ref mut variable_width_data) => {
                 match variable_width_data.bits_per_offset {
@@ -408,18 +514,23 @@ impl BlockCompressor for VariableEncoder {
                         output.extend_from_slice(&variable_width_data.data);
                         Ok(LanceBuffer::from(output))
                     }
-                    _ => {
-                        panic!(
-                            "BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
-                            variable_width_data.bits_per_offset
-                        );
-                    }
+                    _ => Err(Error::invalid_input(format!(
+                        "BinaryBlockEncoder does not support {}-bit offsets",
+                        variable_width_data.bits_per_offset
+                    ))),
                 }
             }
-            _ => {
-                panic!("BinaryBlockEncoder can only work with Variable Width DataBlock.");
-            }
+            _ => unreachable!("variable-width input was validated above"),
         }
+        .map(|payload| {
+            (
+                Some(payload),
+                ProtobufUtils21::variable(
+                    ProtobufUtils21::flat(bits_per_offset as u64, None),
+                    None,
+                ),
+            )
+        })
     }
 }
 
@@ -450,7 +561,8 @@ impl VariablePerValueDecompressor for VariableDecoder {
 pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Binary block")?;
         // In older (not quite stable) versions we stored the bits per offset as a single byte and then the num_values
         // as four bytes.  However, this led to alignment problems and was wasteful since we already store the num_values
         // in higher layers.
@@ -462,18 +574,48 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         // never be more than 255 and it's little endian so the last 3 bytes will always be 0.  These will be the least
         // significant 3 bytes of the number of values in the old scheme.  It's pretty unlikely these are all 0 (that would
         // mean there are at least 16M values in a single page) so we'll use this to determine if the old scheme is used.
+        //
+        // The header fields and the offsets themselves come straight from the file.
+        // The structural checks below (all O(1)) reject blocks whose regions do not
+        // line up; the offset *values* are validated later, by the mandatory layout
+        // validation in `VariableWidthBlock::into_arrow`, so they are not rescanned
+        // here.
+        if data.len() < 4 {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "block of {} bytes is too small to hold a header",
+                    data.len()
+                ),
+            ));
+        }
         let is_old_scheme = data[1] != 0 || data[2] != 0 || data[3] != 0;
 
+        let ensure_header = |header_len: usize| {
+            if data.len() < header_len {
+                return Err(Error::corrupt_file_named(
+                    "variable-width block",
+                    format!(
+                        "block of {} bytes is too small for a {} byte header",
+                        data.len(),
+                        header_len
+                    ),
+                ));
+            }
+            Ok(())
+        };
         let (bits_per_offset, bytes_start_offset, offset_start) = if is_old_scheme {
             // Old scheme
             let bits_per_offset = data[0];
             match bits_per_offset {
                 32 => {
+                    ensure_header(9)?;
                     debug_assert_eq!(LittleEndian::read_u32(&data[1..5]), num_values as u32);
                     let bytes_start_offset = LittleEndian::read_u32(&data[5..9]);
-                    (bits_per_offset, bytes_start_offset as u64, 9)
+                    (bits_per_offset, bytes_start_offset as u64, 9_u64)
                 }
                 64 => {
+                    ensure_header(17)?;
                     debug_assert_eq!(LittleEndian::read_u64(&data[1..9]), num_values);
                     let bytes_start_offset = LittleEndian::read_u64(&data[9..17]);
                     (bits_per_offset, bytes_start_offset, 17)
@@ -489,10 +631,12 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             let bits_per_offset = LittleEndian::read_u32(&data[0..4]) as u8;
             match bits_per_offset {
                 32 => {
+                    ensure_header(8)?;
                     let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
                     (bits_per_offset, bytes_start_offset as u64, 8)
                 }
                 64 => {
+                    ensure_header(16)?;
                     let bytes_start_offset = LittleEndian::read_u64(&data[8..16]);
                     (bits_per_offset, bytes_start_offset, 16)
                 }
@@ -504,9 +648,55 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             }
         };
 
+        // The offsets region sits between the header and `bytes_start_offset`
+        // and must hold exactly `num_values + 1` offsets starting at zero.
+        let expected_offsets_bytes = num_values
+            .checked_add(1)
+            .and_then(|num_offsets| num_offsets.checked_mul(bits_per_offset as u64 / 8))
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable-width block",
+                    format!("offsets region size overflows for {num_values} values"),
+                )
+            })?;
+        if bytes_start_offset < offset_start || bytes_start_offset > data.len() as u64 {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "bytes start offset {} is outside the block (header: {} bytes, block: {} bytes)",
+                    bytes_start_offset,
+                    offset_start,
+                    data.len()
+                ),
+            ));
+        }
+        if bytes_start_offset - offset_start != expected_offsets_bytes {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "expected {} offset bytes for {} values but found {}",
+                    expected_offsets_bytes,
+                    num_values,
+                    bytes_start_offset - offset_start
+                ),
+            ));
+        }
+
         // the next `bytes_start_offset - offset_start` stores the offsets.
-        let offsets =
-            data.slice_with_length(offset_start, bytes_start_offset as usize - offset_start);
+        let offsets = data.slice_with_length(
+            offset_start as usize,
+            (bytes_start_offset - offset_start) as usize,
+        );
+        let first_offset = match bits_per_offset {
+            32 => LittleEndian::read_u32(&offsets[0..4]) as u64,
+            _ => LittleEndian::read_u64(&offsets[0..8]),
+        };
+        if first_offset != 0 {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!("first offset must be 0 but found {first_offset}"),
+            ));
+        }
 
         // the rest are the binary bytes.
         let data = data.slice_with_length(
@@ -533,29 +723,41 @@ mod tests {
     use arrow_schema::{DataType, Field};
 
     use crate::{
+        buffer::LanceBuffer,
         constants::{
             COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
+        data::{BlockInfo, DataBlock, VariableWidthBlock},
         testing::check_specific_random,
     };
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::{
-        testing::{
-            FnArrayGeneratorProvider, TestCases, check_basic_random,
-            check_round_trip_encoding_of_data,
-        },
-        version::LanceFileVersion,
+    use crate::testing::{
+        FnArrayGeneratorProvider, TestCases, TestEncoding, check_basic_random_case,
+        check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
     };
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_utf8_binary() {
+    async fn test_utf8_binary(
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let field = Field::new("", DataType::Utf8, false);
         check_specific_random(
             field,
-            TestCases::basic().with_min_file_version(LanceFileVersion::V2_1),
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
         )
         .await;
     }
@@ -566,6 +768,15 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -574,7 +785,7 @@ mod tests {
         );
 
         let field = Field::new("", data_type, false).with_metadata(field_metadata);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[rstest]
@@ -583,6 +794,14 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::Binary, DataType::Utf8)] data_type: DataType,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -592,7 +811,10 @@ mod tests {
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
         // TODO (https://github.com/lance-format/lance/issues/4783)
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing]);
         check_specific_random(field, test_cases).await;
     }
 
@@ -602,6 +824,14 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -612,21 +842,30 @@ mod tests {
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
         check_specific_random(
             field,
-            TestCases::basic().with_min_file_version(LanceFileVersion::V2_1),
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
         )
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_binary() {
-        let field = Field::new("", DataType::LargeBinary, true);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_utf8() {
-        let field = Field::new("", DataType::LargeUtf8, true);
-        check_basic_random(field).await;
+    async fn test_large_binary_types(
+        #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let field = Field::new("", data_type, true);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[rstest]
@@ -634,20 +873,31 @@ mod tests {
     async fn test_small_strings(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
-        use crate::testing::check_basic_generated;
-
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             structural_encoding.into(),
         );
         let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
-        check_basic_generated(
+        check_round_trip_encoding_generated(
             field,
             Box::new(FnArrayGeneratorProvider::new(move || {
                 lance_datagen::array::utf8_prefix_plus_counter("user_", /*is_large=*/ false)
             })),
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
         )
         .await;
     }
@@ -698,10 +948,19 @@ mod tests {
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_bigger_than_max_page_size() {
-        // Create an array with one single 32MiB string
-        let big_string = String::from_iter((0..(32 * 1024 * 1024)).map(|_| '0'));
+    async fn test_value_bigger_than_max_page_size(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        // Create one value larger than the configured 1MiB page budget.
+        let big_string = String::from_iter((0..(2 * 1024 * 1024)).map(|_| '0'));
         let string_array = StringArray::from(vec![
             Some(big_string),
             Some("abc".to_string()),
@@ -711,7 +970,9 @@ mod tests {
         ]);
 
         // Drop the max page size to 1MiB
-        let test_cases = TestCases::default().with_max_page_size(1024 * 1024);
+        let test_cases = TestCases::default()
+            .with_max_page_size(1024 * 1024)
+            .with_encoding(encoding);
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
@@ -719,16 +980,29 @@ mod tests {
             HashMap::new(),
         )
         .await;
+    }
 
-        // This is a regression testing the case where a page with X rows is split into Y parts
-        // where the number of parts is not evenly divisible by the number of rows.  In this
-        // case we are splitting 90 rows into 4 parts.
-        let big_string = String::from_iter((0..(1000 * 1000)).map(|_| '0'));
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_page_split_parts_do_not_evenly_divide_rows(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        // Regression: split 90 rows into four parts, where the part count does
+        // not evenly divide the row count.
+        let big_string = String::from_iter((0..45_000).map(|_| '0'));
         let string_array = StringArray::from_iter_values((0..90).map(|_| big_string.clone()));
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
-            &TestCases::default(),
+            &TestCases::default()
+                .with_max_page_size(1024 * 1024)
+                .with_encoding(encoding),
             HashMap::new(),
         )
         .await;
@@ -801,7 +1075,7 @@ mod tests {
         #[values(true, false)] with_nulls: bool,
         #[values(100, 500, 35000)] dict_size: u32,
     ) {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         let strings = (0..dict_size)
             .map(|i| i.to_string())
             .collect::<Vec<String>>();
@@ -829,7 +1103,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("variable")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both automatic selection and explicit configuration
         // 1. Test automatic binary encoding selection (small strings that won't trigger FSST)
@@ -967,5 +1241,196 @@ mod tests {
                 panic!("Expected VariableWidth block");
             }
         }
+    }
+
+    #[test]
+    fn test_binary_miniblock_rejects_corrupt_offsets() {
+        use super::BinaryMiniBlockDecompressor;
+        use crate::compression::MiniBlockDecompressor;
+        use lance_core::Error;
+
+        // Chunk layout mirrors the on-disk format for ["alpha", "beta", "gamma"]:
+        // LE u32 offsets [16, 21, 25, 30] followed by the value bytes, padded to
+        // a multiple of 8 bytes.
+        fn chunk_u32(offsets: &[u32], values: &[u8]) -> LanceBuffer {
+            let mut chunk = offsets
+                .iter()
+                .flat_map(|offset| offset.to_le_bytes())
+                .collect::<Vec<u8>>();
+            chunk.extend_from_slice(values);
+            chunk.resize(chunk.len().next_multiple_of(8), 0);
+            LanceBuffer::from(chunk)
+        }
+
+        let decompressor = BinaryMiniBlockDecompressor::new(32);
+
+        // The tail offset points past the end of the 32-byte chunk.
+        let err = decompressor
+            .decompress(
+                vec![chunk_u32(&[16, 21, 25, 100_000], b"alphabetagamma")],
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+
+        // Offsets go backwards, which would underflow the rebase subtraction.
+        let err = decompressor
+            .decompress(vec![chunk_u32(&[16, 25, 21, 30], b"alphabetagamma")], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("decreases"), "{err}");
+
+        // The first offset points inside the offset table, which would alias
+        // the serialized offsets into the value bytes.
+        let err = decompressor
+            .decompress(vec![chunk_u32(&[0, 21, 25, 30], b"alphabetagamma")], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("overlaps"), "{err}");
+
+        // The chunk stores fewer offsets than the requested value count needs.
+        let err = decompressor
+            .decompress(vec![chunk_u32(&[8, 8], &[])], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("requires 4"), "{err}");
+
+        // The chunk size is not a multiple of the offset width.
+        let err = decompressor
+            .decompress(vec![LanceBuffer::from(vec![0u8; 10])], 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("multiple"), "{err}");
+
+        // 64-bit offsets take the same validation path.
+        fn chunk_u64(offsets: &[u64], values: &[u8]) -> LanceBuffer {
+            let mut chunk = offsets
+                .iter()
+                .flat_map(|offset| offset.to_le_bytes())
+                .collect::<Vec<u8>>();
+            chunk.extend_from_slice(values);
+            chunk.resize(chunk.len().next_multiple_of(8), 0);
+            LanceBuffer::from(chunk)
+        }
+        let decompressor = BinaryMiniBlockDecompressor::new(64);
+        let err = decompressor
+            .decompress(
+                vec![chunk_u64(&[32, 37, 41, 100_000], b"alphabetagamma")],
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+        let err = decompressor
+            .decompress(vec![chunk_u64(&[0, 37, 41, 46], b"alphabetagamma")], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("overlaps"), "{err}");
+
+        // A valid chunk still decodes: offsets rebase to [0, 5, 9, 14].
+        let decompressor = BinaryMiniBlockDecompressor::new(32);
+        let block = decompressor
+            .decompress(vec![chunk_u32(&[16, 21, 25, 30], b"alphabetagamma")], 3)
+            .unwrap();
+        let DataBlock::VariableWidth(block) = block else {
+            panic!("expected a variable-width block");
+        };
+        assert_eq!(block.data.as_ref(), b"alphabetagamma");
+        assert_eq!(
+            block.offsets,
+            LanceBuffer::reinterpret_vec(vec![0_u32, 5, 9, 14])
+        );
+    }
+
+    fn encoded_binary_block(bits_per_offset: u8) -> Vec<u8> {
+        use crate::compression::BlockCompressor;
+
+        let offsets = match bits_per_offset {
+            32 => LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 14]),
+            64 => LanceBuffer::reinterpret_vec(vec![0_i64, 5, 9, 14]),
+            _ => unreachable!(),
+        };
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"alphabetagamma"),
+            offsets,
+            bits_per_offset,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        });
+        BlockCompressor::compress(&super::VariableEncoder::default(), block)
+            .unwrap()
+            .0
+            .as_ref()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The block decompressor only checks the block structure (all O(1)); bad
+    /// offset values inside a structurally-sound block are rejected by the
+    /// mandatory layout validation when the block is converted to Arrow.
+    #[rstest]
+    #[case::i32_tail_out_of_bounds(32, 3, 100_000, "out of bounds")]
+    #[case::i64_tail_out_of_bounds(64, 3, 15, "out of bounds")]
+    #[case::i32_non_monotonic(32, 2, 4, "non-monotonic")]
+    #[case::i64_non_monotonic(64, 2, 4, "non-monotonic")]
+    fn test_binary_block_bad_offsets_rejected_at_arrow_conversion(
+        #[case] bits_per_offset: u8,
+        #[case] mutated_offset_index: usize,
+        #[case] mutated_offset_value: u64,
+        #[case] expected_message: &str,
+    ) {
+        use crate::compression::BlockDecompressor;
+        use lance_core::Error;
+
+        let mut encoded = encoded_binary_block(bits_per_offset);
+        let bytes_per_offset = (bits_per_offset / 8) as usize;
+        // The standard scheme header is two offset-width fields.
+        let mutated_offset_start = bytes_per_offset * (2 + mutated_offset_index);
+        encoded[mutated_offset_start..mutated_offset_start + bytes_per_offset]
+            .copy_from_slice(&mutated_offset_value.to_le_bytes()[..bytes_per_offset]);
+
+        let block = super::BinaryBlockDecompressor::default()
+            .decompress(Some(LanceBuffer::from(encoded)), 3)
+            .unwrap();
+        let data_type = match bits_per_offset {
+            32 => DataType::Binary,
+            _ => DataType::LargeBinary,
+        };
+        let err = block.into_arrow(data_type, false).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains(expected_message), "{err}");
+    }
+
+    #[test]
+    fn test_binary_block_rejects_corrupt_structure() {
+        use crate::compression::BlockDecompressor;
+        use lance_core::Error;
+
+        let decompressor = super::BinaryBlockDecompressor::default();
+
+        // The first offset must be zero.
+        let mut encoded = encoded_binary_block(32);
+        encoded[8..12].copy_from_slice(&5_u32.to_le_bytes());
+        let err = decompressor
+            .decompress(Some(LanceBuffer::from(encoded)), 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("first offset"), "{err}");
+
+        // The offsets region must hold exactly num_values + 1 offsets.
+        let encoded = encoded_binary_block(32);
+        let err = decompressor
+            .decompress(Some(LanceBuffer::from(encoded)), 4)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("offset bytes"), "{err}");
+
+        // A block too small to hold its header is rejected, not a panic.
+        let err = decompressor
+            .decompress(Some(LanceBuffer::from(vec![0_u8; 2])), 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("too small"), "{err}");
     }
 }

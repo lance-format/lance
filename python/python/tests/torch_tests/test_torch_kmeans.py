@@ -10,15 +10,16 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from lance.torch import preferred_device  # noqa: E402
 from lance.torch.kmeans import KMeans  # noqa: E402
 from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
 
 
-@pytest.mark.skip(reason="flaky")
 def test_kmeans():
     arr = np.array(range(128)).reshape(-1, 8).astype(np.float32)
-    kmeans = KMeans(4, device="cpu")
+    # These duplicate centroids reproduce the empty clusters that made this test
+    # depend on random initialization before empty-cluster recovery was fixed.
+    centroids = torch.from_numpy(arr[[5, 5, 13, 13]])
+    kmeans = KMeans(4, centroids=centroids, device="cpu")
     kmeans.fit(arr)
 
     cluster_ids = kmeans.transform(arr)
@@ -27,7 +28,6 @@ def test_kmeans():
     assert len(cnts) == 4  # all cluster has data
 
 
-@pytest.mark.skip(reason="TODO: async dataset hangs on github CI")
 def test_torch_kmeans_accept_torch_device(tmp_path: Path):
     values = pa.array(np.array(range(128)).astype(np.float32))
     arr = pa.FixedSizeListArray.from_arrays(values, 8)
@@ -39,7 +39,7 @@ def test_torch_kmeans_accept_torch_device(tmp_path: Path):
         "vector",
         2,
         metric_type="L2",
-        accelerator=preferred_device(),
+        accelerator=torch.device("cpu"),
     )
 
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::{Range, RangeBounds, RangeInclusive};
 use std::{collections::BTreeMap, io::Read};
@@ -85,6 +85,14 @@ impl RowAddrMask {
         matches!(self, Self::BlockList(b) if b.is_empty())
     }
 
+    /// Returns whether this mask selects every row in `rows`.
+    pub fn selects_all(&self, rows: &RowAddrTreeMap) -> bool {
+        match self {
+            Self::AllowList(allow_list) => (rows.clone() - allow_list).is_empty(),
+            Self::BlockList(block_list) => (rows.clone() & block_list).is_empty(),
+        }
+    }
+
     /// Return the indices of the input row ids that were valid
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
         row_ids
@@ -104,6 +112,51 @@ impl RowAddrMask {
         match self {
             Self::AllowList(allow_list) => Self::AllowList(allow_list - block_list),
             Self::BlockList(existing) => Self::BlockList(existing | block_list),
+        }
+    }
+
+    /// Build a mask from serialized [`RowAddrTreeMap`] payloads.
+    ///
+    /// `allow` selects rows, `block` excludes them; each is the output of
+    /// [`RowAddrTreeMap::serialize_into`]. Returns `None` when neither is given,
+    /// which callers read as "no mask" rather than "select nothing".
+    ///
+    /// Bytes rather than treemaps on purpose: a caller living in a different
+    /// dynamically-linked extension module has its own copy of these Rust types
+    /// and cannot hand one over, but both sides agree on this encoding.
+    pub fn from_serialized_parts(
+        allow: Option<&[u8]>,
+        block: Option<&[u8]>,
+    ) -> Result<Option<Self>> {
+        // Name the offending side: the underlying failure is a bare "failed to
+        // fill whole buffer", which tells a caller holding two blobs nothing.
+        fn decode(bytes: &[u8], which: &str) -> Result<RowAddrTreeMap> {
+            RowAddrTreeMap::deserialize_from(bytes).map_err(|e| {
+                Error::invalid_input(format!(
+                    "row address {which} is not a serialized RowAddrTreeMap: {e}"
+                ))
+            })
+        }
+        let allow = allow.map(|b| decode(b, "allowlist")).transpose()?;
+        let block = block.map(|b| decode(b, "blocklist")).transpose()?;
+        Ok(match (allow, block) {
+            (Some(allow), Some(block)) => Some(Self::from_allowed(allow).also_block(block)),
+            (Some(allow), None) => Some(Self::from_allowed(allow)),
+            (None, Some(block)) => Some(Self::from_block(block)),
+            (None, None) => None,
+        })
+    }
+
+    /// Intersect two masks: a row survives only if both select it.
+    ///
+    /// Lets a planner apply a caller-supplied mask at one boundary rather than
+    /// at every branch that produces rows, which is how branches get missed.
+    pub fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
+            (Self::AllowList(a), Self::BlockList(b)) => Self::AllowList(a).also_block(b),
+            (Self::BlockList(a), Self::AllowList(b)) => Self::AllowList(b).also_block(a),
+            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
         }
     }
 
@@ -537,6 +590,62 @@ impl RowAddrTreeMap {
         count
     }
 
+    /// Build a set from many independently sorted runs of row addresses.
+    ///
+    /// Each run must be sorted ascending; the runs may interleave arbitrarily
+    /// and may repeat addresses (the result is a set). This is the cheap way
+    /// to assemble the output of a scan that produced one sorted chunk per
+    /// page or partition: building one map per run and unioning them costs
+    /// O(runs x fragments) tiny bitmaps, whereas here every address is
+    /// bucketed by fragment in a single pass, a bucket is sorted only if the
+    /// runs that fed it actually interleaved, and exactly one bitmap is built
+    /// per fragment.
+    ///
+    /// Cost is O(N) plus O(n log n) for each bucket whose runs interleaved,
+    /// where N is the total number of addresses and n the bucket size.
+    pub fn from_sorted_runs<'a, I>(runs: I) -> Self
+    where
+        I: IntoIterator<Item = &'a [u64]>,
+    {
+        // fragment -> (low 32 bits of every address seen, still sorted?)
+        let mut buckets: HashMap<u32, (Vec<u32>, bool)> = HashMap::new();
+        for run in runs {
+            let mut rest = run;
+            while let Some(&first) = rest.first() {
+                let fragment = (first >> 32) as u32;
+                // A sorted run keeps each fragment's addresses contiguous, so
+                // the segment for `fragment` is a prefix of `rest`.
+                let end = rest
+                    .iter()
+                    .position(|addr| (addr >> 32) as u32 != fragment)
+                    .unwrap_or(rest.len());
+                let (segment, tail) = rest.split_at(end);
+                let (offsets, sorted) = buckets
+                    .entry(fragment)
+                    .or_insert_with(|| (Vec::new(), true));
+                if *sorted && offsets.last().is_some_and(|&last| last > first as u32) {
+                    *sorted = false;
+                }
+                offsets.extend(segment.iter().map(|addr| *addr as u32));
+                rest = tail;
+            }
+        }
+
+        let inner = buckets
+            .into_iter()
+            .map(|(fragment, (mut offsets, sorted))| {
+                if !sorted {
+                    offsets.sort_unstable();
+                }
+                offsets.dedup();
+                let bitmap = RoaringBitmap::from_sorted_iter(offsets)
+                    .expect("offsets were sorted and deduplicated");
+                (fragment, RowAddrSelection::Partial(bitmap))
+            })
+            .collect();
+        Self { inner }
+    }
+
     /// Add a bitmap for a single fragment
     pub fn insert_bitmap(&mut self, fragment: u32, bitmap: RoaringBitmap) {
         self.inner
@@ -623,8 +732,21 @@ impl RowAddrTreeMap {
             if bitmap_size == 0 {
                 inner.insert(fragment, RowAddrSelection::Full);
             } else {
-                let mut buffer = vec![0; bitmap_size as usize];
-                reader.read_exact(&mut buffer)?;
+                // Grow with the bytes that actually arrive instead of trusting the
+                // declared size. This is reachable from a public byte boundary, so
+                // a 12-byte payload could otherwise declare 4 GiB and abort the
+                // process on the allocation before any read fails.
+                let mut buffer = Vec::new();
+                let read = reader
+                    .by_ref()
+                    .take(u64::from(bitmap_size))
+                    .read_to_end(&mut buffer)?;
+                if read != bitmap_size as usize {
+                    return Err(Error::invalid_input(format!(
+                        "row addr treemap declares a {bitmap_size} byte bitmap for \
+                         fragment {fragment} but only {read} bytes remain"
+                    )));
+                }
                 let set = RoaringBitmap::deserialize_from(&buffer[..])?;
                 inner.insert(fragment, RowAddrSelection::Partial(set));
             }
@@ -649,12 +771,10 @@ impl RowAddrTreeMap {
 
     /// Convert the set into an iterator of row addrs
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// This is unsafe because if any of the inner RowAddrSelection elements
-    /// is not a Partial then the iterator will panic because we don't know
-    /// the size of the bitmap.
-    pub unsafe fn into_addr_iter(self) -> impl Iterator<Item = u64> {
+    /// Panics if any selection is `Full` because the fragment size is unknown.
+    pub fn into_addr_iter(self) -> impl Iterator<Item = u64> {
         self.inner
             .into_iter()
             .flat_map(|(fragment, selection)| match selection {
@@ -675,10 +795,10 @@ impl RowAddrTreeMap {
     /// rather than its individual bits, so dense ranges cost
     /// O(num_containers) (roughly num_rows / 65536) instead of O(num_rows).
     ///
-    /// # Safety
-    /// Same contract as [`Self::into_addr_iter`]: panics if any entry is
-    /// `Full`, since the fragment size is unknown at this layer.
-    pub unsafe fn iter_runs(&self) -> impl Iterator<Item = (u32, RangeInclusive<u32>)> + '_ {
+    /// # Panics
+    ///
+    /// Panics if any selection is `Full` because the fragment size is unknown.
+    pub fn iter_runs(&self) -> impl Iterator<Item = (u32, RangeInclusive<u32>)> + '_ {
         self.inner
             .iter()
             .flat_map(|(&fragment, selection)| match selection {
@@ -1204,6 +1324,57 @@ mod tests {
     }
 
     #[test]
+    fn test_from_sorted_runs() {
+        let addr = |frag: u64, off: u64| frag << 32 | off;
+
+        // No runs, and runs that are all empty, give an empty set.
+        assert_eq!(RowAddrTreeMap::from_sorted_runs([]), RowAddrTreeMap::new());
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&[][..], &[][..]]),
+            RowAddrTreeMap::new()
+        );
+
+        // A single run is taken as-is (no sort needed) and spans fragments.
+        let single = [addr(0, 3), addr(0, 9), addr(2, 1), addr(7, 0)];
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&single[..]]),
+            rows(&single)
+        );
+
+        // Interleaved runs whose fragments overlap: every bucket must be
+        // re-sorted and the union must match the naive construction.
+        let run_a = [addr(0, 5), addr(1, 2), addr(1, 8), addr(3, 4)];
+        let run_b = [addr(0, 1), addr(0, 6), addr(1, 3), addr(2, 0)];
+        let run_c = [addr(1, 0), addr(3, 4), addr(3, 5)]; // repeats addr(3, 4)
+        let expected: Vec<u64> = run_a
+            .iter()
+            .chain(run_b.iter())
+            .chain(run_c.iter())
+            .copied()
+            .collect();
+        let actual = RowAddrTreeMap::from_sorted_runs([&run_a[..], &run_b[..], &run_c[..]]);
+        assert_eq!(actual, rows(&expected));
+        assert_eq!(actual.len(), Some(10));
+
+        // Runs that touch disjoint fragment ranges never need a sort, and a
+        // later run that continues a bucket in order keeps it sorted too.
+        let lo = [addr(0, 0), addr(0, 1)];
+        let hi = [addr(0, 2), addr(5, 0)];
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&lo[..], &hi[..]]),
+            rows(&[addr(0, 0), addr(0, 1), addr(0, 2), addr(5, 0)])
+        );
+
+        // Bare stable row ids (no fragment bits) all land in bucket 0.
+        let ids_a = [1_u64, 4, 9];
+        let ids_b = [2_u64, 4, 10];
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&ids_a[..], &ids_b[..]]),
+            rows(&[1, 2, 4, 9, 10])
+        );
+    }
+
+    #[test]
     fn test_row_addr_mask_construction() {
         let full_mask = RowAddrMask::all_rows();
         assert_eq!(full_mask.max_len(), None);
@@ -1237,6 +1408,23 @@ mod tests {
         assert_eq!(allow_list.max_len(), None);
         assert_mask_selects(&allow_list, &[(2 << 32) + 5], &[(3 << 32) + 5]);
         assert!(allow_list.iter_addrs().is_none());
+    }
+
+    #[test]
+    fn test_row_addr_mask_selects_all_known_rows() {
+        let partition_rows = rows(&[10, 20, 2_u64 << 32 | 3]);
+
+        assert!(RowAddrMask::all_rows().selects_all(&partition_rows));
+        assert!(
+            RowAddrMask::from_allowed(rows(&[10, 20, 30, 2_u64 << 32 | 3]))
+                .selects_all(&partition_rows)
+        );
+        assert!(
+            !RowAddrMask::from_allowed(rows(&[10, 2_u64 << 32 | 3])).selects_all(&partition_rows)
+        );
+        assert!(RowAddrMask::from_block(rows(&[30])).selects_all(&partition_rows));
+        assert!(!RowAddrMask::from_block(rows(&[20, 30])).selects_all(&partition_rows));
+        assert!(RowAddrMask::allow_nothing().selects_all(&RowAddrTreeMap::new()));
     }
 
     #[test]
@@ -1294,6 +1482,102 @@ mod tests {
         // Block list
         let mask = RowAddrMask::from_block(rows(&[10, 20, 30]));
         assert!(mask.iter_addrs().is_none());
+    }
+
+    #[test]
+    fn test_row_addr_mask_intersect() {
+        let a = rows(&[1, 2, 3]);
+        let b = rows(&[3, 4]);
+
+        // allow & allow -> only rows in both
+        assert_mask_selects(
+            &RowAddrMask::from_allowed(a.clone()).intersect(RowAddrMask::from_allowed(b.clone())),
+            &[3],
+            &[1, 2, 4, 100],
+        );
+        // allow & block -> allowed minus blocked
+        assert_mask_selects(
+            &RowAddrMask::from_allowed(a.clone()).intersect(RowAddrMask::from_block(b.clone())),
+            &[1, 2],
+            &[3, 4, 100],
+        );
+        // block & allow -> same, order independent
+        assert_mask_selects(
+            &RowAddrMask::from_block(b.clone()).intersect(RowAddrMask::from_allowed(a.clone())),
+            &[1, 2],
+            &[3, 4, 100],
+        );
+        // block & block -> both exclusions apply
+        assert_mask_selects(
+            &RowAddrMask::from_block(a.clone()).intersect(RowAddrMask::from_block(b)),
+            &[100],
+            &[1, 2, 3, 4],
+        );
+        // all_rows is the identity, and intersecting with itself changes nothing
+        let allow_a = RowAddrMask::from_allowed(a.clone());
+        assert_eq!(allow_a.clone().intersect(RowAddrMask::all_rows()), allow_a);
+        assert_eq!(allow_a.clone().intersect(allow_a.clone()), allow_a);
+        // allow_nothing absorbs
+        assert_mask_selects(
+            &RowAddrMask::allow_nothing().intersect(RowAddrMask::from_allowed(a)),
+            &[],
+            &[1, 2, 3, 100],
+        );
+    }
+
+    #[test]
+    fn test_row_addr_mask_from_serialized_parts() {
+        fn ser(tm: &RowAddrTreeMap) -> Vec<u8> {
+            let mut buf = Vec::new();
+            tm.serialize_into(&mut buf).unwrap();
+            buf
+        }
+        let allow = ser(&rows(&[1, 2, 3]));
+        let block = ser(&rows(&[3, 4]));
+
+        // Neither part means "no mask", which is not the same as "select nothing".
+        assert!(
+            RowAddrMask::from_serialized_parts(None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let m = RowAddrMask::from_serialized_parts(Some(&allow), None)
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&m, &[1, 2, 3], &[4, 100]);
+
+        let m = RowAddrMask::from_serialized_parts(None, Some(&block))
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&m, &[1, 2, 100], &[3, 4]);
+
+        // Block wins on the overlap.
+        let m = RowAddrMask::from_serialized_parts(Some(&allow), Some(&block))
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&m, &[1, 2], &[3, 4, 100]);
+
+        // Round trips through the same encoding the caller used.
+        let again = RowAddrMask::from_serialized_parts(Some(&ser(m.allow_list().unwrap())), None)
+            .unwrap()
+            .unwrap();
+        assert_mask_selects(&again, &[1, 2], &[3, 4]);
+
+        assert!(RowAddrMask::from_serialized_parts(Some(b"not a treemap"), None).is_err());
+
+        // A declared bitmap size must not be allocated before the bytes are
+        // known to exist: this 12-byte payload claims ~4 GiB.
+        let bomb = [
+            1u8, 0, 0, 0, // one entry
+            0, 0, 0, 0, // fragment zero
+            0xff, 0xff, 0xff, 0xff, // declared bitmap size
+        ];
+        let err = RowAddrMask::from_serialized_parts(Some(&bomb), None).unwrap_err();
+        assert!(
+            err.to_string().contains("only 0 bytes remain"),
+            "expected a length complaint, got: {err}"
+        );
     }
 
     #[test]
@@ -1582,9 +1866,7 @@ mod tests {
         let mut mask = RowAddrTreeMap::default();
         mask.insert_fragment(0);
 
-        unsafe {
-            let _ = mask.into_addr_iter().collect::<Vec<u64>>();
-        }
+        let _ = mask.into_addr_iter().collect::<Vec<u64>>();
     }
 
     #[test]
@@ -1596,7 +1878,7 @@ mod tests {
         mask.insert(2 << 32 | 10);
 
         let expected = vec![0u64, 1, 1 << 32 | 5, 2 << 32 | 10];
-        let actual: Vec<u64> = unsafe { mask.into_addr_iter().collect() };
+        let actual: Vec<u64> = mask.into_addr_iter().collect();
         assert_eq!(actual, expected);
     }
 
@@ -1608,8 +1890,7 @@ mod tests {
         mask.insert_range(10..15);
         mask.insert_range((1u64 << 32) + 100..(1u64 << 32) + 103);
 
-        // SAFETY: only Partial entries.
-        let runs: Vec<(u32, RangeInclusive<u32>)> = unsafe { mask.iter_runs().collect() };
+        let runs: Vec<(u32, RangeInclusive<u32>)> = mask.iter_runs().collect();
         assert_eq!(runs, vec![(0, 0..=2), (0, 10..=14), (1, 100..=102)]);
     }
 
@@ -1622,13 +1903,14 @@ mod tests {
         mask.insert_range(20..25);
         mask.insert_range((1u64 << 32)..(1u64 << 32) + 3);
 
-        let from_runs: Vec<u64> = unsafe { mask.iter_runs() }
+        let from_runs: Vec<u64> = mask
+            .iter_runs()
             .flat_map(|(frag, run)| {
                 let frag = u64::from(frag);
                 (*run.start()..=*run.end()).map(move |v| (frag << 32) | u64::from(v))
             })
             .collect();
-        let from_bits: Vec<u64> = unsafe { mask.clone().into_addr_iter() }.collect();
+        let from_bits: Vec<u64> = mask.clone().into_addr_iter().collect();
         assert_eq!(from_runs, from_bits);
     }
 

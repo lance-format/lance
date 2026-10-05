@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 .PHONY: help install build test integtest doctest compattest format format-python lint lint-python lint-rust clean
 PYTHON ?=
-PYTEST_ARGS ?= -vvv -s -m "not recurring"
+PYTEST_ARGS ?= -vvv -s
 KEEP_COMPOSE ?= 0
 COMPOSE_FILE ?= ../docker-compose.yml
 UV_SYNC = uv sync
@@ -18,6 +18,17 @@ ifeq ($(CI), true)
   PYTEST_ARGS += --durations=30
 endif
 
+# Number of pytest-xdist workers, e.g. `auto` or an explicit count. Empty (the
+# default) runs serially; CI sets it per runner size. Much of the suite is spent
+# waiting on IO rather than saturating the Rust core's own thread pools, so
+# sharding across processes wins back time a single pytest process leaves idle.
+PYTEST_WORKERS ?=
+ifneq ($(strip $(PYTEST_WORKERS)),)
+  # loadgroup rather than the default scheduler so that tests sharing state on
+  # disk can be pinned to a single worker with @pytest.mark.xdist_group.
+  PYTEST_ARGS += -n $(PYTEST_WORKERS) --dist loadgroup
+endif
+
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
@@ -32,7 +43,7 @@ install: ## Sync dependencies and set up local development tools
 build: ## Build the local Rust extension with maturin
 	$(UV_RUN) maturin develop --uv
 
-test: ## Run Python tests except recurring tests
+test: ## Run Python tests
 	pytest $(PYTEST_ARGS) python/tests
 
 integtest: ## Start LocalStack and run integration tests

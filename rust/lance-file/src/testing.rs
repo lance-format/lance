@@ -16,7 +16,8 @@ use lance_io::{
 };
 
 use crate::reader::{FileReader, FileReaderOptions};
-use crate::writer::{FileWriter, FileWriterOptions};
+use crate::version::ConcreteFileVersion;
+use crate::{versions, writer::FileWriterOptions};
 
 pub struct FsFixture {
     pub tmp_path: TempObjFile,
@@ -47,13 +48,15 @@ pub struct WrittenFile {
 pub async fn write_lance_file(
     data: impl RecordBatchReader,
     fs: &FsFixture,
+    version: ConcreteFileVersion,
     options: FileWriterOptions,
 ) -> WrittenFile {
     let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
 
     let lance_schema = lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap();
 
-    let mut file_writer = FileWriter::try_new(writer, lance_schema.clone(), options).unwrap();
+    let mut file_writer =
+        versions::create_writer(version, writer, lance_schema.clone(), options).unwrap();
 
     let data = data
         .collect::<std::result::Result<Vec<_>, ArrowError>>()

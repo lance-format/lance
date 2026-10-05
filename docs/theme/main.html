@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{#- Render one nav section as sidenav groups: its direct pages/links under the
+    section's own label, then each child section as a further group. -#}
+{%- macro sidenav_section(sec, label) -%}
+  {%- set direct = sec.children | selectattr("is_section", "ne", true) | list -%}
+  {%- if direct -%}
+  <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">{{ label }}</div>
+    {%- for child in direct %}
+    {%- if child.is_link %}
+    <a href="{{ child.url }}" target="_blank" rel="noopener">{{ child.title }} <span class="ext">↗</span></a>
+    {%- else %}
+    <a{% if child == page %} class="active"{% endif %} href="{{ child.url | url }}">{{ child.title }}</a>
+    {%- endif %}
+    {%- endfor %}
+  </div>
+  {%- endif -%}
+  {%- for child in sec.children if child.is_section -%}
+    {{ sidenav_section(child, child.title) }}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{% block container %}
+  {%- set active_section = namespace(item=none) -%}
+  {%- for item in nav %}{% if item.active %}{% set active_section.item = item %}{% endif %}{% endfor %}
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      {{ active_section.item.title if active_section.item else "Menu" }}
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+      {%- if active_section.item and active_section.item.is_section %}
+        {{ sidenav_section(active_section.item, active_section.item.title) }}
+      {%- elif active_section.item %}
+      <div class="ld-sidenav__group">
+        <div class="ld-sidenav__label">{{ active_section.item.title }}</div>
+        <a class="active" href="{{ active_section.item.url | url }}">{{ active_section.item.title }}</a>
+      </div>
+      {%- endif %}
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        {%- for crumb in page.ancestors | reverse %}
+        <span>/</span><span>{{ crumb.title }}</span>
+        {%- endfor %}
+        <span>/</span><b>{{ page.title }}</b>
+      </div>
+
+      <article class="ld-article">
+        {{ page.content }}
+      </article>
+
+      <div class="ld-pagenav">
+        {%- if page.previous_page %}
+        <a href="{{ page.previous_page.url | url }}">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">{{ page.previous_page.title }}</div>
+        </a>
+        {%- else %}<span></span>{% endif %}
+        {%- if page.next_page %}
+        <a class="next" href="{{ page.next_page.url | url }}">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">{{ page.next_page.title }}</div>
+        </a>
+        {%- endif %}
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      {%- set toc_items = namespace(list=[]) -%}
+      {%- for h1 in page.toc -%}
+        {%- if loop.first and page.toc | length == 1 -%}
+          {%- set toc_items.list = h1.children -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if page.toc | length > 1 %}{% set toc_items.list = page.toc %}{% endif -%}
+      {%- if toc_items.list %}
+      <div class="ld-toc__label">On this page</div>
+      {%- for h2 in toc_items.list %}
+      <a class="ld-toc__h2" href="{{ h2.url }}">{{ h2.title }}</a>
+      {%- for h3 in h2.children %}
+      <a class="ld-toc__h3" href="{{ h3.url }}">{{ h3.title }}</a>
+      {%- endfor %}
+      {%- endfor %}
+      {%- endif %}
+    </aside>
+  </main>
+{% endblock %}

@@ -20,6 +20,7 @@ mod bitpacker4x;
 mod bitpacker8x;
 
 pub use bitpacker4x::BitPacker4x;
+pub use bitpacker8x::BitPacker8x;
 
 pub(crate) trait Available {
     fn available() -> bool;

@@ -7,11 +7,12 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
-use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{NullabilityComparison, Schema};
+use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
@@ -19,12 +20,13 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
-use crate::blob::normalize_prepared_blob_schema;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+    write_fragments_internal_to_file,
 };
 use crate::{Error, Result};
 use tracing::info;
@@ -52,6 +54,7 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
+    preassigned_data_file_name: Option<Arc<String>>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -60,11 +63,20 @@ impl<'a> InsertBuilder<'a> {
             dest: dest.into(),
             params: None,
             write_progress: None,
+            preassigned_data_file_name: None,
         }
     }
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
+        self
+    }
+
+    pub(crate) fn with_preassigned_data_file_name(
+        mut self,
+        preassigned_data_file_name: impl Into<String>,
+    ) -> Self {
+        self.preassigned_data_file_name = Some(Arc::new(preassigned_data_file_name.into()));
         self
     }
 
@@ -136,7 +148,7 @@ impl<'a> InsertBuilder<'a> {
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
-            .with_storage_format(context.storage_version)
+            .with_exact_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone())
@@ -213,16 +225,37 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let (written_fragments, written_schema) = write_fragments_internal(
-            context.dest.dataset(),
-            context.object_store.clone(),
-            &context.base_path,
-            schema.clone(),
-            stream,
-            context.params.clone(),
-            target_base_info,
-        )
-        .await?;
+        let (written_fragments, written_schema) =
+            if let Some(preassigned_data_file_name) = &self.preassigned_data_file_name {
+                if target_base_info.is_some() {
+                    return Err(Error::invalid_input(
+                        "a fixed data file name cannot be combined with target bases",
+                    ));
+                }
+                Box::pin(write_fragments_internal_to_file(
+                    context.storage_version,
+                    context.dest.dataset(),
+                    context.object_store.clone(),
+                    &context.base_path,
+                    schema.clone(),
+                    stream,
+                    context.params.clone(),
+                    preassigned_data_file_name.clone(),
+                ))
+                .await?
+            } else {
+                Box::pin(write_fragments_internal(
+                    context.storage_version,
+                    context.dest.dataset(),
+                    context.object_store.clone(),
+                    &context.base_path,
+                    schema.clone(),
+                    stream,
+                    context.params.clone(),
+                    target_base_info,
+                ))
+                .await?
+            };
 
         let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
 
@@ -316,21 +349,34 @@ impl<'a> InsertBuilder<'a> {
                 context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
             }
 
-            let schema_cmp_opts = SchemaCompareOptions {
-                compare_dictionary: dataset.manifest.should_use_legacy_format(),
-                compare_nullability: NullabilityComparison::Ignore,
-                allow_missing_if_nullable: true,
-                ignore_field_order: true,
-                ..Default::default()
-            };
+            let version = dataset.manifest.data_storage_format.lance_file_format();
+            if (version == ConcreteFileVersion::V1)
+                != (context.storage_version == ConcreteFileVersion::V1)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Cannot append data files in version {} to a dataset with default version {version}: V1 and V2 storage versions cannot be mixed",
+                    context.storage_version
+                )));
+            }
+            let mut schema_cmp_opts = crate::dataset::versions::schema_compare_options(version);
+            schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
+            schema_cmp_opts.allow_missing_if_nullable = true;
+            schema_cmp_opts.ignore_field_order = true;
 
-            let normalized_data_schema = normalize_prepared_blob_schema(data_schema)?;
-            normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
+            if normalized_data_schema
+                .check_compatible(dataset.schema(), &schema_cmp_opts)
+                .is_err()
+            {
+                let normalized_data_schema =
+                    super::promote_legacy_blob_schema(&normalized_data_schema)?;
+                let dataset_schema = super::promote_legacy_blob_schema(dataset.schema())?;
+                normalized_data_schema.check_compatible(&dataset_schema, &schema_cmp_opts)?;
+            }
         }
 
-        // Make sure we aren't using any reserved column names
         for field in data_schema.fields.iter() {
-            if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
+            if is_system_column(&field.name) {
                 return Err(Error::invalid_input_source(
                     format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
@@ -365,7 +411,10 @@ impl<'a> InsertBuilder<'a> {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
-                dataset.commit_handler.clone(),
+                params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let registry = params
@@ -409,22 +458,13 @@ impl<'a> InsertBuilder<'a> {
             }
         };
 
-        let storage_version = match (&params.mode, &dest) {
-            (WriteMode::Overwrite, WriteDestination::Dataset(dataset)) => {
-                // If overwriting an existing dataset, allow the user to specify but use
-                // the existing version if they don't
-                params.data_storage_version.map(Ok).unwrap_or_else(|| {
-                    let m = dataset.manifest.as_ref();
-                    m.data_storage_format.lance_file_version()
-                })?
-            }
-            (_, WriteDestination::Dataset(dataset)) => {
-                // If appending to an existing dataset, always use the dataset version
-                let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_version()?
-            }
+        let storage_version = match &dest {
+            WriteDestination::Dataset(dataset) => params
+                .data_storage_version
+                .map(LanceFileVersion::resolve)
+                .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format()),
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
-            (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
+            WriteDestination::Uri(_) => params.storage_version_or_default(),
         };
 
         Ok(WriteContext {
@@ -445,20 +485,311 @@ struct WriteContext<'a> {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
-    storage_version: LanceFileVersion,
+    storage_version: ConcreteFileVersion,
 }
 
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
 
-    use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
+    use arrow_array::{
+        ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray, record_batch,
+    };
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
+    use rstest::rstest;
 
     use crate::session::Session;
 
     use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn append_resolves_explicit_or_default_exact_version(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        default_version: LanceFileVersion,
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        target_version: LanceFileVersion,
+    ) {
+        let batch = record_batch!(("id", Int32, [0])).unwrap();
+        let create_params = WriteParams {
+            data_storage_version: Some(default_version),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&create_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        let default_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&default_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.fragments[1].files[0]
+                .file_version()
+                .unwrap(),
+            default_version.resolve()
+        );
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+
+        let explicit_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(target_version),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&explicit_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            default_version.resolve()
+        );
+        assert_eq!(
+            dataset.manifest.fragments[2].files[0]
+                .file_version()
+                .unwrap(),
+            target_version.resolve()
+        );
+        let expected_flags = if default_version == target_version {
+            0
+        } else {
+            FLAG_MIXED_DATA_FILE_VERSIONS
+        };
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            expected_flags
+        );
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            expected_flags
+        );
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&default_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.fragments[3].files[0]
+                .file_version()
+                .unwrap(),
+            default_version.resolve()
+        );
+        let expected =
+            arrow_select::concat::concat_batches(&batch.schema(), [&batch, &batch, &batch, &batch])
+                .unwrap();
+        let reopened = dataset
+            .checkout_version(dataset.version().version)
+            .await
+            .unwrap();
+        assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::default(None, ConcreteFileVersion::V2_0)]
+    #[case::explicit(Some(LanceFileVersion::V2_1), ConcreteFileVersion::V2_1)]
+    #[tokio::test]
+    async fn overwrite_resolves_exact_version(
+        #[case] target: Option<LanceFileVersion>,
+        #[case] expected: ConcreteFileVersion,
+    ) {
+        let batch = record_batch!(("id", Int32, [0])).unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            })
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: target,
+                ..Default::default()
+            })
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            expected
+        );
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert_eq!(
+            dataset.manifest.fragments[0].files[0]
+                .file_version()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+    }
+
+    #[tokio::test]
+    async fn create_from_mixed_prewritten_files_requires_explicit_default() {
+        let test_dir = TempStrDir::default();
+        let mut transaction = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [0])).unwrap()])
+            .await
+            .unwrap();
+        let other = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [1])).unwrap()])
+            .await
+            .unwrap();
+        let Operation::Overwrite { fragments, .. } = &mut transaction.operation else {
+            panic!("expected overwrite");
+        };
+        let Operation::Overwrite {
+            fragments: other_fragments,
+            ..
+        } = other.operation
+        else {
+            panic!("expected overwrite");
+        };
+        fragments.extend(other_fragments);
+        let error = CommitBuilder::new(test_dir.as_str())
+            .execute(transaction.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("All data files must have the same version"),
+            "{error}"
+        );
+        let dataset = CommitBuilder::new(test_dir.as_str())
+            .with_storage_format(LanceFileVersion::V2_0)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            record_batch!(("id", Int32, [0, 1])).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_exact_version_appends_derive_capability_from_final_manifest() {
+        let create_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        };
+        let original = Arc::new(
+            InsertBuilder::new("memory://")
+                .with_params(&create_params)
+                .execute(vec![record_batch!(("id", Int32, [0])).unwrap()])
+                .await
+                .unwrap(),
+        );
+        let v2_1_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let v2_2_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let tx_v2_1 = InsertBuilder::new(original.clone())
+            .with_params(&v2_1_params)
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [1])).unwrap()])
+            .await
+            .unwrap();
+        let tx_v2_2 = InsertBuilder::new(original.clone())
+            .with_params(&v2_2_params)
+            .execute_uncommitted(vec![record_batch!(("id", Int32, [2])).unwrap()])
+            .await
+            .unwrap();
+        let Operation::Append { fragments } = &tx_v2_2.operation else {
+            panic!("expected append");
+        };
+        let prewritten_files = fragments[0].files.clone();
+        CommitBuilder::new(original.clone())
+            .execute(tx_v2_1)
+            .await
+            .unwrap();
+        // The second writer still holds the original snapshot, forcing a retry.
+        let dataset = CommitBuilder::new(original).execute(tx_v2_2).await.unwrap();
+
+        let versions = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.files[0].file_version().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions,
+            vec![
+                ConcreteFileVersion::V2_0,
+                ConcreteFileVersion::V2_1,
+                ConcreteFileVersion::V2_2
+            ]
+        );
+        assert_eq!(dataset.manifest.fragments[2].files, prewritten_files);
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            record_batch!(("id", Int32, [0, 1, 2])).unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn test_pass_session() {
@@ -507,6 +838,74 @@ mod test {
     }
 
     #[tokio::test]
+    async fn dataset_destination_honors_explicit_commit_handler() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(initial_batch)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+            .await
+            .unwrap();
+
+        let append_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                .unwrap();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(Arc::new(RenameCommitHandler)),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(append_batch)], schema),
+            Arc::new(dataset),
+            Some(params),
+        )
+        .await
+        .expect("the explicit per-write commit handler should override the dataset handler");
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[rstest::rstest]
+    #[case::row_id("_rowid")]
+    #[case::row_addr("_rowaddr")]
+    #[case::row_offset("_rowoffset")]
+    #[case::row_created_at_version("_row_created_at_version")]
+    #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[tokio::test]
+    async fn rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+        // Every system column name must be rejected on write. The row-version
+        // columns (`_row_created_at_version`, `_row_last_updated_at_version`) are
+        // computed at read time and appended by `Projection::to_schema`; a user
+        // data column sharing one of those names would otherwise pass ingest and
+        // later collide with the appended field.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            reserved_name,
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+
+        let result = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        let err = result.expect_err("writing a reserved system column name should fail");
+        assert!(
+            err.to_string().contains("reserved name"),
+            "unexpected error for {reserved_name}: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn allow_overwrite_to_v2_2_without_blob_upgrade() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
@@ -536,7 +935,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
+    async fn create_v2_2_dataset_accepts_legacy_blob_input() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("blob", DataType::Binary, false).with_metadata(HashMap::from([(
                 BLOB_META_KEY.to_string(),
@@ -558,50 +957,93 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = dataset.unwrap_err();
-        match err {
-            Error::InvalidInput { source, .. } => {
-                let message = source.to_string();
-                assert!(message.contains("Legacy blob columns"));
-                assert!(message.contains("lance.blob.v2"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let dataset = Arc::new(dataset.unwrap());
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"abc"
+        );
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
     }
 
+    #[rstest]
+    #[case::create(None)]
+    #[case::append_v20(Some(LanceFileVersion::V2_0))]
+    #[case::append_v21(Some(LanceFileVersion::V2_1))]
     #[tokio::test]
-    async fn create_v2_2_dataset_rejects_nested_legacy_blob_schema() {
-        let image_field = Field::new("image_bytes", DataType::Binary, true).with_metadata(
-            HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
-        );
+    async fn create_v2_2_dataset_accepts_nested_legacy_blob_input(
+        #[case] initial_version: Option<LanceFileVersion>,
+    ) {
+        let image_field =
+            Field::new("image_bytes", DataType::LargeBinary, true).with_metadata(HashMap::from([
+                (BLOB_META_KEY.to_string(), "true".to_string()),
+            ]));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "summary_image_nested",
             DataType::Struct(vec![image_field.clone()].into()),
             true,
         )]));
-        let image_values: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]));
+        let image_values: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![Some(
+            b"abc".as_slice(),
+        )]));
         let nested_values = StructArray::from(vec![(Arc::new(image_field), image_values)]);
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_values)]).unwrap();
 
-        let dataset = InsertBuilder::new("memory://forced-nested-blob-v2")
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        if let Some(version) = initial_version {
+            InsertBuilder::new(uri)
+                .with_params(&WriteParams {
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                })
+                .execute_stream(RecordBatchIterator::new(
+                    [Ok(batch.clone())],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        let dataset = InsertBuilder::new(uri)
             .with_params(&WriteParams {
-                mode: WriteMode::Create,
+                mode: if initial_version.is_some() {
+                    WriteMode::Append
+                } else {
+                    WriteMode::Create
+                },
                 data_storage_version: Some(LanceFileVersion::V2_2),
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = dataset.unwrap_err();
-        match err {
-            Error::InvalidInput { source, .. } => {
-                let message = source.to_string();
-                assert!(message.contains("Legacy blob columns"));
-                assert!(message.contains("summary_image_nested.image_bytes"));
-                assert!(message.contains("lance.blob.v2"));
-            }
-            other => panic!("unexpected error: {other:?}"),
+        let dataset = Arc::new(dataset.unwrap());
+        let blobs = dataset
+            .take_blobs_by_indices(&[0], "summary_image_nested.image_bytes")
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"abc"
+        );
+        let descriptors = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            descriptors.num_rows(),
+            if initial_version.is_some() { 2 } else { 1 }
+        );
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment.scan().try_into_batch().await.unwrap().schema(),
+                descriptors.schema()
+            );
         }
+        assert!(
+            dataset
+                .schema()
+                .field("summary_image_nested.image_bytes")
+                .unwrap()
+                .is_blob_v2()
+        );
     }
 
     mod external_error {

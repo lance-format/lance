@@ -21,6 +21,21 @@
 //! bypass `object_store`'s HTTP client, so there is no place to install the
 //! connector for them.
 //!
+//! Neither layer sees the optimized local reads and writes ([`LocalObjectReader`],
+//! [`LocalWriter`], the io_uring readers, and the local `copy` / recursive delete
+//! shortcuts), which go straight to the filesystem. Those publish the same
+//! request-level metrics themselves through
+//! [`IOTracker::begin_io`](crate::utils::tracking_store::IOTracker::begin_io).
+//! The two are installed together, so a store either publishes for all of its
+//! IO or for none of it. A store built by calling a provider's `new_store`
+//! directly, bypassing both `ObjectStore` constructors — as
+//! [`ObjectStore::local`](crate::object_store::ObjectStore::local) and
+//! [`ObjectStore::memory`](crate::object_store::ObjectStore::memory) do — is in
+//! the "none of it" case.
+//!
+//! [`LocalObjectReader`]: crate::local::LocalObjectReader
+//! [`LocalWriter`]: crate::object_writer::LocalWriter
+//!
 //! Metrics carry a `base` label identifying the store. Its cardinality is
 //! controlled by the `LANCE_OBJECT_STORE_METRICS_LABEL` environment variable
 //! ([`BASE_LABEL_ENV_VAR`]):
@@ -28,6 +43,11 @@
 //! * `scheme` (default) — scheme only, e.g. `s3`; low, bounded cardinality.
 //! * `full` — the full store prefix, e.g. `s3$bucket` or `az$container@account`,
 //!   so multiple buckets on the same cloud can be told apart.
+//! * `dataset` — `base` as in `full`, plus a `dataset` label with the URI the
+//!   store was opened for, e.g. `s3://bucket/path/table.lance`, so IO can be
+//!   attributed to a dataset. Each URI gets its own store (and HTTP client)
+//!   instead of sharing one per bucket, while the AIMD throttle budget stays
+//!   shared per bucket; cardinality grows with the number of datasets opened.
 //! * `off` — omit the `base` label entirely.
 //!
 //! The metric name constants ([`METRIC_REQUESTS`] etc.) and the recording
@@ -50,6 +70,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
     UploadPart,
 };
+use url::Url;
 
 /// Total number of object store requests, labelled by `operation` and `base`.
 pub const METRIC_REQUESTS: &str = "lance_object_store_requests_total";
@@ -77,12 +98,16 @@ pub const BASE_LABEL_ENV_VAR: &str = "LANCE_OBJECT_STORE_METRICS_LABEL";
 /// Controls how much of a store's identity the `base` label carries, traded off
 /// against metric cardinality. Selected via [`BASE_LABEL_ENV_VAR`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaseLabelMode {
-    /// Full store prefix, e.g. `s3$bucket` or `az$container@account`. Highest
-    /// cardinality: one series family per bucket/container.
+pub(crate) enum BaseLabelMode {
+    /// Full store prefix, e.g. `s3$bucket` or `az$container@account`: one
+    /// series family per bucket/container.
     Full,
     /// Scheme only, e.g. `s3`. The default: low, bounded cardinality.
     Scheme,
+    /// Full store prefix as `base`, plus a `dataset` label with the URI the
+    /// store was opened for, e.g. `s3://bucket/path/table.lance`. Highest
+    /// cardinality: one series family per dataset.
+    Dataset,
     /// Omit the `base` label entirely.
     Off,
 }
@@ -90,12 +115,13 @@ enum BaseLabelMode {
 fn parse_base_label_mode(value: Option<&str>) -> BaseLabelMode {
     match value {
         Some("full") => BaseLabelMode::Full,
+        Some("dataset") => BaseLabelMode::Dataset,
         Some("off") | Some("none") => BaseLabelMode::Off,
         Some("scheme") | None => BaseLabelMode::Scheme,
         Some(other) => {
             tracing::warn!(
                 "Unrecognized {BASE_LABEL_ENV_VAR}={other:?}; \
-                 expected one of full, scheme, off. Defaulting to scheme."
+                 expected one of full, scheme, dataset, off. Defaulting to scheme."
             );
             BaseLabelMode::Scheme
         }
@@ -103,19 +129,43 @@ fn parse_base_label_mode(value: Option<&str>) -> BaseLabelMode {
 }
 
 /// The label mode is read once from the environment and cached for the process.
-fn base_label_mode() -> BaseLabelMode {
+pub(crate) fn base_label_mode() -> BaseLabelMode {
     static MODE: OnceLock<BaseLabelMode> = OnceLock::new();
     *MODE.get_or_init(|| parse_base_label_mode(std::env::var(BASE_LABEL_ENV_VAR).ok().as_deref()))
 }
 
-/// Reduce a full store prefix (`scheme$authority`, or just `scheme` for stores
-/// without buckets) to the configured `base` label value, or `None` when the
-/// label should be omitted.
-fn scoped_base(mode: BaseLabelMode, base: &str) -> Option<String> {
+/// Reduce a store identity from [`metrics_base`] to the configured `base`
+/// label, plus the `dataset` label in dataset mode. Empty when the label should
+/// be omitted. A bare prefix (`scheme$authority`, or just `scheme` for stores
+/// without buckets) in dataset mode, as a caller-metered store hands over, gets
+/// only the `base` label.
+fn base_labels(mode: BaseLabelMode, base: &str) -> Vec<metrics::Label> {
+    let base_label = |base: &str| metrics::Label::new("base", base.to_owned());
     match mode {
-        BaseLabelMode::Full => Some(base.to_owned()),
-        BaseLabelMode::Scheme => Some(base.split('$').next().unwrap_or(base).to_owned()),
-        BaseLabelMode::Off => None,
+        BaseLabelMode::Full => vec![base_label(base)],
+        BaseLabelMode::Scheme => vec![base_label(base.split('$').next().unwrap_or(base))],
+        BaseLabelMode::Dataset => match base.split_once(' ') {
+            Some((prefix, uri)) => vec![
+                base_label(prefix),
+                metrics::Label::new("dataset", uri.to_owned()),
+            ],
+            None => vec![base_label(base)],
+        },
+        BaseLabelMode::Off => vec![],
+    }
+}
+
+/// The identity a store's metrics are labelled with: its prefix
+/// (`scheme$authority`), followed in dataset mode by a space and the URI it was
+/// opened for. A space cannot occur in either part, so [`base_labels`] splits
+/// on it. The registry also keys its store cache by this, so per-dataset labels
+/// come with per-dataset stores.
+pub(crate) fn metrics_base(mode: BaseLabelMode, store_prefix: &str, location: &Url) -> String {
+    match mode {
+        BaseLabelMode::Dataset => {
+            format!("{store_prefix} {}", location.as_str().trim_end_matches('/'))
+        }
+        _ => store_prefix.to_owned(),
     }
 }
 
@@ -123,9 +173,7 @@ fn scoped_base(mode: BaseLabelMode, base: &str) -> Option<String> {
 /// store-level metrics, honoring the configured label mode.
 fn operation_labels(base: &str, operation: &'static str) -> Vec<metrics::Label> {
     let mut labels = vec![metrics::Label::new("operation", operation)];
-    if let Some(base) = scoped_base(base_label_mode(), base) {
-        labels.push(metrics::Label::new("base", base));
-    }
+    labels.extend(base_labels(base_label_mode(), base));
     labels
 }
 
@@ -642,9 +690,7 @@ mod http {
     /// honoring the configured label mode.
     fn status_labels(base: &str, status: u16) -> Vec<metrics::Label> {
         let mut labels = vec![metrics::Label::new("status", status.to_string())];
-        if let Some(base) = scoped_base(base_label_mode(), base) {
-            labels.push(metrics::Label::new("base", base));
-        }
+        labels.extend(base_labels(base_label_mode(), base));
         labels
     }
 
@@ -776,10 +822,17 @@ pub use http::MeteringHttpConnector;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
+    use lance_core::utils::tempfile::TempStdDir;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutPayload};
+    use tokio::io::AsyncWriteExt;
+    use url::Url;
+
+    use crate::object_store::ObjectStore as LanceObjectStore;
+    use crate::traits::Writer;
 
     fn payload(data: &[u8]) -> PutPayload {
         PutPayload::from_bytes(Bytes::copy_from_slice(data))
@@ -877,33 +930,57 @@ mod tests {
         assert_eq!(parse_base_label_mode(None), BaseLabelMode::Scheme);
         assert_eq!(parse_base_label_mode(Some("scheme")), BaseLabelMode::Scheme);
         assert_eq!(parse_base_label_mode(Some("full")), BaseLabelMode::Full);
+        assert_eq!(
+            parse_base_label_mode(Some("dataset")),
+            BaseLabelMode::Dataset
+        );
         assert_eq!(parse_base_label_mode(Some("off")), BaseLabelMode::Off);
         assert_eq!(parse_base_label_mode(Some("none")), BaseLabelMode::Off);
         // Unrecognized values fall back to the conservative default.
         assert_eq!(parse_base_label_mode(Some("bogus")), BaseLabelMode::Scheme);
     }
 
+    #[rstest]
+    #[case::full(BaseLabelMode::Full, "s3$bucket", &[("base", "s3$bucket")])]
+    #[case::scheme(BaseLabelMode::Scheme, "s3$bucket", &[("base", "s3")])]
+    // Azure keeps only the scheme even though its prefix carries the account.
+    #[case::scheme_azure(BaseLabelMode::Scheme, "az$container@account", &[("base", "az")])]
+    // A prefix without `$` (e.g. memory/file) is unchanged by scheme mode.
+    #[case::scheme_no_bucket(BaseLabelMode::Scheme, "memory", &[("base", "memory")])]
+    #[case::off(BaseLabelMode::Off, "s3$bucket", &[])]
+    #[case::dataset(
+        BaseLabelMode::Dataset,
+        "s3$bucket s3://bucket/a/b.lance",
+        &[("base", "s3$bucket"), ("dataset", "s3://bucket/a/b.lance")]
+    )]
+    // A caller-metered store carries no URI, so dataset mode degrades to `full`.
+    #[case::dataset_bare_prefix(BaseLabelMode::Dataset, "s3$bucket", &[("base", "s3$bucket")])]
+    fn test_base_labels(
+        #[case] mode: BaseLabelMode,
+        #[case] base: &str,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let labels = base_labels(mode, base);
+        let got: Vec<(&str, &str)> = labels.iter().map(|l| (l.key(), l.value())).collect();
+        assert_eq!(got, expected);
+    }
+
     #[test]
-    fn test_scoped_base() {
+    fn test_metrics_base() {
+        let url = Url::parse("s3://bucket/a/b.lance/").unwrap();
+        // Only dataset mode appends the URI; a trailing slash does not split a
+        // dataset's series in two.
         assert_eq!(
-            scoped_base(BaseLabelMode::Full, "s3$bucket").as_deref(),
-            Some("s3$bucket")
+            metrics_base(BaseLabelMode::Dataset, "s3$bucket", &url),
+            "s3$bucket s3://bucket/a/b.lance"
         );
-        assert_eq!(
-            scoped_base(BaseLabelMode::Scheme, "s3$bucket").as_deref(),
-            Some("s3")
-        );
-        // Azure keeps only the scheme even though its prefix carries the account.
-        assert_eq!(
-            scoped_base(BaseLabelMode::Scheme, "az$container@account").as_deref(),
-            Some("az")
-        );
-        // A prefix without `$` (e.g. memory/file) is unchanged by scheme mode.
-        assert_eq!(
-            scoped_base(BaseLabelMode::Scheme, "memory").as_deref(),
-            Some("memory")
-        );
-        assert_eq!(scoped_base(BaseLabelMode::Off, "s3$bucket"), None);
+        for mode in [
+            BaseLabelMode::Full,
+            BaseLabelMode::Scheme,
+            BaseLabelMode::Off,
+        ] {
+            assert_eq!(metrics_base(mode, "s3$bucket", &url), "s3$bucket");
+        }
     }
 
     #[test]
@@ -1424,6 +1501,204 @@ mod tests {
         let list_labels = [("operation", "list"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &list_labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_ERRORS, &list_labels), 1);
+    }
+
+    /// The optimized local reads and writes talk to the filesystem directly, so
+    /// they never reach [`MeteredObjectStore`] and publish these metrics
+    /// themselves. They must land under the same `base` label as the store's
+    /// metered operations, which for a local store is its scheme.
+    #[test]
+    fn test_local_filesystem_io_is_metered() {
+        let tmp = TempStdDir::default();
+        let dir = tmp.join("sub");
+        let data = b"hello world";
+        let recorded = capture_metrics(|| async {
+            // Built through the registry, like any store opened from a URI.
+            let (store, path) = LanceObjectStore::from_uri(dir.join("a.bin").to_str().unwrap())
+                .await
+                .unwrap();
+            // Writes go through LocalWriter.
+            store.put(&path, data).await.unwrap();
+
+            // Reads go through LocalObjectReader.
+            let reader = store.open(&path).await.unwrap();
+            assert_eq!(reader.size().await.unwrap(), data.len());
+            assert_eq!(reader.get_range(0..5).await.unwrap().len(), 5);
+            assert_eq!(reader.get_all().await.unwrap().len(), data.len());
+            // The file is smaller than the block size, so it streams as one chunk.
+            let chunks: Vec<_> = reader.get_stream().await.unwrap().collect().await;
+            assert_eq!(chunks.len(), 1);
+
+            // Copy and recursive delete both shortcut to the filesystem too.
+            store
+                .copy(&path, &Path::from_absolute_path(dir.join("b.bin")).unwrap())
+                .await
+                .unwrap();
+            store
+                .remove_dir_all(Path::from_absolute_path(&dir).unwrap())
+                .await
+                .unwrap();
+        });
+
+        let put_labels = [("operation", "put"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &put_labels), 1);
+        assert_eq!(
+            counter_value(&recorded, METRIC_BYTES, &put_labels),
+            data.len() as u64
+        );
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &put_labels), 1);
+        assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &put_labels), 0.0);
+
+        // One request each for the range read, the full read and the single
+        // streamed chunk.
+        let get_labels = [("operation", "get"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &get_labels), 3);
+        assert_eq!(
+            counter_value(&recorded, METRIC_BYTES, &get_labels),
+            (5 + 2 * data.len()) as u64
+        );
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &get_labels), 3);
+        assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &get_labels), 0.0);
+
+        // The size lookup is the local equivalent of a HEAD, and transfers no
+        // payload bytes.
+        let head_labels = [("operation", "head"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &head_labels), 1);
+        assert_eq!(counter_value(&recorded, METRIC_BYTES, &head_labels), 0);
+
+        for operation in ["copy", "delete"] {
+            let labels = [("operation", operation), ("base", "file")];
+            assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+            assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
+        }
+
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &get_labels), 0);
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &put_labels), 0);
+    }
+
+    #[test]
+    fn test_local_read_error_is_counted() {
+        let tmp = TempStdDir::default();
+        let recorded = capture_metrics(|| async {
+            let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                .await
+                .unwrap();
+            store.put(&path, b"hello").await.unwrap();
+
+            let reader = store.open(&path).await.unwrap();
+            // Reading past the end of the file fails.
+            assert!(reader.get_range(0..100).await.is_err());
+        });
+
+        let labels = [("operation", "get"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 1);
+        // A failed read is still counted as a request, with latency recorded.
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
+        assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
+    }
+
+    /// A local write is reported as a single `put` covering the whole file, so it
+    /// stays in flight until the file is persisted under its final path.
+    #[test]
+    fn test_local_write_is_in_flight_until_persisted() {
+        let tmp = TempStdDir::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "put"), ("base", "file")];
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                    .await
+                    .unwrap();
+                let mut writer = store.create(&path).await.unwrap();
+                writer.write_all(b"hello").await.unwrap();
+
+                let recorded = snapshot(&snapshotter);
+                assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &labels), 1.0);
+                assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 0);
+
+                Writer::shutdown(writer.as_mut()).await.unwrap();
+                let recorded = snapshot(&snapshotter);
+                assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &labels), 0.0);
+                assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+                assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 5);
+            });
+        });
+    }
+
+    /// A store handed in by the caller is metered like one built by the registry.
+    #[test]
+    fn test_caller_supplied_store_is_metered() {
+        let recorded = capture_metrics(|| async {
+            #[allow(deprecated)]
+            let params = crate::object_store::ObjectStoreParams {
+                object_store: Some((
+                    Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>,
+                    Url::parse("memory:///").unwrap(),
+                )),
+                ..Default::default()
+            };
+            let (store, _) = LanceObjectStore::from_uri_and_params(
+                Arc::new(crate::object_store::ObjectStoreRegistry::default()),
+                "memory:///",
+                &params,
+            )
+            .await
+            .unwrap();
+            store.put(&Path::from("a"), b"hello").await.unwrap();
+        });
+
+        assert_eq!(
+            counter_value(
+                &recorded,
+                METRIC_REQUESTS,
+                &[("operation", "put"), ("base", "memory")]
+            ),
+            1
+        );
+    }
+
+    /// `ObjectStore::new` is how `DatasetBuilder` wraps a caller-supplied store,
+    /// so it must meter both halves of the store: the operations that go through
+    /// `inner`, and the local ones that bypass it. Metering only one half would
+    /// report a partial picture that reads like a complete one.
+    #[test]
+    fn test_store_built_from_new_is_metered() {
+        let tmp = TempStdDir::default();
+        let recorded = capture_metrics(|| async {
+            let store = LanceObjectStore::new(
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                Url::parse("file:///").unwrap(),
+                None,
+                None,
+                false,
+                false,
+                1,
+                3,
+                None,
+            );
+            let path = Path::from_absolute_path(tmp.join("a.bin")).unwrap();
+            // put and open bypass `inner` and publish for themselves.
+            store.put(&path, b"hello").await.unwrap();
+            let reader = store.open(&path).await.unwrap();
+            assert_eq!(reader.get_all().await.unwrap().len(), 5);
+            // delete goes through `inner`, so only MeteredObjectStore can count it.
+            store.delete(&path).await.unwrap();
+        });
+
+        for (operation, bytes) in [("put", 5), ("get", 5), ("delete", 0)] {
+            let labels = [("operation", operation), ("base", "file")];
+            assert_eq!(
+                counter_value(&recorded, METRIC_REQUESTS, &labels),
+                1,
+                "expected one {operation} request"
+            );
+            assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), bytes);
+        }
     }
 
     /// A store whose stream-producing operations always yield an error, used to

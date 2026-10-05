@@ -16,6 +16,8 @@ package org.lance;
 import org.apache.arrow.util.Preconditions;
 
 import java.io.Closeable;
+import java.util.Collections;
+import java.util.Map;
 
 /**
  * A user session that holds runtime state for Lance datasets.
@@ -33,6 +35,14 @@ import java.io.Closeable;
  * Session customSession = Session.builder()
  *     .indexCacheSizeBytes(2L * 1024 * 1024 * 1024)  // 2 GiB
  *     .metadataCacheSizeBytes(512L * 1024 * 1024)    // 512 MiB
+ *     .build();
+ *
+ * // Select registered cache backends using URIs or structured configuration
+ * Session backendSession = Session.builder()
+ *     .indexCacheBackend("moka://?capacity=1073741824")
+ *     .metadataCacheBackend(CacheBackendConfig.builder("moka")
+ *         .option("capacity", "268435456")
+ *         .build())
  *     .build();
  *
  * // Open multiple datasets with shared session
@@ -110,8 +120,12 @@ public class Session implements Closeable {
 
   /** Builder for creating Session instances with custom configuration. */
   public static class Builder {
-    private long indexCacheSizeBytes = DEFAULT_INDEX_CACHE_SIZE_BYTES;
-    private long metadataCacheSizeBytes = DEFAULT_METADATA_CACHE_SIZE_BYTES;
+    private Long indexCacheSizeBytes;
+    private Long metadataCacheSizeBytes;
+    private String indexCacheBackendUri;
+    private CacheBackendConfig indexCacheBackendConfig;
+    private String metadataCacheBackendUri;
+    private CacheBackendConfig metadataCacheBackendConfig;
 
     private Builder() {}
 
@@ -124,6 +138,37 @@ public class Session implements Closeable {
     public Builder indexCacheSizeBytes(long indexCacheSizeBytes) {
       Preconditions.checkArgument(indexCacheSizeBytes >= 0, "indexCacheSizeBytes must be >= 0");
       this.indexCacheSizeBytes = indexCacheSizeBytes;
+      return this;
+    }
+
+    /**
+     * Selects a registered index cache backend using a backend URI.
+     *
+     * <p>For example, {@code moka://?capacity=1048576}. This option is mutually exclusive with
+     * {@link #indexCacheSizeBytes(long)}.
+     *
+     * @param backendUri backend URI whose scheme identifies the registered backend
+     * @return this builder instance
+     */
+    public Builder indexCacheBackend(String backendUri) {
+      Preconditions.checkNotNull(backendUri, "backendUri must not be null");
+      this.indexCacheBackendUri = backendUri;
+      this.indexCacheBackendConfig = null;
+      return this;
+    }
+
+    /**
+     * Selects a registered index cache backend using structured configuration.
+     *
+     * <p>This option is mutually exclusive with {@link #indexCacheSizeBytes(long)}.
+     *
+     * @param backendConfig backend kind and backend-specific options
+     * @return this builder instance
+     */
+    public Builder indexCacheBackend(CacheBackendConfig backendConfig) {
+      Preconditions.checkNotNull(backendConfig, "backendConfig must not be null");
+      this.indexCacheBackendConfig = backendConfig;
+      this.indexCacheBackendUri = null;
       return this;
     }
 
@@ -141,13 +186,74 @@ public class Session implements Closeable {
     }
 
     /**
+     * Selects a registered metadata cache backend using a backend URI.
+     *
+     * <p>For example, {@code moka://?capacity=1048576}. This option is mutually exclusive with
+     * {@link #metadataCacheSizeBytes(long)}.
+     *
+     * @param backendUri backend URI whose scheme identifies the registered backend
+     * @return this builder instance
+     */
+    public Builder metadataCacheBackend(String backendUri) {
+      Preconditions.checkNotNull(backendUri, "backendUri must not be null");
+      this.metadataCacheBackendUri = backendUri;
+      this.metadataCacheBackendConfig = null;
+      return this;
+    }
+
+    /**
+     * Selects a registered metadata cache backend using structured configuration.
+     *
+     * <p>This option is mutually exclusive with {@link #metadataCacheSizeBytes(long)}.
+     *
+     * @param backendConfig backend kind and backend-specific options
+     * @return this builder instance
+     */
+    public Builder metadataCacheBackend(CacheBackendConfig backendConfig) {
+      Preconditions.checkNotNull(backendConfig, "backendConfig must not be null");
+      this.metadataCacheBackendConfig = backendConfig;
+      this.metadataCacheBackendUri = null;
+      return this;
+    }
+
+    /**
      * Builds the Session with the configured settings.
      *
      * @return a new Session instance
      */
     public Session build() {
-      long handle = createNative(indexCacheSizeBytes, metadataCacheSizeBytes);
+      validateCacheConfiguration();
+      long handle =
+          createNative(
+              indexCacheSizeBytes == null ? -1 : indexCacheSizeBytes,
+              metadataCacheSizeBytes == null ? -1 : metadataCacheSizeBytes,
+              indexCacheBackendUri,
+              backendKind(indexCacheBackendConfig),
+              backendOptions(indexCacheBackendConfig),
+              metadataCacheBackendUri,
+              backendKind(metadataCacheBackendConfig),
+              backendOptions(metadataCacheBackendConfig));
       return new Session(handle);
+    }
+
+    private void validateCacheConfiguration() {
+      Preconditions.checkArgument(
+          indexCacheSizeBytes == null
+              || (indexCacheBackendUri == null && indexCacheBackendConfig == null),
+          "indexCacheSizeBytes and indexCacheBackend are mutually exclusive; set one or the other");
+      Preconditions.checkArgument(
+          metadataCacheSizeBytes == null
+              || (metadataCacheBackendUri == null && metadataCacheBackendConfig == null),
+          "metadataCacheSizeBytes and metadataCacheBackend are mutually exclusive; "
+              + "set one or the other");
+    }
+
+    private static String backendKind(CacheBackendConfig config) {
+      return config == null ? null : config.getKind();
+    }
+
+    private static Map<String, String> backendOptions(CacheBackendConfig config) {
+      return config == null ? Collections.emptyMap() : config.getOptions();
     }
   }
 
@@ -174,6 +280,19 @@ public class Session implements Closeable {
   public long sizeBytes() {
     Preconditions.checkArgument(nativeSessionHandle != 0, "Session is closed");
     return sizeBytesNative();
+  }
+
+  /**
+   * Returns statistics for the metadata cache of this session.
+   *
+   * <p>The returned statistics are a snapshot; call this method periodically to observe how hits
+   * and misses evolve over time.
+   *
+   * @return the metadata cache statistics
+   */
+  public CacheStats metadataCacheStats() {
+    Preconditions.checkArgument(nativeSessionHandle != 0, "Session is closed");
+    return metadataCacheStatsNative();
   }
 
   /**
@@ -238,9 +357,19 @@ public class Session implements Closeable {
     return String.format("Session(sizeBytes=%d)", sizeBytes());
   }
 
-  private static native long createNative(long indexCacheSizeBytes, long metadataCacheSizeBytes);
+  private static native long createNative(
+      long indexCacheSizeBytes,
+      long metadataCacheSizeBytes,
+      String indexCacheBackendUri,
+      String indexCacheBackendKind,
+      Map<String, String> indexCacheBackendOptions,
+      String metadataCacheBackendUri,
+      String metadataCacheBackendKind,
+      Map<String, String> metadataCacheBackendOptions);
 
   private native long sizeBytesNative();
+
+  private native CacheStats metadataCacheStatsNative();
 
   private static native void releaseNative(long handle);
 

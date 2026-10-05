@@ -14,12 +14,14 @@ use std::{borrow::Cow, ops::Deref};
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, Manifest},
+    format::{
+        DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
+    },
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -80,6 +82,20 @@ impl CacheKey for ManifestKey<'_> {
     fn type_name() -> &'static str {
         "Manifest"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.manifest-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +110,14 @@ impl CacheKey for TransactionKey {
     }
     fn type_name() -> &'static str {
         "Transaction"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.transaction-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
     }
 }
 
@@ -117,6 +141,26 @@ impl CacheKey for DeletionFileKey<'_> {
     fn type_name() -> &'static str {
         "DeletionVector"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        builder.write_u64(self.deletion_file.read_version);
+        builder.write_u64(self.deletion_file.id);
+        builder.write_variant(match &self.deletion_file.file_type {
+            DeletionFileType::Array => 0,
+            DeletionFileType::Bitmap => 1,
+        });
+        if let Some(base_id) = self.deletion_file.base_id {
+            builder.write_some();
+            builder.write_u32(base_id);
+        } else {
+            builder.write_none();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -139,35 +183,163 @@ impl CacheKey for RowAddrMaskKey {
     fn type_name() -> &'static str {
         "RowAddrMask"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-address-mask-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        if let Some(restrict_hash) = self.restrict_hash {
+            builder.write_some();
+            builder.write_u64(restrict_hash);
+        } else {
+            builder.write_none();
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct RowIdIndexKey {
+pub struct RowIdIndexKey<'a> {
     pub version: u64,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's index for a version number the new incarnation
+    /// now also holds. The e-tag disambiguates generations the same way
+    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
+    /// cached index at all (see `get_row_id_index`).
+    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for RowIdIndexKey {
+impl CacheKey for RowIdIndexKey<'_> {
     type ValueType = RowIdIndex;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_index/{}", self.version))
+        Cow::Owned(format!(
+            "row_id_index/{}/{}",
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
     }
     fn type_name() -> &'static str {
         "RowIdIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct RowIdSequenceKey {
+pub struct RowIdSequenceKey<'a> {
     pub fragment_id: u64,
+    /// Where the sequence is stored. A fragment id alone is not enough: this
+    /// cache is namespaced by dataset URI only (see
+    /// [`GlobalMetadataCache::for_dataset`]), and a dataset dropped and
+    /// recreated at the same URI restarts fragment ids at 0, so a reused id
+    /// would otherwise be served the earlier generation's sequence (#7645).
+    /// The `row_id_meta` differentiates generations of dataset fragments.
+    ///
+    /// Any operation that changes which row ids a fragment holds also writes it
+    /// new `row_id_meta`, so generations stay distinct; operations that leave
+    /// row ids alone (deletes, added columns) leave it untouched and keep
+    /// hitting the cache.
+    ///
+    /// For inline metadata the identity of the sequence *is* its encoded bytes,
+    /// so the key uses
+    /// [`InlineRowIds::digest`](lance_table::format::InlineRowIds::digest),
+    /// which those bytes memoize on first use — an array-encoded sequence is
+    /// 8 bytes per row, too much to rehash on every lookup.
+    pub row_id_meta: &'a RowIdMeta,
+    /// The data file the sequence is spilled to, when `row_id_meta` says it
+    /// is one; identifies the contents the way an inline digest does.
+    pub lineage_file: Option<&'a DataFile>,
 }
 
-impl CacheKey for RowIdSequenceKey {
+impl CacheKey for RowIdSequenceKey<'_> {
     type ValueType = RowIdSequence;
+    // Only the legacy display form. Identity comes from `write_key` below.
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
     }
     fn type_name() -> &'static str {
         "RowIdSequence"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 2)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        match self.row_id_meta {
+            RowIdMeta::Inline(data) => {
+                builder.write_variant(0);
+                builder.write_fixed_bytes(data.digest());
+            }
+            // The sequence lives in one of the fragment's data files, which is
+            // named freshly per rewrite; the file identifies the contents the
+            // way the inline digest does.
+            RowIdMeta::Column => {
+                builder.write_variant(1);
+                match self.lineage_file {
+                    Some(file) => {
+                        builder.write_str(&file.path);
+                        builder.write_u64(file.base_id.map_or(u64::MAX, u64::from));
+                    }
+                    None => builder.write_str(""),
+                }
+            }
+        }
+    }
+}
+
+/// Cache key for one of a fragment's per-row version sequences that is spilled
+/// to a data file column.
+///
+/// Inline sequences are not cached: they decode straight from the manifest
+/// bytes the fragment already holds.
+#[derive(Debug)]
+pub struct RowVersionSequenceKey<'a> {
+    pub fragment_id: u64,
+    /// Which sequence this is, by the reserved field id of its column.
+    pub field_id: i32,
+    /// The data file carrying the column, named freshly per rewrite, so its
+    /// path identifies the contents the way an inline sequence's digest does.
+    pub data_file: &'a DataFile,
+}
+
+impl CacheKey for RowVersionSequenceKey<'_> {
+    type ValueType = RowDatasetVersionSequence;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_version_sequence/{}/{}",
+            self.fragment_id, self.field_id
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowDatasetVersionSequence"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-version-sequence-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        builder.write_u64(self.field_id as u64);
+        builder.write_str(&self.data_file.path);
+        builder.write_u64(self.data_file.base_id.map_or(u64::MAX, u64::from));
     }
 }
 
@@ -176,5 +348,101 @@ impl DSMetadataCache {
     /// This is used by file readers and other components that need file-level caching.
     pub(crate) fn file_metadata_cache(&self, prefix: &Path) -> LanceCache {
         self.0.with_key_prefix(prefix.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lance_table::rowids::write_row_ids;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn deletion_file_key_separates_storage_bases() {
+        let cache = LanceCache::with_capacity(4096);
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file,
+                },
+                Arc::new(DeletionVector::NoDeletions),
+            )
+            .await;
+
+        let deletion_file_on_other_base = DeletionFile {
+            base_id: Some(7),
+            ..deletion_file
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_sequence_key_separates_fragment_generations() {
+        // A dataset dropped and recreated at the same URI restarts fragment ids,
+        // so the same id must not resolve to the earlier generation's sequence.
+        let cache = LanceCache::with_capacity(4096);
+        let first_generation = RowIdMeta::Inline(write_row_ids(&(0..100).into()).into());
+        let key = RowIdSequenceKey {
+            fragment_id: 0,
+            row_id_meta: &first_generation,
+            lineage_file: None,
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdSequence::from(0..100)))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        let second_generation = RowIdMeta::Inline(write_row_ids(&(100..160).into()).into());
+        assert!(
+            cache
+                .get_with_key(&RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &second_generation,
+                    lineage_file: None,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_index_key_separates_manifest_generations() {
+        let cache = LanceCache::with_capacity(4096);
+        let key = RowIdIndexKey {
+            version: 5,
+            e_tag: Some("first-etag"),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&RowIdIndexKey {
+                    version: 5,
+                    e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
     }
 }

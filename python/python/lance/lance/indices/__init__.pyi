@@ -17,13 +17,16 @@ from typing import Optional
 
 import pyarrow as pa
 
+from .. import _Fragment
+from ..bitmap import Bitmap
+
 class IndexConfig:
     index_type: str
     config: str
 
 class IndexSegment:
     uuid: str
-    fragment_ids: set[int]
+    fragment_ids: Bitmap
     index_version: int
 
     def __repr__(self) -> str: ...
@@ -37,7 +40,7 @@ def train_ivf_model(
     sample_rate: int,
     max_iters: int,
     fragment_ids: Optional[list[int]] = None,
-) -> pa.Array: ...
+) -> pa.FixedSizeListArray: ...
 def train_pq_model(
     dataset,
     column: str,
@@ -46,9 +49,12 @@ def train_pq_model(
     distance_type: str,
     sample_rate: int,
     max_iters: int,
+    # Kept as the ``Array`` base type: callers pass ``IvfModel.centroids``,
+    # which the public ``IvfModel`` constructor accepts as a plain ``pa.Array``.
     ivf_model: pa.Array,
     fragment_ids: Optional[list[int]] = None,
-) -> pa.Array: ...
+    num_bits: int = 8,
+) -> pa.FixedSizeListArray: ...
 def transform_vectors(
     dataset,
     column: str,
@@ -58,21 +64,25 @@ def transform_vectors(
     ivf_centroids: pa.Array,
     pq_codebook: pa.Array,
     dst_uri: str,
+    fragments: list[_Fragment],
+    partitions_ds_uri: Optional[str] = None,
+    num_bits: int = 8,
 ): ...
 def build_rq_model(
     dimension: int,
-    num_bits: int = 1,
+    num_bits: int = 5,
     dtype: str = "float32",
 ) -> str: ...
 
 class IndexSegmentDescription:
     uuid: str
     dataset_version_at_last_update: int
-    fragment_ids: set[int]
+    fragment_ids: Bitmap
     index_version: int
     created_at: Optional[datetime]
     size_bytes: Optional[int]
     base_id: Optional[int]
+    covering_fields: list[int]
 
     def __repr__(self) -> str: ...
 

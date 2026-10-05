@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use datafusion::common::Result as DFResult;
@@ -49,6 +52,7 @@ pub struct DeleteOnlyMergeInsertExec {
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
+    source_skipped_duplicates: Arc<AtomicU64>,
 }
 
 impl DeleteOnlyMergeInsertExec {
@@ -56,6 +60,7 @@ impl DeleteOnlyMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -74,6 +79,7 @@ impl DeleteOnlyMergeInsertExec {
             merge_stats: Arc::new(Mutex::new(None)),
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
+            source_skipped_duplicates,
         })
     }
 
@@ -216,10 +222,6 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         "DeleteOnlyMergeInsertExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(arrow_schema::Schema::empty())
     }
@@ -246,6 +248,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
             merge_stats: self.merge_stats.clone(),
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
+            source_skipped_duplicates: self.source_skipped_duplicates.clone(),
         }))
     }
 
@@ -283,9 +286,10 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let merged_generations = self.params.merged_generations.clone();
+        let compacted_sstables = self.params.compacted_sstables.clone();
         let source_dedupe_behavior = self.params.source_dedupe_behavior;
         let on_columns = self.params.on.clone();
+        let source_skipped_duplicates = self.source_skipped_duplicates.clone();
 
         let result_stream = futures::stream::once(async move {
             // Delete-only merges write no data files, but still validate any
@@ -308,7 +312,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 updated_fragments,
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations,
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields
@@ -323,6 +327,13 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
             let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
             let num_deleted = delete_row_addrs.len();
+            let num_skipped_duplicates = (skipped_duplicates.value() as u64)
+                .checked_add(source_skipped_duplicates.load(Ordering::Relaxed))
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "merge insert skipped duplicate count overflowed u64".to_string(),
+                    )
+                })?;
             let stats = MergeStats {
                 num_deleted_rows: num_deleted,
                 num_inserted_rows: 0,
@@ -330,7 +341,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 bytes_written: 0,
                 num_files_written: 0,
                 num_attempts: 1,
-                num_skipped_duplicates: skipped_duplicates.value() as u64,
+                num_skipped_duplicates,
             };
 
             if let Ok(mut transaction_guard) = transaction_holder.lock() {

@@ -23,17 +23,20 @@ import java.util.Map;
 public class MemWalIndexDetails {
   private final long numShards;
   private final List<String> maintainedIndexes;
+  private final boolean maintainAllIndexes;
   private final Map<String, String> writerConfigDefaults;
   private final List<ShardingSpec> shardingSpecs;
 
   public MemWalIndexDetails(
       long numShards,
       List<String> maintainedIndexes,
+      boolean maintainAllIndexes,
       Map<String, String> writerConfigDefaults,
       List<ShardingSpec> shardingSpecs) {
     this.numShards = numShards;
     this.maintainedIndexes =
         maintainedIndexes == null ? Collections.emptyList() : maintainedIndexes;
+    this.maintainAllIndexes = maintainAllIndexes;
     this.writerConfigDefaults =
         writerConfigDefaults == null ? Collections.emptyMap() : writerConfigDefaults;
     this.shardingSpecs = shardingSpecs == null ? Collections.emptyList() : shardingSpecs;
@@ -44,9 +47,22 @@ public class MemWalIndexDetails {
     return numShards;
   }
 
-  /** Names of the indexes maintained through the MemWAL. */
+  /**
+   * Names of the indexes maintained through the MemWAL. Empty when {@link #maintainAllIndexes()} is
+   * set, which names no index because it covers every one.
+   */
   public List<String> maintainedIndexes() {
     return maintainedIndexes;
+  }
+
+  /**
+   * Whether every index the table has is maintained, including ones created later.
+   *
+   * <p>This is what separates maintaining everything from maintaining nothing: both leave {@link
+   * #maintainedIndexes()} empty.
+   */
+  public boolean maintainAllIndexes() {
+    return maintainAllIndexes;
   }
 
   /** Default {@link ShardWriterConfig} values persisted in the MemWAL index. */
@@ -64,6 +80,7 @@ public class MemWalIndexDetails {
     return MoreObjects.toStringHelper(this)
         .add("numShards", numShards)
         .add("maintainedIndexes", maintainedIndexes)
+        .add("maintainAllIndexes", maintainAllIndexes)
         .add("writerConfigDefaults", writerConfigDefaults)
         .add("shardingSpecs", shardingSpecs)
         .toString();

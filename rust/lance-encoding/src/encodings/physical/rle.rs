@@ -54,16 +54,18 @@
 //! When used in the block compression path, the encoded output is a single buffer:
 //! `[8-byte header: values buffer size][values buffer][run_lengths buffer]`.
 
-use arrow_buffer::ArrowNativeType;
+use arrow_buffer::{ArrowNativeType, ScalarBuffer};
 use log::trace;
 
 use crate::buffer::LanceBuffer;
-use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor};
+use crate::compression::{
+    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+};
 use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::encodings::physical::block::{CompressionConfig, GeneralBufferCompressor};
 use crate::format::ProtobufUtils21;
@@ -452,7 +454,15 @@ impl RleEncoder {
             };
 
             if values_processed == 0 {
-                break;
+                // A non-final chunk needs at least two values because log_num_values == 0
+                // identifies the final chunk. Report an error instead of returning partial data.
+                return Err(Error::internal(format!(
+                    "RLE encoder made no progress: values_remaining={values_remaining}, \
+                     offset={offset}, data_len={}, bits_per_value={bits_per_value}, \
+                     max_miniblock_values={}",
+                    data.len(),
+                    *MAX_MINIBLOCK_VALUES
+                )));
             }
 
             let log_num_values = if is_last_chunk {
@@ -864,7 +874,10 @@ impl RleEncoder {
                 num_values: child_values,
                 block_info: BlockInfo::default(),
             });
-            let chunk_packed = BlockCompressor::compress(&compressor, block)?;
+            let (chunk_packed, _) = BlockCompressor::compress(&compressor, block)?;
+            let chunk_packed = chunk_packed.ok_or_else(|| {
+                Error::internal("RLE bitpacking child returned no payload".to_string())
+            })?;
             let packed_size = u32::try_from(chunk_packed.len()).map_err(|_| {
                 Error::invalid_input_source(
                     format!(
@@ -905,18 +918,24 @@ impl RleEncoder {
             8 => buffer.as_ref().iter().map(|value| *value as u64).max(),
             16 => buffer
                 .as_ref()
-                .chunks_exact(2)
-                .map(|value| u16::from_le_bytes(value.try_into().unwrap()) as u64)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|value| u16::from_le_bytes(*value) as u64)
                 .max(),
             32 => buffer
                 .as_ref()
-                .chunks_exact(4)
-                .map(|value| u32::from_le_bytes(value.try_into().unwrap()) as u64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| u32::from_le_bytes(*value) as u64)
                 .max(),
             64 => buffer
                 .as_ref()
-                .chunks_exact(8)
-                .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|value| u64::from_le_bytes(*value))
                 .max(),
             _ => {
                 return Err(Error::invalid_input_source(
@@ -1028,7 +1047,11 @@ impl RleChildCandidate {
 }
 
 impl MiniBlockCompressor for RleEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let num_values = fixed_width.num_values;
@@ -1095,7 +1118,7 @@ impl MiniBlockCompressor for RleEncoder {
 
 impl BlockCompressor for RleEncoder {
     // Block format: [8-byte header: values buffer size][values buffer][run_lengths buffer]
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let num_values = fixed_width.num_values;
@@ -1110,7 +1133,13 @@ impl BlockCompressor for RleEncoder {
                 combined.extend_from_slice(&values_size.to_le_bytes());
                 combined.extend_from_slice(&all_buffers[0]);
                 combined.extend_from_slice(&all_buffers[1]);
-                Ok(LanceBuffer::from(combined))
+                Ok((
+                    Some(LanceBuffer::from(combined)),
+                    ProtobufUtils21::rle(
+                        ProtobufUtils21::flat(bits_per_value, None),
+                        ProtobufUtils21::flat(self.run_length_width.bits_per_value(), None),
+                    ),
+                ))
             }
             _ => Err(Error::invalid_input_source(
                 "RLE encoding only supports FixedWidth data blocks".into(),
@@ -1204,7 +1233,7 @@ impl RleChildDecompressor {
                 } else {
                     num_values.unwrap_or(0)
                 };
-                let decoded = decompressor.decompress(data, num_values)?;
+                let decoded = decompressor.decompress(Some(data), num_values)?;
                 self.extract_fixed_width(decoded, num_values, label)
             }
         }
@@ -1281,7 +1310,12 @@ impl RleDecompressor {
         }
     }
 
-    fn decode_data(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+    fn decode_data(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        clamp_overflow: bool,
+    ) -> Result<DataBlock> {
         if num_values == 0 {
             return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
                 bits_per_value: self.bits_per_value,
@@ -1307,11 +1341,41 @@ impl RleDecompressor {
         let (values_buffer, lengths_buffer) =
             self.decode_child_buffers(values_buffer, lengths_buffer)?;
 
+        self.decode_child_data(&values_buffer, &lengths_buffer, num_values, clamp_overflow)
+    }
+
+    fn decode_child_data(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+        num_values: u64,
+        clamp_overflow: bool,
+    ) -> Result<DataBlock> {
         let decoded_data = match self.bits_per_value {
-            8 => self.decode_generic::<u8>(&values_buffer, &lengths_buffer, num_values)?,
-            16 => self.decode_generic::<u16>(&values_buffer, &lengths_buffer, num_values)?,
-            32 => self.decode_generic::<u32>(&values_buffer, &lengths_buffer, num_values)?,
-            64 => self.decode_generic::<u64>(&values_buffer, &lengths_buffer, num_values)?,
+            8 => self.decode_generic::<u8>(
+                values_buffer,
+                lengths_buffer,
+                num_values,
+                clamp_overflow,
+            )?,
+            16 => self.decode_generic::<u16>(
+                values_buffer,
+                lengths_buffer,
+                num_values,
+                clamp_overflow,
+            )?,
+            32 => self.decode_generic::<u32>(
+                values_buffer,
+                lengths_buffer,
+                num_values,
+                clamp_overflow,
+            )?,
+            64 => self.decode_generic::<u64>(
+                values_buffer,
+                lengths_buffer,
+                num_values,
+                clamp_overflow,
+            )?,
             _ => {
                 return Err(Error::invalid_input_source(
                     format!(
@@ -1329,6 +1393,79 @@ impl RleDecompressor {
             num_values,
             block_info: BlockInfo::default(),
         }))
+    }
+
+    fn sum_run_lengths(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+    ) -> Result<u64> {
+        let (value_size, value_type) = match self.bits_per_value {
+            8 => (1, "u8"),
+            16 => (2, "u16"),
+            32 => (4, "u32"),
+            64 => (8, "u64"),
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE decoding bits_per_value must be 8, 16, 32, or 64, got {}",
+                        self.bits_per_value
+                    )
+                    .into(),
+                ));
+            }
+        };
+        let length_size =
+            self.validate_buffer_sizes(values_buffer, lengths_buffer, value_size, value_type)?;
+
+        lengths_buffer
+            .chunks_exact(length_size)
+            .try_fold(0_u64, |num_values, length_bytes| {
+                let length = self.run_length_width.read_length(length_bytes);
+                if length == 0 {
+                    return Err(Error::invalid_input_source(
+                        "RLE decoding encountered a zero run length".into(),
+                    ));
+                }
+                num_values.checked_add(length).ok_or_else(|| {
+                    Error::invalid_input_source("RLE run length sum overflowed u64".into())
+                })
+            })
+    }
+
+    fn validate_buffer_sizes(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+        value_size: usize,
+        value_type: &str,
+    ) -> Result<usize> {
+        let length_size = self.run_length_width.bytes_per_value();
+        if !values_buffer.len().is_multiple_of(value_size)
+            || !lengths_buffer.len().is_multiple_of(length_size)
+        {
+            return Err(Error::invalid_input_source(format!(
+                "Invalid buffer sizes for RLE {value_type} decoding: values {} bytes (not divisible by {}), lengths {} bytes (not divisible by {})",
+                values_buffer.len(),
+                value_size,
+                lengths_buffer.len(),
+                length_size
+            )
+            .into()));
+        }
+
+        let num_runs = values_buffer.len() / value_size;
+        let num_length_entries = lengths_buffer.len() / length_size;
+        if num_runs != num_length_entries {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Inconsistent RLE buffers: {} runs but {} length entries",
+                    num_runs, num_length_entries
+                )
+                .into(),
+            ));
+        }
+        Ok(length_size)
     }
 
     fn decode_child_buffers(
@@ -1398,12 +1535,12 @@ impl RleDecompressor {
         values_buffer: &LanceBuffer,
         lengths_buffer: &LanceBuffer,
         num_values: u64,
+        clamp_overflow: bool,
     ) -> Result<LanceBuffer>
     where
         T: bytemuck::Pod + Copy + std::fmt::Debug + ArrowNativeType,
     {
         let type_size = std::mem::size_of::<T>();
-        let length_size = self.run_length_width.bytes_per_value();
 
         if values_buffer.is_empty() || lengths_buffer.is_empty() {
             if num_values == 0 {
@@ -1415,31 +1552,12 @@ impl RleDecompressor {
             }
         }
 
-        if !values_buffer.len().is_multiple_of(type_size)
-            || !lengths_buffer.len().is_multiple_of(length_size)
-        {
-            return Err(Error::invalid_input_source(format!(
-                "Invalid buffer sizes for RLE {} decoding: values {} bytes (not divisible by {}), lengths {} bytes (not divisible by {})",
-                std::any::type_name::<T>(),
-                values_buffer.len(),
-                type_size,
-                lengths_buffer.len(),
-                length_size
-            )
-            .into()));
-        }
-
-        let num_runs = values_buffer.len() / type_size;
-        let num_length_entries = lengths_buffer.len() / length_size;
-        if num_runs != num_length_entries {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Inconsistent RLE buffers: {} runs but {} length entries",
-                    num_runs, num_length_entries
-                )
-                .into(),
-            ));
-        }
+        let length_size = self.validate_buffer_sizes(
+            values_buffer,
+            lengths_buffer,
+            type_size,
+            std::any::type_name::<T>(),
+        )?;
 
         let values_ref = values_buffer.borrow_to_typed_slice::<T>();
         let values: &[T] = values_ref.as_ref();
@@ -1450,8 +1568,21 @@ impl RleDecompressor {
                 format!("RLE num_values does not fit in usize: {num_values}").into(),
             )
         })?;
-        let mut decoded_value_count = 0usize;
-        for length_bytes in lengths.chunks_exact(length_size) {
+        // Legacy miniblock encoders rolled back to a power-of-2 checkpoint after a run
+        // had already crossed it, so a chunk's run lengths can sum past its declared
+        // value count (the excess values are re-encoded at the start of the next chunk).
+        // The pre-run-length-width decoder truncated the excess, so miniblock decoding
+        // clamps rather than rejects to keep those files readable. Block payloads never
+        // legitimately overflow, so they decode strictly.
+        let mut decoded: Vec<T> = Vec::new();
+        decoded
+            .try_reserve_exact(expected_value_count)
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    format!("RLE decoding cannot allocate {expected_value_count} values").into(),
+                )
+            })?;
+        for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
             let length = self.run_length_width.read_length(length_bytes);
             if length == 0 {
                 return Err(Error::invalid_input_source(
@@ -1463,34 +1594,33 @@ impl RleDecompressor {
                     format!("RLE run length does not fit in usize: {length}").into(),
                 )
             })?;
-            decoded_value_count = decoded_value_count.checked_add(length).ok_or_else(|| {
-                Error::invalid_input_source("RLE run length sum overflowed usize".into())
-            })?;
-            if decoded_value_count > expected_value_count {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "RLE decoding overflowed expected value count: produced at least {}, expected {}",
-                        decoded_value_count, expected_value_count
-                    )
-                    .into(),
-                ));
+            let remaining = expected_value_count - decoded.len();
+            if length > remaining {
+                if !clamp_overflow {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "RLE decoding overflowed expected value count: produced at least {}, expected {}",
+                            decoded.len() + length,
+                            expected_value_count
+                        )
+                        .into(),
+                    ));
+                }
+                decoded.resize(expected_value_count, *value);
+                break;
             }
+            decoded.resize(decoded.len() + length, *value);
         }
 
-        if decoded_value_count != expected_value_count {
+        if decoded.len() != expected_value_count {
             return Err(Error::invalid_input_source(
                 format!(
                     "RLE decoding produced {} values, expected {}",
-                    decoded_value_count, expected_value_count
+                    decoded.len(),
+                    expected_value_count
                 )
                 .into(),
             ));
-        }
-
-        let mut decoded: Vec<T> = Vec::with_capacity(expected_value_count);
-        for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
-            let length = self.run_length_width.read_length(length_bytes) as usize;
-            decoded.resize(decoded.len() + length, *value);
         }
 
         trace!(
@@ -1504,51 +1634,322 @@ impl RleDecompressor {
 
 impl MiniBlockDecompressor for RleDecompressor {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
-        self.decode_data(data, num_values)
+        self.decode_data(data, num_values, true)
+    }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
     }
 }
 
 impl BlockDecompressor for RleDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        // fetch the values_size
-        if data.len() < 8 {
-            return Err(Error::invalid_input_source(
-                format!("Insufficient data size: {}", data.len()).into(),
-            ));
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "RLE")?;
+        let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
+        self.decode_data(vec![values_buffer, lengths_buffer], num_values, false)
+    }
+
+    fn infer_num_values(&self, data: &LanceBuffer) -> Result<Option<u64>> {
+        // Pylance 6.0.1 used this exact RLE signature for structural levels. Newer RLE
+        // variants are not part of that compatibility case and may contain much wider,
+        // untrusted run lengths.
+        if self.bits_per_value != 16
+            || self.run_length_width != RunLengthWidth::U8
+            || !self.values.is_identity()
+            || !self.run_lengths.is_identity()
+        {
+            return Ok(None);
         }
+        let (values_buffer, lengths_buffer) = parse_rle_block_frame(data)?;
+        self.sum_run_lengths(&values_buffer, &lengths_buffer)
+            .map(Some)
+    }
+}
 
-        let values_size_bytes: [u8; 8] =
-            data[..8].try_into().expect("slice length already checked");
-        let values_size: u64 = u64::from_le_bytes(values_size_bytes);
+/// Split an RLE block-format buffer into its `(values, lengths)` sub-buffers.
+/// Frame: `[values_size: u64-le][values bytes][run-length bytes]`.
+fn parse_rle_block_frame(data: &LanceBuffer) -> Result<(LanceBuffer, LanceBuffer)> {
+    // fetch the values_size
+    if data.len() < 8 {
+        return Err(Error::invalid_input_source(
+            format!("Insufficient data size: {}", data.len()).into(),
+        ));
+    }
 
-        // parse values
-        let values_start: usize = 8;
-        let values_size: usize = values_size.try_into().map_err(|_| {
+    let values_size_bytes: [u8; 8] = data[..8].try_into().expect("slice length already checked");
+    let values_size: usize = u64::from_le_bytes(values_size_bytes)
+        .try_into()
+        .map_err(|_| {
             Error::invalid_input_source(
-                format!("Invalid values buffer size: {}", values_size).into(),
+                format!(
+                    "Invalid values buffer size: {}",
+                    u64::from_le_bytes(values_size_bytes)
+                )
+                .into(),
             )
         })?;
-        let lengths_start = values_start
-            .checked_add(values_size)
-            .ok_or_else(|| Error::invalid_input_source("Invalid RLE values buffer size".into()))?;
 
-        if data.len() < lengths_start {
+    // parse values
+    let values_start: usize = 8;
+    let lengths_start = values_start
+        .checked_add(values_size)
+        .ok_or_else(|| Error::invalid_input_source("Invalid RLE values buffer size".into()))?;
+
+    if data.len() < lengths_start {
+        return Err(Error::invalid_input_source(
+            format!("Insufficient data size: {}", data.len()).into(),
+        ));
+    }
+
+    let values_buffer = data.slice_with_length(values_start, values_size);
+    let lengths_buffer = data.slice_with_length(lengths_start, data.len() - lengths_start);
+    Ok((values_buffer, lengths_buffer))
+}
+
+#[derive(Clone, Debug)]
+enum RleRunLengths {
+    U8(ScalarBuffer<u8>),
+    U16(ScalarBuffer<u16>),
+    U32(ScalarBuffer<u32>),
+}
+
+impl RleRunLengths {
+    fn try_new(buffer: LanceBuffer, width: RunLengthWidth) -> Result<Self> {
+        let width_bytes = width.bytes_per_value();
+        if !buffer.len().is_multiple_of(width_bytes) {
             return Err(Error::invalid_input_source(
-                format!("Insufficient data size: {}", data.len()).into(),
+                format!(
+                    "Invalid RLE run lengths buffer: {} bytes (not divisible by {})",
+                    buffer.len(),
+                    width_bytes
+                )
+                .into(),
+            ));
+        }
+        Ok(match width {
+            RunLengthWidth::U8 => Self::U8(buffer.borrow_to_typed_slice()),
+            RunLengthWidth::U16 => Self::U16(buffer.borrow_to_typed_slice()),
+            RunLengthWidth::U32 => Self::U32(buffer.borrow_to_typed_slice()),
+        })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U8(lengths) => lengths.len(),
+            Self::U16(lengths) => lengths.len(),
+            Self::U32(lengths) => lengths.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> usize {
+        match self {
+            Self::U8(lengths) => lengths[index] as usize,
+            Self::U16(lengths) => lengths[index] as usize,
+            Self::U32(lengths) => lengths[index] as usize,
+        }
+    }
+
+    fn owned_size(&self) -> usize {
+        match self {
+            Self::U8(lengths) => std::mem::size_of_val(lengths.as_ref()),
+            Self::U16(lengths) => std::mem::size_of_val(lengths.as_ref()),
+            Self::U32(lengths) => std::mem::size_of_val(lengths.as_ref()),
+        }
+    }
+
+    fn into_owned(self) -> Self {
+        match self {
+            Self::U8(lengths) => Self::U8(ScalarBuffer::from(lengths.as_ref().to_vec())),
+            Self::U16(lengths) => Self::U16(ScalarBuffer::from(lengths.as_ref().to_vec())),
+            Self::U32(lengths) => Self::U32(ScalarBuffer::from(lengths.as_ref().to_vec())),
+        }
+    }
+
+    fn deep_size(&self) -> usize {
+        match self {
+            Self::U8(lengths) => lengths.inner().capacity(),
+            Self::U16(lengths) => lengths.inner().capacity(),
+            Self::U32(lengths) => lengths.inner().capacity(),
+        }
+    }
+}
+
+/// Validated physical RLE runs for `u16` values.
+///
+/// The values and original-width lengths remain unexpanded. The constructor
+/// verifies that every length is non-zero and that the runs cover exactly
+/// `num_values` logical values.
+#[derive(Clone, Debug)]
+pub(crate) struct RleRuns {
+    values: ScalarBuffer<u16>,
+    lengths: RleRunLengths,
+    num_values: usize,
+    coalesced_runs: usize,
+}
+
+impl RleRuns {
+    fn try_new(
+        values_buffer: LanceBuffer,
+        lengths_buffer: LanceBuffer,
+        run_length_width: RunLengthWidth,
+        num_values: u64,
+    ) -> Result<Self> {
+        let num_values = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE num_values does not fit in usize: {num_values}").into(),
+            )
+        })?;
+        let type_size = std::mem::size_of::<u16>();
+        if !values_buffer.len().is_multiple_of(type_size) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Invalid RLE u16 values buffer: {} bytes (not divisible by {})",
+                    values_buffer.len(),
+                    type_size
+                )
+                .into(),
             ));
         }
 
-        let values_buffer = data.slice_with_length(values_start, values_size);
-        let lengths_buffer = data.slice_with_length(lengths_start, data.len() - lengths_start);
+        let values = values_buffer.borrow_to_typed_slice::<u16>();
+        let lengths = RleRunLengths::try_new(lengths_buffer, run_length_width)?;
+        if values.len() != lengths.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Inconsistent RLE buffers: {} runs but {} length entries",
+                    values.len(),
+                    lengths.len()
+                )
+                .into(),
+            ));
+        }
+        if values.is_empty() && num_values != 0 {
+            return Err(Error::invalid_input_source(
+                format!("Empty RLE buffers but expected {num_values} values").into(),
+            ));
+        }
 
-        self.decode_data(vec![values_buffer, lengths_buffer], num_values)
+        let mut decoded_values = 0usize;
+        let mut coalesced_runs = 0usize;
+        let mut previous_value = None;
+        for run in 0..values.len() {
+            let length = lengths.get(run);
+            if length == 0 {
+                return Err(Error::invalid_input_source(
+                    "RLE decoding encountered a zero run length".into(),
+                ));
+            }
+            decoded_values = decoded_values.checked_add(length).ok_or_else(|| {
+                Error::invalid_input_source("RLE run length sum overflowed usize".into())
+            })?;
+            if decoded_values > num_values {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE decoding overflowed expected value count: produced at least {}, expected {}",
+                        decoded_values, num_values
+                    )
+                    .into(),
+                ));
+            }
+            if previous_value != Some(values[run]) {
+                coalesced_runs += 1;
+                previous_value = Some(values[run]);
+            }
+        }
+        if decoded_values != num_values {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE decoding produced {} values, expected {}",
+                    decoded_values, num_values
+                )
+                .into(),
+            ));
+        }
+
+        Ok(Self {
+            values,
+            lengths,
+            num_values,
+            coalesced_runs,
+        })
+    }
+
+    pub(crate) fn num_values(&self) -> usize {
+        self.num_values
+    }
+
+    pub(crate) fn num_runs(&self) -> usize {
+        self.values.len()
+    }
+
+    pub(crate) fn coalesced_runs(&self) -> usize {
+        self.coalesced_runs
+    }
+
+    pub(crate) fn owned_size(&self) -> usize {
+        std::mem::size_of_val(self.values.as_ref()) + self.lengths.owned_size()
+    }
+
+    pub(crate) fn into_owned(self) -> Self {
+        Self {
+            values: ScalarBuffer::from(self.values.as_ref().to_vec()),
+            lengths: self.lengths.into_owned(),
+            num_values: self.num_values,
+            coalesced_runs: self.coalesced_runs,
+        }
+    }
+
+    pub(crate) fn deep_size(&self) -> usize {
+        self.values.inner().capacity() + self.lengths.deep_size()
+    }
+
+    pub(crate) fn value(&self, run: usize) -> u16 {
+        self.values[run]
+    }
+
+    pub(crate) fn length(&self, run: usize) -> usize {
+        self.lengths.get(run)
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (u16, usize)> + '_ {
+        (0..self.num_runs()).map(|run| (self.value(run), self.length(run)))
+    }
+}
+
+impl RleDecompressor {
+    /// Decode and validate a block frame while preserving its physical runs.
+    pub(crate) fn decode_u16_runs(&self, data: LanceBuffer, num_values: u64) -> Result<RleRuns> {
+        if self.bits_per_value != 16 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE level values must be 16 bits, got {}",
+                    self.bits_per_value
+                )
+                .into(),
+            ));
+        }
+        let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
+        let (values_buffer, lengths_buffer) =
+            self.decode_child_buffers(values_buffer, lengths_buffer)?;
+        RleRuns::try_new(
+            values_buffer,
+            lengths_buffer,
+            self.run_length_width,
+            num_values,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
+    use crate::compression::{
+        DecompressionStrategy, DefaultDecompressionStrategy, create_rle_decompressor,
+    };
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
     use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
@@ -1557,6 +1958,242 @@ mod tests {
         compression::{BlockCompressor, BlockDecompressor},
     };
     use arrow_array::Int32Array;
+    use rstest::rstest;
+
+    fn compress_miniblock(
+        compressor: &dyn MiniBlockCompressor,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        compressor.compress(MiniBlockCompressionContext::new(0, true, true), data)
+    }
+
+    fn expand_u16_runs(runs: &RleRuns) -> Vec<u16> {
+        let mut expanded = Vec::with_capacity(runs.num_values());
+        for (value, length) in runs.iter() {
+            expanded.extend(std::iter::repeat_n(value, length));
+        }
+        expanded
+    }
+
+    #[test]
+    fn decode_u16_runs_matches_eager() {
+        // Near-constant u16 levels (the all-null shape): a few long runs.
+        let mut levels: Vec<u16> = vec![1u16; 1000];
+        levels.extend(std::iter::repeat_n(0u16, 500));
+        levels.extend(std::iter::repeat_n(2u16, 300));
+        let num_values = levels.len() as u64;
+
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(levels.clone())),
+            bits_per_value: 16,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block)
+            .unwrap()
+            .0
+            .unwrap();
+
+        let eager = BlockDecompressor::decompress(
+            &RleDecompressor::new(16),
+            Some(frame.clone()),
+            num_values,
+        )
+        .unwrap();
+        let DataBlock::FixedWidth(eager) = eager else {
+            panic!("expected fixed-width block");
+        };
+        assert_eq!(
+            eager.data.borrow_to_typed_slice::<u16>().as_ref(),
+            levels.as_slice()
+        );
+
+        // Lazy run form preserves boundaries and expands identically.
+        let runs = RleDecompressor::new(16)
+            .decode_u16_runs(frame, num_values)
+            .unwrap();
+        assert_eq!(runs.num_values(), num_values as usize);
+        // The encoder splits each value into <=255-length runs (4 + 2 + 2 = 8
+        // on-disk runs here); the scan identifies 3 coalesced logical runs.
+        assert_eq!(runs.num_runs(), 8);
+        assert_eq!(runs.coalesced_runs(), 3);
+        assert_eq!(expand_u16_runs(&runs), levels);
+    }
+
+    #[test]
+    fn decode_u16_runs_empty() {
+        let mut empty_frame = Vec::new();
+        empty_frame.extend_from_slice(&0u64.to_le_bytes());
+        let runs = RleDecompressor::new(16)
+            .decode_u16_runs(LanceBuffer::from(empty_frame), 0)
+            .unwrap();
+        assert_eq!(runs.num_values(), 0);
+        assert_eq!(runs.num_runs(), 0);
+        assert_eq!(runs.coalesced_runs(), 0);
+
+        let error = RleDecompressor::new(16)
+            .decode_u16_runs(LanceBuffer::empty(), 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("Insufficient data size: 0"));
+    }
+
+    #[test]
+    fn legacy_block_rle_infers_value_count_without_materializing() {
+        let num_values = u64::from(u16::MAX) + 8;
+        let full_runs = num_values / u64::from(u8::MAX);
+        let remainder = num_values % u64::from(u8::MAX);
+        let num_runs = full_runs + u64::from(remainder != 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(num_runs * 2).to_le_bytes());
+        frame.extend(std::iter::repeat_n(7_u16, num_runs as usize).flat_map(u16::to_le_bytes));
+        frame.extend(std::iter::repeat_n(u8::MAX, full_runs as usize));
+        if remainder != 0 {
+            frame.push(remainder as u8);
+        }
+
+        let inferred_num_values = RleDecompressor::new(16)
+            .infer_num_values(&LanceBuffer::from(frame))
+            .unwrap();
+        assert_eq!(inferred_num_values, Some(num_values));
+    }
+
+    #[test]
+    fn newer_block_rle_does_not_infer_untrusted_run_sum() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2_u64.to_le_bytes());
+        frame.extend_from_slice(&7_u16.to_le_bytes());
+        frame.extend_from_slice(&u32::MAX.to_le_bytes());
+        let frame = LanceBuffer::from(frame);
+        let decompressor = RleDecompressor::with_run_length_width(16, RunLengthWidth::U32);
+
+        assert_eq!(decompressor.infer_num_values(&frame).unwrap(), None);
+        let error = BlockDecompressor::decompress(&decompressor, Some(frame), u64::from(u16::MAX))
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("RLE decoding overflowed expected value count")
+        );
+    }
+
+    #[rstest]
+    #[case::zero(0, 1, "zero run length")]
+    #[case::underflow(1, 2, "produced 1 values, expected 2")]
+    #[case::overflow(2, 1, "overflowed expected value count")]
+    #[case::nonempty_for_empty(1, 0, "overflowed expected value count")]
+    fn decode_u16_runs_rejects_invalid_coverage(
+        #[case] run_length: u8,
+        #[case] num_values: u64,
+        #[case] expected_message: &str,
+    ) {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u64.to_le_bytes());
+        frame.extend_from_slice(&7u16.to_le_bytes());
+        frame.push(run_length);
+
+        let error = RleDecompressor::new(16)
+            .decode_u16_runs(LanceBuffer::from(frame), num_values)
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message));
+    }
+
+    #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn decode_u16_runs_supports_compressed_values_child() {
+        let levels: Vec<u16> = (0..1024)
+            .flat_map(|run| std::iter::repeat_n((run % 8) as u16, 4))
+            .collect();
+        let num_values = levels.len() as u64;
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(levels.clone())),
+            bits_per_value: 16,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block)
+            .unwrap()
+            .0
+            .unwrap();
+        let (values, lengths) = parse_rle_block_frame(&frame).unwrap();
+
+        let compression = test_general_compression();
+        let compressor = GeneralBufferCompressor::get_compressor(compression).unwrap();
+        let mut compressed_values = Vec::new();
+        compressor
+            .compress(values.as_ref(), &mut compressed_values)
+            .unwrap();
+        let mut compressed_frame = Vec::new();
+        compressed_frame.extend_from_slice(&(compressed_values.len() as u64).to_le_bytes());
+        compressed_frame.extend_from_slice(&compressed_values);
+        compressed_frame.extend_from_slice(lengths.as_ref());
+
+        let encoding = ProtobufUtils21::rle(
+            ProtobufUtils21::wrapped(compression, ProtobufUtils21::flat(16, None)).unwrap(),
+            ProtobufUtils21::flat(8, None),
+        );
+        let decompressor = create_rle_decompressor(
+            expect_rle(&encoding),
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+        let runs = decompressor
+            .decode_u16_runs(LanceBuffer::from(compressed_frame), num_values)
+            .unwrap();
+        assert_eq!(expand_u16_runs(&runs), levels);
+    }
+
+    #[test]
+    fn decode_u16_runs_counts_coalesced_runs() {
+        // A logically constant page is emitted as ceil(N / 255) equal-valued
+        // runs (the encoder caps run lengths at 255); the validated view records
+        // that they can collapse to a single logical run.
+        let num_values = 5000u64;
+        let constant: Vec<u16> = vec![7u16; num_values as usize];
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(constant)),
+            bits_per_value: 16,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block)
+            .unwrap()
+            .0
+            .unwrap();
+        let runs = RleDecompressor::new(16)
+            .decode_u16_runs(frame, num_values)
+            .unwrap();
+        assert_eq!(
+            runs.num_runs(),
+            num_values.div_ceil(u8::MAX as u64) as usize
+        );
+        assert_eq!(runs.coalesced_runs(), 1);
+        assert_eq!(expand_u16_runs(&runs), vec![7u16; num_values as usize]);
+
+        // Distinct adjacent values must not be merged: alternating single-value
+        // runs stay separate and still expand to the original.
+        let alternating: Vec<u16> = (0..200u16).map(|i| i % 2).collect();
+        let n = alternating.len() as u64;
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(alternating.clone())),
+            bits_per_value: 16,
+            num_values: n,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block)
+            .unwrap()
+            .0
+            .unwrap();
+        let runs = RleDecompressor::new(16).decode_u16_runs(frame, n).unwrap();
+        assert_eq!(
+            runs.coalesced_runs() as u64,
+            n,
+            "no two adjacent values are equal"
+        );
+        assert_eq!(expand_u16_runs(&runs), alternating);
+    }
+
     // ========== Core Functionality Tests ==========
 
     #[test]
@@ -1567,7 +2204,7 @@ mod tests {
         let array = Int32Array::from(vec![1, 1, 1, 2, 2, 3, 3, 3, 3]);
         let data_block = DataBlock::from_array(array);
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, data_block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, data_block).unwrap();
 
         assert_eq!(compressed.num_values, 9);
         assert_eq!(compressed.chunks.len(), 1);
@@ -1588,8 +2225,7 @@ mod tests {
         data.extend(&[100i32; 300]); // Will be split into 255+45
 
         let array = Int32Array::from(data);
-        let (compressed, _) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         // Should have 6 runs total (4 for first value, 2 for second)
         let lengths_buffer = &compressed.data[1];
@@ -1603,7 +2239,7 @@ mod tests {
         let data = vec![42i32; 1000];
         let array = Int32Array::from(data);
         let (compressed, encoding) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+            compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         assert_eq!(compressed.data[0].len(), 4);
         assert_eq!(compressed.data[1].len(), 2);
@@ -1644,7 +2280,7 @@ mod tests {
             RleEncoder::with_child_encoding(RunLengthWidth::U8, Some(compression), None, false);
         let array = Int32Array::from(repeating_runs(1024, 4));
         let (compressed, encoding) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+            compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         let rle = expect_rle(&encoding);
         assert!(matches!(
@@ -1677,7 +2313,7 @@ mod tests {
         let encoder =
             RleEncoder::with_child_encoding(RunLengthWidth::U8, None, Some(compression), false);
         let expected = repeating_runs(1024, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -1713,7 +2349,7 @@ mod tests {
         use crate::encodings::physical::bitpacking::OutOfLineBitpacking;
 
         let expected = repeating_runs(1024, 4);
-        let (compressed, _) = MiniBlockCompressor::compress(
+        let (compressed, _) = compress_miniblock(
             &RleEncoder::new(),
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -1727,7 +2363,10 @@ mod tests {
             block_info: BlockInfo::default(),
         });
         let bitpacked_run_lengths =
-            BlockCompressor::compress(&OutOfLineBitpacking::new(3, 8), run_lengths_block).unwrap();
+            BlockCompressor::compress(&OutOfLineBitpacking::new(3, 8), run_lengths_block)
+                .unwrap()
+                .0
+                .unwrap();
         let encoding = ProtobufUtils21::rle(
             ProtobufUtils21::flat(32, None),
             ProtobufUtils21::out_of_line_bitpacking(8, ProtobufUtils21::flat(3, None)),
@@ -1807,7 +2446,7 @@ mod tests {
             false,
         );
         let expected = repeating_runs(8192, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -1838,7 +2477,7 @@ mod tests {
     fn test_rle_miniblock_bitpacks_values_child_when_smaller() {
         let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
         let expected = monotonic_runs(2048, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -1868,7 +2507,7 @@ mod tests {
     fn test_rle_miniblock_bitpacks_run_lengths_when_values_do_not_shrink() {
         let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
         let expected = high_entropy_runs(2048, 4);
-        let (compressed, encoding) = MiniBlockCompressor::compress(
+        let (compressed, encoding) = compress_miniblock(
             &encoder,
             DataBlock::from_array(Int32Array::from(expected.clone())),
         )
@@ -1996,7 +2635,7 @@ mod tests {
             block_info: BlockInfo::default(),
         });
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, block).unwrap();
         let decompressor = RleDecompressor::new(bits_per_value);
         let decompressed = MiniBlockDecompressor::decompress(
             &decompressor,
@@ -2030,7 +2669,7 @@ mod tests {
 
             let array = Int32Array::from(data);
             let (compressed, _) =
-                MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+                compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
             // Verify all non-last chunks have power-of-2 values
             for (i, chunk) in compressed.chunks.iter().enumerate() {
@@ -2046,7 +2685,72 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::u8_lengths(RunLengthWidth::U8)]
+    #[case::u16_lengths(RunLengthWidth::U16)]
+    #[case::u32_lengths(RunLengthWidth::U32)]
+    fn test_miniblock_chunk_counts_match_encoded_runs(#[case] run_length_width: RunLengthWidth) {
+        // This pattern crosses the 2,048-value boundary in the middle of a two-value run.
+        let levels = (0..4098)
+            .map(|index| if index % 3 == 0 { 1u16 } else { 0u16 })
+            .collect::<Vec<_>>();
+        let num_values = levels.len() as u64;
+        let encoder = RleEncoder::with_run_length_width(run_length_width);
+        let (buffers, chunks) = encoder
+            .encode_data(
+                &LanceBuffer::reinterpret_vec(levels),
+                num_values,
+                u16::BITS as u64,
+            )
+            .unwrap();
+
+        assert_eq!(buffers.len(), 2);
+        let bytes_per_length = run_length_width.bytes_per_value();
+        let mut values_offset = 0usize;
+        let mut lengths_offset = 0usize;
+        let mut values_processed = 0u64;
+
+        for chunk in &chunks {
+            let values_size = chunk.buffer_sizes[0] as usize;
+            let lengths_size = chunk.buffer_sizes[1] as usize;
+            let lengths_end = lengths_offset + lengths_size;
+            let chunk_lengths = &buffers[1].as_ref()[lengths_offset..lengths_end];
+            let length_chunks = chunk_lengths.chunks_exact(bytes_per_length);
+            assert!(length_chunks.remainder().is_empty());
+            let num_runs = length_chunks.len();
+            let encoded_values = length_chunks
+                .map(|bytes| run_length_width.read_length(bytes))
+                .sum::<u64>();
+            let declared_values = chunk.num_values(values_processed, num_values);
+
+            assert_eq!(values_size, num_runs * size_of::<u16>());
+            assert_eq!(encoded_values, declared_values);
+
+            values_offset += values_size;
+            lengths_offset = lengths_end;
+            values_processed += declared_values;
+        }
+
+        assert_eq!(values_processed, num_values);
+        assert_eq!(values_offset, buffers[0].len());
+        assert_eq!(lengths_offset, buffers[1].len());
+    }
+
     // ========== Error Handling Tests ==========
+
+    #[test]
+    fn test_encoder_rejects_zero_progress() {
+        let error = RleEncoder::new()
+            .encode_data(&LanceBuffer::empty(), 1, u16::BITS as u64)
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Internal { .. }),
+            "expected internal error, got: {error:?}"
+        );
+        assert!(error.to_string().contains("made no progress"));
+        assert!(error.to_string().contains("values_remaining=1"));
+    }
 
     #[test]
     fn test_invalid_buffer_count() {
@@ -2096,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rle_rejects_underflow_overflow_and_zero_lengths() {
+    fn test_rle_rejects_underflow_and_zero_lengths_and_clamps_overflow() {
         let decompressor = RleDecompressor::with_run_length_width(32, RunLengthWidth::U16);
         let value = LanceBuffer::from(1i32.to_le_bytes().to_vec());
 
@@ -2119,12 +2823,15 @@ mod tests {
             ],
             5,
         )
-        .unwrap_err();
-        assert!(
-            overflow
-                .to_string()
-                .contains("overflowed expected value count")
-        );
+        .unwrap();
+        match overflow {
+            DataBlock::FixedWidth(block) => {
+                assert_eq!(block.num_values, 5);
+                let decoded = block.data.borrow_to_typed_slice::<i32>();
+                assert_eq!(decoded.as_ref(), &[1i32; 5]);
+            }
+            _ => panic!("Expected FixedWidth block"),
+        }
 
         let zero = MiniBlockDecompressor::decompress(
             &decompressor,
@@ -2133,6 +2840,61 @@ mod tests {
         )
         .unwrap_err();
         assert!(zero.to_string().contains("zero run length"));
+    }
+
+    #[test]
+    fn test_block_rle_rejects_overflow() {
+        // Block payloads have no chunk boundaries, so run lengths summing past
+        // num_values can only be corruption and must stay a hard error.
+        let decompressor = RleDecompressor::with_run_length_width(32, RunLengthWidth::U16);
+        let values = 1i32.to_le_bytes();
+        let lengths = 6u16.to_le_bytes();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&values);
+        payload.extend_from_slice(&lengths);
+
+        let error =
+            BlockDecompressor::decompress(&decompressor, Some(LanceBuffer::from(payload)), 5)
+                .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("overflowed expected value count")
+        );
+    }
+
+    #[test]
+    fn test_rle_truncates_legacy_chunk_boundary_overflow() {
+        // Legacy encoders emitted chunks declaring 2048 values whose final run crossed
+        // the checkpoint boundary (e.g. run lengths summing to 2080); the excess values
+        // are duplicated at the start of the next chunk and must be ignored here.
+        let decompressor = RleDecompressor::with_run_length_width(32, RunLengthWidth::U16);
+        let mut values = Vec::new();
+        values.extend_from_slice(&7i32.to_le_bytes());
+        values.extend_from_slice(&8i32.to_le_bytes());
+        let mut lengths = Vec::new();
+        lengths.extend_from_slice(&2000u16.to_le_bytes());
+        lengths.extend_from_slice(&80u16.to_le_bytes());
+
+        let decoded = MiniBlockDecompressor::decompress(
+            &decompressor,
+            vec![LanceBuffer::from(values), LanceBuffer::from(lengths)],
+            2048,
+        )
+        .unwrap();
+        match decoded {
+            DataBlock::FixedWidth(block) => {
+                assert_eq!(block.num_values, 2048);
+                let decoded = block.data.borrow_to_typed_slice::<i32>();
+                let decoded = decoded.as_ref();
+                assert_eq!(decoded.len(), 2048);
+                assert!(decoded[..2000].iter().all(|&v| v == 7));
+                assert!(decoded[2000..].iter().all(|&v| v == 8));
+            }
+            _ => panic!("Expected FixedWidth block"),
+        }
     }
 
     #[test]
@@ -2147,7 +2909,7 @@ mod tests {
             block_info: BlockInfo::default(),
         });
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, empty_block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, empty_block).unwrap();
         assert_eq!(compressed.num_values, 0);
         assert!(compressed.data.is_empty());
 
@@ -2181,8 +2943,7 @@ mod tests {
         data.extend(vec![777i32; 2000]);
 
         let array = Int32Array::from(data.clone());
-        let (compressed, _) =
-            MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
         // Manually decompress all chunks
         let mut reconstructed = Vec::new();
@@ -2295,7 +3056,7 @@ mod tests {
             // Compress the data
             let array = Int32Array::from(data.clone());
             let (compressed, _) =
-                MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+                compress_miniblock(&encoder, DataBlock::from_array(array)).unwrap();
 
             // Decompress and verify
             match MiniBlockDecompressor::decompress(
@@ -2365,7 +3126,7 @@ mod tests {
             block_info: BlockInfo::default(),
         });
 
-        let (compressed, _) = MiniBlockCompressor::compress(&encoder, block).unwrap();
+        let (compressed, _) = compress_miniblock(&encoder, block).unwrap();
 
         // Debug first few chunks
         for (i, chunk) in compressed.chunks.iter().take(5).enumerate() {
@@ -2415,7 +3176,6 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_rle_encoding_verification() {
         use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-        use crate::version::LanceFileVersion;
         use arrow_array::{Array, Int32Array};
         use lance_datagen::{ArrayGenerator, RowCount};
         use std::collections::HashMap;
@@ -2423,7 +3183,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("rle")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both explicit metadata and automatic selection
         // 1. Test with explicit RLE threshold metadata (also disable BSS)
@@ -2547,7 +3307,7 @@ mod tests {
 
         let mut data = Vec::new();
         data.extend_from_slice(&u64::MAX.to_le_bytes());
-        let result = BlockDecompressor::decompress(&decompressor, LanceBuffer::from(data), 1);
+        let result = BlockDecompressor::decompress(&decompressor, Some(LanceBuffer::from(data)), 1);
         assert!(result.is_err());
         assert!(
             result
@@ -2560,8 +3320,11 @@ mod tests {
     #[test]
     fn test_block_decompressor_too_small() {
         let decompressor = RleDecompressor::new(32);
-        let result =
-            BlockDecompressor::decompress(&decompressor, LanceBuffer::from(vec![1, 2, 3]), 10);
+        let result = BlockDecompressor::decompress(
+            &decompressor,
+            Some(LanceBuffer::from(vec![1, 2, 3])),
+            10,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -2577,7 +3340,10 @@ mod tests {
 
         let data = vec![1i32, 1, 1];
         let array = Int32Array::from(data);
-        let compressed = BlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+        let compressed = BlockCompressor::compress(&encoder, DataBlock::from_array(array))
+            .unwrap()
+            .0
+            .unwrap();
 
         // Verify header format: first 8 bytes should be values_size as u64
         assert!(compressed.len() >= 8);
@@ -2601,7 +3367,7 @@ mod tests {
         let array = Int32Array::from(data.clone());
         let data_block = DataBlock::from_array(array);
 
-        let compressed = BlockCompressor::compress(&encoder, data_block).unwrap();
+        let compressed = BlockCompressor::compress(&encoder, data_block).unwrap().0;
         let decompressed =
             BlockDecompressor::decompress(&decompressor, compressed, data.len() as u64).unwrap();
 
@@ -2630,7 +3396,9 @@ mod tests {
         assert_eq!(total_values, 10000);
 
         let array = Int32Array::from(data.clone());
-        let compressed = BlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
+        let compressed = BlockCompressor::compress(&encoder, DataBlock::from_array(array))
+            .unwrap()
+            .0;
         let decompressed =
             BlockDecompressor::decompress(&decompressor, compressed, total_values as u64).unwrap();
 
