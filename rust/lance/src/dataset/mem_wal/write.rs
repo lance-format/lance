@@ -1571,11 +1571,12 @@ async fn replay_memtable_from_wal(
                         }
                     }
 
-                    // Seal + flush on the same criteria the live path uses, measured
-                    // against this whole entry, so no entry is split across two
-                    // memtables and each sealed one covers a clean range of complete
-                    // entries. An empty memtable is never rotated: a fresh one holds
-                    // an oversized entry no better, left to the insert below to
+                    // The boundary an entry naming no generation gets: the same
+                    // criteria the live path uses, measured against this whole
+                    // entry, so no entry is split across two memtables and each
+                    // sealed one covers a clean range of complete entries. An
+                    // empty memtable is never rotated: a fresh one holds an
+                    // oversized entry no better, left to the insert below to
                     // surface.
                     let entry_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                     if entry.target.is_none()
@@ -1589,6 +1590,20 @@ async fn replay_memtable_from_wal(
                             entry_rows,
                         )
                     {
+                        // Splitting here would publish the generation replay is
+                        // leaving under a number the record goes on to reuse,
+                        // and a Blob v2 target naming that number would then
+                        // have two generations over it. Nothing has been
+                        // published yet, so refusing leaves the shard reopenable
+                        // under a memtable as large as the one that wrote it.
+                        if let Some(generation) = entry.generation {
+                            return Err(Error::io(format!(
+                                "WAL entry at position {} continues generation {} past the \
+                                 memtable replaying it; the shard was written under a larger \
+                                 max_memtable_rows or max_memtable_batches",
+                                position, generation
+                            )));
+                        }
                         let store = active.batch_store();
                         // The last entry this memtable fully absorbed is the one
                         // before the entry about to be inserted.
@@ -5644,12 +5659,26 @@ mod tests {
         reopened.close().await.unwrap();
     }
 
-    /// Replay splits on its own memtable as well as on the record, so a WAL
-    /// written under a larger one can leave its counter past a Blob v2 target's
-    /// generation. That number is already written out, so replay refuses it
-    /// rather than putting a second generation over it.
+    async fn manifest_generations(
+        store: &Arc<ObjectStore>,
+        base_path: &Path,
+        shard_id: Uuid,
+    ) -> Vec<u64> {
+        ShardManifestStore::new(store.clone(), base_path, shard_id, 10)
+            .latest()
+            .await
+            .unwrap()
+            .map(|m| m.sstables.iter().map(|s| s.generation).collect())
+            .unwrap_or_default()
+    }
+
+    /// A memtable smaller than the one that wrote the WAL cannot hold a
+    /// generation the record names, and splitting it would publish the part it
+    /// leaves under a number the record goes on to reuse. Replay refuses before
+    /// publishing anything, so the shard is unchanged and reopens once it is
+    /// given a memtable the size it was written under.
     #[tokio::test]
-    async fn test_replay_refuses_a_target_generation_its_own_splitting_passed() {
+    async fn test_replay_refuses_a_recorded_generation_it_cannot_hold() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let config = ShardWriterConfig {
             shard_id: Uuid::new_v4(),
@@ -5711,27 +5740,48 @@ mod tests {
             std::mem::forget(writer);
         }
 
+        let published_before_replay =
+            manifest_generations(&store, &base_path, config.shard_id).await;
+
         // A fiftieth of the cap the prefix was written under: the five plain
-        // rows alone split replay past generation 1.
+        // rows alone overrun the memtable replaying them.
+        let smaller = ShardWriterConfig {
+            max_memtable_rows: 2,
+            ..config.clone()
+        };
         let err = ShardWriter::open(
-            store,
-            base_path,
-            base_uri,
-            ShardWriterConfig {
-                max_memtable_rows: 2,
-                ..config
-            },
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            smaller,
             blob_proto.schema(),
             Vec::new(),
         )
         .await
         .err()
-        .expect("a target generation replay has passed must be refused");
+        .expect("a recorded generation the memtable cannot hold must be refused");
         assert!(
-            err.to_string()
-                .contains("does not follow active generation"),
+            err.to_string().contains("past the memtable replaying it"),
             "unexpected error: {err}"
         );
+        assert_eq!(
+            manifest_generations(&store, &base_path, config.shard_id).await,
+            published_before_replay,
+            "the refusal must come before replay publishes a generation"
+        );
+
+        // The same WAL under the cap it was written with replays in full.
+        let reopened = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            blob_proto.schema(),
+            Vec::new(),
+        )
+        .await
+        .expect("the shard is unchanged and reopens at its original cap");
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -9357,6 +9407,9 @@ mod tests {
     /// one — exactly as the live write path does. Before, replay stuffed
     /// everything into a single memtable and `open()` failed outright with
     /// "MemTable batch store is full", leaving the shard permanently unopenable.
+    ///
+    /// A WAL-only writer records no generation, so this rotation is the only
+    /// boundary its entries get and the one replay must supply itself.
     #[tokio::test]
     async fn test_replay_rotates_when_wal_exceeds_one_memtable() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -9365,12 +9418,11 @@ mod tests {
 
         const N: i32 = 8;
 
-        // Writer A has a *large* capacity, so its eight one-batch puts all land in
-        // a single memtable and it never freezes or flushes a generation of its
-        // own. Dropping it without close leaves an eight-entry WAL and no
-        // generations — a WAL that no single small memtable could hold.
+        // Writer A holds no memtable at all, so its eight one-batch puts reach
+        // the WAL naming no generation and it flushes none of its own. That
+        // leaves an eight-entry WAL that no single small memtable could hold.
         let writer_a_config = ShardWriterConfig {
-            max_memtable_batches: 1000,
+            enable_memtable: false,
             ..memtable_config_with_pk(shard_id)
         };
         // Writer B has a *two-batch* capacity, so replaying that eight-entry WAL is
@@ -9458,7 +9510,7 @@ mod tests {
 
     /// The same rotation, driven by `max_memtable_rows` instead of the batch cap.
     ///
-    /// Replay builds the final memtable's indexes itself, so a WAL holding more
+    /// Replay sizes each memtable's HNSW graph to that cap, so a WAL holding more
     /// rows than one memtable's capacity has to rotate for `open()` to succeed.
     #[tokio::test]
     async fn test_replay_rotates_when_wal_exceeds_the_row_cap() {
@@ -9492,10 +9544,10 @@ mod tests {
             .unwrap()
         };
 
-        // Writer A's row cap is far above what it writes, so all 32 rows land in
-        // one memtable and dropping it without close leaves them all in the WAL.
+        // Writer A holds no memtable, so all 32 rows reach the WAL naming no
+        // generation and dropping it leaves every one of them there.
         let writer_a_config = ShardWriterConfig {
-            max_memtable_rows: 10_000,
+            enable_memtable: false,
             ..memtable_config_with_pk(shard_id)
         };
         // Writer B caps a memtable at 8 rows — and sizes its HNSW graph to match.
@@ -9511,7 +9563,9 @@ mod tests {
                 base_uri.clone(),
                 writer_a_config,
                 schema.clone(),
-                hnsw_configs(),
+                // WAL-only mode maintains no in-memory index; writer B below
+                // carries the HNSW configs whose capacity this test is about.
+                vec![],
             )
             .await
             .unwrap();
