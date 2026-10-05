@@ -250,6 +250,7 @@ enum JsonIndexTargetType {
     Int64,
     Float64,
     Utf8,
+    // Retained for parameters derived from legacy array/object indices.
     LargeBinary,
 }
 
@@ -604,7 +605,11 @@ impl JsonIndexPlugin {
                 JsonbType::Int64 => DataType::Int64,
                 JsonbType::Float64 => DataType::Float64,
                 JsonbType::String => DataType::Utf8,
-                JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
+                JsonbType::Array | JsonbType::Object => {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot create a JSON index for JSON path '{path}' with JSON type {jsonb_type:?}; only scalar values are supported"
+                    )));
+                }
             };
             return Ok(Some(data_type));
         }
@@ -927,6 +932,12 @@ impl BasicTrainer for JsonIndexPlugin {
         }
 
         let params = serde_json::from_str::<JsonIndexParameters>(params)?;
+        if params.target_data_type == Some(JsonIndexTargetType::LargeBinary) {
+            return Err(Error::invalid_input(format!(
+                "Cannot create a JSON index for JSON path '{}' with target data type LargeBinary (arrays or objects); only scalar values are supported",
+                params.path
+            )));
+        }
         // Initial builds infer the type from the data. Derived rebuild parameters
         // carry the learned type so every new segment uses the same target schema.
         let target_type = params
@@ -1160,6 +1171,80 @@ mod tests {
                 .contains("JSON-path indexes do not support target index type 'inverted'"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_json_index_rejects_large_binary_target() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let error = plugin
+            .basic_trainer()
+            .unwrap()
+            .new_training_request(
+                r#"{"target_index_type":"btree","target_data_type":"LargeBinary","path":"$.v"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .err()
+            .expect("a LargeBinary target should be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("JSON path '$.v'"), "{message}");
+        assert!(message.contains("LargeBinary"), "{message}");
+        assert!(message.contains("only scalar values"), "{message}");
+    }
+
+    #[rstest]
+    #[case::array(r#"{"v": [1, 2]}"#, JsonbType::Array)]
+    #[case::empty_array(r#"{"v": []}"#, JsonbType::Array)]
+    #[case::null_array_items(r#"{"v": [null, null]}"#, JsonbType::Array)]
+    #[case::object(r#"{"v": {"a": 1}}"#, JsonbType::Object)]
+    #[case::empty_object(r#"{"v": {}}"#, JsonbType::Object)]
+    #[case::null_object_value(r#"{"v": {"a": null}}"#, JsonbType::Object)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_index_rejects_non_scalar_path(
+        #[case] json_doc: &str,
+        #[case] json_type: JsonbType,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let request = trainer
+            .new_training_request(
+                r#"{"target_index_type":"btree","path":"$.v"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .unwrap();
+
+        // Inference must skip null and missing values, including an all-null batch.
+        let null_batch = json_update_batch(&[r#"{"v": null}"#, r#"{}"#], vec![0, 1]);
+        let value_batch = json_update_batch(&[json_doc], vec![2]);
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            null_batch.schema(),
+            futures::stream::iter([Ok(null_batch), Ok(value_batch)]),
+        )) as SendableRecordBatchStream;
+        let (store, _tmpdir) = local_json_index_store();
+        let error = trainer
+            .train_index(
+                data,
+                store.as_ref(),
+                request,
+                None,
+                crate::progress::noop_progress(),
+            )
+            .await
+            .err()
+            .expect("an array or object path should be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("JSON path '$.v'"), "{message}");
+        assert!(
+            message.contains(&format!("JSON type {json_type:?}")),
+            "{message}"
+        );
+        assert!(message.contains("only scalar values"), "{message}");
     }
 
     #[test]
