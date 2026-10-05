@@ -21,11 +21,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
 use datafusion_physical_expr::create_physical_expr;
-use lance_core::datatypes::{format_field_path_minimal, parse_field_path};
+use lance_core::datatypes::format_field_path_minimal;
 use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
 use super::exec::ReconcileExec;
+use super::projection::{is_auto_managed, resolve_data_fields_or_drop};
 use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_id};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
@@ -306,43 +307,40 @@ impl GenerationRead {
     /// Each arm's canonical projection restores the table's nullability once
     /// tombstones are dropped.
     fn target(&self, source: &Schema) -> SchemaRef {
-        // A projection names paths, and a nested one names a column the table
-        // holds inside another: `field_with_name` answers for the top level
-        // only, so taking it alone drops the parent the path selected.
-        let mut roots: Vec<(String, Option<Vec<Vec<String>>>)> = Vec::new();
-        for name in &self.projection {
-            let Ok(segments) = parse_field_path(name) else {
-                continue;
-            };
-            let Some((root, rest)) = segments.split_first() else {
-                continue;
-            };
-            match roots.iter_mut().find(|(seen, _)| seen == root) {
-                // Selecting the parent as well takes it whole.
-                Some((_, selected)) if rest.is_empty() => *selected = None,
-                Some((_, Some(selected))) => selected.push(rest.to_vec()),
-                Some((_, None)) => {}
-                None => roots.push((
-                    root.clone(),
-                    (!rest.is_empty()).then(|| vec![rest.to_vec()]),
-                )),
-            }
-        }
-
-        let mut fields: Vec<Field> = roots
+        // Resolved the way the canonical projection resolves, so the two agree
+        // on child order, on how sibling selections of one parent merge, and on
+        // the shape a container keeps. Dropping rather than refusing an unknown
+        // name: a generation read projects under the table's names while
+        // reading a memtable that predates them.
+        let data_names: Vec<String> = self
+            .projection
             .iter()
-            .filter_map(|(root, selected)| {
-                let declared = self.table_schema.field_with_name(root).ok()?;
+            .filter(|name| !is_auto_managed(name))
+            .cloned()
+            .collect();
+        let resolved =
+            resolve_data_fields_or_drop(&data_names, &self.table_schema).unwrap_or_default();
+        // The resolver renumbers as it projects; `Plan::resolve` below pairs
+        // source to target by id, so the table's own ids go back on.
+        let resolved = with_ids_from(
+            &Schema::new(
+                resolved
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect::<Vec<_>>(),
+            ),
+            &self.table_schema,
+        );
+        let mut fields: Vec<Field> = resolved
+            .fields()
+            .iter()
+            .map(|field| {
                 // Absent from the source means synthesized, so nullable.
                 let nullable = self
-                    .stored_name(root)
+                    .stored_name(field.name())
                     .and_then(|stored_column| source.field_with_name(stored_column).ok())
                     .is_none_or(|f| f.is_nullable());
-                let declared = match selected {
-                    None => declared.clone(),
-                    Some(paths) => prune_to_selected(declared, paths)?,
-                };
-                Some(declared.with_nullable(nullable))
+                field.as_ref().clone().with_nullable(nullable)
             })
             .collect();
         // A generation's own columns are not the table's, so they pass through
@@ -431,35 +429,6 @@ fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String
                 .map(|table_path| (stored_path, (*table_path).clone()))
         })
         .collect()
-}
-
-/// `field` carrying only the parts `selected` names, sibling selections merged.
-///
-/// `selected` holds the path remaining below `field`; an empty one selects the
-/// field whole. `None` when nothing under it was selected, which cannot happen
-/// for a path the caller asked for but can for one naming a child the field
-/// does not have.
-fn prune_to_selected(field: &Field, selected: &[Vec<String>]) -> Option<Field> {
-    if selected.iter().any(|path| path.is_empty()) {
-        return Some(field.clone());
-    }
-    // Only a struct is pruned: a selection reaching into a list or map element
-    // takes the container whole, which is wider than asked for and never wrong.
-    let DataType::Struct(children) = field.data_type() else {
-        return Some(field.clone());
-    };
-    let kept: Vec<Field> = children
-        .iter()
-        .filter_map(|child| {
-            let below: Vec<Vec<String>> = selected
-                .iter()
-                .filter(|path| path[0] == *child.name())
-                .map(|path| path[1..].to_vec())
-                .collect();
-            (!below.is_empty()).then(|| prune_to_selected(child, &below))?
-        })
-        .collect();
-    (!kept.is_empty()).then(|| field.clone().with_data_type(DataType::Struct(kept.into())))
 }
 
 /// The fields nested inside `data_type`, each one carrying an id of its own.

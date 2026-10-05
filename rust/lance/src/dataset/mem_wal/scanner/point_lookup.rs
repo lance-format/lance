@@ -2756,12 +2756,6 @@ mod tests {
     /// The resolved output must follow the selection, as the canonical
     /// projection does, or the later relabel pairs children positionally and
     /// one child answers with the other's value.
-    ///
-    /// The resolved target still follows declaration order, so this fails: it
-    /// holds the reproduction until the target is built the way the canonical
-    /// projection builds it, which also settles the container shape a selection
-    /// reaching into a list element should keep.
-    #[ignore = "nested selection order is not yet carried into the resolved target"]
     #[tokio::test]
     async fn a_nested_projection_keeps_selection_order() {
         let stored_schema = create_nested_schema();
