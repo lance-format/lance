@@ -1898,8 +1898,9 @@ fn build_tombstone_batch(
 ///
 /// Each memtable is created under one of these and keeps it: its batches are
 /// stored under `storage`, its indexes are built from `index_configs`, and its
-/// flush writes a generation of that schema. [`ShardWriter::evolve_schema`]
-/// replaces the writer's current one; memtables created before keep theirs.
+/// flush writes a generation of that schema. [`ShardWriter::evolve_schema`] and
+/// [`ShardWriter::replace_index_configs`] replace the writer's current one;
+/// memtables created before keep theirs.
 #[derive(Clone)]
 struct WriterSchema {
     /// The base table's schema as the caller passed it — no `_tombstone`,
@@ -2565,7 +2566,8 @@ enum WriterMode {
         /// The base table's schema as the caller passed it, without field ids.
         /// Caller input is held to it (see [`validate_against_logical_schema`]).
         /// Memtable mode keeps its own in [`WriterState`], where
-        /// [`ShardWriter::evolve_schema`] can replace it.
+        /// [`ShardWriter::evolve_schema`] can replace it. WAL-only mode has no
+        /// memtable, so nothing replaces this one.
         logical_schema: Arc<ArrowSchema>,
     },
 }

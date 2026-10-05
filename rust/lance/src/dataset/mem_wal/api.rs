@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use uuid::Uuid;
 
@@ -827,7 +828,7 @@ impl ShardWriter {
     /// derives them when it opens a writer.
     ///
     /// `dataset` is the base table this writer's shard belongs to, read after
-    /// the schema change.
+    /// the schema change. `Ok(None)` when the writer already holds both.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -864,8 +865,6 @@ enum OnMissingIndex {
 
 /// The MemWAL index details every writer operation on `dataset` needs.
 async fn require_mem_wal_details(dataset: &Dataset) -> Result<MemWalIndexDetails> {
-    use lance_index::metrics::NoOpMetricsCollector;
-
     let index = dataset
         .open_mem_wal_index(&NoOpMetricsCollector)
         .await?
@@ -1099,8 +1098,6 @@ async fn load_vector_index_config(
     index_meta: &lance_table::format::IndexMetadata,
     hnsw_params: Option<HnswBuildParams>,
 ) -> Result<MemIndexConfig> {
-    use lance_index::metrics::NoOpMetricsCollector;
-
     let field_id = index_meta.fields.first().ok_or_else(|| {
         Error::invalid_input(format!("Vector index '{}' has no fields", index_name))
     })?;
