@@ -20,13 +20,6 @@ The Python/Java logger can be configured with several environment variables:
 - `LANCE_LOG_TS_PRECISION`: The precision of the timestamp in the log messages. Valid values are `ns`, `us`, `ms`, `s`.
 - `LANCE_LOG_FILE`: Redirects Rust log messages to the specified file path instead of stderr. When set, Lance will create the file and any necessary parent directories. If the file cannot be created (e.g., due to permission issues), Lance will fall back to logging to stderr.
 
-The LanceDB Node SDK (`@lancedb/lancedb`) uses `LANCEDB_LOG` for Rust log filtering and
-`LANCEDB_LOG_STYLE` for colors. Its default log level is `warn`. Set these variables **before loading
-the SDK**, since the native module initializes its logger at import time. For example, a terminal UI
-can disable Rust logs with `LANCEDB_LOG=off node app.js`, or suppress commit-hook logs with
-`LANCEDB_LOG=warn,lance::io::commit=off node app.js`. These filters use the same
-[env_logger syntax](https://docs.rs/env_logger/latest/env_logger/) as `LANCE_LOG`.
-
 ## Trace Events
 
 Lance uses tracing to log events. If you are running `pylance` then these events will be emitted
