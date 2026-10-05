@@ -1392,6 +1392,7 @@ async fn prewarm_index_segments_by_metadata(
     available_segment_count: usize,
     requested_segment_count: Option<usize>,
 ) -> Result<FtsPrewarmResult> {
+    let warm_dataset = dataset.with_cache_load_origin(lance_core::cache::CacheLoadOrigin::Warm);
     let request_started = Instant::now();
     let selected_segment_count = indices.len();
     let selected_size_bytes = total_index_segment_size_bytes(&indices);
@@ -1412,6 +1413,7 @@ async fn prewarm_index_segments_by_metadata(
         "prewarm index segments started"
     );
 
+    let warm_dataset = &warm_dataset;
     let result = futures::future::try_join_all(indices.into_iter().map(|index_meta| async move {
         let index_uuid = index_meta.uuid;
         let size_bytes = index_meta.total_size_bytes();
@@ -1432,7 +1434,7 @@ async fn prewarm_index_segments_by_metadata(
             "prewarm index segment started"
         );
 
-        let index = match dataset
+        let index = match warm_dataset
             .open_generic_index(name, &index_uuid, &NoOpMetricsCollector)
             .await
         {

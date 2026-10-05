@@ -46,6 +46,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
+use lance_core::cache::CacheLoadOrigin;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
@@ -807,7 +808,7 @@ impl DatasetMemWalExt for Dataset {
         snapshots: &[ShardSnapshot],
         cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
-        let session = self.session();
+        let session = Arc::new(self.session().with_cache_load_origin(CacheLoadOrigin::Warm));
         // Every open below targets a generation URI, never the base's own.
         let store_params = self.store_params().map(derived_store_params);
         // Resolve SSTable paths exactly as the LSM collector does, so the
@@ -832,7 +833,8 @@ impl DatasetMemWalExt for Dataset {
                         let dataset =
                             open_sstable(&path, Some(session), store_params.as_ref(), cache, None)
                                 .await?;
-                        prewarm_all_indexes(&dataset).await
+                        prewarm_all_indexes(&dataset.with_cache_load_origin(CacheLoadOrigin::Warm))
+                            .await
                     }
                 })
             })
@@ -2030,6 +2032,10 @@ mod tests {
         base.prewarm_mem_wal(std::slice::from_ref(&snapshot), Some(&cache))
             .await
             .expect("prewarm must open the generation and warm its index");
+        let diagnostics = base.session().cache_diagnostics();
+        let warm_activity = &diagnostics.index.activity.warm;
+        assert!(warm_activity.attempts > 0);
+        assert!(warm_activity.loads_succeeded > 0);
 
         // The generation is resident in the cache (same session), with its
         // index loadable — a later lookup that opens this path is a pure hit.
