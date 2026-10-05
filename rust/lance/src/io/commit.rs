@@ -475,12 +475,12 @@ async fn do_commit_new_dataset(
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
-            let new_base_id = source_manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| *id + 1)
-                .unwrap_or(0);
+            let new_base_id = match source_manifest.base_paths.keys().max() {
+                Some(id) => id.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input(format!("Cannot allocate clone base ID after {id}"))
+                })?,
+                None => 0,
+            };
             let new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
@@ -1952,7 +1952,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-    use lance_table::format::{DataFile, DataStorageFormat};
+    use lance_table::format::{BasePath, DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
         commit_handler_from_url,
@@ -2464,6 +2464,54 @@ mod tests {
             "max_fragment_id should not decrease on restore: before={}, after={}",
             latest_max,
             restored_max
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shallow_clone_rejects_exhausted_base_ids() {
+        let source_dir = TempStrDir::default();
+        let target_dir = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset(
+                source_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(1),
+            )
+            .await
+            .unwrap();
+        let mut dataset = Arc::new(dataset)
+            .add_bases(
+                vec![BasePath {
+                    id: u32::MAX,
+                    name: Some("last_base".to_string()),
+                    path: format!("{}/extra", source_dir.as_str()),
+                    is_dataset_root: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let version = dataset.manifest.version;
+        let original_data = dataset.scan().try_into_batch().await.unwrap();
+
+        let error = dataset
+            .shallow_clone(target_dir.as_str(), version, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot allocate clone base ID after 4294967295")
+        );
+        let error = Dataset::open(target_dir.as_str()).await.unwrap_err();
+        assert!(matches!(error, Error::DatasetNotFound { .. }));
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, version);
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            original_data
         );
     }
 
