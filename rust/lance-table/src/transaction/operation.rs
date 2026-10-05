@@ -143,7 +143,7 @@ pub enum Operation {
     /// fragment (aligned with the old one at rows) and, optionally, brand-new fragments
     /// listed after them. New fragments use id 0 (assigned a fresh id at commit time) or
     /// a pre-reserved id; either way, on stable row id datasets they are also assigned
-    /// row ids at commit time, like Append.
+    /// row ids at commit time, like Append. New fragments must not carry row id metadata.
     /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,

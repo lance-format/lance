@@ -1206,7 +1206,21 @@ impl Transaction {
                 // unassigned, non-zero pre-reserved) and, with stable row ids,
                 // row ids plus fresh version metadata.
                 for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
-                    if *is_new && fragment.id == 0 {
+                    if !*is_new {
+                        continue;
+                    }
+                    // Caller-supplied row ids are never checked against live
+                    // fragments or next_row_id, so keeping them could commit
+                    // duplicate or unallocated stable row ids.
+                    if fragment.row_id_meta.is_some() {
+                        return Err(Error::invalid_input(format!(
+                            "Merge operation includes new fragment (id {}) with row id \
+                             metadata. New fragments must not carry row ids; they are \
+                             assigned at commit time.",
+                            fragment.id
+                        )));
+                    }
+                    if fragment.id == 0 {
                         fragment.id = fragment_id;
                         fragment_id += 1;
                     }
@@ -1215,8 +1229,6 @@ impl Transaction {
                 if let Some(next_row_id) = &mut next_row_id {
                     for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
                         if *is_new {
-                            // Fragments that already carry a complete row id sequence
-                            // are left untouched by assign_row_ids.
                             Self::assign_row_ids(next_row_id, std::slice::from_mut(fragment))?;
                             let version_meta = build_version_meta(fragment, new_version);
                             fragment.last_updated_at_version_meta = version_meta.clone();
@@ -4308,6 +4320,42 @@ mod tests {
         assert!(Transaction::merge_rewritten_fields(&existing, &merge_list).is_empty());
     }
 
+    #[rstest::rstest]
+    #[case::complete_stable(&[0, 1], true)]
+    #[case::partial_stable(&[0], true)]
+    #[case::complete_non_stable(&[0, 1], false)]
+    fn merge_build_manifest_rejects_row_ids_on_new_fragments(
+        #[case] supplied_row_ids: &[u64],
+        #[case] stable: bool,
+    ) {
+        // Supplied row ids duplicate the existing fragment's live ids; keeping
+        // them (or filling a partial prefix) would corrupt the row id index.
+        let existing = if stable {
+            frag_with_row_ids(0, "frag0.lance", &[0, 1])
+        } else {
+            frag_without_row_ids(0, "frag0.lance", 2)
+        };
+        let (mut manifest, schema) = merge_test_manifest(vec![existing.clone()], stable);
+        if stable {
+            manifest.next_row_id = 2;
+        }
+
+        let mut staged = frag_with_row_ids(0, "staged.lance", supplied_row_ids);
+        staged.physical_rows = Some(2);
+        let err = build_merge(&manifest, schema, vec![existing, staged]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("new fragment (id 0) with row id metadata"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
     #[test]
     fn merge_validate_rejects_duplicate_nonzero_fragment_ids() {
         let existing = vec![frag_without_row_ids(1, "frag1.lance", 2)];
@@ -4486,14 +4534,14 @@ mod tests {
         manifest.next_row_id = 100;
         manifest.version = 1;
 
-        // New fragment (id=1) not present in prev manifest — exercises the None branch
-        let row_ids_1 = RowIdSequence::from([20u64, 21, 22, 23].as_slice());
+        // New fragment (id=1) not present in prev manifest; row ids are
+        // allocated at commit time.
         let new_fragment = Fragment {
             id: 1,
             files: vec![mk_file("new.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
+            row_id_meta: None,
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4516,6 +4564,12 @@ mod tests {
         assert_eq!(out.version, 2);
 
         let new_frag = out.fragments.iter().find(|f| f.id == 1).unwrap();
+        let Some(RowIdMeta::Inline(data)) = &new_frag.row_id_meta else {
+            panic!("new fragment must have inline row id metadata");
+        };
+        let row_ids: Vec<u64> = crate::rowids::read_row_ids(data).unwrap().iter().collect();
+        assert_eq!(row_ids, vec![100, 101, 102, 103]);
+        assert_eq!(out.next_row_id, 104);
 
         // last_updated_at_version must be set to the commit version
         let last_updated_seq = new_frag
