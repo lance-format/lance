@@ -30,6 +30,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>18.3.0</arrow.version>
         <opentelemetry.version>1.64.0</opentelemetry.version>
+        <protobuf.version>3.25.5</protobuf.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.43.0</spotless.version>
@@ -128,6 +129,11 @@
             <artifactId>opentelemetry-api</artifactId>
             <version>${opentelemetry.version}</version>
         </dependency>
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>${protobuf.version}</version>
+        </dependency>
         <!-- AWS SDK for S3 integration testing -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -167,7 +173,35 @@
     </distributionManagement>
 
     <build>
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.5.0.Final</version>
+            </extension>
+        </extensions>
         <plugins>
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <version>0.6.1</version>
+                <configuration>
+                    <protoSourceRoot>${project.basedir}/../protos</protoSourceRoot>
+                    <includes>
+                        <include>cache_diagnostics.proto</include>
+                    </includes>
+                    <protocArtifact>
+                        com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}
+                    </protocArtifact>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -270,6 +304,7 @@
                     <failsOnError>true</failsOnError>
                     <violationSeverity>warning</violationSeverity>
                     <linkXRef>false</linkXRef>
+                    <excludeGeneratedSources>true</excludeGeneratedSources>
                 </configuration>
                 <executions>
                     <execution>

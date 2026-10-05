@@ -467,6 +467,48 @@ public class SessionTest {
   }
 
   @Test
+  void testIndexCacheStatsAndCompleteDiagnostics() {
+    try (Session session =
+        Session.builder().indexCacheSizeBytes(0).metadataCacheSizeBytes(2048).build()) {
+      CacheStats indexStats = session.getIndexCacheStats();
+      assertEquals(0, indexStats.getHits());
+      assertEquals(0, indexStats.getMisses());
+      assertEquals(0, indexStats.getNumEntries());
+      assertEquals(0, indexStats.getSizeBytes());
+
+      CacheDiagnostics diagnostics = session.getCacheDiagnostics();
+      assertEquals(
+          CacheDiagnostics.BackendKind.QUICK, diagnostics.getIndex().getBackend().getKind());
+      assertEquals(0, diagnostics.getIndex().getBackend().getCapacityBytes().orElseThrow());
+      assertFalse(diagnostics.getIndex().getBackend().getEnabled().orElseThrow());
+      assertFalse(diagnostics.getIndex().getUtilization().isPresent());
+      assertEquals(2048, diagnostics.getMetadata().getBackend().getCapacityBytes().orElseThrow());
+      assertTrue(diagnostics.getMetadata().getBackend().getEnabled().orElseThrow());
+      assertEquals(0.0, diagnostics.getMetadata().getUtilization().orElseThrow());
+      assertEquals(0, diagnostics.getIndex().getActivity().getLoadsInFlight());
+      assertEquals(0, diagnostics.getIndex().getActivity().getWarm().getAttempts());
+      assertEquals(0, diagnostics.getMetadata().getActivity().getWarm().getLoadBytes());
+
+      CacheDiagnostics refreshed = session.getCacheDiagnostics(true);
+      assertEquals(0, refreshed.getMetadata().getBackend().getNumEntries().orElseThrow());
+
+      CacheDiagnosticsOptions options =
+          CacheDiagnosticsOptions.builder().refresh(true).byType(true).build();
+      assertTrue(options.getRefresh());
+      assertTrue(options.getByType());
+      CacheDiagnostics byType = session.getCacheDiagnostics(options);
+      CacheDiagnostics.ByType indexByType = byType.getIndex().getByType().orElseThrow();
+      assertTrue(indexByType.getActivity().isEmpty());
+      assertTrue(indexByType.getOccupancy().orElseThrow().getTypes().isEmpty());
+      assertEquals(0, indexByType.getTypeLabelOverflowEvents());
+
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::getIndexCacheStats);
+      assertThrows(IllegalArgumentException.class, session::getCacheDiagnostics);
+    }
+  }
+
+  @Test
   void testInvalidCacheSizes() {
     assertThrows(
         IllegalArgumentException.class, () -> Session.builder().indexCacheSizeBytes(-1).build());
