@@ -1491,9 +1491,17 @@ async fn replay_memtable_from_wal(
                         } else {
                             active.generation() + 1
                         };
-                        if target.generation != expected_generation {
+                        // The target names the directory its payload is in, so
+                        // its generation is the authority and the rotation below
+                        // adopts it. A gap is legitimate: the writer also rotates
+                        // for reasons no entry records -- an index set replaced,
+                        // a schema evolved -- and replay cannot reconstruct
+                        // those. Going backwards is not: that generation has
+                        // been flushed, and reusing the number would write a
+                        // second one over it.
+                        if target.generation < expected_generation {
                             return Err(Error::io(format!(
-                                "WAL target generation {} at position {} does not follow active generation {}",
+                                "WAL target generation {} at position {} precedes active generation {}",
                                 target.generation,
                                 position,
                                 active.generation()
@@ -3855,16 +3863,6 @@ impl ShardWriter {
         if next.is_equivalent(&current) {
             return Ok(None);
         }
-        // A Blob v2 column arriving or leaving changes whether memtables carry a
-        // preassigned data target, and a WAL entry is replayed into a memtable
-        // built the other way. Refuse rather than seal across it: the caller
-        // reopens, and replay rebuilds every memtable under one layout.
-        if next.preassigns_data_target() != current.preassigns_data_target() {
-            return Err(Error::invalid_input(format!(
-                "{op} cannot change whether the schema carries Blob v2 payload columns: \
-                 the writer must be reopened so the WAL is replayed under one layout"
-            )));
-        }
         if next.pk_field_ids != current.pk_field_ids {
             return Err(Error::invalid_input(format!(
                 "{op} cannot change the primary key: the writer holds primary key field ids \
@@ -5334,51 +5332,6 @@ mod tests {
         paths
     }
 
-    /// A Blob v2 column leaving the schema changes whether memtables preassign a
-    /// data target, and a WAL entry is replayed into a memtable built the other
-    /// way. The swap is refused so the caller reopens and replays under one.
-    #[tokio::test]
-    async fn test_evolve_schema_refuses_a_blob_layout_change() {
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let batch = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"abc".to_vec())]);
-        let schema = batch.schema();
-        let config = ShardWriterConfig {
-            shard_id,
-            durable_write: false,
-            max_wal_flush_interval: Some(Duration::from_millis(10)),
-            ..Default::default()
-        };
-        let writer = ShardWriter::open(
-            store,
-            base_path,
-            base_uri,
-            config,
-            schema.clone(),
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-
-        let without_blob = Arc::new(ArrowSchema::new(
-            schema
-                .fields()
-                .iter()
-                .filter(|f| f.name() != "blob")
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
-        let error = writer
-            .evolve_schema(without_blob, Vec::new())
-            .await
-            .expect_err("dropping the blob column changes the memtable layout");
-        assert!(
-            error.to_string().contains("Blob v2"),
-            "unexpected error: {error}"
-        );
-        writer.close().await.unwrap();
-    }
-
     #[tokio::test]
     async fn test_blob_v2_target_is_reused_across_replay_and_flush() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -5589,6 +5542,112 @@ mod tests {
             sidecars_after_successor,
             "flush must reuse every sidecar written before and after replay"
         );
+    }
+
+    /// A Blob v2 target names the generation whose directory holds its payload,
+    /// so replay rotates onto it rather than requiring it to be the next one.
+    /// The writer also rotates for reasons no entry records — here a rename, and
+    /// then the first Blob column — so the recorded generation is the only thing
+    /// that relates what replay rebuilds to what the writer had.
+    #[tokio::test]
+    async fn test_replay_adopts_a_blob_target_generation_across_a_gap() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            max_wal_buffer_size: 1,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        };
+
+        let blob_proto = create_blob_v2_batch(2, &[BlobTestValue::Bytes(b"de".to_vec())]);
+        let rename = |schema: &ArrowSchema| {
+            Arc::new(ArrowSchema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if f.name() == "vector" {
+                            Arc::new(f.as_ref().clone().with_name("embedding"))
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let without_blob = Arc::new(ArrowSchema::new(
+            blob_proto
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "blob")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let renamed = rename(&without_blob);
+        let renamed_with_blob = rename(blob_proto.schema().as_ref());
+        let row = |schema: &Arc<ArrowSchema>, id: i32, blob: bool| {
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> =
+                vec![Arc::new(Int32Array::from(vec![id]))];
+            if blob {
+                columns.push(blob_proto.column(1).slice(0, 1));
+            }
+            columns.push(blob_proto.column(2).slice(0, 1));
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+
+        let live_generation;
+        {
+            let writer = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                without_blob.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            writer
+                .put(vec![row(&without_blob, 0, false)])
+                .await
+                .unwrap();
+            writer
+                .evolve_schema(renamed.clone(), Vec::new())
+                .await
+                .unwrap();
+            writer.put(vec![row(&renamed, 1, false)]).await.unwrap();
+            writer
+                .evolve_schema(renamed_with_blob.clone(), Vec::new())
+                .await
+                .unwrap();
+            writer
+                .put(vec![row(&renamed_with_blob, 2, true)])
+                .await
+                .unwrap();
+            live_generation = writer.active_memtable_ref().await.unwrap().generation;
+            // Dropped without a flush: the WAL holds every entry and none of the
+            // generations it describes were committed.
+            std::mem::forget(writer);
+        }
+
+        let reopened = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            renamed_with_blob,
+            Vec::new(),
+        )
+        .await
+        .expect("replay must rebuild a writer the schema changes rotated");
+        assert_eq!(
+            reopened.active_memtable_ref().await.unwrap().generation,
+            live_generation,
+            "replay lands on the generation the target records"
+        );
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
