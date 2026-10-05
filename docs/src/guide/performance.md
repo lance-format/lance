@@ -4,10 +4,11 @@ This guide provides tips and tricks for optimizing the performance of your Lance
 
 ## Logging
 
-Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
-library you are using. For rust, you will need to configure a logging subscriber. For more details
-ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
-logging subscriber that logs to stderr.
+Lance emits log messages through the `log` crate and structured events through the `tracing` crate.
+Rust applications configure their own logger and tracing subscriber, including filtering and output
+destinations; the Rust library does not install either globally. See the
+[log](https://docs.rs/log/latest/log/) and [tracing](https://docs.rs/tracing/latest/tracing/) docs.
+The Python and Java clients configure a default logger that logs to stderr.
 
 The Python/Java logger can be configured with several environment variables:
 
@@ -18,6 +19,13 @@ The Python/Java logger can be configured with several environment variables:
 - `LANCE_LOG_STYLE`: Controls whether colors are used in the log messages. Valid values are `auto`, `always`, `never`.
 - `LANCE_LOG_TS_PRECISION`: The precision of the timestamp in the log messages. Valid values are `ns`, `us`, `ms`, `s`.
 - `LANCE_LOG_FILE`: Redirects Rust log messages to the specified file path instead of stderr. When set, Lance will create the file and any necessary parent directories. If the file cannot be created (e.g., due to permission issues), Lance will fall back to logging to stderr.
+
+The LanceDB Node SDK (`@lancedb/lancedb`) uses `LANCEDB_LOG` for Rust log filtering and
+`LANCEDB_LOG_STYLE` for colors. Its default log level is `warn`. Set these variables **before loading
+the SDK**, since the native module initializes its logger at import time. For example, a terminal UI
+can disable Rust logs with `LANCEDB_LOG=off node app.js`, or suppress commit-hook logs with
+`LANCEDB_LOG=warn,lance::io::commit=off node app.js`. These filters use the same
+[env_logger syntax](https://docs.rs/env_logger/latest/env_logger/) as `LANCE_LOG`.
 
 ## Trace Events
 

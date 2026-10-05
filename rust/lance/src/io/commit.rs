@@ -1570,7 +1570,7 @@ async fn record_successful_commit(
         // which versions are available for cleanup.
         match auto_cleanup_hook(dataset, manifest).await {
             Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-            Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+            Err(e) => log::warn!("Auto cleanup failed after a successful commit: {}", e),
             _ => {}
         };
     }
@@ -1979,6 +1979,32 @@ mod tests {
     #[case::nan(Some("NaN"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
     fn test_parse_commit_retry_timeout(#[case] raw: Option<&str>, #[case] expected: Duration) {
         assert_eq!(parse_commit_retry_timeout(raw), expected);
+    }
+
+    #[tokio::test]
+    async fn test_auto_cleanup_failure_preserves_successful_commit() {
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        dataset
+            .update_config([("lance.auto_cleanup.interval", "invalid")])
+            .await
+            .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, 2);
+        assert_eq!(
+            dataset.manifest.config["lance.auto_cleanup.interval"],
+            "invalid"
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+        let error = auto_cleanup_hook(&dataset, &dataset.manifest)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Cleanup { .. }));
+        assert!(error.to_string().contains("lance.auto_cleanup.interval"));
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {

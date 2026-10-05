@@ -720,7 +720,6 @@ impl<'a> CleanupTask<'a> {
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
-        let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
@@ -730,7 +729,7 @@ impl<'a> CleanupTask<'a> {
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
                     // If the directory doesn't exist then we can just return an empty stream.
-                    if is_not_found_err(&e) {
+                    if e.is_not_found() {
                         future::ready(Ok(stream::empty::<Result<ObjectMeta>>().boxed()))
                     } else {
                         future::ready(Err(e))
@@ -861,7 +860,7 @@ impl<'a> CleanupTask<'a> {
                         // Cleanup lists first and deletes after, so a concurrent
                         // writer or a second cleanup can remove a path in between.
                         // Already gone is the outcome we wanted.
-                        Err(error) if is_not_found_err(&error) => Ok(()),
+                        Err(error) if error.is_not_found() => Ok(()),
                         Err(error) => Err(error),
                     };
                     Ok::<_, Error>((file, outcome))
@@ -1426,7 +1425,7 @@ async fn expired_manifest_size(
         Some(size_bytes) => Ok(size_bytes),
         None => match object_store.size(path).await {
             Ok(size_bytes) => Ok(size_bytes),
-            Err(Error::NotFound { .. }) => Ok(0),
+            Err(error) if error.is_not_found() => Ok(0),
             Err(error) => Err(error),
         },
     }
@@ -3751,6 +3750,81 @@ mod tests {
         assert_eq!(after_count.num_manifest_files, 1);
     }
 
+    #[rstest]
+    #[case::missing(true, 0)]
+    #[case::permission_denied(false, 2)]
+    #[tokio::test]
+    async fn cleanup_handles_wrapped_delete_errors(
+        #[case] is_missing: bool,
+        #[case] expected_failed_deletes: u64,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 1.into())
+        };
+        fixture.create_with_data(data()).await.unwrap();
+        fixture.append_data(data()).await.unwrap();
+        fixture.overwrite_data(data()).await.unwrap();
+
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "concurrent_data_delete",
+            Arc::new(move |method, path| {
+                if method == "delete" && path.extension() == Some("lance") {
+                    if is_missing {
+                        // Simulate another cleanup removing the file after listing.
+                        std::fs::remove_file(lance_io::local::to_local_path(path))?;
+                        return Err(Error::not_found(path.to_string()));
+                    }
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "cleanup delete denied",
+                    )));
+                }
+                Ok(())
+            }),
+        );
+
+        let dataset = fixture.load().await.unwrap();
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let stats = dataset
+            .cleanup_with_policy(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, 2);
+        assert_eq!(stats.failed_deletes, expected_failed_deletes);
+        assert_eq!(stats.data_files_removed, if is_missing { 2 } else { 0 });
+        assert_eq!(
+            fixture.count_files().await.unwrap().num_data_files,
+            if is_missing { 1 } else { 3 }
+        );
+        assert_eq!(fixture.count_rows().await.unwrap(), 2);
+        let output = std::fs::read_to_string(logs.path()).unwrap();
+        assert_eq!(
+            output
+                .matches("failed to delete file; continuing and counting it")
+                .count(),
+            usize::from(!is_missing),
+            "missing files must be silent; other failures warn once per sweep: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_rejects_retain_zero_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
@@ -5166,10 +5240,29 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_index_files, 7);
     }
 
+    #[rstest]
+    #[case::plain(false)]
+    #[case::wrapped(true)]
     #[tokio::test]
-    async fn expired_manifest_size_tolerates_a_vanished_manifest() {
-        let store = ObjectStore::memory();
+    async fn expired_manifest_size_tolerates_a_vanished_manifest(#[case] is_wrapped: bool) {
+        let wrapper = Arc::new(MockObjectStore::new());
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://",
+            &ObjectStoreParams {
+                object_store_wrapper: Some(wrapper.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let path = Path::from("_versions/1.manifest");
+        if is_wrapped {
+            wrapper.policy.lock().unwrap().set_before_policy(
+                "missing_manifest",
+                Arc::new(|_, path| Err(Error::not_found(path.to_string()))),
+            );
+        }
 
         // A size the listing already reported costs no request at all.
         assert_eq!(
@@ -5185,6 +5278,11 @@ mod tests {
         assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 0);
 
         // A present object still reports its real size through the fallback.
+        wrapper
+            .policy
+            .lock()
+            .unwrap()
+            .clear_before_policy("missing_manifest");
         store.put(&path, b"1234".as_slice()).await.unwrap();
         assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 4);
     }
