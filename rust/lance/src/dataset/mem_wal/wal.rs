@@ -44,6 +44,18 @@ pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
 /// The memtable generation an entry's batches belong to. Absent in WAL-only
 /// mode, which holds no memtable.
 pub const GENERATION_KEY: &str = "generation";
+
+/// Metadata keys a WAL entry carries about itself rather than about its batches.
+const RESERVED_ENTRY_KEYS: &[&str] = &[
+    WRITER_EPOCH_KEY,
+    GENERATION_KEY,
+    FENCE_SENTINEL_KEY,
+    TARGET_GENERATION_KEY,
+    TARGET_GENERATION_DIR_KEY,
+    TARGET_DATA_FILE_KEY,
+    TARGET_CREATOR_EPOCH_KEY,
+    TARGET_BATCH_CAPACITY_KEY,
+];
 const TARGET_GENERATION_KEY: &str = "mem_wal_target_generation";
 const TARGET_GENERATION_DIR_KEY: &str = "mem_wal_target_generation_dir";
 const TARGET_DATA_FILE_KEY: &str = "mem_wal_target_data_file";
@@ -1561,6 +1573,13 @@ fn serialize_appender_batches(
 ) -> Result<Vec<u8>> {
     let schema = batches[0].schema();
     let mut metadata = schema.metadata().clone();
+    // These keys describe the entry, not the batch, so the writer owns every one
+    // of them: a caller carrying the same key in its own schema metadata must
+    // not be able to speak for the writer. Cleared first, then set to whatever
+    // this entry actually is.
+    for reserved in RESERVED_ENTRY_KEYS {
+        metadata.remove(*reserved);
+    }
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
     if let Some(generation) = generation {
         metadata.insert(GENERATION_KEY.to_string(), generation.to_string());
@@ -2856,5 +2875,31 @@ mod tests {
             cursors.check_poisoned().unwrap_err().fence_reason(),
             Some(FenceReason::PersistenceFailure)
         );
+    }
+
+    /// Generation 0 belongs to the base table, so a caller must not be able to
+    /// claim it — or any other generation — through its own schema metadata.
+    #[test]
+    fn an_entry_takes_its_generation_from_the_writer_not_the_batch() {
+        let mut claimed = std::collections::HashMap::new();
+        claimed.insert(GENERATION_KEY.to_string(), "0".to_string());
+        claimed.insert(WRITER_EPOCH_KEY.to_string(), "99".to_string());
+        let schema = Arc::new(Schema::new_with_metadata(
+            create_test_schema().fields().to_vec(),
+            claimed,
+        ));
+        let batch = create_test_batch(&schema, 1);
+
+        // WAL-only mode holds no memtable, so the entry names no generation.
+        let bytes =
+            serialize_appender_batches(std::slice::from_ref(&batch), 7, None, None).unwrap();
+        let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
+        assert_eq!(decoded.generation, None, "the batch cannot supply one");
+        assert_eq!(decoded.writer_epoch, 7, "nor speak for the writer's epoch");
+
+        // And a writer that does name one is the one that wins.
+        let bytes = serialize_appender_batches(&[batch], 7, None, Some(4)).unwrap();
+        let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
+        assert_eq!(decoded.generation, Some(4));
     }
 }

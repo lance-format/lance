@@ -1486,8 +1486,12 @@ async fn replay_memtable_from_wal(
                     // The entry names the generation its batches belong to, so
                     // the boundary is read rather than measured. A WAL-only
                     // entry names none; the size rule below answers for it.
+                    // Replay may also split one recorded generation across
+                    // several of its own when its memtable is smaller than the
+                    // writer's — the numbers still ascend, so only the target
+                    // check below has to care.
                     if let Some(generation) = entry.generation
-                        && generation != active.generation()
+                        && generation > active.generation()
                         && !active.batch_store().is_empty()
                     {
                         let global_end = active.batch_store().global_end();
@@ -1512,15 +1516,17 @@ async fn replay_memtable_from_wal(
                         } else {
                             active.generation() + 1
                         };
-                        // Every entry names its generation, so the rotation
-                        // above has already moved onto the one this target
-                        // belongs to. A disagreement means the two disagree
-                        // about which memtable wrote these rows, and the
-                        // payload directory this entry points into may not be
-                        // the one the memtable owns.
+                        // A target's generation names the directory its
+                        // payload was spilled to, and the memtable's names the
+                        // generation it flushes as, so replay has to adopt the
+                        // target's number for both. It can only do that while
+                        // its own splitting has left that number still ahead —
+                        // otherwise a second generation would take a number
+                        // already written out. A memtable smaller than the one
+                        // the WAL was written under is what gets it there.
                         if target.generation != expected_generation {
                             return Err(Error::io(format!(
-                                "WAL target generation {} at position {} does not follow active generation {}",
+                                "WAL target generation {} at position {} does not follow active generation {}; the memtable replaying this WAL is smaller than the one that wrote it",
                                 target.generation,
                                 position,
                                 active.generation()
@@ -1619,24 +1625,7 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    // Rebuild the active memtable's in-memory indexes from the batches just
-    // replayed, so readers see them through the index path — matching what the
-    // pre-crash writer's flush would have done. Sealed memtables needed no
-    // in-memory index build: they were flushed straight to disk and are gone.
-    if let Some(indexes) = active.indexes_arc() {
-        let batch_count = active.batch_count();
-        if batch_count > 0 {
-            let store = active.batch_store();
-            let stored: Vec<StoredBatch> = (0..batch_count)
-                .filter_map(|pos| store.get(pos).cloned())
-                .collect();
-            tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
-                .await
-                .map_err(|e| {
-                    Error::internal(format!("WAL replay index update task panicked: {}", e))
-                })??;
-        }
-    }
+    index_replayed_batches(&active).await?;
 
     Ok(ReplayResult {
         active,
@@ -1747,6 +1736,30 @@ fn memtable_resident_bytes(memtable: &MemTable) -> usize {
 /// path when secondary indexes are configured (mirroring the live memtable-flush
 /// handler). Commits the manifest, stamping `covered` as the generation's
 /// `replay_after_wal_entry_position` so a later reopen skips these entries.
+/// Index the batches a replayed memtable holds.
+///
+/// Replay inserts with `insert_batches_only`, so a memtable it built carries no
+/// index until this runs. The primary-key sidecar a flush writes is trained from
+/// that index, so a memtable flushed without this one lands on storage with no
+/// sidecar and its rows cannot be looked up by key.
+async fn index_replayed_batches(memtable: &MemTable) -> Result<()> {
+    let Some(indexes) = memtable.indexes_arc() else {
+        return Ok(());
+    };
+    let batch_count = memtable.batch_count();
+    if batch_count == 0 {
+        return Ok(());
+    }
+    let store = memtable.batch_store();
+    let stored: Vec<StoredBatch> = (0..batch_count)
+        .filter_map(|pos| store.get(pos).cloned())
+        .collect();
+    tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
+        .await
+        .map_err(|e| Error::internal(format!("WAL replay index update task panicked: {}", e)))??;
+    Ok(())
+}
+
 async fn flush_replayed_memtable(
     flusher: &MemTableFlusher,
     memtable: &MemTable,
@@ -1755,6 +1768,7 @@ async fn flush_replayed_memtable(
     durable: usize,
     index_configs: &[MemIndexConfig],
 ) -> Result<()> {
+    index_replayed_batches(memtable).await?;
     if index_configs.is_empty() {
         flusher.flush(memtable, epoch, covered, durable).await?;
     } else {
@@ -5559,11 +5573,83 @@ mod tests {
         );
     }
 
-    /// A generation boundary is read from the entry, not derived from the row
-    /// cap, so a writer reopened under a different cap rebuilds the generations
-    /// it had — and a Blob v2 target still names one replay reaches.
+    /// Nothing replay can measure marks this boundary: the memtable it leaves
+    /// is well under the row cap and carries no Blob v2 target. Only the
+    /// generation the entries name puts it there.
     #[tokio::test]
-    async fn test_replay_follows_recorded_generations_under_a_smaller_row_cap() {
+    async fn test_replay_rotates_on_a_recorded_generation_alone() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            max_wal_buffer_size: 1,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_rows: 100,
+            ..Default::default()
+        };
+        let before = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let after = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let row = |schema: &Arc<ArrowSchema>, id: i32| {
+            let mut columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![id]))];
+            if schema.fields().len() > 1 {
+                columns.push(Arc::new(StringArray::from(vec![None::<&str>])));
+            }
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+
+        let live_generation;
+        {
+            let writer = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                before.clone(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            writer.put(vec![row(&before, 0)]).await.unwrap();
+            writer
+                .evolve_schema(after.clone(), Vec::new())
+                .await
+                .unwrap();
+            writer.put(vec![row(&after, 1)]).await.unwrap();
+            live_generation = writer.active_memtable_ref().await.unwrap().generation;
+            // Dropped without a flush: the WAL holds both entries and neither
+            // generation was committed.
+            std::mem::forget(writer);
+        }
+
+        let reopened = ShardWriter::open(store, base_path, base_uri, config, after, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.active_memtable_ref().await.unwrap().generation,
+            live_generation,
+            "replay rebuilds the generation the writer recorded"
+        );
+        assert_eq!(
+            reopened.manifest().await.unwrap().unwrap().sstables.len(),
+            1,
+            "the generation it left must have been flushed, not folded into this one"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    /// Replay splits on its own memtable as well as on the record, so a WAL
+    /// written under a larger one can leave its counter past a Blob v2 target's
+    /// generation. That number is already written out, so replay refuses it
+    /// rather than putting a second generation over it.
+    #[tokio::test]
+    async fn test_replay_refuses_a_target_generation_its_own_splitting_passed() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let config = ShardWriterConfig {
             shard_id: Uuid::new_v4(),
@@ -5595,7 +5681,6 @@ mod tests {
             .unwrap()
         };
 
-        let live_generation;
         {
             let writer = ShardWriter::open(
                 store.clone(),
@@ -5610,8 +5695,8 @@ mod tests {
             for id in 0..5 {
                 writer.put(vec![plain(id)]).await.unwrap();
             }
-            // The first Blob column: the next memtable preassigns a target whose
-            // generation the entry below carries.
+            // The first Blob column: the next memtable preassigns a target
+            // whose generation is 1.
             writer
                 .evolve_schema(blob_proto.schema(), Vec::new())
                 .await
@@ -5623,15 +5708,12 @@ mod tests {
                 )])
                 .await
                 .unwrap();
-            live_generation = writer.active_memtable_ref().await.unwrap().generation;
-            // Dropped without a flush: the WAL holds every entry and none of the
-            // generations it describes were committed.
             std::mem::forget(writer);
         }
 
-        // A quarter of the cap the prefix was written under: a boundary derived
-        // from the cap would fall in different places, a recorded one does not.
-        let reopened = ShardWriter::open(
+        // A fiftieth of the cap the prefix was written under: the five plain
+        // rows alone split replay past generation 1.
+        let err = ShardWriter::open(
             store,
             base_path,
             base_uri,
@@ -5643,13 +5725,13 @@ mod tests {
             Vec::new(),
         )
         .await
-        .expect("replay follows the recorded generations whatever the cap");
-        assert_eq!(
-            reopened.active_memtable_ref().await.unwrap().generation,
-            live_generation,
-            "replay rebuilds the generations the writer had"
+        .err()
+        .expect("a target generation replay has passed must be refused");
+        assert!(
+            err.to_string()
+                .contains("does not follow active generation"),
+            "unexpected error: {err}"
         );
-        reopened.close().await.unwrap();
     }
 
     #[tokio::test]
