@@ -5349,4 +5349,78 @@ mod tests {
             "live pk=2 ('alpha foo', only in the frozen gen) must still match; got ids={ids:?}"
         );
     }
+
+    /// An unrelated column added to the table is enough to route a memtable
+    /// through the resolver, and a nested path only resolves if the map pairs
+    /// full paths. Resolving the top level alone reads `meta.b` as a column the
+    /// memtable never stored, and the search returns nothing for its rows.
+    #[tokio::test]
+    async fn a_nested_fts_still_matches_after_an_unrelated_column_is_added() {
+        let stored_schema = nested_fts_schema();
+        let meta = arrow_array::StructArray::new(
+            nested_meta_fields(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10i64])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["lance rocks"])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            stored_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["unrelated"])),
+                Arc::new(meta),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("nested_fts".to_string(), 4, "meta.b".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        uuid::Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: InMemoryMemTableRef {
+                                batch_store: batch_store.clone(),
+                                index_store: indexes.clone(),
+                                schema: stored_schema.clone(),
+                                generation: 1,
+                            },
+                            frozen: vec![],
+                        },
+                    );
+            let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], table_schema);
+            let plan = planner
+                .plan_search(
+                    FullTextSearchQuery::new("lance".to_string())
+                        .with_column("meta.b".to_string())
+                        .unwrap(),
+                    Some(10),
+                    None,
+                )
+                .await
+                .unwrap();
+            let ctx = datafusion::prelude::SessionContext::new();
+            let batches: Vec<RecordBatch> = plan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+            assert_eq!(count, 1, "the unchanged nested text field still matches");
+        }
+    }
 }

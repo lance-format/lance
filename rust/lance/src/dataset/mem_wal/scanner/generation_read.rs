@@ -21,6 +21,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
 use datafusion_physical_expr::create_physical_expr;
+use lance_core::datatypes::format_field_path;
 use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
@@ -380,35 +381,73 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
 /// mapped to the table's name for it. Paired by field id, since a rename
 /// changes the name and keeps the id.
 fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String, String> {
-    let by_id: HashMap<i32, &str> = table_schema
-        .fields()
+    let table = field_paths(table_schema);
+    let by_id: HashMap<i32, &String> = table
         .iter()
-        .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
+        .filter_map(|(id, path)| id.map(|id| (id, path)))
         .collect();
-    // A caller that supplies no ids leaves only names to match on.
+    // A caller that supplies no ids leaves only names to match on, so a path
+    // resolves to itself when the table still has it.
     if by_id.is_empty() {
-        return stored_schema
-            .fields()
+        let known: std::collections::HashSet<&String> =
+            table.iter().map(|(_, path)| path).collect();
+        return field_paths(stored_schema)
             .iter()
-            .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
-            .filter(|f| table_schema.field_with_name(f.name()).is_ok())
-            .map(|f| (f.name().clone(), f.name().clone()))
+            .filter(|(_, path)| known.contains(path))
+            .map(|(_, path)| (path.clone(), path.clone()))
             .collect();
     }
-    stored_schema
-        .fields()
-        .iter()
-        // A generation's own columns are numbered in its own schema, so their
-        // ids collide with whatever the table gave those numbers. They are not
-        // the table's columns and are never resolved to one.
-        .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
-        .filter_map(|f| {
-            let id = field_id_of(f)?;
+    field_paths(stored_schema)
+        .into_iter()
+        .filter_map(|(id, stored_path)| {
             by_id
-                .get(&id)
-                .map(|name| (f.name().clone(), name.to_string()))
+                .get(&id?)
+                .map(|table_path| (stored_path, (*table_path).clone()))
         })
         .collect()
+}
+
+/// Every field the schema stores, as the lance id stamped on it and the dotted
+/// path that names it.
+///
+/// A struct's children, and a list's element and its children in turn, are
+/// fields in their own right: each carries its own id, and a rename moves one
+/// name without touching its parent's. Pairing only the top level leaves a path
+/// like `meta.body` relating to nothing, which reads as a column the generation
+/// never stored.
+///
+/// A generation's own columns are numbered in its own schema, so their ids
+/// collide with whatever the table gave those numbers. They are not the table's
+/// columns and are never resolved to one, so they and their children are left
+/// out entirely.
+fn field_paths(schema: &Schema) -> Vec<(Option<i32>, String)> {
+    fn walk(field: &Field, prefix: &mut Vec<String>, out: &mut Vec<(Option<i32>, String)>) {
+        prefix.push(field.name().clone());
+        let segments: Vec<&str> = prefix.iter().map(String::as_str).collect();
+        out.push((field_id_of(field), format_field_path(&segments)));
+        match field.data_type() {
+            DataType::Struct(children) => {
+                for child in children {
+                    walk(child, prefix, out);
+                }
+            }
+            DataType::List(element) | DataType::LargeList(element) => walk(element, prefix, out),
+            DataType::FixedSizeList(element, _) => walk(element, prefix, out),
+            _ => {}
+        }
+        prefix.pop();
+    }
+
+    let mut out = Vec::new();
+    let mut prefix = Vec::new();
+    for field in schema
+        .fields()
+        .iter()
+        .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
+    {
+        walk(field, &mut prefix, &mut out);
+    }
+    out
 }
 
 /// Put back the field ids a scan's output schema drops, so the reconciliation
