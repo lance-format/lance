@@ -3855,6 +3855,16 @@ impl ShardWriter {
         if next.is_equivalent(&current) {
             return Ok(None);
         }
+        // A Blob v2 column arriving or leaving changes whether memtables carry a
+        // preassigned data target, and a WAL entry is replayed into a memtable
+        // built the other way. Refuse rather than seal across it: the caller
+        // reopens, and replay rebuilds every memtable under one layout.
+        if next.preassigns_data_target() != current.preassigns_data_target() {
+            return Err(Error::invalid_input(format!(
+                "{op} cannot change whether the schema carries Blob v2 payload columns: \
+                 the writer must be reopened so the WAL is replayed under one layout"
+            )));
+        }
         if next.pk_field_ids != current.pk_field_ids {
             return Err(Error::invalid_input(format!(
                 "{op} cannot change the primary key: the writer holds primary key field ids \
@@ -5322,6 +5332,51 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    /// A Blob v2 column leaving the schema changes whether memtables preassign a
+    /// data target, and a WAL entry is replayed into a memtable built the other
+    /// way. The swap is refused so the caller reopens and replays under one.
+    #[tokio::test]
+    async fn test_evolve_schema_refuses_a_blob_layout_change() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let batch = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"abc".to_vec())]);
+        let schema = batch.schema();
+        let config = ShardWriterConfig {
+            shard_id,
+            durable_write: false,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let without_blob = Arc::new(ArrowSchema::new(
+            schema
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "blob")
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let error = writer
+            .evolve_schema(without_blob, Vec::new())
+            .await
+            .expect_err("dropping the blob column changes the memtable layout");
+        assert!(
+            error.to_string().contains("Blob v2"),
+            "unexpected error: {error}"
+        );
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
