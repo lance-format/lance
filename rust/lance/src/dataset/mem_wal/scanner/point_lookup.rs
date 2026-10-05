@@ -2703,4 +2703,52 @@ mod tests {
         assert_eq!(batch.num_rows(), 2, "the tombstoned key is omitted");
         assert_eq!(sorted_ids(&batch), vec![1, 3]);
     }
+
+    /// A projection naming a nested path must keep the parent it selects from.
+    /// Resolving only the top level drops `meta` from the carry schema, and the
+    /// lookup fails outright rather than returning the row.
+    #[tokio::test]
+    async fn a_nested_point_lookup_survives_an_unrelated_column_add() {
+        let stored_schema = create_nested_schema();
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let active = active_memtable_ref(
+                &stored_schema,
+                &[create_nested_batch(&stored_schema, &[1])],
+                1,
+            );
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        crate::dataset::mem_wal::scanner::collector::InMemoryMemTables {
+                            active,
+                            frozen: vec![],
+                        },
+                    );
+            let planner =
+                LsmPointLookupPlanner::new(collector, vec!["id".to_string()], table_schema)
+                    .unwrap();
+            let row = planner
+                .lookup(
+                    &[ScalarValue::Int32(Some(1))],
+                    Some(&["meta.a".to_string()]),
+                )
+                .await
+                .expect("an unrelated added column must preserve a nested point lookup")
+                .expect("the row is still present");
+            assert_eq!(meta_children(&row), vec!["a"]);
+            assert_eq!(id_at(&row), 1);
+            let meta = row.column_by_name("meta").unwrap().as_struct();
+            assert_eq!(
+                meta.column_by_name("a")
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0),
+                10,
+            );
+        }
+    }
 }

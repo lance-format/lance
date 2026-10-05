@@ -21,7 +21,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::prelude::Expr;
 use datafusion_physical_expr::create_physical_expr;
-use lance_core::datatypes::format_field_path_minimal;
+use lance_core::datatypes::{format_field_path_minimal, parse_field_path};
 use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
@@ -306,17 +306,43 @@ impl GenerationRead {
     /// Each arm's canonical projection restores the table's nullability once
     /// tombstones are dropped.
     fn target(&self, source: &Schema) -> SchemaRef {
-        let mut fields: Vec<Field> = self
-            .projection
+        // A projection names paths, and a nested one names a column the table
+        // holds inside another: `field_with_name` answers for the top level
+        // only, so taking it alone drops the parent the path selected.
+        let mut roots: Vec<(String, Option<Vec<Vec<String>>>)> = Vec::new();
+        for name in &self.projection {
+            let Ok(segments) = parse_field_path(name) else {
+                continue;
+            };
+            let Some((root, rest)) = segments.split_first() else {
+                continue;
+            };
+            match roots.iter_mut().find(|(seen, _)| seen == root) {
+                // Selecting the parent as well takes it whole.
+                Some((_, selected)) if rest.is_empty() => *selected = None,
+                Some((_, Some(selected))) => selected.push(rest.to_vec()),
+                Some((_, None)) => {}
+                None => roots.push((
+                    root.clone(),
+                    (!rest.is_empty()).then(|| vec![rest.to_vec()]),
+                )),
+            }
+        }
+
+        let mut fields: Vec<Field> = roots
             .iter()
-            .filter_map(|name| {
-                let declared = self.table_schema.field_with_name(name).ok()?;
+            .filter_map(|(root, selected)| {
+                let declared = self.table_schema.field_with_name(root).ok()?;
                 // Absent from the source means synthesized, so nullable.
                 let nullable = self
-                    .stored_name(name)
+                    .stored_name(root)
                     .and_then(|stored_column| source.field_with_name(stored_column).ok())
                     .is_none_or(|f| f.is_nullable());
-                Some(declared.clone().with_nullable(nullable))
+                let declared = match selected {
+                    None => declared.clone(),
+                    Some(paths) => prune_to_selected(declared, paths)?,
+                };
+                Some(declared.with_nullable(nullable))
             })
             .collect();
         // A generation's own columns are not the table's, so they pass through
@@ -405,6 +431,33 @@ fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String
                 .map(|table_path| (stored_path, (*table_path).clone()))
         })
         .collect()
+}
+
+/// `field` carrying only the parts `selected` names, sibling selections merged.
+///
+/// `selected` holds the path remaining below `field`; an empty one selects the
+/// field whole. `None` when nothing under it was selected, which cannot happen
+/// for a path the caller asked for but can for one naming a child the field
+/// does not have.
+fn prune_to_selected(field: &Field, selected: &[Vec<String>]) -> Option<Field> {
+    if selected.iter().any(|path| path.is_empty()) {
+        return Some(field.clone());
+    }
+    let DataType::Struct(children) = field.data_type() else {
+        return Some(field.clone());
+    };
+    let kept: Vec<Field> = children
+        .iter()
+        .filter_map(|child| {
+            let below: Vec<Vec<String>> = selected
+                .iter()
+                .filter(|path| path[0] == *child.name())
+                .map(|path| path[1..].to_vec())
+                .collect();
+            (!below.is_empty()).then(|| prune_to_selected(child, &below))?
+        })
+        .collect();
+    (!kept.is_empty()).then(|| field.clone().with_data_type(DataType::Struct(kept.into())))
 }
 
 /// Every field the schema stores, as the lance id stamped on it and the dotted
