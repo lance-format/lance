@@ -572,7 +572,15 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    open_scalar_index_with_plan(dataset, column, index, None, metrics).await
+    open_scalar_index_with_plan(
+        dataset,
+        column,
+        index,
+        None,
+        super::frag_reuse::OpenPurpose::Query,
+        metrics,
+    )
+    .await
 }
 
 /// [`open_scalar_index`] for a segment the manifest does not list (a staged
@@ -584,6 +592,7 @@ pub(crate) async fn open_scalar_index_with_plan(
     column: &str,
     index: &IndexMetadata,
     staged: Option<&super::frag_reuse::SegmentRemappingPlan>,
+    purpose: super::frag_reuse::OpenPurpose,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let index_uuid = index.uuid;
@@ -592,8 +601,10 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let resolved =
-        super::frag_reuse::open_row_id_remapping_with_plan(dataset, index, staged, metrics).await?;
+    let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
+        dataset, index, staged, purpose, metrics,
+    )
+    .await?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
@@ -627,12 +638,15 @@ pub(crate) async fn open_scalar_index_with_plan(
                 .await?;
             }
 
+            let index_version = u32::try_from(index.index_version).unwrap_or(0);
+
             let index = match batch_remapping {
                 Some(remapping) => {
                     plugin
                         .load_index_with_remapping(
                             index_store,
                             &index_details,
+                            index_version,
                             Some(remapping),
                             &index_cache,
                         )
@@ -640,7 +654,13 @@ pub(crate) async fn open_scalar_index_with_plan(
                 }
                 None => {
                     plugin
-                        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                        .load_index(
+                            index_store,
+                            &index_details,
+                            index_version,
+                            frag_reuse_index,
+                            &index_cache,
+                        )
                         .await?
                 }
             };

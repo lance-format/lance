@@ -79,27 +79,9 @@ pub(super) async fn load_indices(
                 continue;
             }
             if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                let can_remap = if super::segment_has_vector_details(index) {
-                    super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index)
-                        .await?
-                } else if index
-                    .index_details
-                    .as_ref()
-                    .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
-                {
-                    super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
-                        .await?
-                } else {
-                    index
-                        .index_details
-                        .as_ref()
-                        .and_then(|details| {
-                            super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
-                                .get_plugin_by_details(details)
-                                .ok()
-                        })
-                        .is_some_and(|plugin| plugin.supports_batch_row_id_remapping())
-                };
+                let can_remap = segment_supports_batch_remapping(dataset, index)
+                    .await?
+                    .unwrap_or(false);
                 if index.fragment_bitmap.is_none() || !can_remap {
                     continue;
                 }
@@ -132,6 +114,39 @@ pub(super) async fn load_indices(
         }
     }
     Ok(Arc::new(result.into_iter().flatten().collect()))
+}
+
+impl FragmentReuseIndex {
+    /// Whether the history carries transitions this build cannot interpret.
+    pub(crate) fn has_unsupported_transitions(&self) -> bool {
+        self.ledger.has_unsupported_transitions()
+    }
+}
+
+/// Whether this build can translate `index`'s stored addresses in batches:
+/// `Some(true)` when its type has a batch remapper, `Some(false)` when it
+/// does not, `None` when its details are missing or cannot be interpreted.
+pub(super) async fn segment_supports_batch_remapping(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Option<bool>> {
+    let Some(details) = index.index_details.as_ref() else {
+        return Ok(None);
+    };
+    if super::segment_has_vector_details(index) {
+        return Ok(Some(
+            super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index).await?,
+        ));
+    }
+    if details.type_url.ends_with("InvertedIndexDetails") {
+        return Ok(Some(
+            super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index).await?,
+        ));
+    }
+    Ok(super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+        .get_plugin_by_details(details)
+        .ok()
+        .map(|plugin| plugin.supports_batch_row_id_remapping()))
 }
 
 /// One segment's derived query-time inputs from the coverage backtrack.
@@ -818,13 +833,16 @@ pub mod tests {
 
     // Deferred compaction is no longer in this list: on a tagged table it
     // appends an ordered-compaction transition to the tagged entry (see the
-    // chained end-to-end test in `crate::index::frag_reuse`).
+    // chained end-to-end test in `crate::index::frag_reuse`). Cleanup is no
+    // longer in this list either: tagged trim is implemented (see
+    // `crate::dataset::index::frag_reuse::tests::tagged_trim`), and on this
+    // fixture it is a retaining no-op. Shallow clone is no longer in this
+    // list: it relocates the entry's row-map references, and deep clone is
+    // not either: it copies the row maps and localizes their references (see
+    // the clone tests in `crate::index::frag_reuse`).
     #[rstest::rstest]
     #[case::eager_compaction("eager")]
     #[case::statistics("statistics")]
-    #[case::cleanup("cleanup")]
-    #[case::shallow_clone("shallow")]
-    #[case::deep_clone("deep")]
     #[tokio::test]
     async fn unsupported_maintenance_preserves_snapshot(#[case] operation: &str) {
         let mut dataset = fixture().await;
@@ -855,17 +873,6 @@ pub mod tests {
             .unwrap_err(),
             "statistics" => dataset
                 .index_statistics(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap_err(),
-            "cleanup" => crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
-                .await
-                .unwrap_err(),
-            "shallow" => dataset
-                .shallow_clone("memory://fri-shallow", version, None)
-                .await
-                .unwrap_err(),
-            "deep" => dataset
-                .deep_clone("memory://fri-deep", version, None)
                 .await
                 .unwrap_err(),
             _ => unreachable!(),
@@ -1006,20 +1013,6 @@ pub mod tests {
                 .contains("tagged FRI metadata requires both"),
             "{error}"
         );
-    }
-
-    #[tokio::test]
-    async fn clone_without_fri_flag_does_not_read_index_metadata() {
-        let dataset = fixture().await;
-        let mut location = dataset.manifest_location.clone();
-        location.path = dataset.base.clone().join("missing.manifest");
-        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
-            &dataset.object_store,
-            &location,
-            &dataset.manifest,
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
@@ -1978,23 +1971,19 @@ pub mod tests {
             base_id: None,
             files: None,
         };
-        dataset
-            .apply_commit(
-                Transaction::new(
-                    dataset.manifest.version,
-                    Operation::CreateIndex {
-                        new_indices: vec![fri.clone()],
-                        removed_indices: vec![],
-                    },
-                    None,
-                ),
-                &Default::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-        let version = dataset.manifest.version;
+        // Installed by writing the manifest directly: the commit chokepoint
+        // (correctly) refuses a hand-built tagged entry, and no writer of this
+        // version can produce an index_version-2 entry.
         let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        indices.push(fri.clone());
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags |= flag;
+            manifest.writer_feature_flags |= flag;
+        }
+        persist_fixture(&mut dataset, indices).await;
+        let version = dataset.manifest.version;
         assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
         assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
         let error = dataset
@@ -2015,23 +2004,27 @@ pub mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("Tagged FRI"));
+        // Shallow clone would have to relocate references inside content it
+        // cannot interpret; the version gate rejects it before any decode.
         let error = dataset
             .shallow_clone("memory://fri-shallow", version, None)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("relocation"));
+        assert!(error.to_string().contains("index_version 2"), "{error}");
+        // Deep clone would have to enumerate row maps referenced by content
+        // it cannot interpret; the same version gate rejects it too.
         let error = dataset
             .deep_clone("memory://fri-deep", version, None)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("relocation"));
+        assert!(error.to_string().contains("index_version 2"), "{error}");
         let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("Upgrade"));
+        assert!(error.to_string().to_lowercase().contains("upgrade"));
         assert_eq!(dataset.manifest.version, version);
 
         dataset
