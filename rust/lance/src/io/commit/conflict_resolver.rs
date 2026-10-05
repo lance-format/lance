@@ -5532,7 +5532,7 @@ mod tests {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 affected_rows: None,
-                conflicting_frag_reuse_indices: Vec::new(),
+                frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
                 current_live: None,
