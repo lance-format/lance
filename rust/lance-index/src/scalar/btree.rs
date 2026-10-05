@@ -4194,7 +4194,7 @@ mod tests {
         // 1000 distinct Int32 values at 64 per page is ~16 pages.
         let data = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(100), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -4333,7 +4333,7 @@ mod tests {
         // per request would be plainly visible in the IOPS count.
         let data = gen_batch()
             .col("value", array::step::<Float32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -4397,7 +4397,7 @@ mod tests {
         // reader in one call.
         let data = gen_batch()
             .col("value", array::step::<Float32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(4000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -4488,7 +4488,7 @@ mod tests {
 
         let data = gen_batch()
             .col("value", array::step::<Float32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(4000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -4568,7 +4568,7 @@ mod tests {
         // read has to clamp the last range the same way a single read does.
         let data = gen_batch()
             .col("value", array::step::<Float32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(1000), BatchCount::from(1));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
@@ -6501,7 +6501,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..NUM_ROWS).map(addr_of));
         let data = RecordBatch::try_from_iter(vec![
             ("value", Arc::new(values) as arrow_array::ArrayRef),
-            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
+            ("_rowaddr", Arc::new(row_ids) as arrow_array::ArrayRef),
         ])
         .unwrap();
         // Training expects value-sorted, page-sized batches (nulls last, as
@@ -7657,7 +7657,7 @@ mod tests {
         for (part_id, start, rows) in [(0u32, 0u64, part0_rows), (1u32, part0_rows, part1_rows)] {
             let data = gen_batch()
                 .col("value", array::step_custom::<Int32Type>(start as i32, 1))
-                .col("_rowid", array::step_custom::<UInt64Type>(start, 1))
+                .col("_rowaddr", array::step_custom::<UInt64Type>(start, 1))
                 .into_df_stream(RowCount::from(rows / 2), BatchCount::from(2));
             let data = Box::pin(RecordBatchStreamAdapter::new(data.schema(), data));
             train_btree_index(data, store, page_size, None, Some(part_id))
@@ -7684,7 +7684,7 @@ mod tests {
         let rows = page_size * num_pages - page_size / 2;
         let data = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(rows), BatchCount::from(1));
         let data = Box::pin(RecordBatchStreamAdapter::new(data.schema(), data));
         train_btree_index(data, store, page_size, None, None)
