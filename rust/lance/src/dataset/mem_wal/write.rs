@@ -1483,6 +1483,30 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
+                    // The entry records the generation its batches belong to,
+                    // so replay rebuilds the boundaries the writer made instead
+                    // of re-deriving them from a row cap it may have been
+                    // reopened with a different value of. An entry written
+                    // before the key existed carries none, and the size rule
+                    // below still answers for it.
+                    if let Some(generation) = entry.generation
+                        && generation != active.generation()
+                        && !active.batch_store().is_empty()
+                    {
+                        let global_end = active.batch_store().global_end();
+                        wal_flusher.advance_durable(global_end);
+                        flush_replayed_memtable(
+                            flusher,
+                            &active,
+                            our_epoch,
+                            position.saturating_sub(1),
+                            global_end,
+                            index_configs,
+                        )
+                        .await?;
+                        active = make_memtable(generation, global_end, None)?;
+                    }
+
                     if let Some(target) = entry.target.as_ref()
                         && active.target() != Some(target)
                     {
@@ -3863,20 +3887,6 @@ impl ShardWriter {
         if next.is_equivalent(&current) {
             return Ok(None);
         }
-        // Whether memtables preassign a data target follows from the schema
-        // carrying Blob v2 payload columns, and replay cannot reconstruct the
-        // boundaries either side of the flip: its own generation counter is
-        // derived from the row cap it reopens with, so it can run ahead of the
-        // writer as easily as behind. Following the recorded target is not
-        // enough — the rows either side of it are divided differently. Refused
-        // until a boundary is recorded rather than inferred; the caller reopens
-        // and replay rebuilds every memtable under one layout.
-        if next.preassigns_data_target() != current.preassigns_data_target() {
-            return Err(Error::invalid_input(format!(
-                "{op} cannot change whether the schema carries Blob v2 payload columns: \
-                 the writer must be reopened so the WAL is replayed under one layout"
-            )));
-        }
         if next.pk_field_ids != current.pk_field_ids {
             return Err(Error::invalid_input(format!(
                 "{op} cannot change the primary key: the writer holds primary key field ids \
@@ -5558,50 +5568,101 @@ mod tests {
         );
     }
 
-    /// Replay cannot reconstruct the boundaries either side of a Blob v2 layout
-    /// flip: its generation counter comes from the row cap it reopens with, so
-    /// it can run ahead of the writer as easily as behind, and the rows either
-    /// side are divided differently. The swap is refused so the caller reopens
-    /// and replays under one layout.
+    /// Replay used to re-derive generation boundaries from the row cap it
+    /// reopened with, so a smaller cap split the same entries into more
+    /// generations than the writer made and the recorded Blob target no longer
+    /// followed. The entry carries its generation now, so the boundary is read
+    /// rather than guessed and the cap no longer takes part.
     #[tokio::test]
-    async fn test_evolve_schema_refuses_a_blob_layout_change() {
+    async fn test_replay_follows_recorded_generations_under_a_smaller_row_cap() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let batch = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"abc".to_vec())]);
-        let schema = batch.schema();
         let config = ShardWriterConfig {
             shard_id: Uuid::new_v4(),
-            durable_write: false,
+            durable_write: true,
+            max_wal_buffer_size: 1,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_rows: 100,
             ..Default::default()
         };
-        let writer = ShardWriter::open(
-            store,
-            base_path,
-            base_uri,
-            config,
-            schema.clone(),
-            Vec::new(),
-        )
-        .await
-        .unwrap();
 
+        let blob_proto = create_blob_v2_batch(9, &[BlobTestValue::Bytes(b"de".to_vec())]);
         let without_blob = Arc::new(ArrowSchema::new(
-            schema
+            blob_proto
+                .schema()
                 .fields()
                 .iter()
                 .filter(|f| f.name() != "blob")
                 .cloned()
                 .collect::<Vec<_>>(),
         ));
-        let error = writer
-            .evolve_schema(without_blob, Vec::new())
+        let plain = |id: i32| {
+            RecordBatch::try_new(
+                without_blob.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![id])),
+                    blob_proto.column(2).slice(0, 1),
+                ],
+            )
+            .unwrap()
+        };
+
+        let live_generation;
+        {
+            let writer = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                without_blob.clone(),
+                Vec::new(),
+            )
             .await
-            .expect_err("dropping the last blob column changes the memtable layout");
-        assert!(
-            error.to_string().contains("Blob v2"),
-            "unexpected error: {error}"
+            .unwrap();
+            for id in 0..5 {
+                writer.put(vec![plain(id)]).await.unwrap();
+            }
+            // The first Blob column: the next memtable preassigns a target whose
+            // generation the entry below carries.
+            writer
+                .evolve_schema(blob_proto.schema(), Vec::new())
+                .await
+                .unwrap();
+            writer
+                .put(vec![create_blob_v2_batch(
+                    9,
+                    &[BlobTestValue::Bytes(b"de".to_vec())],
+                )])
+                .await
+                .unwrap();
+            live_generation = writer.active_memtable_ref().await.unwrap().generation;
+            // Dropped without a flush: the WAL holds every entry and none of the
+            // generations it describes were committed.
+            std::mem::forget(writer);
+        }
+
+        // Reopened with a cap the prefix does not fit under: re-deriving would
+        // split it into more generations than the writer made, and the recorded
+        // Blob target would no longer follow. Reading the record does not depend
+        // on the cap at all.
+        let reopened = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            ShardWriterConfig {
+                max_memtable_rows: 2,
+                ..config
+            },
+            blob_proto.schema(),
+            Vec::new(),
+        )
+        .await
+        .expect("replay follows the recorded generations whatever the cap");
+        assert_eq!(
+            reopened.active_memtable_ref().await.unwrap().generation,
+            live_generation,
+            "replay rebuilds the generations the writer had"
         );
-        writer.close().await.unwrap();
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]

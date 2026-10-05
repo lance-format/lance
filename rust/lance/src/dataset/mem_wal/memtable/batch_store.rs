@@ -226,6 +226,11 @@ pub struct BatchStore {
 
     /// Final generation/data-file identity for batches in this store.
     target: Option<MemTableDataTarget>,
+
+    /// The memtable generation these batches belong to. A WAL entry records it,
+    /// so replay rebuilds the boundaries the writer made rather than re-deriving
+    /// them from a row cap it may be reopened with a different value of.
+    generation: u64,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -265,13 +270,14 @@ impl BatchStore {
     /// batch sequence. Used by `freeze_memtable` for every memtable after the
     /// first; the first starts at 0.
     pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
-        Self::with_capacity_at_target(capacity, global_offset, None)
+        Self::with_capacity_at_target(capacity, global_offset, None, 0)
     }
 
     pub(crate) fn with_capacity_at_target(
         capacity: usize,
         global_offset: usize,
         target: Option<MemTableDataTarget>,
+        generation: u64,
     ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
@@ -292,7 +298,13 @@ impl BatchStore {
             retained_buffers: Mutex::new(HashSet::new()),
             global_offset,
             target,
+            generation,
         }
+    }
+
+    /// The memtable generation these batches belong to.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Calculate recommended capacity from memtable size configuration.
