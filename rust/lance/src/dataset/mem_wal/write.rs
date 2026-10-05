@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use super::reconcile::{Plan, without_field_ids};
 use arc_swap::ArcSwap;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_null_array};
-use arrow_schema::{Fields, Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -1459,10 +1459,6 @@ async fn replay_memtable_from_wal(
     let mut position = start_position;
 
     let mut active = make_memtable(base_generation, 0, None)?;
-    // The shape of the last entry replayed. A writer rotates when the schema
-    // changes, and nothing in the entry records that it did -- but each entry is
-    // its own IPC stream, so its own schema says where the boundary fell.
-    let mut replayed_fields: Option<Fields> = None;
 
     loop {
         match tailer.read_entry(position).await? {
@@ -1487,36 +1483,6 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    // Rotate where the writer did, so the generation counter
-                    // lands on its boundaries -- which a Blob v2 target's
-                    // generation is then checked against below. Metadata is per
-                    // entry (the writer epoch rides in it), so only the fields
-                    // relate two entries.
-                    let entry_fields = entry
-                        .batches
-                        .first()
-                        .map(|batch| batch.schema_ref().fields().clone());
-                    if let Some(fields) = entry_fields.as_ref()
-                        && replayed_fields.as_ref().is_some_and(|prev| prev != fields)
-                        && !active.batch_store().is_empty()
-                    {
-                        let global_end = active.batch_store().global_end();
-                        wal_flusher.advance_durable(global_end);
-                        flush_replayed_memtable(
-                            flusher,
-                            &active,
-                            our_epoch,
-                            position.saturating_sub(1),
-                            global_end,
-                            index_configs,
-                        )
-                        .await?;
-                        active = make_memtable(active.generation() + 1, global_end, None)?;
-                    }
-                    if entry_fields.is_some() {
-                        replayed_fields = entry_fields;
-                    }
-
                     if let Some(target) = entry.target.as_ref()
                         && active.target() != Some(target)
                     {
@@ -3889,6 +3855,16 @@ impl ShardWriter {
         if next.is_equivalent(&current) {
             return Ok(None);
         }
+        // A Blob v2 column arriving or leaving changes whether memtables carry a
+        // preassigned data target, and a WAL entry is replayed into a memtable
+        // built the other way. Refuse rather than seal across it: the caller
+        // reopens, and replay rebuilds every memtable under one layout.
+        if next.preassigns_data_target() != current.preassigns_data_target() {
+            return Err(Error::invalid_input(format!(
+                "{op} cannot change whether the schema carries Blob v2 payload columns: \
+                 the writer must be reopened so the WAL is replayed under one layout"
+            )));
+        }
         if next.pk_field_ids != current.pk_field_ids {
             return Err(Error::invalid_input(format!(
                 "{op} cannot change the primary key: the writer holds primary key field ids \
@@ -5358,148 +5334,49 @@ mod tests {
         paths
     }
 
-    /// A schema change rotates the writer, and the entry carries no marker that
-    /// it did. Replay reads each entry's own schema, so it rotates at the same
-    /// points -- which is what lets a Blob v2 target's generation still line up
-    /// after a crash with the earlier flushes uncommitted.
+    /// A Blob v2 column leaving the schema changes whether memtables preassign a
+    /// data target, and a WAL entry is replayed into a memtable built the other
+    /// way. The swap is refused so the caller reopens and replays under one.
     #[tokio::test]
-    async fn test_replay_rotates_where_a_schema_change_did() {
+    async fn test_evolve_schema_refuses_a_blob_layout_change() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
+        let batch = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"abc".to_vec())]);
+        let schema = batch.schema();
         let config = ShardWriterConfig {
             shard_id,
-            durable_write: true,
-            max_wal_buffer_size: 1,
+            durable_write: false,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             ..Default::default()
         };
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
 
-        // Without a blob column nothing marks a generation boundary.
-        let plain = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"abc".to_vec())]);
         let without_blob = Arc::new(ArrowSchema::new(
-            plain
-                .schema()
+            schema
                 .fields()
                 .iter()
                 .filter(|f| f.name() != "blob")
                 .cloned()
                 .collect::<Vec<_>>(),
         ));
-        let plain_batch = |start: i32| {
-            RecordBatch::try_new(
-                without_blob.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![start])),
-                    plain.column(2).slice(0, 1),
-                ],
-            )
-            .unwrap()
-        };
-        // The same columns with the vector renamed: a real schema change.
-        let renamed = Arc::new(ArrowSchema::new(
-            without_blob
-                .fields()
-                .iter()
-                .map(|f| {
-                    if f.name() == "vector" {
-                        Arc::new(f.as_ref().clone().with_name("embedding"))
-                    } else {
-                        f.clone()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ));
-        let renamed_batch = |start: i32| {
-            RecordBatch::try_new(
-                renamed.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![start])),
-                    plain.column(2).slice(0, 1),
-                ],
-            )
-            .unwrap()
-        };
-
-        // The first Blob v2 column arrives on top of the rename.
-        let blob_proto = create_blob_v2_batch(2, &[BlobTestValue::Bytes(b"de".to_vec())]);
-        let renamed_with_blob = Arc::new(ArrowSchema::new(
-            blob_proto
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| {
-                    if f.name() == "vector" {
-                        Arc::new(f.as_ref().clone().with_name("embedding"))
-                    } else {
-                        f.clone()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ));
-        let blob_batch = |start: i32| {
-            RecordBatch::try_new(
-                renamed_with_blob.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![start])),
-                    blob_proto.column(1).slice(0, 1),
-                    blob_proto.column(2).slice(0, 1),
-                ],
-            )
-            .unwrap()
-        };
-
-        let live_generation;
-        {
-            let writer = ShardWriter::open(
-                store.clone(),
-                base_path.clone(),
-                base_uri.clone(),
-                config.clone(),
-                without_blob.clone(),
-                Vec::new(),
-            )
+        let error = writer
+            .evolve_schema(without_blob, Vec::new())
             .await
-            .unwrap();
-            writer.put(vec![plain_batch(0)]).await.unwrap();
-            // A rename rotates the writer to generation 1, and the entries on
-            // either side carry nothing that records the boundary.
-            writer
-                .evolve_schema(renamed.clone(), Vec::new())
-                .await
-                .unwrap();
-            writer.put(vec![renamed_batch(1)]).await.unwrap();
-            // The first Blob v2 column: the next memtable preassigns a target,
-            // whose generation the entries below carry.
-            writer
-                .evolve_schema(renamed_with_blob.clone(), Vec::new())
-                .await
-                .unwrap();
-            writer.put(vec![blob_batch(2)]).await.unwrap();
-            live_generation = writer.active_memtable_ref().await.unwrap().generation;
-            // Dropped without a flush: the WAL holds every entry and the
-            // generations it describes were never committed.
-            std::mem::forget(writer);
-        }
-
-        // Replay reconstructs the boundaries, so the target's generation follows.
-        let reopened = ShardWriter::open(
-            store,
-            base_path,
-            base_uri,
-            config,
-            renamed_with_blob,
-            Vec::new(),
-        )
-        .await
-        .expect("replay must rebuild the generations the schema changes created");
-        // Replay has to land on the boundaries the writer made, not merge the
-        // entries a schema change separated.
-        let generation = reopened.active_memtable_ref().await.unwrap().generation;
-        assert_eq!(
-            generation, live_generation,
-            "replay must rebuild the generations the writer had"
+            .expect_err("dropping the blob column changes the memtable layout");
+        assert!(
+            error.to_string().contains("Blob v2"),
+            "unexpected error: {error}"
         );
-        reopened.close().await.unwrap();
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
