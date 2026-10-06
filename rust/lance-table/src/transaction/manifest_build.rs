@@ -2565,11 +2565,21 @@ mod tests {
         let error = transaction
             .build_manifest(Some(&manifest), vec![fri], "txn", &default_build_config())
             .unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-        assert!(
-            error.to_string().contains("Tagged FRI history maintenance"),
-            "{error}"
-        );
+        if kind == "bare_rewrite" {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("carries no fragment reuse transition"),
+                "{error}"
+            );
+        } else {
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(
+                error.to_string().contains("Tagged FRI history maintenance"),
+                "{error}"
+            );
+        }
     }
 
     #[rstest::rstest]

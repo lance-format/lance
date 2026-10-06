@@ -1503,9 +1503,10 @@ async fn build_config_for_attempt(
 /// a rewrite on a table with a tagged fragment reuse history the entry's
 /// history is decoded here, once per attempt, so the preparation can walk
 /// the lineage without guessing; other operations never interpret the
-/// entry: an append must carry a history a newer writer recorded through
-/// untouched. `frag_reuse` is what the rebase settled about the entry for
-/// this attempt. Nothing flows back into `transaction`.
+/// entry: an append, or a merge that only adds columns, must carry a
+/// history a newer writer recorded through untouched. `frag_reuse` is what
+/// the rebase settled about the entry for this attempt. Nothing flows back
+/// into `transaction`.
 async fn prepare_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
@@ -1513,14 +1514,14 @@ async fn prepare_attempt(
     frag_reuse: FragReuseUpdate,
 ) -> Result<PreparedIndices> {
     let indices = load_all_indices(dataset).await?;
-    let may_rewrite_in_place = match &transaction.operation {
-        Operation::Update {
-            fields_modified, ..
-        } => !fields_modified.is_empty(),
-        Operation::Merge { .. } | Operation::DataReplacement { .. } => true,
-        _ => false,
-    };
-    let ledger = if may_rewrite_in_place {
+    // Same rewrite set the preparation withdraws from; nothing else interprets the entry.
+    let rewrites_in_place = !Transaction::rewritten_physical_columns(
+        &transaction.operation,
+        &dataset.manifest.schema,
+        &dataset.manifest.fragments,
+    )
+    .is_empty();
+    let ledger = if rewrites_in_place {
         match indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))

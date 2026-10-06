@@ -652,7 +652,14 @@ impl DatasetMemWalExt for Dataset {
     }
 
     async fn mem_wal_index_details(&self) -> Result<Option<MemWalIndexDetails>> {
-        let Some(index_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? else {
+        // Stored list, not the derived listing: a history this writer cannot decode must
+        // not block add_columns.
+        let Some(index_meta) = crate::index::load_all_indices(self)
+            .await?
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .cloned()
+        else {
             return Ok(None);
         };
 

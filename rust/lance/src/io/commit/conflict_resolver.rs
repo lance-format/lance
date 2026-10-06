@@ -8006,6 +8006,376 @@ mod tests {
             );
         }
 
+        /// Indexed and index-disabled results for `predicate` agree; the
+        /// indexed batch is returned.
+        async fn assert_indexed_agrees(dataset: &Dataset, predicate: &str) -> RecordBatch {
+            let indexed = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .use_scalar_index(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let scanned = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .use_scalar_index(false)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(indexed, scanned, "{predicate}");
+            indexed
+        }
+
+        /// A rewrite of two groups: fragments 0 and 1 partitioned onto 10
+        /// and 11 with their transition recorded, fragments 2 and 3 moved
+        /// onto 20 and 21 with no transition (a bare group).
+        async fn mixed_rewrite(dataset: &Dataset) -> Operation {
+            let old = |ids: &[u64]| -> Vec<Fragment> {
+                dataset
+                    .fragments()
+                    .iter()
+                    .filter(|fragment| ids.contains(&fragment.id))
+                    .cloned()
+                    .collect()
+            };
+            let (transition, covered_destinations) = prepare_partition(dataset, &[0, 1], 10).await;
+            let (_, bare_destinations) = prepare_partition(dataset, &[2, 3], 20).await;
+            Operation::Rewrite {
+                groups: vec![
+                    RewriteGroup {
+                        old_fragments: old(&[0, 1]),
+                        new_fragments: covered_destinations,
+                    },
+                    RewriteGroup {
+                        old_fragments: old(&[2, 3]),
+                        new_fragments: bare_destinations,
+                    },
+                ],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(
+                    crate::index::frag_reuse::frag_reuse_entry_appending(dataset, vec![transition])
+                        .await
+                        .unwrap(),
+                ),
+            }
+        }
+
+        /// Four fragments of four rows, `i_idx` over all of them.
+        async fn covered_fixture() -> Dataset {
+            let mut dataset = ram_fixture(4, 4).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            reserve(&mut dataset, 40).await;
+            dataset
+        }
+
+        /// Two fragments indexed by `i_idx`, then fragments 2 and 3 (values
+        /// 8..16) appended after the index was built: nothing covers them.
+        async fn uncovered_fixture() -> Dataset {
+            let mut dataset = ram_fixture(2, 4).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let dataset = append_rows(&dataset, 8..12).await;
+            let mut dataset = append_rows(&dataset, 12..16).await;
+            reserve(&mut dataset, 40).await;
+            dataset
+        }
+
+        /// Attach a MemWAL index (no fragment bitmap by design).
+        async fn with_mem_wal(dataset: Dataset) -> Dataset {
+            use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails};
+            let version = dataset.manifest.version;
+            let mem_wal = lance_table::system_index::mem_wal::new_mem_wal_index_meta(
+                version,
+                MemWalIndexDetails::default(),
+            )
+            .unwrap();
+            let dataset = commit_sp(
+                &dataset,
+                version,
+                Operation::CreateIndex {
+                    new_indices: vec![mem_wal],
+                    removed_indices: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let entry = stored
+                .iter()
+                .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                .unwrap();
+            assert!(entry.fragment_bitmap.is_none());
+            dataset
+        }
+
+        fn i_idx(indices: &[IndexMetadata]) -> &IndexMetadata {
+            indices.iter().find(|idx| idx.name == "i_idx").unwrap()
+        }
+
+        /// The mixed rewrite on `dataset` is refused whole: nothing lands,
+        /// `i_idx` is as it was and still agrees with the scan.
+        async fn assert_mixed_rewrite_refused(mut dataset: Dataset) {
+            let version = dataset.manifest.version;
+            let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+            assert_eq!(
+                i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1, 2, 3])
+            );
+
+            let operation = mixed_rewrite(&dataset).await;
+            let error = commit_sp(&dataset, version, operation).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains("i_idx"), "{error}");
+
+            assert_eq!(dataset.latest_version_id().await.unwrap(), version);
+            dataset.checkout_latest().await.unwrap();
+            assert_eq!(
+                dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+                vec![0, 1, 2, 3]
+            );
+            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            assert_eq!(stored.len(), stored_before.len());
+            assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
+            assert_eq!(
+                i_idx(&stored).fragment_bitmap,
+                i_idx(&stored_before).fragment_bitmap
+            );
+            assert_eq!(sorted_values(&dataset).await, (0..16).collect::<Vec<_>>());
+            assert_eq!(
+                assert_indexed_agrees(&dataset, "i = 13").await.num_rows(),
+                1
+            );
+        }
+
+        /// The mixed rewrite on `dataset` lands: the transition is recorded,
+        /// `i_idx` translates onto the covered destinations, the bare
+        /// destinations are scanned.
+        async fn assert_mixed_rewrite_lands(dataset: Dataset) {
+            let version = dataset.manifest.version;
+            let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+            assert_eq!(
+                i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1])
+            );
+
+            let operation = mixed_rewrite(&dataset).await;
+            let committed = commit_sp(&dataset, version, operation).await.unwrap();
+            assert_eq!(
+                committed
+                    .fragments()
+                    .iter()
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>(),
+                vec![10, 11, 20, 21]
+            );
+            let (_, ledger) = fri_ledger(&committed).await;
+            assert_eq!(ledger.transitions().len(), 1);
+            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            assert_eq!(stored.len(), stored_before.len() + 1, "the entry was added");
+            assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
+            assert_eq!(
+                i_idx(&stored).fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1]),
+                "stored provenance stays the retired sources"
+            );
+            let derived = committed.load_indices().await.unwrap();
+            assert_eq!(
+                i_idx(&derived).fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10u32, 11]),
+                "derived coverage is the covered destinations"
+            );
+            assert_eq!(sorted_values(&committed).await, (0..16).collect::<Vec<_>>());
+            assert_eq!(
+                assert_indexed_agrees(&committed, "i = 5").await.num_rows(),
+                1
+            );
+            assert_eq!(
+                assert_indexed_agrees(&committed, "i = 13").await.num_rows(),
+                1
+            );
+            assert_eq!(
+                assert_indexed_agrees(&committed, "i >= 6").await.num_rows(),
+                10
+            );
+        }
+
+        /// A rewrite carrying a transition for one group and none for another
+        /// is validated group by group: the bare group must pass the rule of a
+        /// bare rewrite (its old fragments outside every index bitmap). Here
+        /// `i_idx` covers the bare group's sources, so the whole transaction
+        /// is refused and nothing partial is published: without this the
+        /// index silently loses coverage of the moved rows.
+        #[tokio::test]
+        async fn mixed_rewrite_with_a_bare_group_over_covered_fragments_is_refused_whole() {
+            assert_mixed_rewrite_refused(covered_fixture().await).await;
+        }
+
+        /// The same shape where no index covers the bare group's sources
+        /// lands: the transition is recorded, the index translates onto the
+        /// covered destinations, the bare destinations are scanned.
+        #[tokio::test]
+        async fn mixed_rewrite_with_a_bare_group_over_uncovered_fragments_lands() {
+            assert_mixed_rewrite_lands(uncovered_fixture().await).await;
+        }
+
+        /// A MemWAL index carries no fragment bitmap by design; it is not
+        /// unknown coverage, so it neither blocks the uncovered bare group
+        /// nor excuses the covered one.
+        #[tokio::test]
+        async fn mixed_rewrite_beside_a_mem_wal_index_follows_the_bare_group_rule() {
+            assert_mixed_rewrite_lands(with_mem_wal(uncovered_fixture().await).await).await;
+            assert_mixed_rewrite_refused(with_mem_wal(covered_fixture().await).await).await;
+        }
+
+        /// A second writer's index over `fragment_ids`, committed after
+        /// `version`.
+        async fn concurrent_index(dataset: &Dataset, fragment_ids: Vec<u32>) -> Dataset {
+            let mut writer_b = dataset.clone();
+            writer_b
+                .create_index_builder(&["i"], IndexType::Scalar, &ScalarIndexParams::default())
+                .name("late_idx".into())
+                .fragments(fragment_ids)
+                .await
+                .unwrap();
+            assert_eq!(writer_b.manifest.version, dataset.manifest.version + 1);
+            writer_b
+        }
+
+        fn late_idx(indices: &[IndexMetadata]) -> &IndexMetadata {
+            indices.iter().find(|idx| idx.name == "late_idx").unwrap()
+        }
+
+        /// The bare group is checked against the index list of the attempt,
+        /// not of the read version: an index a concurrent writer built over
+        /// the bare group's fragments refuses the rebased rewrite.
+        #[tokio::test]
+        async fn bare_group_covered_by_a_concurrent_index_is_refused_on_retry() {
+            let mut writer_a = uncovered_fixture().await;
+            let version = writer_a.manifest.version;
+            let operation = mixed_rewrite(&writer_a).await;
+            let writer_b = concurrent_index(&writer_a, vec![2, 3]).await;
+            let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+            assert_eq!(
+                late_idx(&stored_b).fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([2u32, 3])
+            );
+
+            let error = commit_sp(&writer_a, version, operation).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains("late_idx"), "{error}");
+
+            assert_eq!(
+                writer_a.latest_version_id().await.unwrap(),
+                writer_b.manifest.version,
+                "nothing from writer A landed"
+            );
+            writer_a.checkout_latest().await.unwrap();
+            assert_eq!(
+                writer_a
+                    .fragments()
+                    .iter()
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2, 3]
+            );
+            let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+            assert_eq!(stored.len(), stored_b.len());
+            assert_eq!(late_idx(&stored).uuid, late_idx(&stored_b).uuid);
+            assert_eq!(
+                late_idx(&stored).fragment_bitmap,
+                late_idx(&stored_b).fragment_bitmap
+            );
+            assert_eq!(i_idx(&stored).uuid, i_idx(&stored_b).uuid);
+            assert_eq!(sorted_values(&writer_a).await, (0..16).collect::<Vec<_>>());
+            assert_eq!(
+                assert_indexed_agrees(&writer_a, "i = 13").await.num_rows(),
+                1
+            );
+            assert_eq!(
+                assert_indexed_agrees(&writer_a, "i >= 6").await.num_rows(),
+                10
+            );
+        }
+
+        /// The mirror: the concurrent index covers only the transition
+        /// group's sources, so the rebased rewrite lands and that index
+        /// translates onto the covered destinations.
+        #[tokio::test]
+        async fn bare_group_uncovered_by_a_concurrent_index_lands_on_retry() {
+            let writer_a = uncovered_fixture().await;
+            let version = writer_a.manifest.version;
+            let operation = mixed_rewrite(&writer_a).await;
+            let writer_b = concurrent_index(&writer_a, vec![0, 1]).await;
+            let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+
+            let committed = commit_sp(&writer_a, version, operation).await.unwrap();
+            assert_eq!(committed.manifest.version, writer_b.manifest.version + 1);
+            assert_eq!(
+                committed
+                    .fragments()
+                    .iter()
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>(),
+                vec![10, 11, 20, 21]
+            );
+            let (_, ledger) = fri_ledger(&committed).await;
+            assert_eq!(ledger.transitions().len(), 1);
+            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            assert_eq!(stored.len(), stored_b.len() + 1, "the entry was added");
+            for (name, pick) in [
+                (
+                    "late_idx",
+                    late_idx as fn(&[IndexMetadata]) -> &IndexMetadata,
+                ),
+                ("i_idx", i_idx),
+            ] {
+                assert_eq!(pick(&stored).uuid, pick(&stored_b).uuid, "{name}");
+                assert_eq!(
+                    pick(&stored).fragment_bitmap.as_ref().unwrap(),
+                    &RoaringBitmap::from_iter([0u32, 1]),
+                    "{name}: stored provenance stays the retired sources"
+                );
+            }
+            let derived = committed.load_indices().await.unwrap();
+            assert_eq!(
+                late_idx(&derived).fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10u32, 11])
+            );
+            assert_eq!(sorted_values(&committed).await, (0..16).collect::<Vec<_>>());
+            assert_eq!(
+                assert_indexed_agrees(&committed, "i = 5").await.num_rows(),
+                1
+            );
+            assert_eq!(
+                assert_indexed_agrees(&committed, "i = 13").await.num_rows(),
+                1
+            );
+            assert_eq!(
+                assert_indexed_agrees(&committed, "i >= 6").await.num_rows(),
+                10
+            );
+        }
+
         /// A tagged table with one stable-partition transition (fragments
         /// 10 and 11) built through the real commit path.
         async fn make_tagged(mut dataset: Dataset) -> Dataset {

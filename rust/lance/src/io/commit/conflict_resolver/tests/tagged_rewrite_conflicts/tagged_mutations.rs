@@ -1021,6 +1021,166 @@ async fn tagged_table_with_corrupt_history_refuses_the_commit() {
     assert_eq!(dataset.manifest.version, version, "nothing was committed");
 }
 
+/// The full table's `(i, v, z)` rows, index disabled.
+async fn rows_with_z(dataset: &Dataset) -> Vec<(i32, i32, i32)> {
+    let mut scan = dataset.scan();
+    scan.use_scalar_index(false);
+    let batch = scan.try_into_batch().await.unwrap();
+    let i = batch["i"].as_primitive::<Int32Type>();
+    let v = batch["v"].as_primitive::<Int32Type>();
+    let z = batch["z"].as_primitive::<Int32Type>();
+    let mut rows: Vec<(i32, i32, i32)> = i
+        .values()
+        .iter()
+        .zip(v.values().iter())
+        .zip(z.values().iter())
+        .map(|((i, v), z)| (*i, *v, *z))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// Four more rows (`i` 8..12) appended as a new fragment.
+async fn append_four(dataset: Dataset) -> Dataset {
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    let batch = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("v", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("w", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .into_batch_rows(lance_datagen::RowCount::from(4))
+        .unwrap();
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+/// Rewrite the fixture's entry in place through `persist_fixture`.
+async fn persist_entry(dataset: &mut Dataset, edit: impl FnOnce(&mut IndexMetadata)) {
+    let mut indices = crate::index::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let entry = indices
+        .iter_mut()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .unwrap();
+    edit(entry);
+    persist_fixture(dataset, indices).await;
+}
+
+/// The entry is carried through exactly: same identity, same version, and
+/// the `i` segment's stored provenance untouched.
+async fn assert_entry_carried(dataset: &Dataset, before: &[IndexMetadata]) {
+    let stored = crate::index::load_all_indices(dataset).await.unwrap();
+    assert_eq!(fri_entry(&stored).uuid, fri_entry(before).uuid);
+    assert_eq!(
+        fri_entry(&stored).index_version,
+        fri_entry(before).index_version
+    );
+    assert_eq!(
+        fri_entry(&stored).index_details,
+        fri_entry(before).index_details
+    );
+    assert_eq!(user_segment(&stored).uuid, user_segment(before).uuid);
+    assert_eq!(
+        user_segment(&stored).fragment_bitmap,
+        user_segment(before).fragment_bitmap
+    );
+}
+
+/// A history a newer writer recorded (`index_version` 2) is not this
+/// writer's to interpret, and an append or an added column rewrites no
+/// existing column in place, so neither decodes it: both commit and carry
+/// the entry through untouched. Rewriting an existing column in place
+/// needs the history to withdraw coverage, so it is still refused.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_with_a_newer_history_admits_append_and_add_columns() {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    persist_entry(&mut dataset, |entry| entry.index_version = 2).await;
+    let dataset = fresh_session(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    assert_eq!(fri_entry(&before).index_version, 2);
+
+    let mut dataset = append_four(dataset).await;
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("z".into(), "i * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        rows_with_z(&dataset).await,
+        (0..12).map(|i| (i, i, i * 2)).collect::<Vec<_>>()
+    );
+    assert_entry_carried(&dataset, &before).await;
+    // Reading through the index still needs the history, which this
+    // writer cannot interpret.
+    let error = dataset.count_rows(Some("i = 3".into())).await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains("index_version 2"), "{error}");
+
+    let version = dataset.manifest.version;
+    let error = rewrite_in_place(dataset, "v", 3, 333).await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains("index_version 2"), "{error}");
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version, "nothing was committed");
+    assert_entry_carried(&dataset, &before).await;
+}
+
+/// The same for a history this writer cannot decode at all: an append and
+/// an added column never look at it and commit; the in-place rewrite that
+/// must walk it is refused.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_with_corrupt_history_admits_append_and_add_columns() {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    persist_entry(&mut dataset, |entry| {
+        entry.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: vec![0x0a, 0x03, 0xff, 0xff],
+        }));
+    })
+    .await;
+    let dataset = fresh_session(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+
+    let mut dataset = append_four(dataset).await;
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("z".into(), "i * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        rows_with_z(&dataset).await,
+        (0..12).map(|i| (i, i, i * 2)).collect::<Vec<_>>()
+    );
+    assert_entry_carried(&dataset, &before).await;
+
+    let version = dataset.manifest.version;
+    let error = rewrite_in_place(dataset, "v", 3, 333).await.unwrap_err();
+    assert!(error.to_string().contains("FRI details"), "{error}");
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version, "nothing was committed");
+    assert_entry_carried(&dataset, &before).await;
+}
+
 /// A segment built after the rewrite names the destinations directly, so an
 /// in-place rewrite of its column is withdrawn from its bitmap as on an
 /// untagged table: the patched fragment leaves the `v` index and is

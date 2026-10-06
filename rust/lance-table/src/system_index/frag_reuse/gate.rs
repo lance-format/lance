@@ -14,6 +14,7 @@
 use super::FRAG_REUSE_INDEX_NAME;
 use super::metadata::{is_tagged, uses_tagged_fri};
 use crate::format::{IndexMetadata, Manifest};
+use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{FragReuseUpdate, Operation};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
@@ -223,16 +224,32 @@ pub fn classify(
             .flat_map(|group| group.old_fragments.iter())
             .filter_map(|fragment| u32::try_from(fragment.id).ok())
             .collect();
-        // Unknown coverage is not empty coverage: without a bitmap the
-        // entry could cover anything, so refuse.
-        if current_indices.iter().all(|index| {
-            index
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| bitmap.is_disjoint(&rewritten))
-        }) {
-            return Ok(Admission::RewritesUncoveredFragments);
-        }
+        let fragments = || {
+            groups
+                .iter()
+                .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
+                .collect::<Vec<_>>()
+        };
+        return match covered_bare_rewrite(&rewritten, current_indices) {
+            None => Ok(Admission::RewritesUncoveredFragments),
+            Some(BareRewriteRefusal::Covered { index, overlap }) => {
+                Err(Error::invalid_input(format!(
+                    "rewrite of fragments {:?} carries no fragment reuse transition but index \
+                     {index} covers fragments {:?} of it; record a transition for the group or \
+                     rebuild the index before the rewrite",
+                    fragments(),
+                    overlap.iter().collect::<Vec<_>>(),
+                )))
+            }
+            Some(BareRewriteRefusal::UnknownCoverage { index }) => {
+                Err(Error::invalid_input(format!(
+                    "rewrite of fragments {:?} carries no fragment reuse transition and index \
+                     {index} has no fragment bitmap, so its coverage is unknown; record a \
+                     transition for the group or rebuild the index before the rewrite",
+                    fragments(),
+                )))
+            }
+        };
     }
 
     // A tagged history translates row ADDRESSES; stable row ids replace
@@ -290,9 +307,10 @@ pub fn classify(
         | Operation::DataReplacement { .. }
         | Operation::UpdateBases { .. } => Ok(Admission::MovesNoRows),
         Operation::Restore { .. } => Ok(Admission::RestoresManifest),
-        // A bare rewrite of covered fragments or a v0 snapshot would
-        // misinterpret the history; MemWAL state, overlays, clones and base
-        // changes have no tagged semantics yet. A CreateIndex reaching here
+        // A bare rewrite beside an entry of a newer version or carrying
+        // rewritten indices, or a v0 snapshot, would misinterpret the
+        // history; MemWAL state, overlays, clones and base changes have no
+        // tagged semantics yet. A CreateIndex reaching here
         // touches the entry without being its trim.
         Operation::Rewrite { .. }
         | Operation::CreateIndex { .. }
@@ -302,6 +320,43 @@ pub fn classify(
             "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
         )),
     }
+}
+
+/// Why a rewrite recording no transition for `rewritten` is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BareRewriteRefusal {
+    /// `index`'s bitmap contains `overlap`, a subset of the rewritten fragments.
+    Covered {
+        index: String,
+        overlap: RoaringBitmap,
+    },
+    /// `index` carries no bitmap; unknown coverage is not empty coverage.
+    UnknownCoverage { index: String },
+}
+
+/// The bare-rewrite rule shared by the gate and the per-group check of a
+/// transition-carrying rewrite: every current index bitmap, the fragment
+/// reuse entry's included, must be disjoint from `rewritten`, and an index
+/// without a bitmap refuses. The MemWAL entry carries no bitmap by design
+/// and covers no fragment, so it is skipped. The first offending index is
+/// returned.
+pub fn covered_bare_rewrite(
+    rewritten: &RoaringBitmap,
+    indices: &[IndexMetadata],
+) -> Option<BareRewriteRefusal> {
+    indices
+        .iter()
+        .filter(|index| index.name != MEM_WAL_INDEX_NAME)
+        .find_map(|index| match index.fragment_bitmap.as_ref() {
+            Some(bitmap) if bitmap.is_disjoint(rewritten) => None,
+            Some(bitmap) => Some(BareRewriteRefusal::Covered {
+                index: index.name.clone(),
+                overlap: bitmap & rewritten,
+            }),
+            None => Some(BareRewriteRefusal::UnknownCoverage {
+                index: index.name.clone(),
+            }),
+        })
 }
 
 #[cfg(test)]
@@ -602,7 +657,7 @@ mod tests {
         Verdict::Admit(Admission::MaintainsUserIndices)
     )]
     #[case("create_index_replacing_entry", Table::Tagged, Verdict::InvalidInput)]
-    #[case("rewrite_bare_covered", Table::Tagged, Verdict::NotSupported)]
+    #[case("rewrite_bare_covered", Table::Tagged, Verdict::InvalidInput)]
     #[case(
         "rewrite_bare_uncovered",
         Table::Tagged,
@@ -732,6 +787,43 @@ mod tests {
     }
 
     /// The stable row id migration is a `Merge` with the activation marker.
+    /// The MemWAL entry carries no fragment bitmap by design; it is not
+    /// unknown coverage, so a bare rewrite of uncovered fragments is still
+    /// admitted beside it, and a covered one still refused. A user index
+    /// without a bitmap remains unknown coverage.
+    #[test]
+    fn mem_wal_entry_without_a_bitmap_does_not_block_a_bare_rewrite() {
+        let (manifest, mut indices) = table(Table::Tagged);
+        let mut mem_wal = sample_index_metadata(MEM_WAL_INDEX_NAME);
+        mem_wal.fields.clear();
+        mem_wal.fragment_bitmap = None;
+        indices.push(mem_wal);
+        let classify_bare = |old: u64, indices: &[IndexMetadata]| {
+            classify(
+                &rewrite(old, None),
+                Some(&manifest),
+                indices,
+                &FragReuseUpdate::None,
+                None,
+            )
+        };
+        assert_eq!(
+            classify_bare(7, &indices).unwrap(),
+            Admission::RewritesUncoveredFragments
+        );
+        let error = classify_bare(0, &indices).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(FRAG_REUSE_INDEX_NAME), "{error}");
+
+        let mut without_bitmap = sample_index_metadata("id_idx");
+        without_bitmap.fragment_bitmap = None;
+        indices.push(without_bitmap);
+        let error = classify_bare(7, &indices).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("id_idx"), "{error}");
+        assert!(error.to_string().contains("no fragment bitmap"), "{error}");
+    }
+
     #[test]
     fn migration_is_refused_on_a_tagged_table() {
         let (manifest, indices) = table(Table::Tagged);
