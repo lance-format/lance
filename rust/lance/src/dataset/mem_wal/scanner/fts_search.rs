@@ -255,16 +255,21 @@ fn prune_absent_columns(
         IndexFtsQuery::Phrase(leaf) => present(&leaf.column).then(|| query.clone()),
         IndexFtsQuery::Boost(boost) => {
             // The positive side is what matches; without it there is nothing to
-            // score. Losing the negative side only leaves the scores unadjusted.
+            // score. A negative side this source cannot answer subtracts
+            // nothing, so what is left is the positive side alone — keeping the
+            // original would put its column back into `columns()` and the arms
+            // below resolve every one of those.
             let positive = prune_absent_columns(&boost.positive, absent)?;
-            let negative = prune_absent_columns(&boost.negative, absent);
-            Some(IndexFtsQuery::Boost(
-                lance_index::scalar::inverted::query::BoostQuery {
-                    positive: Box::new(positive),
-                    negative: Box::new(negative.unwrap_or_else(|| (*boost.negative).clone())),
-                    negative_boost: boost.negative_boost,
-                },
-            ))
+            match prune_absent_columns(&boost.negative, absent) {
+                Some(negative) => Some(IndexFtsQuery::Boost(
+                    lance_index::scalar::inverted::query::BoostQuery {
+                        positive: Box::new(positive),
+                        negative: Box::new(negative),
+                        negative_boost: boost.negative_boost,
+                    },
+                )),
+                None => Some(positive),
+            }
         }
         IndexFtsQuery::MultiMatch(multi) => {
             let kept: Vec<_> = multi
@@ -5498,6 +5503,30 @@ mod tests {
             kept.columns().into_iter().collect::<Vec<_>>(),
             vec!["title".to_string()]
         );
+
+        // A boost whose negative side this source cannot answer subtracts
+        // nothing. Keeping the original would leave its column in `columns()`,
+        // and both arms resolve every column they are handed.
+        let boosted = IndexFtsQuery::Boost(lance_index::scalar::inverted::query::BoostQuery::new(
+            leaf("title"),
+            leaf("body"),
+            Some(0.5),
+        ));
+        let kept = prune_absent_columns(&boosted, &absent).expect("the positive side survives");
+        assert_eq!(
+            kept.columns().into_iter().collect::<Vec<_>>(),
+            vec!["title".to_string()],
+            "an unanswerable negative side is dropped, not restored"
+        );
+
+        // And the positive side going is the whole query going.
+        let unanswerable =
+            IndexFtsQuery::Boost(lance_index::scalar::inverted::query::BoostQuery::new(
+                leaf("body"),
+                leaf("title"),
+                Some(0.5),
+            ));
+        assert!(prune_absent_columns(&unanswerable, &absent).is_none());
     }
 
     /// Full-text search on a field inside a list of structs still matches after
