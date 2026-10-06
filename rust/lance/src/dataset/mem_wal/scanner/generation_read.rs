@@ -401,26 +401,30 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
 /// changes the name and keeps the id.
 fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String, String> {
     let table = field_paths(table_schema);
-    let by_id: HashMap<i32, &String> = table
+    // Keyed on the spelling as well as the id: a list's element has a physical
+    // path and an elided one, and pairing one schema's elided path with the
+    // other's physical one would answer a full-text lookup with a projection
+    // path, which the index does not know.
+    let by_id: HashMap<(i32, bool), &String> = table
         .iter()
-        .filter_map(|(id, path)| id.map(|id| (id, path)))
+        .filter_map(|(id, elided, path)| id.map(|id| ((id, *elided), path)))
         .collect();
     // A caller that supplies no ids leaves only names to match on, so a path
     // resolves to itself when the table still has it.
     if by_id.is_empty() {
         let known: std::collections::HashSet<&String> =
-            table.iter().map(|(_, path)| path).collect();
+            table.iter().map(|(_, _, path)| path).collect();
         return field_paths(stored_schema)
             .iter()
-            .filter(|(_, path)| known.contains(path))
-            .map(|(_, path)| (path.clone(), path.clone()))
+            .filter(|(_, _, path)| known.contains(path))
+            .map(|(_, _, path)| (path.clone(), path.clone()))
             .collect();
     }
     field_paths(stored_schema)
         .into_iter()
-        .filter_map(|(id, stored_path)| {
+        .filter_map(|(id, elided, stored_path)| {
             by_id
-                .get(&id?)
+                .get(&(id?, elided))
                 .map(|table_path| (stored_path, (*table_path).clone()))
         })
         .collect()
@@ -446,31 +450,63 @@ fn nested_children(data_type: &DataType) -> Vec<&Arc<Field>> {
 /// A struct's child and a list's element are fields with ids of their own, so a
 /// path like `meta.body` only relates two schemas through the ids along it.
 ///
+/// A list's element is named in two ways and both appear: a projection spells
+/// it out (`tags.item.body`) while full-text search elides it (`tags.body`), so
+/// a map holding only one of them answers for only one of the callers.
+///
 /// A generation numbers its own columns in its own schema, so those ids collide
 /// with the table's. They and their children are left out.
-fn field_paths(schema: &Schema) -> Vec<(Option<i32>, String)> {
-    fn walk(field: &Field, prefix: &mut Vec<String>, out: &mut Vec<(Option<i32>, String)>) {
-        prefix.push(field.name().clone());
+fn field_paths(schema: &Schema) -> Vec<(Option<i32>, bool, String)> {
+    /// `physical` spells every field out; `elided` drops the element names a
+    /// full-text path leaves implicit.
+    fn walk(
+        field: &Field,
+        physical: &mut Vec<String>,
+        elided: &mut Vec<String>,
+        in_list: bool,
+        out: &mut Vec<(Option<i32>, bool, String)>,
+    ) {
+        physical.push(field.name().clone());
+        if !in_list {
+            elided.push(field.name().clone());
+        }
         // The minimal form, not the SQL-expression one: a caller asks for a
         // column under the name its index metadata and its projection use, and
         // SQL quoting would wrap anything with a hyphen in backticks and stop
         // matching either.
-        let segments: Vec<&str> = prefix.iter().map(String::as_str).collect();
-        out.push((field_id_of(field), format_field_path_minimal(&segments)));
-        for child in nested_children(field.data_type()) {
-            walk(child, prefix, out);
+        let id = field_id_of(field);
+        let as_path = |segments: &[String]| {
+            format_field_path_minimal(&segments.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        let physical_path = as_path(physical);
+        if !in_list {
+            let elided_path = as_path(elided);
+            if elided_path != physical_path {
+                out.push((id, true, elided_path));
+            }
         }
-        prefix.pop();
+        out.push((id, false, physical_path));
+        let list = matches!(
+            field.data_type(),
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)
+        );
+        for child in nested_children(field.data_type()) {
+            walk(child, physical, elided, list, out);
+        }
+        physical.pop();
+        if !in_list {
+            elided.pop();
+        }
     }
 
     let mut out = Vec::new();
-    let mut prefix = Vec::new();
+    let (mut physical, mut elided) = (Vec::new(), Vec::new());
     for field in schema
         .fields()
         .iter()
         .filter(|f| f.name() != TOMBSTONE && !is_system_column(f.name()))
     {
-        walk(field, &mut prefix, &mut out);
+        walk(field, &mut physical, &mut elided, false, &mut out);
     }
     out
 }

@@ -5351,6 +5351,100 @@ mod tests {
     /// full paths. Resolving the top level alone reads `meta.b` as a column the
     /// memtable never stored, and the search returns nothing for its rows.
     #[tokio::test]
+    async fn a_list_of_struct_fts_still_matches_after_an_unrelated_column_is_added() {
+        // A full-text path elides a list's element (`tags.body`), a projection
+        // spells it out (`tags.item.body`). Resolving only one of the two leaves
+        // the other reading as a column the generation never stored.
+        let item_fields: arrow_schema::Fields = vec![
+            Arc::new(Field::new("a", DataType::Int64, true)),
+            Arc::new(Field::new("body", DataType::Utf8, true)),
+        ]
+        .into();
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(item_fields.clone()),
+            true,
+        ));
+        let stored_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tags", DataType::List(item.clone()), true),
+        ]));
+        let values = arrow_array::StructArray::new(
+            item_fields,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10i64])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["lance rocks"])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let tags = arrow_array::ListArray::new(
+            item,
+            arrow_buffer::OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            stored_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1])), Arc::new(tags)],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("list_fts".to_string(), 3, "tags.body".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        uuid::Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: InMemoryMemTableRef {
+                                batch_store: batch_store.clone(),
+                                index_store: indexes.clone(),
+                                schema: stored_schema.clone(),
+                                generation: 1,
+                            },
+                            frozen: vec![],
+                        },
+                    );
+            let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], table_schema);
+            let plan = planner
+                .plan_search(
+                    FullTextSearchQuery::new("lance".to_string())
+                        .with_column("tags.body".to_string())
+                        .unwrap(),
+                    Some(10),
+                    None,
+                )
+                .await
+                .unwrap();
+            let ctx = datafusion::prelude::SessionContext::new();
+            let batches: Vec<RecordBatch> = plan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+            assert_eq!(
+                count, 1,
+                "the list's text field still matches under its full-text path"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_nested_fts_still_matches_after_an_unrelated_column_is_added() {
         let stored_schema = nested_fts_schema();
         let meta = arrow_array::StructArray::new(
