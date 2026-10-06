@@ -491,12 +491,13 @@ enum Unsupported {
     /// can be accepted after the check and before the commit. That row is then
     /// in a table whose schema forbids it, and every later merge of it fails.
     Tightening,
-    /// A sharded MemWAL picks the shard that owns a row by hashing its primary
-    /// key, and a writer caches the schema it resolves that key through. Two
-    /// writers holding different names for the key hash different columns, so
-    /// the same row can be accepted into two shards and a lookup by key finds
-    /// one of them.
-    RenameKey,
+    /// A sharded MemWAL picks the shard that owns a row by hashing the column
+    /// the spec names, and a writer caches the schema it resolves that column
+    /// through. Two writers holding different names for it hash different
+    /// columns, so the same row can be accepted into two shards and a lookup
+    /// by key finds only one of them. Carries the field ids being renamed, so
+    /// only a rename of a column the spec actually shards by is refused.
+    RenameShardColumn(Vec<i32>),
 }
 
 /// Refuse `unsupported` when the table has a MemWAL attached.
@@ -510,8 +511,27 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
     let Some(unsupported) = unsupported else {
         return Ok(());
     };
-    if dataset.mem_wal_index_details().await?.is_none() {
+    let Some(details) = dataset.mem_wal_index_details().await? else {
         return Ok(());
+    };
+    if let Unsupported::RenameShardColumn(renamed) = &unsupported {
+        // Only the columns the spec hashes. An unsharded MemWAL has one shard
+        // that owns every row, so no name decides anything and a rename there
+        // is as ordinary as any other.
+        let shards_by = |id: &i32| {
+            details
+                .sharding_specs
+                .iter()
+                .any(|spec| spec.fields.iter().any(|f| f.source_ids.contains(id)))
+        };
+        if !renamed.iter().any(shards_by) {
+            return Ok(());
+        }
+        return Err(Error::invalid_input(
+            "cannot rename the column a sharded MemWAL shards by: it is what decides which \
+             shard owns a row, and a writer that has not yet seen the new name would route by \
+             a different column. Drop the MemWAL first.",
+        ));
     }
     Err(Error::invalid_input(match unsupported {
         Unsupported::Retype => {
@@ -524,11 +544,7 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
              runs against the base table, and a write admitted into the WAL while it runs is \
              not there to be checked. Drop the MemWAL first."
         }
-        Unsupported::RenameKey => {
-            "cannot rename a primary key column on a table with a MemWAL attached: the key is \
-             what decides which shard owns a row, and a writer that has not yet seen the new \
-             name would route by a different column. Drop the MemWAL first."
-        }
+        Unsupported::RenameShardColumn(_) => unreachable!("handled above"),
     }))
 }
 
@@ -861,14 +877,16 @@ pub(super) async fn alter_columns(
                 .is_none_or(|field| field.nullable)
     }) {
         Some(Unsupported::Tightening)
-    } else if alterations.iter().any(|a| {
-        a.rename.is_some()
-            && dataset
-                .schema()
-                .field(&a.path)
-                .is_some_and(|field| field.is_unenforced_primary_key())
-    }) {
-        Some(Unsupported::RenameKey)
+    } else if let renamed_keys = alterations
+        .iter()
+        .filter(|a| a.rename.is_some())
+        .filter_map(|a| dataset.schema().field(&a.path))
+        .filter(|field| field.is_unenforced_primary_key())
+        .map(|field| field.id)
+        .collect::<Vec<_>>()
+        && !renamed_keys.is_empty()
+    {
+        Some(Unsupported::RenameShardColumn(renamed_keys))
     } else {
         None
     };
@@ -1511,11 +1529,9 @@ mod test {
         }
     }
 
-    /// The key is what a sharded MemWAL hashes to pick a shard, so renaming it
-    /// while one is attached would let two writers route the same row two ways.
-    /// Every other column renames freely.
+    /// An unsharded MemWAL hashes nothing, so renaming its key is ordinary.
     #[tokio::test]
-    async fn alter_columns_on_a_mem_wal_table_refuses_renaming_the_key() {
+    async fn alter_columns_on_an_unsharded_mem_wal_allows_renaming_the_key() {
         use crate::dataset::mem_wal::DatasetMemWalExt;
         use arrow_array::Int64Array;
         use lance_core::datatypes::{
@@ -1557,15 +1573,11 @@ mod test {
             .await
             .unwrap();
 
-        let err = dataset
+        // Unsharded: one shard owns every row, so no name decides anything.
+        dataset
             .alter_columns(&[ColumnAlteration::new("id".into()).rename("key".into())])
             .await
-            .expect_err("renaming the key must be refused");
-        assert!(
-            err.to_string()
-                .contains("cannot rename a primary key column"),
-            "unexpected error: {err}"
-        );
+            .expect("renaming the key of an unsharded MemWAL must be allowed");
 
         dataset
             .alter_columns(&[ColumnAlteration::new("value".into()).rename("amount".into())])
