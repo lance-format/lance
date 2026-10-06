@@ -667,56 +667,54 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
-                if memtable_matches_table(schema, &self.identity_schema) {
-                    // Supply PKs so the memtable scanner can choose HNSW for
-                    // append-only data and exact newest-before-top-k search when
-                    // PK rewrites or filters make stale suppression necessary.
-                    scanner.with_pk_columns(self.pk_columns.clone());
-                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                    if let Some(ref filter) = self.filter {
-                        // Routed to filtered brute-force (see `plan_vector_search`):
-                        // the predicate masks rows before the memtable top-k cut.
-                        scanner.filter_expr(filter.clone());
-                    }
-                    scanner.nearest(&self.vector_column, query_vector, k)?;
-                    scanner.distance_range(self.distance_range.0, self.distance_range.1);
-                    if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
-                        scanner.minimum_nprobes(minimum_nprobes);
-                    }
-                    if let Some(maximum_nprobes) = probe_bounds.maximum_nprobes {
-                        scanner.maximum_nprobes(maximum_nprobes);
-                    }
-                    scanner.distance_metric(self.distance_type);
-                    if let Some(ef) = self.ef {
-                        scanner.ef(ef);
-                    }
-                    return scanner.create_plan().await;
-                }
-
-                // Created before a schema change, so it is asked under the
+                // A memtable created before a schema change is asked under the
                 // names it holds and resolved as the sealed-generation arm
-                // above resolves a generation.
-                let mut generation = GenerationRead::for_memtable(
-                    schema,
-                    &self.identity_schema,
-                    &self.pk_columns,
-                    cols,
-                );
-                let Some(vector_column) = generation.stored_name(&self.vector_column) else {
-                    // Created before the searched column existed: no candidates.
-                    return self.empty_plan(projection);
+                // above resolves a generation. One created under the table's
+                // own names needs no resolution.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let vector_column = match &generation {
+                    Some(generation) => match generation.stored_name(&self.vector_column) {
+                        Some(stored) => stored.to_string(),
+                        // Created before the searched column existed: no candidates.
+                        None => return self.empty_plan(projection),
+                    },
+                    None => self.vector_column.clone(),
                 };
-                let vector_column = vector_column.to_string();
-                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
-                scanner.with_pk_columns(generation.stored_pk_columns()?);
-                scanner.project(&generation.stored_projection())?;
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(self.filter.as_ref()),
+                    None => (self.filter.clone(), None),
+                };
+
+                // Supply PKs so the memtable scanner can choose HNSW for
+                // append-only data and exact newest-before-top-k search when
+                // PK rewrites or filters make stale suppression necessary.
+                match &generation {
+                    Some(generation) => {
+                        scanner.with_pk_columns(generation.stored_pk_columns()?);
+                        scanner.project(&generation.stored_projection())?;
+                    }
+                    None => {
+                        scanner.with_pk_columns(self.pk_columns.clone());
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
+                }
                 if let Some(stored) = stored_filter {
+                    // Routed to filtered brute-force (see `plan_vector_search`):
+                    // the predicate masks rows before the memtable top-k cut.
                     scanner.filter_expr(stored);
                 }
                 // A predicate that runs above the resolution runs after the
-                // top-k, so this arm ranks every row it holds exactly -- the
-                // graph would cut to its own beam first -- and leaves the cut to
-                // the filter and the union.
+                // top-k, so that case ranks every row the memtable holds
+                // exactly -- the graph would cut to its own beam first -- and
+                // leaves the cut to the filter and the union.
                 let k = match above {
                     None => k,
                     Some(_) => {
@@ -736,7 +734,11 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
+                let plan = Box::pin(scanner.create_plan()).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(plan, &above),
+                    None => Ok(plan),
+                }
             }
         }
     }

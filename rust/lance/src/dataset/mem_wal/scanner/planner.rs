@@ -447,41 +447,37 @@ impl LsmScanPlanner {
                 // position-based dedup (suppressing the older real row) and is
                 // then dropped by this predicate. A memtable without the column
                 // (legacy / test) gets no fold.
-                let has_tombstone = schema.column_with_name(TOMBSTONE).is_some();
+                // A memtable created before a schema change holds the names
+                // and shapes the table had then, and is resolved as a
+                // generation sealed at that point would be. One created under
+                // the table's own names is asked for under them and needs no
+                // resolution. A predicate the stored names cannot answer runs
+                // above the resolution, which is still after the dedup.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(filter),
+                    None => (filter.cloned(), None),
+                };
 
-                if memtable_matches_table(schema, &self.identity_schema) {
-                    // Stored under the table's own names, so it is asked for
-                    // under them and needs no resolution.
-                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                    scanner.with_row_address();
-                    let folded;
-                    let effective: Option<&Expr> = if has_tombstone {
-                        folded = fold_not_tombstone(filter);
-                        Some(&folded)
-                    } else {
-                        filter
-                    };
-                    if let Some(expr) = effective {
-                        scanner.filter_expr(expr.clone());
+                match &generation {
+                    Some(generation) => {
+                        scanner.project(&generation.stored_projection())?;
                     }
-                    return scanner.create_dedup_plan(&self.pk_columns).await;
+                    None => {
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
                 }
-
-                // Created before a schema change, so it holds the names and
-                // shapes the table had then, and is resolved as a generation
-                // sealed at that point would be. A predicate it cannot answer
-                // runs above the resolution, which is still after the dedup.
-                let mut generation = GenerationRead::for_memtable(
-                    schema,
-                    &self.identity_schema,
-                    &self.pk_columns,
-                    cols,
-                );
-                let (stored_filter, above) = generation.split_filter(filter);
-                scanner.project(&generation.stored_projection())?;
                 scanner.with_row_address();
                 let folded;
-                let effective: Option<&Expr> = if has_tombstone {
+                let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
                     folded = fold_not_tombstone(stored_filter.as_ref());
                     Some(&folded)
                 } else {
@@ -490,9 +486,16 @@ impl LsmScanPlanner {
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
-                let deduped =
-                    Box::pin(scanner.create_dedup_plan(&generation.stored_pk_columns()?)).await?;
-                generation.reconcile_above(deduped, &above)
+
+                let pk_columns = match &generation {
+                    Some(generation) => generation.stored_pk_columns()?,
+                    None => self.pk_columns.clone(),
+                };
+                let deduped = Box::pin(scanner.create_dedup_plan(&pk_columns)).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(deduped, &above),
+                    None => Ok(deduped),
+                }
             }
         }
     }

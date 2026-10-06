@@ -5680,34 +5680,14 @@ mod tests {
     #[tokio::test]
     async fn test_replay_refuses_a_recorded_generation_it_cannot_hold() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        // Far above what the writer below puts in it, so every row lands in one
+        // memtable and nothing is sealed or flushed — the WAL holds the lot
+        // under a single recorded generation.
         let config = ShardWriterConfig {
-            shard_id: Uuid::new_v4(),
-            durable_write: true,
-            max_wal_buffer_size: 1,
-            max_wal_flush_interval: Some(Duration::from_millis(10)),
-            max_memtable_rows: 100,
-            ..Default::default()
-        };
-
-        let blob_proto = create_blob_v2_batch(9, &[BlobTestValue::Bytes(b"de".to_vec())]);
-        let without_blob = Arc::new(ArrowSchema::new(
-            blob_proto
-                .schema()
-                .fields()
-                .iter()
-                .filter(|f| f.name() != "blob")
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
-        let plain = |id: i32| {
-            RecordBatch::try_new(
-                without_blob.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![id])),
-                    blob_proto.column(2).slice(0, 1),
-                ],
-            )
-            .unwrap()
+            max_memtable_rows: 10_000,
+            ..memtable_config_with_pk(shard_id)
         };
 
         {
@@ -5716,46 +5696,38 @@ mod tests {
                 base_path.clone(),
                 base_uri.clone(),
                 config.clone(),
-                without_blob.clone(),
-                Vec::new(),
+                schema.clone(),
+                vec![],
             )
             .await
             .unwrap();
-            for id in 0..5 {
-                writer.put(vec![plain(id)]).await.unwrap();
+            for id in 0..4i32 {
+                writer
+                    .put(vec![create_test_batch(&schema, id, 1)])
+                    .await
+                    .unwrap();
             }
-            // The first Blob column: the next memtable preassigns a target
-            // whose generation is 1.
-            writer
-                .evolve_schema(blob_proto.schema(), Vec::new())
-                .await
-                .unwrap();
-            writer
-                .put(vec![create_blob_v2_batch(
-                    9,
-                    &[BlobTestValue::Bytes(b"de".to_vec())],
-                )])
-                .await
-                .unwrap();
-            std::mem::forget(writer);
+            // Dropped without a close, so only the WAL survives.
         }
+        assert!(
+            manifest_generations(&store, &base_path, shard_id)
+                .await
+                .is_empty(),
+            "the writer must have flushed nothing for this to be about replay"
+        );
 
-        let published_before_replay =
-            manifest_generations(&store, &base_path, config.shard_id).await;
-
-        // A fiftieth of the cap the prefix was written under: the five plain
-        // rows alone overrun the memtable replaying them.
-        let smaller = ShardWriterConfig {
-            max_memtable_rows: 2,
-            ..config.clone()
-        };
+        // A memtable that holds two of the four rows the recorded generation
+        // covers.
         let err = ShardWriter::open(
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
-            smaller,
-            blob_proto.schema(),
-            Vec::new(),
+            ShardWriterConfig {
+                max_memtable_rows: 2,
+                ..config.clone()
+            },
+            schema.clone(),
+            vec![],
         )
         .await
         .err()
@@ -5764,23 +5736,22 @@ mod tests {
             err.to_string().contains("past the memtable replaying it"),
             "unexpected error: {err}"
         );
-        assert_eq!(
-            manifest_generations(&store, &base_path, config.shard_id).await,
-            published_before_replay,
+        assert!(
+            manifest_generations(&store, &base_path, shard_id)
+                .await
+                .is_empty(),
             "the refusal must come before replay publishes a generation"
         );
 
         // The same WAL under the cap it was written with replays in full.
-        let reopened = ShardWriter::open(
-            store,
-            base_path,
-            base_uri,
-            config,
-            blob_proto.schema(),
-            Vec::new(),
-        )
-        .await
-        .expect("the shard is unchanged and reopens at its original cap");
+        let reopened = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .expect("the shard is unchanged and reopens at its original cap");
+        assert_eq!(
+            reopened.memtable_stats().await.unwrap().row_count,
+            4,
+            "every row the WAL held must be back in the memtable"
+        );
         reopened.close().await.unwrap();
     }
 

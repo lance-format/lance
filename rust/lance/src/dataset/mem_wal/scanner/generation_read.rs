@@ -271,7 +271,7 @@ impl GenerationRead {
     pub(super) fn reconcile(&self, scan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         let source =
             self.with_only_table_field_ids(with_ids_from(&scan.schema(), &self.stored_schema));
-        let target = self.target(&source);
+        let target = self.target(&source)?;
         let plan = Plan::resolve(&source, &target, &self.pk_columns)?.emitting_plain_schema();
         if plan.is_identity() {
             return Ok(scan);
@@ -306,7 +306,7 @@ impl GenerationRead {
     /// store non-key columns as nullable so a strict table can hold a tombstone.
     /// Each arm's canonical projection restores the table's nullability once
     /// tombstones are dropped.
-    fn target(&self, source: &Schema) -> SchemaRef {
+    fn target(&self, source: &Schema) -> Result<SchemaRef> {
         // Resolved the way the canonical projection resolves, so the two agree
         // on child order, on how sibling selections of one parent merge, and on
         // the shape a container keeps. Dropping rather than refusing an unknown
@@ -318,8 +318,7 @@ impl GenerationRead {
             .filter(|name| !is_auto_managed(name))
             .cloned()
             .collect();
-        let resolved =
-            resolve_data_fields_or_drop(&data_names, &self.table_schema).unwrap_or_default();
+        let resolved = resolve_data_fields_or_drop(&data_names, &self.table_schema)?;
         // The resolver renumbers as it projects; `Plan::resolve` below pairs
         // source to target by id, so the table's own ids go back on.
         let resolved = with_ids_from(
@@ -351,7 +350,7 @@ impl GenerationRead {
                 fields.push(field.as_ref().clone());
             }
         }
-        Arc::new(Schema::new(fields))
+        Ok(Arc::new(Schema::new(fields)))
     }
 }
 
