@@ -272,6 +272,26 @@ jobs:
         run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
         run: cargo nextest run --cargo-profile ci
+  windows-arm-build:
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
     # Verifies that lance-linalg's runtime SIMD dispatch still works
