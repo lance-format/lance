@@ -2327,6 +2327,16 @@ impl MergeInsertJob {
         }
     }
 
+    /// Whether the source provides a dataset column with a blob anywhere in it.
+    fn source_carries_blob(&self, source_schema: &Schema) -> bool {
+        self.dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| source_schema.column_with_name(&field.name).is_some())
+            .any(subtree_has_blob)
+    }
+
     /// Resolves the caller's [`MergeInsertWriteMode`] against this operation.
     ///
     /// [`WriteSink::RewriteColumns`] only ever replaces column data within a
@@ -2394,14 +2404,7 @@ impl MergeInsertJob {
         // the top-level fields it carries and then descends: a blob nested
         // anywhere under one of them (struct member, list item, map value) is
         // still patched by writing that whole top-level column.
-        if self
-            .dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| source_schema.column_with_name(&field.name).is_some())
-            .any(subtree_has_blob)
-        {
+        if self.source_carries_blob(source_schema) {
             blockers.push("the source carries a blob column, whose stored form differs from the one it provides");
         }
 
@@ -2711,8 +2714,10 @@ impl MergeInsertJob {
         // probe: the sink decides how many bytes are written, the probe only how
         // the matched rows are found. Merges that write nothing (no matched
         // update) or write whole rows on both paths (a full-schema source) are
-        // unaffected, so they keep the index.
-        let write_mode_needs_v2 = self.params.write_mode == MergeInsertWriteMode::RewriteRows
+        // unaffected, so they keep the index. A source carrying a blob column
+        // needs whole rows too: patching cannot write blobs (`select_write_sink`).
+        let write_mode_needs_v2 = (self.params.write_mode == MergeInsertWriteMode::RewriteRows
+            || self.source_carries_blob(source_schema))
             && is_subset_schema
             && matches!(
                 self.params.when_matched,
@@ -15343,6 +15348,112 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    /// A partial-schema source carrying a Blob v2 column updates and inserts
+    /// whether or not the join key has a scalar index.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_partial_blob_v2_source(#[values(false, true)] indexed: bool) {
+        use crate::{BlobArrayBuilder, blob_field};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blobs", true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let make_batch = |blob_values: &[&[u8]], ids: Vec<i64>| {
+            let mut blobs = BlobArrayBuilder::new(blob_values.len());
+            for value in blob_values {
+                blobs.push_bytes(value).unwrap();
+            }
+            let others = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    blobs.finish().unwrap(),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(others)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(make_batch(&[b"foo", b"bar"], vec![0, 1]))],
+                schema.clone(),
+            ),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let source = make_batch(&[b"baz", b"qux"], vec![1, 2])
+            .project(&[0, 1])
+            .unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        ));
+
+        let (new_dataset, _) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(source)
+                .await
+                .unwrap();
+
+        let batch = new_dataset
+            .scan()
+            .project(&["id", "other"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let others = batch["other"].as_primitive::<arrow_array::types::Int64Type>();
+        let mut actual = Vec::new();
+        for (row, blob) in blobs.into_iter().enumerate() {
+            actual.push((
+                ids.value(row),
+                others.is_valid(row).then(|| others.value(row)),
+                blob.unwrap().read().await.unwrap().to_vec(),
+            ));
+        }
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                (0, Some(0), b"foo".to_vec()),
+                (1, Some(10), b"baz".to_vec()),
+                (2, None, b"qux".to_vec()),
+            ]
         );
     }
 
