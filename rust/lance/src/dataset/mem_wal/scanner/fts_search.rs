@@ -227,6 +227,96 @@ fn validate_source_document_granularities(
 /// Only one remains: a fuzzy Match cannot also require every term, because the
 /// fuzzy path expands each term independently and unions the expansions. A
 /// multi-match is checked leaf by leaf under the same rule.
+/// `query` with every clause naming a column this source does not store taken
+/// out, or `None` when nothing it asks for can match here.
+///
+/// A generation sealed before a column existed has no postings for it, which is
+/// not the same as the query having no answer: `title:lance OR body:lance` over
+/// a generation that predates `body` still has its `title` matches, and
+/// dropping the source loses them. What each position does when its column is
+/// absent follows from what it asserts — a `should` contributes nothing, a
+/// `must` cannot be satisfied, a `must_not` is satisfied by every row.
+///
+/// `CombinedFields` is left whole: its per-column weights have no public
+/// accessor, so a pruned one cannot be rebuilt faithfully, and answering with
+/// the wrong weights is worse than answering with nothing.
+fn prune_absent_columns(
+    query: &IndexFtsQuery,
+    absent: &dyn Fn(&str) -> bool,
+) -> Option<IndexFtsQuery> {
+    let present = |column: &Option<String>| match column {
+        // A leaf naming no column is bound later, so nothing here can rule it
+        // out.
+        None => true,
+        Some(column) => !absent(column),
+    };
+    match query {
+        IndexFtsQuery::Match(leaf) => present(&leaf.column).then(|| query.clone()),
+        IndexFtsQuery::Phrase(leaf) => present(&leaf.column).then(|| query.clone()),
+        IndexFtsQuery::Boost(boost) => {
+            // The positive side is what matches; without it there is nothing to
+            // score. Losing the negative side only leaves the scores unadjusted.
+            let positive = prune_absent_columns(&boost.positive, absent)?;
+            let negative = prune_absent_columns(&boost.negative, absent);
+            Some(IndexFtsQuery::Boost(
+                lance_index::scalar::inverted::query::BoostQuery {
+                    positive: Box::new(positive),
+                    negative: Box::new(negative.unwrap_or_else(|| (*boost.negative).clone())),
+                    negative_boost: boost.negative_boost,
+                },
+            ))
+        }
+        IndexFtsQuery::MultiMatch(multi) => {
+            let kept: Vec<_> = multi
+                .match_queries
+                .iter()
+                .filter(|leaf| present(&leaf.column))
+                .cloned()
+                .collect();
+            (!kept.is_empty()).then_some(IndexFtsQuery::MultiMatch(
+                lance_index::scalar::inverted::query::MultiMatchQuery {
+                    match_queries: kept,
+                },
+            ))
+        }
+        IndexFtsQuery::CombinedFields(_) => {
+            use lance_index::scalar::inverted::query::FtsQueryNode;
+            query
+                .columns()
+                .iter()
+                .all(|column| !absent(column))
+                .then(|| query.clone())
+        }
+        IndexFtsQuery::Boolean(boolean) => {
+            let prune_all = |clauses: &[IndexFtsQuery]| -> Vec<IndexFtsQuery> {
+                clauses
+                    .iter()
+                    .filter_map(|clause| prune_absent_columns(clause, absent))
+                    .collect()
+            };
+            // Every `must` has to survive: one that cannot match leaves the
+            // whole query with no answer here.
+            let must = prune_all(&boolean.must);
+            if must.len() != boolean.must.len() {
+                return None;
+            }
+            let should = prune_all(&boolean.should);
+            // A query that only ever asked for `should` clauses and kept none
+            // asks for nothing.
+            if should.is_empty() && !boolean.should.is_empty() && must.is_empty() {
+                return None;
+            }
+            Some(IndexFtsQuery::Boolean(
+                lance_index::scalar::inverted::query::BooleanQuery {
+                    should,
+                    must,
+                    must_not: prune_all(&boolean.must_not),
+                },
+            ))
+        }
+    }
+}
+
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     fn visit(query: &IndexFtsQuery) -> Result<()> {
         match query {
@@ -1184,17 +1274,35 @@ impl LsmFtsSearchPlanner {
                     &self.pk_columns,
                     asked_for,
                 );
-                // Every queried column has to be resolved: a rename moved the
-                // table's name while the file still holds the old one.
-                let mut stored_columns = Vec::with_capacity(columns.len());
-                for column in columns {
-                    let Some(stored) = generation.stored_fts_name(column) else {
-                        // Sealed before the column existed, so it has nothing to
-                        // match -- and nothing to give a predicate spanning it.
-                        return self.empty_plan(target_schema);
-                    };
-                    stored_columns.push((column.clone(), stored.to_string()));
-                }
+                // A rename moves the table's name while the file still holds
+                // the old one, and a column added since was never stored here
+                // at all. The second is not an answerless query: the clauses
+                // over the columns this generation does have still match.
+                let absent = |column: &str| generation.stored_fts_name(column).is_none();
+                let Some(pruned) = prune_absent_columns(&query.query, &absent) else {
+                    return self.empty_plan(target_schema);
+                };
+                let columns: Vec<String> = {
+                    use lance_index::scalar::inverted::query::FtsQueryNode;
+                    let mut kept: Vec<String> = pruned.columns().into_iter().collect();
+                    kept.sort();
+                    kept
+                };
+                let columns = columns.as_slice();
+                let pruned = FullTextSearchQuery {
+                    query: pruned,
+                    ..query.clone()
+                };
+                let query = &pruned;
+                let stored_columns: Vec<(String, String)> = columns
+                    .iter()
+                    .map(|column| {
+                        let stored = generation
+                            .stored_fts_name(column)
+                            .expect("pruning kept only columns this generation stores");
+                        (column.clone(), stored.to_string())
+                    })
+                    .collect();
                 // A predicate this generation cannot answer as written runs
                 // above the reconciliation, where the columns it names exist.
                 let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
@@ -1243,20 +1351,40 @@ impl LsmFtsSearchPlanner {
                             self.fts_scanner_projection(projection),
                         )
                     });
-                // (table name, stored name) for each queried column.
+                // A column added since this memtable was created was never
+                // stored in it, which leaves the clauses over the columns it
+                // does hold still matching. See `prune_absent_columns`.
+                let absent = |column: &str| match &generation {
+                    None => false,
+                    Some(generation) => generation.stored_fts_name(column).is_none(),
+                };
+                let Some(pruned) = prune_absent_columns(&query.query, &absent) else {
+                    return self
+                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity)?);
+                };
+                let columns: Vec<String> = {
+                    use lance_index::scalar::inverted::query::FtsQueryNode;
+                    let mut kept: Vec<String> = pruned.columns().into_iter().collect();
+                    kept.sort();
+                    kept
+                };
+                let columns = columns.as_slice();
+                let pruned = FullTextSearchQuery {
+                    query: pruned,
+                    ..query.clone()
+                };
+                let query = &pruned;
+
+                // Each queried column as the table names it, paired with the
+                // name this memtable stores it under.
                 let mut stored_columns = Vec::with_capacity(columns.len());
                 for column in columns {
                     let stored = match &generation {
                         None => column.clone(),
-                        Some(generation) => match generation.stored_fts_name(column) {
-                            Some(stored) => stored.to_string(),
-                            // Created before the column existed: nothing matches.
-                            None => {
-                                return self.empty_plan(
-                                    &self.canonical_fts_schema(projection, document_granularity)?,
-                                );
-                            }
-                        },
+                        Some(generation) => generation
+                            .stored_fts_name(column)
+                            .expect("pruning kept only columns this memtable stores")
+                            .to_string(),
                     };
                     stored_columns.push((column.clone(), stored));
                 }
@@ -5322,6 +5450,53 @@ mod tests {
         assert!(
             ids.contains(&2),
             "live pk=2 ('alpha foo', only in the frozen gen) must still match; got ids={ids:?}"
+        );
+    }
+
+    /// `title:lance OR body:lance` over a generation that predates `body` still
+    /// has its `title` matches. Dropping the whole source loses them.
+    #[test]
+    fn an_or_over_a_column_this_source_lacks_keeps_the_other_clause() {
+        use lance_index::scalar::inverted::query::{BooleanQuery, FtsQueryNode, MatchQuery, Occur};
+        let leaf = |column: &str| {
+            IndexFtsQuery::Match(
+                MatchQuery::new("lance".to_string()).with_column(Some(column.to_string())),
+            )
+        };
+        let absent = |column: &str| column == "body";
+
+        let either = IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+            (Occur::Should, leaf("title")),
+            (Occur::Should, leaf("body")),
+        ]));
+        let kept = prune_absent_columns(&either, &absent).expect("the title clause survives");
+        assert_eq!(
+            kept.columns().into_iter().collect::<Vec<_>>(),
+            vec!["title".to_string()],
+            "only the clause this source cannot answer is dropped"
+        );
+
+        // Both sides absent: nothing left to ask.
+        let neither =
+            IndexFtsQuery::Boolean(BooleanQuery::new(vec![(Occur::Should, leaf("body"))]));
+        assert!(prune_absent_columns(&neither, &absent).is_none());
+
+        // A `must` the source cannot answer leaves the query unsatisfiable.
+        let required = IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+            (Occur::Must, leaf("body")),
+            (Occur::Should, leaf("title")),
+        ]));
+        assert!(prune_absent_columns(&required, &absent).is_none());
+
+        // A `must_not` on an absent column is satisfied by every row.
+        let excluded = IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+            (Occur::Must, leaf("title")),
+            (Occur::MustNot, leaf("body")),
+        ]));
+        let kept = prune_absent_columns(&excluded, &absent).expect("the title clause survives");
+        assert_eq!(
+            kept.columns().into_iter().collect::<Vec<_>>(),
+            vec!["title".to_string()]
         );
     }
 
