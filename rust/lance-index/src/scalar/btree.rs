@@ -96,16 +96,19 @@ const BATCH_SIZE_META_KEY: &str = "batch_size";
 const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
 const PAGE_NUM_PER_RANGE_PARTITION_META_KEY: &str = "page_num_per_range_partition";
-/// BTree index format version 1: the `ids` column stores physical row
-/// addresses (`_rowaddr`).
+/// BTree index format version 1: the second page column stores physical row
+/// addresses (`_rowaddr`), newly written as [`BTREE_ADDRS_COLUMN`] (`addrs`).
 ///
-/// The older version (0) stored row ids (`_rowid`).
+/// The older version (0) stored row ids (`_rowid`) in that same column,
+/// historically named `ids` on disk. Reading a page is positional, not by
+/// column name, so an old page file's on-disk column name never needs to
+/// match this constant.
 pub const BTREE_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
 /// The latest index format version (mainly used in tests that don't want to target
 /// a specific version)
 pub const BTREE_INDEX_VERSION: u32 = BTREE_ROW_ADDR_DOMAIN_VERSION;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
-pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
+pub(crate) const BTREE_ADDRS_COLUMN: &str = "addrs";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -2000,12 +2003,12 @@ impl BTreeIndex {
     }
 
     /// Compile a sargable predicate into a physical expr against the per-page
-    /// schema ([values, ids]). Built once in `search` and shared across pages so
+    /// schema ([values, addrs]). Built once in `search` and shared across pages so
     /// a large IN-list is not re-materialized for every page.
     fn compile_predicate(&self, query: &SargableQuery) -> Result<Arc<dyn PhysicalExpr>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true),
-            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+            Field::new(BTREE_ADDRS_COLUMN, DataType::UInt64, false),
         ]));
         let df_schema = DFSchema::try_from(schema)?;
         Ok(create_physical_expr(
@@ -2995,7 +2998,7 @@ pub async fn train_btree_index(
             batches_source.schema().field(0).data_type().clone(),
             true,
         ),
-        Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+        Field::new(BTREE_ADDRS_COLUMN, DataType::UInt64, false),
     ]));
 
     let mut sub_index_file = match partition_id {
