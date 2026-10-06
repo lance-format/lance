@@ -667,10 +667,8 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
-                // A memtable created before a schema change is asked under the
-                // names it holds and resolved as the sealed-generation arm
-                // above resolves a generation. One created under the table's
-                // own names needs no resolution.
+                // A memtable from before a schema change stores the table's
+                // older names. One that matches the table needs no resolver.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(

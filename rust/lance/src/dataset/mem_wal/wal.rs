@@ -2881,12 +2881,15 @@ mod tests {
     /// claim it — or any other generation — through its own schema metadata.
     #[test]
     fn an_entry_takes_its_generation_from_the_writer_not_the_batch() {
-        let mut claimed = std::collections::HashMap::new();
-        claimed.insert(GENERATION_KEY.to_string(), "0".to_string());
-        claimed.insert(WRITER_EPOCH_KEY.to_string(), "99".to_string());
+        // Every reserved key, forged. Built from the list itself, so a key
+        // added to it is covered here without anyone remembering to.
+        let forged: std::collections::HashMap<String, String> = RESERVED_ENTRY_KEYS
+            .iter()
+            .map(|key| (key.to_string(), "0".to_string()))
+            .collect();
         let schema = Arc::new(Schema::new_with_metadata(
             create_test_schema().fields().to_vec(),
-            claimed,
+            forged,
         ));
         let batch = create_test_batch(&schema, 1);
 
@@ -2896,6 +2899,12 @@ mod tests {
         let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
         assert_eq!(decoded.generation, None, "the batch cannot supply one");
         assert_eq!(decoded.writer_epoch, 7, "nor speak for the writer's epoch");
+        assert_eq!(decoded.target, None, "nor hand it a blob payload directory");
+        assert_eq!(
+            decoded.batches.len(),
+            1,
+            "nor pass itself off as a fence sentinel, which carries no batches"
+        );
 
         // And a writer that does name one is the one that wins.
         let bytes = serialize_appender_batches(&[batch], 7, None, Some(4)).unwrap();

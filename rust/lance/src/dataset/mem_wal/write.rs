@@ -1483,13 +1483,9 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    // The entry names the generation its batches belong to, so
-                    // the boundary is read rather than measured. A WAL-only
-                    // entry names none; the size rule below answers for it.
-                    // Replay may also split one recorded generation across
-                    // several of its own when its memtable is smaller than the
-                    // writer's — the numbers still ascend, so only the target
-                    // check below has to care.
+                    // The entry names the generation its rows belong to, so
+                    // the boundary is read, not measured. A WAL-only entry
+                    // names none and the size rule below answers for it.
                     if let Some(generation) = entry.generation
                         && generation > active.generation()
                         && !active.batch_store().is_empty()
@@ -1516,14 +1512,12 @@ async fn replay_memtable_from_wal(
                         } else {
                             active.generation() + 1
                         };
-                        // A target's generation names the directory its
-                        // payload was spilled to, and the memtable's names the
-                        // generation it flushes as, so replay has to adopt the
-                        // target's number for both. It can only do that while
-                        // its own splitting has left that number still ahead —
-                        // otherwise a second generation would take a number
-                        // already written out. A memtable smaller than the one
-                        // the WAL was written under is what gets it there.
+                        // A target's generation names its payload directory
+                        // and the memtable's names the generation it flushes
+                        // as, so replay adopts the target's number for both.
+                        // Only possible while that number is still ahead;
+                        // behind, a second generation would take a number
+                        // already written out.
                         if target.generation != expected_generation {
                             return Err(Error::io(format!(
                                 "WAL target generation {} at position {} does not follow active generation {}; the memtable replaying this WAL is smaller than the one that wrote it",
@@ -1571,13 +1565,11 @@ async fn replay_memtable_from_wal(
                         }
                     }
 
-                    // The boundary an entry naming no generation gets: the same
-                    // criteria the live path uses, measured against this whole
-                    // entry, so no entry is split across two memtables and each
-                    // sealed one covers a clean range of complete entries. An
-                    // empty memtable is never rotated: a fresh one holds an
-                    // oversized entry no better, left to the insert below to
-                    // surface.
+                    // The boundary an entry naming no generation gets, on the
+                    // live path's criteria measured over the whole entry, so no
+                    // entry straddles two memtables. An empty one is never
+                    // rotated — a fresh memtable holds an oversized entry no
+                    // better, and the insert below surfaces it.
                     let entry_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                     if entry.target.is_none()
                         && !active.batch_store().is_empty()
@@ -1590,12 +1582,11 @@ async fn replay_memtable_from_wal(
                             entry_rows,
                         )
                     {
-                        // Splitting here would publish the generation replay is
-                        // leaving under a number the record goes on to reuse,
-                        // and a Blob v2 target naming that number would then
-                        // have two generations over it. Nothing has been
-                        // published yet, so refusing leaves the shard reopenable
-                        // under a memtable as large as the one that wrote it.
+                        // Splitting would publish this generation under a
+                        // number the record goes on to reuse, putting two
+                        // generations over one Blob v2 payload directory.
+                        // Nothing is published yet, so the shard still reopens
+                        // under the memtable size that wrote it.
                         if let Some(generation) = entry.generation {
                             return Err(Error::io(format!(
                                 "WAL entry at position {} continues generation {} past the \
@@ -1747,16 +1738,11 @@ fn memtable_resident_bytes(memtable: &MemTable) -> usize {
         + super::memtable::pk_bloom_filter_bytes()
 }
 
-/// Flush a sealed replay memtable to a Lance generation, choosing the indexed
-/// path when secondary indexes are configured (mirroring the live memtable-flush
-/// handler). Commits the manifest, stamping `covered` as the generation's
-/// `replay_after_wal_entry_position` so a later reopen skips these entries.
 /// Index the batches a replayed memtable holds.
 ///
-/// Replay inserts with `insert_batches_only`, so a memtable it built carries no
-/// index until this runs. The primary-key sidecar a flush writes is trained from
-/// that index, so a memtable flushed without this one lands on storage with no
-/// sidecar and its rows cannot be looked up by key.
+/// Replay inserts with `insert_batches_only`, which builds no index. A flush
+/// trains its primary-key sidecar from that index, so without this the
+/// generation lands with no sidecar and its rows cannot be looked up by key.
 async fn index_replayed_batches(memtable: &MemTable) -> Result<()> {
     let Some(indexes) = memtable.indexes_arc() else {
         return Ok(());
@@ -1775,6 +1761,10 @@ async fn index_replayed_batches(memtable: &MemTable) -> Result<()> {
     Ok(())
 }
 
+/// Flush a sealed replay memtable to a Lance generation, taking the indexed path
+/// when secondary indexes are configured, as the live flush handler does.
+/// `covered` is stamped as the generation's `replay_after_wal_entry_position`,
+/// so a later reopen skips these entries.
 async fn flush_replayed_memtable(
     flusher: &MemTableFlusher,
     memtable: &MemTable,
@@ -2047,12 +2037,10 @@ impl WriterSchema {
     /// A fresh, cursor-bound memtable under this schema at a given generation
     /// and writer-global coordinate.
     ///
-    /// Always builds and binds an `IndexStore`, even with no user indexes and
-    /// no primary key. It is what carries the memtable's `indexed_count`, and
-    /// binding it to the writer's cursors is what lets a reader derive the
-    /// visible prefix — so an index-less memtable that skipped this would fall
-    /// back to `visible == indexed` and publish rows before they were durable.
-    /// (A PK memtable also needs the PK dedup index and its flushed sidecar.)
+    /// An `IndexStore` is always built and bound, even with no user indexes and
+    /// no primary key: it carries `indexed_count`, which is how a reader derives
+    /// the visible prefix. Skipping it would fall back to `visible == indexed`
+    /// and publish rows before they were durable.
     ///
     /// `target` is the data target a replayed entry recorded; `None` assigns a
     /// fresh one when [`Self::preassigns_data_target`].
@@ -3954,28 +3942,21 @@ impl ShardWriter {
 
     /// Hold this writer to `schema` from now on, without reopening it.
     ///
-    /// A schema change on the base table — a column added, dropped, or renamed
-    /// at any depth, or relaxed to nullable — otherwise leaves a live writer
-    /// rejecting every write shaped to the new schema, and reopening it replays
-    /// the whole WAL tail and rebuilds every in-memory index.
-    ///
     /// The active memtable is sealed under the schema it was written with and
     /// flushes as a generation of that schema, with the indexes it was built
-    /// with; the next memtable is created under `schema`, with `index_configs`.
-    /// Reads resolve each memtable to the table's schema by field id, the way
-    /// they already resolve sealed generations, so the rows written before stay
-    /// readable under the new names. A WAL entry written under the old schema is
-    /// conformed to whatever schema a later reopen passes.
+    /// with; the next is created under `schema` and `index_configs`. Reads
+    /// resolve a memtable by field id the way they resolve a sealed generation,
+    /// so rows written before stay readable under the new names.
     ///
     /// `schema` should carry each field's id under `lance:field_id`, as for
-    /// [`Self::open`]. The primary key must keep its field ids; a primary key
-    /// cannot be added, dropped or replaced under a MemWAL. A schema and index
-    /// set equivalent to the current ones is a no-op, so concurrent callers
-    /// reacting to the same change seal once. An empty active memtable is
-    /// replaced rather than sealed: it holds nothing to flush.
+    /// [`Self::open`]. A primary key cannot be added, dropped or replaced under
+    /// a MemWAL, so its field ids must not move. An empty active memtable is
+    /// replaced rather than sealed, and a schema and index set equivalent to
+    /// the current ones is a no-op, so concurrent callers reacting to the same
+    /// change seal once.
     ///
-    /// MemTable mode only. `Ok(None)` when the schema and index set are
-    /// already current; otherwise a [`SealFence`] covering whatever was sealed.
+    /// MemTable mode only. `Ok(None)` when nothing would change; otherwise a
+    /// [`SealFence`] covering whatever was sealed.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -9373,14 +9354,10 @@ mod tests {
 
     /// A WAL holding more batches than one memtable's capacity must reopen.
     ///
-    /// One memtable holds at most `max_memtable_batches` batches, but a WAL is
-    /// unbounded, so replay has to rotate — seal the full memtable, start a fresh
-    /// one — exactly as the live write path does. Before, replay stuffed
-    /// everything into a single memtable and `open()` failed outright with
-    /// "MemTable batch store is full", leaving the shard permanently unopenable.
-    ///
-    /// A WAL-only writer records no generation, so this rotation is the only
-    /// boundary its entries get and the one replay must supply itself.
+    /// One memtable holds at most `max_memtable_batches` batches and a WAL is
+    /// unbounded, so replay rotates the way the live write path does, or the
+    /// batch store fills and the shard never reopens. A WAL-only writer records
+    /// no generation, so this rotation is the only boundary its entries get.
     #[tokio::test]
     async fn test_replay_rotates_when_wal_exceeds_one_memtable() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;

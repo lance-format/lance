@@ -440,19 +440,9 @@ impl LsmScanPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
-                // The dedup scan applies the filter post-dedup; pushing it
-                // into the raw scan would resurrect older versions of PKs
-                // whose newest version fails the predicate. Folding
-                // `NOT _tombstone` here is correct: a tombstone wins the
-                // position-based dedup (suppressing the older real row) and is
-                // then dropped by this predicate. A memtable without the column
-                // (legacy / test) gets no fold.
-                // A memtable created before a schema change holds the names
-                // and shapes the table had then, and is resolved as a
-                // generation sealed at that point would be. One created under
-                // the table's own names is asked for under them and needs no
-                // resolution. A predicate the stored names cannot answer runs
-                // above the resolution, which is still after the dedup.
+                // A memtable from before a schema change stores the table's
+                // older names, and resolves the way a generation sealed then
+                // does. One that matches the table needs no resolver.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(
@@ -476,6 +466,13 @@ impl LsmScanPlanner {
                     }
                 }
                 scanner.with_row_address();
+
+                // The dedup scan applies the filter post-dedup; pushing it into
+                // the raw scan would resurrect older versions of keys whose
+                // newest version fails the predicate. Folding `NOT _tombstone`
+                // in is correct: a tombstone wins the position-based dedup,
+                // suppressing the older real row, and is then dropped by this
+                // predicate. A memtable without the column gets no fold.
                 let folded;
                 let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
                     folded = fold_not_tombstone(stored_filter.as_ref());

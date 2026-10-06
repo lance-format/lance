@@ -1227,9 +1227,6 @@ impl LsmFtsSearchPlanner {
                     scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
-                // Bound here, limited below: this arm's limit rule is not the
-                // one `bind` applies, so only the column binding is taken from
-                // the shape of the set.
                 let bound_query = bind_to_stored_columns(query, columns, &stored_columns)?;
                 // A predicate that could not be pushed down runs above the
                 // reconciliation, which is after the search has taken its top-k
@@ -1253,9 +1250,8 @@ impl LsmFtsSearchPlanner {
                 ..
             } => {
                 let document_granularity = query_document_granularity(query)?;
-                // A memtable created before a schema change holds the names the
-                // table had then, and is resolved as the sealed-generation arm
-                // above resolves a generation. `None` in the steady state.
+                // A memtable from before a schema change stores the table's
+                // older names; `None` is the steady state.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(
