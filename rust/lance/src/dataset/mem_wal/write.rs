@@ -1734,10 +1734,11 @@ fn memtable_reached_flush_threshold(
 /// Whether a memtable physically cannot take `incoming`, as opposed to being
 /// merely large enough to seal.
 ///
-/// The batch store is fixed-length and the index store is sized from the row
-/// cap, so these two are refusals. The byte and resident-memory arms of
-/// [`fill_reached_flush_threshold`] are seal triggers: crossing one means it is
-/// time to start another memtable, not that this one is full.
+/// The batch store holds a fixed number of batches and the index store is
+/// sized from the row cap, so those two are refusals. The byte and
+/// resident-memory arms of [`fill_reached_flush_threshold`] are seal triggers:
+/// crossing one means it is time to start another memtable, not that this one
+/// has no room.
 fn memtable_cannot_take(
     memtable: &MemTable,
     max_memtable_rows: usize,
@@ -5753,10 +5754,9 @@ mod tests {
     /// instead, and reopens once it is given a memtable the size the WAL was
     /// written under.
     ///
-    /// Nothing is published here because the refusal lands on the first
-    /// generation. A refusal later in a replay leaves the generations before it
-    /// committed, which is why the reopen below is what the shard is checked
-    /// against rather than the manifest being untouched in general.
+    /// The refusal lands on the first generation, so nothing is published. One
+    /// later in a replay leaves the generations before it committed, so the
+    /// reopen below is what the shard is checked against.
     #[tokio::test]
     async fn test_replay_refuses_a_recorded_generation_it_cannot_hold() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
