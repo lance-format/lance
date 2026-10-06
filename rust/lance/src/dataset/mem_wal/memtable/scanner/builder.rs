@@ -1383,7 +1383,9 @@ impl MemTableScanner {
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::index::MemIndexSpec;
-    use arrow_array::{BooleanArray, Float64Array, Int32Array, StringArray};
+    use arrow_array::{
+        BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     fn create_test_schema() -> SchemaRef {
@@ -2919,5 +2921,232 @@ mod tests {
         let got = scanner.try_into_batch().await.unwrap();
         assert_eq!(got.num_rows(), 1, "only 1.0 matches {filter}");
         assert_eq!(got["value"].null_count(), 0);
+    }
+
+    /// Three batches holding the values a comparison is most likely to get
+    /// wrong: nulls, NaN, both zeros, the infinities, empty and non-ASCII text.
+    /// `rid` identifies each row and carries no index.
+    fn differential_memtable(indexed: &[&str]) -> (Arc<BatchStore>, Arc<IndexStore>, SchemaRef) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int32, false),
+            Field::new("i", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("d", DataType::Date32, true),
+        ]));
+        let ints = [
+            Some(0i64),
+            Some(-3),
+            None,
+            Some(7),
+            Some(7),
+            Some(i64::MIN),
+            Some(i64::MAX),
+            Some(2),
+            None,
+            Some(-1),
+            Some(5),
+            Some(0),
+        ];
+        let floats = [
+            Some(0.0f64),
+            Some(-0.0),
+            None,
+            Some(f64::NAN),
+            Some(1.5),
+            Some(-2.5),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1.5),
+            None,
+            Some(3.0),
+            Some(-0.0),
+        ];
+        let strs = [
+            Some("apple"),
+            Some(""),
+            None,
+            Some("app"),
+            Some("apricot"),
+            Some("b"),
+            Some("é"),
+            Some("apple"),
+            None,
+            Some("zz"),
+            Some("ap%"),
+            Some("a_b"),
+        ];
+        let bools = [
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(true),
+            Some(false),
+            None,
+        ];
+        let dates = [
+            Some(0i32),
+            Some(19000),
+            None,
+            Some(-1),
+            Some(19000),
+            Some(20000),
+            Some(1),
+            None,
+            Some(19999),
+            Some(0),
+            Some(-365),
+            Some(19001),
+        ];
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let specs: Vec<MemIndexSpec> = indexed
+            .iter()
+            .map(|column| {
+                let field_id = lance_schema.field(column).unwrap().id;
+                MemIndexSpec::btree(format!("{column}_idx"), field_id, *column)
+            })
+            .collect();
+        let indexes = IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        for chunk in 0..3usize {
+            let range = chunk * 4..chunk * 4 + 4;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(
+                        range.clone().map(|r| r as i32).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(ints[range.clone()].to_vec())),
+                    Arc::new(Float64Array::from(floats[range.clone()].to_vec())),
+                    Arc::new(StringArray::from(strs[range.clone()].to_vec())),
+                    Arc::new(BooleanArray::from(bools[range.clone()].to_vec())),
+                    Arc::new(Date32Array::from(dates[range].to_vec())),
+                ],
+            )
+            .unwrap();
+            let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, offset, Some(position))
+                .unwrap();
+        }
+        (batch_store, Arc::new(indexes), schema)
+    }
+
+    async fn filtered_rids(
+        memtable: &(Arc<BatchStore>, Arc<IndexStore>, SchemaRef),
+        filter: &str,
+        use_index: bool,
+    ) -> Vec<i32> {
+        let (batch_store, indexes, schema) = memtable;
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.filter(filter).unwrap();
+        scanner.use_index(use_index);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut rids = batch["rid"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        rids.sort_unstable();
+        rids
+    }
+
+    /// Whatever an index answers must be what reading every row answers. Every
+    /// filter here goes both ways over the same memtable, with indexes on some
+    /// columns and not others so a filter mixes indexed and unindexed parts.
+    #[tokio::test]
+    async fn an_index_answers_every_filter_the_way_a_scan_does() {
+        let filters = [
+            "i = 7",
+            "i = 0",
+            "i <> 7",
+            "i < 0",
+            "i <= 0",
+            "i > 2",
+            "i >= 2",
+            "i BETWEEN -3 AND 5",
+            "i IN (0, 7, 99)",
+            "i IN (0, NULL)",
+            "i NOT IN (0, 7)",
+            "i IS NULL",
+            "i IS NOT NULL",
+            "i < -9223372036854775807",
+            "i >= 9223372036854775807",
+            "f = 0.0",
+            "f = -0.0",
+            "f = 'NaN'",
+            "f > 1.0",
+            "f >= 1.5",
+            "f < 0.0",
+            "f <= 0.0",
+            "f < 'Infinity'",
+            "f > '-Infinity'",
+            "f IN (1.5, 3.0)",
+            "f IS NULL",
+            "f IS NOT NULL",
+            "f BETWEEN -1.0 AND 1.0",
+            "s = 'apple'",
+            "s = ''",
+            "s < 'b'",
+            "s >= 'app'",
+            "s > 'apple'",
+            "s IN ('b', 'zz')",
+            "s IS NULL",
+            "s LIKE 'ap%'",
+            "s LIKE 'app%'",
+            "s LIKE 'a_b'",
+            "s LIKE 'ap\\%%'",
+            "s LIKE '%'",
+            "s LIKE ''",
+            "s = 'é'",
+            "s > 'z'",
+            "i > 0 AND s = 'apple'",
+            "i > 0 OR s = 'b'",
+            "i = 7 AND f = 1.5",
+            "i = 7 OR f IS NULL",
+            "(i < 0 OR i > 5) AND s IS NOT NULL",
+            "NOT (i = 7)",
+            "i = 7 AND rid > 3",
+            "i = 7 OR rid = 0",
+            "rid >= 6 AND f > 0.0",
+            "b",
+            "NOT b",
+            "b = true",
+            "b = false",
+            "b IS NULL",
+            "b IS NOT TRUE",
+            "b AND i > 0",
+            "d = DATE '2022-01-08'",
+            "d > DATE '1970-01-01'",
+            "d <= DATE '1970-01-01'",
+            "d BETWEEN DATE '1969-01-01' AND DATE '2022-01-08'",
+            "d IS NULL",
+            "d < DATE '2024-01-01' AND b",
+        ];
+        for indexed in [
+            &["i", "f", "s", "b", "d"][..],
+            &["i"][..],
+            &["s", "f"][..],
+            &["b", "d"][..],
+        ] {
+            let memtable = differential_memtable(indexed);
+            for filter in filters {
+                let scanned = filtered_rids(&memtable, filter, false).await;
+                let indexed_rids = filtered_rids(&memtable, filter, true).await;
+                assert_eq!(
+                    indexed_rids, scanned,
+                    "`{filter}` with indexes on {indexed:?}: index route vs reading every row"
+                );
+            }
+        }
     }
 }
