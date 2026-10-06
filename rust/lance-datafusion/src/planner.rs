@@ -215,7 +215,7 @@ impl Default for LanceContextProvider {
 impl ContextProvider for LanceContextProvider {
     fn get_table_source(
         &self,
-        name: datafusion::sql::TableReference,
+        name: datafusion::common::TableReference,
     ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Attempt to reference inner table {} not supported",
@@ -2176,28 +2176,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_regexp_match_infer_error_without_boolean_coercion() {
-        // With the fix applied, using parse_filter should coerce regexp_match to boolean
-        // even when nested in a larger AND expression, so this should plan successfully.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("keywords", DataType::Utf8, true),
-            Field::new("natural_caption", DataType::Utf8, true),
-            Field::new("poetic_caption", DataType::Utf8, true),
-        ]));
+    #[rstest]
+    #[case::bare("regexp_match(name, 'e[12]')", [false, true, true, false, false, false])]
+    #[case::is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL",
+        [false, true, true, false, false, false]
+    )]
+    #[case::is_null(
+        "regexp_match(name, 'e[12]') IS NULL",
+        [true, false, false, true, true, true]
+    )]
+    #[case::not_bare(
+        "NOT regexp_match(name, 'e[12]')",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_bare(
+        "regexp_match(name, 'e[12]') AND name <> 'name2'",
+        [false, true, false, false, false, false]
+    )]
+    #[case::or_bare(
+        "regexp_match(name, 'e[12]') OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    #[case::not_is_not_null(
+        "NOT (regexp_match(name, 'e[12]') IS NOT NULL)",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_is_null(
+        "regexp_match(name, 'e[12]') IS NULL AND name IS NOT NULL",
+        [true, false, false, false, true, true]
+    )]
+    #[case::or_is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    fn test_regexp_match_filter_coercion(#[case] filter: &str, #[case] expected: [bool; 6]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [
+                Some("name0"),
+                Some("name1"),
+                Some("name2"),
+                None,
+                Some("name4"),
+                Some("name5")
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let result = physical_expr.evaluate(&batch).unwrap();
 
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::is_not_null("regexp_match(name, 'e[12]') IS NOT NULL")]
+    #[case::is_null("regexp_match(name, 'e[12]') IS NULL")]
+    #[case::comparison("regexp_match(name, 'e[12]') = regexp_match(name, 'e[12]')")]
+    fn test_regexp_match_preserves_value_contexts(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let planner = Planner::new(schema);
 
-        let expr = planner
-            .parse_filter(
-                "regexp_match(keywords, 'Liberty|revolution') AND \
-                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
-                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
-            )
-            .unwrap();
-
-        // Should not panic
-        let _physical = planner.create_physical_expr(&expr).unwrap();
+        assert_eq!(
+            planner.parse_filter(filter).unwrap(),
+            planner.parse_expr(filter).unwrap()
+        );
     }
 
     #[test]

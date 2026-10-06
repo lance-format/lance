@@ -436,12 +436,11 @@ impl LsmVectorSearchPlanner {
 
         // No cross-source dedup needed (see struct doc): SortExec(per partition)
         // + SortPreservingMerge does the p-way distance-ordered top-k merge.
-        #[allow(deprecated)]
         // The downstream `SortPreservingMergeExec` already spawns one driver
         // task per input partition (one per union arm) via `spawn_buffered`, so
         // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
         // task without an extra repartition.
-        let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
+        let merged = UnionExec::try_new(knn_plans)?;
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(

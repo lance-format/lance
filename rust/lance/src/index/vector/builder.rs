@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::{
@@ -592,7 +593,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
+    /// Remap through an in-memory mapping (the legacy entry point). The
+    /// per-partition tasks are `'static`, so the map is shared through an
+    /// owned translator (the same clone this method always made).
     pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
+        self.remap_with(RowAddrTranslator::sync(mapping.clone()))
+            .await
+    }
+
+    /// Remap through a translator whose payload may need reads, one
+    /// partition's addresses at a time.
+    pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.clone()).await
+    }
+
+    async fn remap_with(&mut self, mapping: RowAddrTranslator) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -604,7 +619,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
-        let mapping = Arc::new(mapping.clone());
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();
@@ -613,12 +627,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .as_any()
                     .downcast_ref::<IVFIndex<S, Q>>()
                     .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+                let part = ivf_index
+                    .load_partition(part_id, false, &NoOpMetricsCollector)
+                    .await?;
+
+                // One partition's addresses are the unit of translation; the
+                // partition itself is the working set it always was.
+                let row_ids: Vec<u64> = part.storage.row_ids().copied().collect();
+                let mapping = mapping.resolve(row_ids).await?;
                 let (storage, index) = if S::name() == HNSW::name() {
                     remap_hnsw_partition(ivf_index, part_id, &mapping).await?
                 } else {
-                    let part = ivf_index
-                        .load_partition(part_id, false, &NoOpMetricsCollector)
-                        .await?;
                     let storage = part.storage.remap(&mapping)?;
                     let index = part.index.remap(&mapping, &storage)?;
                     (storage, index)
@@ -630,9 +649,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         });
 
-        // Heap-pin the merge stage: at opt-level 0 its state machine is the bulk of
-        // this future, and this future is embedded in every caller up to
-        // `compact_files` (see `remap_boxed` in ivf.rs).
+        // `merge_partitions` is the bulk of this future; `remap_streaming`/`remap`
+        // and the 11-arm v3 dispatch (`remap_index_file_v3`) each carry a copy
+        // otherwise. The eager compaction remap polls that chain under Python's
+        // `block_on` on the calling thread, which overflowed the Windows
+        // main-thread stack in CI (dev-profile wheel, opt-level 0, where every
+        // awaited future is also a separate stack temporary of its caller).
         let files = Box::pin(
             self.merge_partitions(
                 stream::iter(build_iter)
@@ -999,9 +1021,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 .map(|row_id| partition_map.get(row_id).copied()),
                         );
                         let part_ids = UInt32Array::from(part_ids);
+                        // A batch that already carries the column would make
+                        // this a duplicate-name error, so report it instead of
+                        // panicking inside the spawned task.
                         batch = batch
                             .try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids.clone()))
-                            .expect("failed to add part id column");
+                            .map_err(|e| {
+                                Error::invalid_input(format!(
+                                    "could not attach the precomputed partition ids to a batch \
+                                     with schema {}: {e}",
+                                    batch.schema()
+                                ))
+                            })?;
 
                         if part_ids.null_count() > 0 {
                             log::info!(
@@ -1029,7 +1060,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 })
             })
             .buffered(get_num_compute_intensive_cpus())
-            .map(|x| x.unwrap())
+            .map(|x| {
+                x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
+            })
             .peekable(),
         );
 
@@ -3693,6 +3726,102 @@ mod tests {
             IvfBuildParams::try_with_centroids(centers.len(), Arc::new(centroids)).unwrap();
         ivf_params.target_partition_size = target_partition_size;
         VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params)
+    }
+
+    /// A batch that already carries `__ivf_part_id` used to panic inside the
+    /// spawned transform task (`try_with_column` rejects the duplicate name and
+    /// the call site expected it away), and the panic came back out of the
+    /// stream as a `JoinError` that was itself unwrapped. Both steps now report.
+    #[tokio::test]
+    async fn test_shuffle_data_reports_duplicate_partition_id_column() {
+        use lance_index::vector::v3::shuffler::IvfShuffler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = write_clusters(uri, &[(8, 0.0)]).await;
+        let index_dir = dataset.indices_dir().join("idx");
+
+        // A one-row partition map keyed by a row id the batch below carries.
+        let parts_uri = format!("{uri}_parts");
+        let parts_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("row_id", DataType::UInt64, false),
+            arrow_schema::Field::new("partition", DataType::UInt32, false),
+        ]));
+        let parts_batch = RecordBatch::try_new(
+            parts_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt32Array::from(vec![0u32])),
+            ],
+        )
+        .unwrap();
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(parts_batch)], parts_schema.clone());
+        crate::Dataset::write(reader, &parts_uri, None)
+            .await
+            .unwrap();
+
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 4]), 4)
+                .unwrap();
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids.clone())).unwrap();
+        ivf_params.precomputed_partitions_file = Some(parts_uri);
+
+        let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+            dataset,
+            "vec".to_owned(),
+            index_dir.clone(),
+            DistanceType::L2,
+            Box::new(IvfShuffler::new(index_dir, 1)),
+            Some(ivf_params),
+            Some(()),
+            (),
+            None,
+        );
+        let Ok(mut builder) = builder else {
+            panic!("the builder should accept centroids with a partitions file");
+        };
+        builder
+            .with_ivf(IvfModel::new(centroids, None))
+            .with_quantizer(FlatQuantizer::new(4, DistanceType::L2));
+
+        // The batch arrives with the partition column already attached.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            arrow_schema::Field::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            PART_ID_FIELD.clone(),
+        ]));
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 4]), 4)
+                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(vectors),
+                Arc::new(UInt32Array::from(vec![0u32])),
+            ],
+        )
+        .unwrap();
+
+        let result = builder
+            .shuffle_data(Some(stream::iter(vec![Ok(batch)])))
+            .await;
+        let Err(err) = result else {
+            panic!("expected the duplicate partition column to be reported");
+        };
+        assert!(
+            err.to_string().contains("precomputed partition ids"),
+            "unexpected error: {err}"
+        );
     }
 
     fn cluster_schema() -> Arc<arrow_schema::Schema> {

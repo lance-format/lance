@@ -2896,7 +2896,7 @@ impl Dataset {
     /// (Lance 0.16 and earlier). Neither is rejected on read, so the search
     /// result is checked and a scan takes over when it does not match --
     /// returning some other fragment's data would be silent corruption.
-    fn find_fragment(&self, id: u64) -> Option<&Fragment> {
+    pub(crate) fn find_fragment(&self, id: u64) -> Option<&Fragment> {
         if !u32::try_from(id).is_ok_and(|id| self.fragment_bitmap.contains(id)) {
             return None;
         }
