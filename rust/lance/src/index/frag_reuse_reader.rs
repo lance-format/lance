@@ -543,7 +543,7 @@ pub mod tests {
         }
         let batch = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .project_with_transform(&[("value", "i")])
             .unwrap()
             .try_into_batch()
