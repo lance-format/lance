@@ -10,7 +10,7 @@
 //! scan, point lookup, vector search, full-text search — goes through
 //! [`GenerationRead`] so they resolve a generation the same way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -52,7 +52,12 @@ pub(super) struct GenerationRead {
     /// name-addressed: a scan projection takes names, and so do the column
     /// references in a DataFusion predicate. Columns the table no longer has
     /// are absent.
+    /// The table's name for a column to the name this generation stores it
+    /// under — the direction every caller asks in.
     names: HashMap<String, String>,
+    /// Every name this generation stores, for asking whether one of its
+    /// columns is the table's at all.
+    stored_columns: HashSet<String>,
     /// The same, under the spellings a full-text path uses.
     fts_names: HashMap<String, String>,
     /// The table's schema, also carrying field ids.
@@ -106,11 +111,20 @@ impl GenerationRead {
         projection: Vec<String>,
     ) -> Self {
         let (names, fts_names) = stored_names(&stored_schema, table_schema);
+        let stored_columns = names.keys().cloned().collect::<HashSet<_>>();
+        // Inverted once here rather than scanned per lookup.
+        let invert = |m: HashMap<String, String>| {
+            m.into_iter()
+                .map(|(stored, in_table)| (in_table, stored))
+                .collect::<HashMap<_, _>>()
+        };
+        let (names, fts_names) = (invert(names), invert(fts_names));
         let (table_schema, pk_columns) = (Arc::clone(table_schema), pk_columns.to_vec());
         Self {
             stored_schema,
             names,
             fts_names,
+            stored_columns,
             table_schema,
             pk_columns,
             projection,
@@ -119,10 +133,7 @@ impl GenerationRead {
 
     /// The generation's name for `column`. `column` is the table's name for it.
     pub(super) fn stored_name(&self, column: &str) -> Option<&str> {
-        self.names
-            .iter()
-            .find(|(_, in_table)| *in_table == column)
-            .map(|(in_generation, _)| in_generation.as_str())
+        self.names.get(column).map(String::as_str)
     }
 
     /// [`Self::stored_name`] for a full-text path, which elides a list's
@@ -131,10 +142,7 @@ impl GenerationRead {
     /// list has the same spelling as the element itself, and one map would have
     /// to answer both with the same field.
     pub(super) fn stored_fts_name(&self, column: &str) -> Option<&str> {
-        self.fts_names
-            .iter()
-            .find(|(_, in_table)| *in_table == column)
-            .map(|(in_generation, _)| in_generation.as_str())
+        self.fts_names.get(column).map(String::as_str)
     }
 
     /// The primary key under the names this generation stores it under.
@@ -306,7 +314,7 @@ impl GenerationRead {
         let fields: Vec<Field> = source
             .fields()
             .iter()
-            .map(|field| match self.names.contains_key(field.name()) {
+            .map(|field| match self.stored_columns.contains(field.name()) {
                 true => field.as_ref().clone(),
                 false => without_field_id(field),
             })
@@ -360,7 +368,7 @@ impl GenerationRead {
         // A generation's own columns are not the table's, so they pass through
         // as the generation has them.
         for field in source.fields() {
-            let is_the_tables = self.names.contains_key(field.name());
+            let is_the_tables = self.stored_columns.contains(field.name());
             if !is_the_tables && fields.iter().all(|f| f.name() != field.name()) {
                 fields.push(field.as_ref().clone());
             }
@@ -825,7 +833,12 @@ mod tests {
         let (_, fts) = stored_names(&list("body", 3), &list("text", 3));
         let read = GenerationRead {
             names: HashMap::new(),
-            fts_names: fts,
+            stored_columns: HashSet::new(),
+            // Held the way the lookup asks: the table's name to the stored one.
+            fts_names: fts
+                .into_iter()
+                .map(|(stored, in_table)| (in_table, stored))
+                .collect(),
             stored_schema: Schema::empty(),
             table_schema: Arc::new(Schema::empty()),
             pk_columns: Vec::new(),
