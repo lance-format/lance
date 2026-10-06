@@ -491,6 +491,12 @@ enum Unsupported {
     /// can be accepted after the check and before the commit. That row is then
     /// in a table whose schema forbids it, and every later merge of it fails.
     Tightening,
+    /// A sharded MemWAL picks the shard that owns a row by hashing its primary
+    /// key, and a writer caches the schema it resolves that key through. Two
+    /// writers holding different names for the key hash different columns, so
+    /// the same row can be accepted into two shards and a lookup by key finds
+    /// one of them.
+    RenameKey,
 }
 
 /// Refuse `unsupported` when the table has a MemWAL attached.
@@ -517,6 +523,11 @@ async fn reject_on_mem_wal(dataset: &Dataset, unsupported: Option<Unsupported>) 
             "cannot make a column non-nullable on a table with a MemWAL attached: the check \
              runs against the base table, and a write admitted into the WAL while it runs is \
              not there to be checked. Drop the MemWAL first."
+        }
+        Unsupported::RenameKey => {
+            "cannot rename a primary key column on a table with a MemWAL attached: the key is \
+             what decides which shard owns a row, and a writer that has not yet seen the new \
+             name would route by a different column. Drop the MemWAL first."
         }
     }))
 }
@@ -850,6 +861,14 @@ pub(super) async fn alter_columns(
                 .is_none_or(|field| field.nullable)
     }) {
         Some(Unsupported::Tightening)
+    } else if alterations.iter().any(|a| {
+        a.rename.is_some()
+            && dataset
+                .schema()
+                .field(&a.path)
+                .is_some_and(|field| field.is_unenforced_primary_key())
+    }) {
+        Some(Unsupported::RenameKey)
     } else {
         None
     };
@@ -1490,6 +1509,69 @@ mod test {
                 .await
                 .unwrap_or_else(|e| panic!("`{expression}` must be unaffected: {e}"));
         }
+    }
+
+    /// The key is what a sharded MemWAL hashes to pick a shard, so renaming it
+    /// while one is attached would let two writers route the same row two ways.
+    /// Every other column renames freely.
+    #[tokio::test]
+    async fn alter_columns_on_a_mem_wal_table_refuses_renaming_the_key() {
+        use crate::dataset::mem_wal::DatasetMemWalExt;
+        use arrow_array::Int64Array;
+        use lance_core::datatypes::{
+            LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+        };
+
+        let key_meta = HashMap::from([
+            (LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string()),
+            (
+                LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+                "0".to_string(),
+            ),
+        ]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false).with_metadata(key_meta),
+            ArrowField::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(Int64Array::from(vec![Some(10i64)])),
+            ],
+        )
+        .unwrap();
+        let uri = format!("memory://mem_wal_rename_key_{}", uuid::Uuid::new_v4());
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        assert!(
+            !dataset.schema().unenforced_primary_key().is_empty(),
+            "the test table must declare a key for the guard to have anything to refuse"
+        );
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename("key".into())])
+            .await
+            .expect_err("renaming the key must be refused");
+        assert!(
+            err.to_string()
+                .contains("cannot rename a primary key column"),
+            "unexpected error: {err}"
+        );
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("amount".into())])
+            .await
+            .expect("renaming any other column must still be allowed");
+        assert!(dataset.schema().field("amount").is_some());
     }
 
     /// What the MemWAL guard refuses, and what it lets through.
