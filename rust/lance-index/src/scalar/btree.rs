@@ -97,19 +97,12 @@ const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
 const PAGE_NUM_PER_RANGE_PARTITION_META_KEY: &str = "page_num_per_range_partition";
 /// BTree index format version 1: the `ids` column stores physical row
-/// addresses (`_rowaddr`) instead of row ids, so the index survives a
-/// fragment-reuse-index remap on a stable-row-id dataset. A segment persisted
-/// before this version is row-id domain. Recorded in `IndexMetadata::index_version`
-/// and passed to [`ScalarIndexPlugin::load_index`](super::registry::ScalarIndexPlugin::load_index)
-/// so an older segment is read correctly instead of being reinterpreted under
-/// the newest format.
+/// addresses (`_rowaddr`).
+///
+/// The older version (0) stored row ids (`_rowid`).
 pub const BTREE_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
-/// The current BTree index format version, stamped on every freshly written
-/// segment. Currently equal to [`BTREE_ROW_ADDR_DOMAIN_VERSION`], but the two
-/// mean different things: this one just tracks "the newest format," so code
-/// that wants to simulate or assert "a fresh segment's version" should use
-/// this constant, not the domain threshold -- they will diverge the day this
-/// format changes again for an unrelated reason.
+/// The latest index format version (mainly used in tests that don't want to target
+/// a specific version)
 pub const BTREE_INDEX_VERSION: u32 = BTREE_ROW_ADDR_DOMAIN_VERSION;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
@@ -7807,7 +7800,9 @@ mod tests {
         build_plain_btree(&store, page_size, num_pages).await;
 
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
-        let index = BTreeIndex::load(store.clone(), None, &cache, true).await.unwrap();
+        let index = BTreeIndex::load(store.clone(), None, &cache, true)
+            .await
+            .unwrap();
 
         // Baseline: the per-page path costs at least one request per page.
         let reader = store.open_index_file(BTREE_PAGES_NAME).await.unwrap();

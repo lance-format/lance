@@ -57,9 +57,19 @@ class BTreeIndex(UpgradeDowngradeTest):
         assert table.num_rows == 1
         assert table.column("idx").to_pylist() == [7]
 
-        # Verify index is used
-        explain = ds.scanner(filter="btree == 7").explain_plan()
-        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+        # Verify index is used -- but only when we can be sure this build
+        # recognizes whatever format the index is actually in. BTREE moved to
+        # storing row addresses and bumped its on-disk format version (see
+        # BTreeRowAddressDomainIndex below); the current build understands
+        # both the old and new format, but an older build only understands
+        # the old one. In the upgrade/downgrade round trip this same method
+        # runs under the older build *after* the current build's check_write
+        # has already rebuilt the index in the newer format, so the older
+        # build can no longer see it here and must fall back to a full scan
+        # -- still correct, just not re-asserted as "indexed" in that case.
+        if lance.__version__ != self.compat_version:
+            explain = ds.scanner(filter="btree == 7").explain_plan()
+            assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
 
     def check_write(self):
         """Verify can insert data and optimize BTREE index."""
@@ -75,6 +85,116 @@ class BTreeIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
         # Verify new data is queryable
+        table = ds.to_table(filter="btree == 1000")
+        assert table.num_rows >= 1
+
+
+@compat_test(min_version="0.36.0")
+class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
+    """Test BTREE forward/backward compatibility across the row-address-domain
+    format change.
+
+    BTREE was changed to store physical row addresses (``_rowaddr``) instead
+    of row ids, which bumped its on-disk format version. This dataset enables
+    stable row ids, so the two domains genuinely differ and updating a
+    pre-change segment must rebuild it rather than merge new data into it (a
+    merge would otherwise silently combine row ids and row addresses in the
+    same column). This test checks the full story:
+
+    - An old-format (row-id domain) BTREE index is loaded and used correctly
+      by the current build.
+    - Updating it (inserting rows, then optimizing) with the current build
+      keeps both old and new rows queryable.
+    - Once the current build has touched the index this way, an older build
+      must no longer use it -- its format version has moved past what that
+      build supports -- but it must still answer every query correctly via a
+      full scan, and must not error out when writing to the dataset
+      afterwards.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def _is_old_build(self) -> bool:
+        """True while this method body is executing inside the pinned old
+        venv under test.
+
+        `self.compat_version` names the historical release under test
+        regardless of which build actually executes a given method (this
+        class's methods run under both the old venv and the current build,
+        at different points of the upgrade/downgrade round trip). The old
+        venv has exactly that pylance version installed, so comparing it
+        against the live `lance.__version__` tells the two apart.
+        """
+        return lance.__version__ == self.compat_version
+
+    def create(self):
+        """Create a stable-row-id dataset with a BTREE index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "btree": pa.array(range(1000)),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+            enable_stable_row_ids=True,
+        )
+        dataset.create_scalar_index("btree", "BTREE")
+
+    def _assert_queryable(self, expect_index_used: bool):
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="btree == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        explain = ds.scanner(filter="btree == 7").explain_plan()
+        used_index = "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+        if expect_index_used:
+            assert used_index, "expected the BTREE index to be used"
+        else:
+            assert not used_index, (
+                "an older build must not use a BTREE index in a format it "
+                "does not understand -- it should fall back to a full scan"
+            )
+
+    def check_read(self):
+        """An old-format index must be used by the current build; a
+        too-new one must be safely ignored (but answers must stay correct)
+        by an older build."""
+        self._assert_queryable(expect_index_used=not self._is_old_build())
+
+    def check_write(self):
+        """Insert a row and update the index, then verify old and new rows
+        both stay correct -- whether or not this build can even see the
+        index."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "btree": pa.array([1000]),
+            }
+        )
+        ds.insert(data)
+        # For a build that cannot see this index at all, there is nothing
+        # registered to update, so this is a safe no-op rather than an
+        # error. For the current build updating a legacy row-id-domain
+        # segment, this must rebuild (not merge) the index -- see the class
+        # docstring.
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="btree == 7")
+        assert table.num_rows == 1
+        # `check_write` runs more than once across the upgrade/downgrade
+        # round trip, each time inserting another `btree == 1000` row, so
+        # this can't assert an exact count the way the `== 7` row (written
+        # once, in `create`) can.
         table = ds.to_table(filter="btree == 1000")
         assert table.num_rows >= 1
 
