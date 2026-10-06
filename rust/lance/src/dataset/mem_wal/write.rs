@@ -1571,7 +1571,38 @@ async fn replay_memtable_from_wal(
                     // rotated — a fresh memtable holds an oversized entry no
                     // better, and the insert below surfaces it.
                     let entry_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    // A recorded generation is followed, so replay cannot split
+                    // it: doing so would publish part of it under a number the
+                    // record goes on to reuse, and put two generations over one
+                    // Blob v2 payload directory. When the memtable physically
+                    // cannot hold it, the only honest answer is to stop.
+                    //
+                    // Only on what a memtable cannot take, never on the byte
+                    // thresholds beside it: reconciliation widens old rows to
+                    // the current schema, so a WAL written under this very
+                    // configuration can cross a byte trigger on the way back in.
+                    if let Some(generation) = entry.generation
+                        && !active.batch_store().is_empty()
+                        && memtable_cannot_take(
+                            &active,
+                            max_memtable_rows,
+                            batches.len(),
+                            entry_rows,
+                        )
+                    {
+                        return Err(Error::io(format!(
+                            "WAL entry at position {} continues generation {} past what the \
+                             memtable replaying it can hold ({} batches, {} rows); the shard \
+                             was written under a larger max_memtable_batches or \
+                             max_memtable_rows",
+                            position,
+                            generation,
+                            active.batch_store().capacity(),
+                            max_memtable_rows,
+                        )));
+                    }
                     if entry.target.is_none()
+                        && entry.generation.is_none()
                         && !active.batch_store().is_empty()
                         && memtable_reached_flush_threshold(
                             &active,
@@ -1582,19 +1613,6 @@ async fn replay_memtable_from_wal(
                             entry_rows,
                         )
                     {
-                        // Splitting would publish this generation under a
-                        // number the record goes on to reuse, putting two
-                        // generations over one Blob v2 payload directory.
-                        // Nothing is published yet, so the shard still reopens
-                        // under the memtable size that wrote it.
-                        if let Some(generation) = entry.generation {
-                            return Err(Error::io(format!(
-                                "WAL entry at position {} continues generation {} past the \
-                                 memtable replaying it; the shard was written under a larger \
-                                 max_memtable_rows or max_memtable_batches",
-                                position, generation
-                            )));
-                        }
                         let store = active.batch_store();
                         // The last entry this memtable fully absorbed is the one
                         // before the entry about to be inserted.
@@ -1713,6 +1731,24 @@ fn memtable_reached_flush_threshold(
 /// published snapshot without the write lock. One predicate, so a put cannot be
 /// refused for a seal the writer would not have made.
 #[allow(clippy::too_many_arguments)]
+/// Whether a memtable physically cannot take `incoming`, as opposed to being
+/// merely large enough to seal.
+///
+/// The batch store is fixed-length and the index store is sized from the row
+/// cap, so these two are refusals. The byte and resident-memory arms of
+/// [`fill_reached_flush_threshold`] are seal triggers: crossing one means it is
+/// time to start another memtable, not that this one is full.
+fn memtable_cannot_take(
+    memtable: &MemTable,
+    max_memtable_rows: usize,
+    incoming_batches: usize,
+    incoming_rows: usize,
+) -> bool {
+    let store = memtable.batch_store();
+    store.remaining_capacity() < incoming_batches
+        || store.total_rows().saturating_add(incoming_rows) > max_memtable_rows
+}
+
 fn fill_reached_flush_threshold(
     store: &BatchStore,
     resident_bytes: usize,
@@ -5653,11 +5689,74 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Replay widens every row it reads to the current schema, so a WAL written
+    /// under this very configuration comes back bigger than it went out. That
+    /// must not be read as the memtable being full: the rows and batches still
+    /// fit, and refusing would leave acknowledged writes unrecoverable under
+    /// the configuration that wrote them.
+    #[tokio::test]
+    async fn test_replay_does_not_refuse_rows_a_schema_change_widened() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let narrow = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        // Small enough that the widened rows cross it on the way back in, while
+        // the row and batch caps stay far above what is written.
+        let config = ShardWriterConfig {
+            max_memtable_size: 128,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        {
+            let writer = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                narrow.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            for id in 0..8i64 {
+                let batch = RecordBatch::try_new(
+                    narrow.clone(),
+                    vec![Arc::new(arrow_array::Int64Array::from(vec![id]))],
+                )
+                .unwrap();
+                writer.put(vec![batch]).await.unwrap();
+            }
+        }
+
+        // Reopened under a schema with a column added since, which replay fills
+        // with nulls — the same rows, wider.
+        let widened = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 64),
+                true,
+            ),
+        ]));
+        let reopened = ShardWriter::open(store, base_path, base_uri, config, widened, vec![])
+            .await
+            .expect("a widened replay must not be read as a full memtable");
+        reopened.close().await.unwrap();
+    }
+
     /// A memtable smaller than the one that wrote the WAL cannot hold a
     /// generation the record names, and splitting it would publish the part it
-    /// leaves under a number the record goes on to reuse. Replay refuses before
-    /// publishing anything, so the shard is unchanged and reopens once it is
-    /// given a memtable the size it was written under.
+    /// leaves under a number the record goes on to reuse. Replay refuses
+    /// instead, and reopens once it is given a memtable the size the WAL was
+    /// written under.
+    ///
+    /// Nothing is published here because the refusal lands on the first
+    /// generation. A refusal later in a replay leaves the generations before it
+    /// committed, which is why the reopen below is what the shard is checked
+    /// against rather than the manifest being untouched in general.
     #[tokio::test]
     async fn test_replay_refuses_a_recorded_generation_it_cannot_hold() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -5714,7 +5813,8 @@ mod tests {
         .err()
         .expect("a recorded generation the memtable cannot hold must be refused");
         assert!(
-            err.to_string().contains("past the memtable replaying it"),
+            err.to_string()
+                .contains("past what the memtable replaying it can hold"),
             "unexpected error: {err}"
         );
         assert!(
