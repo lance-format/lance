@@ -1646,7 +1646,7 @@ mod tests {
     /// page for every later probe.
     #[test]
     fn test_btree_index_to_training_batches_dedups_repeated_positions() {
-        use lance_core::ROW_ID;
+        use lance_core::ROW_ADDR;
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 
         // Int and bytes backends both dedup; check each.
@@ -1660,7 +1660,7 @@ mod tests {
         let batches = index.to_training_batches(100).unwrap();
         assert_eq!(batches.len(), 1);
         let row_ids = batches[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
@@ -1691,7 +1691,7 @@ mod tests {
         index.insert(&batch, 0).unwrap();
         let batches = index.to_training_batches(100).unwrap();
         let row_ids = batches[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
