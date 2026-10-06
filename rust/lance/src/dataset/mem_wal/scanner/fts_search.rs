@@ -1037,7 +1037,7 @@ impl LsmFtsSearchPlanner {
                         &self.pk_columns,
                         Vec::new(),
                     );
-                    match generation.stored_name(column) {
+                    match generation.stored_fts_name(column) {
                         None => Vec::new(),
                         Some(stored_column) => {
                             if index_params.is_empty() {
@@ -1069,7 +1069,7 @@ impl LsmFtsSearchPlanner {
                             &self.pk_columns,
                             Vec::new(),
                         );
-                        match generation.stored_name(column) {
+                        match generation.stored_fts_name(column) {
                             None => Vec::new(),
                             Some(stored_column) => {
                                 index_store.fts_document_granularities_by_column(stored_column)
@@ -1205,7 +1205,7 @@ impl LsmFtsSearchPlanner {
                 // table's name while the file still holds the old one.
                 let mut stored_columns = Vec::with_capacity(columns.len());
                 for column in columns {
-                    let Some(stored) = generation.stored_name(column) else {
+                    let Some(stored) = generation.stored_fts_name(column) else {
                         // Sealed before the column existed, so it has nothing to
                         // match -- and nothing to give a predicate spanning it.
                         return self.empty_plan(target_schema);
@@ -1267,7 +1267,7 @@ impl LsmFtsSearchPlanner {
                 for column in columns {
                     let stored = match &generation {
                         None => column.clone(),
-                        Some(generation) => match generation.stored_name(column) {
+                        Some(generation) => match generation.stored_fts_name(column) {
                             Some(stored) => stored.to_string(),
                             // Created before the column existed, so it has
                             // nothing to match.

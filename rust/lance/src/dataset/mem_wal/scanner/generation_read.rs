@@ -53,6 +53,8 @@ pub(super) struct GenerationRead {
     /// references in a DataFusion predicate. Columns the table no longer has
     /// are absent.
     names: HashMap<String, String>,
+    /// The same, under the spellings a full-text path uses.
+    fts_names: HashMap<String, String>,
     /// The table's schema, also carrying field ids.
     table_schema: SchemaRef,
     pk_columns: Vec<String>,
@@ -103,11 +105,12 @@ impl GenerationRead {
         pk_columns: &[String],
         projection: Vec<String>,
     ) -> Self {
-        let names = stored_names(&stored_schema, table_schema);
+        let (names, fts_names) = stored_names(&stored_schema, table_schema);
         let (table_schema, pk_columns) = (Arc::clone(table_schema), pk_columns.to_vec());
         Self {
             stored_schema,
             names,
+            fts_names,
             table_schema,
             pk_columns,
             projection,
@@ -120,6 +123,18 @@ impl GenerationRead {
             .iter()
             .find(|(_, in_table)| *in_table == column)
             .map(|(in_generation, _)| in_generation.as_str())
+    }
+
+    /// [`Self::stored_name`] for a full-text path, which elides a list's
+    /// element where a projection spells it out. Kept apart from the projection
+    /// map rather than merged into it: a struct child named `item` inside a
+    /// list has the same spelling as the element itself, and one map would have
+    /// to answer both with the same field.
+    pub(super) fn stored_fts_name(&self, column: &str) -> Option<&str> {
+        self.fts_names
+            .get(column)
+            .map(String::as_str)
+            .or_else(|| self.stored_name(column))
     }
 
     /// The primary key under the names this generation stores it under.
@@ -399,7 +414,10 @@ fn filter_above(plan: Arc<dyn ExecutionPlan>, expr: &Expr) -> Result<Arc<dyn Exe
 /// Each column the generation stores, keyed by the name it stores it under,
 /// mapped to the table's name for it. Paired by field id, since a rename
 /// changes the name and keeps the id.
-fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String, String> {
+fn stored_names(
+    stored_schema: &Schema,
+    table_schema: &Schema,
+) -> (HashMap<String, String>, HashMap<String, String>) {
     let table = field_paths(table_schema);
     // Keyed on the spelling as well as the id: a list's element has a physical
     // path and an elided one, and pairing one schema's elided path with the
@@ -414,20 +432,28 @@ fn stored_names(stored_schema: &Schema, table_schema: &Schema) -> HashMap<String
     if by_id.is_empty() {
         let known: std::collections::HashSet<&String> =
             table.iter().map(|(_, _, path)| path).collect();
-        return field_paths(stored_schema)
-            .iter()
-            .filter(|(_, _, path)| known.contains(path))
-            .map(|(_, _, path)| (path.clone(), path.clone()))
-            .collect();
+        let mut physical = HashMap::new();
+        let mut fts = HashMap::new();
+        for (_, elided, path) in field_paths(stored_schema) {
+            if !known.contains(&path) {
+                continue;
+            }
+            let into = if elided { &mut fts } else { &mut physical };
+            into.insert(path.clone(), path);
+        }
+        return (physical, fts);
     }
-    field_paths(stored_schema)
-        .into_iter()
-        .filter_map(|(id, elided, stored_path)| {
-            by_id
-                .get(&(id?, elided))
-                .map(|table_path| (stored_path, (*table_path).clone()))
-        })
-        .collect()
+    let mut physical = HashMap::new();
+    let mut fts = HashMap::new();
+    for (id, elided, stored_path) in field_paths(stored_schema) {
+        let Some(id) = id else { continue };
+        let Some(table_path) = by_id.get(&(id, elided)) else {
+            continue;
+        };
+        let into = if elided { &mut fts } else { &mut physical };
+        into.insert(stored_path, (*table_path).clone());
+    }
+    (physical, fts)
 }
 
 /// The fields nested inside `data_type`, each one carrying an id of its own.
@@ -776,8 +802,35 @@ mod tests {
             Field::new("id", DataType::Int64, true),
             Field::new("value", DataType::Int64, true),
         ]);
-        let names = stored_names(&stored_schema, &table_schema);
+        let (names, _) = stored_names(&stored_schema, &table_schema);
         assert_eq!(names.get("value"), Some(&"value".to_string()));
         assert_eq!(names.get(TOMBSTONE), None, "not one of the table's columns");
+    }
+
+    /// A list's element and a struct child named `item` inside it spell the
+    /// same path — one as a projection, one as a full-text alias. Held in one
+    /// map, whichever was inserted last answers for both, and the projection
+    /// reads an existing column as absent and fills it with nulls.
+    #[test]
+    fn a_list_element_and_a_child_named_item_do_not_share_a_mapping() {
+        let child = Arc::new(with_id("item", DataType::Utf8, 3));
+        let element = Arc::new(with_id(
+            "item",
+            DataType::Struct(vec![Arc::clone(&child)].into()),
+            2,
+        ));
+        let schema = Schema::new(vec![with_id("tags", DataType::List(element), 1)]);
+        let (physical, fts) = stored_names(&schema, &schema);
+
+        assert_eq!(
+            physical.get("tags.item").map(String::as_str),
+            Some("tags.item"),
+            "the element keeps the path a projection spells out"
+        );
+        assert_eq!(
+            fts.get("tags.item").map(String::as_str),
+            Some("tags.item"),
+            "the child keeps the path a full-text query uses"
+        );
     }
 }
