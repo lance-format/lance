@@ -1654,6 +1654,13 @@ impl BlobV2FieldRewritePlan {
                 ))
             })?;
             let ArrowDataType::Struct(input_children) = input_field.data_type() else {
+                // Legacy blob bytes: the writer converts them to Blob v2.
+                if matches!(
+                    input_field.data_type(),
+                    ArrowDataType::Binary | ArrowDataType::LargeBinary
+                ) {
+                    return Ok(Self::passthrough(input_field));
+                }
                 return Err(Error::invalid_input(format!(
                     "Blob v2 field '{}' has non-struct input type {:?}",
                     field.name,
