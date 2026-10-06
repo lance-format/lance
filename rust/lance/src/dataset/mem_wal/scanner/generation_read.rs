@@ -132,9 +132,9 @@ impl GenerationRead {
     /// to answer both with the same field.
     pub(super) fn stored_fts_name(&self, column: &str) -> Option<&str> {
         self.fts_names
-            .get(column)
-            .map(String::as_str)
-            .or_else(|| self.stored_name(column))
+            .iter()
+            .find(|(_, in_table)| *in_table == column)
+            .map(|(in_generation, _)| in_generation.as_str())
     }
 
     /// The primary key under the names this generation stores it under.
@@ -505,11 +505,11 @@ fn field_paths(schema: &Schema) -> Vec<(Option<i32>, bool, String)> {
             format_field_path_minimal(&segments.iter().map(String::as_str).collect::<Vec<_>>())
         };
         let physical_path = as_path(physical);
+        // A full-text path for every field, so the map that serves those
+        // lookups is complete on its own and no lookup has to fall back to the
+        // projection map, where a different field can wear the same spelling.
         if !in_list {
-            let elided_path = as_path(elided);
-            if elided_path != physical_path {
-                out.push((id, true, elided_path));
-            }
+            out.push((id, true, as_path(elided)));
         }
         out.push((id, false, physical_path));
         let list = matches!(
@@ -805,6 +805,37 @@ mod tests {
         let (names, _) = stored_names(&stored_schema, &table_schema);
         assert_eq!(names.get("value"), Some(&"value".to_string()));
         assert_eq!(names.get(TOMBSTONE), None, "not one of the table's columns");
+    }
+
+    /// A full-text lookup asks under the name the table uses now and must get
+    /// back the name the generation stored, the way a projection lookup does.
+    /// Reading the map the other way loses every hit the moment a list's text
+    /// child is renamed.
+    #[test]
+    fn a_full_text_alias_resolves_the_current_name_to_the_stored_one() {
+        let list = |child: &str, id: i32| {
+            let element = Arc::new(with_id(
+                "item",
+                DataType::Struct(vec![Arc::new(with_id(child, DataType::Utf8, id))].into()),
+                2,
+            ));
+            Schema::new(vec![with_id("tags", DataType::List(element), 1)])
+        };
+        // The same field id either side: a rename moves the name, not the id.
+        let (_, fts) = stored_names(&list("body", 3), &list("text", 3));
+        let read = GenerationRead {
+            names: HashMap::new(),
+            fts_names: fts,
+            stored_schema: Schema::empty(),
+            table_schema: Arc::new(Schema::empty()),
+            pk_columns: Vec::new(),
+            projection: Vec::new(),
+        };
+        assert_eq!(
+            read.stored_fts_name("tags.text"),
+            Some("tags.body"),
+            "the renamed child still has to find its stored index name"
+        );
     }
 
     /// A list's element and a struct child named `item` inside it spell the
