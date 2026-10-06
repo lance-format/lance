@@ -27,11 +27,12 @@
 //!   waiting would not save reads (`LANCE_RQ_LAZY_EAGER_BEFORE_FULL`): then
 //!   it is gathered at once with `T` = +inf, selecting every accepted row as
 //!   the eager load does;
-//! - the query task scores ready probes on one heap and publishes progress.
-//!   A lazy probe whose survivors first fill the heap publishes the heap's
-//!   top as soon as they do, partway through the probe, unless
-//!   `LANCE_RQ_LAZY_PARTIAL_PUBLISH` is off; that threshold is looser than the
-//!   probe's final one, so the gathers it releases read more rows.
+//! - the query task scores ready probes on one heap and publishes progress
+//!   once each probe is scored whole. With `LANCE_RQ_LAZY_PARTIAL_PUBLISH=on`,
+//!   a lazy probe whose survivors first fill the heap publishes the heap's
+//!   top as soon as they do, partway through the probe; that threshold is
+//!   looser than the probe's final one, so the gathers it releases read more
+//!   rows.
 //!
 //! Every staging and gather step runs as its own task, so it makes progress
 //! whether or not the producer is polling the buffer that holds it; see

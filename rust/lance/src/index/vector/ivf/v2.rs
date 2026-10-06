@@ -8260,8 +8260,9 @@ mod tests {
         /// settings route every predicted-dense probe (`all`), and the far
         /// window never applies. Promotions are off unless set, so some
         /// settings that gather sparse rows promote a plane after one read.
-        /// Some settings publish the threshold only once a probe is scored
-        /// whole, never as soon as its survivors fill the heap.
+        /// Thresholds are published once a probe is scored whole unless set,
+        /// so some settings publish one as soon as a lazy probe's survivors
+        /// fill the heap, partway through scoring it.
         /// The count of settings is prime, so over the parity test's cases
         /// the rotation pairs every setting with every `k`, filter,
         /// approximation mode and bounds choice.
@@ -8338,17 +8339,18 @@ mod tests {
                     ..enabled
                 },
                 // The first probe stays lazy, and its survivors filling the
-                // heap publish no threshold before it is scored whole.
+                // heap publish the threshold before it is scored whole.
                 LayeredLazyConfig {
                     dense_to_eager: DenseToEager::Off,
-                    partial_publish: false,
+                    partial_publish: true,
                     ..enabled
                 },
-                // Gathers wait for the heap to fill, which only whole probes publish.
+                // Gathers wait for the heap to fill, which a lazy probe
+                // publishes partway through its scoring.
                 LayeredLazyConfig {
                     window: 4,
                     eager_before_full: false,
-                    partial_publish: false,
+                    partial_publish: true,
                     ..enabled
                 },
             ];
@@ -8380,19 +8382,19 @@ mod tests {
                     promote: promote_once,
                     ..enabled
                 },
-                // The defaults with whole-probe publishes only.
+                // The defaults with mid-probe publishes.
                 LayeredLazyConfig {
-                    partial_publish: false,
+                    partial_publish: true,
                     ..enabled
                 },
-                // Far gathers released only by whole-probe publishes once the
-                // heap fills, beyond no window.
+                // Far gathers released by a mid-probe publish once the heap
+                // fills, beyond no window.
                 LayeredLazyConfig {
                     window: 0,
                     eager_before_full: false,
                     dense_to_eager: DenseToEager::Off,
                     far_window: usize::MAX,
-                    partial_publish: false,
+                    partial_publish: true,
                     ..enabled
                 },
             ];
@@ -10700,7 +10702,7 @@ mod tests {
 
         /// A lazy first probe whose survivors fill the heap publishes the
         /// heap's top partway through its scoring, once per query at rank 0,
-        /// unless partial publishes are off; the probe stays certain dense
+        /// only with partial publishes on; the probe stays certain dense
         /// either way. Routed to the eager scan, which publishes only once a
         /// probe is scored whole, it publishes no mid-probe threshold. Every
         /// setting matches the eager scan, and the gathers that took a

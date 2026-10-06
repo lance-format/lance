@@ -268,9 +268,9 @@ layered_lazy_counters! {
         lazy_rank0_scored_queries,
         /// Time from the start of each of those scans until it published the
         /// scoring of its first probe (rank 0) to the gathers: once the probe
-        /// was scored or, earlier, once its rows filled the heap, unless
-        /// `LANCE_RQ_LAZY_PARTIAL_PUBLISH` is off. No gather that waits for
-        /// the threshold or its turn is released before.
+        /// was scored or, with `LANCE_RQ_LAZY_PARTIAL_PUBLISH=on`, earlier,
+        /// once its rows filled the heap. No gather that waits for the
+        /// threshold or its turn is released before.
         lazy_rank0_scored_ns,
         /// Lazy scans that issued a gather of a probe that is not
         /// `certain_dense`, whose issue waits on scoring progress; see
@@ -401,9 +401,10 @@ layered_lazy_counters! {
         stage2_exact_rejected,
         /// Lazy probes whose survivors first filled the heap to `k` rows
         /// while they were scored, and that published the heap's top then,
-        /// before the probe was scored whole (see
-        /// `LANCE_RQ_LAZY_PARTIAL_PUBLISH`). That threshold is the `k`-th
-        /// best of the rows scored so far, looser than the probe's final one.
+        /// before the probe was scored whole, which only
+        /// `LANCE_RQ_LAZY_PARTIAL_PUBLISH=on` does. That threshold is the
+        /// `k`-th best of the rows scored so far, looser than the probe's
+        /// final one.
         mid_probe_full_publishes,
         /// Gathers that selected their survivors against such a mid-probe
         /// threshold: issued after it was published and before its probe

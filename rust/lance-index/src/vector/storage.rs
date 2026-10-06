@@ -878,14 +878,18 @@ pub const LAZY_FAR_WINDOW_ENV: &str = "LANCE_RQ_LAZY_FAR_WINDOW";
 /// returned (default 64, at least 1). The pool is sized once per index.
 pub const LAZY_FAR_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_FAR_INFLIGHT";
 /// When the lazy scan publishes the heap's threshold to the gathers once a
-/// lazy probe's survivors first fill the heap to `k` rows: `on` (default) as
-/// soon as they do, partway through scoring the probe, or `off` only once the
-/// probe is scored whole, as every other probe publishes. A gather waiting
-/// for the threshold selects its survivors against the first one published;
-/// a mid-probe threshold is the `k`-th best of the rows scored so far, looser
-/// than the probe's final one, so such a gather reads more rows. Results are
-/// the same either way: the heap's top never increases, so a later threshold
-/// still covers every row stage 2, pruning on the live heap, scores.
+/// lazy probe's survivors first fill the heap to `k` rows: `off` (default)
+/// only once the probe is scored whole, as every other probe publishes, or
+/// `on` as soon as they do, partway through scoring the probe. A gather
+/// waiting for the threshold selects its survivors against the first one
+/// published; a mid-probe threshold is the `k`-th best of the rows scored so
+/// far, looser than the probe's final one, so such a gather reads more rows.
+/// On S3 at 32 concurrent queries, the gathers of probe ranks 1-15 selected
+/// about 80x (k=10) and 30x (k=100) as many rows with `on` as with `off`,
+/// which served 1.49x and 1.32x the queries per second; at one query in
+/// flight the two did not differ. Results are the same either way: the
+/// heap's top never increases, so a later threshold still covers every row
+/// stage 2, pruning on the live heap, scores.
 pub const LAZY_PARTIAL_PUBLISH_ENV: &str = "LANCE_RQ_LAZY_PARTIAL_PUBLISH";
 /// Benchmark knob (`0` or `1`, default `0`): `1` loads a layered partition's
 /// sign plane before its ex planes on backends that do not gate plane
@@ -1492,7 +1496,7 @@ impl Default for LayeredLazyConfig {
             dense_to_eager: DenseToEager::Origin,
             far_window: DEFAULT_LAZY_FAR_WINDOW,
             far_inflight: DEFAULT_LAZY_FAR_INFLIGHT,
-            partial_publish: true,
+            partial_publish: false,
         }
     }
 }
@@ -3822,7 +3826,7 @@ mod tests {
             (LAZY_DENSE_TO_EAGER_ENV, "0"),
             (LAZY_FAR_WINDOW_ENV, "8"),
             (LAZY_FAR_INFLIGHT_ENV, " 2 "),
-            (LAZY_PARTIAL_PUBLISH_ENV, " off "),
+            (LAZY_PARTIAL_PUBLISH_ENV, " on "),
         ]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
@@ -3844,7 +3848,7 @@ mod tests {
                 dense_to_eager: DenseToEager::Off,
                 far_window: 8,
                 far_inflight: 2,
-                partial_publish: false,
+                partial_publish: true,
             }
         );
         assert_eq!(
@@ -3859,8 +3863,8 @@ mod tests {
             LayeredLazyConfig::default().dense_to_eager,
             DenseToEager::Origin
         );
-        assert!(LayeredLazyConfig::default().partial_publish);
-        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_PARTIAL_PUBLISH_ENV, "on")]);
+        assert!(!LayeredLazyConfig::default().partial_publish);
+        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_PARTIAL_PUBLISH_ENV, "off")]);
         assert_eq!(
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
                 .unwrap(),
