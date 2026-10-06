@@ -9,7 +9,11 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments, load_all_indices,
+        build_index_metadata_from_segments,
+        frag_reuse_with_stable_row_ids::{
+            ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
+        },
+        load_all_indices,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -175,6 +179,26 @@ impl<'a> CreateIndexBuilder<'a> {
                     params.index_type.eq_ignore_ascii_case("inverted")
                         || params.index_type.eq_ignore_ascii_case("fts")
                 });
+        // Load indices from the disk. Names are reserved against every index the
+        // manifest carries: one this build cannot read still owns its name, and
+        // handing that name out again commits two indices under it.
+        let indices = load_all_indices(self.dataset).await?;
+        // These always store row ids, so refuse them before training.
+        let index_kind = if self.index_type.is_vector() {
+            Some("vector")
+        } else if self.index_type == IndexType::Inverted || scalar_fts_request {
+            Some("full-text")
+        } else {
+            None
+        };
+        if let Some(index_kind) = index_kind {
+            ensure_index_kind_allowed_with_frag_reuse(
+                &self.dataset.manifest,
+                &indices,
+                index_kind,
+                column_input,
+            )?;
+        }
         let inverted_params = if self.index_type == IndexType::Inverted {
             if let Some(params) = self
                 .params
@@ -295,10 +319,6 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         }
 
-        // Load indices from the disk. Names are reserved against every index the
-        // manifest carries: one this build cannot read still owns its name, and
-        // handing that name out again commits two indices under it.
-        let indices = load_all_indices(self.dataset).await?;
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -636,7 +656,7 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        Ok(IndexMetadata {
+        let index_metadata = IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
@@ -656,7 +676,10 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
-        })
+        };
+        // A generic scalar request only resolves to an implementation here.
+        ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
+        Ok(index_metadata)
         }
         .boxed()
     }
@@ -815,6 +838,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
             };
+            ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &metadata)?;
             let segments = vec![metadata.into_index_segment()?];
             let new_indices =
                 build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
@@ -872,7 +896,7 @@ impl<'a> CreateIndexBuilder<'a> {
             )
             .await?;
 
-            segment_metadatas.push(IndexMetadata {
+            let segment = IndexMetadata {
                 uuid: segment_uuid,
                 name: index_name.clone(),
                 fields: vec![field.id],
@@ -884,7 +908,9 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
-            });
+            };
+            ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
+            segment_metadatas.push(segment);
         }
 
         // Convert to IndexSegments and build proper transaction metadata
@@ -1078,6 +1104,8 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod staged_tagged;
+
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
@@ -2264,6 +2292,93 @@ mod tests {
             files.iter().all(|file| !file.path.starts_with("part_")),
             "staged bitmap segment should only reference canonical files"
         );
+    }
+
+    /// The bitmap build rejects input that is not ascending by value, and it
+    /// judges that with `OrderableScalarValue`, whereas the training stream is
+    /// ordered by the scan's own sort. If the two disagreed anywhere, a valid
+    /// column would be rejected and index creation would fail for users.
+    ///
+    /// Floats are where they could plausibly diverge: `OrderableScalarValue`
+    /// uses `f64::total_cmp`, which separates `-0.0` from `0.0` and sorts `NaN`
+    /// above every finite value, while IEEE comparison calls `-0.0 == 0.0` and
+    /// leaves `NaN` unordered. The values are spread over two fragments and are
+    /// unsorted within each, so the order the build sees comes from the real
+    /// scan rather than from the order the rows were written in.
+    #[tokio::test]
+    async fn test_bitmap_build_accepts_scan_sorted_floats() {
+        use arrow_array::Float64Array;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let fragments = [
+            vec![Some(f64::NAN), Some(0.0), Some(-1.0), None],
+            vec![
+                Some(-0.0),
+                Some(1.0),
+                Some(f64::NEG_INFINITY),
+                Some(f64::INFINITY),
+            ],
+        ];
+        let batches = fragments
+            .iter()
+            .map(|values| {
+                Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Float64Array::from(values.clone()))],
+                )
+                .unwrap())
+            })
+            .collect::<Vec<std::result::Result<_, arrow_schema::ArrowError>>>();
+        let reader = RecordBatchIterator::new(batches, schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::Bitmap,
+                Some("value_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .expect("scan-sorted float input must be accepted by the bitmap build");
+
+        // The index serves these predicates, so the postings also have to have
+        // landed under the right keys.
+        for (predicate, expected) in [
+            ("value = 1.0", 1),
+            ("value = -1.0", 1),
+            ("value IS NULL", 1),
+            ("value IS NOT NULL", 7),
+        ] {
+            let count = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap();
+            assert_eq!(count, expected, "wrong row count for `{predicate}`");
+        }
     }
 
     #[tokio::test]
@@ -4012,6 +4127,106 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(labels)]).unwrap();
         (schema, batch)
+    }
+
+    /// `merge_existing_index_segments` for Bitmap, with segments that each cover
+    /// two fragments and an old-data filter that actually removes rows.
+    ///
+    /// The other Bitmap merge tests go through `optimize_indices` and build one
+    /// segment per fragment, so this is the only coverage of the distributed-build
+    /// entry point, and of a segment whose coverage is wider than one fragment.
+    /// Stable row ids make the filter an exact row-id allow-list, so the deleted
+    /// rows reach it rather than being masked at scan time.
+    #[tokio::test]
+    async fn test_bitmap_merge_existing_index_segments_multi_fragment() {
+        async fn count_value(dataset: &Dataset, segment: &IndexMetadata, value: &str) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = SargableQuery::Equals(ScalarValue::Utf8(Some(value.to_string())));
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_ids) => row_ids.true_rows().row_addrs().unwrap().count(),
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 16 rows over four 4-row fragments; `cat` cycles A/B/C/D, so four each.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..16)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..16).map(|i| ["A", "B", "C", "D"][(i % 4) as usize]),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        // Two segments, each covering two fragments.
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let mut staged = Vec::with_capacity(2);
+        for fragments in [vec![0u32, 1], vec![2, 3]] {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["cat"], IndexType::Bitmap, &params)
+                    .name("cat_idx".to_string())
+                    .fragments(fragments)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("cat_idx", "cat", staged)
+            .await
+            .unwrap();
+
+        // One B from each segment's coverage, so both filters have work to do.
+        dataset.delete("id = 1 OR id = 9").await.unwrap();
+
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref(),
+            Some(&(0..4u32).collect::<RoaringBitmap>()),
+            "the merged segment must cover every fragment the sources did"
+        );
+
+        for (value, expected) in [("A", 4), ("B", 2), ("C", 4), ("D", 4)] {
+            assert_eq!(
+                count_value(&dataset, &merged, value).await,
+                expected,
+                "wrong row count for cat = {value} after merging multi-fragment segments"
+            );
+        }
     }
 
     #[tokio::test]

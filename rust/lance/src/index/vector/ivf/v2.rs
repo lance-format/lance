@@ -4,6 +4,7 @@
 //! IVF - Inverted File index.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -44,7 +45,7 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::metrics::{IndexTimer, IndexTiming, LocalMetricsCollector, MetricsCollector};
 use lance_index::prefilter::NoFilter;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -85,6 +86,7 @@ use lance_select::RowAddrTreeMap;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
@@ -1222,10 +1224,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
-        let (part_entry, ()) = tokio::try_join!(
-            self.load_partition(partition_id, true, metrics),
-            pre_filter.wait_for_ready(),
-        )?;
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+        let (part_entry, ()) =
+            tokio::try_join!(self.load_partition(partition_id, true, metrics), async {
+                let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await
+            },)?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
@@ -1250,6 +1254,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
@@ -1274,6 +1279,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -1357,6 +1363,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -1426,7 +1433,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
-    fn global_heap_to_batch(heap: BinaryHeap<OrderedNode<u64>>) -> Result<RecordBatch> {
+    fn global_heap_to_batch(
+        heap: BinaryHeap<OrderedNode<u64>>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         let (row_ids, dists): (Vec<_>, Vec<_>) = heap.into_iter().map(|r| (r.id, r.dist.0)).unzip();
         Ok(RecordBatch::try_new(
             VECTOR_RESULT_SCHEMA.clone(),
@@ -1709,6 +1720,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionLoad);
         if partition_id >= self.ivf.num_partitions() {
             return Err(Error::index(format!(
                 "partition id {} is out of range of {} partitions",
@@ -1755,11 +1767,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<PartitionEntry<S, Q>> {
+        let batch = self
+            .read_sub_index_batch(
+                partition_id,
+                self.read_projection.as_ref(),
+                io_stats.clone(),
+            )
+            .await?;
+        let idx = S::load(batch)?;
+        let storage = self.load_partition_storage(partition_id, io_stats).await?;
+        Ok(PartitionEntry::new(idx, storage))
+    }
+
+    /// Read the serialized sub-index of a partition, with its metadata attached.
+    ///
+    /// `projection` narrows the read to the columns search needs; `None` reads
+    /// every column the writer emitted, which a caller rewriting the partition
+    /// has to carry through. Bypasses the partition cache.
+    pub(crate) async fn read_sub_index_batch(
+        &self,
+        partition_id: usize,
+        projection: Option<&ReaderProjection>,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
         // `concat_batches` indexes the batches by this schema's field positions
         // without comparing the two, so the schema has to describe exactly what
         // was read: the full file schema over a projected read would index past
         // the last column.
-        let schema = Arc::new(match &self.read_projection {
+        let schema = Arc::new(match projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
         });
@@ -1781,7 +1816,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                         None => Cow::Borrowed(&self.reader),
                     };
                     let params = ReadBatchParams::Range(row_range);
-                    let stream = match &self.read_projection {
+                    let stream = match projection {
                         Some(projection) => {
                             reader
                                 .read_stream_projected(
@@ -1804,13 +1839,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 }
             }
         };
-        let batch = batch.add_metadata(
+        Ok(batch.add_metadata(
             S::metadata_key().to_owned(),
             self.sub_index_metadata[partition_id].clone(),
-        )?;
-        let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
-        Ok(PartitionEntry::new(idx, storage))
+        )?)
     }
 
     async fn materialize_prewarm_partition(
@@ -2187,11 +2219,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        pre_filter.wait_for_ready().await?;
-        let pre_filter =
-            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
-                .await?;
+        let (part_entry, pre_filter) = {
+            // Match split preparation without counting CPU queueing or search.
+            let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+            let part_entry = self.load_partition(partition_id, true, metrics).await?;
+            {
+                let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await?;
+            }
+            let pre_filter = Self::prefilter_for_partition(
+                &self.index_cache,
+                partition_id,
+                &part_entry,
+                pre_filter,
+            )
+            .await?;
+            (part_entry, pre_filter)
+        };
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
@@ -2206,11 +2250,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let scratch_pool = self.scratch_pool.clone();
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
+        let queued = Instant::now();
         let (batch, local_metrics) = spawn_cpu(move || {
+            let local_metrics = LocalMetricsCollector::default();
+            local_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+            let search_timer = IndexTimer::new(&local_metrics, IndexTiming::Search);
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
             let k = query.k * refine_factor;
-            let local_metrics = LocalMetricsCollector::default();
             let rotated_partition_centroid =
                 rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
             let residual = Self::query_context_for_scratch(
@@ -2233,6 +2280,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     scratch,
                 )
             })?;
+            drop(search_timer);
             Result::Ok((batch, local_metrics))
         })
         .await?;
@@ -2318,7 +2366,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
-            pre_filter.wait_for_ready().await?;
+            {
+                let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await?;
+            }
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
@@ -2371,7 +2422,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 let chunk = chunk?;
                 let search_metrics = metrics.clone();
                 let scratch_pool = self.scratch_pool.clone();
+                let queued = Instant::now();
                 let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
+                    search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                     scratch_pool.with_scratch(|scratch| -> Result<()> {
                         for prepared in chunk {
                             Self::accumulate_prepared_partition_search(
@@ -2398,9 +2451,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // `spawn_cpu` dispatch pays for itself, so do it inline and keep the
             // common small-k query at one dispatch (as before the chunked scoring).
             let batch = if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
-                Self::global_heap_to_batch(heap)?
+                Self::global_heap_to_batch(heap, metrics.as_ref())?
             } else {
-                spawn_cpu(move || Self::global_heap_to_batch(heap)).await?
+                let result_metrics = metrics.clone();
+                let queued = Instant::now();
+                spawn_cpu(move || {
+                    result_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+                    Self::global_heap_to_batch(heap, result_metrics.as_ref())
+                })
+                .await?
             };
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -2518,7 +2577,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     // on `closed()` would not help here: `spawn_cpu` closures are not
                     // cancellable, so abandoning the await leaves the work running.)
                     let cancel_probe = batch_tx.clone();
+                    let queued = Instant::now();
                     let search_output = spawn_cpu(move || {
+                        search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                         let mut outputs: Vec<DataFusionResult<RecordBatch>> =
                             Vec::with_capacity(prepared_batch.len());
                         // `stopped` means the whole search should end (an error, an
@@ -2671,7 +2732,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             }
         }
 
-        pre_filter.wait_for_ready().await?;
+        {
+            let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
+            pre_filter.wait_for_ready().await?;
+        }
 
         // Score partitions in a deterministic order. `assignments` is a HashMap,
         // so its iteration order (and hence the order partitions accumulate into
@@ -2734,7 +2798,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let raw_query_contexts = raw_query_contexts.clone();
             let scratch_pool = self.scratch_pool.clone();
             let search_metrics = metrics.clone();
+            let queued = Instant::now();
             let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+                search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                 scratch_pool.with_scratch(|scratch| -> Result<()> {
                     for (part_id, part_entry, probing_queries) in &chunk {
                         let partition_centroid = index.ivf.centroid(*part_id);
@@ -2774,7 +2840,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         heaps
             .into_iter()
-            .map(Self::global_heap_to_batch)
+            .map(|heap| Self::global_heap_to_batch(heap, metrics.as_ref()))
             .collect::<Result<Vec<_>>>()
     }
 
@@ -2866,6 +2932,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     }
 
     async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
+    }
+
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::index(
             "Remapping IVF in this way not supported".to_string(),
         ))
@@ -2989,7 +3062,7 @@ mod tests {
     };
 
     use all_asserts::{assert_ge, assert_lt};
-    use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
+    use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
@@ -3040,8 +3113,8 @@ mod tests {
     use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::flat::storage::FlatFloatStorage;
-    use lance_index::vector::hnsw::HNSW;
-    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams};
+    use lance_index::vector::hnsw::{HNSW, HnswMetadata};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
@@ -5377,6 +5450,150 @@ mod tests {
         assert!(err.to_string().contains("overlapping fragment coverage"));
     }
 
+    async fn build_ivf_flat_segment(
+        dataset: &mut Dataset,
+        metric: DistanceType,
+        fragment_ids: Vec<u32>,
+    ) -> IndexMetadata {
+        // Each segment trains its own IVF model, as distributed workers do.
+        // The build name differs from the committed index name on purpose:
+        // builders may not reuse the name of an existing index.
+        let params = VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, metric);
+        dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("worker_idx".to_string())
+            .fragments(fragment_ids)
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_commit_index_segments_rejects_mixed_vector_metrics() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/mixed_metric_segments", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let l2_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::L2,
+            vec![fragments[0].id() as u32],
+        )
+        .await;
+        let cosine_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::Cosine,
+            vec![fragments[1].id() as u32],
+        )
+        .await;
+
+        let version_before = dataset.manifest.version;
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![l2_segment, cosine_segment],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("metric"),
+            "error should name the metric mismatch: {err}"
+        );
+        assert_eq!(dataset.manifest.version, version_before);
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_index_segments_rejects_metric_mismatch_with_retained_segment() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/retained_mixed_metric_segments", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let l2_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::L2,
+            vec![fragments[0].id() as u32],
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![l2_segment])
+            .await
+            .unwrap();
+
+        let version_before = dataset.manifest.version;
+        let cosine_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::Cosine,
+            vec![fragments[1].id() as u32],
+        )
+        .await;
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![cosine_segment])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("metric"),
+            "error should name the metric mismatch: {err}"
+        );
+        assert_eq!(dataset.manifest.version, version_before);
+        // The retained L2 segment still serves queries, unmodified.
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_index_segments_allows_metric_change_on_full_replacement() {
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/full_replacement_metric_change", test_dir.as_str());
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let all_fragment_ids = fragments.iter().map(|f| f.id() as u32).collect::<Vec<_>>();
+        let l2_segment = build_ivf_flat_segment(
+            &mut dataset,
+            DistanceType::L2,
+            vec![fragments[0].id() as u32],
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![l2_segment])
+            .await
+            .unwrap();
+
+        // A new metric is valid when no old segment remains in the index.
+        let cosine_segment =
+            build_ivf_flat_segment(&mut dataset, DistanceType::Cosine, all_fragment_ids).await;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![cosine_segment])
+            .await
+            .unwrap();
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+    }
+
     #[tokio::test]
     async fn test_distributed_vector_build_supports_hnsw_variants() {
         let test_dir = TempStrDir::default();
@@ -5905,7 +6122,8 @@ mod tests {
             .scan()
             .nearest("vector", query.as_primitive::<Float32Type>(), PQ_MATRIX_K)
             .unwrap()
-            .nprobes(nlist)
+            .minimum_nprobes(nlist)
+            .maximum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -6124,12 +6342,13 @@ mod tests {
     }
 
     async fn test_delete_all_rows(params: VectorIndexParams) {
+        // Boxed for CI clippy `large_futures`: each typed delete-all future grew past 16 KiB.
         match params.metric_type {
             DistanceType::Hamming => {
-                test_delete_all_rows_impl::<UInt8Type>(params, 0..4).await;
+                Box::pin(test_delete_all_rows_impl::<UInt8Type>(params, 0..4)).await;
             }
             _ => {
-                test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0).await;
+                Box::pin(test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0)).await;
             }
         }
     }
@@ -6214,13 +6433,15 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist, recall_requirement).await;
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6283,7 +6504,8 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_pq_delete_all_rows_lifecycle() {
         let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6308,7 +6530,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let params = VectorIndexParams::with_ivf_sq_params(distance_type, ivf_params, sq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6349,7 +6572,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let rq_params = RQBuildParams::with_rotation_type(5, rotation_type);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6465,7 +6689,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6491,12 +6716,14 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params.clone()).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
         test_remap(params, nlist, recall_requirement).await;
     }
 
@@ -6614,6 +6841,147 @@ mod tests {
     // the on-disk names, which are part of the index file contract.
     const HNSW_VECTOR_ID_COL: &str = "__vector_id";
     const HNSW_NEIGHBORS_COL: &str = "__neighbors";
+
+    /// Store wrapper that holds every read open for a measurable window and
+    /// records how many were in flight at once. Instantaneous reads never
+    /// overlap, so a delay is what makes concurrency observable at all.
+    #[derive(Debug)]
+    struct ConcurrencyProbeStore {
+        target: Arc<dyn object_store::ObjectStore>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for ConcurrencyProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ConcurrencyProbeStore({})", self.target)
+        }
+    }
+
+    impl ConcurrencyProbeStore {
+        async fn enter(&self) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for ConcurrencyProbeStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.target.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.target.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.enter().await;
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &object_store::path::Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.enter().await;
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Opening the storage reads the IVF protobuf and the quantizer buffer,
+    /// two independent global buffers whose positions both come from the schema
+    /// metadata. Reading them one after the other costs an extra round trip on
+    /// every cold open, so pin that they go out together: with the reads
+    /// serialized this sees one in flight at a time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>("memory://", 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(16),
+            PQBuildParams::new(4, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut probed = dataset.object_store.as_ref().clone();
+        probed.inner = Arc::new(ConcurrencyProbeStore {
+            target: probed.inner.clone(),
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+        });
+        let probed = Arc::new(probed);
+        let scheduler = ScanScheduler::new(probed, SchedulerConfig::default_for_testing());
+        let reader = open_rq_aux_reader(&dataset, scheduler, &indices[0].uuid.to_string()).await;
+        max_in_flight.store(0, Ordering::SeqCst);
+        let _storage = lance_index::vector::storage::IvfQuantizationStorage::<
+            lance_index::vector::pq::ProductQuantizer,
+        >::try_new(reader, None)
+        .await
+        .unwrap();
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            2,
+            "both global buffer reads should be in flight at once"
+        );
+    }
 
     async fn build_ivf_hnsw_sq(test_uri: &str, nlist: usize) -> Dataset {
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
@@ -6830,6 +7198,197 @@ mod tests {
         assert!(compared > 0, "no non-empty partition was compared");
     }
 
+    /// Each partition's graph as written, with the row ids of its storage.
+    async fn read_hnsw_graphs(dataset: &Dataset) -> Vec<(RecordBatch, Vec<u64>)> {
+        let index = open_ivf_hnsw_sq(dataset).await;
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<IvfHnswSqIndex>()
+            .expect("IVF_HNSW_SQ should open as IvfHnswSqIndex");
+        let mut graphs = Vec::with_capacity(hnsw.ivf.num_partitions());
+        for partition_id in 0..hnsw.ivf.num_partitions() {
+            let graph = hnsw
+                .read_sub_index_batch(partition_id, None, None)
+                .await
+                .unwrap();
+            let storage = hnsw
+                .load_partition_storage(partition_id, None)
+                .await
+                .unwrap();
+            graphs.push((graph, storage.row_ids().copied().collect()));
+        }
+        graphs
+    }
+
+    fn level0_edges(graph: &RecordBatch) -> HashSet<(u32, u32)> {
+        let metadata: HnswMetadata =
+            serde_json::from_str(&graph.schema_ref().metadata()[HNSW_METADATA_KEY]).unwrap();
+        let neighbors = graph[HNSW_NEIGHBORS_COL].as_list::<i32>();
+        (0..metadata.level_offsets[1])
+            .flat_map(|node| {
+                let neighbors = neighbors.value(node);
+                neighbors
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .map(|neighbor| (node as u32, *neighbor))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Compaction copies each HNSW graph when no row is deleted. When rows are
+    /// deleted the surviving edges are kept and the nodes that lost a neighbor
+    /// are reconnected, so the level-0 edges are not just the old edges relabeled.
+    #[rstest]
+    #[case::no_deletions(None, true)]
+    #[case::few_deletions(Some(20), false)]
+    #[case::many_deletions(Some(2), false)]
+    #[tokio::test]
+    async fn test_compaction_keeps_hnsw_graph(
+        #[case] delete_every: Option<u64>,
+        #[case] is_graph_kept: bool,
+    ) {
+        const NLIST: usize = 2;
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 20;
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = generate_batch::<Float32Type>(NUM_ROWS, None, 0.0..1.0, false);
+        let vectors = batch["vector"].as_fixed_size_list().clone();
+        let mut dataset = write_dataset_from_batches_with_max_rows(
+            test_dir.as_str(),
+            schema,
+            vec![batch],
+            NUM_ROWS / 4,
+        )
+        .await;
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(NLIST),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let search = async |dataset: &Dataset, query: &dyn Array| {
+            dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .with_row_id()
+                .nearest("vector", query, K)
+                .unwrap()
+                .minimum_nprobes(NLIST)
+                .try_into_batch()
+                .await
+                .unwrap()
+        };
+        let old_graphs = read_hnsw_graphs(&dataset).await;
+        let mut old_results = Vec::with_capacity(NUM_QUERIES);
+        for i in 0..NUM_QUERIES {
+            old_results.push(search(&dataset, &vectors.value(i)).await);
+        }
+        let old_dataset = dataset.clone();
+        let old_index_id = dataset.load_indices().await.unwrap()[0].uuid;
+
+        let is_deleted = |id: u64| delete_every.is_some_and(|every| id.is_multiple_of(every));
+        if let Some(every) = delete_every {
+            dataset.delete(&format!("id % {every} = 0")).await.unwrap();
+        }
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_ne!(dataset.load_indices().await.unwrap()[0].uuid, old_index_id);
+        let new_graphs = read_hnsw_graphs(&dataset).await;
+        assert_eq!(new_graphs.len(), old_graphs.len());
+
+        if delete_every.is_none() {
+            for ((old, old_rows), (new, new_rows)) in old_graphs.iter().zip(&new_graphs) {
+                assert_eq!(old_rows.len(), new_rows.len());
+                assert_eq!(old.columns(), new.columns());
+                assert_eq!(
+                    old.schema_ref().metadata()[HNSW_METADATA_KEY],
+                    new.schema_ref().metadata()[HNSW_METADATA_KEY]
+                );
+            }
+            // Same graph, same vectors: same neighbors at the same distances,
+            // reported under the rewritten row addresses.
+            for (i, old_result) in old_results.iter().enumerate() {
+                let new_result = search(&dataset, &vectors.value(i)).await;
+                assert_eq!(&old_result["id"], &new_result["id"], "query {i}");
+                assert_eq!(&old_result[DIST_COL], &new_result[DIST_COL], "query {i}");
+                assert_ne!(&old_result[ROW_ID], &new_result[ROW_ID], "query {i}");
+            }
+            return;
+        }
+
+        let id_projection = dataset.schema().project(&["id"]).unwrap();
+        let mut num_rebuilt = 0;
+        for ((old, old_rows), (new, new_rows)) in old_graphs.iter().zip(&new_graphs) {
+            let old_ids = old_dataset
+                .take_rows(old_rows, id_projection.clone())
+                .await
+                .unwrap();
+            let mut new_of_old = Vec::with_capacity(old_rows.len());
+            let mut num_kept = 0;
+            for id in old_ids["id"].as_primitive::<UInt64Type>().values() {
+                if is_deleted(*id) {
+                    new_of_old.push(None);
+                } else {
+                    new_of_old.push(Some(num_kept));
+                    num_kept += 1;
+                }
+            }
+            assert_eq!(num_kept as usize, new_rows.len());
+
+            let new_edges = level0_edges(new);
+            assert!(
+                new_edges
+                    .iter()
+                    .all(|(from, to)| (*from as usize) < new_rows.len()
+                        && (*to as usize) < new_rows.len())
+            );
+            let relabeled_old_edges = level0_edges(old)
+                .into_iter()
+                .filter_map(|(from, to)| {
+                    Some((new_of_old[from as usize]?, new_of_old[to as usize]?))
+                })
+                .collect::<HashSet<_>>();
+            if is_graph_kept {
+                assert_eq!(new_edges, relabeled_old_edges);
+            } else if !new_edges.is_subset(&relabeled_old_edges) {
+                num_rebuilt += 1;
+            }
+        }
+        // Repair adds links the old graph did not have. A tiny partition can
+        // be fully linked either way, so require that of any one partition.
+        assert_eq!(num_rebuilt > 0, !is_graph_kept);
+
+        let mut hits = 0;
+        for i in 0..NUM_QUERIES {
+            let query = vectors.value(i);
+            let result = search(&dataset, &query).await;
+            let ids = result["id"].as_primitive::<UInt64Type>();
+            assert!(ids.values().iter().all(|id| !is_deleted(*id)), "query {i}");
+            // The row addresses search reports must point at the rows it matched.
+            let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+            let taken = dataset
+                .take_rows(row_ids, id_projection.clone())
+                .await
+                .unwrap();
+            assert_eq!(&taken["id"], &result["id"], "query {i}");
+
+            let gt = ground_truth(&dataset, "vector", &query, K, DistanceType::L2).await;
+            hits += row_ids.iter().filter(|id| gt.contains(id)).count();
+        }
+        let recall = hits as f32 / (NUM_QUERIES * K) as f32;
+        assert_ge!(recall, 0.8, "recall after compaction with deletions");
+    }
+
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
         // we introduce XTR for performance, which would reduce the recall a little bit
         let recall_requirement = recall_requirement * 0.9;
@@ -6934,21 +7493,23 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        test_index(
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(
             v1_params,
             nlist,
             recall_requirement,
             Some((dataset.clone(), vectors.clone())),
-        )
+        ))
         .await;
         dataset.checkout_latest().await.unwrap();
         // retest with v3 params on the same dataset
-        test_index(
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(
             v3_params,
             nlist,
             recall_requirement,
             Some((dataset.clone(), vectors)),
-        )
+        ))
         .await;
 
         dataset.checkout_latest().await.unwrap();
@@ -7434,7 +7995,8 @@ mod tests {
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
-            .nprobes(nlist)
+            .minimum_nprobes(nlist)
+            .maximum_nprobes(nlist)
             .with_row_id()
             .try_into_batch()
             .await
@@ -8882,7 +9444,8 @@ mod tests {
             .with_row_id()
             .nearest("vector", &q, 10)
             .unwrap()
-            .nprobes(4)
+            .minimum_nprobes(4)
+            .maximum_nprobes(4)
             .project(&["_rowid"])
             .unwrap()
             .try_into_batch()
@@ -8929,7 +9492,8 @@ mod tests {
             .scan()
             .nearest("vector", &q, 10)
             .unwrap()
-            .nprobes(4)
+            .minimum_nprobes(4)
+            .maximum_nprobes(4)
             .project(&["_rowid"])
             .unwrap()
             .try_into_batch()

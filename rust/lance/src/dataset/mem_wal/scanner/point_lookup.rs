@@ -28,6 +28,7 @@ use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
+use crate::dataset::blob::prepared_blob_batch_to_descriptors;
 use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
@@ -1076,6 +1077,7 @@ fn gather_rows(
     // for, or by both. Relabelling needs the two types to agree on their
     // children, so the shape is settled first.
     let gathered = RecordBatch::try_new(Arc::new(Schema::new(stored_fields)), cols)?;
+    let gathered = prepared_blob_batch_to_descriptors(&gathered)?;
     let narrowed = gathered.project_by_schema(target)?;
     let cols = narrowed
         .columns()

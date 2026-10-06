@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use std::{
     ops::Bound,
     sync::{Arc, Mutex},
@@ -101,6 +102,22 @@ impl Index for JsonIndex {
     }
 }
 
+impl JsonIndex {
+    /// The JSON index over a rewritten target index.
+    fn wrap_target(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
+        let json_details = crate::pb::JsonIndexDetails {
+            path: self.path.clone(),
+            target_details: Some(target_created.index_details),
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&json_details)?,
+            // TODO: We should store the target index version in the details
+            index_version: JSON_INDEX_VERSION,
+            files: target_created.files,
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for JsonIndex {
     async fn search(
@@ -134,16 +151,19 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.wrap_target(target_created)
+    }
+
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let target_created = self
+            .target_index
+            .remap_streaming(translator, dest_store)
+            .await?;
+        self.wrap_target(target_created)
     }
 
     async fn update(
@@ -230,6 +250,7 @@ enum JsonIndexTargetType {
     Int64,
     Float64,
     Utf8,
+    // Retained for parameters derived from legacy array/object indices.
     LargeBinary,
 }
 
@@ -584,7 +605,11 @@ impl JsonIndexPlugin {
                 JsonbType::Int64 => DataType::Int64,
                 JsonbType::Float64 => DataType::Float64,
                 JsonbType::String => DataType::Utf8,
-                JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
+                JsonbType::Array | JsonbType::Object => {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot create a JSON index for JSON path '{path}' with JSON type {jsonb_type:?}; only scalar values are supported"
+                    )));
+                }
             };
             return Ok(Some(data_type));
         }
@@ -907,6 +932,12 @@ impl BasicTrainer for JsonIndexPlugin {
         }
 
         let params = serde_json::from_str::<JsonIndexParameters>(params)?;
+        if params.target_data_type == Some(JsonIndexTargetType::LargeBinary) {
+            return Err(Error::invalid_input(format!(
+                "Cannot create a JSON index for JSON path '{}' with target data type LargeBinary (arrays or objects); only scalar values are supported",
+                params.path
+            )));
+        }
         // Initial builds infer the type from the data. Derived rebuild parameters
         // carry the learned type so every new segment uses the same target schema.
         let target_type = params
@@ -1069,6 +1100,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1076,8 +1108,21 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
+        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
+        // the target's; `JsonIndexDetails` does not yet record the target's own
+        // version. Every target this wrapper builds comes from a fresh training
+        // pass in this same codebase, so it is always at that plugin's current
+        // format; passing the target's own max version is the accurate stand-in
+        // until the target's version is recorded here directly.
         let target_index = target_plugin
-            .load_index(index_store, target_details, frag_reuse_index, cache)
+            .load_index(
+                index_store,
+                target_details,
+                target_plugin.version(),
+                frag_reuse_index,
+                cache,
+            )
             .await?;
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
     }
@@ -1126,6 +1171,80 @@ mod tests {
                 .contains("JSON-path indexes do not support target index type 'inverted'"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_json_index_rejects_large_binary_target() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let error = plugin
+            .basic_trainer()
+            .unwrap()
+            .new_training_request(
+                r#"{"target_index_type":"btree","target_data_type":"LargeBinary","path":"$.v"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .err()
+            .expect("a LargeBinary target should be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("JSON path '$.v'"), "{message}");
+        assert!(message.contains("LargeBinary"), "{message}");
+        assert!(message.contains("only scalar values"), "{message}");
+    }
+
+    #[rstest]
+    #[case::array(r#"{"v": [1, 2]}"#, JsonbType::Array)]
+    #[case::empty_array(r#"{"v": []}"#, JsonbType::Array)]
+    #[case::null_array_items(r#"{"v": [null, null]}"#, JsonbType::Array)]
+    #[case::object(r#"{"v": {"a": 1}}"#, JsonbType::Object)]
+    #[case::empty_object(r#"{"v": {}}"#, JsonbType::Object)]
+    #[case::null_object_value(r#"{"v": {"a": null}}"#, JsonbType::Object)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_index_rejects_non_scalar_path(
+        #[case] json_doc: &str,
+        #[case] json_type: JsonbType,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let request = trainer
+            .new_training_request(
+                r#"{"target_index_type":"btree","path":"$.v"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .unwrap();
+
+        // Inference must skip null and missing values, including an all-null batch.
+        let null_batch = json_update_batch(&[r#"{"v": null}"#, r#"{}"#], vec![0, 1]);
+        let value_batch = json_update_batch(&[json_doc], vec![2]);
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            null_batch.schema(),
+            futures::stream::iter([Ok(null_batch), Ok(value_batch)]),
+        )) as SendableRecordBatchStream;
+        let (store, _tmpdir) = local_json_index_store();
+        let error = trainer
+            .train_index(
+                data,
+                store.as_ref(),
+                request,
+                None,
+                crate::progress::noop_progress(),
+            )
+            .await
+            .err()
+            .expect("an array or object path should be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("JSON path '$.v'"), "{message}");
+        assert!(
+            message.contains(&format!("JSON type {json_type:?}")),
+            "{message}"
+        );
+        assert!(message.contains("only scalar values"), "{message}");
     }
 
     #[test]
@@ -1391,7 +1510,13 @@ mod tests {
             .unwrap();
 
         plugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap()
     }
@@ -1504,6 +1629,7 @@ mod tests {
             .load_index(
                 dest_store,
                 &created.index_details,
+                0,
                 None,
                 &LanceCache::no_cache(),
             )

@@ -38,6 +38,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
 };
@@ -810,6 +811,17 @@ impl ScalarIndex for RTreeIndex {
         ))
     }
 
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
+        Err(Error::invalid_input_source(
+            "RTree does not support remap".into(),
+        ))
+    }
+
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
@@ -1250,6 +1262,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1263,6 +1276,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {

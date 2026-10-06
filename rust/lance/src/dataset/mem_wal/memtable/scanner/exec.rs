@@ -26,6 +26,7 @@ mod fts;
 mod scan;
 mod vector;
 
+use crate::dataset::blob::prepared_blob_batch_to_descriptors;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::BatchStore;
 
@@ -35,6 +36,11 @@ pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::{FtsIndexExec, SCORE_COLUMN};
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;
+
+pub(super) fn scan_record_batch(batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
+    prepared_blob_batch_to_descriptors(batch)
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+}
 
 /// Take `indices` out of `source_columns` and trim each to the shape
 /// `output_schema` promises for that column name.

@@ -99,6 +99,30 @@ mod tests {
         // Tests asserting the contents of the written file are in reader.rs
     }
 
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_negative_dictionary_values_with_runt_tail(#[case] version: ConcreteFileVersion) {
+        let values: Vec<i64> = (0..9216_u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 7) % 1600) as i64 - 800)
+            .collect();
+        let batch = arrow_array::record_batch!(("f0", Int64, values)).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(reader, &fs, version, FileWriterOptions::default()).await;
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::new(DecoderPlugins::default()),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read, batch);
+    }
+
     #[tokio::test]
     async fn test_write_empty() {
         let tmp_path = TempObjFile::default();

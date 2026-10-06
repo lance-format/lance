@@ -25,6 +25,7 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -796,6 +797,17 @@ impl ScalarIndex for ZoneMapIndex {
         ))
     }
 
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
+        Err(Error::invalid_input_source(
+            "ZoneMapIndex does not support remap".into(),
+        ))
+    }
+
     /// Add the new data , creating an updated version of the index in `dest_store`
     async fn update(
         &self,
@@ -1555,6 +1567,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1577,6 +1590,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {

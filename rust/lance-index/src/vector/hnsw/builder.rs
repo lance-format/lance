@@ -71,7 +71,7 @@ pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: 
 }
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
     /// Maximum number of levels in the graph.
     pub max_level: u16,
@@ -907,161 +907,17 @@ impl HnswBuilder {
 
     /// Give every node an inbound path from the entry point on level 0.
     ///
-    /// A query only ever enumerates level 0, so a node without a level-0 path
-    /// from the entry point can never be returned by a graph traversal.
-    /// Parallel insertion cannot rule that out: a node picks its neighbors
-    /// from the graph it searched, and by the time its reciprocal edges are
-    /// written those neighbors may have filled up with closer nodes and pruned
-    /// it straight back out, leaving it with no inbound edge at all. A node
-    /// inserted while the graph was still nearly empty is the usual victim:
-    /// its only neighbors are the first few hubs, and hubs fill up first.
-    /// Nothing inserted afterwards can rediscover such a node, since discovery
-    /// only happens by traversal.
-    ///
-    /// The level-0 graph is walked once from the entry point after the
-    /// parallel phase, and every stranded node is linked from a reachable node
-    /// near it. The work is bounded explicitly, because degenerate data (many
-    /// identical vectors) can strand most of the graph and an unbounded
-    /// per-node search would then cost more than the build itself:
-    ///
-    /// - The audit and the bookkeeping are `O(N + E)`: a stranded node is
-    ///   anchored on its nearest reachable out-neighbor, and a node whose
-    ///   out-neighbors are all stranded waits until one of them is linked.
-    /// - The anchor is refined by a greedy walk over reachable nodes of at
-    ///   most `ef_construction` hops, so a node costs at most
-    ///   `ef_construction * 2 * m` distance computations.
-    /// - Every node anchors at most one stranded node, so a level-0 list never
-    ///   exceeds `2 * m + 1`. Once the candidates near a node are all taken, it
-    ///   chains onto the most recently linked node instead, which has room by
-    ///   construction.
-    ///
-    /// The anchor is allowed that one extra edge rather than evicting a
-    /// neighbor, which could strand that neighbor in turn.
+    /// See [`connect_stranded_level0`]. Called after the parallel insert.
+    /// Remap repair calls that function on the repaired level-0 edges.
     fn connect_stranded_nodes(&self, storage: &impl VectorStore) {
-        let nodes = self.nodes.as_slice();
-        let level0 = HnswLevelView::new(0, nodes);
-        let mut reachable = vec![false; nodes.len()];
-        let mut queue = VecDeque::new();
-        // Marks everything the walk reaches from `start` and returns the nodes
-        // that were not reachable before.
-        let mut mark_reachable = |start: u32, reachable: &mut Vec<bool>| -> Vec<u32> {
-            let mut newly_reachable = Vec::new();
-            if reachable[start as usize] {
-                return newly_reachable;
-            }
-            reachable[start as usize] = true;
-            queue.push_back(start);
-            while let Some(current) = queue.pop_front() {
-                newly_reachable.push(current);
-                for &neighbor in level0.neighbors(current).iter() {
-                    if !reachable[neighbor as usize] {
-                        reachable[neighbor as usize] = true;
-                        queue.push_back(neighbor);
-                    }
-                }
-            }
-            newly_reachable
+        let mut level0 = BuilderLevel0 {
+            nodes: self.nodes.as_slice(),
         };
-        mark_reachable(self.entry_point, &mut reachable);
-
-        let stranded: Vec<u32> = (0..nodes.len() as u32)
-            .filter(|node| !reachable[*node as usize])
-            .collect();
-        if stranded.is_empty() {
-            return;
-        }
-
-        // Stranded nodes keyed by the stranded out-neighbors they wait on.
-        let mut waiting_on: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &node in &stranded {
-            for &neighbor in level0.neighbors(node).iter() {
-                if !reachable[neighbor as usize] {
-                    waiting_on.entry(neighbor).or_default().push(node);
-                }
-            }
-        }
-
-        let mut anchored = vec![false; nodes.len()];
-        // The most recently linked node that has not anchored anything yet.
-        let mut chain_tail: Option<u32> = None;
-        let link = |anchor: OrderedNode,
-                    node: u32,
-                    anchored: &mut [bool],
-                    chain_tail: &mut Option<u32>| {
-            let mut anchor_node = nodes[anchor.id as usize].write().unwrap();
-            anchor_node.add_neighbor(node, anchor.dist, 0);
-            anchor_node.update_from_ranked_neighbors(0);
-            anchored[anchor.id as usize] = true;
-            *chain_tail = Some(node);
-        };
-
-        let mut isolated = Vec::new();
-        let mut ready: VecDeque<u32> = stranded.iter().copied().collect();
-        while let Some(node) = ready.pop_front() {
-            if reachable[node as usize] {
-                continue;
-            }
-            let dist_calc = storage.dist_calculator_from_id(node);
-            let mut candidates: Vec<OrderedNode> =
-                nodes[node as usize].read().unwrap().level_neighbors_ranked[0]
-                    .iter()
-                    .filter(|neighbor| reachable[neighbor.id as usize])
-                    .cloned()
-                    .collect();
-            let Some(nearest) = candidates.iter().min().cloned() else {
-                isolated.push(node);
-                continue;
-            };
-
-            // Walk toward the node over reachable nodes only; the walk is
-            // capped so that it cannot degenerate into a graph-wide search.
-            let mut closest = nearest.clone();
-            for _ in 0..self.params.ef_construction {
-                let step = level0
-                    .neighbors(closest.id)
-                    .iter()
-                    .filter(|neighbor| reachable[**neighbor as usize])
-                    .map(|&neighbor| {
-                        OrderedNode::new(neighbor, dist_calc.distance(neighbor).into())
-                    })
-                    .min();
-                match step {
-                    Some(step) if step.dist < closest.dist => closest = step,
-                    _ => break,
-                }
-            }
-
-            candidates.sort_unstable();
-            let anchor = std::iter::once(closest)
-                .chain(candidates)
-                .find(|candidate| !anchored[candidate.id as usize])
-                .or_else(|| {
-                    chain_tail.map(|tail| OrderedNode::new(tail, dist_calc.distance(tail).into()))
-                })
-                .unwrap_or(nearest);
-            link(anchor, node, &mut anchored, &mut chain_tail);
-            for newly_reachable in mark_reachable(node, &mut reachable) {
-                if let Some(waiting) = waiting_on.remove(&newly_reachable) {
-                    ready.extend(waiting);
-                }
-            }
-        }
-
-        // Nodes whose out-edges never lead back to the entry point have no
-        // nearby anchor to offer; chain them onto the last linked node.
-        for node in isolated {
-            if reachable[node as usize] {
-                continue;
-            }
-            let anchor = chain_tail.unwrap_or(self.entry_point);
-            let anchor = OrderedNode::new(anchor, storage.dist_between(anchor, node).into());
-            link(anchor, node, &mut anchored, &mut chain_tail);
-            mark_reachable(node, &mut reachable);
-        }
-
-        log::debug!(
-            "Linked {} HNSW node(s) that parallel construction left unreachable on level 0",
-            stranded.len()
+        connect_stranded_level0(
+            &mut level0,
+            self.entry_point,
+            self.params.ef_construction,
+            storage,
         );
     }
 
@@ -1083,6 +939,205 @@ impl HnswBuilder {
             select_neighbors_heuristic_owned(storage, level_neighbors, max_connections);
         builder_node.update_from_ranked_neighbors(level);
     }
+}
+
+/// Level-0 graph [`connect_stranded_level0`] reads and extends.
+///
+/// `neighbors` returns the list search walks. `ranked` returns those edges
+/// with distances. `link` appends one edge and does not drop a neighbor.
+pub(crate) trait Level0Links {
+    fn len(&self) -> usize;
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>>;
+    fn ranked(&self, id: u32) -> Vec<OrderedNode>;
+    fn link(&mut self, anchor: OrderedNode, node: u32);
+}
+
+struct BuilderLevel0<'a> {
+    nodes: &'a [RwLock<GraphBuilderNode>],
+}
+
+impl Level0Links for BuilderLevel0<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>> {
+        self.nodes[id as usize].read().unwrap().level_neighbors[0].clone()
+    }
+
+    fn ranked(&self, id: u32) -> Vec<OrderedNode> {
+        self.nodes[id as usize]
+            .read()
+            .unwrap()
+            .level_neighbors_ranked[0]
+            .clone()
+    }
+
+    fn link(&mut self, anchor: OrderedNode, node: u32) {
+        let mut anchor_node = self.nodes[anchor.id as usize].write().unwrap();
+        anchor_node.add_neighbor(node, anchor.dist, 0);
+        anchor_node.update_from_ranked_neighbors(0);
+    }
+}
+
+/// Give every node an inbound path from the entry point on level 0.
+///
+/// A query only ever enumerates level 0, so a node without a level-0 path
+/// from the entry point can never be returned by a graph traversal.
+/// Parallel insertion cannot rule that out: a node picks its neighbors
+/// from the graph it searched, and by the time its reciprocal edges are
+/// written those neighbors may have filled up with closer nodes and pruned
+/// it straight back out, leaving it with no inbound edge at all. A node
+/// inserted while the graph was still nearly empty is the usual victim:
+/// its only neighbors are the first few hubs, and hubs fill up first.
+/// Nothing inserted afterwards can rediscover such a node, since discovery
+/// only happens by traversal. Remap repair can open the same hole when it
+/// trims a reciprocal edge that was a node's only inbound link.
+///
+/// The level-0 graph is walked once from the entry point, and every stranded
+/// node is linked from a reachable node near it. The work is bounded
+/// explicitly, because degenerate data (many identical vectors) can strand
+/// most of the graph and an unbounded per-node search would then cost more
+/// than the build itself:
+///
+/// - The audit and the bookkeeping are `O(N + E)`: a stranded node is
+///   anchored on its nearest reachable out-neighbor, and a node whose
+///   out-neighbors are all stranded waits until one of them is linked.
+/// - The anchor is refined by a greedy walk over reachable nodes of at
+///   most `ef_construction` hops, so a node costs at most
+///   `ef_construction * 2 * m` distance computations.
+/// - Every node anchors at most one stranded node, so a level-0 list never
+///   exceeds `2 * m + 1`. Once the candidates near a node are all taken, it
+///   chains onto the most recently linked node instead, which has room by
+///   construction.
+///
+/// The anchor is allowed that one extra edge rather than evicting a
+/// neighbor, which could strand that neighbor in turn.
+pub(crate) fn connect_stranded_level0<G: Level0Links, S: VectorStore>(
+    graph: &mut G,
+    entry_point: u32,
+    ef_construction: usize,
+    storage: &S,
+) {
+    let n = graph.len();
+    let mut reachable = vec![false; n];
+    mark_level0_reachable(graph, entry_point, &mut reachable);
+
+    let stranded: Vec<u32> = (0..n as u32)
+        .filter(|node| !reachable[*node as usize])
+        .collect();
+    if stranded.is_empty() {
+        return;
+    }
+
+    // Stranded nodes keyed by the stranded out-neighbors they wait on.
+    let mut waiting_on: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &node in &stranded {
+        for &neighbor in graph.neighbors(node).iter() {
+            if !reachable[neighbor as usize] {
+                waiting_on.entry(neighbor).or_default().push(node);
+            }
+        }
+    }
+
+    let mut anchored = vec![false; n];
+    // The most recently linked node that has not anchored anything yet.
+    let mut chain_tail: Option<u32> = None;
+    let mut isolated = Vec::new();
+    let mut ready: VecDeque<u32> = stranded.iter().copied().collect();
+    while let Some(node) = ready.pop_front() {
+        if reachable[node as usize] {
+            continue;
+        }
+        let dist_calc = storage.dist_calculator_from_id(node);
+        let mut candidates: Vec<OrderedNode> = graph
+            .ranked(node)
+            .into_iter()
+            .filter(|neighbor| reachable[neighbor.id as usize])
+            .collect();
+        let Some(nearest) = candidates.iter().min().cloned() else {
+            isolated.push(node);
+            continue;
+        };
+
+        // Walk toward the node over reachable nodes only; the walk is
+        // capped so that it cannot degenerate into a graph-wide search.
+        let mut closest = nearest.clone();
+        for _ in 0..ef_construction {
+            let step = graph
+                .neighbors(closest.id)
+                .iter()
+                .filter(|neighbor| reachable[**neighbor as usize])
+                .map(|&neighbor| OrderedNode::new(neighbor, dist_calc.distance(neighbor).into()))
+                .min();
+            match step {
+                Some(step) if step.dist < closest.dist => closest = step,
+                _ => break,
+            }
+        }
+
+        candidates.sort_unstable();
+        let anchor = std::iter::once(closest)
+            .chain(candidates)
+            .find(|candidate| !anchored[candidate.id as usize])
+            .or_else(|| {
+                chain_tail.map(|tail| OrderedNode::new(tail, dist_calc.distance(tail).into()))
+            })
+            .unwrap_or(nearest);
+        graph.link(anchor.clone(), node);
+        anchored[anchor.id as usize] = true;
+        chain_tail = Some(node);
+        for newly_reachable in mark_level0_reachable(graph, node, &mut reachable) {
+            if let Some(waiting) = waiting_on.remove(&newly_reachable) {
+                ready.extend(waiting);
+            }
+        }
+    }
+
+    // Nodes whose out-edges never lead back to the entry point have no
+    // nearby anchor to offer; chain them onto the last linked node.
+    for node in isolated {
+        if reachable[node as usize] {
+            continue;
+        }
+        let anchor = chain_tail.unwrap_or(entry_point);
+        let anchor = OrderedNode::new(anchor, storage.dist_between(anchor, node).into());
+        graph.link(anchor.clone(), node);
+        anchored[anchor.id as usize] = true;
+        chain_tail = Some(node);
+        mark_level0_reachable(graph, node, &mut reachable);
+    }
+
+    log::debug!(
+        "Linked {} HNSW node(s) that had no level-0 path from the entry point",
+        stranded.len()
+    );
+}
+
+/// Marks everything the walk reaches from `start` and returns the nodes that
+/// were not reachable before.
+fn mark_level0_reachable<G: Level0Links>(
+    graph: &G,
+    start: u32,
+    reachable: &mut [bool],
+) -> Vec<u32> {
+    let mut newly_reachable = Vec::new();
+    if reachable[start as usize] {
+        return newly_reachable;
+    }
+    let mut queue = VecDeque::new();
+    reachable[start as usize] = true;
+    queue.push_back(start);
+    while let Some(current) = queue.pop_front() {
+        newly_reachable.push(current);
+        for &neighbor in graph.neighbors(current).iter() {
+            if !reachable[neighbor as usize] {
+                reachable[neighbor as usize] = true;
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    newly_reachable
 }
 
 // View of a level in HNSW graph.

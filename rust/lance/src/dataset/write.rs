@@ -34,7 +34,7 @@ use lance_io::traits::Writer;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -213,6 +213,7 @@ impl Dataset {
             )?,
             None,
             preprocessor,
+            None,
         );
         let mut data = Box::pin(data);
         let write_result = async {
@@ -928,6 +929,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>>
 where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
@@ -954,6 +956,7 @@ where
         source_store_params,
         params.blob_pack_file_size_threshold,
         file_writer_options,
+        preassigned_data_file_name,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1755,6 +1758,60 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_impl(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        target_bases_info,
+        file_row_counts,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_fragments_internal_to_file(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    preassigned_data_file_name: Arc<String>,
+) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_impl(
+        storage_version,
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        None,
+        None,
+        Some(preassigned_data_file_name),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_fragments_internal_impl(
+    storage_version: ConcreteFileVersion,
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
+) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
     // Make sure the max rows per group is not larger than the max rows per file
@@ -1772,6 +1829,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         params,
         target_bases_info,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await
 }
@@ -2031,6 +2089,60 @@ pub(in crate::dataset) struct V2WriterAdapter {
     writer: current_writer::FileWriter,
     data_file: Option<DataFile>,
     preprocessor: Option<BlobPreprocessor>,
+    promotion: Option<FilePromotion>,
+}
+
+pub(in crate::dataset) struct FilePromotion {
+    object_store: ObjectStore,
+    staging_path: Path,
+    final_path: Path,
+}
+
+impl FilePromotion {
+    async fn promote(&self) -> Result<()> {
+        match self
+            .object_store
+            .inner
+            .copy_if_not_exists(&self.staging_path, &self.final_path)
+            .await
+        {
+            Ok(()) => {}
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let staged = self
+                    .object_store
+                    .inner
+                    .head(&self.staging_path)
+                    .await
+                    .map_err(|error| Error::io(error.to_string()))?;
+                let existing = self
+                    .object_store
+                    .inner
+                    .head(&self.final_path)
+                    .await
+                    .map_err(|error| Error::io(error.to_string()))?;
+                if staged.size != existing.size {
+                    return Err(Error::io(format!(
+                        "fixed data file {} already exists with size {}, but the staged retry has size {}",
+                        self.final_path, existing.size, staged.size
+                    )));
+                }
+            }
+            Err(error) => return Err(Error::io(error.to_string())),
+        }
+        self.object_store
+            .inner
+            .delete(&self.staging_path)
+            .await
+            .map_err(|error| Error::io(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn abort(&self) {
+        let _ = self.object_store.inner.delete(&self.staging_path).await;
+    }
 }
 
 impl V2WriterAdapter {
@@ -2041,11 +2153,13 @@ impl V2WriterAdapter {
         writer: current_writer::FileWriter,
         data_file: Option<DataFile>,
         preprocessor: Option<BlobPreprocessor>,
+        promotion: Option<FilePromotion>,
     ) -> Self {
         Self {
             writer,
             data_file,
             preprocessor,
+            promotion,
         }
     }
 
@@ -2060,10 +2174,23 @@ impl V2WriterAdapter {
 
     /// Finish the blob sidecars and the data file.
     pub(in crate::dataset) async fn finish_file(&mut self) -> Result<FileWriteSummary> {
-        if let Some(pre) = self.preprocessor.as_mut() {
-            pre.finish().await?;
+        let result = async {
+            if let Some(pre) = self.preprocessor.as_mut() {
+                pre.finish().await?;
+            }
+            let summary = self.writer.finish().await?;
+            if let Some(promotion) = &self.promotion {
+                promotion.promote().await?;
+            }
+            Ok(summary)
         }
-        self.writer.finish().await
+        .await;
+        if result.is_err()
+            && let Some(promotion) = &self.promotion
+        {
+            promotion.abort().await;
+        }
+        result
     }
 
     /// Abandon the data file and any blob sidecars in progress.
@@ -2071,6 +2198,9 @@ impl V2WriterAdapter {
         self.writer.abort().await;
         if let Some(pre) = self.preprocessor.as_mut() {
             pre.abort();
+        }
+        if let Some(promotion) = &self.promotion {
+            promotion.abort().await;
         }
     }
 }
@@ -2140,6 +2270,7 @@ impl GenericWriter for V2WriterAdapter {
 pub(crate) struct WriterOptions {
     add_data_dir: bool,
     base_id: Option<u32>,
+    preassigned_data_file_name: Option<Arc<String>>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
@@ -2174,10 +2305,14 @@ pub(crate) async fn open_v1_writer(
     let WriterOptions {
         add_data_dir,
         base_id,
+        preassigned_data_file_name,
         ..
     } = options;
-    let (_data_file_key, filename, _data_dir, full_path) =
-        prepare_data_file_path(base_dir, add_data_dir);
+    let (_data_file_key, filename, _data_dir, full_path) = prepare_data_file_path(
+        base_dir,
+        add_data_dir,
+        preassigned_data_file_name.as_deref().map(String::as_str),
+    );
     Ok(Box::new(V1WriterAdapter {
         writer: V1FileWriter::<ManifestDescribing>::try_new(
             object_store,
@@ -2210,12 +2345,23 @@ where
     let WriterOptions {
         add_data_dir,
         base_id,
+        preassigned_data_file_name,
         file_writer_options,
         ..
     } = options;
-    let (_data_file_key, filename, _data_dir, full_path) =
-        prepare_data_file_path(base_dir, add_data_dir);
-    let writer = object_store.create(&full_path).await?;
+    let (_data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
+        base_dir,
+        add_data_dir,
+        preassigned_data_file_name.as_deref().map(String::as_str),
+    );
+    let (writer_path, promotion_target) =
+        staged_writer_path(data_dir, final_path, preassigned_data_file_name.is_some());
+    let writer = object_store.create(&writer_path).await?;
+    let promotion = promotion_target.map(|final_path| FilePromotion {
+        object_store: object_store.clone(),
+        staging_path: writer_path,
+        final_path,
+    });
     let (file_writer, data_file) = create_file_writer(
         writer,
         schema.clone(),
@@ -2227,6 +2373,7 @@ where
         file_writer,
         Some(data_file),
         None,
+        promotion,
     )))
 }
 
@@ -2249,6 +2396,7 @@ where
     let WriterOptions {
         add_data_dir,
         base_id,
+        preassigned_data_file_name,
         external_base_resolver,
         allow_external_blob_outside_bases,
         external_blob_mode,
@@ -2257,9 +2405,22 @@ where
         blob_pack_file_size_threshold,
         file_writer_options,
     } = options;
-    let (data_file_key, filename, data_dir, full_path) =
-        prepare_data_file_path(base_dir, add_data_dir);
-    let writer = object_store.create(&full_path).await?;
+    let (data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
+        base_dir,
+        add_data_dir,
+        preassigned_data_file_name.as_deref().map(String::as_str),
+    );
+    let (writer_path, promotion_target) = staged_writer_path(
+        data_dir.clone(),
+        final_path,
+        preassigned_data_file_name.is_some(),
+    );
+    let writer = object_store.create(&writer_path).await?;
+    let promotion = promotion_target.map(|final_path| FilePromotion {
+        object_store: object_store.clone(),
+        staging_path: writer_path,
+        final_path,
+    });
     let (file_writer, data_file) = create_file_writer(
         writer,
         schema.clone(),
@@ -2283,12 +2444,22 @@ where
         file_writer,
         Some(data_file),
         Some(preprocessor),
+        promotion,
     )))
 }
 
-fn prepare_data_file_path(base_dir: &Path, add_data_dir: bool) -> (String, String, Path, Path) {
-    let data_file_key = generate_random_filename();
-    let filename = format!("{}.lance", data_file_key);
+fn prepare_data_file_path(
+    base_dir: &Path,
+    add_data_dir: bool,
+    preassigned_data_file_name: Option<&str>,
+) -> (String, String, Path, Path) {
+    let filename = preassigned_data_file_name
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{}.lance", generate_random_filename()));
+    let data_file_key = filename
+        .strip_suffix(".lance")
+        .unwrap_or(filename.as_str())
+        .to_string();
     let data_dir = if add_data_dir {
         base_dir.clone().join(DATA_DIR)
     } else {
@@ -2296,6 +2467,14 @@ fn prepare_data_file_path(base_dir: &Path, add_data_dir: bool) -> (String, Strin
     };
     let full_path = data_dir.clone().join(filename.as_str());
     (data_file_key, filename, data_dir, full_path)
+}
+
+fn staged_writer_path(data_dir: Path, final_path: Path, stage: bool) -> (Path, Option<Path>) {
+    if !stage {
+        return (final_path, None);
+    }
+    let staging_path = data_dir.join(format!("{}.lance-stage", generate_random_filename()));
+    (staging_path, Some(final_path))
 }
 
 /// Reserved base id that refers to the dataset's primary storage in
@@ -2336,6 +2515,8 @@ struct WriterGenerator<OpenWriter> {
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
+    preassigned_data_file_name: Option<Arc<String>>,
+    writers_created: AtomicUsize,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -2359,6 +2540,7 @@ where
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
         file_writer_options: FileWriterOptions,
+        preassigned_data_file_name: Option<Arc<String>>,
     ) -> Self {
         Self {
             object_store,
@@ -2373,6 +2555,8 @@ where
             source_store_params,
             blob_pack_file_size_threshold,
             file_writer_options,
+            preassigned_data_file_name,
+            writers_created: AtomicUsize::new(0),
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -2389,6 +2573,14 @@ where
     }
 
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
+        let writer_index = self
+            .writers_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if writer_index > 0 && self.preassigned_data_file_name.is_some() {
+            return Err(Error::internal(
+                "a fixed data file name requires the write to produce exactly one fragment",
+            ));
+        }
         // Use temporary ID 0; will assign ID later.
         let fragment = Fragment::new(0);
 
@@ -2402,6 +2594,7 @@ where
                     // Primary-storage slots stamp no base id, like a write
                     // without target bases.
                     base_id: (base_info.base_id != PRIMARY_BASE_ID).then_some(base_info.base_id),
+                    preassigned_data_file_name: self.preassigned_data_file_name.clone(),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,
@@ -2420,6 +2613,7 @@ where
                 WriterOptions {
                     add_data_dir: true,
                     base_id: None,
+                    preassigned_data_file_name: self.preassigned_data_file_name.clone(),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,
@@ -3362,6 +3556,7 @@ mod tests {
             ObjectStoreParams::default(),
             None,
             FileWriterOptions::default(),
+            None,
         );
 
         // Create a writer
@@ -3481,6 +3676,7 @@ mod tests {
             ObjectStoreParams::default(),
             None,
             FileWriterOptions::default(),
+            None,
         );
 
         // Create test batch
@@ -4738,6 +4934,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
         )
         .await;
 
@@ -4799,6 +4996,7 @@ mod tests {
             },
             None,
             Vec::new(),
+            None,
             None,
         )
         .await;
@@ -5028,6 +5226,7 @@ mod tests {
             },
             Some(target_bases),
             vec![],
+            None,
             None,
         )
         .await;

@@ -339,6 +339,9 @@ impl Tags<'_> {
             }
         };
 
+        // Direct Ref::Version construction bypasses normalization in the tuple conversions.
+        let branch = branch.as_deref().and_then(standardize_branch);
+
         let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
@@ -1044,7 +1047,8 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
 
     if branch_name.eq("main") {
         return Err(Error::InvalidRef {
-            message: "Branch name cannot be 'main'".to_string(),
+            message: "\"main\" is reserved for the default branch; use a different branch name"
+                .to_string(),
         });
     }
     Ok(())

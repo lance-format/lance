@@ -422,14 +422,34 @@ impl CompressedPostingList {
         }
     }
 
-    pub(super) fn with_packed_first_docs(
-        mut self,
-        states: Arc<[OnceLock<Box<[u32]>>]>,
+    /// A view of one slot of a packed posting group, sharing the group's
+    /// lazily decoded block heads.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_packed_slot(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        posting_tail_codec: PostingTailCodec,
+        block_size: usize,
+        impacts: Option<ImpactSkipData>,
+        first_docs_states: Arc<[OnceLock<Box<[u32]>>]>,
         slot: usize,
     ) -> Self {
-        debug_assert!(slot < states.len());
-        self.first_docs = FirstDocsState::Packed { states, slot };
-        self
+        debug_assert!(block_size.is_power_of_two());
+        debug_assert!(slot < first_docs_states.len());
+        Self {
+            max_score,
+            length,
+            blocks,
+            posting_tail_codec,
+            block_size,
+            positions: None,
+            impacts,
+            first_docs: FirstDocsState::Packed {
+                states: first_docs_states,
+                slot,
+            },
+        }
     }
 
     /// Block sizes are validated powers of two, so per-doc hot loops derive
@@ -526,6 +546,56 @@ impl CompressedPostingList {
     #[inline]
     pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
         self.block_first_docs()[block_idx]
+    }
+
+    /// Whether each of `doc_ids`, which must be ascending, is in this list.
+    ///
+    /// Only the blocks that could hold one of them are decoded, and only their doc
+    /// id stream, so probing a few documents costs a few blocks rather than the
+    /// whole list.
+    pub(crate) fn contains_each(&self, doc_ids: &[u32]) -> Vec<bool> {
+        debug_assert!(doc_ids.is_sorted());
+        let first_docs = self.block_first_docs();
+        let num_blocks = self.blocks.len();
+        let remainder = self.length as usize % self.block_size;
+        let mut buffer = vec![0u32; self.block_size];
+        let mut block_doc_ids = Vec::with_capacity(self.block_size);
+        let mut decoded_block = None;
+        doc_ids
+            .iter()
+            .map(|&doc_id| {
+                // The last block starting at or before `doc_id` is the only one that
+                // can hold it.
+                let Some(block_idx) = first_docs
+                    .partition_point(|&first| first <= doc_id)
+                    .checked_sub(1)
+                else {
+                    return false;
+                };
+                if decoded_block != Some(block_idx) {
+                    block_doc_ids.clear();
+                    let block = self.blocks.value(block_idx);
+                    if block_idx + 1 == num_blocks && remainder != 0 {
+                        super::super::encoding::decompress_posting_remainder_doc_ids(
+                            block,
+                            remainder,
+                            self.posting_tail_codec,
+                            self.block_size,
+                            &mut block_doc_ids,
+                        );
+                    } else {
+                        super::super::encoding::decompress_posting_block_doc_ids(
+                            block,
+                            &mut buffer,
+                            &mut block_doc_ids,
+                            self.block_size,
+                        );
+                    }
+                    decoded_block = Some(block_idx);
+                }
+                block_doc_ids.binary_search(&doc_id).is_ok()
+            })
+            .collect()
     }
 
     /// First doc id of every block, decoded once per cached list and shared by

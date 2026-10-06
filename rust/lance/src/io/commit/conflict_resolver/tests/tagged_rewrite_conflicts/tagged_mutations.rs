@@ -24,8 +24,8 @@ use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 /// Two fragments of four rows each, columns `i` (indexed key), `v` and `w`
-/// (payloads, initially equal to `i`), tagged by a stable partition.
-async fn tagged_two_column_fixture(uri: &str) -> Dataset {
+/// (payloads, initially equal to `i`), with `i_idx` built and not yet tagged.
+async fn indexed_two_column_fixture(uri: &str) -> Dataset {
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
         .col("v", lance_datagen::array::step::<Int32Type>())
@@ -43,7 +43,12 @@ async fn tagged_two_column_fixture(uri: &str) -> Dataset {
         )
         .await
         .unwrap();
-    let dataset = make_tagged(dataset).await;
+    dataset
+}
+
+/// [`indexed_two_column_fixture`] tagged by a stable partition.
+async fn tagged_two_column_fixture(uri: &str) -> Dataset {
+    let dataset = make_tagged(indexed_two_column_fixture(uri).await).await;
     assert_eq!(
         dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
         vec![10, 11]
@@ -1021,6 +1026,203 @@ async fn tagged_table_with_corrupt_history_refuses_the_commit() {
     assert_eq!(dataset.manifest.version, version, "nothing was committed");
 }
 
+/// The full table's `(i, v, z)` rows, index disabled.
+async fn rows_with_z(dataset: &Dataset) -> Vec<(i32, i32, i32)> {
+    let mut scan = dataset.scan();
+    scan.use_scalar_index(false);
+    let batch = scan.try_into_batch().await.unwrap();
+    let i = batch["i"].as_primitive::<Int32Type>();
+    let v = batch["v"].as_primitive::<Int32Type>();
+    let z = batch["z"].as_primitive::<Int32Type>();
+    let mut rows: Vec<(i32, i32, i32)> = i
+        .values()
+        .iter()
+        .zip(v.values().iter())
+        .zip(z.values().iter())
+        .map(|((i, v), z)| (*i, *v, *z))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// Four more rows (`i` 8..12) appended as a new fragment.
+async fn append_four(dataset: Dataset) -> Dataset {
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    let batch = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("v", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("w", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .into_batch_rows(lance_datagen::RowCount::from(4))
+        .unwrap();
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+/// Rewrite the fixture's entry in place through `persist_fixture`.
+async fn persist_entry(dataset: &mut Dataset, edit: impl FnOnce(&mut IndexMetadata)) {
+    let mut indices = crate::index::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let entry = indices
+        .iter_mut()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .unwrap();
+    edit(entry);
+    persist_fixture(dataset, indices).await;
+}
+
+/// The entry is carried through exactly: same identity, same version, and
+/// the `i` segment's stored provenance untouched.
+async fn assert_entry_carried(dataset: &Dataset, before: &[IndexMetadata]) {
+    let stored = crate::index::load_all_indices(dataset).await.unwrap();
+    assert_eq!(fri_entry(&stored).uuid, fri_entry(before).uuid);
+    assert_eq!(
+        fri_entry(&stored).index_version,
+        fri_entry(before).index_version
+    );
+    assert_eq!(
+        fri_entry(&stored).index_details,
+        fri_entry(before).index_details
+    );
+    assert_eq!(user_segment(&stored).uuid, user_segment(before).uuid);
+    assert_eq!(
+        user_segment(&stored).fragment_bitmap,
+        user_segment(before).fragment_bitmap
+    );
+}
+
+/// A history a newer writer recorded (`index_version` 2) is not this
+/// writer's to interpret, and an append or an added column rewrites no
+/// existing column in place, so neither decodes it: both commit and carry
+/// the entry through untouched. Rewriting an existing column in place
+/// needs the history to withdraw coverage, so it is still refused.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_with_a_newer_history_admits_append_and_add_columns() {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    persist_entry(&mut dataset, |entry| entry.index_version = 2).await;
+    let dataset = fresh_session(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    assert_eq!(fri_entry(&before).index_version, 2);
+
+    let mut dataset = append_four(dataset).await;
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("z".into(), "i * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        rows_with_z(&dataset).await,
+        (0..12).map(|i| (i, i, i * 2)).collect::<Vec<_>>()
+    );
+    assert_entry_carried(&dataset, &before).await;
+    // Reading through the index still needs the history, which this
+    // writer cannot interpret.
+    let error = dataset.count_rows(Some("i = 3".into())).await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains("index_version 2"), "{error}");
+
+    let version = dataset.manifest.version;
+    let error = rewrite_in_place(dataset, "v", 3, 333).await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains("index_version 2"), "{error}");
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version, "nothing was committed");
+    assert_entry_carried(&dataset, &before).await;
+}
+
+/// The same for a history this writer cannot decode at all: an append and
+/// an added column never look at it and commit; the in-place rewrite that
+/// must walk it is refused.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_with_corrupt_history_admits_append_and_add_columns() {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    persist_entry(&mut dataset, |entry| {
+        entry.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: vec![0x0a, 0x03, 0xff, 0xff],
+        }));
+    })
+    .await;
+    let dataset = fresh_session(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+
+    let mut dataset = append_four(dataset).await;
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("z".into(), "i * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        rows_with_z(&dataset).await,
+        (0..12).map(|i| (i, i, i * 2)).collect::<Vec<_>>()
+    );
+    assert_entry_carried(&dataset, &before).await;
+
+    let version = dataset.manifest.version;
+    let error = rewrite_in_place(dataset, "v", 3, 333).await.unwrap_err();
+    assert!(error.to_string().contains("FRI details"), "{error}");
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version, "nothing was committed");
+    assert_entry_carried(&dataset, &before).await;
+}
+
+/// A segment built after the rewrite names the destinations directly, so an
+/// in-place rewrite of its column is withdrawn from its bitmap as on an
+/// untagged table: the patched fragment leaves the `v` index and is
+/// scanned, the other destination is still served.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_prunes_in_place_rewrite_from_a_direct_index() {
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    create_v_index(&mut dataset).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_before = before.iter().find(|idx| idx.name == "v_idx").unwrap();
+    assert_eq!(
+        v_before.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11])
+    );
+
+    rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_after = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
+    assert_eq!(v_after.uuid, v_before.uuid);
+    assert_eq!(
+        v_after.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32]),
+        "the patched destination (odd values, i = 3) left the v index"
+    );
+    assert_eq!(rows(&dataset, Some("v = 333"), true).await, vec![(3, 333)]);
+    assert_eq!(rows(&dataset, Some("v = 3"), true).await, vec![]);
+    assert_eq!(rows(&dataset, Some("v = 4"), true).await, vec![(4, 4)]);
+    assert_eq!(
+        rows(&dataset, None, true).await,
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| (i, if i == 3 { 333 } else { i }))
+    );
+    assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+}
+
 /// Sorted `i` values under a predicate, with or without the scalar index;
 /// for tables whose `v` is no longer Int32.
 async fn i_values(dataset: &Dataset, predicate: Option<&str>, use_index: bool) -> Vec<i32> {
@@ -1233,6 +1435,163 @@ async fn tagged_table_accepts_config_update() {
         vec![(6, 6)]
     );
     assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+}
+
+mod mem_wal_state {
+    //! The MemWAL system index and a tagged history coexist: the index is
+    //! installed on a tagged table (or tagged under), and recording SSTable
+    //! compaction progress on it (`UpdateMemWalState`) replaces only the
+    //! MemWAL entry. The history, the user segment and its derived coverage
+    //! are carried through unchanged.
+
+    use super::*;
+    use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
+    use lance_index::mem_wal::MemWalIndexDetails;
+
+    /// Installs `__lance_mem_wal` through the commit path, as MemWAL
+    /// initialization does.
+    async fn install_mem_wal_index(dataset: Dataset) -> Dataset {
+        let version = dataset.manifest.version;
+        let mem_wal_index = new_mem_wal_index_meta(version, MemWalIndexDetails::default()).unwrap();
+        commit_sp(
+            &dataset,
+            version,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn advance_mem_wal_state(
+        dataset: &Dataset,
+        shard: Uuid,
+        generation: u64,
+    ) -> Result<Dataset> {
+        commit_sp(
+            dataset,
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
+            },
+        )
+        .await
+    }
+
+    fn mem_wal_entry(indices: &[IndexMetadata]) -> &IndexMetadata {
+        indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+    }
+
+    /// Two state updates land on the tagged table carrying `i_idx` and the
+    /// MemWAL index; each replaces the MemWAL entry only.
+    async fn assert_mem_wal_state_advances_beside_the_history(uri: &str, dataset: Dataset) {
+        let before = crate::index::load_all_indices(&dataset).await.unwrap();
+        let derived_before = dataset.load_indices().await.unwrap();
+        let shard = Uuid::new_v4();
+
+        let committed = advance_mem_wal_state(&dataset, shard, 3).await.unwrap();
+        let dataset = fresh_session(uri).await;
+        assert_eq!(dataset.manifest.version, committed.manifest.version);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        assert_eq!(stored.len(), before.len());
+
+        let mem_wal = mem_wal_entry(&stored);
+        let details = load_mem_wal_index_details(mem_wal.clone()).unwrap();
+        assert_eq!(
+            details.compacted_sstables,
+            vec![CompactedSsTable::new(shard, 3)]
+        );
+        assert_eq!(mem_wal.dataset_version, dataset.manifest.version);
+        assert_ne!(
+            mem_wal.uuid,
+            mem_wal_entry(&before).uuid,
+            "a state update mints a new MemWAL entry identity"
+        );
+
+        let fri = fri_entry(&stored);
+        assert_eq!(fri.uuid, fri_entry(&before).uuid);
+        assert_eq!(fri.index_version, fri_entry(&before).index_version);
+        assert_eq!(fri.dataset_version, fri_entry(&before).dataset_version);
+        assert_eq!(
+            fri.index_details,
+            fri_entry(&before).index_details,
+            "the history's details bytes are carried through unchanged"
+        );
+
+        let segment = user_segment(&stored);
+        assert_eq!(
+            segment.dataset_version,
+            user_segment(&before).dataset_version
+        );
+        assert_eq!(segment.index_version, user_segment(&before).index_version);
+        assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+        let derived = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            user_segment(&derived).fragment_bitmap,
+            user_segment(&derived_before).fragment_bitmap
+        );
+        assert_eq!(
+            assert_index_agrees_with_scan(&dataset, "i = 6").await,
+            vec![(6, 6)]
+        );
+        assert_eq!(
+            rows(&dataset, None, true).await,
+            (0..8).map(|i| (i, i)).collect::<Vec<_>>()
+        );
+
+        // The generation keeps advancing on the same shard.
+        let committed = advance_mem_wal_state(&dataset, shard, 4).await.unwrap();
+        let dataset = fresh_session(uri).await;
+        assert_eq!(dataset.manifest.version, committed.manifest.version);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let details = load_mem_wal_index_details(mem_wal_entry(&stored).clone()).unwrap();
+        assert_eq!(
+            details.compacted_sstables,
+            vec![CompactedSsTable::new(shard, 4)]
+        );
+        assert_eq!(fri_entry(&stored).uuid, fri_entry(&before).uuid);
+        assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+        assert_eq!(
+            assert_index_agrees_with_scan(&dataset, "i = 6").await,
+            vec![(6, 6)]
+        );
+    }
+
+    /// The MemWAL index is installed on an already tagged table, then its
+    /// state is advanced.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn mem_wal_state_advances_on_a_tagged_table() {
+        let dir = TempStrDir::default();
+        let dataset = tagged_two_column_fixture(dir.as_str()).await;
+        let installed = install_mem_wal_index(dataset).await;
+        let dataset = fresh_session(dir.as_str()).await;
+        assert_eq!(dataset.manifest.version, installed.manifest.version);
+        assert_mem_wal_state_advances_beside_the_history(dir.as_str(), dataset).await;
+    }
+
+    /// The table is tagged after the MemWAL index exists, then the state is
+    /// advanced: the same order MemWAL initialization followed by a stable
+    /// partition produces.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn mem_wal_state_advances_on_a_table_tagged_after_the_index() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_two_column_fixture(dir.as_str()).await;
+        let dataset = install_mem_wal_index(dataset).await;
+        let dataset = make_tagged(dataset).await;
+        assert_eq!(
+            dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        let dataset = fresh_session(dir.as_str()).await;
+        assert_mem_wal_state_advances_beside_the_history(dir.as_str(), dataset).await;
+    }
 }
 
 /// Every commit attempt prepares the index list against the manifest it
@@ -1580,4 +1939,446 @@ async fn vector_index_live_only_remainder_is_withdrawn_whole_and_agrees_with_the
     );
     // Rebuilding the emptied segment through `optimize_indices` is the
     // maintenance change's job (its `withdrawn_vector_index_is_rebuilt_by_optimize`).
+}
+
+/// A segment staged before the rewrite, committed after a destination's
+/// indexed column was rewritten in place (admitted, since no committed index
+/// covered the column): the addresses still translate but the values do
+/// not. The commit replays the rewrite over the segment and withdraws the
+/// transition's sources, so the segment claims nothing and the rows are
+/// scanned.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_commit_of_a_stale_staged_index_drops_rewritten_destinations() {
+    let dir = TempStrDir::default();
+    let dataset = tagged_two_column_fixture(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+
+    // Staged at the pre-rewrite version (2: data plus i_idx), over F0, F1.
+    let mut pre = dataset.checkout_version(2).await.unwrap();
+    let segment = crate::index::CreateIndexBuilder::new(
+        &mut pre,
+        &["v"],
+        IndexType::Scalar,
+        &ScalarIndexParams::default(),
+    )
+    .name("v_idx".into())
+    .execute_uncommitted()
+    .await
+    .unwrap();
+    assert_eq!(
+        segment.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1])
+    );
+
+    // F11 (odd values) gets v rewritten in place: admitted, no committed
+    // index covers v.
+    rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
+    let mut dataset = fresh_session(dir.as_str()).await;
+    dataset
+        .commit_existing_index_segments("v_idx", "v", vec![segment])
+        .await
+        .unwrap();
+
+    let dataset = fresh_session(dir.as_str()).await;
+    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
+    // Both sources feed F11 (the partition splits every source by parity).
+    assert!(
+        v_idx.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "{:?}",
+        v_idx.fragment_bitmap
+    );
+    let derived = dataset.load_indices().await.unwrap();
+    assert!(
+        derived
+            .iter()
+            .find(|idx| idx.name == "v_idx")
+            .and_then(|idx| idx.fragment_bitmap.as_ref())
+            .is_none_or(|bitmap| bitmap.is_empty()),
+        "claims nothing"
+    );
+    assert_eq!(rows(&dataset, Some("v = 333"), true).await, vec![(3, 333)]);
+    assert_eq!(rows(&dataset, Some("v = 3"), true).await, vec![]);
+    assert_eq!(
+        rows(&dataset, None, true).await,
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| (i, if i == 3 { 333 } else { i }))
+    );
+    assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+}
+
+/// The same sequence with `alter_columns`: a cast rewrites `v` under a NEW
+/// field id, so a segment staged for the old field cannot be carried across
+/// it; the commit says to rebuild and nothing is published.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_refuses_committing_a_staged_index_after_a_cast_of_its_column() {
+    use crate::dataset::ColumnAlteration;
+    use arrow_schema::DataType;
+
+    let dir = TempStrDir::default();
+    let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let mut pre = dataset.checkout_version(2).await.unwrap();
+    let segment = crate::index::CreateIndexBuilder::new(
+        &mut pre,
+        &["v"],
+        IndexType::Scalar,
+        &ScalarIndexParams::default(),
+    )
+    .name("v_idx".into())
+    .execute_uncommitted()
+    .await
+    .unwrap();
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("v".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+    let mut dataset = fresh_session(dir.as_str()).await;
+    let version = dataset.manifest.version;
+    let error = dataset
+        .commit_existing_index_segments("v_idx", "v", vec![segment])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Rebuild"), "{error}");
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.manifest.version, version, "nothing was committed");
+    assert!(
+        crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .all(|idx| idx.name != "v_idx")
+    );
+    assert_eq!(i_values(&dataset, Some("v = 3"), true).await, vec![3]);
+    assert_segment_and_history_untouched(&dataset, &before, &[10, 11]).await;
+}
+
+/// A merged segment's bitmap is the union of its sources' provenance, so a
+/// segment can name a destination directly (F10) and, through retired
+/// sources (F0, F1), reach it as well. The rewrite commits and both go: the
+/// direct id and the whole transition's sources, so the segment claims
+/// nothing; `optimize_indices` rebuilds the coverage afterwards.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_withdraws_a_mixed_provenance_whole() {
+    use lance_index::optimize::OptimizeOptions;
+
+    let dir = TempStrDir::default();
+    let dataset = tagged_two_column_fixture(dir.as_str()).await;
+    let mut untagged = dataset.checkout_version(2).await.unwrap();
+    untagged.restore().await.unwrap();
+    create_v_index(&mut untagged).await;
+    let mut dataset = make_tagged(untagged).await;
+
+    let direct = crate::index::CreateIndexBuilder::new(
+        &mut dataset,
+        &["v"],
+        IndexType::Scalar,
+        &ScalarIndexParams::default(),
+    )
+    .name("v_idx".into())
+    .replace(true)
+    .fragments(vec![10])
+    .execute_uncommitted()
+    .await
+    .unwrap();
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    indices.push(direct);
+    persist_fixture(&mut dataset, indices).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let merged: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == "v_idx")
+        .cloned()
+        .collect();
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert_eq!(
+        merged[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1, 10]),
+        "mixed provenance"
+    );
+
+    // Row i = 2 lives in F10, the fragment the segment names directly.
+    rewrite_in_place(dataset, "v", 2, 222).await.unwrap();
+    let mut dataset = fresh_session(dir.as_str()).await;
+    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
+    assert!(
+        v_idx.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "{:?}",
+        v_idx.fragment_bitmap
+    );
+    // The withdrawn segment is out of the listing. Opening it by uuid through
+    // the query entry is an error (no scan covers its rows, so an empty
+    // answer would drop them); the maintenance entry opens it as contributing
+    // nothing so it can be rebuilt.
+    {
+        use crate::index::DatasetIndexInternalExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        assert!(
+            !dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .any(|idx| idx.uuid == v_idx.uuid),
+            "excluded from the listing"
+        );
+        let refused = dataset
+            .open_scalar_index("v", &v_idx.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("does not exist"), "{refused}");
+        let Err(refused) = dataset
+            .open_generic_index("v", &v_idx.uuid, &NoOpMetricsCollector)
+            .await
+        else {
+            panic!("the query entry opened a withdrawn segment")
+        };
+        assert!(refused.to_string().contains("does not exist"), "{refused}");
+        dataset
+            .open_scalar_index_for_maintenance("v", &v_idx.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+    }
+    assert_eq!(rows(&dataset, Some("v = 222"), true).await, vec![(2, 222)]);
+    assert_eq!(rows(&dataset, Some("v = 2"), true).await, vec![]);
+    assert_eq!(
+        rows(&dataset, None, true).await,
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| (i, if i == 2 { 222 } else { i }))
+    );
+
+    // Optimizing rebuilds the coverage over the live fragments: the withdrawn
+    // segment (kept as the record of what to build) is replaced by a new one
+    // that claims the live fragments and holds their rows.
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let rebuilt: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| idx.name == "v_idx")
+        .cloned()
+        .collect();
+    assert_eq!(rebuilt.len(), 1, "{rebuilt:?}");
+    assert_ne!(
+        rebuilt[0].uuid, v_idx.uuid,
+        "the withdrawn segment is replaced"
+    );
+    assert_eq!(
+        rebuilt[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11])
+    );
+    {
+        use crate::index::DatasetIndexInternalExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        let index = dataset
+            .open_scalar_index("v", &rebuilt[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(rows) = index
+            .search(
+                &SargableQuery::Equals(datafusion::scalar::ScalarValue::Int32(Some(222))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected an exact result");
+        };
+        let fragments: Vec<u32> = rows
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|addr| lance_core::utils::address::RowAddress::from(u64::from(addr)).fragment_id())
+            .collect();
+        assert_eq!(fragments, vec![10], "the new segment holds the live row");
+    }
+    let derived = dataset.load_indices().await.unwrap();
+    assert_eq!(
+        derived
+            .iter()
+            .filter(|idx| idx.name == "v_idx")
+            .filter_map(|idx| idx.fragment_bitmap.clone())
+            .fold(RoaringBitmap::new(), |acc, b| acc | b),
+        RoaringBitmap::from_iter([10u32, 11])
+    );
+    let plan = dataset
+        .scan()
+        .filter("v = 222")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(rows(&dataset, Some("v = 222"), true).await, vec![(2, 222)]);
+}
+
+/// Two stable partitions around one in-place rewrite: the rewritten
+/// destination is retired again before the staged segment is committed.
+/// The replay carries the segment across both partitions and the rewrite in
+/// order, so the withdrawal happens where the rewrite happened; the segment
+/// claims nothing and the rows are scanned.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired_destination() {
+    let dir = TempStrDir::default();
+    let dataset = tagged_two_column_fixture(dir.as_str()).await;
+    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let mut pre = dataset.checkout_version(2).await.unwrap();
+    let segment = crate::index::CreateIndexBuilder::new(
+        &mut pre,
+        &["v"],
+        IndexType::Scalar,
+        &ScalarIndexParams::default(),
+    )
+    .name("v_idx".into())
+    .execute_uncommitted()
+    .await
+    .unwrap();
+
+    rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
+    let mut dataset = fresh_session(dir.as_str()).await;
+    reserve(&mut dataset, 40).await;
+    let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+    let (transition, destinations) = prepare_partition(&dataset, &[10, 11], 20).await;
+    let version = dataset.manifest.version;
+    let mut dataset = commit_sp(
+        &dataset,
+        version,
+        tagged_rewrite(&dataset, old_fragments, destinations, vec![transition]).await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![20, 21]
+    );
+    assert_eq!(
+        assert_index_agrees_with_scan(&dataset, "i = 3").await,
+        vec![(3, 333)]
+    );
+
+    dataset
+        .commit_existing_index_segments("v_idx", "v", vec![segment])
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
+    assert!(
+        v_idx.fragment_bitmap.as_ref().unwrap().is_empty(),
+        "{:?}",
+        v_idx.fragment_bitmap
+    );
+    assert_eq!(rows(&dataset, Some("v = 333"), true).await, vec![(3, 333)]);
+    assert_eq!(rows(&dataset, Some("v = 3"), true).await, vec![]);
+    let i_idx = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
+    assert_eq!(
+        i_idx.uuid,
+        before.iter().find(|idx| idx.name == "i_idx").unwrap().uuid
+    );
+    assert_eq!(
+        i_idx.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1])
+    );
+}
+
+/// A bare rewrite (no transition: only admitted for fragments no committed
+/// index covers) that consumes a fragment a staged segment was built on
+/// leaves the segment nothing to translate through: the commit says to
+/// rebuild it.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn tagged_table_commit_of_a_staged_index_over_a_bare_rewritten_source_says_rebuild() {
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+
+    let dir = TempStrDir::default();
+    let dataset = tagged_two_column_fixture(dir.as_str()).await;
+    let batch = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("v", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("w", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .into_batch_rows(lance_datagen::RowCount::from(4))
+        .unwrap();
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+    let appended = dataset.fragments().last().unwrap().clone();
+    let segment = crate::index::CreateIndexBuilder::new(
+        &mut dataset,
+        &["v"],
+        IndexType::Scalar,
+        &ScalarIndexParams::default(),
+    )
+    .name("v_idx".into())
+    .fragments(vec![appended.id as u32])
+    .execute_uncommitted()
+    .await
+    .unwrap();
+
+    // Rewrite the appended fragment in place of itself, bare: no committed
+    // index covers it, so the gate admits the plain rewrite.
+    let rows_of_appended = dataset
+        .scan()
+        .with_fragments(vec![appended.clone()])
+        .try_into_batch()
+        .await
+        .unwrap();
+    let rewritten = InsertBuilder::new(Arc::new(dataset.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![rows_of_appended])
+        .await
+        .unwrap();
+    let Operation::Append { fragments } = rewritten.operation else {
+        unreachable!()
+    };
+    let version = dataset.manifest.version;
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![appended],
+                    new_fragments: fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let mut dataset = fresh_session(dataset.uri()).await;
+    let error = dataset
+        .commit_existing_index_segments("v_idx", "v", vec![segment])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Rebuild"), "{error}");
 }

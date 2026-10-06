@@ -18,7 +18,7 @@ use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    metrics::MetricsCollector,
+    metrics::{IndexTimer, IndexTiming, MetricsCollector},
     prefilter::PreFilter,
     vector::{
         ApproxMode, DIST_COL, Query,
@@ -151,6 +151,7 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
@@ -160,8 +161,11 @@ impl IvfSubIndex for FlatIndex {
                 approx_mode: params.approx_mode,
             },
         );
+        drop(query_timer);
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
             // The calculator certifies that its top-k scan keeps every row the
@@ -238,6 +242,8 @@ impl IvfSubIndex for FlatIndex {
             }
         };
 
+        drop(distance_timer);
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         // we don't need to sort the results by distances here
         // because there's a SortExec node in the query plan which sorts the results from all partitions
         let (row_ids, dists): (Vec<_>, Vec<_>) = res.into_iter().map(|r| (r.id, r.dist.0)).unzip();
@@ -290,6 +296,7 @@ impl IvfSubIndex for FlatIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
@@ -299,7 +306,10 @@ impl IvfSubIndex for FlatIndex {
                 approx_mode: params.approx_mode,
             },
         );
+        drop(query_timer);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
             true => {
@@ -331,6 +341,7 @@ impl IvfSubIndex for FlatIndex {
                 );
             }
         };
+        drop(distance_timer);
         Ok(())
     }
 

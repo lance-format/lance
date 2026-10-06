@@ -20,6 +20,7 @@
 //!   - Row IDs and doc_start_positions in metadata
 //!   - File metadata: c_table, huffman_codes, tree topology
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +34,9 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
+use lance_index_core::remapping::RowAddrTranslator;
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
@@ -1661,6 +1662,14 @@ impl ScalarIndex for FMIndexScalarIndex {
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
+
+    async fn remap_streaming(
+        &self,
+        _: &RowAddrTranslator,
+        _: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::not_supported("Fm does not support remap"))
+    }
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
@@ -2329,6 +2338,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
+        _index_version: u32,
         fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -2839,7 +2849,13 @@ mod tests {
             .unwrap();
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -3268,7 +3284,13 @@ mod tests {
         assert_eq!(created.files[1].path, fmindex_partition_path(1));
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
         let r = index

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
@@ -20,9 +22,10 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream, sorts::sort::SortExec,
     stream::RecordBatchStreamAdapter,
 };
-use datafusion_common::ScalarValue;
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
-use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStream, TryStreamExt, future::Either, stream::BoxStream};
+use lance_arrow::deepcopy::deep_copy_batch_sliced;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache,
@@ -31,7 +34,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::exec::{
-    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan,
+    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
 };
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -45,8 +48,8 @@ use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
-    BitmapIndexState, build_index_map, merge_index_maps, merge_source_entry_count,
-    new_bitmap_batch_writer, remap_index_map, remap_row_addrs,
+    BitmapIndexState, OldSegment, build_index_map, merge_index_maps, merge_source_entry_count,
+    new_bitmap_batch_writer, remap_index_map, remap_row_addrs_with,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -200,6 +203,40 @@ impl LabelListIndex {
     }
 }
 
+impl LabelListIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
+        let mut writer = new_bitmap_batch_writer(
+            dest_store,
+            BITMAP_LOOKUP_NAME,
+            self.values_index.value_type(),
+        )
+        .await?;
+        writer
+            .add_global_buffer(
+                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
+                serialize_list_nulls(&remapped_nulls)?,
+            )
+            .await?;
+        remap_index_map(&self.values_index, mapping, &mut writer).await?;
+        let file = writer.finish().await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
     #[instrument(skip_all, level = "debug")]
@@ -241,28 +278,15 @@ impl ScalarIndex for LabelListIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped_nulls = remap_row_addrs(&self.list_nulls, mapping)?;
-        let mut writer = new_bitmap_batch_writer(
-            dest_store,
-            BITMAP_LOOKUP_NAME,
-            self.values_index.value_type(),
-        )
-        .await?;
-        writer
-            .add_global_buffer(
-                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-                serialize_list_nulls(&remapped_nulls)?,
-            )
-            .await?;
-        remap_index_map(&self.values_index, mapping, &mut writer).await?;
-        let file = writer.finish().await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
-                .unwrap(),
-            index_version: LABEL_LIST_INDEX_VERSION,
-            files: vec![file],
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -272,15 +296,8 @@ impl ScalarIndex for LabelListIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Not applied, matching every other derived-key scalar index (ngram,
-        // fmindex, bloomfilter, zonemap, rtree). Only btree and bitmap -- one
-        // key per row -- prune retired rows here. The cost is real: postings for
-        // retired rows survive, so an update that rewrites rows in place can
-        // leave this index returning them. Preserved as-is rather than fixed,
-        // since changing it is a correctness change this memory work should not
-        // carry.
-        let _ = old_data_filter;
-        let file = update_label_list_index(self, new_data, dest_store).await?;
+        let file =
+            update_label_list_index(self, new_data, dest_store, old_data_filter.as_ref()).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
@@ -523,12 +540,10 @@ fn serialize_list_nulls(null_map: &RowAddrTreeMap) -> Result<Bytes> {
 /// buffers the data volume at all.
 ///
 /// Nulls sort first because `OrderableScalarValue` orders them below every
-/// value, so [`build_index_map`]'s ascending-input `debug_assert!` rejects a
-/// stream that puts them last. Its runtime path would in fact tolerate a null
-/// run anywhere -- `finish_run` never advances the old-keys cursor for a null
-/// key -- but the assert is the contract, and null-first is also what
-/// [`remap_index_map`] emits and what the plain bitmap index's training scan
-/// produces.
+/// value. [`build_index_map`] would accept a single null run anywhere -- nulls
+/// are collected separately rather than merge-joined by value -- but null-first
+/// is also what [`remap_index_map`] emits and what the plain bitmap index's
+/// training scan produces.
 ///
 /// `mem_pool_size`, when set, overrides the session's memory pool for this
 /// sort instead of leaving it to `LANCE_MEM_POOL_SIZE`. Production callers
@@ -545,6 +560,38 @@ fn sort_labels_by_value(
     unnested: SendableRecordBatchStream,
     mem_pool_size: Option<u64>,
 ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
+    let mut options = LanceExecutionOptions {
+        use_spilling: true,
+        mem_pool_size,
+        ..Default::default()
+    };
+
+    // Keep each input batch within one sorted output chunk. DataFusion's
+    // in-memory merge reserves comparison keys as it reads each chunk;
+    // multi-chunk inputs can exhaust the pool while other chunks remain buffered.
+    let chunk_rows = get_session_context(&options).state().config().batch_size();
+    // Pin the sort's chunk size to the split's, so the two cannot drift apart.
+    options.batch_size = Some(chunk_rows);
+    let schema = unnested.schema();
+    let pieces = unnested
+        .map_ok(move |batch| {
+            let num_rows = batch.num_rows();
+            if num_rows <= chunk_rows {
+                return Either::Left(futures::stream::once(std::future::ready(Ok(batch))));
+            }
+            Either::Right(futures::stream::iter(
+                (0..num_rows).step_by(chunk_rows).map(move |offset| {
+                    // Copy the slice so memory accounting excludes the parent's
+                    // unused buffers.
+                    let piece = batch.slice(offset, chunk_rows.min(num_rows - offset));
+                    deep_copy_batch_sliced(&piece).map_err(DataFusionError::from)
+                }),
+            ))
+        })
+        .try_flatten();
+    let unnested: SendableRecordBatchStream =
+        Box::pin(RecordBatchStreamAdapter::new(schema, pieces));
+
     let input: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::new(unnested));
     // Resolved by name: `Column::evaluate` only bounds-checks the index it is
     // given and never consults the name, so a hardcoded index would silently
@@ -559,29 +606,9 @@ fn sort_labels_by_value(
         },
     };
 
-    let options = LanceExecutionOptions {
-        use_spilling: true,
-        mem_pool_size,
-        ..Default::default()
-    };
-
-    // Unnesting multiplies rows by list length, so one scan batch becomes a batch
-    // far larger than any other operator produces: 8,192 rows x 512 labels is
-    // 4.2M rows at once. DataFusion's sort cannot spill a batch it has not first
-    // admitted, so an oversized batch fails the build outright instead of
-    // spilling -- reproduced as `ResourcesExhausted` from `ExternalSorter` with
-    // only 512 distinct labels. Cap by bytes before the sort. Byte-aware rather
-    // than row-aware because list width and label width both vary, and
-    // deep-copying, because a sliced batch still reports its parent buffer's
-    // size to memory accounting.
-    //
-    // A sixth of the pool, derived rather than fixed: the sort reserves
-    // `min(pool / 3, 40 MiB)` up front, so at worst two thirds of the pool is
-    // left to admit a batch into, and a sixth is a quarter of that worst case --
-    // room for the sort to work in, not just to hold the batch. Deriving it also
-    // avoids restating that reservation formula, which lives in `lance-datafusion`
-    // and would silently drift. At the 150 MiB default this is 25 MiB, the value
-    // the merge-insert write path fixes above its own sort.
+    // The row cap alone cannot bound bytes when label widths vary. DataFusion
+    // must reserve space for each incoming batch even with spilling enabled.
+    // Cap batches at a sixth of the pool to leave room for sort/merge overhead.
     let max_batch_bytes = (options.mem_pool_size() / 6).max(1) as usize;
     let capped: Arc<dyn ExecutionPlan> =
         Arc::new(HardCapBatchSizeExec::new(input, max_batch_bytes));
@@ -605,11 +632,18 @@ async fn write_label_list_index(
     value_type: &DataType,
     sorted_labels: SendableRecordBatchStream,
     old_index: Option<&BitmapIndex>,
+    old_data_filter: Option<&OldIndexDataFilter>,
     list_nulls: impl FnOnce() -> Result<RowAddrTreeMap>,
 ) -> Result<IndexFile> {
     let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, value_type).await?;
-    // `None`: LabelList does not apply the old-data filter. See `update`.
-    build_index_map(sorted_labels, old_index, None, &mut writer).await?;
+    let old_segments = old_index
+        .map(|index| OldSegment {
+            index,
+            filter: old_data_filter,
+        })
+        .into_iter()
+        .collect();
+    build_index_map(sorted_labels, old_segments, &mut writer).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
@@ -644,7 +678,7 @@ async fn train_label_list_index_with_plan(
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
 
-    let file = write_label_list_index(index_store, &value_type, sorted, None, || {
+    let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
         Ok(list_nulls.lock().unwrap().clone())
     })
     .await?;
@@ -673,6 +707,7 @@ async fn update_label_list_index(
     existing: &LabelListIndex,
     new_data: SendableRecordBatchStream,
     dest_store: &dyn IndexStore,
+    old_data_filter: Option<&OldIndexDataFilter>,
 ) -> Result<IndexFile> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
     let new_data = track_list_nulls(new_data, list_nulls.clone());
@@ -699,8 +734,13 @@ async fn update_label_list_index(
         &value_type,
         sorted,
         Some(&existing.values_index),
+        old_data_filter,
         || {
             let mut merged = (*existing_nulls).clone();
+            // Prune old state before adding replacements, which may reuse row IDs.
+            if let Some(filter) = old_data_filter {
+                filter.retain_old_rows(&mut merged);
+            }
             merged |= &*list_nulls.lock().unwrap();
             Ok(merged)
         },
@@ -714,8 +754,8 @@ async fn update_label_list_index(
 /// separate `list_nulls` row set. Because distributed segments cover disjoint rows
 /// (distinct fragments), merging streams and unions the bitmap payloads by key
 /// and separately unions the `list_nulls` sets; no source-data re-scan is
-/// required. This mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but
-/// also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
+/// required. This mirrors [`crate::scalar::bitmap::BitmapIndex::merge_segments`]
+/// but also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
 /// rows from retired fragments are removed from both the value bitmaps and
 /// `list_nulls`.
 pub async fn merge_label_list_indices(
@@ -1025,6 +1065,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1042,6 +1083,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1100,6 +1142,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
     use datafusion_common::ScalarValue;
@@ -1218,57 +1261,23 @@ mod tests {
         }
     }
 
-    /// A wide list column must build whatever the memory pool is set to.
-    ///
-    /// `unnest_chunks` maps one input batch to one output batch, multiplying rows
-    /// by list length, so a scan's 8,192-row batch becomes 4.2M unnested rows in
-    /// a single batch. DataFusion's sort cannot spill a batch it has not first
-    /// admitted, so without the byte cap in `sort_labels_by_value` this fails
-    /// outright with `ResourcesExhausted` -- and with only 512 distinct labels,
-    /// so it is unrelated to the cardinality this index's memory work targets.
-    ///
-    /// Both pool sizes matter. The default case is the originally reported
-    /// failure; the small-pool case is what a cap fixed at 25 MiB gets wrong,
-    /// since 25 MiB does not fit in a 32 MiB pool's ~21 MiB of admittable space.
-    /// Each fixture is sized to exceed its own pool, so a cap that stopped
-    /// tracking the pool fails one case or the other.
-    ///
-    /// Deliberately one large batch: every other fixture here chunks input at 64
-    /// rows, which is why none of them can reach this. The default-pool case is
-    /// also the one test here that exceeds the one-second guideline (~1.6s), and
-    /// deliberately: it has to put more than ~110 MiB through a single batch, and
-    /// trimming it closer to the threshold would let it pass without the cap on a
-    /// machine with slightly different accounting. A memory test that quietly
-    /// stops reproducing is worse than a slow one.
-    #[rstest]
-    #[case::default_pool(None, 1024)]
-    #[case::small_pool(Some(32 * 1024 * 1024), 256)]
+    // One scan batch unnests to more bytes than the small pool can admit at once.
+    // The separate spill test checks the multi-batch merge path.
     #[tokio::test]
-    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_train_index_handles_a_wide_list_in_one_scan_batch(
-        #[case] mem_pool_size: Option<u64>,
-        #[case] rows: usize,
-    ) {
-        // Sized for bytes, not rows: a wide label keeps the single batch over the
-        // pool while sorting far fewer rows than an 8,192-row scan batch would.
+    async fn test_train_index_handles_a_wide_list_in_one_scan_batch() {
+        const ROWS: usize = 256;
         const LABELS_PER_ROW: usize = 512;
         const LABEL_PAD: usize = 200;
+        let labels: Vec<String> = (0..LABELS_PER_ROW)
+            .map(|label| format!("label-{label:04}{}", "p".repeat(LABEL_PAD)))
+            .collect();
 
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new(
-                VALUE_COLUMN_NAME,
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                true,
-            ),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
+        let schema = label_list_schema();
         let mut builder =
             arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new());
-        for _ in 0..rows {
-            for label in 0..LABELS_PER_ROW {
-                builder
-                    .values()
-                    .append_value(format!("label-{label:04}{}", "p".repeat(LABEL_PAD)));
+        for _ in 0..ROWS {
+            for label in &labels {
+                builder.values().append_value(label);
             }
             builder.append(true);
         }
@@ -1276,32 +1285,29 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(builder.finish()),
-                Arc::new(UInt64Array::from_iter_values(0..rows as u64)),
+                Arc::new(UInt64Array::from_iter_values(0..ROWS as u64)),
             ],
         )
         .unwrap();
         let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            futures::stream::iter(vec![Ok(batch)]),
+            futures::stream::once(std::future::ready(Ok(batch))),
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index_with_plan(stream, store.as_ref(), mem_pool_size)
+        train_label_list_index_with_plan(stream, store.as_ref(), Some(32 * 1024 * 1024))
             .await
-            .expect("a wide list column must build whatever the pool is set to");
+            .expect("the wide-list fixture must build with the selected pool");
 
-        let contents = read_index_contents(store.as_ref()).await;
-        assert_eq!(
-            contents.labels.len(),
-            LABELS_PER_ROW,
-            "every label in the lists must be indexed"
-        );
         // Every row carries every label, so each posting covers all rows.
-        assert!(
-            contents.labels.iter().all(|(_, addrs)| addrs.len() == rows),
-            "each label must cover all {rows} rows"
-        );
-        assert!(contents.list_nulls.is_empty());
+        let expected = IndexContents {
+            labels: labels
+                .into_iter()
+                .map(|label| (Some(label), (0..ROWS as u64).collect()))
+                .collect(),
+            list_nulls: vec![],
+        };
+        assert_eq!(read_index_contents(store.as_ref()).await, expected);
     }
 
     // ---- shared fixtures for the spill-build tests ------------------------
@@ -1507,6 +1513,83 @@ mod tests {
         let tiny = read_index_contents(store.as_ref()).await;
 
         assert_eq!(generous, tiny, "a spilling sort must not change the index");
+    }
+
+    // Unsplit inputs would produce multiple chunks in the in-memory spill merge.
+    // DataFusion's spawn_buffered reads ahead only on a multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_train_index_spills_wide_labels_in_a_large_pool() {
+        const POOL_BYTES: u64 = 256 * 1024 * 1024;
+        const LABEL_BYTES: usize = 1024;
+        const DISTINCT_LABELS: usize = 1024;
+        // 64 rows x 256 labels unnest to 16,384 rows: two of the sort's 8,192-row
+        // chunks.
+        const ROWS_PER_BATCH: usize = 64;
+        const LABELS_PER_ROW: usize = 256;
+        // 128 MiB of labels forces spilling with sort overhead and the 40 MiB
+        // merge reservation. Without row splitting, this fails in ExternalSorterMerge.
+        const BATCHES: usize = 8;
+
+        let labels: Vec<String> = (0..DISTINCT_LABELS)
+            .map(|i| format!("label-{i:04}-{}", "p".repeat(LABEL_BYTES - 11)))
+            .collect();
+        let schema = label_list_schema();
+        let batch_schema = schema.clone();
+        let input_labels = labels.clone();
+        let batches = (0..BATCHES).map(move |batch_idx| {
+            let mut builder =
+                arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new());
+            let first_row = batch_idx * ROWS_PER_BATCH;
+            for row in first_row..first_row + ROWS_PER_BATCH {
+                for slot in row * LABELS_PER_ROW..(row + 1) * LABELS_PER_ROW {
+                    builder
+                        .values()
+                        .append_value(&input_labels[slot % DISTINCT_LABELS]);
+                }
+                builder.append(true);
+            }
+            let addrs = UInt64Array::from_iter_values(
+                (first_row..first_row + ROWS_PER_BATCH).map(|row| row as u64),
+            );
+            Ok(RecordBatch::try_new(
+                batch_schema.clone(),
+                vec![Arc::new(builder.finish()), Arc::new(addrs)],
+            )
+            .unwrap())
+        });
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+
+        let (_tmpdir, store) = test_util::index_store();
+        let (_file, sort_plan) =
+            train_label_list_index_with_plan(stream, store.as_ref(), Some(POOL_BYTES))
+                .await
+                .expect("wide labels must build when a large pool's sort spills");
+
+        let metrics = sort_plan.metrics().expect("SortExec must report metrics");
+        assert!(
+            metrics.spill_count().unwrap_or(0) > 0,
+            "the fixture must force a spill; got metrics: {metrics:?}"
+        );
+
+        let expected = IndexContents {
+            labels: labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    // Each group of 256 labels belongs to one of four row classes.
+                    let addrs = (i / LABELS_PER_ROW..BATCHES * ROWS_PER_BATCH)
+                        .step_by(DISTINCT_LABELS / LABELS_PER_ROW)
+                        .map(|row| row as u64)
+                        .collect();
+                    (Some(label), addrs)
+                })
+                .collect(),
+            list_nulls: vec![],
+        };
+        assert_eq!(read_index_contents(store.as_ref()).await, expected);
     }
 
     async fn build_label_list_segment(rows: &[SampleRow]) -> (TempObjDir, Arc<LabelListIndex>) {
@@ -1810,6 +1893,60 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::row_addresses(false)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_update_applies_old_data_filter(#[case] stable_row_ids: bool) {
+        const KEPT: u64 = 1 << 32;
+        let initial = vec![
+            (
+                0,
+                Some(vec![Some("old".into()), Some("shared".into()), None]),
+            ),
+            (1, None),
+            (2, Some(vec![Some("old".into())])),
+            (3, None),
+            (KEPT, Some(vec![Some("kept".into())])),
+            (KEPT + 1, None),
+        ];
+        let updated_start = if stable_row_ids { 0 } else { 2 << 32 };
+        let replacements = vec![
+            (
+                updated_start,
+                Some(vec![Some("new".into()), Some("shared".into())]),
+            ),
+            (updated_start + 1, Some(vec![Some("new".into())])),
+            (updated_start + 2, None),
+            (updated_start + 3, Some(vec![])),
+        ];
+        let filter = if stable_row_ids {
+            OldIndexDataFilter::RowIds([KEPT, KEPT + 1].into_iter().collect())
+        } else {
+            OldIndexDataFilter::Fragments {
+                to_keep: RoaringBitmap::from_iter([1]),
+                to_remove: RoaringBitmap::from_iter([0]),
+            }
+        };
+        let (_src_dir, index) = build_label_list_segment(&initial).await;
+        let (_dest_dir, dest_store) = test_util::index_store();
+        index
+            .update(
+                sample_rows_to_stream(&replacements),
+                dest_store.as_ref(),
+                Some(filter),
+            )
+            .await
+            .unwrap();
+
+        let mut actual = read_index_contents(dest_store.as_ref()).await;
+        // Bitmap updates retain empty keys; compare the surviving memberships.
+        actual.labels.retain(|(_, rows)| !rows.is_empty());
+        let expected_rows = [initial[4..].to_vec(), replacements].concat();
+        assert_eq!(build_label_list_index(&expected_rows).await, actual);
+    }
+
     /// The spill and destination file schemas are declared from the existing
     /// index while the keys come from the new stream, so a disagreement must be
     /// rejected rather than written as a file whose schema lies about its keys.
@@ -1842,7 +1979,7 @@ mod tests {
             futures::stream::iter(vec![Ok(batch)]),
         ));
 
-        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref())
+        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref(), None)
             .await
             .expect_err("a value-type mismatch must be rejected");
         let message = error.to_string();
@@ -1922,6 +2059,7 @@ mod tests {
             legacy.as_ref(),
             sample_rows_to_stream(&additional),
             updated_store.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -2000,6 +2138,7 @@ mod tests {
                     index.as_ref(),
                     sample_rows_to_stream(second),
                     dest_store.as_ref(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2052,5 +2191,42 @@ mod tests {
             "only the null list belongs to list_nulls -- not the empty list, \
              and not the row with a null element"
         );
+    }
+
+    /// Null labels on both sides of a split point keep their rows. The fixture is
+    /// sized from the session's batch size, so it crosses a split point whatever
+    /// that size is.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_null_labels_keep_their_rows_across_a_split_point() {
+        const FRAGMENT_1: u64 = 1 << 32;
+        let chunk_rows = get_session_context(&LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        })
+        .state()
+        .config()
+        .batch_size();
+        // Row 0 unnests to rows 0..chunk_rows, so its trailing null ends the first
+        // piece and the next row's leading null starts the second.
+        let mut first_labels = vec![Some("a".to_string()); chunk_rows - 1];
+        first_labels.push(None);
+        let rows: Vec<SampleRow> = vec![
+            (0, Some(first_labels)),
+            (1, None),
+            (FRAGMENT_1, Some(vec![None, Some("b".to_string())])),
+        ];
+
+        let contents = build_label_list_index(&rows).await;
+
+        assert_eq!(
+            contents.labels,
+            vec![
+                (None, vec![0, FRAGMENT_1]),
+                (Some("a".to_string()), vec![0]),
+                (Some("b".to_string()), vec![FRAGMENT_1]),
+            ]
+        );
+        assert_eq!(contents.list_nulls, vec![1]);
     }
 }

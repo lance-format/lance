@@ -17,15 +17,20 @@ use lance_table::{
         ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
         RowIdMeta,
     },
-    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
+    rowids::{
+        FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids,
+        version::{LoadedRowLineage, SpilledRowLineage},
+    },
 };
 use std::sync::Arc;
 
+pub(crate) use spill::place_carried_row_lineage;
 pub use spill::{
     DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
     PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
     place_row_lineage, read_spilled_row_ids, read_spilled_versions,
 };
+pub(crate) use spill::{RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -125,6 +130,61 @@ pub async fn load_row_version_sequence(
             .load_sequence()
             .map(|sequence| Some(Arc::new(sequence))),
     }
+}
+
+/// Read ahead every lineage sequence of `fragments` that lives outside the
+/// manifest, for a commit that will need to consult them.
+///
+/// Building a manifest is synchronous and cannot read a data file, so the
+/// commit path calls this first, over the whole manifest, and hands the result
+/// over in `ManifestBuildConfig::spilled_row_lineage`. Only spilled sequences
+/// are loaded; when none is, this returns an empty map without IO.
+pub async fn load_spilled_row_lineage<'a>(
+    dataset: &Dataset,
+    fragments: impl IntoIterator<Item = &'a Fragment>,
+) -> Result<Arc<SpilledRowLineage>> {
+    // A `for` loop rather than `map`: a closure returning a future that borrows
+    // its argument trips the higher-ranked lifetime check on the outer future.
+    let mut loads = Vec::new();
+    for fragment in fragments {
+        if fragment.has_spilled_row_lineage() {
+            loads.push(load_fragment_spilled_lineage(dataset, fragment));
+        }
+    }
+    let loaded: SpilledRowLineage = futures::stream::iter(loads)
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    Ok(Arc::new(loaded))
+}
+
+/// The spilled sequences of one fragment, for [`load_spilled_row_lineage`].
+async fn load_fragment_spilled_lineage(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<(u64, LoadedRowLineage)> {
+    let row_ids = match &fragment.row_id_meta {
+        Some(RowIdMeta::Column) => Some(load_row_id_sequence(dataset, fragment).await?),
+        _ => None,
+    };
+    let mut versions = [None, None];
+    for (slot, kind) in versions
+        .iter_mut()
+        .zip([RowVersionKind::CreatedAt, RowVersionKind::LastUpdatedAt])
+    {
+        if let Some(RowDatasetVersionMeta::Column) = kind.meta(fragment) {
+            *slot = load_row_version_sequence(dataset, fragment, kind).await?;
+        }
+    }
+    let [created_at, last_updated_at] = versions;
+    Ok((
+        fragment.id,
+        LoadedRowLineage {
+            row_ids,
+            created_at,
+            last_updated_at,
+        },
+    ))
 }
 
 /// Load row id sequences from the given dataset and fragments.
@@ -312,10 +372,25 @@ async fn row_addrs_to_row_ids_impl(
 /// keyed by the fragment's content; the index is keyed by manifest generation
 /// and cannot stand in for it.
 async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
+    load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments).await
+}
+
+/// Build a row id index covering only `fragments`, not the whole dataset.
+///
+/// A caller that already knows the row ids it will look up were all read from
+/// a known, small set of fragments -- compaction rewriting a handful of
+/// fragments out of a much larger table, for instance -- gets no benefit from
+/// [`get_row_id_index`]'s whole-dataset index and pays for reading every other
+/// fragment's row id sequence and deletion vector for nothing. This builds an
+/// index scoped to just those fragments instead.
+pub(crate) async fn load_row_id_index_for_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<RowIdIndex> {
     // A `for` loop rather than `map`: a closure returning a future that borrows
     // its argument trips the higher-ranked lifetime check on the outer future.
-    let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
-    for fragment in dataset.manifest.fragments.iter() {
+    let mut loads = Vec::with_capacity(fragments.len());
+    for fragment in fragments.iter() {
         loads.push(read_fragment_row_id_index(dataset, fragment));
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)

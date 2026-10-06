@@ -36,14 +36,15 @@ use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
+    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
-use lance_table::transaction::{FragReuseUpdate, PreparedIndices};
+use lance_table::transaction::{FragReuseUpdate, PreparedIndices, has_writer_placed_lineage};
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
@@ -51,6 +52,7 @@ use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
@@ -83,14 +85,13 @@ pub mod namespace_manifest;
 mod s3_test;
 
 /// Wall-clock budget for conflict retry backoff when callers do not override it.
+/// It starts once the commit has caught up with the versions committed since
+/// its read version, so how far behind the writer started does not count.
 pub(crate) const DEFAULT_COMMIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Env var overriding [`DEFAULT_COMMIT_RETRY_TIMEOUT`] process-wide, in
-/// (possibly fractional) seconds. A long-running maintenance commit (index
-/// build, compaction) can start from a read version that is hours old on a
-/// write-heavy table, and catching up through the intervening versions can
-/// need far more than the default budget; this is the operational escape
-/// hatch for callers that have no explicit-timeout API of their own.
+/// (possibly fractional) seconds: the operational escape hatch for callers
+/// that have no explicit-timeout API of their own.
 const COMMIT_RETRY_TIMEOUT_ENV: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
 
 /// The commit conflict-retry budget used when the caller does not set one:
@@ -216,6 +217,18 @@ async fn cleanup_transaction_file(
     }
 }
 
+/// Best-effort removal of files a shallow clone staged in the target before
+/// its commit conclusively failed (the relocated FRI entry's spilled
+/// `details.binpb`). Never called when the commit outcome is unknown: the
+/// clone may have landed and still need them.
+async fn cleanup_spilled_clone_files(object_store: &ObjectStore, spilled_files: &[Path]) {
+    for path in spilled_files {
+        if let Err(e) = object_store.delete(path).await {
+            log::warn!("Failed to clean up staged clone file '{}': {}", path, e);
+        }
+    }
+}
+
 /// Who owns the manifest at a version, checked after a failed commit attempt.
 #[derive(Debug)]
 enum CommitOutcome {
@@ -267,8 +280,11 @@ async fn verify_commit_outcome(
     }
 
     // Durable form of this attempt's transaction, matching what the commit
-    // path serialized.
-    let transaction_pb = pb::Transaction::from(transaction);
+    // path serialized. The commit path already rejected anything that fails
+    // to serialize, so this cannot fail in practice; stay conservative if it does.
+    let Ok(transaction_pb) = pb::Transaction::try_from(transaction) else {
+        return CommitOutcome::Unknown;
+    };
 
     let mut backoff = Backoff::default();
     let failure = loop {
@@ -416,13 +432,17 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
     let may_change_schema = operation_may_change_schema(&pb_transaction);
 
+    // Files a shallow clone writes into the target before the manifest
+    // commit; deleted again when the commit conclusively fails.
+    let mut spilled_clone_files: Vec<Path> = Vec::new();
     let clone_source = if let Operation::Clone {
+        is_shallow,
         ref_version,
         ref_path,
         ..
@@ -433,7 +453,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
+            ObjectStore::extract_path_from_uri(store_registry.clone(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
@@ -445,19 +465,80 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
-        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
-            source_store,
-            &source_manifest_location,
-            &source_manifest,
-        )
-        .await?;
-        Some((source_store, source_manifest_location, source_manifest))
+
+        // Prepare the cloned index metadata now: an uncloneable tagged FRI
+        // history must be rejected before anything is written to the target.
+        let indices = if let Some(index_section_pos) = source_manifest.index_section {
+            let reader = source_store.open(&source_manifest_location.path).await?;
+            let section: pb::IndexSection =
+                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            section
+                .indices
+                .into_iter()
+                .map(IndexMetadata::try_from)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        let new_base_id = source_manifest
+            .base_paths
+            .keys()
+            .max()
+            .map(|id| *id + 1)
+            .unwrap_or(0);
+        let mut updated_indices = Vec::with_capacity(indices.len());
+        for mut index in indices {
+            if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
+                // Restamp the entry's row-map references through the clone's
+                // base mapping and move the entry itself into the clone. A
+                // shallow clone leaves the row-map files where they are; a
+                // deep clone copies them into its own `_fri/` (the copy loop
+                // in `deep_clone`), so every reference becomes local.
+                let base_remap = if *is_shallow {
+                    crate::index::frag_reuse::CloneBaseRemap::Shallow { new_base_id }
+                } else {
+                    crate::index::frag_reuse::CloneBaseRemap::Deep
+                };
+                let (relocated, spilled) =
+                    crate::index::frag_reuse::relocate_tagged_entry_for_clone(
+                        source_store,
+                        &source_base_path,
+                        &source_manifest,
+                        store_registry.clone(),
+                        &index,
+                        base_remap,
+                        object_store,
+                        base_path,
+                    )
+                    .await?;
+                index = relocated;
+                spilled_clone_files.extend(spilled);
+            } else if !*is_shallow {
+                // Deep clone: keep metadata but normalize base to local.
+                index.base_id = None;
+            } else if index.base_id.is_none() {
+                // Same rule as the data files in `Manifest::shallow_clone`:
+                // only the source's own entries get the new base; entries
+                // already stamped keep their ids, which carry over into
+                // the clone's `base_paths` verbatim (a chained clone must
+                // not restamp an origin-based index onto the middle hop).
+                index.base_id = Some(new_base_id);
+            }
+            updated_indices.push(index);
+        }
+        Some((source_manifest, new_base_id, updated_indices))
     } else {
         None
     };
 
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, &pb_transaction).await?
+        match write_transaction_file(object_store, base_path, &pb_transaction).await {
+            Ok(transaction_file) => transaction_file,
+            Err(err) => {
+                cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
+                return Err(err);
+            }
+        }
     } else {
         String::new()
     };
@@ -470,16 +551,10 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_store, source_manifest_location, source_manifest)),
+        Some((source_manifest, new_base_id, updated_indices)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
-            let new_base_id = source_manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| *id + 1)
-                .unwrap_or(0);
             let new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
@@ -487,37 +562,10 @@ async fn do_commit_new_dataset(
                 branch_name.clone(),
                 transaction_file.clone(),
             );
-
-            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = source_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        if index.base_id.is_none() {
-                            // Same rule as the data files in
-                            // `Manifest::shallow_clone`: only the source's own
-                            // entries get the new base; entries already stamped
-                            // keep their ids, which carry over into the clone's
-                            // `base_paths` verbatim. A chained clone (clone of
-                            // a clone) must not restamp an origin-based index
-                            // onto the middle hop, where its files do not
-                            // exist.
-                            index.base_id = Some(new_base_id);
-                        }
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                vec![]
-            };
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
-            let mut new_manifest = source_manifest.clone();
+            let mut new_manifest = source_manifest;
             new_manifest.base_paths.clear();
             new_manifest.branch = None;
             new_manifest.tag = None;
@@ -535,22 +583,6 @@ async fn do_commit_new_dataset(
             }
             new_manifest.fragments = Arc::new(new_frags);
 
-            // Indices: keep metadata but normalize base to local
-            let mut updated_indices = Vec::new();
-            if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = source_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                updated_indices = section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = None;
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-            }
             (new_manifest, updated_indices)
         }
     } else {
@@ -628,6 +660,7 @@ async fn do_commit_new_dataset(
                 }
             }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
@@ -666,6 +699,7 @@ async fn do_commit_new_dataset(
                 }
             }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
             Err(err)
         }
     }
@@ -858,10 +892,16 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
         seen_fields.clear();
     }
 
-    // Apply mapping to the schema
+    // Apply mapping to the schema. Children carry an independent `parent_id`
+    // that is serialized verbatim, so re-parent them onto the new id as well.
+    // A field's children are named by this field's id only, so each entry can
+    // be applied independently of the order the mapping is iterated in.
     for (old_field_id, new_field_id) in &old_field_id_mapping {
         let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
         field.id = *new_field_id;
+        for child in field.children.iter_mut() {
+            child.parent_id = *new_field_id;
+        }
     }
 
     // Drop data files that are no longer in use.
@@ -1213,7 +1253,7 @@ pub(crate) async fn do_commit_detached_transaction(
              fragment reuse entry; commit the rewrite on the main version chain",
         ));
     }
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -1239,7 +1279,7 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
-        let build_config = write_config.to_build_config();
+        let build_config = build_config_for_attempt(dataset, transaction, write_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -1354,7 +1394,11 @@ pub(crate) async fn do_commit_detached_transaction(
                 }
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
-                inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
+                inline_tx = if inline_transaction {
+                    Some(pb::Transaction::try_from(transaction)?.into())
+                } else {
+                    None
+                };
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
@@ -1423,15 +1467,53 @@ pub(crate) async fn commit_detached_transaction(
     .await
 }
 
+/// The build config for one commit attempt against `dataset`'s current manifest.
+///
+/// An operation that carries rows' lineage over from existing fragments needs
+/// their sequences at build time, and the build cannot read the ones spilled to
+/// data files; they are read here, per attempt, so a rebase onto a newer
+/// manifest sees that manifest's fragments.
+async fn build_config_for_attempt(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+) -> Result<ManifestBuildConfig> {
+    let mut config = write_config.to_build_config();
+    let reads_existing_lineage = match &transaction.operation {
+        // An update resolves its new fragments' created-at versions from the
+        // existing fragments unless their writer placed them, and refreshes
+        // the existing last-updated-at versions of the offsets it rewrote in
+        // place (`updated_fragment_offsets`).
+        Operation::Update {
+            new_fragments,
+            updated_fragment_offsets,
+            ..
+        } => {
+            !new_fragments.iter().all(has_writer_placed_lineage)
+                || updated_fragment_offsets
+                    .as_ref()
+                    .is_some_and(|offsets| !offsets.0.is_empty())
+        }
+        Operation::DataOverlay { .. } => true,
+        _ => false,
+    };
+    if reads_existing_lineage {
+        config.spilled_row_lineage =
+            load_spilled_row_lineage(dataset, dataset.manifest.fragments.iter()).await?;
+    }
+    Ok(config)
+}
+
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
 /// list as read from the manifest current at this attempt, and the prepared
 /// list an in-place column rewrite has already withdrawn or pruned. For such
 /// a rewrite on a table with a tagged fragment reuse history the entry's
 /// history is decoded here, once per attempt, so the preparation can walk
 /// the lineage without guessing; other operations never interpret the
-/// entry: an append must carry a history a newer writer recorded through
-/// untouched. `frag_reuse` is what the rebase settled about the entry for
-/// this attempt. Nothing flows back into `transaction`.
+/// entry: an append, or a merge that only adds columns, must carry a
+/// history a newer writer recorded through untouched. `frag_reuse` is what
+/// the rebase settled about the entry for this attempt. Nothing flows back
+/// into `transaction`.
 async fn prepare_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
@@ -1439,14 +1521,14 @@ async fn prepare_attempt(
     frag_reuse: FragReuseUpdate,
 ) -> Result<PreparedIndices> {
     let indices = load_all_indices(dataset).await?;
-    let may_rewrite_in_place = match &transaction.operation {
-        Operation::Update {
-            fields_modified, ..
-        } => !fields_modified.is_empty(),
-        Operation::Merge { .. } | Operation::DataReplacement { .. } => true,
-        _ => false,
-    };
-    let ledger = if may_rewrite_in_place {
+    // Same rewrite set the preparation withdraws from; nothing else interprets the entry.
+    let rewrites_in_place = !Transaction::rewritten_physical_columns(
+        &transaction.operation,
+        &dataset.manifest.schema,
+        &dataset.manifest.fragments,
+    )
+    .is_empty();
+    let ledger = if rewrites_in_place {
         match indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -1468,7 +1550,7 @@ async fn prepare_attempt(
     )
 }
 
-async fn load_and_sort_new_transactions(
+pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
     let NewTransactionResult {
@@ -1526,7 +1608,7 @@ async fn record_successful_commit(
         // which versions are available for cleanup.
         match auto_cleanup_hook(dataset, manifest).await {
             Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-            Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+            Err(e) => log::warn!("Auto cleanup failed after a successful commit: {}", e),
             _ => {}
         };
     }
@@ -1588,7 +1670,12 @@ pub(crate) async fn commit_transaction(
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
-    let start = Instant::now();
+    // `retry_timeout` bounds the conflict-retry phase, which starts once the
+    // first attempt has caught up with the versions committed since
+    // `read_version`. A long-running writer (index build, compaction) on a
+    // write-heavy table can be thousands of versions behind, and that initial
+    // catch-up is work the commit must do however many retries it gets.
+    let mut retry_start: Option<Instant> = None;
 
     // Other transactions that may have been committed since the read_version.
     // We keep pair of (version, transaction). No other transactions to check initially
@@ -1629,10 +1716,12 @@ pub(crate) async fn commit_transaction(
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
+        let attempt_start = Instant::now();
+        let retry_start = *retry_start.get_or_insert(attempt_start);
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
-        let pb_transaction = pb::Transaction::from(&transaction);
+        let pb_transaction = pb::Transaction::try_from(&transaction)?;
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
         // Classified from the operation itself. Reading it back off the inline
         // copy would tie the verdict to the payload size instead.
@@ -1654,7 +1743,7 @@ pub(crate) async fn commit_transaction(
         // Build an up-to-date manifest from the transaction and current
         // manifest: prepare the index list against this attempt's manifest
         // first, then build from the prepared result.
-        let build_config = write_config.to_build_config();
+        let build_config = build_config_for_attempt(&dataset, &transaction, write_config).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 // A restore reinstates its snapshot's index list and entry
@@ -1673,6 +1762,7 @@ pub(crate) async fn commit_transaction(
             _ => {
                 let frag_reuse = match tagged_rewrite.take() {
                     Some(assembly) => FragReuseUpdate::Rewrite(assembly),
+                    None if write_config.tagged_frag_reuse_trim() => FragReuseUpdate::Trim,
                     None => FragReuseUpdate::None,
                 };
                 let prepared =
@@ -1795,9 +1885,12 @@ pub(crate) async fn commit_transaction(
                 if backoff.attempt() == 0 {
                     // We add 10% buffer here, to allow concurrent writes to complete.
                     // We pass the first attempt's time to the backoff so it's used
-                    // as the unit for backoff time slots.
+                    // as the unit for backoff time slots. The catch-up before the
+                    // attempt is excluded: it is not the window in which concurrent
+                    // writers collide with this one.
                     // See SlotBackoff implementation for more details on how this works.
-                    backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    backoff =
+                        backoff.with_unit((attempt_start.elapsed().as_millis() * 11 / 10) as u32);
                 }
 
                 if next_attempt_i < num_attempts {
@@ -1809,11 +1902,11 @@ pub(crate) async fn commit_transaction(
                         &current_transaction_file,
                     )
                     .await;
-                    if start.elapsed() > retry_timeout {
+                    if retry_start.elapsed() > retry_timeout {
                         return Err(timeout_error(retry_timeout, backoff.attempt() + 1));
                     }
                     let sleep_fut = tokio::time::sleep(backoff.next_backoff());
-                    maybe_timeout(backoff.attempt(), start, retry_timeout, sleep_fut).await?;
+                    maybe_timeout(backoff.attempt(), retry_start, retry_timeout, sleep_fut).await?;
                     continue;
                 } else {
                     break;
@@ -1925,6 +2018,32 @@ mod tests {
     #[case::nan(Some("NaN"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
     fn test_parse_commit_retry_timeout(#[case] raw: Option<&str>, #[case] expected: Duration) {
         assert_eq!(parse_commit_retry_timeout(raw), expected);
+    }
+
+    #[tokio::test]
+    async fn test_auto_cleanup_failure_preserves_successful_commit() {
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        dataset
+            .update_config([("lance.auto_cleanup.interval", "invalid")])
+            .await
+            .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, 2);
+        assert_eq!(
+            dataset.manifest.config["lance.auto_cleanup.interval"],
+            "invalid"
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+        let error = auto_cleanup_hook(&dataset, &dataset.manifest)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Cleanup { .. }));
+        assert!(error.to_string().contains("lance.auto_cleanup.interval"));
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -2067,7 +2186,7 @@ mod tests {
         let file_name = write_transaction_file(
             &object_store,
             &base_path,
-            &pb::Transaction::from(&transaction),
+            &pb::Transaction::try_from(&transaction).unwrap(),
         )
         .await
         .unwrap();
@@ -2641,6 +2760,95 @@ mod tests {
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
+    }
+
+    #[test]
+    fn test_fix_schema_nested() {
+        // A duplicated struct field is renumbered, so its children must be
+        // re-parented onto the new id. Otherwise the manifest serializes a
+        // parent_id that no longer exists and can never be read back.
+        let mut field0 = Field::try_from(ArrowField::new("a", DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+
+        let inner = ArrowField::new(
+            "inner",
+            DataType::Struct(vec![ArrowField::new("ordinal", DataType::Int32, false)].into()),
+            false,
+        );
+        let mut outer = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("text", DataType::Utf8, false), inner].into()),
+            false,
+        ))
+        .unwrap();
+        // ids: s = 1, text = 2, inner = 3, ordinal = 4
+        outer.set_id(-1, &mut 1);
+
+        let schema = Schema {
+            fields: vec![field0, outer],
+            metadata: Default::default(),
+        };
+        // Both the struct (1) and the nested struct (3) have duplicate coverage
+        // within this fragment, so both get renumbered.
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![
+                DataFile::new_legacy_from_fields("path1", vec![0, 1, 2, 3, 4], None),
+                DataFile::new_legacy_from_fields("path2", vec![1, 3], None),
+            ],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }];
+
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        fix_schema(&mut manifest).unwrap();
+
+        // max_field_id was 4, so 1 -> 5 and 3 -> 6.
+        let outer = &manifest.schema.fields[1];
+        assert_eq!(outer.id, 5);
+        let text = &outer.children[0];
+        let inner = &outer.children[1];
+        assert_eq!(
+            text.parent_id, 5,
+            "child of a renumbered struct kept a stale parent_id"
+        );
+        assert_eq!(
+            inner.parent_id, 5,
+            "child of a renumbered struct kept a stale parent_id"
+        );
+        assert_eq!(inner.id, 6);
+        assert_eq!(
+            inner.children[0].parent_id, 6,
+            "grandchild of a renumbered struct kept a stale parent_id"
+        );
+
+        // Every non-root field must name a parent that still exists in the schema.
+        let live_ids = manifest
+            .schema
+            .fields_pre_order()
+            .map(|f| f.id)
+            .collect::<HashSet<_>>();
+        for field in manifest.schema.fields_pre_order() {
+            if field.parent_id >= 0 {
+                assert!(
+                    live_ids.contains(&field.parent_id),
+                    "field '{}' (id={}) references parent id {}, which no longer exists",
+                    field.name,
+                    field.id,
+                    field.parent_id
+                );
+            }
+        }
     }
 
     /// A CommitHandler that always fails with OtherError, used to simulate
@@ -3787,7 +3995,7 @@ mod tests {
             None,
         );
         // What the commit wrote, and what verification reads back.
-        let durable = pb::Transaction::from(&transaction);
+        let durable = pb::Transaction::try_from(&transaction).unwrap();
         let read_back = pb::Transaction::decode(durable.encode_to_vec().as_slice()).unwrap();
         // The old comparison (read-back deserialized into memory, compared
         // with `Transaction::eq`) misclassifies our own landed commit: the
@@ -3800,6 +4008,6 @@ mod tests {
         );
         // The comparison `verify_commit_outcome` performs: read-back durable
         // form against the regenerated durable form of this attempt.
-        assert_eq!(read_back, pb::Transaction::from(&transaction));
+        assert_eq!(read_back, pb::Transaction::try_from(&transaction).unwrap());
     }
 }

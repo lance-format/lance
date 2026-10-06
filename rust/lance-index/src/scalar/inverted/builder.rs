@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
+use crate::scalar::RowAddrTranslatorRef;
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
@@ -16,7 +17,6 @@ use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
-use fst::Streamer;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_arrow::json::JsonEncoding;
@@ -27,6 +27,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowSetOps;
 use object_store::path::Path;
@@ -100,50 +101,96 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
 /// Merge the workers' leftover tail builders into as few partitions as the
 /// memory budget allows. Folding unconditionally would collapse every build
 /// whose workers never hit the flush threshold into a single partition, which
-/// destroys intra-query parallelism; splitting by the same per-partition
-/// budget as the flush path makes the final partition count converge to
-/// roughly total_builder_memory / memory_limit_bytes regardless of worker
-/// layout.
-fn merge_all_tail_partitions(
+/// destroys intra-query parallelism, so a partition only takes builders while
+/// it stays under the same per-partition budget as the flush path.
+///
+/// Merging runs in rounds whose groups are merged concurrently. A round plans
+/// its groups from the sum of the builders' memory sizes, which overestimates
+/// the merged size: every worker keeps its own dictionary entry and posting
+/// list builder for each token it saw, and merging deduplicates them. The next
+/// round plans again from the merged sizes, until no two adjacent builders fit
+/// together. Every two adjacent partitions then reach the budget, so the
+/// partition count stays below 2 * merged_memory / memory_limit_bytes + 1
+/// however many workers produced tails.
+async fn merge_tail_partitions(
     tails: Vec<TailPartition>,
     memory_limit_bytes: u64,
 ) -> Result<Vec<InnerBuilder>> {
-    let mut merged_builders: Vec<InnerBuilder> = Vec::new();
-    let mut merged: Option<InnerBuilder> = None;
+    let mut builders = tails
+        .into_iter()
+        .map(|tail| tail.builder)
+        .collect::<Vec<_>>();
+    loop {
+        let groups =
+            spawn_cpu(move || Result::Ok(group_tail_builders(builders, memory_limit_bytes)))
+                .await?;
+        let merges_any = groups.iter().any(|group| group.len() > 1);
+        builders = futures::stream::iter(
+            groups
+                .into_iter()
+                .map(|group| spawn_cpu(move || merge_tail_group(group))),
+        )
+        .buffered(get_num_compute_intensive_cpus().max(1))
+        .try_collect()
+        .await?;
+        if !merges_any {
+            return Ok(builders);
+        }
+    }
+}
+
+/// Split `builders` into consecutive groups whose summed memory sizes stay
+/// under `memory_limit_bytes`.
+fn group_tail_builders(
+    builders: Vec<InnerBuilder>,
+    memory_limit_bytes: u64,
+) -> Vec<Vec<InnerBuilder>> {
+    let mut groups: Vec<Vec<InnerBuilder>> = Vec::new();
+    let mut group_memory_size = 0u64;
+    let mut group_num_docs = 0usize;
     let mut empty_coordinate_builder: Option<InnerBuilder> = None;
-    for tail in tails {
-        let builder = tail.builder;
+    for builder in builders {
         if builder.is_empty() {
             if builder.docs.coordinate_rank() > 0 && empty_coordinate_builder.is_none() {
                 empty_coordinate_builder = Some(builder);
             }
             continue;
         }
-        match &mut merged {
-            Some(current) => {
-                let would_exceed_memory =
-                    current.memory_size().saturating_add(builder.memory_size())
-                        >= memory_limit_bytes;
-                let would_exceed_doc_ids =
-                    current.docs.len().saturating_add(builder.docs.len()) > u32::MAX as usize;
-                if would_exceed_memory || would_exceed_doc_ids {
-                    merged_builders.push(std::mem::replace(current, builder));
-                } else {
-                    current.merge_from(builder)?;
-                }
+        let memory_size = builder.memory_size();
+        let num_docs = builder.docs.len();
+        match groups.last_mut() {
+            Some(group)
+                if group_memory_size.saturating_add(memory_size) < memory_limit_bytes
+                    && group_num_docs.saturating_add(num_docs) <= u32::MAX as usize =>
+            {
+                group.push(builder);
+                group_memory_size += memory_size;
+                group_num_docs += num_docs;
             }
-            None => merged = Some(builder),
+            _ => {
+                groups.push(vec![builder]);
+                group_memory_size = memory_size;
+                group_num_docs = num_docs;
+            }
         }
     }
-    if let Some(builder) = merged {
-        merged_builders.push(builder);
-    }
-    if merged_builders.is_empty()
+    if groups.is_empty()
         && let Some(builder) = empty_coordinate_builder
     {
-        merged_builders.push(builder);
+        groups.push(vec![builder]);
     }
-    Ok(merged_builders)
+    groups
+}
+
+fn merge_tail_group(group: Vec<InnerBuilder>) -> Result<InnerBuilder> {
+    let mut builders = group.into_iter();
+    let mut merged = builders
+        .next()
+        .ok_or_else(|| Error::internal("tail partition group is empty".to_owned()))?;
+    for builder in builders {
+        merged.merge_from(builder)?;
+    }
+    Ok(merged)
 }
 
 #[derive(Debug)]
@@ -514,10 +561,8 @@ impl InvertedIndexBuilder {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let merged_tail_partitions = spawn_cpu(move || {
-                merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
-            })
-            .await?;
+            let merged_tail_partitions =
+                merge_tail_partitions(tail_partitions, worker_memory_limit_bytes).await?;
             // Tail partitions hold most of the data when workers rarely hit the
             // flush threshold; writing them one at a time serializes the
             // posting-list compression of nearly the whole index behind a
@@ -544,9 +589,31 @@ impl InvertedIndexBuilder {
         index_build.await
     }
 
+    /// Remap through an in-memory mapping (the legacy entry point).
     pub async fn remap(
         &mut self,
         mapping: &RowAddrRemap,
+        src_store: Arc<dyn IndexStore>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.into(), src_store, dest_store).await
+    }
+
+    /// Remap through a translator whose payload may need reads, one
+    /// partition's documents at a time.
+    pub async fn remap_streaming(
+        &mut self,
+        mapping: &RowAddrTranslator,
+        src_store: Arc<dyn IndexStore>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.as_ref(), src_store, dest_store)
+            .await
+    }
+
+    pub(crate) async fn remap_with(
+        &mut self,
+        mapping: RowAddrTranslatorRef<'_>,
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
@@ -561,7 +628,7 @@ impl InvertedIndexBuilder {
             )
             .await?;
             let mut builder = part.into_builder().await?;
-            builder.remap(mapping).await?;
+            builder.remap_with(mapping).await?;
             files.extend(
                 builder
                     .write_to(dest_store, self.partition_write_target())
@@ -831,7 +898,7 @@ pub struct InnerBuilder {
     format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
     block_size: usize,
-    pub(crate) tokens: TokenSet,
+    pub(super) tokens: TokenDictionary,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
 }
@@ -894,7 +961,7 @@ impl InnerBuilder {
             format_version,
             posting_tail_codec: format_version.posting_tail_codec(),
             block_size,
-            tokens: TokenSet::default(),
+            tokens: TokenDictionary::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
         }
@@ -951,8 +1018,14 @@ impl InnerBuilder {
     }
 
     /// Set the token set for this builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tokens` does not map its tokens to distinct ids in
+    /// `0..tokens.len()`, the ids the posting lists are indexed by.
     pub fn set_tokens(&mut self, tokens: TokenSet) {
-        self.tokens = tokens;
+        self.tokens = TokenDictionary::try_from_token_set(tokens)
+            .expect("token set must map its tokens to dense ids");
     }
 
     /// Set the document set for this builder.
@@ -965,10 +1038,22 @@ impl InnerBuilder {
         self.posting_lists = posting_lists;
     }
 
+    /// Remap through an in-memory mapping (the legacy entry point).
     pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
+        self.remap_with(mapping.into()).await
+    }
+
+    /// Remap through a translator whose payload may need reads.
+    pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<()> {
+        self.remap_with(mapping.as_ref()).await
+    }
+
+    pub(crate) async fn remap_with(&mut self, mapping: RowAddrTranslatorRef<'_>) -> Result<()> {
+        // One partition's documents are the unit of translation.
+        let mapping = mapping.resolve(self.docs.row_ids().iter().copied()).await?;
         // for the docs, we need to remove the rows that are removed from the doc set,
         // and update the row ids of the rows that are updated
-        let removed = self.docs.remap(mapping);
+        let removed = self.docs.remap(&mapping);
 
         // for the posting lists, we need to remap the doc ids:
         // - if the a row is removed, we need to shift the doc ids of the following rows
@@ -1052,22 +1137,8 @@ impl InnerBuilder {
         }
 
         let mut token_id_map = vec![u32::MAX; posting_lists.len()];
-        match tokens.tokens {
-            TokenMap::HashMap(map) => {
-                for (token, token_id) in map {
-                    let new_token_id = self.tokens.get_or_add(token.as_str());
-                    token_id_map[token_id as usize] = new_token_id;
-                }
-            }
-            TokenMap::Fst(map) => {
-                let mut stream = map.stream();
-                while let Some((token, token_id)) = stream.next() {
-                    let new_token_id = self
-                        .tokens
-                        .get_or_add(String::from_utf8_lossy(token).as_ref());
-                    token_id_map[token_id as usize] = new_token_id;
-                }
-            }
+        for (token_id, token) in tokens.iter() {
+            token_id_map[token_id as usize] = self.tokens.get_or_add(token);
         }
 
         let doc_id_offset = self.docs.len() as u32;
@@ -1277,7 +1348,11 @@ impl InnerBuilder {
     async fn write_tokens(&mut self, store: &dyn IndexStore, path: &str) -> Result<IndexFile> {
         log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
-        let batch = tokens.to_batch(self.token_set_format)?;
+        let token_set_format = self.token_set_format;
+        // Sorting the tokens and building the FST takes seconds for a partition
+        // with millions of tokens. Tail partitions are written concurrently from
+        // one task, so doing it inline would serialize all of them.
+        let batch = spawn_cpu(move || tokens.to_batch(token_set_format)).await?;
         let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
         writer.finish().await
@@ -3775,7 +3850,7 @@ mod tests {
             TokenSetFormat::default(),
             posting_tail_codec,
         );
-        partition.tokens.add("hello".to_owned());
+        partition.tokens.get_or_add("hello");
         let mut posting_list =
             PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
         posting_list.add(0, PositionRecorder::Count(1));
@@ -4552,7 +4627,7 @@ mod tests {
 
     fn tail_with_docs(id: u64, num_docs: u64) -> TailPartition {
         let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
-        let token = builder.tokens.add(format!("token{}", id));
+        let token = builder.tokens.get_or_add(&format!("token{}", id));
         builder
             .posting_lists
             .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
@@ -4563,24 +4638,25 @@ mod tests {
         TailPartition { builder }
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
-        let merged = merge_all_tail_partitions(
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
+        let merged = merge_tail_partitions(
             vec![
                 tail_with_docs(0, 4),
                 tail_with_docs(1, 4),
                 tail_with_docs(2, 4),
             ],
             u64::MAX,
-        )?;
+        )
+        .await?;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id(), 0);
         assert_eq!(merged[0].docs.len(), 12);
         Ok(())
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_splits_on_memory_budget() -> Result<()> {
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_splits_on_memory_budget() -> Result<()> {
         let tails = vec![
             tail_with_docs(0, 64),
             tail_with_docs(1, 64),
@@ -4589,15 +4665,63 @@ mod tests {
         ];
         let single = tails[0].builder.memory_size();
         // A budget below two builders' footprint must keep them separate.
-        let merged = merge_all_tail_partitions(tails, single + 1)?;
+        let merged = merge_tail_partitions(tails, single + 1).await?;
         assert_eq!(merged.len(), 4);
         assert!(merged.iter().all(|builder| builder.docs.len() == 64));
+
+        // A budget that fits two builders pairs them up, and a merged pair
+        // stays within it.
+        let tails = (0..4).map(|id| tail_with_docs(id, 64)).collect();
+        let merged = merge_tail_partitions(tails, 2 * single + 1).await?;
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|builder| builder.docs.len() == 128));
+        assert!(
+            merged
+                .iter()
+                .all(|builder| builder.memory_size() <= 2 * single)
+        );
         Ok(())
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
-        assert!(merge_all_tail_partitions(Vec::new(), u64::MAX)?.is_empty());
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
+        assert!(
+            merge_tail_partitions(Vec::new(), u64::MAX)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_all_tail_partitions_plans_from_merged_sizes() -> Result<()> {
+        // Workers that saw the same tokens each hold their own per-token
+        // state, which merging deduplicates, so the tails' summed sizes
+        // overestimate the merged partition.
+        let tail_with_shared_tokens = |id: u64| {
+            let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
+            for token in 0..1000 {
+                builder.tokens.get_or_add(&format!("shared{token}"));
+            }
+            builder
+                .posting_lists
+                .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
+            let doc = builder.docs.append(id, 1000);
+            for posting_list in &mut builder.posting_lists {
+                posting_list.add(doc, PositionRecorder::Count(1));
+            }
+            TailPartition { builder }
+        };
+        let tails = (0..4).map(tail_with_shared_tokens).collect::<Vec<_>>();
+        let single = tails[0].builder.memory_size();
+        let memory_limit_bytes = single * 5 / 2;
+
+        // Summed sizes only admit pairs, but a merged pair is barely larger
+        // than one tail, so the pairs fit together.
+        let merged = merge_tail_partitions(tails, memory_limit_bytes).await?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].docs.len(), 4);
+        assert!(merged[0].memory_size() < memory_limit_bytes);
         Ok(())
     }
 
@@ -4755,10 +4879,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_merge_tail_partition_group_combines_tail_builders() -> Result<()> {
+    #[tokio::test]
+    async fn test_merge_tail_partition_group_combines_tail_builders() -> Result<()> {
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
-        let hello = first.tokens.add("hello".to_owned());
+        let hello = first.tokens.get_or_add("hello");
         first
             .posting_lists
             .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
@@ -4766,20 +4890,21 @@ mod tests {
         first.posting_lists[hello as usize].add(first_doc, PositionRecorder::Count(1));
 
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
-        let world = second.tokens.add("world".to_owned());
+        let world = second.tokens.get_or_add("world");
         second
             .posting_lists
             .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
         let second_doc = second.docs.append(20, 2);
         second.posting_lists[world as usize].add(second_doc, PositionRecorder::Count(2));
 
-        let merged = merge_all_tail_partitions(
+        let merged = merge_tail_partitions(
             vec![
                 TailPartition { builder: first },
                 TailPartition { builder: second },
             ],
             u64::MAX,
-        )?;
+        )
+        .await?;
         assert_eq!(merged.len(), 1);
         let merged = &merged[0];
 
@@ -4804,7 +4929,7 @@ mod tests {
         // middle one, mirroring filter_old_data dropping a token whose postings emptied.
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
         for token in ["a", "b", "c"] {
-            first.tokens.add(token.to_owned());
+            first.tokens.get_or_add(token);
         }
         first
             .posting_lists
@@ -4817,16 +4942,12 @@ mod tests {
         first.tokens.remap(&[1]);
         first.posting_lists.remove(1);
         assert_eq!(first.tokens.len(), first.posting_lists.len());
+        assert_eq!(first.tokens.get("c"), Some(1));
 
-        // Mimic a token set persisted by a writer from before #7115. Converting the
-        // loaded set for mutation must restore the dense token-id invariant.
-        first.tokens.next_id = 9;
-        first.tokens = std::mem::take(&mut first.tokens).into_mutable();
-
-        // `second` contributes a brand-new token absent from `first`. Before the fix,
-        // get_or_add returned the stale next_id, indexing past posting_lists.
+        // `second` contributes a brand-new token absent from `first`; its id must
+        // follow the compacted ids rather than index past posting_lists.
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
-        let zeta = second.tokens.add("zeta".to_owned());
+        let zeta = second.tokens.get_or_add("zeta");
         second
             .posting_lists
             .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
@@ -4886,10 +5007,7 @@ mod tests {
 
         write_stale_next_id_token_file(store.as_ref(), 0).await;
         let reader = store.open_index_file(&token_file_path(0)).await.unwrap();
-        let tokens = TokenSet::load(reader, TokenSetFormat::Fst)
-            .await
-            .unwrap()
-            .into_mutable();
+        let tokens = TokenSet::load(reader, TokenSetFormat::Fst).await.unwrap();
 
         let mut first = InnerBuilder::new(0, false, TokenSetFormat::Fst);
         first.set_tokens(tokens);
@@ -4901,7 +5019,7 @@ mod tests {
         first.posting_lists[1].add(doc, PositionRecorder::Count(1));
 
         let mut second = InnerBuilder::new(1, false, TokenSetFormat::Fst);
-        let zeta = second.tokens.add("zeta".to_owned());
+        let zeta = second.tokens.get_or_add("zeta");
         second
             .posting_lists
             .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
