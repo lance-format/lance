@@ -38,7 +38,7 @@ use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::super::tokenizer::document_tokenizer::DocType;
 use super::super::tokenizer::{InvertedIndexParams, LEGACY_BLOCK_SIZE};
 use super::cursor::{CombinedTermPostings, MaterializedTerm};
-use super::maxscore::{MaxscoreStats, combined_maxscore, term_upper_bound};
+use super::maxscore::{MaxscoreStats, combined_maxscore};
 use super::{
     CombinedCorpusStats, CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
 };
@@ -50,22 +50,17 @@ use crate::scalar::{IndexStore, RowIdRemapper};
 pub(super) fn term(idf: f32, entries: &[(u64, f32)]) -> MaterializedTerm {
     let mut postings = entries.to_vec();
     postings.sort_unstable_by_key(|(row_id, _)| *row_id);
-    MaterializedTerm::new(CombinedTermPostings {
-        idf,
-        upper_bound: term_upper_bound(idf),
-        postings,
-    })
+    MaterializedTerm::new(CombinedTermPostings { idf, postings })
 }
 
-// A varying blended length so scores are not all equal; the exact reference
-// and MAXSCORE must read it identically.
+// A varying blended length so scores are not all equal.
 pub(super) fn dl_of(row_id: u64) -> f32 {
     3.0 + (row_id % 4) as f32
 }
 
-/// Independent exact reference: score every candidate the merged scan would
-/// (the union of the terms' postings for OR; all-terms-present for AND) and
-/// return the `limit` highest scores, descending.
+/// Exhaustive reference: score every row in the union of the postings (only
+/// rows holding every term for AND) and return the top `limit` scores,
+/// descending.
 pub(super) fn exact_topk_scores(
     cursors: &[MaterializedTerm],
     dl_prime: impl Fn(u64) -> f32,

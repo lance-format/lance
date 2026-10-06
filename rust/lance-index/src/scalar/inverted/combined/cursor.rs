@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Per-term cross-column cursors for `combined_fields`: the [`TermCursor`]
-//! abstraction, its full-read implementation, and the loaded posting sources it
-//! is built from.
+//! Per-term cross-column cursors for `combined_fields` and the posting sources
+//! they are built from.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,36 +14,6 @@ use super::super::index::{PostingList, live_posting_rows};
 use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::maxscore::term_upper_bound;
 
-/// The MAXSCORE loop's view of one query term. [`MaterializedTerm`] implements it
-/// by reading every posting up front; the trait keeps
-/// [`combined_maxscore`](super::maxscore::combined_maxscore) independent of how a
-/// `tf'` is fetched, so a lazier cursor can be substituted without touching the
-/// algorithm.
-///
-/// A term exposes a merged cross-column cursor over the shared row-id space:
-/// [`head`](Self::head) is the smallest not-yet-consumed row id, advanced by
-/// the essential terms during discovery; [`probe`](Self::probe) reads `tf'` at
-/// an arbitrary (non-decreasing) target for the non-essential terms.
-pub(super) trait TermCursor {
-    /// The constant per-term ceiling `idf · MAX_DOC_WEIGHT` (clamped, see
-    /// [`term_upper_bound`]).
-    fn upper_bound(&self) -> f32;
-    /// The blended IDF `idf'(t)`.
-    fn idf(&self) -> f32;
-    /// The smallest not-yet-consumed row id across the term's columns, or
-    /// `None` when the term is exhausted.
-    fn head(&self) -> Option<u64>;
-    /// `tf'` at [`head`](Self::head) (the weighted sum across the columns that
-    /// carry the head row id). Only meaningful while `head()` is `Some`.
-    fn head_tf(&self) -> f32;
-    /// Consume `row_id`: advance every column cursor currently sitting on it.
-    /// Called only for `row_id == head()`.
-    fn consume(&mut self, row_id: u64);
-    /// `tf'` at `target`, or 0 when the term is absent there. `target` never
-    /// decreases across calls to one cursor, so the lazy path can skip blocks.
-    fn probe(&mut self, target: u64) -> f32;
-}
-
 /// One query term's postings, merged across every target column/partition into
 /// the shared row-id space.
 ///
@@ -52,7 +21,6 @@ pub(super) trait TermCursor {
 /// frequency `tf'(t, d) = Σ_f w_f · freq_f(t, d)`.
 pub(super) struct CombinedTermPostings {
     pub(super) idf: f32,
-    pub(super) upper_bound: f32,
     pub(super) postings: Vec<(u64, f32)>,
 }
 
@@ -67,7 +35,11 @@ impl CombinedTermPostings {
     }
 }
 
-/// [`TermCursor`] over a [`CombinedTermPostings`] with an owned scan cursor.
+/// One query term as seen by
+/// [`combined_maxscore`](super::maxscore::combined_maxscore): fully read
+/// [`CombinedTermPostings`] plus a cursor. Essential terms are walked with
+/// [`head`](Self::head) and [`consume`](Self::consume); non-essential ones are
+/// read with [`probe`](Self::probe).
 pub(super) struct MaterializedTerm {
     pub(super) postings: CombinedTermPostings,
     cursor: usize,
@@ -80,26 +52,28 @@ impl MaterializedTerm {
             cursor: 0,
         }
     }
-}
 
-impl TermCursor for MaterializedTerm {
+    /// See [`term_upper_bound`].
     #[inline]
-    fn upper_bound(&self) -> f32 {
-        self.postings.upper_bound
+    pub(super) fn upper_bound(&self) -> f32 {
+        term_upper_bound(self.postings.idf)
     }
 
+    /// The blended IDF `idf'(t)`.
     #[inline]
-    fn idf(&self) -> f32 {
+    pub(super) fn idf(&self) -> f32 {
         self.postings.idf
     }
 
+    /// The smallest unconsumed row id, or `None` when exhausted.
     #[inline]
-    fn head(&self) -> Option<u64> {
+    pub(super) fn head(&self) -> Option<u64> {
         self.postings.postings.get(self.cursor).map(|(id, _)| *id)
     }
 
+    /// `tf'` at [`head`](Self::head).
     #[inline]
-    fn head_tf(&self) -> f32 {
+    pub(super) fn head_tf(&self) -> f32 {
         self.postings
             .postings
             .get(self.cursor)
@@ -107,15 +81,17 @@ impl TermCursor for MaterializedTerm {
             .unwrap_or(0.0)
     }
 
+    /// Advance past `row_id`, which must be `head()`.
     #[inline]
-    fn consume(&mut self, row_id: u64) {
+    pub(super) fn consume(&mut self, row_id: u64) {
         if self.head() == Some(row_id) {
             self.cursor += 1;
         }
     }
 
+    /// `tf'` at `target`, or 0 when absent.
     #[inline]
-    fn probe(&mut self, target: u64) -> f32 {
+    pub(super) fn probe(&mut self, target: u64) -> f32 {
         self.postings.tf_prime(target)
     }
 }
@@ -128,8 +104,8 @@ pub(super) struct LoadedSource {
     pub(super) posting: PostingList,
 }
 
-/// Build the full-read cursor for `term` by merging every source's postings into
-/// the shared row-id space, accumulating `tf'` in the canonical order.
+/// Merge every source's postings for `term` into the shared row-id space,
+/// accumulating `tf'` in the canonical order.
 pub(super) fn build_materialized_term(
     term: &str,
     sources: Vec<LoadedSource>,
@@ -148,11 +124,7 @@ pub(super) fn build_materialized_term(
     let idf = scorer.query_weight(term);
     let mut postings: Vec<(u64, f32)> = acc.into_iter().collect();
     postings.sort_unstable_by_key(|(row_id, _)| *row_id);
-    MaterializedTerm::new(CombinedTermPostings {
-        idf,
-        upper_bound: term_upper_bound(idf),
-        postings,
-    })
+    MaterializedTerm::new(CombinedTermPostings { idf, postings })
 }
 
 #[cfg(test)]
@@ -166,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_materialized_term_merges_legacy_and_compressed() {
-        // Fallback data path: a legacy (Plain, row-id-keyed, list-multiplicity)
+        // A legacy (Plain, row-id-keyed, list-multiplicity)
         // source and a compressed source merge into one ordered `tf'` stream,
         // masked rows dropped and contributions summed in column order.
         use super::super::super::index::PlainPostingList;
@@ -217,9 +189,7 @@ mod tests {
         // posting lists stay aligned and answers `TOMBSTONE_ROW` for its address.
         // Nothing else stops that address: a default mask is an empty block list,
         // which selects it, and `doc_length_at(TOMBSTONE_ROW) == 0` would give it
-        // the largest `doc_weight` there is. It stays out of the result today only
-        // because `TOMBSTONE_ROW == u64::MAX` collides with `combined_maxscore`'s
-        // exhausted-cursor sentinel, so it must be dropped at the source.
+        // the largest `doc_weight` there is, so it must be dropped at the source.
         const DEAD_ROW: u64 = 20;
         let scorer = CombinedFieldsBM25Scorer::new(1000, 12.0, HashMap::new());
         let docs = modern_identity_docs(&[4u32; 40], &[DEAD_ROW]).await;
@@ -248,12 +218,8 @@ mod tests {
              must keep their exact contributions"
         );
 
-        // Nor may it be collected: the two live rows are the whole top-k, scored
-        // exactly as if the dead slot's posting did not exist.
-        //
-        // `test_scorer` carries no document frequencies, so `query_weight` is 0 for
-        // every term and both rows score 0. The order is therefore the tiebreak,
-        // ascending by row id.
+        // The live rows are the whole top-k, scored as if the dead slot's posting
+        // did not exist.
         let mut cursors = vec![term];
         let dl_prime = |row_id: u64| -> f32 { 2.0 * docs.doc_length_at(row_id) as f32 };
         let (top, _) = combined_maxscore(&mut cursors, dl_prime, 10, false, &scorer);

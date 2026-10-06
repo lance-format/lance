@@ -15,7 +15,7 @@ use super::super::documents::AddressKeyedDocuments;
 use super::super::query::{FtsSearchParams, Operator, Tokens};
 use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::cursor::{LoadedSource, MaterializedTerm, build_materialized_term};
-use super::maxscore::{MaxscoreStats, combined_maxscore};
+use super::maxscore::combined_maxscore;
 use super::{CombinedFieldColumn, unique_terms};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
@@ -54,15 +54,11 @@ impl RankedDoc {
 /// Exact cross-field BM25F search over the target columns.
 ///
 /// Loads each query term's postings across every column and partition, then
-/// ranks them with the term-at-a-time `combined_maxscore`, which skips scoring
-/// a candidate whose upper bound cannot reach the running k-th score. That bound
-/// only ever drops a candidate the collector would have rejected anyway, so the
-/// top-k is the exhaustive scan's top-k.
+/// ranks them with `combined_maxscore`, which skips candidates that cannot reach
+/// the running k-th score. The top-k equals that of an exhaustive scan.
 ///
 /// Results come back ordered by `score DESC, row_id ASC`, which is a total order,
-/// so the same data always yields the same top-k even when scores tie. Candidates
-/// are discovered in ascending row-id order and `RankedDoc` settles ties, so
-/// neither the membership nor the order depends on heap internals.
+/// so the same data always yields the same top-k even when scores tie.
 ///
 /// `operator` applies across the virtual field: `And` keeps only docs where
 /// every query term appears in at least one column; `Or` keeps docs matching
@@ -76,36 +72,10 @@ pub async fn combined_fields_search(
     prefilter: Arc<dyn PreFilter>,
     metrics: &dyn MetricsCollector,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
-    let (row_ids, scores, _stats) = combined_fields_search_with_stats(
-        columns, tokens, params, operator, scorer, prefilter, metrics,
-    )
-    .await?;
-    Ok((row_ids, scores))
-}
-
-/// [`combined_fields_search`] plus the [`MaxscoreStats`] of the scan, for a bench
-/// that wants to report how much candidate scoring the pruning saved.
-///
-/// This is the whole implementation; [`combined_fields_search`] is the same call
-/// with the stats dropped. The stats are three counters the MAXSCORE loop keeps
-/// either way, so the default path does no extra work.
-///
-/// Reachable outside the crate only under `cfg(test)` or the `test-scan-stats`
-/// feature: per-candidate counters are not something the production
-/// `MetricsCollector` carries.
-pub async fn combined_fields_search_with_stats(
-    columns: &[CombinedFieldColumn],
-    tokens: &Tokens,
-    params: &FtsSearchParams,
-    operator: Operator,
-    scorer: &CombinedFieldsBM25Scorer,
-    prefilter: Arc<dyn PreFilter>,
-    metrics: &dyn MetricsCollector,
-) -> Result<(Vec<u64>, Vec<f32>, MaxscoreStats)> {
     let terms = unique_terms(tokens);
     let limit = params.limit.unwrap_or(usize::MAX);
     if terms.is_empty() || limit == 0 {
-        return Ok((Vec::new(), Vec::new(), MaxscoreStats::default()));
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mask = prefilter.mask();
@@ -151,43 +121,35 @@ pub async fn combined_fields_search_with_stats(
     // scoring loop. The `'static` closure clones the borrowed `scorer` (a handful
     // of per-term statistics) and moves everything else in.
     let scorer = Arc::new(scorer.clone());
-    let (top, stats) = spawn_cpu(move || {
+    let (top, _stats) = spawn_cpu(move || {
         let dl_prime = |row_id: u64| -> f32 {
             length_sources
                 .iter()
                 .map(|(weight, docs)| weight * docs.doc_length_at(row_id) as f32)
                 .sum()
         };
-        // Cursors that are all exhausted need no special case: `combined_maxscore`
-        // finds no candidate and returns an empty heap, which unzips to no hits.
-        let mut cursors: Vec<MaterializedTerm> = Vec::with_capacity(terms.len());
-        for (term, sources) in terms.iter().zip(loaded) {
-            cursors.push(build_materialized_term(
-                term,
-                sources,
-                &mask,
-                scorer.as_ref(),
-            ));
-        }
-        let result = combined_maxscore(
+        let mut cursors: Vec<MaterializedTerm> = terms
+            .iter()
+            .zip(loaded)
+            .map(|(term, sources)| build_materialized_term(term, sources, &mask, &scorer))
+            .collect();
+        Result::Ok(combined_maxscore(
             &mut cursors,
             dl_prime,
             limit,
             require_all_terms,
-            scorer.as_ref(),
-        );
-        Result::Ok(result)
+            &scorer,
+        ))
     })
     .await?;
 
     // Ascending in `Reverse<RankedDoc>` is descending in `RankedDoc`, i.e. best
     // first: highest score, and within a score the lowest row id.
-    let (row_ids, scores) = top
+    Ok(top
         .into_sorted_vec()
         .into_iter()
         .map(|Reverse(doc)| (doc.row_id.0, doc.score.0))
-        .unzip();
-    Ok((row_ids, scores, stats))
+        .unzip())
 }
 
 #[cfg(test)]
@@ -371,77 +333,6 @@ mod tests {
         );
         assert_eq!(scores[0].to_bits(), idf(1, 19).to_bits());
         assert_eq!(scores[1].to_bits(), idf(10, 19).to_bits());
-    }
-
-    /// Discovery pruning through the real loading path, not just the
-    /// `combined_maxscore` unit fixtures: one rare term and one term in every
-    /// row, so the common term's ceiling drops below the k-th score at once and
-    /// candidate discovery walks the rare term's single posting alone.
-    ///
-    /// Also the coverage for [`combined_fields_search_with_stats`] and its
-    /// re-export: it is reached here through the gated crate path the bench uses,
-    /// and its top-k must be what plain [`combined_fields_search`] returns.
-    #[tokio::test]
-    async fn test_combined_fields_search_with_stats_prunes_discovery() {
-        use crate::scalar::inverted::{MaxscoreStats, combined_fields_search_with_stats};
-
-        const ROWS: usize = 40;
-        let vocab = ["rare", "common"];
-        let rows: ElementRows = (0..ROWS)
-            .map(|row| {
-                if row == 0 {
-                    vec![vec!["rare", "common"]]
-                } else {
-                    vec![vec!["common"]]
-                }
-            })
-            .collect();
-        let (index, _dir) =
-            element_document_index(InvertedListFormatVersion::V3, &vocab, &rows).await;
-        let columns = combined_columns(vec![index]);
-
-        let tokens = Tokens::new(vec!["rare".to_owned(), "common".to_owned()], DocType::Text);
-        let scorer =
-            build_combined_bm25_scorer(&columns, &tokens, CombinedCorpusStats::IndexOnly, None)
-                .await
-                .unwrap();
-        let params = FtsSearchParams::new().with_limit(Some(1));
-
-        let (row_ids, scores, stats): (Vec<u64>, Vec<f32>, MaxscoreStats) =
-            combined_fields_search_with_stats(
-                &columns,
-                &tokens,
-                &params,
-                Operator::Or,
-                &scorer,
-                Arc::new(NoFilter),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        assert_eq!(row_ids, vec![0], "the only row holding `rare` must win");
-        // Every candidate discovered is either pruned or scored, so the counts
-        // account for the whole loop.
-        assert_eq!(stats.discovered, stats.pruned + stats.scored);
-        assert_eq!(
-            stats.discovered, 1,
-            "only `rare`'s single posting drives discovery, not the {ROWS} rows \
-             in the candidate union",
-        );
-
-        // The delegating entry point must return exactly this, stats aside.
-        let plain = combined_fields_search(
-            &columns,
-            &tokens,
-            &params,
-            Operator::Or,
-            &scorer,
-            Arc::new(NoFilter),
-            &NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
-        assert_eq!(plain, (row_ids, scores));
     }
 
     /// One legacy element-per-document column and one modern row-per-document

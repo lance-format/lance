@@ -40,10 +40,6 @@ use lance_select::RowAddrTreeMap;
 pub use flat::flat_combined_fields_search_stream;
 pub use search::combined_fields_search;
 pub use stats::{CombinedCorpusStats, FlatFieldStats, build_combined_bm25_scorer};
-// The MAXSCORE candidate counters, for test and bench targets only; see the
-// `test-scan-stats` feature.
-#[cfg(any(test, feature = "test-scan-stats"))]
-pub use {maxscore::MaxscoreStats, search::combined_fields_search_with_stats};
 
 use super::index::InvertedIndex;
 use super::query::Tokens;
