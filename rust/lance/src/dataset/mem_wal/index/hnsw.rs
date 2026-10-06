@@ -544,14 +544,14 @@ impl super::plugin::MemIndex for HnswMemIndex {
         if dim == 0 {
             // No vector was ever inserted (e.g. an all-tombstone generation):
             // skip the index, keep the data flush.
-            return Ok(FlushOutcome::BuildFromGeneration);
+            return Ok(FlushOutcome::Skip);
         }
         // Forward-written data: HNSW row ids line up 1:1 with the data file, so
         // no position reversal (pass `None`).
         let Some((hnsw, flat_storage_batch)) = self.to_lance_hnsw(None)? else {
             // Every vector in the generation is null → empty graph; skip the
             // index rather than failing the flush.
-            return Ok(FlushOutcome::BuildFromGeneration);
+            return Ok(FlushOutcome::Skip);
         };
 
         // Train SQ8 on the full memtable in one pass: learn global min/max
@@ -1237,7 +1237,7 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
         "Hnsw"
     }
 
-    fn details_suffix(&self) -> &str {
+    fn details_message(&self) -> &str {
         "VectorIndexDetails"
     }
 
@@ -1296,7 +1296,7 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
             HnswParams {
                 distance_type,
                 build_params: ctx
-                    .overrides::<HnswBuildParams>()
+                    .overrides::<HnswBuildParams>()?
                     .cloned()
                     .unwrap_or_else(mem_wal_hnsw_default),
             },

@@ -93,8 +93,13 @@ const PARALLEL_INDEX_MIN_ROWS: usize = 64;
 /// the order-preserving encoded tuple ([`encode_pk_tuple`]) instead. Either way
 /// the lookup is a single seek on one `BTreeMemIndex`.
 enum PkIndex {
-    /// Arity 1: aliases an entry in `indexes`, so the insert loop maintains it.
-    Single(Arc<dyn PrimaryKeyIndex>),
+    /// Arity 1: aliases the entry named `entry` in `indexes`, so the insert
+    /// loop maintains it. Held by name because a plugin may hand out a fresh
+    /// capability wrapper each time it is asked.
+    Single {
+        index: Arc<dyn PrimaryKeyIndex>,
+        entry: String,
+    },
     /// Arity >= 2: an index over the encoded-tuple `Binary` key, maintained
     /// explicitly in the insert paths (the original batch lacks the synthetic
     /// key column). `columns` are the PK columns in order, resolved against
@@ -326,7 +331,7 @@ impl std::fmt::Debug for IndexStore {
                 "pk_index",
                 &match &self.pk_index {
                     None => "none".to_string(),
-                    Some(PkIndex::Single(index)) => {
+                    Some(PkIndex::Single { index, .. }) => {
                         format!("single({})", index.columns().join(", "))
                     }
                     Some(PkIndex::Composite { columns, .. }) => {
@@ -511,19 +516,21 @@ impl IndexStore {
                 // second copy would double both the memory and the insert work.
                 let existing = self
                     .indexes
-                    .values()
-                    .filter(|index| index.columns().iter().any(|c| c == column))
-                    .find_map(|index| index.clone().as_primary_key());
-                let pk = match existing {
-                    Some(index) => index,
+                    .iter()
+                    .filter(|(_, index)| index.columns().iter().any(|c| c == column))
+                    .find_map(|(name, index)| {
+                        index.clone().as_primary_key().map(|pk| (name.clone(), pk))
+                    });
+                let (entry, index) = match existing {
+                    Some(shared) => shared,
                     None => {
+                        let entry = format!("__pk__{column}");
                         let btree = Arc::new(BTreeMemIndex::new(*field_id, column.clone()));
-                        self.indexes
-                            .insert(format!("__pk__{column}"), btree.clone());
-                        btree
+                        self.indexes.insert(entry.clone(), btree.clone());
+                        (entry, btree as Arc<dyn PrimaryKeyIndex>)
                     }
                 };
-                Some(PkIndex::Single(pk))
+                Some(PkIndex::Single { index, entry })
             }
             multi => Some(PkIndex::Composite {
                 // Synthetic field id (-1): the composite index is held directly,
@@ -547,7 +554,7 @@ impl IndexStore {
     pub fn pk_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
         match &self.pk_index {
             None => Ok(Vec::new()),
-            Some(PkIndex::Single(index)) | Some(PkIndex::Composite { index, .. }) => {
+            Some(PkIndex::Single { index, .. }) | Some(PkIndex::Composite { index, .. }) => {
                 index.training_batches(batch_size)
             }
         }
@@ -607,7 +614,9 @@ impl IndexStore {
     ) -> Option<RowPosition> {
         match &self.pk_index {
             None => None,
-            Some(PkIndex::Single(index)) => index.newest_visible(&values[0], max_visible_row),
+            Some(PkIndex::Single { index, .. }) => {
+                index.newest_visible(&values[0], max_visible_row)
+            }
             Some(PkIndex::Composite { index, .. }) => {
                 // An unsupported PK type would have failed at insert, so the
                 // index can't hold a tuple this fails to encode. The probe key is
@@ -642,7 +651,7 @@ impl IndexStore {
     pub fn pk_contains_key(&self, key: &ScalarValue, max_visible_row: RowPosition) -> bool {
         match &self.pk_index {
             None => false,
-            Some(PkIndex::Single(index)) | Some(PkIndex::Composite { index, .. }) => {
+            Some(PkIndex::Single { index, .. }) | Some(PkIndex::Composite { index, .. }) => {
                 index.newest_visible(key, max_visible_row).is_some()
             }
         }
@@ -652,7 +661,7 @@ impl IndexStore {
     pub fn pk_is_empty(&self) -> bool {
         match &self.pk_index {
             None => true,
-            Some(PkIndex::Single(index)) | Some(PkIndex::Composite { index, .. }) => {
+            Some(PkIndex::Single { index, .. }) | Some(PkIndex::Composite { index, .. }) => {
                 index.is_empty()
             }
         }
@@ -677,20 +686,11 @@ impl IndexStore {
     }
 
     /// The single-column primary-key index, if `name` is the entry it shares.
-    ///
-    /// It shares its entry with a user index on the same column when there is
-    /// one, so this compares the handle rather than the name's shape.
     fn single_pk_at(&self, name: &str) -> Option<&Arc<dyn PrimaryKeyIndex>> {
-        let Some(PkIndex::Single(pk)) = &self.pk_index else {
+        let Some(PkIndex::Single { index, entry }) = &self.pk_index else {
             return None;
         };
-        let shared = self
-            .indexes
-            .get(name)?
-            .clone()
-            .as_primary_key()
-            .is_some_and(|index| Arc::ptr_eq(pk, &index));
-        shared.then_some(pk)
+        (entry == name).then_some(index)
     }
 
     fn mark_pk_overrides_if_needed(&self, had_existing_pk: bool) {
@@ -1097,7 +1097,7 @@ impl IndexStore {
         // A composite PK's index is held only here.
         let pk = match &self.pk_index {
             Some(PkIndex::Composite { index, .. }) => index.resident_bytes(),
-            Some(PkIndex::Single(_)) | None => 0,
+            Some(PkIndex::Single { .. }) | None => 0,
         };
         indexes + pk
     }
@@ -1262,7 +1262,7 @@ mod tests {
         fn name(&self) -> &str {
             "Stub"
         }
-        fn details_suffix(&self) -> &str {
+        fn details_message(&self) -> &str {
             "StubIndexDetails"
         }
         fn flush_index_type(&self) -> IndexType {
@@ -1316,7 +1316,7 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    /// Matching is on the message-name suffix, not the whole url: `Any::from_msg`
+    /// Matching is on the message name, not the whole url: `Any::from_msg`
     /// emits the package (`/lance.table.`, `/lance.index.pb.`), while MemWAL flush
     /// used to hand-write a `type.googleapis.com/` url that existing datasets
     /// still carry.
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     /// Registering is what makes a kind maintainable, so a plugin claiming a
-    /// suffix another already claims is a configuration error rather than a
+    /// message another already claims is a configuration error rather than a
     /// silent override.
     #[test]
     fn a_registry_refuses_two_plugins_for_one_kind() {
@@ -1375,7 +1375,7 @@ mod tests {
             fn name(&self) -> &str {
                 "BTreeV2"
             }
-            fn details_suffix(&self) -> &str {
+            fn details_message(&self) -> &str {
                 "BTreeIndexDetails"
             }
             fn flush_index_type(&self) -> IndexType {
@@ -1409,19 +1409,19 @@ mod tests {
         );
     }
 
-    /// Every registered plugin must resolve from its own suffix, or it is
+    /// Every registered plugin must resolve from its own message, or it is
     /// registered and never reached.
     #[test]
-    fn every_registered_plugin_resolves_from_its_own_suffix() {
+    fn every_registered_plugin_resolves_from_its_own_message() {
         let registry = MemIndexRegistry::default();
         for plugin in registry.plugins() {
-            let url = format!("/lance.table.{}", plugin.details_suffix());
+            let url = format!("/lance.table.{}", plugin.details_message());
             assert_eq!(
                 registry
                     .plugin_for_details_url(&url)
                     .map(|found| found.name()),
                 Some(plugin.name()),
-                "{} does not resolve from its own suffix",
+                "{} does not resolve from its own message",
                 plugin.name(),
             );
         }
@@ -2454,8 +2454,8 @@ mod tests {
         fn name(&self) -> &str {
             "stand-in"
         }
-        fn details_suffix(&self) -> &str {
-            self.0.details_suffix()
+        fn details_message(&self) -> &str {
+            self.0.details_message()
         }
         fn flush_index_type(&self) -> IndexType {
             self.0.flush_index_type()
@@ -2603,5 +2603,160 @@ mod tests {
             .collect();
         assert_eq!(names, ["BTree", "Hnsw", "Inverted"]);
         assert!(MemIndexRegistry::empty().plugins().is_empty());
+    }
+
+    /// A B-tree whose primary-key capability is a fresh wrapper each time it is
+    /// asked for, which the trait allows.
+    #[derive(Debug)]
+    struct FreshWrapperBTree(Arc<BTreeMemIndex>);
+
+    #[derive(Debug)]
+    struct PkWrapper(Arc<BTreeMemIndex>);
+
+    #[async_trait::async_trait]
+    impl MemIndex for FreshWrapperBTree {
+        fn columns(&self) -> &[String] {
+            MemIndex::columns(self.0.as_ref())
+        }
+        fn can_answer(&self, query: &dyn MemQuery) -> bool {
+            self.0.can_answer(query)
+        }
+        fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
+            MemIndex::insert(self.0.as_ref(), batch, row_offset)
+        }
+        fn resident_bytes(&self) -> usize {
+            MemIndex::resident_bytes(self.0.as_ref())
+        }
+        fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
+            self.0.search(query, ctx)
+        }
+        async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+            self.0.flush(ctx).await
+        }
+        fn as_primary_key(self: Arc<Self>) -> Option<Arc<dyn PrimaryKeyIndex>> {
+            Some(Arc::new(PkWrapper(self.0.clone())))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemIndex for PkWrapper {
+        fn columns(&self) -> &[String] {
+            MemIndex::columns(self.0.as_ref())
+        }
+        fn can_answer(&self, query: &dyn MemQuery) -> bool {
+            self.0.can_answer(query)
+        }
+        fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
+            MemIndex::insert(self.0.as_ref(), batch, row_offset)
+        }
+        fn resident_bytes(&self) -> usize {
+            MemIndex::resident_bytes(self.0.as_ref())
+        }
+        fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
+            self.0.search(query, ctx)
+        }
+        async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+            self.0.flush(ctx).await
+        }
+    }
+
+    impl PrimaryKeyIndex for PkWrapper {
+        fn insert_and_report_existing(
+            &self,
+            batch: &RecordBatch,
+            row_offset: RowPosition,
+        ) -> Result<bool> {
+            PrimaryKeyIndex::insert_and_report_existing(self.0.as_ref(), batch, row_offset)
+        }
+        fn newest_visible(
+            &self,
+            key: &ScalarValue,
+            max_visible: RowPosition,
+        ) -> Option<RowPosition> {
+            PrimaryKeyIndex::newest_visible(self.0.as_ref(), key, max_visible)
+        }
+        fn training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
+            PrimaryKeyIndex::training_batches(self.0.as_ref(), batch_size)
+        }
+        fn is_empty(&self) -> bool {
+            PrimaryKeyIndex::is_empty(self.0.as_ref())
+        }
+    }
+
+    /// A key index shared with a plugin's user index keeps reporting rewrites
+    /// even when the plugin hands out a new capability wrapper on every ask.
+    #[test]
+    fn a_shared_key_index_reports_rewrites_through_fresh_wrappers() {
+        let mut store = IndexStore::new();
+        store.add_index(
+            "id_idx".to_string(),
+            Arc::new(FreshWrapperBTree(Arc::new(BTreeMemIndex::new(
+                0,
+                "id".to_string(),
+            )))),
+        );
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+        assert_eq!(
+            store.indexes.len(),
+            1,
+            "the user index serves as the key index; no second copy"
+        );
+
+        store.insert(&id_batch(&[1, 2]), 0).unwrap();
+        assert!(!store.pk_has_overrides());
+        store.insert(&id_batch(&[2]), 2).unwrap();
+        assert!(store.pk_has_overrides());
+        assert_eq!(
+            store.pk_newest_visible(&[ScalarValue::Int32(Some(2))], 5),
+            Some(2)
+        );
+    }
+
+    /// A type url reaches the plugin whose message is exactly its own, not one
+    /// whose message it merely ends with.
+    #[test]
+    fn a_type_url_reaches_the_plugin_for_exactly_its_message() {
+        #[derive(Debug)]
+        struct Custom(&'static str);
+
+        #[async_trait::async_trait]
+        impl MemIndexPlugin for Custom {
+            fn name(&self) -> &str {
+                "Custom"
+            }
+            fn details_message(&self) -> &str {
+                self.0
+            }
+            fn flush_index_type(&self) -> IndexType {
+                IndexType::BTree
+            }
+            fn training_criteria(&self) -> TrainingCriteria {
+                TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+            }
+            fn validate(&self, _ctx: &MemIndexBuildContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {
+                let (column, _) = ctx.single_column()?;
+                Ok(Arc::new(StubMemIndex::new(column.to_string())))
+            }
+        }
+
+        let registry = MemIndexRegistry::default()
+            .with_plugin(Arc::new(Custom("MyBTreeIndexDetails")))
+            .unwrap();
+        let found = |url: &str| registry.plugin_for_details_url(url).map(|p| p.name());
+        assert_eq!(found("/acme.MyBTreeIndexDetails"), Some("Custom"));
+        assert_eq!(found("/lance.table.BTreeIndexDetails"), Some("BTree"));
+        assert_eq!(found("/lance.table.IndexDetails"), None);
+
+        for bad in ["", "acme.MyIndexDetails", "acme/MyIndexDetails"] {
+            assert!(
+                MemIndexRegistry::empty()
+                    .with_plugin(Arc::new(Custom(bad)))
+                    .is_err(),
+                "{bad:?} is not a bare message name"
+            );
+        }
     }
 }

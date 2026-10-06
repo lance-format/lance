@@ -116,18 +116,14 @@ impl FtsIndexExec {
         base_schema: SchemaRef,
         with_row_id: bool,
     ) -> Result<Self> {
-        // Every queried column must resolve an index. A cross-column predicate
-        // is one predicate: a column with no arm is a missing answer rather
-        // than a narrower one.
-        for column in query.columns() {
-            if indexes
-                .index_answering(column, &FtsMemQuery::probe(query.document_granularity))
-                .is_none()
-            {
-                return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{column}'"
-                )));
-            }
+        // Every part of the search needs an index that answers it. A
+        // cross-column predicate is one predicate: a column with no arm is a
+        // missing answer rather than a narrower one.
+        if !query.is_answered_by(&indexes) {
+            return Err(Error::invalid_input(format!(
+                "no full-text index answers this search over {:?}",
+                query.columns()
+            )));
         }
         let with_doc_index = query.document_granularity.is_list_element();
 
@@ -236,12 +232,17 @@ impl FtsIndexExec {
                 "full-text search names no column to search".to_string(),
             ));
         };
-        let Some(index) = self
-            .indexes
-            .index_answering(column, &FtsMemQuery::probe(self.query.document_granularity))
-        else {
-            return Ok(vec![]);
+        // Planning chose this arm because an index answered this question;
+        // finding none now means an index broke that contract.
+        let Some((_, question)) = self.query.index_questions().into_iter().next() else {
+            return Err(Error::internal(
+                "full-text search names no column to search".to_string(),
+            ));
         };
+        let index = self
+            .indexes
+            .index_answering(column, &question)
+            .ok_or_else(|| declined(column))?;
 
         // The scanner carries the tree the index evaluates, so there is nothing
         // to translate here.
@@ -271,15 +272,14 @@ impl FtsIndexExec {
             granularity: self.query.document_granularity,
         };
         let ctx = SearchContext::new(self.max_readable_row.unwrap_or(u64::MAX));
-        let entries: Vec<FtsEntry> = index
-            .search(&query, &ctx)?
-            .as_ref()
-            .and_then(MemMatches::as_ranked)
-            .unwrap_or_default()
-            .iter()
+        let Some(MemMatches::Ranked(ranked)) = index.search(&query, &ctx)? else {
+            return Err(declined(column));
+        };
+        let entries: Vec<FtsEntry> = ranked
+            .into_iter()
             .map(|m| FtsEntry {
                 row_position: m.position,
-                doc_index: m.element.clone(),
+                doc_index: m.element,
                 score: m.score,
             })
             .collect();
@@ -308,33 +308,43 @@ impl FtsIndexExec {
         let max_visible = self.max_readable_row.unwrap_or(u64::MAX);
 
         let ctx = SearchContext::new(max_visible);
-        Ok(search_cross_column(&self.query.expr, |column, leaf| {
-            let granularity = self.query.document_granularity;
-            let index = self
-                .indexes
-                .index_answering(column, &FtsMemQuery::probe(granularity))?;
+        // The first index to fail, or to decline a leaf it accepted while
+        // planning; the combination below cannot carry an error itself.
+        let failure: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
+        let combined = search_cross_column(&self.query.expr, |column, leaf| {
             let query = FtsMemQuery {
                 expr: leaf.clone(),
                 options: options.clone(),
-                granularity,
+                granularity: self.query.document_granularity,
             };
-            let MemMatches::Ranked(ranked) = index.search(&query, &ctx).ok()?? else {
-                return None;
-            };
-            Some(
-                ranked
-                    .into_iter()
-                    .map(|m| FtsEntry {
-                        row_position: m.position,
-                        doc_index: m.element,
-                        score: m.score,
-                    })
-                    .collect(),
-            )
-        })?
-        .into_iter()
-        .map(|entry| (entry.row_position, entry.doc_index, entry.score))
-        .collect())
+            let index = self.indexes.index_answering(column, &query)?;
+            match index.search(&query, &ctx) {
+                Ok(Some(MemMatches::Ranked(ranked))) => Some(
+                    ranked
+                        .into_iter()
+                        .map(|m| FtsEntry {
+                            row_position: m.position,
+                            doc_index: m.element,
+                            score: m.score,
+                        })
+                        .collect(),
+                ),
+                outcome => {
+                    failure.borrow_mut().get_or_insert(match outcome {
+                        Err(error) => error,
+                        Ok(_) => declined(column),
+                    });
+                    Some(Vec::new())
+                }
+            }
+        })?;
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
+        }
+        Ok(combined
+            .into_iter()
+            .map(|entry| (entry.row_position, entry.doc_index, entry.score))
+            .collect())
     }
 
     /// Filter results by MVCC visibility using max_row_position. O(n).
@@ -768,6 +778,13 @@ impl ExecutionPlan for FtsIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+/// An index planning routed a full-text search to declined it at execution.
+fn declined(column: &str) -> Error {
+    Error::internal(format!(
+        "the full-text index on '{column}' declined a search it accepted while planning"
+    ))
 }
 
 #[cfg(test)]

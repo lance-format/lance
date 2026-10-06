@@ -824,7 +824,7 @@ impl DatasetMemWalExt for Dataset {
 
         // The writer's per-index tuning reaches the plugins as opaque values,
         // each recognising its own.
-        let overrides = writer_overrides(&config);
+        let overrides = writer_overrides(&config)?;
         let index_specs = build_index_specs(
             self,
             &maintained_indexes,
@@ -884,7 +884,7 @@ impl DatasetMemWalExt for Dataset {
         let index_specs = build_index_specs(
             self,
             &maintained_indexes,
-            &writer_overrides(config),
+            &writer_overrides(config)?,
             &config.mem_index_registry,
             OnMissingIndex::Skip,
             on_unsupported,
@@ -948,22 +948,24 @@ async fn resolve_maintained_indexes(
     Ok((names, OnUnsupportedIndex::Skip))
 }
 
-/// The writer's per-index build tuning, as the opaque values plugins take.
+/// The writer's per-index build settings, as the opaque values plugins read.
 ///
-/// Typed on the config so a caller sets HNSW parameters without reaching for
-/// `Any`, and opaque past this point so a plugin Lance does not know about can
-/// be tuned the same way.
-fn writer_overrides(config: &ShardWriterConfig) -> HashMap<String, Arc<dyn Any + Send + Sync>> {
-    config
-        .hnsw_params
-        .iter()
-        .map(|(name, params)| {
-            (
-                name.clone(),
-                Arc::new(params.clone()) as Arc<dyn Any + Send + Sync>,
-            )
-        })
-        .collect()
+/// HNSW settings are typed on the config so a caller sets them without
+/// reaching for `Any`; every other plugin's arrive through
+/// `index_overrides`. One index named in both is ambiguous.
+fn writer_overrides(
+    config: &ShardWriterConfig,
+) -> Result<HashMap<String, Arc<dyn Any + Send + Sync>>> {
+    let mut overrides = config.index_overrides.clone();
+    for (name, params) in &config.hnsw_params {
+        if overrides.contains_key(name) {
+            return Err(Error::invalid_input(format!(
+                "index '{name}' has both HNSW parameters and other writer settings"
+            )));
+        }
+        overrides.insert(name.clone(), Arc::new(params.clone()));
+    }
+    Ok(overrides)
 }
 
 /// Build the in-memory index specs for `index_names`.
@@ -1201,6 +1203,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::inverted::DocumentGranularity;
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
@@ -2010,7 +2013,7 @@ mod tests {
         fn name(&self) -> &str {
             "BitmapAsBTree"
         }
-        fn details_suffix(&self) -> &str {
+        fn details_message(&self) -> &str {
             "BitmapIndexDetails"
         }
         fn flush_index_type(&self) -> IndexType {
@@ -2121,6 +2124,65 @@ mod tests {
         assert_eq!(
             writer.maintained_index_names(),
             vec!["id_bitmap".to_string()]
+        );
+        writer.close().await.unwrap();
+    }
+
+    async fn vector_table_maintaining_all(uri: &str) -> Dataset {
+        let mut dataset = dataset_with_vector_index(uri, DataType::Float32).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        dataset
+    }
+
+    /// Settings of a type the index's plugin does not read fail the writer
+    /// open, rather than leaving the index quietly on its defaults.
+    #[tokio::test]
+    async fn test_a_mistyped_index_override_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset = vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id).with_index_override("vector_idx", 7u32);
+        let Err(error) = dataset.mem_wal_writer(shard_id, config).await else {
+            panic!("the writer must not open");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("vector_idx"), "{error}");
+    }
+
+    /// One index named in both the HNSW settings and the generic ones is
+    /// ambiguous.
+    #[tokio::test]
+    async fn test_an_index_overridden_twice_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset = vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
+            .with_hnsw_params("vector_idx", HnswBuildParams::default())
+            .with_index_override("vector_idx", HnswBuildParams::default());
+        let Err(error) = dataset.mem_wal_writer(shard_id, config).await else {
+            panic!("the writer must not open");
+        };
+        assert!(error.to_string().contains("both"), "{error}");
+    }
+
+    /// The generic channel carries the type a plugin reads: HNSW settings set
+    /// through it reach the writer exactly as through the typed field.
+    #[tokio::test]
+    async fn test_index_overrides_reach_the_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset = vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
+            .with_index_override("vector_idx", HnswBuildParams::default());
+        let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
+        assert_eq!(
+            writer.maintained_index_names(),
+            vec!["vector_idx".to_string()]
         );
         writer.close().await.unwrap();
     }

@@ -65,6 +65,7 @@ use super::projection::{
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::index::FtsMemQuery;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::dataset::mem_wal::memtable::scanner::local_fts_query;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
@@ -264,6 +265,26 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
         }
     }
     visit(&query.query)
+}
+
+/// Whether the active memtable's own indexes answer this search, asked the
+/// question each index will actually receive.
+fn active_source_answers_fts(source: &LsmDataSource, query: &FullTextSearchQuery) -> bool {
+    let LsmDataSource::ActiveMemTable {
+        batch_store,
+        index_store,
+        ..
+    } = source
+    else {
+        return false;
+    };
+    // Rows become visible only after every index holds them, so an index
+    // that answers plus a visible row means it has something.
+    batch_store
+        .max_visible_row(index_store.visible_count())
+        .is_some()
+        && local_fts_query(query.clone(), Some(index_store))
+            .is_ok_and(|local| local.is_answered_by(index_store))
 }
 
 fn active_source_can_execute_fts(
@@ -1231,9 +1252,7 @@ impl LsmFtsSearchPlanner {
                 // single store, and re-indexing a maintained column costs one
                 // tokenize pass over a memtable that is already paying for the
                 // missing one.
-                let index_store = if columns.iter().all(|column| {
-                    active_source_can_execute_fts(source, column, document_granularity)
-                }) {
+                let index_store = if active_source_answers_fts(source, query) {
                     index_store.clone()
                 } else {
                     match transient_fts_index_store(

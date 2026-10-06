@@ -1387,7 +1387,7 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
         "BTree"
     }
 
-    fn details_suffix(&self) -> &str {
+    fn details_message(&self) -> &str {
         "BTreeIndexDetails"
     }
 

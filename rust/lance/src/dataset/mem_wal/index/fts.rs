@@ -519,6 +519,44 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Every leaf that names a column, with that column, in tree order.
+    pub fn bound_leaves(&self) -> Vec<(&str, &Self)> {
+        fn visit<'a>(expr: &'a FtsQueryExpr, out: &mut Vec<(&'a str, &'a FtsQueryExpr)>) {
+            match expr {
+                FtsQueryExpr::Boolean {
+                    must,
+                    should,
+                    must_not,
+                } => {
+                    for child in must.iter().chain(should).chain(must_not) {
+                        visit(child, out);
+                    }
+                }
+                FtsQueryExpr::Boost {
+                    positive, negative, ..
+                } => {
+                    visit(positive, out);
+                    if let Some(negative) = negative {
+                        visit(negative, out);
+                    }
+                }
+                FtsQueryExpr::MultiMatch { children } => {
+                    for child in children {
+                        visit(child, out);
+                    }
+                }
+                leaf => {
+                    if let Some(column) = leaf.column() {
+                        out.push((column, leaf));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(self, &mut out);
+        out
+    }
+
     /// Distinct columns this tree's leaves name, in tree order. An unbound leaf
     /// contributes nothing, so an all-unbound tree yields an empty vec.
     pub fn columns(&self) -> Vec<&str> {
@@ -5097,7 +5135,7 @@ impl super::plugin::MemIndex for FtsMemIndex {
         use lance_index::scalar::lance_format::LanceIndexStore;
 
         if self.is_empty() {
-            return Ok(FlushOutcome::BuildFromGeneration);
+            return Ok(FlushOutcome::Skip);
         }
 
         let partition_id = uuid::Uuid::new_v4().as_u64_pair().0;
@@ -7675,7 +7713,7 @@ impl MemIndexPlugin for FtsMemIndexPlugin {
         "Inverted"
     }
 
-    fn details_suffix(&self) -> &str {
+    fn details_message(&self) -> &str {
         "InvertedIndexDetails"
     }
 

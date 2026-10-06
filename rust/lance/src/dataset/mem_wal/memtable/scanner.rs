@@ -30,7 +30,8 @@
 //! ## Key Features
 //!
 //! - **MVCC Visibility**: All scans respect visibility sequence numbers
-//! - **Index Support**: BTree, HNSW vector, and FTS indexes
+//! - **Index Support**: whichever indexes the memtable maintains, asked by
+//!   what they can answer
 //! - **DataFusion Integration**: Full ExecutionPlan compatibility
 
 mod builder;
@@ -38,4 +39,5 @@ mod builder;
 mod exec;
 
 pub use builder::MemTableScanner;
+pub(crate) use builder::local_fts_query;
 pub use exec::{FtsIndexExec, MemTableScanExec, ScalarIndexExec, VectorIndexExec};

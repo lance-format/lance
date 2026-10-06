@@ -28,7 +28,9 @@ use crate::dataset::mem_wal::index::{FtsQueryExpr, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use lance_index::scalar::expression::IndexedExpression;
 
-use crate::dataset::mem_wal::index::{FtsMemQuery, MemQuery, VectorMemQuery, plan_filter};
+use crate::dataset::mem_wal::index::{
+    FtsMemQuery, MemQuery, SearchOptions, VectorMemQuery, plan_filter,
+};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Vector search query parameters.
@@ -56,6 +58,33 @@ pub struct VectorQuery {
     pub distance_lower_bound: Option<f32>,
     /// The upper bound (exclusive) of the distance to be searched.
     pub distance_upper_bound: Option<f32>,
+}
+
+impl VectorQuery {
+    /// The question a vector index is asked, exactly as it will be searched.
+    pub(crate) fn mem_query(&self) -> Result<VectorMemQuery> {
+        use arrow_array::cast::AsArray;
+        let query_array = self.query_vector.as_ref();
+        let vector = if let Some(fsl) = query_array.as_fixed_size_list_opt() {
+            fsl.clone()
+        } else {
+            let values = self.query_vector.clone();
+            let dim = values.len() as i32;
+            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+            arrow_array::FixedSizeListArray::try_new(field, dim, values, None).map_err(|e| {
+                Error::invalid_input(format!(
+                    "Failed to wrap vector query into FixedSizeListArray (dim={}): {}",
+                    dim, e
+                ))
+            })?
+        };
+        Ok(VectorMemQuery {
+            vector,
+            k: self.k,
+            ef: self.ef,
+            distance_type: self.distance_type,
+        })
+    }
 }
 
 /// Full-text search query parameters.
@@ -91,6 +120,37 @@ pub struct FtsQuery {
 pub const DEFAULT_WAND_FACTOR: f32 = 1.0;
 
 impl FtsQuery {
+    /// What each index this search reaches is asked: the whole tree for a
+    /// search over one column, each leaf for a tree spanning several.
+    ///
+    /// Search options are left at their defaults: they are execution hints
+    /// the planner cannot know yet, so an index must not decline over them.
+    pub(crate) fn index_questions(&self) -> Vec<(&str, FtsMemQuery)> {
+        let ask = |expr: &FtsQueryExpr| FtsMemQuery {
+            expr: expr.clone(),
+            options: SearchOptions::new(),
+            granularity: self.document_granularity,
+        };
+        match self.columns().as_slice() {
+            [column] => vec![(column, ask(&self.expr))],
+            _ => self
+                .expr
+                .bound_leaves()
+                .into_iter()
+                .map(|(column, leaf)| (column, ask(leaf)))
+                .collect(),
+        }
+    }
+
+    /// Whether every index this search reaches is there and answers its part.
+    pub(crate) fn is_answered_by(&self, indexes: &IndexStore) -> bool {
+        let questions = self.index_questions();
+        !questions.is_empty()
+            && questions
+                .iter()
+                .all(|(column, question)| indexes.index_answering(column, question).is_some())
+    }
+
     /// Wrap an already-built query tree, binding every unbound leaf to
     /// `column`. Leaves that already name a column keep it.
     pub fn new(column: impl Into<String>, expr: FtsQueryExpr) -> Self {
@@ -270,7 +330,10 @@ fn resolve_memtable_document_granularity(
     }
 }
 
-fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> Result<FtsQuery> {
+pub fn local_fts_query(
+    query: FullTextSearchQuery,
+    indexes: Option<&IndexStore>,
+) -> Result<FtsQuery> {
     let wand_factor = query.wand_factor.unwrap_or(DEFAULT_WAND_FACTOR);
     let limit = query
         .limit
@@ -1170,7 +1233,7 @@ impl MemTableScanner {
     /// Plan a vector similarity search.
     ///
     /// Always emits a plan whose output schema includes `_distance`: dispatches
-    /// to [`VectorIndexExec`] when an HNSW exists for the column, otherwise to
+    /// to [`VectorIndexExec`] when an index answers the search, otherwise to
     /// [`MemTableBruteForceVectorExec`]. The brute-force arm exists because the
     /// active memtable is the LSM's unindexed-rows path — when the HNSW config
     /// hasn't reached this writer yet (cold-start, or rows written between an
@@ -1220,7 +1283,7 @@ impl MemTableScanner {
         let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
             && hnsw_safe_with_pk
             && hnsw_safe_with_bounds
-            && self.has_vector_index(&query.column, query.distance_type)
+            && self.has_index_for(&query.column, &query.mem_query()?)
         {
             Arc::new(VectorIndexExec::new(
                 self.batch_store.clone(),
@@ -1253,13 +1316,10 @@ impl MemTableScanner {
     /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        // Every queried column needs an index: a cross-column predicate is one
-        // predicate, so a missing arm is a missing answer, not a smaller one.
-        if !query
-            .columns()
-            .into_iter()
-            .all(|column| self.has_fts_index(column, query.document_granularity))
-        {
+        // Every queried column needs an index that answers its part: a
+        // cross-column predicate is one predicate, so a missing arm is a
+        // missing answer, not a smaller one.
+        if !query.is_answered_by(&self.indexes) {
             return self.empty_fts_plan(query.document_granularity);
         }
 
@@ -1358,24 +1418,6 @@ impl MemTableScanner {
     /// question and takes its answer, rather than asking what type it is.
     fn has_index_for(&self, column: &str, query: &dyn MemQuery) -> bool {
         self.indexes.index_answering(column, query).is_some()
-    }
-
-    /// Whether an index on `column` can answer a vector search in
-    /// `distance_type`.
-    ///
-    /// A graph's metric is baked into its structure, so a query asking for a
-    /// different one has to brute-force instead — the same fallback
-    /// `Scanner::vector_search` applies when a requested metric disagrees with
-    /// a base index. `None` means "use the index's metric", which always
-    /// matches.
-    fn has_vector_index(&self, column: &str, distance_type: Option<DistanceType>) -> bool {
-        self.has_index_for(column, &VectorMemQuery::probe(distance_type))
-    }
-
-    /// Whether an index on `column` can answer a full-text search at this
-    /// document granularity.
-    fn has_fts_index(&self, column: &str, document_granularity: DocumentGranularity) -> bool {
-        self.has_index_for(column, &FtsMemQuery::probe(document_granularity))
     }
 }
 
@@ -3148,5 +3190,252 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// How a test vector plugin treats the questions it is asked.
+    #[derive(Debug, Clone, Copy)]
+    enum Picky {
+        /// Answers routing probes, declines every real search.
+        DeclinesRealSearches,
+        /// Declines routing probes, answers every real search.
+        DeclinesProbes,
+        /// Says yes to everything, then declines at search time.
+        AcceptsThenDeclines,
+    }
+
+    /// A built-in, wrapped to be picky about what it answers.
+    #[derive(Debug)]
+    struct PickyPlugin {
+        rule: Picky,
+        inner: MemIndexSpec,
+    }
+
+    #[derive(Debug)]
+    struct PickyIndex(Picky, Arc<dyn crate::dataset::mem_wal::index::MemIndex>);
+
+    /// A routing probe: a vector search asking for nothing, or a full-text
+    /// match on no text.
+    fn is_probe(query: &dyn crate::dataset::mem_wal::index::MemQuery) -> bool {
+        let any = query.as_any();
+        any.downcast_ref::<VectorMemQuery>()
+            .is_some_and(|query| query.k == 0)
+            || any.downcast_ref::<FtsMemQuery>().is_some_and(|query| {
+                matches!(&query.expr, FtsQueryExpr::Match { query, .. } if query.is_empty())
+            })
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dataset::mem_wal::index::MemIndexPlugin for PickyPlugin {
+        fn name(&self) -> &str {
+            "Picky"
+        }
+        fn details_message(&self) -> &str {
+            self.inner.plugin.details_message()
+        }
+        fn flush_index_type(&self) -> lance_index::IndexType {
+            self.inner.plugin.flush_index_type()
+        }
+        fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
+            self.inner.plugin.training_criteria()
+        }
+        fn validate(
+            &self,
+            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
+        ) -> Result<()> {
+            self.inner.plugin.validate(ctx)
+        }
+        fn create(
+            &self,
+            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
+        ) -> Result<Arc<dyn crate::dataset::mem_wal::index::MemIndex>> {
+            Ok(Arc::new(PickyIndex(
+                self.rule,
+                self.inner.plugin.create(ctx)?,
+            )))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dataset::mem_wal::index::MemIndex for PickyIndex {
+        fn columns(&self) -> &[String] {
+            self.1.columns()
+        }
+        fn can_answer(&self, query: &dyn crate::dataset::mem_wal::index::MemQuery) -> bool {
+            self.1.can_answer(query)
+                && match self.0 {
+                    Picky::DeclinesRealSearches => is_probe(query),
+                    Picky::DeclinesProbes => !is_probe(query),
+                    Picky::AcceptsThenDeclines => true,
+                }
+        }
+        fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+            self.1.insert(batch, row_offset)
+        }
+        fn resident_bytes(&self) -> usize {
+            self.1.resident_bytes()
+        }
+        fn search(
+            &self,
+            query: &dyn crate::dataset::mem_wal::index::MemQuery,
+            ctx: &crate::dataset::mem_wal::index::SearchContext,
+        ) -> Result<Option<crate::dataset::mem_wal::index::MemMatches>> {
+            match self.0 {
+                Picky::AcceptsThenDeclines => Ok(None),
+                _ if !self.can_answer(query) => Ok(None),
+                _ => self.1.search(query, ctx),
+            }
+        }
+        async fn flush(
+            &self,
+            ctx: &crate::dataset::mem_wal::index::FlushContext<'_>,
+        ) -> Result<crate::dataset::mem_wal::index::FlushOutcome> {
+            self.1.flush(ctx).await
+        }
+    }
+
+    fn vector_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]))
+    }
+
+    /// A 20-row memtable of points on a line, maintained by `spec` if given.
+    fn vector_memtable(spec: Option<MemIndexSpec>) -> MemTableScanner {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        let schema = vector_schema();
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let specs: Vec<MemIndexSpec> = spec.into_iter().collect();
+        let indexes = IndexStore::from_specs(&specs, &lance_schema, 100, 4).unwrap();
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        for id in 0..20 {
+            vectors.values().append_value(id as f32);
+            vectors.values().append_value(id as f32 * 0.5);
+            vectors.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from((0..20).collect::<Vec<_>>())),
+                Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, offset, Some(position))
+            .unwrap();
+        MemTableScanner::new(batch_store, Arc::new(indexes), schema)
+    }
+
+    /// `inner`, maintained by a plugin that follows `rule`.
+    fn picky(rule: Picky, inner: MemIndexSpec) -> MemIndexSpec {
+        MemIndexSpec {
+            plugin: Arc::new(PickyPlugin {
+                rule,
+                inner: inner.clone(),
+            }),
+            ..inner
+        }
+    }
+
+    fn vector_spec() -> MemIndexSpec {
+        MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2)
+    }
+
+    async fn nearest_ids(mut scanner: MemTableScanner) -> Result<(Vec<i32>, String)> {
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(vec![3.0_f32, 1.5_f32]));
+        scanner.nearest("vector", query.as_ref(), 3).unwrap();
+        let plan = scanner.create_plan().await?;
+        let rendered = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+        );
+        let batch = scanner.try_into_batch().await?;
+        let mut ids = scan_ids(&batch);
+        ids.sort_unstable();
+        Ok((ids, rendered))
+    }
+
+    /// An index that declines the real search is not used, and the rows come
+    /// from reading every vector instead of coming back empty.
+    #[tokio::test]
+    async fn a_vector_index_that_declines_the_real_search_falls_back_to_a_full_read() {
+        let (expected, _) = nearest_ids(vector_memtable(None)).await.unwrap();
+        assert_eq!(expected, vec![2, 3, 4]);
+        let (ids, plan) = nearest_ids(vector_memtable(Some(picky(
+            Picky::DeclinesRealSearches,
+            vector_spec(),
+        ))))
+        .await
+        .unwrap();
+        assert_eq!(ids, expected, "{plan}");
+        assert!(plan.contains("MemTableBruteForceVector"), "{plan}");
+    }
+
+    /// An index is chosen by the search it will actually run, so one that has
+    /// no use for an empty probe is still used.
+    #[tokio::test]
+    async fn a_vector_index_is_chosen_by_the_real_search() {
+        let (ids, plan) = nearest_ids(vector_memtable(Some(picky(
+            Picky::DeclinesProbes,
+            vector_spec(),
+        ))))
+        .await
+        .unwrap();
+        assert_eq!(ids, vec![2, 3, 4]);
+        assert!(plan.contains("VectorIndex"), "{plan}");
+    }
+
+    /// An index that accepts a search while planning and declines it when run
+    /// breaks its contract; that is an error, not an empty answer.
+    #[tokio::test]
+    async fn a_vector_index_that_declines_after_accepting_is_an_error() {
+        let error = nearest_ids(vector_memtable(Some(picky(
+            Picky::AcceptsThenDeclines,
+            vector_spec(),
+        ))))
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("accepted a vector search"),
+            "{error}"
+        );
+    }
+
+    /// A full-text index is chosen by the search it will run: one that has no
+    /// use for an empty probe still answers, rather than the memtable
+    /// answering nothing.
+    #[tokio::test]
+    async fn a_full_text_index_is_chosen_by_the_real_search() {
+        let schema = create_test_schema();
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let spec = picky(
+            Picky::DeclinesProbes,
+            MemIndexSpec::fts("name_fts", 1, "name"),
+        );
+        let indexes = IndexStore::from_specs(&[spec], &lance_schema, 100, 16).unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let batch = create_test_batch(&schema, 0, 10);
+        let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, offset, Some(position))
+            .unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("5".to_string())
+                    .with_column("name".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(scan_ids(&scanner.try_into_batch().await.unwrap()), vec![5]);
     }
 }

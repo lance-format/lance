@@ -41,6 +41,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 use lance_io::object_store::ObjectStore;
@@ -55,6 +56,8 @@ use super::query::{MemMatches, MemQuery, SearchContext};
 /// Comparable, so a writer can tell whether a refreshed set changed without
 /// knowing any plugin's settings. Implemented for every `PartialEq` type; a
 /// plugin whose settings hold a cache implements `PartialEq` to leave it out.
+/// Settings must equal themselves: a value that does not, such as a NaN float,
+/// reads as a changed set on every refresh and seals a memtable each time.
 pub trait MemIndexParams: Any + Send + Sync + std::fmt::Debug {
     /// Whether `other` holds the same settings.
     fn same_as(&self, other: &dyn MemIndexParams) -> bool;
@@ -181,13 +184,23 @@ pub struct ParamsContext<'a> {
 }
 
 impl ParamsContext<'_> {
-    /// The overrides, if they are of type `P`.
+    /// The writer's settings for this index, read as `P`.
     ///
-    /// `None` covers both "nothing was supplied" and "what was supplied was
-    /// meant for a different plugin", which are the same thing here: this
-    /// plugin has no override to apply.
-    pub fn overrides<P: Any>(&self) -> Option<&P> {
-        self.overrides?.downcast_ref::<P>()
+    /// `Ok(None)` when the writer supplied none. Settings of any other type
+    /// are an error naming the index, so a mistyped override cannot quietly
+    /// leave the index on its defaults.
+    pub fn overrides<P: Any>(&self) -> Result<Option<&P>> {
+        let Some(overrides) = self.overrides else {
+            return Ok(None);
+        };
+        overrides.downcast_ref::<P>().map(Some).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "index '{}' was given writer settings of a type its plugin does not read; \
+                 it reads {}",
+                self.name,
+                std::any::type_name::<P>()
+            ))
+        })
     }
 }
 
@@ -296,15 +309,24 @@ impl<'a> FlushContext<'a> {
 
 /// What an index gives the flush.
 pub enum FlushOutcome {
-    /// Nothing worth handing over. The flush builds the on-disk index the
-    /// ordinary way, by reading the generation it has just written.
+    /// Write no index for this generation: the index holds nothing to save,
+    /// such as a vector index over a generation whose vectors are all null.
+    Skip,
+    /// Build the on-disk index the ordinary way, by reading the generation the
+    /// flush has just written, with [`MemIndexPlugin::flush_params`].
     ///
     /// The right answer for a kind whose builder wants its input in an order
     /// the memtable does not hold it in, where re-reading costs less than
-    /// sorting twice.
+    /// sorting twice. Only a scalar [`flush_index_type`] can be built this way;
+    /// any other kind builds its own file from the generation in the
+    /// [`FlushContext`] and returns [`Self::Wrote`], and asking the flush to
+    /// build it is an error.
+    ///
+    /// [`flush_index_type`]: MemIndexPlugin::flush_index_type
     BuildFromGeneration,
     /// Rows for the on-disk builder, in the shape
-    /// [`MemIndexPlugin::training_criteria`] promises.
+    /// [`MemIndexPlugin::training_criteria`] promises, built with
+    /// [`MemIndexPlugin::flush_params`].
     ///
     /// This is the saving a memtable index exists to make: a B-tree wants its
     /// input sorted by value, and the memtable already holds it that way.
@@ -337,9 +359,14 @@ impl FlushOutcome {
 
 /// One index, resident in one memtable.
 ///
-/// Every method may be called concurrently: the write paths fan out one task
-/// per index and readers query the same instance while a writer inserts, so
-/// implementations own their synchronization. Nothing here takes `&mut self`.
+/// Inserts into one instance never overlap: the writer serializes them. Every
+/// other method may run concurrently with an insert and with each other, so
+/// implementations own their synchronization; nothing here takes `&mut self`.
+///
+/// A failed insert stops the writer, and the instance is dropped with its
+/// memtable. Rows become visible only after every index has taken them, so a
+/// partly applied insert is never read. `flush` runs once, after the memtable
+/// is frozen and its last insert has returned.
 #[async_trait::async_trait]
 pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// The columns this index covers, in the order the base-table index names
@@ -358,6 +385,13 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// by downcasting and declines anything else — including a query of a shape
     /// it knows but a configuration it cannot serve, such as a vector search
     /// asking for a metric its graph was not built with.
+    ///
+    /// Planning asks with the query it will run, and then `search` must answer
+    /// it. The one exception is discovering what exists before any query does —
+    /// which full-text granularities a column has — where it asks a probe: a
+    /// query of the same type carrying only the attributes routing turns on.
+    /// Answer a probe truthfully on those. Search options a full-text query
+    /// carries are execution hints, so they must not decide the answer.
     fn can_answer(&self, query: &dyn MemQuery) -> bool;
 
     /// Index every row of `batch`. Row `n` occupies position `row_offset + n`.
@@ -383,7 +417,14 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// `None` means "I cannot help with this one" and the caller scans. That is
     /// a different answer from an empty result, which claims no row matches: a
     /// bloom filter asked for a range has no opinion, and asked for a value it
-    /// has never seen it has a firm one.
+    /// has never seen it has a firm one. Returning `None` for a query
+    /// [`can_answer`](Self::can_answer) accepted is an error the caller reports.
+    ///
+    /// A filter query is answered with [`MemMatches::Filter`], a search with
+    /// [`MemMatches::Ranked`]. Ranked scores are merged with every other
+    /// source's, so they must be on the same scale: a vector index returns the
+    /// exact distance in the query's metric, refining any approximation before
+    /// it returns, and a full-text index the score the built-in one would give.
     fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>>;
 
     /// Hand the flush whatever this index can save it.
@@ -409,6 +450,11 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
 /// practice means an ordered map. The memtable needs more of it than a query
 /// does: point lookups by key, and whether an insert replaced a key already
 /// held.
+///
+/// Only a user index on a single-column key is shared this way. The index the
+/// memtable creates when none qualifies, and the one over a composite key's
+/// encoded tuple, are always the built-in B-tree: replacing the B-tree plugin
+/// does not replace them.
 pub trait PrimaryKeyIndex: MemIndex {
     /// Index a batch and report whether any row replaced a key this index
     /// already held.
@@ -444,12 +490,12 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
     /// own name, for example `Bitmap`.
     fn name(&self) -> &str;
 
-    /// The suffix of the protobuf details message identifying the base-table
+    /// The name of the protobuf details message identifying the base-table
     /// index this plugin maintains, for example `BitmapIndexDetails`.
     ///
-    /// Only the suffix: the package prefix varies with the dataset version and
-    /// every form must resolve.
-    fn details_suffix(&self) -> &str;
+    /// The name alone, without a package: the package varies with the dataset
+    /// version, and a type url matches when its message name is exactly this.
+    fn details_message(&self) -> &str;
 
     /// This plugin's version.
     ///
@@ -470,6 +516,16 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
     /// training happens, so a mismatch is an error naming both sides rather
     /// than an index that disagrees with its own data.
     fn training_criteria(&self) -> TrainingCriteria;
+
+    /// The parameters the flush builds a scalar on-disk index with, from
+    /// [`FlushOutcome::TrainingData`] or from the generation.
+    ///
+    /// The index type's defaults unless overridden. A kind whose base-table
+    /// index was built with tuned parameters returns them, usually from the
+    /// settings its [`resolve`](Self::resolve) read off that index.
+    fn flush_params(&self, _spec: &MemIndexSpec) -> ScalarIndexParams {
+        ScalarIndexParams::default()
+    }
 
     /// How a filter expression reaches this index.
     ///
@@ -551,15 +607,23 @@ impl MemIndexRegistry {
 
     /// Add a plugin. Two plugins cannot claim the same base-table index.
     pub fn add_plugin(&mut self, plugin: Arc<dyn MemIndexPlugin>) -> Result<()> {
+        let message = plugin.details_message();
+        if message.is_empty() || message.contains(['.', '/']) {
+            return Err(Error::invalid_input(format!(
+                "plugin '{}' claims details message '{message}', which is not a bare \
+                 message name",
+                plugin.name()
+            )));
+        }
         if let Some(existing) = self
             .plugins
             .iter()
-            .find(|other| other.details_suffix() == plugin.details_suffix())
+            .find(|other| other.details_message() == plugin.details_message())
         {
             return Err(Error::invalid_input(format!(
-                "plugin '{}' claims details suffix '{}', which '{}' already claims",
+                "plugin '{}' claims details message '{}', which '{}' already claims",
                 plugin.name(),
-                plugin.details_suffix(),
+                plugin.details_message(),
                 existing.name(),
             )));
         }
@@ -576,18 +640,19 @@ impl MemIndexRegistry {
     /// Replace the plugin claiming the same base-table index, or add it.
     ///
     /// How a deployment substitutes its own implementation for one Lance
-    /// builds in: the last plugin registered for a details suffix wins.
+    /// builds in: the last plugin registered for a details message wins.
     pub fn replace_plugin(&mut self, plugin: Arc<dyn MemIndexPlugin>) {
         self.plugins
-            .retain(|other| other.details_suffix() != plugin.details_suffix());
+            .retain(|other| other.details_message() != plugin.details_message());
         self.plugins.push(plugin);
     }
 
     /// The plugin maintaining a base-table index with this details type url.
     pub fn plugin_for_details_url(&self, type_url: &str) -> Option<&Arc<dyn MemIndexPlugin>> {
+        let message = type_url.rsplit(['/', '.']).next().unwrap_or(type_url);
         self.plugins
             .iter()
-            .find(|plugin| type_url.ends_with(plugin.details_suffix()))
+            .find(|plugin| plugin.details_message() == message)
     }
 
     /// Every registered plugin, for diagnostics.

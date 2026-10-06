@@ -224,6 +224,18 @@ pub struct ShardWriterConfig {
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
 
+    /// Build settings for the plugin maintaining an index, by index name.
+    ///
+    /// A plugin reads the type it expects through
+    /// [`ParamsContext::overrides`](super::index::ParamsContext::overrides);
+    /// a value of another type for an index whose plugin reads settings fails
+    /// the writer open. HNSW settings are set through
+    /// [`hnsw_params`](Self::hnsw_params); naming one index in both is an
+    /// error.
+    ///
+    /// Default: empty.
+    pub index_overrides: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+
     /// The memtable index plugins this writer can maintain.
     ///
     /// Defaults to the kinds Lance builds in. A deployment adds its own with
@@ -289,6 +301,7 @@ impl Default for ShardWriterConfig {
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
             hnsw_params: HashMap::new(),
+            index_overrides: HashMap::new(),
             mem_index_registry: MemIndexRegistry::default(),
             warmer: None,
             observer: None,
@@ -432,6 +445,17 @@ impl ShardWriterConfig {
         plugin: std::sync::Arc<dyn super::index::MemIndexPlugin>,
     ) -> Self {
         self.mem_index_registry.replace_plugin(plugin);
+        self
+    }
+
+    /// Set the build settings the plugin maintaining `index_name` reads.
+    pub fn with_index_override(
+        mut self,
+        index_name: impl Into<String>,
+        settings: impl std::any::Any + Send + Sync,
+    ) -> Self {
+        self.index_overrides
+            .insert(index_name.into(), Arc::new(settings));
         self
     }
 

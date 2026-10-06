@@ -12,7 +12,6 @@ use lance_core::cache::LanceCache;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{ShardManifest, SsTable};
-use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
@@ -698,6 +697,7 @@ impl MemTableFlusher {
         let mut created_indexes = Vec::new();
         for (spec, outcome) in outcomes {
             let training_data = match outcome {
+                FlushOutcome::Skip => continue,
                 // The index wrote its own file; nothing left to build.
                 FlushOutcome::Wrote(index_meta) => {
                     created_indexes.push(*index_meta);
@@ -707,21 +707,24 @@ impl MemTableFlusher {
                 FlushOutcome::BuildFromGeneration => None,
             };
 
-            // A kind that writes its own file and had nothing to write — an
-            // empty vector or text index — must not fall through to a scalar
-            // builder that cannot make one.
-            if training_data.is_none() && !spec.plugin.flush_index_type().is_scalar() {
-                continue;
+            // The flush builds scalar indexes only; any other kind writes its
+            // own file. Skipping instead would flush a generation that index
+            // searches cannot see.
+            let index_type = spec.plugin.flush_index_type();
+            if !index_type.is_scalar() {
+                return Err(Error::invalid_input(format!(
+                    "index '{}' asked the flush to build a {index_type} index, which the flush \
+                     builds only for scalar types; plugin '{}' must write it and return \
+                     FlushOutcome::Wrote",
+                    spec.name,
+                    spec.plugin.name()
+                )));
             }
 
-            let params = ScalarIndexParams::default();
-            let mut builder = CreateIndexBuilder::new(
-                dataset,
-                &[spec.column()],
-                spec.plugin.flush_index_type(),
-                &params,
-            )
-            .name(spec.name.clone());
+            let params = spec.plugin.flush_params(spec);
+            let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
+            let mut builder = CreateIndexBuilder::new(dataset, &columns, index_type, &params)
+                .name(spec.name.clone());
             if let Some(stream) = training_data {
                 // Forward-written data: memtable positions line up 1:1 with
                 // the data file, so no remap is needed.
@@ -2006,5 +2009,178 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A built-in whose flush outcome or build parameters a test overrides.
+    #[derive(Debug)]
+    struct Overriding {
+        inner: MemIndexSpec,
+        asks_for_a_build: bool,
+        params: Option<lance_index::scalar::ScalarIndexParams>,
+    }
+
+    #[derive(Debug)]
+    struct OverridingIndex(Arc<dyn crate::dataset::mem_wal::index::MemIndex>, bool);
+
+    #[async_trait::async_trait]
+    impl crate::dataset::mem_wal::index::MemIndexPlugin for Overriding {
+        fn name(&self) -> &str {
+            "Overriding"
+        }
+        fn details_message(&self) -> &str {
+            self.inner.plugin.details_message()
+        }
+        fn flush_index_type(&self) -> lance_index::IndexType {
+            self.inner.plugin.flush_index_type()
+        }
+        fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
+            self.inner.plugin.training_criteria()
+        }
+        fn flush_params(&self, spec: &MemIndexSpec) -> lance_index::scalar::ScalarIndexParams {
+            self.params
+                .clone()
+                .unwrap_or_else(|| self.inner.plugin.flush_params(spec))
+        }
+        fn validate(
+            &self,
+            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
+        ) -> Result<()> {
+            self.inner.plugin.validate(ctx)
+        }
+        fn create(
+            &self,
+            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
+        ) -> Result<Arc<dyn crate::dataset::mem_wal::index::MemIndex>> {
+            Ok(Arc::new(OverridingIndex(
+                self.inner.plugin.create(ctx)?,
+                self.asks_for_a_build,
+            )))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dataset::mem_wal::index::MemIndex for OverridingIndex {
+        fn columns(&self) -> &[String] {
+            self.0.columns()
+        }
+        fn can_answer(&self, query: &dyn crate::dataset::mem_wal::index::MemQuery) -> bool {
+            self.0.can_answer(query)
+        }
+        fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+            self.0.insert(batch, row_offset)
+        }
+        fn resident_bytes(&self) -> usize {
+            self.0.resident_bytes()
+        }
+        fn search(
+            &self,
+            query: &dyn crate::dataset::mem_wal::index::MemQuery,
+            ctx: &crate::dataset::mem_wal::index::SearchContext,
+        ) -> Result<Option<crate::dataset::mem_wal::index::MemMatches>> {
+            self.0.search(query, ctx)
+        }
+        async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+            if self.1 {
+                Ok(FlushOutcome::BuildFromGeneration)
+            } else {
+                self.0.flush(ctx).await
+            }
+        }
+    }
+
+    fn overriding(
+        inner: MemIndexSpec,
+        asks_for_a_build: bool,
+        params: Option<lance_index::scalar::ScalarIndexParams>,
+    ) -> MemIndexSpec {
+        MemIndexSpec {
+            plugin: Arc::new(Overriding {
+                inner: inner.clone(),
+                asks_for_a_build,
+                params,
+            }),
+            ..inner
+        }
+    }
+
+    /// Flush one memtable holding `batch`, maintaining `spec`.
+    async fn flush_one(spec: MemIndexSpec, batch: RecordBatch) -> Result<FlushResult> {
+        use super::super::super::index::IndexStore;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+        let specs = vec![spec];
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
+        let mut memtable = MemTable::new(batch.schema(), 1, vec![]).unwrap();
+        memtable.set_indexes(IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap());
+        let frag_id = memtable.insert(batch).await.unwrap();
+        MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store)
+            .flush_with_indexes(&memtable, epoch, &specs, 1, frag_id + 1)
+            .await
+    }
+
+    /// The flush builds scalar indexes only. A vector plugin asking it to build
+    /// one is refused by name, rather than flushing a generation vector search
+    /// cannot see.
+    #[tokio::test]
+    async fn a_vector_plugin_asking_the_flush_to_build_it_is_an_error() {
+        use arrow_array::FixedSizeListArray;
+        use arrow_array::Float32Array;
+        use lance_linalg::distance::DistanceType;
+
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", DataType::FixedSizeList(item.clone(), 2), false),
+        ]));
+        let vectors = FixedSizeListArray::try_new(
+            item,
+            2,
+            Arc::new(Float32Array::from_iter_values((0..20).map(|i| i as f32))),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let spec = overriding(
+            MemIndexSpec::hnsw("vector_hnsw", 1, "vector", DistanceType::L2),
+            true,
+            None,
+        );
+        let error = flush_one(spec, batch).await.unwrap_err();
+        assert!(
+            error.to_string().contains("vector_hnsw") && error.to_string().contains("Wrote"),
+            "{error}"
+        );
+    }
+
+    /// A scalar build uses the parameters the plugin gives it: a zone size the
+    /// B-tree trainer cannot read fails the build.
+    #[tokio::test]
+    async fn a_scalar_build_uses_the_plugin_flush_params() {
+        let batch = create_test_batch(&create_test_schema(), 10);
+        let params = lance_index::scalar::ScalarIndexParams {
+            index_type: "btree".to_string(),
+            params: Some(r#"{"zone_size": "not a number"}"#.to_string()),
+        };
+        let spec = overriding(MemIndexSpec::btree("id_btree", 0, "id"), true, Some(params));
+        assert!(flush_one(spec, batch.clone()).await.is_err());
+
+        let spec = overriding(MemIndexSpec::btree("id_btree", 0, "id"), true, None);
+        flush_one(spec, batch).await.unwrap();
     }
 }
