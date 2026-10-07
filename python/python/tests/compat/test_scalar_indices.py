@@ -90,10 +90,16 @@ class BTreeIndex(UpgradeDowngradeTest):
         assert table.num_rows >= 1
 
 
-@compat_test(min_version="0.36.0")
+@compat_test(min_version="0.39.0")
 class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
     """Test BTREE forward/backward compatibility across the row-address-domain
     format change.
+
+    min_version is 0.39.0, not the usual 0.36.0, because this test's whole
+    point is an old build correctly ignoring an index format version newer
+    than it understands -- and that mechanism itself was only introduced in
+    0.39.0 (#4906). Before that, an old build doesn't inspect index_version
+    at all and will happily misuse a too-new BTREE index.
 
     BTREE was changed to store physical row addresses (``_rowaddr``) instead
     of row ids, which bumped its on-disk format version. This dataset enables
