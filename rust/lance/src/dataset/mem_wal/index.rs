@@ -790,18 +790,16 @@ impl IndexStore {
                 .flatten();
             tasks.push((
                 name.as_str(),
-                Box::new(move || {
-                    let mut had_existing = false;
-                    for stored in batches {
-                        match pk {
-                            Some(pk) => {
-                                had_existing |=
-                                    pk.insert_and_report_existing(&stored.data, stored.row_offset)?;
-                            }
-                            None => index.insert(&stored.data, stored.row_offset)?,
+                Box::new(move || match pk {
+                    Some(pk) => {
+                        let mut had_existing = false;
+                        for stored in batches {
+                            had_existing |=
+                                pk.insert_and_report_existing(&stored.data, stored.row_offset)?;
                         }
+                        Ok(had_existing)
                     }
-                    Ok(had_existing)
+                    None => index.insert_batches(batches).map(|()| false),
                 }),
             ));
         }
@@ -2366,6 +2364,82 @@ mod tests {
         // Insert without batch position shouldn't change the cursor
         registry.insert(&batch, 6).unwrap();
         assert_eq!(registry.indexed_count(), 11);
+    }
+
+    /// Counts the insert calls it gets, and refuses to be fed one batch at a time.
+    #[derive(Debug, Default)]
+    struct ApplyCounter {
+        columns: Vec<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        batches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MemIndex for ApplyCounter {
+        fn columns(&self) -> &[String] {
+            &self.columns
+        }
+        fn can_answer(&self, _query: &dyn MemQuery) -> bool {
+            false
+        }
+        fn insert(&self, _batch: &RecordBatch, _row_offset: RowPosition) -> Result<()> {
+            Err(Error::internal("indexed one batch at a time"))
+        }
+        fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.batches
+                .fetch_add(batches.len(), std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        fn resident_bytes(&self) -> usize {
+            0
+        }
+        fn search(
+            &self,
+            _query: &dyn MemQuery,
+            _ctx: &SearchContext,
+        ) -> Result<Option<MemMatches>> {
+            Ok(None)
+        }
+        async fn flush(&self, _ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+            Ok(FlushOutcome::Skip)
+        }
+    }
+
+    /// An index gets every batch of one apply in one call, so one that builds
+    /// faster from many rows at once — HNSW inserts them as one graph range —
+    /// is not handed them one by one.
+    #[rstest]
+    #[case::inline(8)]
+    #[case::threaded(PARALLEL_INDEX_MIN_ROWS + 64)]
+    fn test_insert_batches_hands_an_index_every_batch_at_once(#[case] rows_per_batch: usize) {
+        let schema = create_test_schema();
+        let counter = Arc::new(ApplyCounter {
+            columns: vec!["id".to_string()],
+            ..Default::default()
+        });
+        let mut registry = IndexStore::new();
+        registry.add_btree("id_idx".to_string(), 0, "id".to_string());
+        registry.add_index("counter".to_string(), counter.clone());
+
+        let batches: Vec<StoredBatch> = (0..3)
+            .map(|n| {
+                let start = n * rows_per_batch;
+                StoredBatch::new(
+                    create_sized_batch(&schema, start as i32, rows_per_batch),
+                    start as u64,
+                    n,
+                )
+            })
+            .collect();
+        registry.insert_batches(&batches).unwrap();
+
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            counter.batches.load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
     }
 
     /// `insert_batches` picks the inline or the threaded path by row count, so

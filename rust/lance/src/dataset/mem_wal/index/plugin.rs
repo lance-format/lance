@@ -50,6 +50,7 @@ use object_store::path::Path;
 
 use super::RowPosition;
 use super::query::{MemMatches, MemQuery, SearchContext};
+use crate::dataset::mem_wal::memtable::batch_store::StoredBatch;
 
 /// What a plugin builds an index with.
 ///
@@ -399,6 +400,20 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// Every batch carries the shard schema, so one missing a covered column is
     /// an error.
     fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()>;
+
+    /// Index batches in order: every batch written since the index last caught
+    /// up.
+    ///
+    /// The writer hands an index all such batches in one call — one under a
+    /// light load, many when writes queue behind an apply. The default inserts
+    /// them one at a time; an index that builds more cheaply from many rows at
+    /// once overrides it.
+    fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
+        for stored in batches {
+            self.insert(&stored.data, stored.row_offset)?;
+        }
+        Ok(())
+    }
 
     /// Heap bytes held by this index.
     ///

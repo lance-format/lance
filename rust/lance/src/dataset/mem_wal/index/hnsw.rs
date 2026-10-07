@@ -480,6 +480,11 @@ impl super::plugin::MemIndex for HnswMemIndex {
         Self::insert(self, batch, row_offset)
     }
 
+    // One graph insertion over every batch handed over, not one per batch.
+    fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
+        Self::insert_batches(self, batches)
+    }
+
     fn resident_bytes(&self) -> usize {
         Self::resident_bytes(self)
     }
