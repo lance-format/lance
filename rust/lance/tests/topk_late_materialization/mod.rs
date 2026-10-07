@@ -566,3 +566,91 @@ async fn topk_over_an_uncertified_node_is_left_alone() {
         .as_primitive::<Int32Type>();
     assert!(cat.values().iter().all(|v| *v >= 1000));
 }
+
+/// A take that adds `s.x` to an input `s` changes that column, so a sort on
+/// `s` (or a field of it) must stay above the take: below it, the sort would
+/// see only `s.y`.
+#[rstest]
+#[case::existing_field("y")]
+#[case::new_field("x")]
+#[case::whole_struct("all")]
+#[tokio::test]
+async fn sort_stays_above_a_take_that_extends_a_struct(#[case] field_name: &str) {
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatchIterator, StructArray};
+    use arrow_schema::Field;
+    use datafusion::common::DFSchema;
+    use datafusion::functions::core::expr_fn::get_field;
+    use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+    use datafusion::prelude::col as logical_col;
+    use lance_core::datatypes::OnMissing;
+
+    let nested = StructArray::from(vec![
+        (
+            Arc::new(Field::new("x", DataType::Int32, false)),
+            Arc::new(Int32Array::from(vec![3, 1, 2])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("y", DataType::Int32, false)),
+            Arc::new(Int32Array::from(vec![2, 3, 1])) as ArrayRef,
+        ),
+    ]);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "s",
+        nested.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested)]).unwrap();
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    // Built fresh for each run: executing a read consumes it.
+    let make_plan = || {
+        let projection = dataset
+            .empty_projection()
+            .union_column("s.y", OnMissing::Error)
+            .unwrap()
+            .with_row_id();
+        let input = Arc::new(
+            FilteredReadExec::try_new(dataset.clone(), FilteredReadOptions::new(projection), None)
+                .unwrap(),
+        );
+        let extra = dataset
+            .empty_projection()
+            .union_column("s.x", OnMissing::Error)
+            .unwrap();
+        let take: Arc<dyn ExecutionPlan> = Arc::new(
+            TakeExec::try_new(dataset.clone(), input, extra)
+                .unwrap()
+                .unwrap(),
+        );
+        let logical_expr = if field_name == "all" {
+            logical_col("s")
+        } else {
+            get_field(logical_col("s"), field_name)
+        };
+        let expr = SessionContext::new()
+            .create_physical_expr(
+                logical_expr,
+                &DFSchema::try_from(take.schema().as_ref().clone()).unwrap(),
+            )
+            .unwrap();
+        let ordering =
+            LexOrdering::new([PhysicalSortExpr::new(expr, SortOptions::default())]).unwrap();
+        Arc::new(SortExec::new(ordering, take)) as Arc<dyn ExecutionPlan>
+    };
+    let expected = execute(make_plan()).await;
+    let optimized = EnforceSorting::new()
+        .optimize(make_plan(), &ConfigOptions::default())
+        .unwrap();
+    let shown = displayable(optimized.as_ref()).indent(true).to_string();
+    SanityCheckPlan::new()
+        .optimize(optimized.clone(), &ConfigOptions::default())
+        .unwrap_or_else(|e| panic!("{e}\n{shown}"));
+    assert_eq!(execute(optimized).await, expected, "{shown}");
+}
