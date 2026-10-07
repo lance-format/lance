@@ -253,7 +253,7 @@ async fn remap_merged_segment_coverage(
     // Coverage may follow the rows through a compaction only while nothing else
     // has rewritten the indexed fields on the way, and only while the manifests
     // that would show it are still there to be read.
-    if indexed_data_moved_on(dataset, &frag_reuse_index, segments, &staged_coverage).await? {
+    if indexed_data_moved_on(dataset, &frag_reuse_index, segments).await? {
         tracing::warn!(
             index_name,
             staged_fragments = staged_coverage.len(),
@@ -400,19 +400,128 @@ fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i
     })
 }
 
-/// The dataset at `version`, reusing one already read. Absent once cleanup has
-/// removed that manifest.
-async fn snapshot_at(
-    dataset: &Dataset,
-    read: &mut HashMap<u64, Dataset>,
-    version: u64,
-) -> Option<Dataset> {
-    if let Some(at) = read.get(&version) {
-        return Some(at.clone());
+/// A version a coverage proof reads, with its fragments found by id.
+struct Snapshot {
+    dataset: Dataset,
+    fragments: HashMap<u32, usize>,
+}
+
+impl Snapshot {
+    fn new(dataset: Dataset) -> Self {
+        let fragments = dataset
+            .fragments()
+            .iter()
+            .enumerate()
+            .map(|(position, fragment)| (fragment.id as u32, position))
+            .collect();
+        Self { dataset, fragments }
     }
-    let at = dataset.checkout_version(version).await.ok()?;
-    read.insert(version, at.clone());
-    Some(at)
+
+    fn version(&self) -> u64 {
+        self.dataset.manifest.version
+    }
+
+    fn fragment(&self, id: u32) -> Option<&Fragment> {
+        self.fragments
+            .get(&id)
+            .map(|position| &self.dataset.fragments()[*position])
+    }
+}
+
+/// The versions a coverage proof reads, each opened once.
+///
+/// A version counts as gone only when the dataset no longer lists it. Any other
+/// failure to read one is an error: a transient fault must not cost coverage
+/// that the merged index would then never get back.
+struct History<'a> {
+    dataset: &'a Dataset,
+    /// Every version the dataset still lists, ascending.
+    retained: Vec<u64>,
+    snapshots: HashMap<u64, Arc<Snapshot>>,
+}
+
+impl<'a> History<'a> {
+    async fn new(dataset: &'a Dataset) -> Result<Self> {
+        // Ids only: reading every retained manifest to list them would cost more
+        // than the handful of snapshots a proof actually opens.
+        let retained = dataset
+            .version_refs()
+            .await?
+            .iter()
+            .map(|version| version.version)
+            .collect();
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            dataset.manifest.version,
+            Arc::new(Snapshot::new(dataset.clone())),
+        );
+        Ok(Self {
+            dataset,
+            retained,
+            snapshots,
+        })
+    }
+
+    fn current(&self) -> Arc<Snapshot> {
+        self.snapshots[&self.dataset.manifest.version].clone()
+    }
+
+    /// The dataset at `version`, or `None` once cleanup has removed it.
+    async fn at(&mut self, version: u64) -> Result<Option<Arc<Snapshot>>> {
+        if let Some(snapshot) = self.snapshots.get(&version) {
+            return Ok(Some(snapshot.clone()));
+        }
+        if self.retained.binary_search(&version).is_err() {
+            return Ok(None);
+        }
+        let dataset = self
+            .dataset
+            .checkout_version(version)
+            .await
+            .map_err(|error| {
+                Error::io(format!(
+                    "CreateIndex: cannot read dataset version {version} to prove merged index \
+                 coverage: {error}"
+                ))
+            })?;
+        let snapshot = Arc::new(Snapshot::new(dataset));
+        self.snapshots.insert(version, snapshot.clone());
+        Ok(Some(snapshot))
+    }
+
+    /// The commit of the compaction recorded at `recorded`, confirmed to have
+    /// produced `produced`.
+    ///
+    /// The reuse index records each compaction at the version immediately before
+    /// its commit, so the commit is the next one. An entry an older build wrote
+    /// recorded something else, so the commit's own record has to agree;
+    /// where it is gone or does not, nothing about the compaction's output can
+    /// be proven.
+    async fn rewrite_commit(
+        &self,
+        recorded: u64,
+        produced: impl Iterator<Item = u32>,
+    ) -> Result<Option<u64>> {
+        let committed = recorded + 1;
+        if self.retained.binary_search(&committed).is_err() {
+            return Ok(None);
+        }
+        let Some(transaction) = self.dataset.read_transaction_by_version(committed).await? else {
+            return Ok(None);
+        };
+        let Operation::Rewrite { groups, .. } = &transaction.operation else {
+            return Ok(None);
+        };
+        let written = groups
+            .iter()
+            .flat_map(|group| group.new_fragments.iter())
+            .map(|fragment| fragment.id as u32)
+            .collect::<HashSet<_>>();
+        Ok(produced
+            .into_iter()
+            .all(|fragment| written.contains(&fragment))
+            .then_some(committed))
+    }
 }
 
 /// Whether `fragment` holds different data for the `indexed` fields in `after`
@@ -420,123 +529,78 @@ async fn snapshot_at(
 /// in a different file and an overlay adds one, so this one comparison stands in
 /// for every way the data could have moved on.
 fn indexed_data_differs(
-    before: &Dataset,
-    after: &Dataset,
+    before: &Snapshot,
+    after: &Snapshot,
     fragment: u32,
     indexed: &HashSet<i32>,
 ) -> bool {
-    let (Some(then), Some(now)) = (
-        before.fragments().iter().find(|f| f.id as u32 == fragment),
-        after.fragments().iter().find(|f| f.id as u32 == fragment),
-    ) else {
+    let (Some(then), Some(now)) = (before.fragment(fragment), after.fragment(fragment)) else {
         return true;
     };
-    let files_then = fragment_field_files(before, then, indexed);
+    let files_then = fragment_field_files(&before.dataset, then, indexed);
     files_then.is_none()
-        || files_then != fragment_field_files(after, now, indexed)
-        || has_overlay_newer_than(now, before.manifest.version, indexed)
+        || files_then != fragment_field_files(&after.dataset, now, indexed)
+        || has_overlay_newer_than(now, before.version(), indexed)
 }
 
-/// The version that produced `fragment`, proven rather than guessed: the earliest
-/// retained version holding it, accepted only when the version before it is
-/// retained too. Cleanup deletes old manifests, and the earliest surviving
-/// version holding a fragment is evidence of nothing if the one before it is
-/// gone -- a later commit could have rewritten the fragment in between.
+/// Where each covered fragment's index entries were recorded.
 ///
-/// A fragment is present from its creation until a compaction retires it, so the
-/// search is bounded at `until`, a version known to hold it. Searching past that
-/// reads its retirement as absence and walks away from the creation entirely.
-async fn proven_creation_version(
-    dataset: &Dataset,
-    read: &mut HashMap<u64, Dataset>,
-    retained: &[u64],
-    after: u64,
-    until: u64,
-    fragment: u32,
-) -> Result<Option<u64>> {
-    let range = retained
-        .iter()
-        .copied()
-        .filter(|version| *version > after && *version <= until)
-        .collect::<Vec<_>>();
-    let (mut low, mut high) = (0usize, range.len());
-    let mut created = None;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let Some(at) = snapshot_at(dataset, read, range[middle]).await else {
+/// A fragment starts at the version of the segment covering it. Where a
+/// compaction committed after a segment was built, the commit moved that
+/// segment's coverage onto the fragments it produced, which that version does
+/// not have; the entries then describe the inputs the compaction read, so
+/// those are followed from the segment's version instead. `None` where neither
+/// applies, and nothing about the fragment can be proven.
+async fn initial_records(
+    history: &mut History<'_>,
+    frag_reuse_index: &CompactFragReuseIndex,
+    segments: &[IndexMetadata],
+) -> Result<Option<HashMap<u32, u64>>> {
+    let mut by_version = segments.iter().collect::<Vec<_>>();
+    // Oldest first, so a fragment two segments cover is held to the older one.
+    by_version.sort_by_key(|segment| segment.dataset_version);
+
+    let mut following = HashMap::new();
+    for segment in by_version {
+        let version = segment.dataset_version;
+        let Some(built_at) = history.at(version).await? else {
             return Ok(None);
         };
-        if at.fragments().iter().any(|f| f.id as u32 == fragment) {
-            created = Some(range[middle]);
-            high = middle;
-        } else {
-            low = middle + 1;
-        }
-    }
-    let Some(version) = created else {
-        return Ok(None);
-    };
-    // The bisect only ever saw retained versions, so the one before this is proof
-    // only while it is still there to have been looked at.
-    Ok((version > 0 && retained.contains(&(version - 1))).then_some(version))
-}
-
-/// The version a followed fragment's index entries describe.
-#[derive(Clone, Copy)]
-enum Recorded {
-    /// A version already established.
-    At(u64),
-    /// Produced by the compaction that read this version. Dating it needs a
-    /// version known to hold the fragment, so it waits until one is at hand.
-    ProducedAfter(u64),
-}
-
-/// The dataset whose state `fragment`'s index entries describe, established
-/// against `at` -- a version that must hold the fragment for anything to be
-/// worth keeping. Absent once the state cannot be established at all.
-async fn recorded_state(
-    dataset: &Dataset,
-    read: &mut HashMap<u64, Dataset>,
-    retained: &[u64],
-    recorded: Recorded,
-    fragment: u32,
-    at: &Dataset,
-) -> Result<Option<Dataset>> {
-    let version = match recorded {
-        Recorded::At(version) => version,
-        Recorded::ProducedAfter(after) => {
-            // Nothing to date, and nothing worth keeping, once the fragment is
-            // gone from where the comparison would be made.
-            if !at.fragments().iter().any(|f| f.id as u32 == fragment) {
-                return Ok(None);
+        for fragment in segment.fragment_bitmap.iter().flatten() {
+            if built_at.fragment(fragment).is_some() {
+                following.entry(fragment).or_insert(version);
+                continue;
             }
-            // Every group a compaction published shares its commit, so these
-            // searches agree and read the same snapshots, already held.
-            let Some(created) = proven_creation_version(
-                dataset,
-                read,
-                retained,
-                after,
-                at.manifest.version,
-                fragment,
-            )
-            .await?
+            let Some(group) = frag_reuse_index
+                .details
+                .versions
+                .iter()
+                .filter(|reuse| reuse.dataset_version >= version)
+                .flat_map(|reuse| reuse.groups.iter())
+                .find(|group| {
+                    group
+                        .new_frags
+                        .iter()
+                        .any(|produced| produced.id as u32 == fragment)
+                })
             else {
                 return Ok(None);
             };
-            created
+            for source in &group.old_frags {
+                following.entry(source.id as u32).or_insert(version);
+            }
         }
-    };
-    Ok(snapshot_at(dataset, read, version).await)
+    }
+    Ok(Some(following))
 }
 
 /// Whether the data these segments indexed has moved on from the fragments the
 /// merge would have them cover.
 ///
 /// Each fragment being followed carries the version whose state its index
-/// entries describe: the segments' own version to begin with, and then the
-/// commit of whichever compaction last rewrote it. A compaction may carry those
-/// rows forward only if its inputs still match the state they are each recorded
+/// entries describe: its segment's version to begin with, and then the commit
+/// of whichever compaction last rewrote it. A compaction may carry those rows
+/// forward only if its inputs still match the state they are each recorded
 /// against, and the fragments left at the end must still match theirs. A commit
 /// that rewrites an indexed field puts it in a different file and an overlay
 /// adds one, so one comparison per fragment stands in for every way the data
@@ -546,30 +610,16 @@ async fn indexed_data_moved_on(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
-    staged_coverage: &RoaringBitmap,
 ) -> Result<bool> {
-    // The merged index is only as current as its oldest source.
-    let Some(oldest_segment) = segments.iter().map(|segment| segment.dataset_version).min() else {
-        return Ok(false);
-    };
     let mut indexed = HashSet::new();
     for segment in segments {
         indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
     }
-    // Ids only: reading every retained manifest to list them would cost more than
-    // the handful of snapshots the walk actually opens.
-    let retained = dataset
-        .version_refs()
-        .await?
-        .iter()
-        .map(|version| version.version)
-        .collect::<Vec<_>>();
-
-    let mut read = HashMap::new();
-    let mut following = staged_coverage
-        .iter()
-        .map(|fragment| (fragment, Recorded::At(oldest_segment)))
-        .collect::<HashMap<_, _>>();
+    let mut history = History::new(dataset).await?;
+    let Some(mut following) = initial_records(&mut history, frag_reuse_index, segments).await?
+    else {
+        return Ok(true);
+    };
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
     versions.sort_by_key(|version| version.dataset_version);
@@ -588,27 +638,34 @@ async fn indexed_data_moved_on(
         if ours.is_empty() {
             continue;
         }
-        let Some(at_read) = snapshot_at(dataset, &mut read, version.dataset_version).await else {
+        let Some(before_commit) = history.at(version.dataset_version).await? else {
             return Ok(true);
         };
-
         for group in &ours {
             for old in &group.old_frags {
                 let old = old.id as u32;
                 let Some(&recorded) = following.get(&old) else {
                     continue;
                 };
-                let Some(against) =
-                    recorded_state(dataset, &mut read, &retained, recorded, old, &at_read).await?
-                else {
+                let Some(against) = history.at(recorded).await? else {
                     return Ok(true);
                 };
-                if indexed_data_differs(&against, &at_read, old, &indexed) {
+                if indexed_data_differs(&against, &before_commit, old, &indexed) {
                     return Ok(true);
                 }
             }
         }
 
+        let produced = ours
+            .iter()
+            .flat_map(|group| group.new_frags.iter())
+            .map(|fragment| fragment.id as u32);
+        let Some(committed) = history
+            .rewrite_commit(version.dataset_version, produced)
+            .await?
+        else {
+            return Ok(true);
+        };
         // Only the groups this compaction rewrote advance; every other followed
         // fragment stays recorded against the version it already was.
         for group in ours {
@@ -616,26 +673,22 @@ async fn indexed_data_moved_on(
                 following.remove(&(old.id as u32));
             }
             for new in &group.new_frags {
-                following.insert(
-                    new.id as u32,
-                    Recorded::ProducedAfter(version.dataset_version),
-                );
+                following.insert(new.id as u32, committed);
             }
         }
     }
 
+    let current = history.current();
     for (fragment, recorded) in following {
         // A fragment the manifest no longer has is intersected out of the
         // coverage regardless, so it claims nothing and has nothing to match.
-        if !dataset.fragments().iter().any(|f| f.id as u32 == fragment) {
+        if current.fragment(fragment).is_none() {
             continue;
         }
-        let Some(against) =
-            recorded_state(dataset, &mut read, &retained, recorded, fragment, dataset).await?
-        else {
+        let Some(against) = history.at(recorded).await? else {
             return Ok(true);
         };
-        if indexed_data_differs(&against, dataset, fragment, &indexed) {
+        if indexed_data_differs(&against, &current, fragment, &indexed) {
             return Ok(true);
         }
     }
@@ -5734,64 +5787,89 @@ mod tests {
         );
     }
 
-    /// The version before a fragment's first appearance is what makes that
-    /// appearance its creation. Cleanup can delete it, and then the earliest
-    /// surviving version holding the fragment says nothing about when it was
-    /// written.
+    /// A compaction is dated by its own commit record: the version after the
+    /// one the reuse index records it at, and only if that commit is the
+    /// rewrite that produced the fragments in question.
     #[tokio::test]
-    async fn test_creation_version_is_only_proven_while_its_predecessor_is_retained() {
+    async fn test_a_compaction_is_dated_by_its_own_commit_record() {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+
         let test_dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..4))],
+        let batch = |values: std::ops::Range<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(values))],
+            )
+            .unwrap()
+        };
+        let params = WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch(0..4))], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+        // An index, so the deferred compaction records itself in the reuse index.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let sources = all_fragment_ids(&dataset);
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
         )
+        .await
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
-        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
-
-        // A second fragment, so its creation sits after a version holding only
-        // the first.
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        dataset.append(reader, None).await.unwrap();
-        let appended = all_fragment_ids(&dataset)[1];
-
-        let retained = dataset
-            .versions()
+        let committed = dataset.manifest.version;
+        let recorded = dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
             .await
             .unwrap()
-            .iter()
-            .map(|version| version.version)
-            .collect::<Vec<_>>();
-        let until = dataset.manifest.version;
-        let created =
-            proven_creation_version(&dataset, &mut HashMap::new(), &retained, 0, until, appended)
-                .await
-                .unwrap()
-                .expect("the version before the append is retained, so creation is proven");
-        assert!(
-            dataset
-                .checkout_version(created)
-                .await
-                .unwrap()
-                .fragments()
-                .iter()
-                .any(|fragment| fragment.id as u32 == appended)
-        );
+            .expect("a deferred compaction records itself")
+            .details
+            .versions[0]
+            .dataset_version;
+        let produced = all_fragment_ids(&dataset);
+        let reader = RecordBatchIterator::new(vec![Ok(batch(4..6))], schema);
+        dataset.append(reader, None).await.unwrap();
 
-        // The same search over a history missing that predecessor proves nothing.
-        let gapped = retained
-            .iter()
-            .copied()
-            .filter(|version| *version != created - 1)
-            .collect::<Vec<_>>();
-        assert!(
-            proven_creation_version(&dataset, &mut HashMap::new(), &gapped, 0, until, appended)
+        let history = History::new(&dataset).await.unwrap();
+        assert_eq!(
+            history
+                .rewrite_commit(recorded, produced.iter().copied())
                 .await
-                .unwrap()
-                .is_none(),
-            "a fragment's first surviving version is not its creation once the \
-             version before it has been cleaned up"
+                .unwrap(),
+            Some(committed)
+        );
+        assert_eq!(
+            history
+                .rewrite_commit(recorded, sources.iter().copied())
+                .await
+                .unwrap(),
+            None,
+            "the commit is a rewrite, but not the one that produced these fragments"
+        );
+        assert_eq!(
+            history
+                .rewrite_commit(committed, produced.iter().copied())
+                .await
+                .unwrap(),
+            None,
+            "the commit after this version is an append, not a rewrite"
         );
     }
 
@@ -6015,11 +6093,17 @@ mod tests {
     /// Sources staged before a deferred compaction cover fragments the rewrite
     /// has since retired. RTree loads them through `open_scalar_index`, which
     /// applies the dataset's reuse index as a row-address remapper, so the
-    /// merged coverage has to follow those addresses into the fragment the
-    /// rewrite produced.
+    /// merged coverage follows those addresses into the fragment the rewrite
+    /// produced -- but only when the segments cover the whole rewrite group.
+    /// Covering part of it leaves that fragment holding rows none of them
+    /// indexed, and claiming it would drop those rows from results instead of
+    /// scanning for them.
     #[cfg(feature = "geo")]
+    #[rstest]
+    #[case::whole_group(true)]
+    #[case::part_of_the_group(false)]
     #[tokio::test]
-    async fn test_rtree_merge_keeps_coverage_across_a_deferred_compaction() {
+    async fn test_rtree_merge_coverage_across_a_deferred_compaction(#[case] whole_group: bool) {
         const ROWS_PER_FRAGMENT: i32 = 10;
         const FRAGMENTS: i32 = 3;
 
@@ -6030,24 +6114,29 @@ mod tests {
             FRAGMENTS,
         )
         .await;
-        let fragment_ids = all_fragment_ids(&dataset);
+        let mut covered = all_fragment_ids(&dataset);
+        if !whole_group {
+            covered.pop();
+        }
         let staged =
-            crate::utils::test::geo::stage_rtree_segments(&mut dataset, &params, fragment_ids)
-                .await;
+            crate::utils::test::geo::stage_rtree_segments(&mut dataset, &params, covered).await;
         compact_into_one_fragment(&mut dataset, ROWS_PER_FRAGMENT, FRAGMENTS).await;
         let surviving = all_fragment_ids(&dataset);
 
         let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-
         let coverage = merged
             .fragment_bitmap
             .as_ref()
             .expect("a merged segment records what it covers");
-        assert!(
-            !coverage.is_empty(),
-            "the merged RTree index covers nothing: each staged segment resolved \
-             against the rewrite on its own and straddled the group"
-        );
+
+        if !whole_group {
+            assert!(
+                !coverage.contains(surviving[0]),
+                "a straddling merge claimed the rewritten fragment, whose unindexed \
+                 rows would then be dropped from results instead of scanned"
+            );
+            return;
+        }
         assert_eq!(
             coverage.iter().collect::<Vec<_>>(),
             surviving,
@@ -6060,44 +6149,6 @@ mod tests {
             merged_rtree_item_count(&dataset, &merged).await,
             (ROWS_PER_FRAGMENT * FRAGMENTS) as u64,
             "the merged index must hold every row of the fragment it claims"
-        );
-    }
-
-    /// The dangerous direction of the same remap. Segments covering only part of
-    /// a rewrite group leave the fragment that group produced holding rows none
-    /// of them indexed, so claiming it would drop those rows from results
-    /// instead of scanning for them. Covering nothing is the only safe answer.
-    #[cfg(feature = "geo")]
-    #[tokio::test]
-    async fn test_rtree_merge_refuses_coverage_when_its_segments_straddle_a_group() {
-        const ROWS_PER_FRAGMENT: i32 = 10;
-        const FRAGMENTS: i32 = 3;
-
-        let test_dir = TempStrDir::default();
-        let (mut dataset, params) = crate::utils::test::geo::dataset_with_committed_rtree_index(
-            test_dir.as_str(),
-            ROWS_PER_FRAGMENT,
-            FRAGMENTS,
-        )
-        .await;
-        // Every fragment but the last, so the group is covered in part.
-        let mut partial = all_fragment_ids(&dataset);
-        partial.pop();
-        let staged =
-            crate::utils::test::geo::stage_rtree_segments(&mut dataset, &params, partial).await;
-        compact_into_one_fragment(&mut dataset, ROWS_PER_FRAGMENT, FRAGMENTS).await;
-        let surviving = all_fragment_ids(&dataset)[0];
-
-        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-
-        let coverage = merged
-            .fragment_bitmap
-            .as_ref()
-            .expect("a merged segment records what it covers");
-        assert!(
-            !coverage.contains(surviving),
-            "a straddling merge claimed the rewritten fragment, whose unindexed \
-             rows would then be dropped from results instead of scanned"
         );
     }
 
