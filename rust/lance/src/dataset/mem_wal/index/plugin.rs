@@ -162,7 +162,7 @@ impl MemIndexBuildContext<'_> {
 }
 
 /// What an index needs to resolve its build params from the base table.
-pub struct ParamsContext<'a> {
+pub struct ResolveContext<'a> {
     /// Index name on the base table.
     pub name: &'a str,
     /// The base table, for an index whose params live in the trained artifact:
@@ -183,7 +183,7 @@ pub struct ParamsContext<'a> {
     pub overrides: Option<&'a (dyn Any + Send + Sync)>,
 }
 
-impl ParamsContext<'_> {
+impl ResolveContext<'_> {
     /// The writer's settings for this index, read as `P`.
     ///
     /// `Ok(None)` when the writer supplied none. Settings of any other type
@@ -556,7 +556,7 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Runs once, when a memtable is configured, so the per-memtable
     /// [`create`](Self::create) stays synchronous and cannot do I/O on the
     /// write path. A kind with nothing to resolve does not implement this.
-    async fn resolve(&self, ctx: &ParamsContext<'_>) -> Result<ResolvedIndex> {
+    async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         Ok(ResolvedIndex::plain(ctx.columns.to_vec()))
     }
 

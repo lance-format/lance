@@ -154,32 +154,33 @@ impl std::ops::BitOr for PositionSet {
     }
 }
 
-/// Which rows a filter matched, bracketed.
+/// Which rows a filter matched, bracketed, in the terms of Lance's scalar
+/// `SearchResult`.
 ///
 /// An index that locates rows knows the answer. One that only narrows knows a
 /// superset. The two are the endpoints of one interval, so a compound filter
 /// combines them elementwise and the caller asks one question of the result —
 /// is it settled — rather than tracking which index was which.
 ///
-/// * `certain` — rows that definitely match.
-/// * `possible` — rows that might; a row outside it definitely does not.
+/// * `at_least` — rows that definitely match.
+/// * `at_most` — rows that might; a row outside it definitely does not.
 ///
-/// A settled answer has the two equal. A narrowing index leaves `certain`
-/// empty and the caller re-checks `possible`.
+/// A settled answer has the two equal. A narrowing index leaves `at_least`
+/// empty and the caller re-checks `at_most`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemSearchResult {
     /// Rows guaranteed to match.
-    pub certain: PositionSet,
+    pub at_least: PositionSet,
     /// Rows that may match. Nothing outside this set matches.
-    pub possible: PositionSet,
+    pub at_most: PositionSet,
 }
 
 impl MemSearchResult {
     /// A settled answer: exactly these rows match.
     pub fn exact(positions: PositionSet) -> Self {
         Self {
-            certain: positions.clone(),
-            possible: positions,
+            at_least: positions.clone(),
+            at_most: positions,
         }
     }
 
@@ -187,8 +188,8 @@ impl MemSearchResult {
     /// re-checks what is inside.
     pub fn at_most(positions: PositionSet) -> Self {
         Self {
-            certain: PositionSet::empty(),
-            possible: positions,
+            at_least: PositionSet::empty(),
+            at_most: positions,
         }
     }
 
@@ -199,14 +200,14 @@ impl MemSearchResult {
 
     /// Whether the answer is settled and needs no re-check.
     pub fn is_exact(&self) -> bool {
-        self.certain == self.possible
+        self.at_least == self.at_most
     }
 
     /// Drop everything above `max_visible` from both endpoints.
     pub fn truncate_to(self, max_visible: RowPosition) -> Self {
         Self {
-            certain: self.certain.truncate_to(max_visible),
-            possible: self.possible.truncate_to(max_visible),
+            at_least: self.at_least.truncate_to(max_visible),
+            at_most: self.at_most.truncate_to(max_visible),
         }
     }
 }
@@ -214,12 +215,12 @@ impl MemSearchResult {
 impl std::ops::BitAnd for MemSearchResult {
     type Output = Self;
 
-    /// Rows matching both. Certain on both sides stays certain; possible on
-    /// either side bounds the result.
+    /// Rows matching both. Rows certain on both sides stay certain; either
+    /// side's upper bound bounds the result.
     fn bitand(self, rhs: Self) -> Self {
         Self {
-            certain: self.certain & rhs.certain,
-            possible: self.possible & rhs.possible,
+            at_least: self.at_least & rhs.at_least,
+            at_most: self.at_most & rhs.at_most,
         }
     }
 }
@@ -230,8 +231,8 @@ impl std::ops::BitOr for MemSearchResult {
     /// Rows matching either.
     fn bitor(self, rhs: Self) -> Self {
         Self {
-            certain: self.certain | rhs.certain,
-            possible: self.possible | rhs.possible,
+            at_least: self.at_least | rhs.at_least,
+            at_most: self.at_most | rhs.at_most,
         }
     }
 }

@@ -75,7 +75,7 @@ use prost::Message as _;
 
 use super::RowPosition;
 use super::plugin::{
-    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, ParamsContext,
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, ResolveContext,
     ResolvedIndex,
 };
 use super::query::{FtsMemQuery, MemMatches, MemQuery, RankedMatch, SearchContext};
@@ -7727,7 +7727,7 @@ impl MemIndexPlugin for FtsMemIndexPlugin {
         TrainingCriteria::new(TrainingOrdering::None)
     }
 
-    async fn resolve(&self, ctx: &ParamsContext<'_>) -> Result<ResolvedIndex> {
+    async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         Self::resolve_from_metadata(ctx.name, ctx.schema, ctx.index_meta)
     }
 

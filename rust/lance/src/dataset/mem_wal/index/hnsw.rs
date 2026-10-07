@@ -22,7 +22,7 @@ use lance_linalg::distance::DistanceType;
 use super::super::hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams};
 use super::super::memtable::batch_store::StoredBatch;
 use super::plugin::{
-    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, ParamsContext,
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, ResolveContext,
     ResolvedIndex,
 };
 use super::query::{MemMatches, MemQuery, RankedMatch, SearchContext, VectorMemQuery};
@@ -1251,7 +1251,7 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
         TrainingCriteria::new(TrainingOrdering::None)
     }
 
-    async fn resolve(&self, ctx: &ParamsContext<'_>) -> Result<ResolvedIndex> {
+    async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         use crate::index::DatasetIndexInternalExt;
         use lance_index::metrics::NoOpMetricsCollector;
 

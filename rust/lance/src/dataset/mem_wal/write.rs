@@ -227,7 +227,7 @@ pub struct ShardWriterConfig {
     /// Build settings for the plugin maintaining an index, by index name.
     ///
     /// A plugin reads the type it expects through
-    /// [`ParamsContext::overrides`](super::index::ParamsContext::overrides);
+    /// [`ResolveContext::overrides`](super::index::ResolveContext::overrides);
     /// a value of another type for an index whose plugin reads settings fails
     /// the writer open. HNSW settings are set through
     /// [`hnsw_params`](Self::hnsw_params); naming one index in both is an

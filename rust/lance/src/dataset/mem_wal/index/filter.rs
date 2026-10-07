@@ -47,11 +47,11 @@ use super::{IndexStore, MemIndexSpec};
 /// so a deployment's own index kind claims expressions here without Lance
 /// knowing it exists.
 #[derive(Debug, Default)]
-pub struct MemIndexInfo {
+pub struct MemIndexCatalog {
     columns: HashMap<String, (DataType, MultiQueryParser)>,
 }
 
-impl MemIndexInfo {
+impl MemIndexCatalog {
     /// Collect the parsers for every spec that has one.
     ///
     /// A spec whose plugin returns no parser is simply absent here, which is
@@ -96,7 +96,7 @@ impl MemIndexInfo {
     }
 }
 
-impl IndexInformationProvider for MemIndexInfo {
+impl IndexInformationProvider for MemIndexCatalog {
     fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
         self.columns
             .get(col)
@@ -108,11 +108,11 @@ impl IndexInformationProvider for MemIndexInfo {
 ///
 /// `None` when no index can help, which is the caller's signal to plan an
 /// ordinary scan.
-pub fn plan_filter(filter: &Expr, info: &MemIndexInfo) -> Result<Option<IndexedExpression>> {
-    if info.is_empty() {
+pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<IndexedExpression>> {
+    if catalog.is_empty() {
         return Ok(None);
     }
-    let split = apply_scalar_indices(filter.clone(), info)?;
+    let split = apply_scalar_indices(filter.clone(), catalog)?;
     let Some(query) = &split.scalar_query else {
         return Ok(None);
     };
@@ -165,7 +165,7 @@ pub fn evaluate(
                     // for a re-check anyway — a parser says so when the query it
                     // built is a widening of the expression it came from.
                     Ok(if search.needs_recheck {
-                        MemSearchResult::at_most(result.possible)
+                        MemSearchResult::at_most(result.at_most)
                     } else {
                         result
                     })
@@ -186,7 +186,7 @@ fn unknown(ctx: &SearchContext) -> MemSearchResult {
 /// The positions a tree selected, and whether the caller must re-check them.
 pub fn positions(result: MemSearchResult) -> (Vec<u64>, bool) {
     let exact = result.is_exact();
-    (result.possible.into(), exact)
+    (result.at_most.into(), exact)
 }
 
 #[cfg(test)]
@@ -239,12 +239,12 @@ mod tests {
     fn plan(filter: &str, specs: &[MemIndexSpec]) -> Option<IndexedExpression> {
         let arrow = schema();
         let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
-        let info = MemIndexInfo::new(specs, &lance);
+        let catalog = MemIndexCatalog::new(specs, &lance);
         let planner = Planner::new(arrow);
         let expr = planner
             .optimize_expr(planner.parse_filter(filter).unwrap())
             .unwrap();
-        plan_filter(&expr, &info).unwrap()
+        plan_filter(&expr, &catalog).unwrap()
     }
 
     fn run(filter: &str) -> (Vec<u64>, bool) {
@@ -334,14 +334,14 @@ mod tests {
         )]));
         let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
         let specs = vec![MemIndexSpec::btree("value_idx", 0, "value")];
-        let info = MemIndexInfo::new(&specs, &lance);
+        let catalog = MemIndexCatalog::new(&specs, &lance);
         let planner = Planner::new(arrow);
 
         for spelling in ["value = 0.0", "value = 0"] {
             let expr = planner
                 .optimize_expr(planner.parse_filter(spelling).unwrap())
                 .unwrap();
-            let split = plan_filter(&expr, &info)
+            let split = plan_filter(&expr, &catalog)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{spelling} reaches the index"));
             let ScalarIndexExpr::Query(search) = split.scalar_query.unwrap() else {

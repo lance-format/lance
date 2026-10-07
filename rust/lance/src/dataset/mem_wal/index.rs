@@ -23,10 +23,10 @@ mod pk_key;
 mod plugin;
 mod query;
 
-pub use filter::{MemIndexInfo, evaluate as evaluate_index_filter, plan_filter, positions};
+pub use filter::{MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter, positions};
 pub use plugin::{
     FlushContext, FlushOutcome, GenerationWrite, MemIndex, MemIndexBuildContext, MemIndexParams,
-    MemIndexPlugin, MemIndexRegistry, MemIndexSpec, ParamsContext, PrimaryKeyIndex, ResolvedIndex,
+    MemIndexPlugin, MemIndexRegistry, MemIndexSpec, PrimaryKeyIndex, ResolveContext, ResolvedIndex,
 };
 pub use query::{
     FtsMemQuery, MemMatches, MemQuery, MemSearchResult, PositionSet, RankedMatch, ScalarQuery,
@@ -276,7 +276,7 @@ pub struct IndexStore {
     ///
     /// Built once, from the plugins, because a query parser is settled by the
     /// base-table index's details and never changes for a memtable's lifetime.
-    filter_info: Arc<MemIndexInfo>,
+    filter_catalog: Arc<MemIndexCatalog>,
     /// The primary-key index (single-column or composite), or `None` without a
     /// primary key. Queried via [`Self::pk_newest_visible`] (see
     /// [`Self::enable_pk_index`]).
@@ -312,7 +312,7 @@ impl Default for IndexStore {
     fn default() -> Self {
         Self {
             indexes: HashMap::new(),
-            filter_info: Arc::new(MemIndexInfo::default()),
+            filter_catalog: Arc::new(MemIndexCatalog::default()),
 
             pk_index: None,
             indexed_count: AtomicUsize::new(0),
@@ -378,7 +378,7 @@ impl IndexStore {
             let index = spec.build(schema, max_rows, max_batches)?;
             registry.indexes.insert(spec.name.clone(), index);
         }
-        registry.filter_info = MemIndexInfo::for_specs(specs, schema);
+        registry.filter_catalog = MemIndexCatalog::for_specs(specs, schema);
         Ok(registry)
     }
 
@@ -918,8 +918,8 @@ impl IndexStore {
     }
 
     /// How a filter expression reaches these indexes.
-    pub fn filter_info(&self) -> &MemIndexInfo {
-        &self.filter_info
+    pub fn filter_catalog(&self) -> &MemIndexCatalog {
+        &self.filter_catalog
     }
 
     /// The index named `name`, whatever kind maintains it.
@@ -2409,7 +2409,7 @@ mod tests {
                 .search(&query, &SearchContext::new(u64::MAX))
                 .unwrap()
                 .expect("the stub answers equality");
-            let positions = found.as_filter().expect("a filter answer").possible.len();
+            let positions = found.as_filter().expect("a filter answer").at_most.len();
             assert_eq!(
                 positions, 1,
                 "id={id} should be indexed exactly once, got {positions}"
@@ -2476,7 +2476,7 @@ mod tests {
         ) -> Option<Box<dyn lance_index::scalar::expression::ScalarQueryParser>> {
             self.0.query_parser(index_name, index_details)
         }
-        async fn resolve(&self, ctx: &ParamsContext<'_>) -> Result<ResolvedIndex> {
+        async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
             self.0.resolve(ctx).await
         }
     }

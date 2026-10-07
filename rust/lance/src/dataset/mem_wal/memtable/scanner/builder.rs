@@ -1101,7 +1101,7 @@ impl MemTableScanner {
             // pass, so there is nothing to report here.
             let planner = Planner::new(self.schema.clone());
             if let Ok(optimized) = planner.optimize_expr(filter.clone())
-                && let Some(split) = plan_filter(&optimized, self.indexes.filter_info())?
+                && let Some(split) = plan_filter(&optimized, self.indexes.filter_catalog())?
             {
                 return self.plan_index_query(split).await;
             }

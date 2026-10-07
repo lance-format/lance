@@ -58,7 +58,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::index::{
-    MemIndexRegistry, MemIndexSpec, ParamsContext, unsupported_index_type, validate_index_specs,
+    MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type, validate_index_specs,
 };
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
@@ -1067,7 +1067,7 @@ async fn build_index_specs(
         // The plugin decides what it covers and what it needs; nothing here
         // knows one kind from another.
         let resolved = plugin
-            .resolve(&ParamsContext {
+            .resolve(&ResolveContext {
                 name: index_name,
                 dataset,
                 index_meta: &index_meta,
