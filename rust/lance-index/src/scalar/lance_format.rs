@@ -736,9 +736,9 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
+    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
 
@@ -1205,7 +1205,10 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
