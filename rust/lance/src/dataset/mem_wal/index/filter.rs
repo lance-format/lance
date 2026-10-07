@@ -183,15 +183,15 @@ fn unknown(ctx: &SearchContext) -> MemSearchResult {
     MemSearchResult::at_most(PositionSet::all_visible(ctx.max_visible))
 }
 
-/// The positions a tree selected, and whether the caller must re-check them.
-pub fn positions(result: MemSearchResult) -> (Vec<u64>, bool) {
-    let exact = result.is_exact();
-    (result.at_most.into(), exact)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The positions a tree selected, and whether the caller must re-check them.
+    fn positions(result: MemSearchResult) -> (Vec<u64>, bool) {
+        let exact = result.is_exact();
+        (result.at_most.into(), exact)
+    }
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use datafusion::common::ScalarValue;

@@ -23,7 +23,7 @@ mod pk_key;
 mod plugin;
 mod query;
 
-pub use filter::{MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter, positions};
+pub use filter::{MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter};
 pub use plugin::{
     FlushContext, FlushOutcome, GenerationWrite, MemIndex, MemIndexBuildContext, MemIndexParams,
     MemIndexPlugin, MemIndexRegistry, MemIndexSpec, PrimaryKeyIndex, ResolveContext, ResolvedIndex,

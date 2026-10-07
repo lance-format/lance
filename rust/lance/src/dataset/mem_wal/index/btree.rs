@@ -426,12 +426,13 @@ impl FixedIntBackend {
             .flatten()
     }
 
-    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+    fn get(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         let Some(enc) = encode_scalar(value) else {
             if value.is_null() {
-                return self.null_positions.lock().unwrap().clone();
+                let nulls = self.null_positions.lock().unwrap().clone();
+                return (nulls.len() <= limit).then_some(nulls);
             }
-            return Vec::new();
+            return Some(Vec::new());
         };
         let start = FixedKey { enc, position: 0 };
         let mut positions = Vec::new();
@@ -439,9 +440,12 @@ impl FixedIntBackend {
             if key.enc != enc {
                 break;
             }
+            if positions.len() == limit {
+                return None;
+            }
             positions.push(key.position);
         }
-        positions
+        Some(positions)
     }
 
     /// Positions whose value falls in `[lower, upper)`.
@@ -449,7 +453,12 @@ impl FixedIntBackend {
     /// Seeks to the lower bound and stops at the upper, so it touches only the
     /// matching keys. Nulls are excluded: they sort outside every range, the
     /// same rule the on-disk index follows.
-    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+    fn range(
+        &self,
+        lower: Option<&ScalarValue>,
+        upper: Option<&ScalarValue>,
+        limit: usize,
+    ) -> Option<Vec<RowPosition>> {
         let low = lower.and_then(encode_scalar);
         let high = upper.and_then(encode_scalar);
         let mut positions = Vec::new();
@@ -466,9 +475,12 @@ impl FixedIntBackend {
             if high.is_some_and(|bound| key.enc >= bound) {
                 break;
             }
+            if positions.len() == limit {
+                return None;
+            }
             positions.push(key.position);
         }
-        positions
+        Some(positions)
     }
 
     fn len(&self) -> usize {
@@ -646,12 +658,13 @@ impl BytesBackend {
             .flatten()
     }
 
-    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+    fn get(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         let Some(bytes) = value_bytes(value) else {
             if value.is_null() {
-                return self.null_positions.lock().unwrap().clone();
+                let nulls = self.null_positions.lock().unwrap().clone();
+                return (nulls.len() <= limit).then_some(nulls);
             }
-            return Vec::new();
+            return Some(Vec::new());
         };
         let start = BytesKey {
             bytes: InlineBytes::new(bytes),
@@ -662,14 +675,22 @@ impl BytesBackend {
             if key.bytes.as_slice() != bytes {
                 break;
             }
+            if positions.len() == limit {
+                return None;
+            }
             positions.push(key.position);
         }
-        positions
+        Some(positions)
     }
 
     /// Positions whose value falls in `[lower, upper)`. See
     /// [`FixedIntBackend::range`].
-    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+    fn range(
+        &self,
+        lower: Option<&ScalarValue>,
+        upper: Option<&ScalarValue>,
+        limit: usize,
+    ) -> Option<Vec<RowPosition>> {
         let low = lower.and_then(value_bytes);
         let high = upper.and_then(value_bytes);
         let mut positions = Vec::new();
@@ -686,9 +707,12 @@ impl BytesBackend {
             if high.is_some_and(|bound| key.bytes.as_slice() >= bound) {
                 break;
             }
+            if positions.len() == limit {
+                return None;
+            }
             positions.push(key.position);
         }
-        positions
+        Some(positions)
     }
 
     fn len(&self) -> usize {
@@ -858,7 +882,7 @@ impl ScalarBackend {
             .flatten()
     }
 
-    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+    fn get(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         let start = IndexKey {
             value: OrderableScalarValue(value.clone()),
             row_position: 0,
@@ -868,14 +892,22 @@ impl ScalarBackend {
             if key.value.0 != *value {
                 break;
             }
+            if positions.len() == limit {
+                return None;
+            }
             positions.push(key.row_position);
         }
-        positions
+        Some(positions)
     }
 
     /// Positions whose value falls in `[lower, upper)`. See
     /// [`FixedIntBackend::range`].
-    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+    fn range(
+        &self,
+        lower: Option<&ScalarValue>,
+        upper: Option<&ScalarValue>,
+        limit: usize,
+    ) -> Option<Vec<RowPosition>> {
         let mut positions = Vec::new();
         let walk: Box<dyn Iterator<Item = &IndexKey>> = match lower {
             Some(value) => {
@@ -893,9 +925,12 @@ impl ScalarBackend {
             if upper.is_some_and(|bound| &key.value.0 >= bound) {
                 break;
             }
+            if positions.len() == limit {
+                return None;
+            }
             positions.push(key.row_position);
         }
-        positions
+        Some(positions)
     }
 
     fn len(&self) -> usize {
@@ -955,19 +990,27 @@ impl Backend {
         }
     }
 
-    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+    /// The positions holding `value`, or `None` once there are more than `limit`.
+    fn get(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         match self {
-            Self::FixedInt(b) => b.get(value),
-            Self::Bytes(b) => b.get(value),
-            Self::Scalar(b) => b.get(value),
+            Self::FixedInt(b) => b.get(value, limit),
+            Self::Bytes(b) => b.get(value, limit),
+            Self::Scalar(b) => b.get(value, limit),
         }
     }
 
-    fn range(&self, lower: Option<&ScalarValue>, upper: Option<&ScalarValue>) -> Vec<RowPosition> {
+    /// The positions in `[lower, upper)`, or `None` once there are more than
+    /// `limit`.
+    fn range(
+        &self,
+        lower: Option<&ScalarValue>,
+        upper: Option<&ScalarValue>,
+        limit: usize,
+    ) -> Option<Vec<RowPosition>> {
         match self {
-            Self::FixedInt(b) => b.range(lower, upper),
-            Self::Bytes(b) => b.range(lower, upper),
-            Self::Scalar(b) => b.range(lower, upper),
+            Self::FixedInt(b) => b.range(lower, upper, limit),
+            Self::Bytes(b) => b.range(lower, upper, limit),
+            Self::Scalar(b) => b.range(lower, upper, limit),
         }
     }
 
@@ -1095,7 +1138,15 @@ impl BTreeMemIndex {
 
     /// Look up row positions for an exact value.
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
-        self.backend.get().map(|b| b.get(value)).unwrap_or_default()
+        self.get_within(value, usize::MAX).unwrap_or_default()
+    }
+
+    /// As [`Self::get`], or `None` once more than `limit` rows hold `value`.
+    fn get_within(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
+        match self.backend.get() {
+            Some(backend) => backend.get(value, limit),
+            None => Some(Vec::new()),
+        }
     }
 
     /// Row positions whose value falls in `[lower, upper)`, either bound open.
@@ -1107,10 +1158,21 @@ impl BTreeMemIndex {
         lower: Option<&ScalarValue>,
         upper: Option<&ScalarValue>,
     ) -> Vec<RowPosition> {
-        self.backend
-            .get()
-            .map(|b| b.range(lower, upper))
+        self.range_within(lower, upper, usize::MAX)
             .unwrap_or_default()
+    }
+
+    /// As [`Self::range`], or `None` once more than `limit` rows fall in it.
+    fn range_within(
+        &self,
+        lower: Option<&ScalarValue>,
+        upper: Option<&ScalarValue>,
+        limit: usize,
+    ) -> Option<Vec<RowPosition>> {
+        match self.backend.get() {
+            Some(backend) => backend.range(lower, upper, limit),
+            None => Some(Vec::new()),
+        }
     }
 
     /// Get the number of entries (not unique values).
@@ -1260,24 +1322,37 @@ impl super::plugin::MemIndex for BTreeMemIndex {
             return Ok(None);
         };
 
+        // Past the budget, listing matches costs more than reading every row,
+        // so the index declines and the caller reads them instead.
+        let limit = ctx.match_budget.map_or(usize::MAX, |budget| {
+            usize::try_from(budget).unwrap_or(usize::MAX)
+        });
         let positions = match query {
-            SargableQuery::Equals(value) => self.get(value),
+            SargableQuery::Equals(value) => self.get_within(value, limit),
             SargableQuery::IsIn(values) => {
-                values.iter().flat_map(|value| self.get(value)).collect()
+                let mut positions = Vec::new();
+                for value in values {
+                    let Some(found) = self.get_within(value, limit - positions.len()) else {
+                        return Ok(None);
+                    };
+                    positions.extend(found);
+                }
+                Some(positions)
             }
-            SargableQuery::Range(lower, upper) => self.bounded_range(lower, upper),
+            SargableQuery::Range(lower, upper) => self.bounded_range(lower, upper, limit),
             SargableQuery::IsNull() => match self.null_value() {
-                Some(null) => self.get(&null),
+                Some(null) => self.get_within(&null, limit),
                 // Nothing has been inserted, so nothing is null.
-                None => Vec::new(),
+                None => Some(Vec::new()),
             },
-            SargableQuery::LikePrefix(prefix) => match self.prefix_range(prefix) {
-                Some(positions) => positions,
-                // Not a string prefix this index can turn into a range.
-                None => return Ok(None),
-            },
+            // `None` also when the prefix is not one this index can turn into
+            // a range.
+            SargableQuery::LikePrefix(prefix) => self.prefix_range(prefix, limit),
             // A sorted map of whole values cannot score a text query.
             SargableQuery::FullTextSearch(_) => return Ok(None),
+        };
+        let Some(positions) = positions else {
+            return Ok(None);
         };
 
         let visible: PositionSet = positions
@@ -1324,11 +1399,13 @@ impl BTreeMemIndex {
     /// The backing walk is half-open, so an inclusive upper bound adds that
     /// key's positions and an exclusive lower bound removes them. Both are one
     /// extra point lookup, which is what the ordered structure is good at.
+    /// `None` once more than `limit` rows match.
     fn bounded_range(
         &self,
         lower: &Bound<ScalarValue>,
         upper: &Bound<ScalarValue>,
-    ) -> Vec<RowPosition> {
+        limit: usize,
+    ) -> Option<Vec<RowPosition>> {
         let lower_value = match lower {
             Bound::Included(value) | Bound::Excluded(value) => Some(value),
             Bound::Unbounded => None,
@@ -1338,20 +1415,21 @@ impl BTreeMemIndex {
             Bound::Unbounded => None,
         };
 
-        let mut positions = self.range(lower_value, upper_value);
+        let mut positions = self.range_within(lower_value, upper_value, limit)?;
         if let Bound::Excluded(value) = lower {
             let excluded = self.get(value);
             positions.retain(|position| !excluded.contains(position));
         }
         if let Bound::Included(value) = upper {
-            positions.extend(self.get(value));
+            positions.extend(self.get_within(value, limit - positions.len())?);
         }
-        positions
+        Some(positions)
     }
 
     /// Positions whose value starts with `prefix`, or `None` when the prefix is
-    /// not a string this index can turn into a range.
-    fn prefix_range(&self, prefix: &ScalarValue) -> Option<Vec<RowPosition>> {
+    /// not a string this index can turn into a range or more than `limit` rows
+    /// match.
+    fn prefix_range(&self, prefix: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         let (ScalarValue::Utf8(Some(text))
         | ScalarValue::LargeUtf8(Some(text))
         | ScalarValue::Utf8View(Some(text))) = prefix
@@ -1366,7 +1444,7 @@ impl BTreeMemIndex {
             Some(next) => Bound::Excluded(ScalarValue::Utf8(Some(next))),
             None => Bound::Unbounded,
         };
-        Some(self.bounded_range(&lower, &upper))
+        self.bounded_range(&lower, &upper, limit)
     }
 
     /// The typed null for this index's column, or `None` before the first
@@ -1450,6 +1528,54 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// With a match budget the index declines a search listing more rows than
+    /// it allows — its caller then reads every row — and answers one within
+    /// it. Each backend enforces it.
+    #[rstest]
+    #[case::fixed_int(DataType::Int32)]
+    #[case::bytes(DataType::Utf8)]
+    #[case::scalar(DataType::Float64)]
+    fn a_search_past_its_match_budget_is_declined(#[case] data_type: DataType) {
+        let value = |n: i32| match data_type {
+            DataType::Int32 => ScalarValue::Int32(Some(n)),
+            DataType::Utf8 => ScalarValue::Utf8(Some(format!("{n:03}"))),
+            _ => ScalarValue::Float64(Some(n as f64)),
+        };
+        let batch = |values: Vec<i32>| {
+            let array = ScalarValue::iter_to_array(values.into_iter().map(value)).unwrap();
+            let schema = ArrowSchema::new(vec![Field::new("v", array.data_type().clone(), true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap()
+        };
+        let index = BTreeMemIndex::new(0, "v".to_string());
+        index.insert(&batch((0..100).collect()), 0).unwrap();
+        // Seven is held by eleven rows.
+        index.insert(&batch(vec![7; 10]), 100).unwrap();
+
+        let found = |query: SargableQuery| {
+            let ctx = SearchContext::new(u64::MAX).with_match_budget(10);
+            MemIndex::search(&index, &query, &ctx)
+                .unwrap()
+                .map(|matches| matches.as_filter().expect("a filter answer").at_most.len())
+        };
+        let range = |low: i32, high: Bound<i32>| {
+            SargableQuery::Range(Bound::Included(value(low)), high.map(value))
+        };
+        assert_eq!(found(range(20, Bound::Excluded(30))), Some(10));
+        assert_eq!(found(range(20, Bound::Included(29))), Some(10));
+        assert_eq!(found(range(20, Bound::Excluded(31))), None);
+        assert_eq!(found(range(20, Bound::Included(30))), None);
+        assert_eq!(found(SargableQuery::Equals(value(8))), Some(1));
+        assert_eq!(found(SargableQuery::Equals(value(7))), None);
+        assert_eq!(
+            found(SargableQuery::IsIn((20..30).map(value).collect())),
+            Some(10)
+        );
+        assert_eq!(
+            found(SargableQuery::IsIn((20..31).map(value).collect())),
+            None
+        );
     }
 
     #[test]

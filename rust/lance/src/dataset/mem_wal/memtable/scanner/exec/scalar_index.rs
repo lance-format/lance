@@ -31,9 +31,21 @@ use lance_core::Result;
 
 use lance_index::scalar::expression::ScalarIndexExpr;
 
-use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter, positions};
+use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+/// The share of visible rows past which an index answer is not worth listing:
+/// an index may decline a search matching more than `1 / MATCH_BUDGET_SHARE` of
+/// them, and every row is read instead. On 100,000 in-memory rows a B-tree
+/// range lists its matches at about 8 ns each, while reading every row and
+/// applying the filter takes about 135 µs whatever matches; the two cross near
+/// 7% of the rows.
+const MATCH_BUDGET_SHARE: u64 = 16;
+
+/// Matches always worth listing, whatever the share: about 30 µs of listing,
+/// below what reading a memtable costs.
+const MIN_MATCH_BUDGET: u64 = 4096;
 
 /// Execution-plan node answering a filter from the memtable's indexes,
 /// filtered by visibility.
@@ -148,57 +160,75 @@ impl ScalarIndexExec {
         }
     }
 
-    /// Evaluate the index searches and return matching row positions, filtered
-    /// by visibility, with whether the answer still needs the filter applied.
-    fn query_index(&self) -> (Vec<u64>, bool) {
+    /// Evaluate the index searches: the candidate positions, or `None` when
+    /// every visible row is one, and whether the answer still needs the filter.
+    fn query_index(&self) -> (Option<Vec<u64>>, bool) {
         let Some(max_readable_row) = self.compute_max_readable_row() else {
-            return (vec![], true);
+            return (Some(Vec::new()), true);
         };
-        let ctx = SearchContext::new(max_readable_row);
+        let visible_rows = max_readable_row + 1;
+        let mut ctx = SearchContext::new(max_readable_row);
+        // A declined search leaves the rows to the filter, so only offer an
+        // index the choice when there is one to apply.
+        if self.recheck.is_some() {
+            ctx = ctx.with_match_budget((visible_rows / MATCH_BUDGET_SHARE).max(MIN_MATCH_BUDGET));
+        }
         match evaluate_index_filter(&self.index_expr, &self.indexes, &ctx) {
-            Ok(result) => positions(result),
-            // A failing index must not silently answer "no rows". Hand back
-            // every visible row and let the filter decide, which is a scan
-            // done in place.
-            Err(_) => ((0..=max_readable_row).collect(), false),
+            Ok(result) if result.at_most.len() == visible_rows => (None, result.is_exact()),
+            Ok(result) => {
+                let exact = result.is_exact();
+                (Some(result.at_most.into()), exact)
+            }
+            // A failing index must not silently answer "no rows". Every visible
+            // row is a candidate and the filter decides, which is a scan.
+            Err(_) => (None, false),
         }
     }
 
-    /// Read the rows at `positions` (ascending), one stored batch at a time.
+    /// Read the candidate rows, one stored batch at a time: those at
+    /// `candidates` (ascending), or every visible row when it is `None`.
     ///
     /// A touched batch is filtered with a mask, as a full read filters it,
-    /// rather than gathered row by row: a broad answer then costs no more than
-    /// reading every row, and a batch without a match is never read. `recheck`
-    /// is the whole filter, applied when the indexes did not settle it; it runs
-    /// once per touched batch.
+    /// rather than gathered row by row, and a batch without a candidate is
+    /// never read. `recheck` is the whole filter, applied when the indexes did
+    /// not settle it; it runs once per touched batch.
     fn read_rows(
         &self,
-        positions: &[u64],
+        candidates: Option<&[u64]>,
         recheck: Option<&PhysicalExprRef>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
         let mut results = Vec::new();
         let mut next = 0;
-        for stored in self.batch_store.iter() {
-            if next == positions.len() {
-                break;
-            }
+        for stored in self.batch_store.iter().take(self.readable_count) {
             let start = stored.row_offset;
-            let end = start + stored.num_rows as u64;
-            let first = next;
-            while next < positions.len() && positions[next] < end {
-                next += 1;
-            }
-            let in_batch = &positions[first..next];
-            if in_batch.is_empty() {
-                continue;
-            }
-
-            let mut selected = BooleanBufferBuilder::new(stored.num_rows);
-            selected.append_n(stored.num_rows, false);
-            for &position in in_batch {
-                selected.set_bit((position - start) as usize, true);
-            }
-            let mut mask = BooleanArray::new(selected.finish(), None);
+            // `None` keeps every row of the batch.
+            let mut mask = match candidates {
+                None => None,
+                Some(positions) => {
+                    if next == positions.len() {
+                        break;
+                    }
+                    let end = start + stored.num_rows as u64;
+                    let first = next;
+                    while next < positions.len() && positions[next] < end {
+                        next += 1;
+                    }
+                    let in_batch = &positions[first..next];
+                    if in_batch.is_empty() {
+                        continue;
+                    }
+                    if in_batch.len() == stored.num_rows {
+                        None
+                    } else {
+                        let mut selected = BooleanBufferBuilder::new(stored.num_rows);
+                        selected.append_n(stored.num_rows, false);
+                        for &position in in_batch {
+                            selected.set_bit((position - start) as usize, true);
+                        }
+                        Some(BooleanArray::new(selected.finish(), None))
+                    }
+                }
+            };
             if let Some(recheck) = recheck {
                 let evaluated = recheck
                     .evaluate(&stored.data)?
@@ -208,29 +238,28 @@ impl ScalarIndexExec {
                         "a filter must evaluate to a boolean".to_string(),
                     )
                 })?;
-                mask = and(&mask, evaluated)?;
+                let mut combined = match &mask {
+                    Some(selected) => and(selected, evaluated)?,
+                    None => evaluated.clone(),
+                };
                 // A null result is not a match, as it is not in a full scan.
-                if mask.null_count() > 0 {
-                    mask = prep_null_mask_filter(&mask);
+                if combined.null_count() > 0 {
+                    combined = prep_null_mask_filter(&combined);
                 }
+                mask = Some(combined);
             }
-            let kept = mask.true_count();
+            let kept = mask
+                .as_ref()
+                .map_or(stored.num_rows, |mask| mask.true_count());
             if kept == 0 {
                 continue;
             }
 
             let data = scan_record_batch(&stored.data)?;
-            let data = if kept == stored.num_rows {
-                data
-            } else {
-                filter_record_batch(&data, &mask)?
+            let data = match &mask {
+                Some(mask) if kept < stored.num_rows => filter_record_batch(&data, mask)?,
+                _ => data,
             };
-            let row_positions: Vec<u64> = mask
-                .values()
-                .set_indices()
-                .map(|row| start + row as u64)
-                .collect();
-
             let mut columns: Vec<Arc<dyn Array>> = match &self.projection {
                 Some(projection) => take_projected_columns(
                     data.columns(),
@@ -241,12 +270,20 @@ impl ScalarIndexExec {
                 )?,
                 None => data.columns().to_vec(),
             };
-            if self.with_row_id {
-                columns.push(Arc::new(UInt64Array::from(row_positions.clone())));
-            }
-            // A memtable row's address is its position.
-            if self.with_row_address {
-                columns.push(Arc::new(UInt64Array::from(row_positions)));
+            if self.with_row_id || self.with_row_address {
+                let row_positions: Arc<dyn Array> = Arc::new(match &mask {
+                    Some(mask) if kept < stored.num_rows => UInt64Array::from_iter_values(
+                        mask.values().set_indices().map(|row| start + row as u64),
+                    ),
+                    _ => UInt64Array::from_iter_values(start..start + stored.num_rows as u64),
+                });
+                if self.with_row_id {
+                    columns.push(row_positions.clone());
+                }
+                // A memtable row's address is its position.
+                if self.with_row_address {
+                    columns.push(row_positions);
+                }
             }
             results.push(RecordBatch::try_new(self.output_schema.clone(), columns)?);
         }
@@ -328,7 +365,7 @@ impl ExecutionPlan for ScalarIndexExec {
         } else {
             None
         };
-        let batches = self.read_rows(&positions, recheck)?;
+        let batches = self.read_rows(positions.as_deref(), recheck)?;
 
         let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
 
@@ -389,6 +426,98 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Past the match budget the index declines and every visible row is read
+    /// with the filter: exactly the filter's rows and row ids come back, and a
+    /// batch past the readable count stays unread.
+    #[tokio::test]
+    async fn a_broad_answer_reads_every_visible_row_with_the_filter() {
+        const ROWS_PER_BATCH: usize = 1_000;
+        const READABLE_BATCHES: usize = 20;
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        let mut indexes = IndexStore::new();
+        indexes.add_btree("id_idx".to_string(), 0, "id".to_string());
+        for n in 0..=READABLE_BATCHES {
+            let start = n * ROWS_PER_BATCH;
+            let batch = create_test_batch(&schema, start as i32, ROWS_PER_BATCH);
+            batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, start as u64, Some(n))
+                .unwrap();
+        }
+        let visible_rows = (READABLE_BATCHES * ROWS_PER_BATCH) as u64;
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int32(Some(100))),
+            std::ops::Bound::Unbounded,
+        );
+        let budget = (visible_rows / MATCH_BUDGET_SHARE).max(MIN_MATCH_BUDGET);
+        let ctx = SearchContext::new(visible_rows - 1).with_match_budget(budget);
+        assert!(
+            indexes
+                .get_index("id_idx")
+                .unwrap()
+                .search(&query, &ctx)
+                .unwrap()
+                .is_none(),
+            "the B-tree must decline this many matches"
+        );
+
+        let planner = lance_datafusion::planner::Planner::new(schema.clone());
+        let recheck = planner
+            .create_physical_expr(&planner.parse_filter("id >= 100").unwrap())
+            .unwrap();
+        let schema_with_rowid = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("_rowid", DataType::UInt64, true),
+        ]));
+        let exec = ScalarIndexExec::new(
+            batch_store,
+            Arc::new(indexes),
+            search("id_idx", "id", query),
+            Some(recheck),
+            true,
+            READABLE_BATCHES,
+            None,
+            schema_with_rowid,
+            true,
+            false,
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch["id"]
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let row_ids: Vec<u64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch["_rowid"]
+                    .as_primitive::<arrow_array::types::UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let expected: Vec<i32> = (100..visible_rows as i32).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            row_ids,
+            expected.iter().map(|id| *id as u64).collect::<Vec<_>>()
+        );
     }
 
     /// One index search, the way the expression pass produces it.

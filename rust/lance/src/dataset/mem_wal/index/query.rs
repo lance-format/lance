@@ -84,7 +84,11 @@ impl PositionSet {
     /// Every position a reader may see, which is every position up to and
     /// including `max_visible`.
     pub fn all_visible(max_visible: RowPosition) -> Self {
-        Self(RoaringTreemap::from_sorted_iter(0..=max_visible).expect("ascending"))
+        // A range insert fills whole containers rather than adding positions one
+        // by one, which a broad filter would otherwise pay on every query.
+        let mut positions = RoaringTreemap::new();
+        positions.insert_range(0..=max_visible);
+        Self(positions)
     }
 
     /// Whether the set holds no position.
@@ -320,12 +324,26 @@ pub struct SearchContext {
     /// a writer runs ahead of the watermark that publishes them — and must not
     /// return one.
     pub max_visible: RowPosition,
+    /// How many matching rows are worth listing, when there is a limit. An
+    /// index that would list more may return `Ok(None)`, and the caller reads
+    /// every row instead: past some share of the memtable that costs less than
+    /// listing matches one by one. Honouring it is optional.
+    pub match_budget: Option<u64>,
 }
 
 impl SearchContext {
-    /// A search over everything visible up to `max_visible`.
+    /// A search over everything visible up to `max_visible`, with no budget.
     pub fn new(max_visible: RowPosition) -> Self {
-        Self { max_visible }
+        Self {
+            max_visible,
+            match_budget: None,
+        }
+    }
+
+    /// The same search, declinable once it matches more than `budget` rows.
+    pub fn with_match_budget(mut self, budget: u64) -> Self {
+        self.match_budget = Some(budget);
+        self
     }
 }
 
