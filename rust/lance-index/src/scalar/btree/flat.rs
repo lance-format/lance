@@ -422,7 +422,7 @@ impl CacheCodecImpl for FlatIndex {
 mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
-        scalar::btree::{BTREE_ADDRS_COLUMN, BTREE_VALUES_COLUMN},
+        scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN},
     };
 
     use super::*;
@@ -440,7 +440,7 @@ mod tests {
                 "values",
                 array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]),
             )
-            .col("addrs", array::cycle::<UInt64Type>(vec![5, 0, 3, 100]))
+            .col("ids", array::cycle::<UInt64Type>(vec![5, 0, 3, 100]))
             .into_batch_rows(RowCount::from(4))
             .unwrap();
 
@@ -480,7 +480,7 @@ mod tests {
                 Int32,
                 [Some(3), None, Some(1), None, Some(2)]
             ),
-            (BTREE_ADDRS_COLUMN, UInt64, [40, 10, 30, 50, 20])
+            (BTREE_IDS_COLUMN, UInt64, [40, 10, 30, 50, 20])
         )
         .unwrap();
         let index = FlatIndex::try_new(batch).unwrap();
@@ -541,7 +541,7 @@ mod tests {
         // With nulls in the values column
         let batch = record_batch!(
             (BTREE_VALUES_COLUMN, Int32, [None, Some(0), Some(5)]),
-            (BTREE_ADDRS_COLUMN, UInt64, [0, 1, 2])
+            (BTREE_IDS_COLUMN, UInt64, [0, 1, 2])
         )
         .unwrap();
         assert_roundtrips(&FlatIndex::try_new(batch).unwrap());
@@ -648,7 +648,7 @@ mod tests {
         let expected = FlatIndex::try_new(
             gen_batch()
                 .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
-                .col("addrs", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
+                .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
                 .into_batch_rows(RowCount::from(3))
                 .unwrap(),
         )
@@ -680,7 +680,7 @@ mod tests {
         // [null, 0, 5]
         let batch = record_batch!(
             (BTREE_VALUES_COLUMN, Int32, [None, Some(0), Some(5)]),
-            (BTREE_ADDRS_COLUMN, UInt64, [0, 1, 2])
+            (BTREE_IDS_COLUMN, UInt64, [0, 1, 2])
         )
         .unwrap();
         let index = FlatIndex::try_new(batch).unwrap();
@@ -762,7 +762,7 @@ mod tests {
                 [Some(1), Some(2), Some(3), Some(4)]
             ),
             (
-                BTREE_ADDRS_COLUMN,
+                BTREE_IDS_COLUMN,
                 UInt64,
                 [addr(0, 0), addr(2, 7), addr(0, 1), addr(5, 3)]
             )
