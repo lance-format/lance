@@ -290,9 +290,9 @@ appeared in.
 A single fragment may hold both rewritten rows and brand new ones. Order it so
 that **the rewritten rows come first and the new rows last**, then pass only the
 row ids of the rewritten rows. The row ids bind to the leading rows in fragment
-order, and the commit mints ids for the remaining rows.
+order, and the commit generates new ids for the remaining rows.
 
-Do not mint ids for the new rows yourself. Row ids are handed out from a counter
+Do not generate ids for the new rows yourself. Row ids are handed out from a counter
 in the manifest, and a commit that loses a race is retried against the version
 that won, which may have consumed the very ids you picked. Only the commit knows
 which values are free, so it assigns them after conflict resolution has settled.

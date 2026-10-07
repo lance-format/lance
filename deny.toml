@@ -166,6 +166,10 @@ registries = [
 # More documentation about the 'bans' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
 [bans]
+# Lint every dependency declared by a workspace member against the shared
+# `[workspace.dependencies]` table: any crate used by more than one member must
+# go through `workspace = true`, and entries nothing uses are an error.
+workspace-dependencies = { duplicates = "deny", unused = "deny" }
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`

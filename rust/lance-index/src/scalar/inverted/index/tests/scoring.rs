@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::super::partition::validate_no_impact_scorer_upper_bound;
 use super::*;
 
 #[tokio::test]
@@ -14,8 +15,8 @@ async fn test_bm25_search_uses_global_idf() {
 
     // Partition 0: 3 docs, only one contains "alpha".
     let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder0.tokens.add("alpha".to_owned());
-    builder0.tokens.add("beta".to_owned());
+    builder0.tokens.get_or_add("alpha");
+    builder0.tokens.get_or_add("beta");
     builder0.posting_lists.push(PostingListBuilder::new(false));
     builder0.posting_lists.push(PostingListBuilder::new(false));
     builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -28,7 +29,7 @@ async fn test_bm25_search_uses_global_idf() {
 
     // Partition 1: 1 doc, contains "alpha".
     let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
-    builder1.tokens.add("alpha".to_owned());
+    builder1.tokens.get_or_add("alpha");
     builder1.posting_lists.push(PostingListBuilder::new(false));
     builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder1.docs.append(200, 1);
@@ -88,15 +89,34 @@ async fn test_bm25_search_uses_global_idf() {
 async fn write_test_partition_with_optional_impacts(
     store: &Arc<LanceIndexStore>,
     partition_id: u64,
+    builder: InnerBuilder,
+    token_set_format: TokenSetFormat,
+    with_impacts: bool,
+) {
+    write_test_partition_with_optional_impacts_and_positions(
+        store,
+        partition_id,
+        builder,
+        token_set_format,
+        with_impacts,
+        false,
+    )
+    .await;
+}
+
+async fn write_test_partition_with_optional_impacts_and_positions(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
     mut builder: InnerBuilder,
     token_set_format: TokenSetFormat,
     with_impacts: bool,
+    with_positions: bool,
 ) {
     let format_version = InvertedListFormatVersion::V1;
     let block_size = LEGACY_BLOCK_SIZE;
     let docs = std::mem::take(&mut builder.docs);
     let schema = inverted_list_schema_for_version_with_block_size_and_impacts(
-        false,
+        with_positions,
         format_version,
         block_size,
         with_impacts,
@@ -133,6 +153,42 @@ async fn write_test_partition_with_optional_impacts(
     doc_writer.finish().await.unwrap();
 }
 
+async fn load_single_partition_test_index(
+    builder: InnerBuilder,
+    with_impacts: bool,
+) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
+    load_test_index(vec![(0, builder, with_impacts)]).await
+}
+
+async fn load_test_index(
+    partitions: Vec<(u64, InnerBuilder, bool)>,
+) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut partition_ids = Vec::with_capacity(partitions.len());
+    for (partition_id, builder, with_impacts) in partitions {
+        write_test_partition_with_optional_impacts(
+            &store,
+            partition_id,
+            builder,
+            TokenSetFormat::default(),
+            with_impacts,
+        )
+        .await;
+        partition_ids.push(partition_id);
+    }
+    write_test_metadata(&store, partition_ids, InvertedIndexParams::default()).await;
+    let cache = Arc::new(LanceCache::with_capacity(4096));
+    let index = InvertedIndex::load(store, None, cache.as_ref())
+        .await
+        .unwrap();
+    (tmpdir, cache, index)
+}
+
 async fn load_global_scoring_test_index(
     first_partition_has_impacts: bool,
     second_partition_has_impacts: bool,
@@ -162,7 +218,7 @@ async fn load_global_scoring_test_index(
             TokenSetFormat::default(),
             InvertedListFormatVersion::V1,
         );
-        builder.tokens.add("alpha".to_owned());
+        builder.tokens.get_or_add("alpha");
         builder
             .posting_lists
             .push(PostingListBuilder::new_with_posting_tail_codec(
@@ -194,6 +250,265 @@ async fn load_global_scoring_test_index(
     (tmpdir, cache, index)
 }
 
+fn scored_document_bits(documents: Vec<ScoredDoc>) -> Vec<(u64, u32)> {
+    let mut results = documents
+        .into_iter()
+        .map(|document| (document.row_id, document.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    results.sort_unstable();
+    results
+}
+
+#[tokio::test]
+async fn test_prepared_scorer_reuse_preserves_deferred_and_resident_results() {
+    let (_tmpdir, _cache, index) = load_global_scoring_test_index(true, true).await;
+    let tokens = Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
+    let prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(Arc::ptr_eq(
+        prepared.reusable_scorer().unwrap(),
+        prepared.scorer()
+    ));
+    let injected_scorer = Arc::new(prepared.scorer().as_ref().clone());
+    let injected_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            Some(injected_scorer.clone()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(Arc::ptr_eq(injected_prepared.scorer(), &injected_scorer));
+    assert!(injected_prepared.reusable_scorer().is_none());
+    assert_eq!(Arc::strong_count(&injected_scorer), 2);
+
+    let mut expected = None;
+    for is_resident in [false, true] {
+        if is_resident {
+            index
+                .prewarm_with_options(&FtsPrewarmOptions::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(index.has_resident_document_projections(), is_resident);
+        for query in [&prepared, &injected_prepared] {
+            let actual = scored_document_bits(
+                index
+                    .bm25_search_prepared_documents(
+                        query.clone(),
+                        params.clone(),
+                        Operator::Or,
+                        Arc::new(NoFilter),
+                        Arc::new(NoOpMetricsCollector),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected, "resident={is_resident}");
+            } else {
+                expected = Some(actual);
+            }
+            assert_eq!(Arc::strong_count(&injected_scorer), 2);
+            assert_eq!(index.has_resident_document_projections(), is_resident);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_wand_exactness_certificate_support_requires_all_impact_postings() {
+    let (_tmpdir, _cache, mixed_impact_index) = load_global_scoring_test_index(true, false).await;
+    assert!(!mixed_impact_index.is_legacy());
+    assert!(!mixed_impact_index.supports_wand_exactness_certificate());
+
+    let (_tmpdir, _cache, all_impact_index) = load_global_scoring_test_index(true, true).await;
+    assert!(!all_impact_index.is_legacy());
+    assert!(all_impact_index.supports_wand_exactness_certificate());
+}
+
+#[tokio::test]
+async fn test_no_impact_segments_preserve_global_bm25_top_k() {
+    // Segment-local BM25 strongly favors beta in the first segment, while
+    // corpus-wide IDF makes every alpha row the true global winner.
+    let mut alpha_partition = InnerBuilder::new_with_format_version(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    alpha_partition.tokens.get_or_add("alpha");
+    alpha_partition
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    for doc_id in 0_u32..98 {
+        alpha_partition.posting_lists[0].add(doc_id, PositionRecorder::Count(1));
+        alpha_partition.docs.append(u64::from(doc_id), 1);
+    }
+
+    let mut beta_partition = InnerBuilder::new_with_format_version(
+        1,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    beta_partition.tokens.get_or_add("beta");
+    beta_partition
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    beta_partition.posting_lists[0].add(0, PositionRecorder::Count(10));
+    beta_partition.docs.append(98, 10);
+    beta_partition.posting_lists[0].add(1, PositionRecorder::Count(5));
+    beta_partition.docs.append(99, 10);
+
+    let mut second_segment = InnerBuilder::new_with_format_version(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    second_segment.tokens.get_or_add("beta");
+    second_segment
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    for doc_id in 0_u32..10_000 {
+        second_segment.posting_lists[0].add(doc_id, PositionRecorder::Count(1));
+        second_segment.docs.append(1_001 + u64::from(doc_id), 1);
+    }
+
+    // One segment itself mixes a no-impact partition with an impact-backed
+    // partition. The second segment is no-impact, matching a rolling upgrade.
+    let (_first_tmpdir, _first_cache, first_index) =
+        load_test_index(vec![(0, alpha_partition, false), (1, beta_partition, true)]).await;
+    let (_second_tmpdir, _second_cache, second_index) =
+        load_single_partition_test_index(second_segment, false).await;
+    for index in [&first_index, &second_index] {
+        assert!(!index.is_legacy());
+        assert!(!index.supports_wand_exactness_certificate());
+    }
+
+    let scorer = MemBM25Scorer::new(
+        10_118,
+        10_100,
+        HashMap::from([("alpha".to_owned(), 98), ("beta".to_owned(), 10_002)]),
+    );
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".to_owned(), "beta".to_owned()],
+        DocType::Text,
+    ));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
+    let mut candidates = Vec::new();
+    let metrics = Arc::new(NoOpMetricsCollector);
+    // Reverse segment visitation so neither the result nor its row-id tie break
+    // can accidentally depend on the physical search order.
+    for index in [second_index, first_index] {
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                metrics.clone(),
+                Some(&scorer),
+            )
+            .await
+            .unwrap();
+        candidates.extend(row_ids.into_iter().zip(scores));
+    }
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.truncate(2);
+
+    // Before the no-impact fallback used the corpus scorer, the bounded
+    // partition-local candidate set was [98, 1001]. It omitted the alpha tie
+    // group even though row 0 is the true global winner.
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.0)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(candidates[0].1, candidates[1].1);
+
+    let exact_winner_score = scorer.query_weight("alpha") * scorer.doc_weight(1, 1);
+    assert!((exact_winner_score - 4.633_705).abs() < 1e-5);
+    assert!((exact_winner_score - candidates[0].1).abs() < 1e-5);
+}
+
+#[test]
+fn test_global_query_weight_validation_rejects_invalid_values() {
+    let scorer = MemBM25Scorer::new(1, 1, HashMap::from([("alpha".to_owned(), 10)]));
+    let error = validate_no_impact_scorer_upper_bound("alpha", &scorer).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    let message = error.to_string();
+    assert!(message.contains("token \"alpha\""), "{message}");
+    assert!(message.contains("got -"), "{message}");
+}
+
+#[tokio::test]
+async fn test_no_impact_search_rejects_injected_negative_query_weight() {
+    let mut builder = InnerBuilder::new_with_format_version(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    builder.tokens.get_or_add("alpha");
+    builder
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+    builder.docs.append(0, 1);
+    let (_tmpdir, _cache, index) = load_single_partition_test_index(builder, false).await;
+    let scorer = MemBM25Scorer::new(1, 1, HashMap::from([("alpha".to_owned(), 10)]));
+    let error = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            Some(&scorer),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error.to_string().contains(
+            "global BM25 query weight for token \"alpha\" must be finite and non-negative"
+        )
+    );
+}
+
 #[tokio::test]
 async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
     let tmpdir = TempObjDir::default();
@@ -205,7 +520,7 @@ async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
     let matching_partitions = 17_u64;
     for partition_id in 0..matching_partitions {
         let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
-        builder.tokens.add("pipeline".to_owned());
+        builder.tokens.get_or_add("pipeline");
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists[0].add(0, PositionRecorder::Count(1));
         builder.docs.append(partition_id * 1_000 + 7, 1);
@@ -213,7 +528,7 @@ async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
     }
     let unmatched_partition = matching_partitions;
     let mut builder = InnerBuilder::new(unmatched_partition, false, TokenSetFormat::default());
-    builder.tokens.add("unrelated".to_owned());
+    builder.tokens.get_or_add("unrelated");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder.docs.append(999_999, 1);
@@ -447,6 +762,7 @@ async fn search_test_impact_partition(
         grouped_expansions,
         impact_safe,
         exact_scoring_required,
+        no_impact_fallback,
     } = partition
         .load_posting_lists(
             tokens,
@@ -460,6 +776,7 @@ async fn search_test_impact_partition(
         .unwrap();
     assert!(impact_safe);
     assert!(!exact_scoring_required);
+    assert!(!no_impact_fallback);
     assert!(grouped_expansions.is_empty());
 
     let documents = partition.docs.modern().unwrap();
@@ -473,10 +790,186 @@ async fn search_test_impact_partition(
             Operator::Or,
             postings,
             Some(scorer),
+            SharedNormAddends::default(),
             &NoOpMetricsCollector,
             shared_threshold,
         )
         .unwrap()
+}
+
+async fn load_no_impact_bulk_conjunction_test_index(
+    with_positions: bool,
+) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+
+    let mut floor_partition = InnerBuilder::new_with_format_version(
+        0,
+        with_positions,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    let mut winner_partition = InnerBuilder::new_with_format_version(
+        1,
+        with_positions,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    for builder in [&mut floor_partition, &mut winner_partition] {
+        for token in ["lead", "follow"] {
+            builder.tokens.get_or_add(token);
+            builder
+                .posting_lists
+                .push(PostingListBuilder::new_with_posting_tail_codec(
+                    with_positions,
+                    InvertedListFormatVersion::V1.posting_tail_codec(),
+                ));
+        }
+    }
+
+    if with_positions {
+        floor_partition.posting_lists[0].add(0, PositionRecorder::Position(vec![0].into()));
+        floor_partition.posting_lists[1].add(0, PositionRecorder::Position(vec![1].into()));
+    } else {
+        floor_partition.posting_lists[0].add(0, PositionRecorder::Count(1));
+        floor_partition.posting_lists[1].add(0, PositionRecorder::Count(1));
+    }
+    floor_partition.docs.append(100, 2);
+    for row_id in 101..10_100 {
+        floor_partition.docs.append(row_id, 100);
+    }
+
+    let lead_positions = (0..63).map(|position| position * 2).collect::<Vec<_>>();
+    let follow_positions = (0..63).map(|position| position * 2 + 1).collect::<Vec<_>>();
+    for doc_id in 0_u32..100 {
+        if with_positions {
+            winner_partition.posting_lists[0].add(
+                doc_id,
+                PositionRecorder::Position(lead_positions.clone().into()),
+            );
+            winner_partition.posting_lists[1].add(
+                doc_id,
+                PositionRecorder::Position(follow_positions.clone().into()),
+            );
+        } else {
+            winner_partition.posting_lists[0].add(doc_id, PositionRecorder::Count(63));
+            winner_partition.posting_lists[1].add(doc_id, PositionRecorder::Count(63));
+        }
+        winner_partition
+            .docs
+            .append(20_000 + u64::from(doc_id), 126);
+    }
+
+    for (partition_id, builder) in [(0, floor_partition), (1, winner_partition)] {
+        write_test_partition_with_optional_impacts_and_positions(
+            &store,
+            partition_id,
+            builder,
+            TokenSetFormat::default(),
+            false,
+            with_positions,
+        )
+        .await;
+    }
+    let params = InvertedIndexParams::default().with_position(with_positions);
+    write_test_metadata(&store, vec![0, 1], params).await;
+    let cache = Arc::new(LanceCache::with_capacity(4096));
+    let index = InvertedIndex::load(store, None, cache.as_ref())
+        .await
+        .unwrap();
+    (tmpdir, cache, index)
+}
+
+async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
+    let (_tmpdir, _cache, index) = load_no_impact_bulk_conjunction_test_index(with_phrase).await;
+    let tokens = Arc::new(Tokens::new(
+        vec!["lead".to_owned(), "follow".to_owned()],
+        DocType::Text,
+    ));
+    let params = Arc::new(
+        FtsSearchParams::new()
+            .with_limit(Some(1))
+            .with_phrase_slop(with_phrase.then_some(0)),
+    );
+    let scorer = Arc::new(
+        index
+            .bm25_base_scorer(tokens.as_ref(), params.as_ref(), None)
+            .await
+            .unwrap(),
+    );
+    let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+    let shared_norm_addends = SharedNormAddends::default();
+    let mut results = Vec::new();
+    let mut published_floors = Vec::new();
+    for partition_id in [0, 1] {
+        let partition = index
+            .partitions
+            .iter()
+            .find(|partition| partition.id() == partition_id)
+            .unwrap();
+        let LoadedPostings {
+            postings,
+            grouped_expansions,
+            impact_safe,
+            exact_scoring_required,
+            no_impact_fallback,
+        } = partition
+            .load_posting_lists(
+                tokens.as_ref(),
+                params.as_ref(),
+                Operator::And,
+                scorer.as_ref(),
+                &NoOpMetricsCollector,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!impact_safe);
+        assert!(exact_scoring_required);
+        assert!(no_impact_fallback);
+        assert!(grouped_expansions.is_empty());
+
+        let documents = partition.docs.modern().unwrap();
+        let lengths = documents.lengths().await.unwrap();
+        let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
+        results.push(
+            partition
+                .bm25_search_modern(
+                    lengths.as_ref(),
+                    &visibility,
+                    params.as_ref(),
+                    Operator::And,
+                    postings,
+                    Some(scorer.clone()),
+                    shared_norm_addends.clone(),
+                    &NoOpMetricsCollector,
+                    shared_threshold.clone(),
+                )
+                .unwrap(),
+        );
+        published_floors.push(f32::from_bits(shared_threshold.load(Ordering::Relaxed)));
+    }
+
+    assert_eq!(results[0].len(), 1);
+    assert!(published_floors[0] > 0.0);
+    let winner_score = 2.0 * scorer.query_weight("lead") * scorer.doc_weight(63, 126);
+    assert!(winner_score > published_floors[0]);
+    assert_eq!(results[1].len(), 1);
+    assert_eq!(results[1][0].document, DocId::new(0));
+}
+
+#[tokio::test]
+async fn test_no_impact_bulk_and_uses_global_frequency_clamp_bound() {
+    assert_no_impact_bulk_conjunction_preserves_winner(false).await;
+}
+
+#[tokio::test]
+async fn test_no_impact_bulk_phrase_uses_global_frequency_clamp_bound() {
+    assert_no_impact_bulk_conjunction_preserves_winner(true).await;
 }
 
 #[tokio::test]
@@ -608,13 +1101,14 @@ async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
 
     let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
+    let metrics = Arc::new(NoOpMetricsCollector);
     let (row_ids, scores) = index
         .bm25_search(
             tokens.clone(),
             params.clone(),
             Operator::Or,
             Arc::new(NoFilter),
-            Arc::new(NoOpMetricsCollector),
+            metrics.clone(),
             None,
         )
         .await
@@ -637,9 +1131,9 @@ async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
 }
 
 #[tokio::test]
-async fn test_two_legacy_partitions_keep_private_thresholds() {
-    // Legacy BM25 scores use partition-local statistics, so sharing one
-    // pruning floor across partitions can discard the global winner.
+async fn test_two_no_impact_partitions_share_global_scorer_and_threshold() {
+    // Both no-impact partitions must score and prune in the same corpus-global
+    // space before publishing a shared threshold.
     let (_tmpdir, _cache, index) = load_global_scoring_test_index(false, false).await;
     for partition in index.partitions.iter() {
         let posting = partition
@@ -652,13 +1146,14 @@ async fn test_two_legacy_partitions_keep_private_thresholds() {
 
     let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
+    let metrics = Arc::new(NoOpMetricsCollector);
     let (row_ids, scores) = index
         .bm25_search(
             tokens.clone(),
             params.clone(),
             Operator::Or,
             Arc::new(NoFilter),
-            Arc::new(NoOpMetricsCollector),
+            metrics.clone(),
             None,
         )
         .await
@@ -689,7 +1184,7 @@ async fn test_and_query_returns_empty_when_exact_term_missing() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
+    builder.tokens.get_or_add("alpha");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder.docs.append(100, 1);
@@ -747,7 +1242,7 @@ async fn test_and_query_accepts_same_position_alternatives() {
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token in ["getusername", "get", "user", "name"] {
-        builder.tokens.add(token.to_owned());
+        builder.tokens.get_or_add(token);
         builder.posting_lists.push(PostingListBuilder::new(false));
     }
     // Doc 0 only has the split words. Doc 1 has both the complete
@@ -807,7 +1302,7 @@ async fn test_phrase_query_accepts_same_position_alternatives() {
 
     let mut builder = InnerBuilder::new(0, true, TokenSetFormat::default());
     for token in ["getusername", "get", "user", "name"] {
-        builder.tokens.add(token.to_owned());
+        builder.tokens.get_or_add(token);
         builder.posting_lists.push(PostingListBuilder::new(true));
     }
     // Doc 0 only has split words. Doc 1 has both the complete identifier

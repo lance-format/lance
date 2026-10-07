@@ -34,6 +34,7 @@ use lance_linalg::distance::DistanceType;
 use super::super::builder::VectorQuery;
 use super::newest_pk_positions;
 use super::vector::DISTANCE_COLUMN;
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::BatchStore;
 
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
@@ -47,7 +48,7 @@ const DEFAULT_DISTANCE_TYPE: DistanceType = DistanceType::L2;
 pub struct MemTableBruteForceVectorExec {
     batch_store: Arc<BatchStore>,
     query: VectorQuery,
-    visible_count: usize,
+    readable_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -68,7 +69,7 @@ impl Debug for MemTableBruteForceVectorExec {
         f.debug_struct("MemTableBruteForceVectorExec")
             .field("column", &self.query.column)
             .field("k", &self.query.k)
-            .field("visible_count", &self.visible_count)
+            .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
     }
@@ -81,7 +82,7 @@ impl MemTableBruteForceVectorExec {
     pub fn new(
         batch_store: Arc<BatchStore>,
         query: VectorQuery,
-        visible_count: usize,
+        readable_count: usize,
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
@@ -107,7 +108,7 @@ impl MemTableBruteForceVectorExec {
         Ok(Self {
             batch_store,
             query,
-            visible_count,
+            readable_count,
             projection,
             output_schema,
             properties,
@@ -156,23 +157,23 @@ impl MemTableBruteForceVectorExec {
         Ok(Some(mask))
     }
 
-    /// Last row position visible under `visible_count`, or `None`
-    /// if no batches are visible. Identical to `VectorIndexExec`'s helper so
-    /// both arms cut at the same MVCC boundary.
-    fn compute_max_visible_row(&self) -> Option<u64> {
-        let mut max_visible_row_exclusive: u64 = 0;
+    /// Last row position within `readable_count`, or `None` if nothing is
+    /// readable. Identical to `VectorIndexExec`'s helper so both arms cut at
+    /// the same bound.
+    fn compute_max_readable_row(&self) -> Option<u64> {
+        let mut max_readable_row_exclusive: u64 = 0;
         let mut current_row: u64 = 0;
 
         for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
             let batch_end = current_row + stored_batch.num_rows as u64;
-            if batch_position < self.visible_count {
-                max_visible_row_exclusive = batch_end;
+            if batch_position < self.readable_count {
+                max_readable_row_exclusive = batch_end;
             }
             current_row = batch_end;
         }
 
-        if max_visible_row_exclusive > 0 {
-            Some(max_visible_row_exclusive - 1)
+        if max_readable_row_exclusive > 0 {
+            Some(max_readable_row_exclusive - 1)
         } else {
             None
         }
@@ -204,7 +205,7 @@ impl MemTableBruteForceVectorExec {
         if self.query.k == 0 {
             return Ok(Vec::new());
         }
-        let Some(max_visible_row) = self.compute_max_visible_row() else {
+        let Some(max_readable_row) = self.compute_max_readable_row() else {
             return Ok(Vec::new());
         };
         let query_flat = self.query_as_flat()?;
@@ -221,8 +222,8 @@ impl MemTableBruteForceVectorExec {
                 newest_pk_positions(
                     &self.batch_store,
                     pk_columns,
-                    self.visible_count,
-                    max_visible_row,
+                    self.readable_count,
+                    max_readable_row,
                 )
                 .map_err(|e| Error::invalid_input(e.to_string()))?,
             )
@@ -231,7 +232,7 @@ impl MemTableBruteForceVectorExec {
         };
 
         // Walk batches in append order. `current_row` is the global row offset
-        // of the *next* row about to be visited; rows past `max_visible_row`
+        // of the *next* row about to be visited; rows past `max_readable_row`
         // are dropped before they reach the heap.
         let mut current_row: u64 = 0;
         let mut candidates: Vec<(f32, u64)> = Vec::new();
@@ -241,20 +242,18 @@ impl MemTableBruteForceVectorExec {
             if n == 0 {
                 continue;
             }
-            if batch_position >= self.visible_count {
+            if batch_position >= self.readable_count {
                 current_row += n as u64;
                 continue;
             }
 
-            let column = stored_batch
-                .data
-                .column_by_name(column_name)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Vector column '{}' not found in memtable schema",
-                        column_name
-                    ))
-                })?;
+            let scan_batch = scan_record_batch(&stored_batch.data)?;
+            let column = scan_batch.column_by_name(column_name).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Vector column '{}' not found in memtable schema",
+                    column_name
+                ))
+            })?;
             let column_fsl = column.as_fixed_size_list_opt().ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Vector column '{}' must be FixedSizeList; got {:?}",
@@ -272,11 +271,11 @@ impl MemTableBruteForceVectorExec {
 
             // Prefilter: drop rows that fail the predicate before they reach the
             // top-k heap (a NULL predicate result excludes the row, matching SQL).
-            let filter_mask = self.filter_mask(&stored_batch.data)?;
+            let filter_mask = self.filter_mask(&scan_batch)?;
 
             for row in 0..n {
                 let pos = current_row + row as u64;
-                if pos > max_visible_row {
+                if pos > max_readable_row {
                     break;
                 }
                 // Skip superseded versions: only the newest version of each PK is
@@ -357,6 +356,7 @@ impl MemTableBruteForceVectorExec {
         let mut all_batches = Vec::new();
         for (batch_id, rows_with_dist) in batches_data {
             if let Some(stored) = self.batch_store.get(batch_id) {
+                let data = scan_record_batch(&stored.data)?;
                 let rows: Vec<u32> = rows_with_dist.iter().map(|&(r, _, _)| r as u32).collect();
                 let distances: Vec<f32> = rows_with_dist.iter().map(|&(_, d, _)| d).collect();
                 let row_positions: Vec<u64> =
@@ -364,8 +364,7 @@ impl MemTableBruteForceVectorExec {
 
                 let indices = arrow_array::UInt32Array::from(rows);
 
-                let mut columns: Vec<Arc<dyn arrow_array::Array>> = stored
-                    .data
+                let mut columns: Vec<Arc<dyn arrow_array::Array>> = data
                     .columns()
                     .iter()
                     .map(|col| arrow_select::take::take(col.as_ref(), &indices, None).unwrap())
@@ -373,9 +372,15 @@ impl MemTableBruteForceVectorExec {
 
                 columns.push(Arc::new(Float32Array::from(distances)));
 
+                let source_schema = data.schema();
                 let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
+                    let mut projected: Vec<_> = take_projected_columns(
+                        &columns,
+                        source_schema.fields(),
+                        proj_indices,
+                        self.output_schema.as_ref(),
+                        row_positions.len(),
+                    )?;
                     // Distance was just pushed onto `columns`; keep it last.
                     projected.push(columns.last().unwrap().clone());
                     projected
@@ -607,7 +612,7 @@ mod tests {
             MemTableBruteForceVectorExec::new(
                 store,
                 query,
-                /* visible_count = */ usize::MAX,
+                /* readable_count = */ usize::MAX,
                 None,
                 schema,
                 false,
@@ -670,7 +675,7 @@ mod tests {
         let query = query_for([0.0, 0.0], 4);
         let exec = Arc::new(
             MemTableBruteForceVectorExec::new(
-                store, query, /* visible_count = */ 1, None, schema, false,
+                store, query, /* readable_count = */ 1, None, schema, false,
             )
             .expect("ctor"),
         );

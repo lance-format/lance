@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{import_vec_from_method, import_vec_to_rust};
-use arrow::array::Float32Array;
+use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
@@ -21,13 +21,14 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     DocumentGranularity,
     query::{
-        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-        PhraseQuery as FtsPhraseQuery,
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery,
+        CombinedFieldsQuery as FtsCombinedFieldsQuery, FtsQuery, MatchQuery as FtsMatchQuery,
+        MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur, PhraseQuery as FtsPhraseQuery,
     },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
+use uuid::Uuid;
 
 use crate::{
     RT, block_on,
@@ -173,6 +174,33 @@ pub(crate) fn build_full_text_search_query<'a>(
 
             Ok(FtsQuery::MultiMatch(query))
         }
+        "COMBINED_FIELDS" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let columns: Vec<String> =
+                import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                    let jstr = JString::from(elem);
+                    let value: String = env.get_string(&jstr)?.into();
+                    Ok(value)
+                })?;
+
+            let boosts: Option<Vec<f32>> =
+                env.get_optional_from_method(&java_obj, "getBoosts", |env, list_obj| {
+                    import_vec_to_rust(env, &list_obj, |env, elem| {
+                        env.get_f32_from_method(&elem, "floatValue")
+                    })
+                })?;
+            let operator = env.get_fts_operator_from_method(&java_obj)?;
+
+            // Column uniqueness and boost (>= 1) validation live in the Rust core;
+            // `?` surfaces those errors across the JNI boundary.
+            let mut query = FtsCombinedFieldsQuery::try_new(query_text, columns)?;
+            if let Some(boosts) = boosts {
+                query = query.try_with_boosts(boosts)?;
+            }
+            query = query.with_operator(operator);
+
+            Ok(FtsQuery::CombinedFields(query))
+        }
         "BOOST" => {
             let positive_obj = env
                 .call_method(
@@ -257,6 +285,7 @@ fn get_document_granularity(
 /// Scanner options passed from JNI - shared between blocking and async scanners
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
+    pub index_segments_obj: JObject<'a>,
     pub columns_obj: JObject<'a>,
     pub substrait_filter_obj: JObject<'a>,
     pub filter_obj: JObject<'a>,
@@ -305,6 +334,13 @@ pub(crate) fn build_scanner_with_options<'a>(
         }
         scanner.with_fragments(fragments);
     }
+
+    env.get_optional(&options.index_segments_obj, |env, java_segments| {
+        let index_segments: Vec<Uuid> =
+            import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+        scanner.with_index_segments(index_segments)?;
+        Ok(())
+    })?;
 
     let columns_opt = env.get_strings_opt(&options.columns_obj)?;
     if let Some(columns) = columns_opt {
@@ -372,9 +408,49 @@ pub(crate) fn build_scanner_with_options<'a>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        scanner
-            .nearest(&column, &key, k)
-            .map_err(|err| Error::input_error(err.to_string()))?;
+        let query_vector_dim = env
+            .call_method(&java_obj, "getQueryVectorDim", "()I", &[])?
+            .i()?;
+        if query_vector_dim > 0 {
+            // The core interprets a list-shaped query against a multivector column as ONE
+            // multivector query (no `query_index`), which would silently break the
+            // `setKeys` batch contract, so reject it here.
+            if let Some(field) = dataset.schema().field(&column)
+                && matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            {
+                return Err(Error::input_error(format!(
+                    "Batch vector search (setKeys) is not supported on multivector column '{}' \
+                     of type {:?}",
+                    column,
+                    field.data_type()
+                )));
+            }
+            // Batch nearest-neighbor search: the flat buffer packs multiple query
+            // vectors of `query_vector_dim` values each. Wrapping it in a FixedSizeList
+            // makes the core scanner run a shared partition scan across the batch and
+            // emit a `query_index` column tagging each result row with its query.
+            let batch_keys = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                query_vector_dim,
+                Arc::new(key) as ArrayRef,
+                None,
+            )
+            .map_err(|e| {
+                Error::input_error(format!(
+                    "Failed to construct FixedSizeListArray for batch query: {e}"
+                ))
+            })?;
+            scanner
+                .nearest(&column, &batch_keys, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        } else {
+            scanner
+                .nearest(&column, &key, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        }
 
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
@@ -513,31 +589,32 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject<'local>,
     jdataset: JObject<'local>,
-    fragment_ids_obj: JObject<'local>, // Optional<List<Integer>>
-    columns_obj: JObject<'local>,      // Optional<List<String>>
+    fragment_ids_obj: JObject<'local>,   // Optional<List<Integer>>
+    index_segments_obj: JObject<'local>, // Optional<List<UUID>>
+    columns_obj: JObject<'local>,        // Optional<List<String>>
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
-    filter_obj: JObject<'local>,       // Optional<String>
-    batch_size_obj: JObject<'local>,   // Optional<Long>
+    filter_obj: JObject<'local>,         // Optional<String>
+    batch_size_obj: JObject<'local>,     // Optional<Long>
     batch_size_bytes_obj: JObject<'local>, // Optional<Long>
     io_buffer_size_obj: JObject<'local>, // Optional<Long>
-    limit_obj: JObject<'local>,        // Optional<Integer>
-    offset_obj: JObject<'local>,       // Optional<Integer>
-    query_obj: JObject<'local>,        // Optional<Query>
-    fts_query_obj: JObject<'local>,    // Optional<FullTextQuery>
-    prefilter: jboolean,               // boolean
-    with_row_id: jboolean,             // boolean
-    with_row_address: jboolean,        // boolean
-    batch_readahead: jint,             // int
+    limit_obj: JObject<'local>,          // Optional<Integer>
+    offset_obj: JObject<'local>,         // Optional<Integer>
+    query_obj: JObject<'local>,          // Optional<Query>
+    fts_query_obj: JObject<'local>,      // Optional<FullTextQuery>
+    prefilter: jboolean,                 // boolean
+    with_row_id: jboolean,               // boolean
+    with_row_address: jboolean,          // boolean
+    batch_readahead: jint,               // int
     fragment_readahead_obj: JObject<'local>, // Optional<Integer>
-    scan_in_order: jboolean,           // boolean
+    scan_in_order: jboolean,             // boolean
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
-    column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
-    use_scalar_index: jboolean,        // boolean
-    fast_search: jboolean,             // boolean
+    column_orderings: JObject<'local>,   // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,          // boolean
+    fast_search: jboolean,               // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
-    collect_stats: jboolean,           // boolean
-    include_deleted_rows: jboolean,    // boolean
-    strict_batch_size: jboolean,       // boolean
+    collect_stats: jboolean,             // boolean
+    include_deleted_rows: jboolean,      // boolean
+    strict_batch_size: jboolean,         // boolean
     disable_scoring_autoprojection: jboolean, // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -546,6 +623,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             &mut env,
             jdataset,
             fragment_ids_obj,
+            index_segments_obj,
             columns_obj,
             substrait_filter_obj,
             filter_obj,
@@ -580,6 +658,7 @@ fn inner_create_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
+    index_segments_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
@@ -613,6 +692,7 @@ fn inner_create_scanner<'local>(
 
     let options = ScannerOptions {
         fragment_ids_obj,
+        index_segments_obj,
         columns_obj,
         substrait_filter_obj,
         filter_obj,
@@ -700,6 +780,38 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_openStream(
 }
 
 fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> Result<()> {
+    if stream_addr == 0 {
+        return Err(Error::input_error(
+            "ArrowArrayStream address must not be null".to_string(),
+        ));
+    }
+
+    // Reject a stream that already holds a producer. We write the C struct in place below with
+    // `ptr::write_unaligned`, which does not run any destructor on the previous contents. If the
+    // caller passed a stream whose `release` callback is already set (e.g. it was populated by an
+    // earlier export and not yet released), overwriting it would drop that callback and leak the
+    // first producer's resources. A freshly-allocated `ArrowArrayStream` has a null `release`, per
+    // the Arrow C Data Interface, so requiring `release == None` is the contract for "empty".
+    //
+    // The struct is allocated by Arrow Java inside an ArrowBuf and is not guaranteed to be aligned
+    // (hence `write_unaligned` below), so we must not form a reference to it. We read only the
+    // `release` field through an unaligned read: `addr_of!` computes the field address without
+    // creating an intermediate, possibly-unaligned reference, and the field is an `Option<fn>`
+    // which is `Copy` with no destructor, so reading a copy of it leaves the caller's stream
+    // untouched.
+    let release_is_set = unsafe {
+        let stream_ptr = stream_addr as *const FFI_ArrowArrayStream;
+        let release = std::ptr::read_unaligned(std::ptr::addr_of!((*stream_ptr).release));
+        release.is_some()
+    };
+    if release_is_set {
+        return Err(Error::input_error(
+            "ArrowArrayStream is already populated; exporting into it would leak the existing \
+             producer. Pass a freshly-allocated, empty stream."
+                .to_string(),
+        ));
+    }
+
     let record_batch_stream = {
         let scanner_guard =
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;

@@ -39,7 +39,7 @@ All MemWAL index data is stored in the `MemWalIndexDetails` protobuf message in 
 
 The index stores:
 
-- **Configuration**: `sharding_specs`, `maintained_indexes`, and `writer_config_defaults`.
+- **Configuration**: `sharding_specs`, `maintained_indexes`, `maintain_all_indexes`, and `writer_config_defaults`.
 - **Compaction progress**: `compacted_sstables`, the last SSTable compacted into the base table for each shard.
 - **Index catchup progress**: `index_catchup`, the compacted SSTable generation covered by each base-table index.
 - **Shard snapshots**: optional point-in-time snapshot fields for read optimization.
@@ -145,6 +145,29 @@ _mem_wal/{shard_id}/{random8}_gen_{i}/
 If a flush attempt fails, a retry writes a different directory instead of reusing a partially written one.
 The shard manifest records the successful directory name in the SSTable's `path`.
 
+### SSTable Accounting
+
+Alongside `generation` and `path`, a shard manifest entry may record what the
+SSTable holds, as the writer's MemTable accounted for it at flush:
+
+- `in_memory_bytes`: payload size of the rows, summed over the MemTable's
+  buffers as the window each one holds.
+- `physical_rows`: rows held, counting the older duplicates of a primary key
+  that the generation's deletion vector masks. A scan applying the deletion
+  vector yields fewer.
+- `primary_key_bytes`: total payload size of the primary-key columns over every
+  row in `physical_rows`. Not a per-row size, which varies for a
+  variable-length key.
+
+All three are estimates of payload, not bounds on what reading the SSTable
+costs: they exclude the per-array structure a reader materializes, and
+`primary_key_bytes` is not the size of any encoded form of the key. A consumer
+budgeting memory from them adds its own headroom.
+
+All three are optional. An entry written before they existed records none of
+them, and a reader must not treat an absent value as zero; `primary_key_bytes`
+is also absent on a table with no primary key.
+
 The SSTable directory is a standard Lance dataset written with the base table's data storage version.
 Each SSTable is written as one fragment.
 Additional MemWAL sidecars may be present:
@@ -243,7 +266,7 @@ It is not used to choose the newest row inside the same SSTable; the deletion ve
 
 ### Maintained User Indexes
 
-When the MemWAL index lists `maintained_indexes`, flush may build matching indexes inside the SSTable.
+When the MemWAL index names indexes to maintain -- in `maintained_indexes`, or every index the table has when `maintain_all_indexes` is set -- flush may build matching indexes inside the SSTable.
 These index files live in the SSTable's `_indices/{index_uuid}/` directory and are recorded in the SSTable's Lance manifest.
 The implicit primary-key BTree sidecar is not included in `maintained_indexes` and does not live under `_indices/`.
 
@@ -335,20 +358,24 @@ The `index_details` field contains a `MemWalIndexDetails` protobuf message.
 Important fields:
 
 - `sharding_specs`: sharding configuration used by writers and shard pruning.
-- `maintained_indexes`: names of base-table indexes to maintain in MemTables and SSTables.
+- `maintained_indexes`: names of base-table indexes to maintain in MemTables and SSTables. Ignored when `maintain_all_indexes` is set.
+- `maintain_all_indexes`: maintain every index the table has rather than the names above. The set is resolved from the table's indexes each time a MemTable is built, so an index created after the MemWAL was installed is picked up and a dropped one falls out. An index the writer cannot mirror is skipped, so introducing one does not make the table unwritable; a name in `maintained_indexes` that it cannot mirror is an error instead, because the caller asked for that index. The field carries presence: absent and empty `maintained_indexes` mean maintain nothing, while set and empty means maintain everything.
 - `writer_config_defaults`: string map of default writer configuration values persisted for all writers.
 - `compacted_sstables`: per-shard compaction progress, updated atomically with base-table compaction commits.
 - `index_catchup`: per-index coverage progress after data has been compacted into the base table.
 - `snapshot_ts_millis`, `num_shards`, and `inline_snapshots`: optional shard snapshot fields for read optimization.
 
-What an absent entry means depends on the `FLAG_MEM_WAL_INDEX_CATCHUP` feature bit:
+A shard absent from `index_catchup` for an index means that index is *not* known
+to have caught up, so the shard's SSTables must be retained until some commit
+records that it has.
 
-- **Without the bit**, a shard absent from `index_catchup` for an index means that index is assumed fully caught up for the shard.
-- **With the bit**, absence means the opposite: the index is *not* known to have caught up, so the shard's SSTables must be retained until some commit records that it has.
+Catch-up is derived at commit time, not reported by the writer. An index whose segments together span every fragment live at the transaction's read version holds every row compaction had copied into the base table by then, so the commit records it as caught up to that version's `compacted_sstables`. That is the only proof available — nothing maps a compaction generation to the fragments its rows landed in — so covering the table as the transaction read it is how an index shows it covered those rows. Fragments appended since that read are a later catch-up gap and are not required.
 
-A commit records catch-up by attaching an `IndexCatchupAdvance` to the index operation that publishes the work, so the index result and the position recorded for it land together. The advance names the index, the exact segments it expects that index to consist of, the fragments those segments covered when it inspected them, and every fragment live in the table at that moment. The commit fails unless the published segments match all three, which is what ties the recorded generations to an index that actually covers them — nothing maps a generation to the fragments its rows landed in. Fragments appended after the repair's snapshot are a later catch-up gap and are not required.
+Two rules bound what a commit may record. It never credits more than its own `compacted_sstables`, and it clamps to that value, so a position can only describe generations the base table has actually taken in. Otherwise it never lowers a position an index already held, provided that index is unchanged by this commit. "Unchanged" compares each segment's UUID together with its fragment bitmap, not the UUID alone, because an operation can prune the bitmap in place while keeping the UUID; the remaining metadata does not affect which rows the index answers for. An index this commit changes keeps no position it cannot re-earn.
 
-Setting the bit is one-way. Once SSTables have stopped being served against a recorded catch-up position, reading absence as "caught up" again could drop rows that only those SSTables still hold, so the bit is never cleared as a rollback. Writers must also hold the bit: a writer that does not maintain `index_catchup` can change an index without withdrawing the position recorded for it, leaving a position that no longer describes the index it names.
+Because the position is derived rather than transmitted, it cannot go stale between inspection and commit, and it survives rebase — `read_version` is fixed for a transaction's life, so what a commit can prove does not move, though a rebased attempt may record a different result because the head it commits against has changed. Any commit can earn a position, so an ordinary index build that happens to cover the table records catch-up as a side effect. A dedicated repair is still needed where no such commit occurs, or where an index does not yet span the table.
+
+A read version with no fragments proves nothing, even though an index trivially covers an empty table. An empty fragment list is also what a manifest written before the `UpdateMemWalState` fragment fix looks like, where the SSTables are the last copy of those rows; crediting coverage there would retire them. The cost is that a table whose rows have all been deleted keeps its SSTables.
 
 Shard snapshots, when present, use the following Lance file schema:
 
@@ -501,7 +528,7 @@ On commit conflict, a compactor reloads the conflicting base-table version:
 The garbage collector may remove obsolete SSTables after:
 
 1. The SSTable has been compacted into the base table.
-2. Every index a query may rely on has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. With `FLAG_MEM_WAL_INDEX_CATCHUP` set, an index absent from `index_catchup` has *not* caught up, so this condition is not met for it.
+2. Every index a query may rely on has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads. An index absent from `index_catchup` has *not* caught up, so this condition is not met for it.
 3. No retained base-table version needs the SSTable for time travel or consistency.
 
 !!! warning

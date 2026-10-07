@@ -34,6 +34,7 @@ lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-bitpacking = { workspace = true }
+blake3 = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -48,7 +49,7 @@ async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-clap = { version = "4.1.1", features = ["derive"], optional = true }
+clap = { workspace = true, optional = true }
 # Only used by the (disabled) `mem_wal_kv_point_lookup` benchmark's RocksDB arm.
 # Commented out so CI's all-features build never compiles the bundled librocksdb
 # C++ sources (needs libclang). Uncomment with the bench target + feature to run.
@@ -56,18 +57,14 @@ clap = { version = "4.1.1", features = ["derive"], optional = true }
 crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
-dashmap = "6"
-# matches arrow-rs use
-half.workspace = true
+dashmap.workspace = true
 # Fast non-cryptographic hasher for the hot FTS mem-index insert path.
 rustc-hash = "2.1"
 # Compact FST term dictionary for the FTS mem-index partitions.
-fst = "0.4"
+fst.workspace = true
 itertools.workspace = true
 moka.workspace = true
 object_store = { workspace = true }
-aws-credential-types.workspace = true
-aws-credential-types.optional = true
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -101,7 +98,7 @@ tokio-util = { workspace = true }
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -111,17 +108,19 @@ lzma-sys = { version = "0.1" }
 [dev-dependencies]
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
+lance-datafusion = { workspace = true, features = ["datagen"] }
 pretty_assertions = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
-all_asserts = "2.3.1"
+all_asserts.workspace = true
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
+lance-index = { workspace = true, features = ["test-oracle"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-env_logger = "0.11.7"
+env_logger.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
@@ -130,13 +129,15 @@ serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
+half.workspace = true
 geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
-parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+parquet = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
@@ -154,7 +155,7 @@ protoc = [
     "lance-index/protoc",
     "lance-table/protoc",
 ]
-aws = ["lance-io/aws", "dep:aws-credential-types"]
+aws = ["lance-io/aws"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
@@ -208,6 +209,10 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
+name = "stable_row_id_limit"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
@@ -241,6 +246,10 @@ harness = false
 
 [[bench]]
 name = "distributed_vector_build"
+harness = false
+
+[[bench]]
+name = "frag_reuse"
 harness = false
 
 [[bench]]
@@ -314,6 +323,10 @@ harness = false
 
 [[bench]]
 name = "manifest_commit"
+harness = false
+
+[[bench]]
+name = "rowid_spill"
 harness = false
 
 [[bench]]

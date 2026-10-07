@@ -374,16 +374,17 @@ mod tests {
             Some([f32::NAN, 1.0]),
             Some([f32::INFINITY, 1.0]),
             Some([f32::NEG_INFINITY, 1.0]),
+            Some([1e20, -1e20]),
             Some([3.0, 4.0]),
         ]);
         let output = KeepFiniteVectors::new("v").transform(&batch).unwrap();
 
         let kept = output.column_by_name("v").unwrap().as_fixed_size_list();
-        assert_eq!(kept.len(), 2, "only the two finite rows survive");
+        assert_eq!(kept.len(), 3, "only finite rows survive");
         assert_eq!(kept.null_count(), 0);
         assert_eq!(
             kept.values().as_primitive::<Float32Type>().values(),
-            &[1.0, 2.0, 3.0, 4.0]
+            &[1.0, 2.0, 1e20, -1e20, 3.0, 4.0]
         );
     }
 

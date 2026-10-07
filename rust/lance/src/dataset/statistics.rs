@@ -145,7 +145,12 @@ impl<'a> DatasetStatistics<'a> {
         let indices = dataset.load_indices().await?;
         let segments: Vec<_> = indices
             .iter()
-            .filter(|idx| matches!(idx.fields.as_slice(), [only] if *only == field_id))
+            .filter(|idx| {
+                // A covered index still answers for its keyed column; only
+                // the keyed prefix decides whether this index matches, not
+                // the full `fields` vector including carried columns.
+                idx.keyed_field() == Some(field_id)
+            })
             .filter(|idx| {
                 idx.index_details
                     .as_ref()

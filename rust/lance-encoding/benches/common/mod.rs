@@ -26,7 +26,6 @@ use lance_encoding::{
         },
     },
     encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
-    format::pb21::CompressiveEncoding,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +140,7 @@ impl CompressionStrategy for BenchCompressionStrategy {
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
         if self.encoding == BenchEncoding::StructuralU32
             && let Some(compressor) = try_fixed_u8_rle_block(data, &params)?

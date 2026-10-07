@@ -15,7 +15,12 @@ on:
       - rust-toolchain.toml
       - Cargo.toml
       - Cargo.lock
+      - python/Cargo.lock
+      - java/lance-jni/Cargo.lock
+      - .cargo/config.toml
+      - clippy.toml
       - deny.toml
+      - ci/check_dependency_age.py
 
 permissions:
   contents: read
@@ -66,10 +71,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -81,10 +86,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Get features
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | sort | uniq | paste -s -d "," -`
@@ -101,8 +106,12 @@ jobs:
         with:
           log-level: warn
           command: check
+      # Runs after cargo-deny so it can reuse the index cargo-deny already
+      # fetched. The script falls back to the network when that misses.
+      - name: Check dependency age
+        run: python3 ci/check_dependency_age.py
 
-  linux-coverage-build:
+  linux-build:
     runs-on: "ubuntu-24.04-8x"
     timeout-minutes: 75
     env:
@@ -115,163 +124,37 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup rust toolchain
         run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
+          rustup toolchain install stable
+          rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
-          key: llvm-cov-ci
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
+          tool: protoc
       - name: Install cargo-nextest
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
         with:
           tool: nextest
-      - name: Build coverage tests
+      - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly-2026-07-13 llvm-cov nextest-archive \
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
             --cargo-profile ci \
             --locked \
             --workspace \
-            --features ${ALL_FEATURES} \
-            --archive-file rust-coverage-tests.tar.zst
-      - name: Upload coverage tests
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-tests
-          path: rust-coverage-tests.tar.zst
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-
-  linux-coverage-test:
-    needs: linux-coverage-build
-    runs-on: "ubuntu-24.04-8x"
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y libssl-dev
+            --features "${ALL_FEATURES}" \
+            --no-run
       - name: Start DynamoDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
-        with:
-          tool: nextest
-      - name: Download coverage tests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rust-coverage-tests
-          path: coverage-artifacts
-      - name: Run coverage tests
+      - name: Run tests
         run: |
-          cargo +nightly-2026-07-13 llvm-cov nextest \
-            --no-report \
-            --archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --partition slice:${{ matrix.shard }}/3
-      - name: Merge shard coverage
-        run: |
-          TOOLCHAIN_ROOT=`rustc +nightly-2026-07-13 --print sysroot`
-          HOST_TRIPLE=`rustc +nightly-2026-07-13 -vV | awk '/^host:/ {print $2}'`
-          LLVM_PROFDATA="${TOOLCHAIN_ROOT}/lib/rustlib/${HOST_TRIPLE}/bin/llvm-profdata"
-          find target/llvm-cov-target -maxdepth 1 -name '*.profraw' -print > coverage-artifacts/profraw-files
-          "${LLVM_PROFDATA}" merge \
-            -sparse \
-            -f coverage-artifacts/profraw-files \
-            -o coverage-artifacts/coverage-shard-${{ matrix.shard }}.profdata
-      - name: Upload shard coverage
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-profile-${{ matrix.shard }}
-          path: coverage-artifacts/coverage-shard-${{ matrix.shard }}.profdata
-          retention-days: 1
-          if-no-files-found: error
-
-  linux-build:
-    needs: [linux-coverage-build, linux-coverage-test]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
-        with:
-          tool: nextest
-      - name: Download coverage tests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rust-coverage-tests
-          path: coverage-artifacts
-      - name: Download shard coverage
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: rust-coverage-profile-*
-          path: coverage-artifacts/profiles
-          merge-multiple: true
-      - name: Merge coverage
-        run: |
-          mkdir -p target/llvm-cov-target
-          cargo +nightly-2026-07-13 nextest list \
-            --archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --extract-to target/llvm-cov-target > /dev/null
-          TOOLCHAIN_ROOT=`rustc +nightly-2026-07-13 --print sysroot`
-          HOST_TRIPLE=`rustc +nightly-2026-07-13 -vV | awk '/^host:/ {print $2}'`
-          LLVM_PROFDATA="${TOOLCHAIN_ROOT}/lib/rustlib/${HOST_TRIPLE}/bin/llvm-profdata"
-          "${LLVM_PROFDATA}" merge \
-            -sparse \
-            coverage-artifacts/profiles/*.profdata \
-            -o target/llvm-cov-target/lance.profdata
-          cargo +nightly-2026-07-13 llvm-cov report \
-            --nextest-archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --codecov \
-            --output-path coverage.codecov
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-codecov
-          path: coverage.codecov
-          retention-days: 1
-          if-no-files-found: error
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          codecov_yml_path: codecov.yml
-          files: coverage.codecov
-          flags: unittests
-          fail_ci_if_error: false
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}"
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x
@@ -284,47 +167,20 @@ jobs:
           rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
-  query-integration-tests:
-    runs-on: ubuntu-24.04-4x
-    timeout-minutes: 75
-    env:
-      # We use opt-level 1 which makes some tests 5x faster to run.
-      RUSTFLAGS: "-C debuginfo=1 -C opt-level=1"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build query integration tests
-        run: |
-          cargo build --locked -p lance --no-default-features --features fp16kernels,slow_tests --tests --test integration_tests
-      - name: Run query integration tests
-        run: |
-          cargo test --locked -p lance --no-default-features --features fp16kernels,slow_tests --test integration_tests
   build-no-lock:
     runs-on: ubuntu-24.04-8x
     timeout-minutes: 30
@@ -342,13 +198,13 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build all
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     runs-on: warp-macos-14-arm64-6x
@@ -373,15 +229,21 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # macOS runner capacity is the scarcest in CI, so this job is kept as short
+      # as it can be. nextest runs each test in its own process and schedules
+      # across all cores, rather than one test binary at a time. Benchmarks are
+      # only compile-checked here, which build-no-lock already does on Linux;
+      # nothing about bench compilation is macOS-specific.
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
-      - name: Check benchmarks
-        run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
+          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: windows-latest-4x
     defaults:
@@ -399,12 +261,17 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # Same reasoning as mac-build: nextest schedules across all cores instead
+      # of running one test binary at a time, and build-no-lock already
+      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo test --profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
+        run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
     # Verifies that lance-linalg's runtime SIMD dispatch still works
@@ -437,13 +304,14 @@ jobs:
         with:
           path: ${{ runner.temp }}/lance-qemu/8.2.10/qemu-x86_64
           key: qemu-user-8.2.10-x86_64-linux-user-${{ runner.os }}-${{ runner.arch }}-v1
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install QEMU build dependencies
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
+          sudo apt update
           sudo apt install -y \
             ninja-build \
             pkg-config \
@@ -502,7 +370,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.91.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.94.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -512,10 +380,10 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install ${{ matrix.msrv }}
         run: |
           rustup toolchain install ${{ matrix.msrv }}
@@ -523,5 +391,5 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.msrv }}
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo check --profile ci --workspace --tests --benches --features ${ALL_FEATURES}

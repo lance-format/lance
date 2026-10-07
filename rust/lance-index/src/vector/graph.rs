@@ -303,7 +303,6 @@ macro_rules! beam_search_loop {
         $visited:ident,
         $k:expr,
         $dist_calc:expr,
-        $prefetch_distance:expr,
         $accepts_result:expr,
         |$current:ident, $process_neighbor:ident| $visit_neighbors:block
     ) => {{
@@ -342,7 +341,6 @@ macro_rules! greedy_search_loop {
         $current:ident,
         $closest_dist:ident,
         $dist_calc:expr,
-        $prefetch_distance:expr,
         |$process_neighbor:ident| $visit_neighbors:block
     ) => {{
         loop {
@@ -416,7 +414,6 @@ pub fn beam_search(
             visited,
             k,
             dist_calc,
-            prefetch_distance,
             accepts_result,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
@@ -455,7 +452,6 @@ pub fn beam_search(
         visited,
         k,
         dist_calc,
-        prefetch_distance,
         accepts_result,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
@@ -497,7 +493,6 @@ pub fn beam_search_borrowed(
             visited,
             k,
             dist_calc,
-            prefetch_distance,
             accepts_result,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
@@ -535,7 +530,6 @@ pub fn beam_search_borrowed(
         visited,
         k,
         dist_calc,
-        prefetch_distance,
         accepts_result,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
@@ -722,21 +716,15 @@ pub fn greedy_search(
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
-    greedy_search_loop!(
-        current,
-        closest_dist,
-        dist_calc,
-        prefetch_distance,
-        |process_neighbor| {
-            let neighbors = graph.neighbors(current);
-            process_neighbors_with_look_ahead(
-                &neighbors,
-                process_neighbor,
-                prefetch_distance,
-                dist_calc,
-            );
-        }
-    );
+    greedy_search_loop!(current, closest_dist, dist_calc, |process_neighbor| {
+        let neighbors = graph.neighbors(current);
+        process_neighbors_with_look_ahead(
+            &neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
+    });
     OrderedNode::new(current, closest_dist.into())
 }
 
@@ -748,21 +736,15 @@ pub fn greedy_search_borrowed(
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
-    greedy_search_loop!(
-        current,
-        closest_dist,
-        dist_calc,
-        prefetch_distance,
-        |process_neighbor| {
-            let neighbors = graph.neighbors(current);
-            process_neighbors_with_look_ahead(
-                neighbors,
-                process_neighbor,
-                prefetch_distance,
-                dist_calc,
-            );
-        }
-    );
+    greedy_search_loop!(current, closest_dist, dist_calc, |process_neighbor| {
+        let neighbors = graph.neighbors(current);
+        process_neighbors_with_look_ahead(
+            neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
+    });
     OrderedNode::new(current, closest_dist.into())
 }
 

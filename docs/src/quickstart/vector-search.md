@@ -210,8 +210,6 @@ The latency vs recall is tunable via:
 - **refine_factor**: determines how many vectors are retrieved during re-ranking
 
 ```python
-%%time
-
 sift1m.to_table(
     nearest={
         "column": "vector",

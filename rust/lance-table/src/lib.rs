@@ -6,4 +6,5 @@ pub mod format;
 pub mod io;
 pub mod rowids;
 pub mod system_index;
+pub mod transaction;
 pub mod utils;

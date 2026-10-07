@@ -237,6 +237,12 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
 /// Reconstruct `VectorIndexParams` from a stored `VectorIndexDetails` proto.
 ///
 /// Returns `None` for legacy indices (empty details) or if the proto is malformed.
+/// The rows-per-partition target the index was created with, if it was recorded.
+pub fn target_partition_size_from_details(details: &prost_types::Any) -> Option<usize> {
+    let details = details.to_msg::<VectorIndexDetails>().ok()?;
+    (details.target_partition_size > 0).then_some(details.target_partition_size as usize)
+}
+
 /// Runtime hints are applied on top of the reconstructed spec.
 // TODO: wire into a general `Dataset::rebuild_index` method so users can
 // regenerate an index from its stored details (e.g. after file corruption).
@@ -364,7 +370,7 @@ pub fn needs_vector_details_inference(
 ) -> bool {
     match &index.index_details {
         Some(d) => d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty(),
-        None => index.fields.iter().any(|&field_id| {
+        None => index.fields.first().is_some_and(|&field_id| {
             schema
                 .field_by_id(field_id)
                 .map(|f| matches!(f.data_type(), arrow_schema::DataType::FixedSizeList(_, _)))
@@ -926,6 +932,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -948,6 +955,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -968,6 +976,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1005,6 +1014,7 @@ mod tests {
         IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![field_id],
+            covering_fields: vec![],
             name: "idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1091,6 +1101,7 @@ mod tests {
             let index = IndexMetadata {
                 uuid: uuid::Uuid::new_v4(),
                 fields: vec![0],
+                covering_fields: vec![],
                 name: "test_index".to_string(),
                 dataset_version: 1,
                 fragment_bitmap: None,

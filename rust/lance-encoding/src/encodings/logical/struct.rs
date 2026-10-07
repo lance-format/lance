@@ -31,7 +31,7 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::validate_fixed_size_list_dimensions};
 use log::trace;
 
 #[derive(Debug)]
@@ -209,13 +209,16 @@ impl StructuralFieldScheduler for StructuralStructScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
+        // Struct children share the parent's row coordinates 1:1 (see
+        // `schedule_ranges`), so every child gets the same ranges.
         let children_initialization = self
             .children
             .iter_mut()
-            .map(|child| child.initialize(filter, context))
+            .map(|child| child.initialize(requested_ranges, filter, context))
             .collect::<FuturesUnordered<_>>();
         async move {
             children_initialization
@@ -235,10 +238,16 @@ pub struct StructuralStructDecoder {
     child_fields: Fields,
     // The root decoder is slightly different because it cannot have nulls
     is_root: bool,
+    nullable: bool,
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Result<Self> {
+    pub fn new(
+        fields: Fields,
+        should_validate: bool,
+        is_root: bool,
+        nullable: bool,
+    ) -> Result<Self> {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -249,6 +258,7 @@ impl StructuralStructDecoder {
             children,
             child_fields: fields,
             is_root,
+            nullable: !is_root && nullable,
         })
     }
 
@@ -263,7 +273,12 @@ impl StructuralStructDecoder {
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Ok(Box::new(decoder))
                 } else {
-                    Ok(Box::new(Self::new(fields.clone(), should_validate, false)?))
+                    Ok(Box::new(Self::new(
+                        fields.clone(),
+                        should_validate,
+                        false,
+                        field.is_nullable(),
+                    )?))
                 }
             }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
@@ -276,6 +291,12 @@ impl StructuralStructDecoder {
             DataType::FixedSizeList(child_field, _)
                 if matches!(child_field.data_type(), DataType::Struct(_)) =>
             {
+                // The scheduler factories run the same guard, but the decoder tree can be
+                // built independently (e.g. `create_decode_stream`) so a zero dimension from
+                // a malformed schema must be rejected here as well.  Draining and unraveling
+                // validity both scale by the dimension and a zero would make that math
+                // degenerate.
+                validate_fixed_size_list_dimensions(field.name(), field.data_type())?;
                 // FixedSizeList containing Struct needs structural decoding
                 let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
                 Ok(Box::new(StructuralFixedSizeListDecoder::new(
@@ -341,6 +362,24 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 
     fn data_type(&self) -> &DataType {
         &self.data_type
+    }
+
+    fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+        let mut out = [0u64; 8];
+        for child in &self.children {
+            let child_bytes = child.plan_decoded_bytes(rows_remaining)?;
+            for (o, c) in out.iter_mut().zip(child_bytes) {
+                *o += c;
+            }
+        }
+        if self.nullable {
+            for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (candidate as u64).min(rows_remaining);
+                out[i] += rows.div_ceil(8);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -547,8 +586,8 @@ impl FieldEncoder for StructFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
+        self.num_rows_seen += array.len() as u64;
         let child_tasks = self
             .children
             .iter_mut()
@@ -626,22 +665,66 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StructArray,
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
         builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use super::StructuralStructDecoder;
+    use crate::constants::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY};
+    use crate::decoder::StructuralFieldDecoder;
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
 
+    #[test]
+    fn test_zero_dimension_fsl_decoder_errors() {
+        // Simulates a stored schema declaring a zero-dimension FixedSizeList (writers reject
+        // it but old files may contain one).  Building the decoder must fail cleanly instead
+        // of letting the zero dimension reach the rep/def decimation.
+        let item_fields = Fields::from(vec![Field::new("x", DataType::Int32, true)]);
+        let fields = Fields::from(vec![Field::new(
+            "vecs",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Struct(item_fields), true)),
+                0,
+            ),
+            true,
+        )]);
+
+        let err = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, lance_core::Error::Schema { .. }));
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_struct() {
+    async fn test_simple_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -758,8 +841,19 @@ mod tests {
         .await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_struct_list() {
+    async fn test_struct_list(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new(
                 "inner_list",
@@ -769,20 +863,42 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_empty_struct() {
+    async fn test_empty_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         // It's technically legal for a struct to have 0 children, need to
         // make sure we support that
         let data_type = DataType::Struct(Fields::from(Vec::<Field>::default()));
         let field = Field::new("row", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_complicated_struct() {
+    async fn test_complicated_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("int", DataType::Int32, true),
             Field::new(
@@ -800,7 +916,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -919,6 +1035,75 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn test_plan_decoded_bytes_struct_non_nullable_primitive() {
+        // Nullable struct containing a non-nullable i32 child.
+        // Only the struct-level bitmap contributes; the child has no bitmap.
+        //
+        // N == CANDIDATE_BATCH_SIZES[5] == 1024 so that all sizes are
+        // naturally aligned to Arrow's 64-byte allocation boundary.
+        use arrow_buffer::NullBuffer;
+
+        const N: usize = 1024;
+        let x_vals = Int32Array::from_iter_values(0..N as i32);
+        let struct_nulls = NullBuffer::from((0..N).map(|i| i % 2 == 0).collect::<Vec<_>>());
+        let struct_field = Field::new("x", DataType::Int32, false);
+        let struct_array = StructArray::new(
+            Fields::from(vec![struct_field]),
+            vec![Arc::new(x_vals) as ArrayRef],
+            Some(struct_nulls),
+        );
+        let expected = struct_array.get_buffer_memory_size() as u64;
+
+        let child_field = Arc::new(Field::new("x", DataType::Int32, false));
+        let fields = Fields::from(vec![child_field]);
+        let decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ false, /*nullable=*/ true,
+        )
+        .unwrap();
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
+        assert_eq!(
+            bytes[5], expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_struct_nullable_primitive() {
+        // Nullable struct containing a nullable i32 child.
+        // Both the struct and the child contribute a validity bitmap.
+        use arrow_buffer::NullBuffer;
+
+        const N: usize = 1024;
+        let y_vals =
+            Int32Array::from_iter((0..N as i32).map(|i| if i % 2 == 0 { Some(i) } else { None }));
+        let struct_nulls = NullBuffer::from((0..N).map(|i| i % 3 != 0).collect::<Vec<_>>());
+        let struct_field = Field::new("y", DataType::Int32, true);
+        let struct_array = StructArray::new(
+            Fields::from(vec![struct_field]),
+            vec![Arc::new(y_vals) as ArrayRef],
+            Some(struct_nulls),
+        );
+        let expected = struct_array.get_buffer_memory_size() as u64;
+
+        let child_field = Arc::new(Field::new("y", DataType::Int32, true));
+        let fields = Fields::from(vec![child_field]);
+        let decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ false, /*nullable=*/ true,
+        )
+        .unwrap();
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        assert_eq!(
+            bytes[5], expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_ragged_scheduling() {
         // This test covers scheduling when batches straddle page boundaries
@@ -947,5 +1132,49 @@ mod tests {
             .collect::<Vec<_>>();
         check_round_trip_encoding_of_data(struct_arrays, &TestCases::default(), HashMap::new())
             .await;
+    }
+
+    /// A null list produces an "invisible" item: a rep/def entry that owns no value in the
+    /// leaf page.  The full-zip decoder works out which items own a value from
+    /// `max_visible_def`, and adding a second nullable layer *above* the list (the struct
+    /// itself) must not move that threshold.  When it does, the decoder hands a value to
+    /// every null list and each later value shifts by one.
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_full_zip_invisible_items_under_nullable_struct(
+        #[values(false, true)] variable_width_items: bool,
+    ) {
+        // struct<x: list<item>> with both layers nullable:
+        //   {x: [_, _]} / {x: null} / {x: [_]} / null / {x: [_, _]}
+        let (item_type, items): (DataType, ArrayRef) = if variable_width_items {
+            (
+                DataType::Utf8,
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            )
+        } else {
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            )
+        };
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", item_type, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 3, 3, 5])),
+            items,
+            Some(NullBuffer::from(vec![true, false, true, true, true])),
+        );
+        let fields = Fields::from(vec![Field::new("x", lists.data_type().clone(), true)]);
+        let rows = StructArray::new(
+            fields,
+            vec![Arc::new(lists)],
+            Some(NullBuffer::from(vec![true, true, true, false, true])),
+        );
+
+        let metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let test_cases = TestCases::default().with_structural_encodings();
+        check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, metadata).await;
     }
 }

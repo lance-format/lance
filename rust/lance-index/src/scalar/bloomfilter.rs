@@ -16,12 +16,14 @@ use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -92,7 +94,11 @@ pub struct BloomFilterIndex {
     probability: f64,
     // Exact set of null row addresses; None for older indices without this bitmap.
     null_rows: Option<RowAddrTreeMap>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
 impl DeepSizeOf for BloomFilterIndex {
@@ -109,6 +115,20 @@ impl BloomFilterIndex {
     ) -> Result<Arc<Self>> {
         Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
             .await
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
+        index.batch_remapper = remapping;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
+        Ok(Arc::new(index))
     }
 
     async fn load_with_max_array_length(
@@ -148,7 +168,9 @@ impl BloomFilterIndex {
         let mut zones = Vec::with_capacity(index_file.num_rows());
         for start in (0..index_file.num_rows()).step_by(read_batch_size) {
             let end = (start + read_batch_size).min(index_file.num_rows());
-            let mut bloom_data = index_file.read_range_stream(start..end, None).await?;
+            let mut bloom_data = index_file
+                .read_range_stream(start..end, None, 4096, 2)
+                .await?;
             while let Some(batch) = bloom_data.try_next().await? {
                 zones.extend(Self::try_from_serialized(batch, max_array_length)?);
             }
@@ -160,6 +182,7 @@ impl BloomFilterIndex {
             probability,
             null_rows,
             frag_reuse_index: fri,
+            batch_remapper: None,
         }))
     }
 
@@ -482,14 +505,41 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        if let BloomFilterQuery::IsNull() = query
+        let result = if let BloomFilterQuery::IsNull() = query
             && let Some(null_rows) = &self.null_rows
         {
-            return Ok(SearchResult::exact(null_rows.clone()));
-        }
+            SearchResult::exact(null_rows.clone())
+        } else {
+            search_zones(&self.zones, metrics, |block| {
+                self.evaluate_block_against_query(block, query)
+            })?
+        };
 
-        search_zones(&self.zones, metrics, |block| {
-            self.evaluate_block_against_query(block, query)
+        let (selected, nulls) = if let Some(remapper) = &self.frag_reuse_index {
+            // Legacy synchronous remapping path.
+            (
+                remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows()),
+                remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows()),
+            )
+        } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            (
+                remap_row_addrs_tree_map_async(
+                    remapper.as_ref(),
+                    result.row_addrs().selected_rows(),
+                )
+                .await?,
+                remap_row_addrs_tree_map_async(remapper.as_ref(), result.row_addrs().null_rows())
+                    .await?,
+            )
+        } else {
+            return Ok(result);
+        };
+
+        Ok(match result {
+            SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
+            SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
+            SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
         })
     }
 
@@ -506,6 +556,17 @@ impl ScalarIndex for BloomFilterIndex {
         _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "BloomFilter does not support remap".into(),
+        ))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::invalid_input_source(
             "BloomFilter does not support remap".into(),
         ))
@@ -632,6 +693,11 @@ pub async fn merge_bloomfilter_indices(
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
     for (source, fragment_filter) in source_indices {
+        if source.batch_remapper.is_some() {
+            return Err(Error::not_supported(
+                "this index maintenance operation does not support asynchronous row-ID remapping",
+            ));
+        }
         if fragment_filter.is_empty() {
             continue;
         }
@@ -692,6 +758,17 @@ fn default_number_of_items() -> u64 {
 fn default_probability() -> f64 {
     *DEFAULT_PROBABILITY
 }
+
+/// Schema of the per-zone bloom filter statistics batch.
+static BLOOMFILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("fragment_id", DataType::UInt64, false),
+        Field::new("zone_start", DataType::UInt64, false),
+        Field::new("zone_length", DataType::UInt64, false),
+        Field::new("has_null", DataType::Boolean, false),
+        Field::new("bloom_filter_data", DataType::Binary, false),
+    ]))
+});
 
 // NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes: 16384(16KiB) + 8 SALT values
 // reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
@@ -776,16 +853,6 @@ impl BloomFilterIndexBuilder {
         Ok(())
     }
 
-    fn bloomfilter_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-            Field::new("has_null", DataType::Boolean, false),
-            Field::new("bloom_filter_data", DataType::Binary, false),
-        ]))
-    }
-
     fn bloomfilter_stats_as_batch(
         fragment_ids: Vec<u64>,
         zone_starts: Vec<u64>,
@@ -815,7 +882,7 @@ impl BloomFilterIndexBuilder {
             bloom_filter_data,
         ];
 
-        Ok(RecordBatch::try_new(Self::bloomfilter_schema(), columns)?)
+        Ok(RecordBatch::try_new(BLOOMFILTER_SCHEMA.clone(), columns)?)
     }
 
     /// Serialize the trained bloom filter zone statistics into an index file in
@@ -835,7 +902,7 @@ impl BloomFilterIndexBuilder {
         index_store: &dyn IndexStore,
         max_array_length: usize,
     ) -> Result<Vec<IndexFile>> {
-        let mut file_schema = Self::bloomfilter_schema().as_ref().clone();
+        let mut file_schema = BLOOMFILTER_SCHEMA.as_ref().clone();
         file_schema.metadata.insert(
             BLOOMFILTER_ITEM_META_KEY.to_string(),
             self.params.number_of_items.to_string(),
@@ -1438,11 +1505,30 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(
+            BloomFilterIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
     }

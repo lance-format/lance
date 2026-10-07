@@ -14,7 +14,6 @@ use lance_encoding::{
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
     encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
-    format::pb21::CompressiveEncoding,
 };
 
 #[derive(Debug, Clone)]
@@ -111,7 +110,7 @@ impl CompressionStrategy for Strategy {
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let _params = self.field_params(field);
         if let Some(compressor) = try_bitpacking_block(data) {
             return Ok(compressor);

@@ -38,6 +38,10 @@ impl Dialect for LanceDialect {
     fn is_delimited_identifier_start(&self, ch: char) -> bool {
         ch == '`'
     }
+
+    fn supports_bitwise_shift_operators(&self) -> bool {
+        self.0.supports_bitwise_shift_operators()
+    }
 }
 
 /// Parse sql filter to Expression.

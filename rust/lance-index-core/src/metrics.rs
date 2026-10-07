@@ -2,22 +2,97 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
-pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
-pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
-pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
-pub const COMPOUND_ADDRESSES_RESOLVED_METRIC: &str = "compound_addresses_resolved";
-pub const COMPOUND_ADDRESS_RESOLUTION_BATCHES_METRIC: &str = "compound_address_resolution_batches";
-pub const COMPOUND_PEAK_ADDRESS_RESOLUTION_BATCH_SIZE_METRIC: &str =
-    "compound_peak_address_resolution_batch_size";
-pub const COMPOUND_SCORE_FLOOR_OVERFLOWS_METRIC: &str = "compound_score_floor_overflows";
-pub const COMPOUND_PEAK_BUFFERED_CANDIDATES_METRIC: &str = "compound_peak_buffered_candidates";
+/// Coarse ANN stage timings. Durations are cumulative wall times, including waits.
+/// Nested stages and concurrent partitions overlap; these are not additive query latency.
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum IndexTiming {
+    /// Cache lookup, cache-fill wait, and loading/decoding a partition on a miss.
+    PartitionLoad,
+    /// Partition loading and per-partition filter preparation, including overlapping waits.
+    PartitionPrepare,
+    /// Time waiting until the shared filter is ready; not filter construction CPU time.
+    PrefilterWait,
+    /// Delay between submitting a search task and starting its CPU closure.
+    CpuQueueWait,
+    /// CPU search of a prepared partition, including query preparation and result construction.
+    Search,
+    /// Distance calculator and lookup-table construction for a partition query.
+    QueryPrepare,
+    /// Fused candidate filtering, distance evaluation, and TopK heap updates.
+    DistanceTopK,
+    /// Conversion of a result heap into Arrow arrays and a record batch.
+    ResultMaterialize,
+    /// Opening an index handle, including cache lookup and metadata reads.
+    IndexOpen,
+}
+
+impl IndexTiming {
+    /// All stages in discriminant order, for fixed-size metric storage.
+    pub const ALL: [Self; 9] = [
+        Self::PartitionLoad,
+        Self::PartitionPrepare,
+        Self::PrefilterWait,
+        Self::CpuQueueWait,
+        Self::Search,
+        Self::QueryPrepare,
+        Self::DistanceTopK,
+        Self::ResultMaterialize,
+        Self::IndexOpen,
+    ];
+
+    /// Key used in execution summaries and language-binding statistics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PartitionLoad => "index_partition_load_time",
+            Self::PartitionPrepare => "index_partition_prepare_time",
+            Self::PrefilterWait => "index_prefilter_wait_time",
+            Self::CpuQueueWait => "index_cpu_queue_wait_time",
+            Self::Search => "index_search_time",
+            Self::QueryPrepare => "index_query_prepare_time",
+            Self::DistanceTopK => "index_distance_topk_time",
+            Self::ResultMaterialize => "index_result_materialize_time",
+            Self::IndexOpen => "index_open_time",
+        }
+    }
+}
+
+/// Records one partition/batch stage, never one candidate or distance evaluation.
+pub struct IndexTimer<'a> {
+    metrics: &'a dyn MetricsCollector,
+    stage: IndexTiming,
+    start: Instant,
+}
+
+impl<'a> IndexTimer<'a> {
+    /// Start a scope timer; dropping it also records early-return and cancellation paths.
+    pub fn new(metrics: &'a dyn MetricsCollector, stage: IndexTiming) -> Self {
+        Self {
+            metrics,
+            stage,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for IndexTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics.record_timing(self.stage, self.start.elapsed());
+    }
+}
 
 /// A trait used by the index to report metrics
 ///
-/// Callers can implement this trait to collect metrics
+/// Callers can implement this trait to collect metrics. Production collectors
+/// must stay coarse-grained: do not record per-document, posting, candidate, or
+/// window events here. Benchmark-only instrumentation belongs in test- or
+/// benchmark-local hooks.
 pub trait MetricsCollector: Send + Sync {
+    /// Record a coarse stage duration; existing collectors may ignore timings.
+    fn record_timing(&self, _stage: IndexTiming, _duration: Duration) {}
+
     /// Record partition loads
     ///
     /// Many indices consist of partitions that may need to be loaded
@@ -77,34 +152,39 @@ pub trait MetricsCollector: Send + Sync {
         self.record_index_cache_misses(1);
     }
 
-    /// Record AND candidates returned from WAND alignment to the scoring loop.
+    /// Record calls to `IndexReader::read_record_batches` made while serving
+    /// this query: one coalesced, batched request for several pages/parts at
+    /// once, as opposed to one request per page.
     ///
-    /// This excludes candidates pruned before `next()` returns. Use this with
-    /// `record_and_candidates_pruned_before_return` to recover total aligned
-    /// AND candidates.
-    fn record_and_candidates_seen(&self, _num_candidates: usize) {}
+    /// This is a request count, not a page count - [`Self::record_parts_loaded`]
+    /// already tracks how many pages were materialized regardless of how many
+    /// requests it took to fetch them. A query whose predicate spans many
+    /// pages should show a `record_parts_loaded` count much larger than this
+    /// one when the reader is coalescing well. See
+    /// [`Self::record_single_page_reads`] for the unbatched counterpart -
+    /// together they account for every `IndexReader` read issued.
+    fn record_batch_reads(&self, _num_reads: usize) {}
 
-    /// Record AND candidates pruned during WAND alignment before `next()` returns.
-    fn record_and_candidates_pruned_before_return(&self, _num_candidates: usize) {}
+    /// Convenience for a single batched read.
+    fn record_batch_read(&self) {
+        self.record_batch_reads(1);
+    }
 
-    fn record_and_full_scores(&self, _num_scores: usize) {}
+    /// Record calls to `IndexReader::read_record_batch` (singular) made while
+    /// serving this query: one request for exactly one page/part, taken
+    /// outside of [`Self::record_batch_reads`]'s coalesced path - e.g. a
+    /// page that turned out to already be evicted by the time it was looked
+    /// up, or a caller (such as `BTreeIndex::contains_keys`) that looks pages
+    /// up individually rather than as a batch.
+    ///
+    /// A query dominated by this counter instead of `record_batch_reads` is
+    /// not benefiting from request coalescing.
+    fn record_single_page_reads(&self, _num_reads: usize) {}
 
-    fn record_freqs_collected(&self, _num_collections: usize) {}
-
-    /// Record compound FTS document addresses resolved for final row-ID ties.
-    fn record_compound_addresses_resolved(&self, _num_addresses: usize) {}
-
-    /// Record bounded compound FTS address-resolution batches.
-    fn record_compound_address_resolution_batches(&self, _num_batches: usize) {}
-
-    /// Record the largest compound FTS address-resolution batch.
-    fn record_compound_peak_address_resolution_batch_size(&self, _num_addresses: usize) {}
-
-    /// Record unresolved score floors that required a resolved-key retry.
-    fn record_compound_score_floor_overflows(&self, _num_overflows: usize) {}
-
-    /// Record a candidate-buffer high-water mark for compound FTS.
-    fn record_compound_peak_buffered_candidates(&self, _num_candidates: usize) {}
+    /// Convenience for a single unbatched read.
+    fn record_single_page_read(&self) {
+        self.record_single_page_reads(1);
+    }
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
@@ -131,24 +211,36 @@ impl MetricsCollector for NoOpMetricsCollector {
 
 #[derive(Default)]
 pub struct LocalMetricsCollector {
+    timings: [AtomicUsize; IndexTiming::ALL.len()],
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
     // Kept `pub(crate)` so that adding new metric fields to this public struct
     // does not break downstream callers that construct or destructure the
     // existing three fields. Callers can still read cumulative values via
-    // [`Self::index_cache_hits`] / [`Self::index_cache_misses`].
+    // [`Self::index_cache_hits`] / [`Self::index_cache_misses`] /
+    // [`Self::batch_reads`] / [`Self::single_page_reads`].
     pub(crate) index_cache_hits: AtomicUsize,
     pub(crate) index_cache_misses: AtomicUsize,
+    pub(crate) batch_reads: AtomicUsize,
+    pub(crate) single_page_reads: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
     pub fn dump_into(self, other: &dyn MetricsCollector) {
+        for stage in IndexTiming::ALL {
+            other.record_timing(
+                stage,
+                Duration::from_nanos(self.timings[stage as usize].load(Ordering::Relaxed) as u64),
+            );
+        }
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
         other.record_index_cache_hits(self.index_cache_hits.load(Ordering::Relaxed));
         other.record_index_cache_misses(self.index_cache_misses.load(Ordering::Relaxed));
+        other.record_batch_reads(self.batch_reads.load(Ordering::Relaxed));
+        other.record_single_page_reads(self.single_page_reads.load(Ordering::Relaxed));
     }
 
     /// Cumulative index cache hits recorded so far.
@@ -160,9 +252,23 @@ impl LocalMetricsCollector {
     pub fn index_cache_misses(&self) -> usize {
         self.index_cache_misses.load(Ordering::Relaxed)
     }
+
+    /// Cumulative batched `read_record_batches` calls recorded so far.
+    pub fn batch_reads(&self) -> usize {
+        self.batch_reads.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative unbatched `read_record_batch` calls recorded so far.
+    pub fn single_page_reads(&self) -> usize {
+        self.single_page_reads.load(Ordering::Relaxed)
+    }
 }
 
 impl MetricsCollector for LocalMetricsCollector {
+    fn record_timing(&self, stage: IndexTiming, duration: Duration) {
+        self.timings[stage as usize].fetch_add(duration.as_nanos() as usize, Ordering::Relaxed);
+    }
+
     fn record_parts_loaded(&self, num_parts: usize) {
         self.parts_loaded.fetch_add(num_parts, Ordering::Relaxed);
     }
@@ -184,6 +290,15 @@ impl MetricsCollector for LocalMetricsCollector {
         self.index_cache_misses
             .fetch_add(num_misses, Ordering::Relaxed);
     }
+
+    fn record_batch_reads(&self, num_reads: usize) {
+        self.batch_reads.fetch_add(num_reads, Ordering::Relaxed);
+    }
+
+    fn record_single_page_reads(&self, num_reads: usize) {
+        self.single_page_reads
+            .fetch_add(num_reads, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +311,8 @@ mod tests {
         comparisons: AtomicUsize,
         hits: AtomicUsize,
         misses: AtomicUsize,
+        batch_reads: AtomicUsize,
+        single_page_reads: AtomicUsize,
     }
 
     impl MetricsCollector for SumSink {
@@ -214,6 +331,12 @@ mod tests {
         fn record_index_cache_misses(&self, n: usize) {
             self.misses.fetch_add(n, Ordering::Relaxed);
         }
+        fn record_batch_reads(&self, n: usize) {
+            self.batch_reads.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_single_page_reads(&self, n: usize) {
+            self.single_page_reads.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -225,6 +348,12 @@ mod tests {
         local.record_part_load();
         local.record_index_load();
         local.record_comparisons(5);
+        local.record_batch_read();
+        local.record_batch_reads(2);
+        local.record_single_page_read();
+        local.record_single_page_reads(3);
+        assert_eq!(local.batch_reads(), 3);
+        assert_eq!(local.single_page_reads(), 4);
 
         let sink = SumSink {
             parts: AtomicUsize::new(0),
@@ -232,6 +361,8 @@ mod tests {
             comparisons: AtomicUsize::new(0),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            batch_reads: AtomicUsize::new(0),
+            single_page_reads: AtomicUsize::new(0),
         };
         local.dump_into(&sink);
 
@@ -240,6 +371,22 @@ mod tests {
         assert_eq!(sink.comparisons.load(Ordering::Relaxed), 5);
         assert_eq!(sink.hits.load(Ordering::Relaxed), 2);
         assert_eq!(sink.misses.load(Ordering::Relaxed), 3);
+        assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(sink.single_page_reads.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn local_metrics_collector_forwards_timings() {
+        let local = LocalMetricsCollector::default();
+        let sink = LocalMetricsCollector::default();
+        for stage in IndexTiming::ALL {
+            local.record_timing(stage, Duration::from_nanos(7));
+            local.record_timing(stage, Duration::from_nanos(11));
+        }
+        local.dump_into(&sink);
+        for stage in IndexTiming::ALL {
+            assert_eq!(sink.timings[stage as usize].load(Ordering::Relaxed), 18);
+        }
     }
 
     #[test]
@@ -251,5 +398,9 @@ mod tests {
         collector.record_index_cache_miss();
         collector.record_index_cache_hits(10);
         collector.record_index_cache_misses(20);
+        collector.record_batch_read();
+        collector.record_batch_reads(10);
+        collector.record_single_page_read();
+        collector.record_single_page_reads(10);
     }
 }

@@ -17,6 +17,7 @@ import com.google.common.base.MoreObjects;
 
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -29,6 +30,7 @@ import java.util.UUID;
 public class Index {
   private final UUID uuid;
   private final List<Integer> fields;
+  private final List<Integer> coveringFields;
   private final String name;
   private final long datasetVersion;
   private final List<Integer> fragments;
@@ -37,11 +39,13 @@ public class Index {
   private final Instant createdAt;
   private final Integer baseId;
   private final Long sizeBytes;
+  private final List<IndexFile> files;
   private final IndexType indexType;
 
   private Index(
       UUID uuid,
       List<Integer> fields,
+      List<Integer> coveringFields,
       String name,
       long datasetVersion,
       List<Integer> fragments,
@@ -50,9 +54,11 @@ public class Index {
       Instant createdAt,
       Integer baseId,
       Long sizeBytes,
+      List<IndexFile> files,
       IndexType indexType) {
     this.uuid = uuid;
     this.fields = fields;
+    this.coveringFields = coveringFields;
     this.name = name;
     this.datasetVersion = datasetVersion;
     this.fragments = fragments;
@@ -60,7 +66,22 @@ public class Index {
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
     this.baseId = baseId;
-    this.sizeBytes = sizeBytes;
+    boolean hasFiles = files != null && !files.isEmpty();
+    if (hasFiles && sizeBytes == null) {
+      long derivedSizeBytes = 0;
+      try {
+        for (IndexFile file : files) {
+          derivedSizeBytes = Math.addExact(derivedSizeBytes, file.getSizeBytes());
+        }
+      } catch (ArithmeticException e) {
+        throw new IllegalArgumentException(
+            "index file sizes cannot be represented by Java long", e);
+      }
+      this.sizeBytes = derivedSizeBytes;
+    } else {
+      this.sizeBytes = !hasFiles && Long.valueOf(0).equals(sizeBytes) ? null : sizeBytes;
+    }
+    this.files = hasFiles ? files : null;
     this.indexType = indexType;
   }
 
@@ -75,6 +96,20 @@ public class Index {
    */
   public List<Integer> fields() {
     return fields;
+  }
+
+  /**
+   * Fields whose values this index carries but is not keyed on. Always a suffix of {@link
+   * #fields()}, and never all of it, so the first entry of {@code fields()} is always a column the
+   * index is keyed on. Empty for an index that carries no extra columns.
+   *
+   * <p>These ids also appear in {@link #fields()} — that is deliberate, so that every consumer
+   * reading {@code fields()} as the index's dependency set also covers them with no change.
+   *
+   * @return the covering field IDs
+   */
+  public List<Integer> coveringFields() {
+    return coveringFields;
   }
 
   /**
@@ -118,6 +153,11 @@ public class Index {
     return Optional.ofNullable(sizeBytes);
   }
 
+  /** Files and sizes for this index segment, or empty when older writers did not record them. */
+  public Optional<List<IndexFile>> getFiles() {
+    return Optional.ofNullable(files);
+  }
+
   /**
    * Get the index version.
    *
@@ -154,12 +194,14 @@ public class Index {
         && indexVersion == index.indexVersion
         && Objects.equals(uuid, index.uuid)
         && Objects.equals(fields, index.fields)
+        && Objects.equals(coveringFields, index.coveringFields)
         && Objects.equals(name, index.name)
         && Objects.equals(fragments, index.fragments)
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
         && Objects.equals(sizeBytes, index.sizeBytes)
+        && Objects.equals(files, index.files)
         && indexType == index.indexType;
   }
 
@@ -169,12 +211,14 @@ public class Index {
         Objects.hash(
             uuid,
             fields,
+            coveringFields,
             name,
             datasetVersion,
             indexVersion,
             createdAt,
             baseId,
             sizeBytes,
+            files,
             fragments,
             indexType);
     result = 31 * result + Arrays.hashCode(indexDetails);
@@ -186,6 +230,7 @@ public class Index {
     return MoreObjects.toStringHelper(this)
         .add("uuid", uuid)
         .add("fields", fields)
+        .add("coveringFields", coveringFields)
         .add("name", name)
         .add("datasetVersion", datasetVersion)
         .add("indexVersion", indexVersion)
@@ -193,6 +238,7 @@ public class Index {
         .add("createdAt", createdAt)
         .add("baseId", baseId)
         .add("sizeBytes", sizeBytes)
+        .add("files", files)
         .toString();
   }
 
@@ -209,6 +255,7 @@ public class Index {
 
     private UUID uuid;
     private List<Integer> fields;
+    private List<Integer> coveringFields = Collections.emptyList();
     private String name;
     private long datasetVersion;
     private List<Integer> fragments;
@@ -217,6 +264,7 @@ public class Index {
     private Instant createdAt;
     private Integer baseId;
     private Long sizeBytes;
+    private List<IndexFile> files;
     private IndexType indexType;
 
     private Builder() {}
@@ -228,6 +276,11 @@ public class Index {
 
     public Builder fields(List<Integer> fields) {
       this.fields = fields;
+      return this;
+    }
+
+    public Builder coveringFields(List<Integer> coveringFields) {
+      this.coveringFields = coveringFields;
       return this;
     }
 
@@ -271,6 +324,11 @@ public class Index {
       return this;
     }
 
+    public Builder files(List<IndexFile> files) {
+      this.files = files;
+      return this;
+    }
+
     public Builder indexType(IndexType indexType) {
       this.indexType = indexType;
       return this;
@@ -280,6 +338,7 @@ public class Index {
       return new Index(
           uuid,
           fields,
+          coveringFields,
           name,
           datasetVersion,
           fragments,
@@ -288,6 +347,7 @@ public class Index {
           createdAt,
           baseId,
           sizeBytes,
+          files,
           indexType);
     }
   }

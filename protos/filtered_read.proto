@@ -62,22 +62,37 @@ message FilteredReadOptionsProto {
   optional uint64 io_buffer_size_bytes = 11;
   // Arrow IPC schema for decoding Substrait filters (may be wider than projection).
   optional bytes filter_schema_ipc = 12;
+  /* If present, a nonzero upper bound on bytes reserved by Blob v2
+   * materialization awaiting ordered emission in one scanner execution.
+   * Admission follows output order; one oversized output batch may exceed the
+   * bound when no other batch is reserved. If absent, Blob v2 materialization
+   * has no independent memory bound.
+   */
+  optional uint64 materialization_readahead_bytes = 13;
+  /* If present, the scanner-level byte budget for output batches. When set,
+   * the file reader uses it as an additional batch boundary alongside the
+   * row-based batch_size. This corresponds to FileReaderOptions.batch_size_bytes.
+   */
+  optional uint64 batch_size_bytes = 14;
 }
 
-// Serializable form of FilteredReadPlan (planned/distributed mode).
-// RowAddrTreeMap serialized via its built-in serialize_into/deserialize_from.
-// Per-fragment filters are Substrait-encoded and deduplicated.
+/* Serializable form of FilteredReadPlan (planned/distributed mode).
+ * RowAddrTreeMap serialized via its built-in serialize_into/deserialize_from.
+ * Per-fragment filters are Substrait-encoded and deduplicated.
+ */
 message FilteredReadPlanProto {
   bytes row_addr_tree_map = 1;
   optional U64Range scan_range_after_filter = 2;
   // Arrow IPC schema for decoding Substrait filters (matches the schema used at encode time).
   optional bytes filter_schema_ipc = 3;
-  // Per-fragment filter mapping. Key is fragment id, value is a list index into
-  // filter_expressions. Multiple fragments can share the same list index when
-  // they have the same filter, avoiding duplicate Substrait encoding.
+  /* Per-fragment filter mapping. Key is fragment id, value is a list index into
+   * filter_expressions. Multiple fragments can share the same list index when
+   * they have the same filter, avoiding duplicate Substrait encoding.
+   */
   map<uint32, uint32> fragment_filter_ids = 4;
-  // Deduplicated Substrait-encoded filter expressions. Each entry is referenced
-  // by one or more values in fragment_filter_ids.
+  /* Deduplicated Substrait-encoded filter expressions. Each entry is referenced
+   * by one or more values in fragment_filter_ids.
+   */
   repeated bytes filter_expressions = 5;
 }
 
@@ -85,15 +100,17 @@ message FilteredReadPlanProto {
 message FilteredReadExecProto {
   TableIdentifier table = 1;
   FilteredReadOptionsProto options = 2;
-  // FilteredRead has two modes
-  // Plan-then-execute (distributed): The planner creates a FilteredReadPlan and sends it to a remote executor.
-  // Plan-and-execute (local): The executor creates the plan itself at execution time.
+  /* FilteredRead has two modes
+   * Plan-then-execute (distributed): The planner creates a FilteredReadPlan and sends it to a remote executor.
+   * Plan-and-execute (local): The executor creates the plan itself at execution time.
+   */
   optional FilteredReadPlanProto plan = 3;
-  // Note: FilteredReadExec.index_input (child ExecutionPlan) is NOT serialized here.
-  // DataFusion's PhysicalExtensionCodec handles child plans automatically: it walks
-  // the plan tree via children() / with_new_children(), serializes each node, and
-  // passes deserialized children back as the `inputs` parameter in try_decode.
-  // This means any ExecutionPlan in the tree (including index_input) must also
-  // implement try_encode/try_decode in the PhysicalExtensionCodec.
-  // TODO: implement serialize/deserialize for lance-specific index input ExecutionPlans.
+  /* Note: FilteredReadExec.index_input (child ExecutionPlan) is NOT serialized here.
+   * DataFusion's PhysicalExtensionCodec handles child plans automatically: it walks
+   * the plan tree via children() / with_new_children(), serializes each node, and
+   * passes deserialized children back as the `inputs` parameter in try_decode.
+   * This means any ExecutionPlan in the tree (including index_input) must also
+   * implement try_encode/try_decode in the PhysicalExtensionCodec.
+   * TODO: implement serialize/deserialize for lance-specific index input ExecutionPlans.
+   */
 }

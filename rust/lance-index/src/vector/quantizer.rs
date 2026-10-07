@@ -25,6 +25,7 @@ use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
+use crate::scalar::RowIdRemapper;
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 
@@ -102,7 +103,29 @@ impl std::fmt::Display for QuantizationType {
 }
 
 pub trait QuantizerBuildParams: Send + Sync {
+    /// Returns the number of rows to sample when training the quantizer.
     fn sample_size(&self) -> usize;
+
+    /// Returns the number of rows to sample, rejecting parameters whose sample size
+    /// cannot be represented by [`usize`].
+    ///
+    /// Implementations with fallible sample-size calculations should override this
+    /// method. The default preserves the behavior of existing implementations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::vector::pq::PQBuildParams;
+    /// use lance_index::vector::quantizer::QuantizerBuildParams;
+    ///
+    /// let params = PQBuildParams::new(16, 8);
+    /// assert_eq!(params.try_sample_size()?, 65_536);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    fn try_sample_size(&self) -> Result<usize> {
+        Ok(self.sample_size())
+    }
+
     fn use_residual(_: DistanceType) -> bool {
         false
     }
@@ -205,6 +228,11 @@ pub struct QuantizationMetadata {
 pub trait QuantizerMetadata:
     fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
 {
+    /// Whether code bytes are laid out column-major across a whole partition.
+    fn is_transposed(&self) -> bool {
+        false
+    }
+
     // the extra metadata index in global buffer
     fn buffer_index(&self) -> Option<u32> {
         None
@@ -240,6 +268,23 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
+
+    /// Internal entry point for compact FRI loading without changing the
+    /// existing concrete-type API.
+    #[doc(hidden)]
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        if frag_reuse_index.is_some() {
+            return Err(Error::not_supported(
+                "this quantization storage does not support a generic row-id remapper".to_string(),
+            ));
+        }
+        Self::try_from_batch(batch, metadata, distance_type, None)
+    }
 
     fn metadata(&self) -> &Self::Metadata;
 

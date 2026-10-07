@@ -19,10 +19,12 @@ import org.apache.arrow.util.Preconditions;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 /** Lance scan options. */
 public class ScanOptions {
   private final Optional<List<Integer>> fragmentIds;
+  private final Optional<List<UUID>> indexSegments;
   private final Optional<Long> batchSize;
   private final Optional<Long> batchSizeBytes;
   private final Optional<Long> ioBufferSize;
@@ -69,6 +71,7 @@ public class ScanOptions {
       boolean collectStats) {
     this(
         fragmentIds,
+        Optional.empty(),
         batchSize,
         columns,
         filter,
@@ -113,7 +116,10 @@ public class ScanOptions {
    * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
    * @param collectStats Whether to collect scan execution statistics. Default is false.
    * @param fastSearch Whether to only search indexed fragments. Default is false.
+   * @deprecated Use the overload that adds {@code indexSegments} for vector index segment
+   *     selection.
    */
+  @Deprecated
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
       Optional<Long> batchSize,
@@ -138,6 +144,85 @@ public class ScanOptions {
       boolean disableScoringAutoprojection) {
     this(
         fragmentIds,
+        Optional.empty(),
+        batchSize,
+        columns,
+        filter,
+        substraitFilter,
+        limit,
+        offset,
+        nearest,
+        fullTextQuery,
+        prefilter,
+        withRowId,
+        withRowAddress,
+        batchReadahead,
+        columnOrderings,
+        useScalarIndex,
+        substraitAggregate,
+        collectStats,
+        fastSearch,
+        includeDeletedRows,
+        strictBatchSize,
+        disableScoringAutoprojection);
+  }
+
+  /**
+   * Constructor for LanceScanOptions.
+   *
+   * @param fragmentIds the id of the fragments to scan
+   * @param indexSegments (Optional) Vector index segment UUIDs to restrict the search to. Only
+   *     valid for nearest-neighbor search. Empty list is rejected by the engine. When combined with
+   *     {@code fragmentIds}, fragments outside the selected segments still fall back to flat KNN.
+   * @param batchSize Maximum row number of each returned ArrowRecordBatch. Optional, use
+   *     Optional.empty() if unspecified.
+   * @param columns (Optional) Projected columns. Optional.empty() for scanning all columns.
+   *     Otherwise, only columns present in the List will be scanned.
+   * @param filter (Optional) Filter expression. Optional.empty() for no filter.
+   * @param substraitFilter (Optional) Substrait filter expression.
+   * @param filter (Optional) Filter expression. Optional.empty() for no filter.
+   * @param limit (Optional) Maximum number of rows to return.
+   * @param offset (Optional) Number of rows to skip before returning results.
+   * @param withRowId Whether to include the row ID in the results.
+   * @param withRowAddress Whether to include the row address in the results.
+   * @param nearest (Optional) Nearest neighbor query.
+   * @param batchReadahead Number of batches to read ahead.
+   * @param columnOrderings (Optional) Column orderings for result sorting.
+   * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
+   * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
+   * @param collectStats Whether to collect scan execution statistics. Default is false.
+   * @param fastSearch Whether to only search indexed fragments. Default is false.
+   * @param includeDeletedRows Whether to include deleted rows in scan results. Default is false.
+   * @param strictBatchSize Whether to enforce strict batch sizing. Default is false.
+   * @param disableScoringAutoprojection Whether to disable scoring column autoprojection. Default
+   *     is false.
+   */
+  public ScanOptions(
+      Optional<List<Integer>> fragmentIds,
+      Optional<List<UUID>> indexSegments,
+      Optional<Long> batchSize,
+      Optional<List<String>> columns,
+      Optional<String> filter,
+      Optional<ByteBuffer> substraitFilter,
+      Optional<Long> limit,
+      Optional<Long> offset,
+      Optional<Query> nearest,
+      Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
+      boolean withRowId,
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats,
+      boolean fastSearch,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection) {
+    this(
+        fragmentIds,
+        indexSegments,
         batchSize,
         Optional.empty(),
         Optional.empty(),
@@ -167,6 +252,7 @@ public class ScanOptions {
 
   private ScanOptions(
       Optional<List<Integer>> fragmentIds,
+      Optional<List<UUID>> indexSegments,
       Optional<Long> batchSize,
       Optional<Long> batchSizeBytes,
       Optional<Long> ioBufferSize,
@@ -213,6 +299,7 @@ public class ScanOptions {
         !(strictBatchSize && batchSizeBytes.isPresent()),
         "strictBatchSize=true cannot be combined with batchSizeBytes");
     this.fragmentIds = fragmentIds;
+    this.indexSegments = indexSegments;
     this.batchSize = batchSize;
     this.batchSizeBytes = batchSizeBytes;
     this.ioBufferSize = ioBufferSize;
@@ -247,6 +334,15 @@ public class ScanOptions {
    */
   public Optional<List<Integer>> getFragmentIds() {
     return fragmentIds;
+  }
+
+  /**
+   * Get the index segment UUIDs.
+   *
+   * @return Optional containing the index segment UUIDs if specified, otherwise empty.
+   */
+  public Optional<List<UUID>> getIndexSegments() {
+    return indexSegments;
   }
 
   /**
@@ -468,6 +564,7 @@ public class ScanOptions {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("fragmentIds", fragmentIds.orElse(null))
+        .add("indexSegments", indexSegments.orElse(null))
         .add("batchSize", batchSize.orElse(null))
         .add("batchSizeBytes", batchSizeBytes.orElse(null))
         .add("ioBufferSize", ioBufferSize.orElse(null))
@@ -503,6 +600,7 @@ public class ScanOptions {
   /** Builder for constructing LanceScanOptions. */
   public static class Builder {
     private Optional<List<Integer>> fragmentIds = Optional.empty();
+    private Optional<List<UUID>> indexSegments = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
     private Optional<Long> batchSizeBytes = Optional.empty();
     private Optional<Long> ioBufferSize = Optional.empty();
@@ -538,6 +636,7 @@ public class ScanOptions {
      */
     public Builder(ScanOptions options) {
       this.fragmentIds = options.getFragmentIds();
+      this.indexSegments = options.getIndexSegments();
       this.batchSize = options.getBatchSize();
       this.batchSizeBytes = options.getBatchSizeBytes();
       this.ioBufferSize = options.getIoBufferSize();
@@ -573,6 +672,29 @@ public class ScanOptions {
      */
     public Builder fragmentIds(List<Integer> fragmentIds) {
       this.fragmentIds = Optional.of(fragmentIds);
+      return this;
+    }
+
+    /**
+     * Restrict vector search to the specified index segment UUIDs from a single logical index.
+     *
+     * <p>By default, no segment restriction is applied. The engine rejects empty lists, unknown
+     * segments, and use without a nearest-neighbor query. When {@link #fragmentIds(List)} is also
+     * set, selected fragments outside these segments are searched with flat KNN; otherwise,
+     * fragments outside the selected segments are excluded.
+     *
+     * <pre>{@code
+     * ScanOptions options = new ScanOptions.Builder()
+     *     .nearest(query)
+     *     .indexSegments(List.of(segment.uuid()))
+     *     .build();
+     * }</pre>
+     *
+     * @param indexSegments the index segment UUIDs to use
+     * @return Builder instance for method chaining.
+     */
+    public Builder indexSegments(List<UUID> indexSegments) {
+      this.indexSegments = Optional.of(indexSegments);
       return this;
     }
 
@@ -877,6 +999,7 @@ public class ScanOptions {
     public ScanOptions build() {
       return new ScanOptions(
           fragmentIds,
+          indexSegments,
           batchSize,
           batchSizeBytes,
           ioBufferSize,

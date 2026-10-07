@@ -14,8 +14,11 @@ pub enum SimdSupport {
     None,
     Neon,
     Sse,
-    /// AVX (256-bit float ops) but no FMA and no AVX2.
-    /// Intel Sandy Bridge / Ivy Bridge.
+    /// AVX (256-bit float ops) without FMA.
+    ///
+    /// This tier does not imply that AVX2 is absent: selecting [`Self::Avx2`]
+    /// requires both AVX2 and FMA, so a host with AVX2 but no FMA selects this
+    /// tier. Intel Sandy Bridge / Ivy Bridge are the typical hosts.
     Avx,
     /// AVX + FMA but no AVX2.
     /// AMD Piledriver / Steamroller / FX-7500.
@@ -194,7 +197,8 @@ pub static SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
             // AMD Piledriver / Steamroller / FX-7500: 256-bit float ops + FMA but no AVX2.
             SimdSupport::AvxFma
         } else if is_x86_feature_detected!("avx") {
-            // Intel Sandy Bridge / Ivy Bridge: 256-bit float ops without FMA.
+            // This includes a possible AVX2 host without FMA because the Avx2
+            // tier above requires both features.
             SimdSupport::Avx
         } else {
             SimdSupport::None

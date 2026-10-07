@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
-rest = ["dep:reqwest", "dep:serde"]
+rest = ["dep:arc-swap", "dep:reqwest", "dep:serde"]
 rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
@@ -32,8 +32,8 @@ lance-namespace.workspace = true
 lance-core.workspace = true
 
 # REST implementation dependencies (optional, enabled by "rest" feature)
-reqwest = { version = "0.12", optional = true, default-features = false, features = [
-    "json",
+arc-swap = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = [
     "charset",
     "gzip",
     "http2",
@@ -89,17 +89,9 @@ hmac = { version = "0.12", optional = true }
 quick-xml = { version = "0.40", optional = true }
 
 [dev-dependencies]
-opendal = { workspace = true, features = ["services-goosefs"] }
-tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 wiremock.workspace = true
-arrow = { workspace = true }
-arrow-array = { workspace = true }
-arrow-ipc = { workspace = true }
 rstest.workspace = true
-lance-table.workspace = true
-lance-arrow = { workspace = true }
-lance = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
 [[example]]

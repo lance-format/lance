@@ -28,6 +28,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -62,34 +63,38 @@ public class AsyncScanner implements AutoCloseable {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(options);
     Preconditions.checkNotNull(allocator);
-    AsyncScanner scanner =
-        createAsyncScanner(
-            dataset,
-            options.getFragmentIds(),
-            options.getColumns(),
-            options.getSubstraitFilter(),
-            options.getFilter(),
-            options.getBatchSize(),
-            options.getBatchSizeBytes(),
-            options.getIoBufferSize(),
-            options.getLimit(),
-            options.getOffset(),
-            options.getNearest(),
-            options.getFullTextQuery(),
-            options.isPrefilter(),
-            options.isWithRowId(),
-            options.isWithRowAddress(),
-            options.getBatchReadahead(),
-            options.getFragmentReadahead(),
-            options.isScanInOrder(),
-            options.getLateMaterialization(),
-            options.getColumnOrderings(),
-            options.isUseScalarIndex(),
-            options.isFastSearch(),
-            options.getSubstraitAggregate(),
-            options.isIncludeDeletedRows(),
-            options.isStrictBatchSize(),
-            options.isDisableScoringAutoprojection());
+    AsyncScanner scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      scanner =
+          createAsyncScanner(
+              dataset,
+              options.getFragmentIds(),
+              options.getIndexSegments(),
+              options.getColumns(),
+              options.getSubstraitFilter(),
+              options.getFilter(),
+              options.getBatchSize(),
+              options.getBatchSizeBytes(),
+              options.getIoBufferSize(),
+              options.getLimit(),
+              options.getOffset(),
+              options.getNearest(),
+              options.getFullTextQuery(),
+              options.isPrefilter(),
+              options.isWithRowId(),
+              options.isWithRowAddress(),
+              options.getBatchReadahead(),
+              options.getFragmentReadahead(),
+              options.isScanInOrder(),
+              options.getLateMaterialization(),
+              options.getColumnOrderings(),
+              options.isUseScalarIndex(),
+              options.isFastSearch(),
+              options.getSubstraitAggregate(),
+              options.isIncludeDeletedRows(),
+              options.isStrictBatchSize(),
+              options.isDisableScoringAutoprojection());
+    }
     scanner.allocator = allocator;
     return scanner;
   }
@@ -97,6 +102,7 @@ public class AsyncScanner implements AutoCloseable {
   static native AsyncScanner createAsyncScanner(
       Dataset dataset,
       Optional<List<Integer>> fragmentIds,
+      Optional<List<UUID>> indexSegments,
       Optional<List<String>> columns,
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,

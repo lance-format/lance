@@ -5,7 +5,7 @@
 
 use super::future::UringReadFuture;
 use super::requests::IoRequest;
-use super::thread::{SUBMITTED_COUNTER, THREAD_SELECTOR, URING_THREADS};
+use super::thread::{QueuedRequest, THREAD_SELECTOR, URING_THREADS};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
@@ -205,35 +205,54 @@ impl UringReader {
             }),
         });
 
-        // Increment submitted counter before sending to channel
-        SUBMITTED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if URING_THREADS.threads.is_empty() {
+            let initialization_errors = if URING_THREADS.initialization_errors.is_empty() {
+                "LANCE_URING_THREAD_COUNT is 0".to_owned()
+            } else {
+                URING_THREADS.initialization_errors.join("; ")
+            };
+            return Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::other(format!(
+                        "no io_uring worker threads are available: {initialization_errors}"
+                    ))),
+                })
+            });
+        }
 
         // Select thread in round-robin fashion
-        let thread_idx =
-            (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize) % URING_THREADS.len();
+        let thread_idx = (THREAD_SELECTOR.fetch_add(1, Ordering::Relaxed) as usize)
+            % URING_THREADS.threads.len();
+        let thread = &URING_THREADS.threads[thread_idx];
+
+        if !thread.is_alive.load(Ordering::Acquire) {
+            return Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread died",
+                    )),
+                })
+            });
+        }
 
         // Send to selected thread via channel
-        match URING_THREADS[thread_idx]
+        match thread
             .request_tx
-            .send(Arc::clone(&request))
+            .send(QueuedRequest::new(Arc::clone(&request)))
         {
-            Ok(()) => {
-                // Return future that will be woken when operation completes
-                Box::pin(UringReadFuture { request })
-            }
-            Err(_) => {
-                // Thread died - decrement counter and return error future
-                SUBMITTED_COUNTER.fetch_sub(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    Err(object_store::Error::Generic {
-                        store: "UringReader",
-                        source: Box::new(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "io_uring thread died",
-                        )),
-                    })
+            Ok(()) => Box::pin(UringReadFuture { request }),
+            Err(_) => Box::pin(async move {
+                Err(object_store::Error::Generic {
+                    store: "UringReader",
+                    source: Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "io_uring thread died",
+                    )),
                 })
-            }
+            }),
         }
     }
 }

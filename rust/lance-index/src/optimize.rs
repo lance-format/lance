@@ -4,8 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_table::system_index::mem_wal::CompactedSsTable;
-
 use crate::progress::{IndexBuildProgress, noop_progress};
 
 /// Options for optimizing all indices.
@@ -50,17 +48,6 @@ pub struct OptimizeOptions {
 
     /// Progress callback for index building during optimization.
     pub progress: Arc<dyn IndexBuildProgress>,
-
-    /// Per-shard MemWAL compaction generations to record as caught up for every
-    /// index this call optimizes.
-    ///
-    /// Only the generations are supplied: the advance must also name the exact
-    /// segments it describes, and those do not exist until the merge runs, so
-    /// `optimize_indices` binds them to what it publishes. Recording them in the
-    /// same commit as the index work is what keeps the two from disagreeing.
-    ///
-    /// Empty for ordinary index maintenance, which records no catch-up.
-    pub mem_wal_index_catchup: Vec<CompactedSsTable>,
 }
 
 impl Default for OptimizeOptions {
@@ -71,7 +58,6 @@ impl Default for OptimizeOptions {
             retrain: false,
             transaction_properties: None,
             progress: noop_progress(),
-            mem_wal_index_catchup: Vec::new(),
         }
     }
 }
@@ -79,12 +65,6 @@ impl Default for OptimizeOptions {
 impl OptimizeOptions {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Record `generations` as caught up for every index this call optimizes.
-    pub fn mem_wal_index_catchup(mut self, generations: Vec<CompactedSsTable>) -> Self {
-        self.mem_wal_index_catchup = generations;
-        self
     }
 
     pub fn merge(num: usize) -> Self {

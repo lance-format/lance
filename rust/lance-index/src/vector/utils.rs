@@ -12,6 +12,7 @@ use arrow_schema::{DataType, Field};
 use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::dot_f16::amx_fp16_available;
 use prost::bytes;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
@@ -43,6 +44,49 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
         SimpleIndexStatus::Auto
     }
 });
+
+/// Whether partition assignment is better served by the exact flat path than by
+/// an approximate lookup through this index.
+///
+/// The index turns one `M x N` problem -- every vector against every centroid --
+/// into `M` independent top-1 graph searches. Each search walks its own path, so
+/// no two vectors share a candidate set and the AMX-FP16 kernel behind them can
+/// only ever score one query against a handful of neighbors: 32 MAC/cycle, one
+/// of the tile's 16 output columns. Keeping the problem in its matrix shape lets
+/// [`crate::vector::kmeans::compute_partitions`] reach the AMX-FP16 GEMM, which
+/// fills all four accumulator tiles at 512 MAC/cycle.
+///
+/// Measured on 100M x 768 fp16 (dot, node-local, m=20, ef_construction=150), the
+/// flat path won on both build time and recall at every `k` tried:
+///
+/// | k     | flat        | indexed     |
+/// |-------|-------------|-------------|
+/// | 10000 | 1965s / .980 | 2011s / .976 |
+/// | 20000 | 2494s / .964 | 2588s / .832 |
+/// | 40000 | 3730s / .970 | 3976s / .940 |
+///
+/// The recall gap is the larger effect: the graph lookup runs at `ef = 15`, so
+/// some vectors land in a partition that is not their nearest and no `nprobes`
+/// setting recovers them. Flat assignment is exact.
+///
+/// The conditions below must stay in lockstep with the AMX gate in
+/// `compute_membership_and_dist`; without the GEMM the flat path is ~2.7x slower
+/// than the index (5361s vs 2011s at k=10000), so a mismatch here is expensive.
+/// That includes the `LANCE_DISABLE_AMX` kill switch, which both consult through
+/// [`amx_fp16_available`]: an operator turning AMX off has to move this decision
+/// too, or the build would take the exact-assignment path with no GEMM under it.
+fn prefers_flat_amx_assignment(
+    centroid_type: &DataType,
+    num_centroids: usize,
+    dimension: usize,
+    distance_type: DistanceType,
+) -> bool {
+    centroid_type == &DataType::Float16
+        && distance_type == DistanceType::Dot
+        && dimension >= 32
+        && num_centroids >= 32
+        && amx_fp16_available()
+}
 
 #[derive(Debug)]
 pub struct SimpleIndex {
@@ -77,6 +121,7 @@ impl SimpleIndex {
     //  - `num_centroids * dimension >= 1_000_000`
     //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
     //      so set the threshold to 1_000_000.
+    //  - the exact flat assignment is not already faster, see `prefers_flat_amx_assignment`
     pub fn may_train_index(
         centroids: ArrayRef,
         dimension: usize,
@@ -85,6 +130,14 @@ impl SimpleIndex {
         match *USE_HNSW_SPEEDUP_INDEXING {
             SimpleIndexStatus::Auto => {
                 if centroids.len() < 1_000_000 {
+                    return Ok(None);
+                }
+                if prefers_flat_amx_assignment(
+                    centroids.data_type(),
+                    centroids.len() / dimension,
+                    dimension,
+                    distance_type,
+                ) {
                     return Ok(None);
                 }
             }
@@ -408,5 +461,41 @@ mod tests {
 
         let error = FixedSizeListArray::try_from(&tensor).unwrap_err();
         assert!(error.to_string().contains("requires 8 bytes"));
+    }
+
+    /// Every shape the AMX-FP16 GEMM cannot serve must keep the centroid index,
+    /// because without the GEMM the flat path it would fall back to is ~2.7x
+    /// slower than the index. These four are the exact complement of the gate in
+    /// `compute_membership_and_dist`.
+    #[rstest]
+    #[case::not_f16(&DataType::Float32, 10_000, 768, DistanceType::Dot)]
+    #[case::not_dot(&DataType::Float16, 10_000, 768, DistanceType::L2)]
+    #[case::dim_below_one_k_pass(&DataType::Float16, 10_000, 31, DistanceType::Dot)]
+    #[case::k_below_one_b_block(&DataType::Float16, 31, 768, DistanceType::Dot)]
+    fn test_flat_amx_assignment_declines_unsupported_shapes(
+        #[case] centroid_type: &DataType,
+        #[case] num_centroids: usize,
+        #[case] dimension: usize,
+        #[case] distance_type: DistanceType,
+    ) {
+        assert!(!prefers_flat_amx_assignment(
+            centroid_type,
+            num_centroids,
+            dimension,
+            distance_type
+        ));
+    }
+
+    /// On a supported shape the decision is exactly "is AMX-FP16 usable here",
+    /// which is a property of the build, the CPU and the `LANCE_DISABLE_AMX`
+    /// kill switch, so the expectation is derived rather than hardcoded -- the
+    /// same assertion has to hold with the switch set, on a machine without AMX,
+    /// and in a build whose toolchain could not compile the kernel.
+    #[test]
+    fn test_flat_amx_assignment_follows_amx_availability() {
+        assert_eq!(
+            prefers_flat_amx_assignment(&DataType::Float16, 10_000, 768, DistanceType::Dot),
+            amx_fp16_available()
+        );
     }
 }

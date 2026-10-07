@@ -90,13 +90,15 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
     Preconditions.checkNotNull(vectorColumn, "vectorColumn must not be null");
     this.allocator = dataset.allocator();
-    nativeCreate(
-        dataset,
-        shardSnapshots,
-        vectorColumn,
-        Optional.ofNullable(pkColumns),
-        Optional.ofNullable(distanceType),
-        Optional.ofNullable(filter));
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      nativeCreate(
+          dataset,
+          shardSnapshots,
+          vectorColumn,
+          Optional.ofNullable(pkColumns),
+          Optional.ofNullable(distanceType),
+          Optional.ofNullable(filter));
+    }
   }
 
   private native void nativeCreate(

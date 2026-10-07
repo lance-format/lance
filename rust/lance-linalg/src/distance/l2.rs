@@ -22,14 +22,18 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_core::assume_eq;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
-// Named tiers are only matched on x86_64, or by the fp16 kernels on the other
-// architectures; without either, nothing below names a `SimdSupport` variant.
-#[cfg(any(feature = "fp16kernels", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
+
+#[cfg(feature = "fp16kernels")]
+use crate::distance::HalfBackend;
+use crate::distance::{
+    HALF_KERNELS_COMPILED, HalfType, U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_layout,
+    assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
+};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -64,6 +68,7 @@ pub trait L2: Num {
         y: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = f32> + 'a {
+        assert_batch_layout(x.len(), y.len(), dimension);
         y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
     }
 }
@@ -82,47 +87,32 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// index an explicit f32 API.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-            // SAFETY: guarded by the runtime AVX-512 detection above.
-            return unsafe { l2_f32_avx512(x, y) };
-        }
-    }
-    l2(x, y)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    debug_assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        let a = _mm512_loadu_ps(x.as_ptr().add(i));
-        let b = _mm512_loadu_ps(y.as_ptr().add(i));
-        let diff = _mm512_sub_ps(a, b);
-        acc = _mm512_fmadd_ps(diff, diff, acc);
-        i += 16;
-    }
-    let mut sum = _mm512_reduce_add_ps(acc);
-    while i < n {
-        let diff = x[i] - y[i];
-        sum += diff * diff;
-        i += 1;
-    }
-    sum
+    f32::l2(x, y)
 }
 
 /// Calculate L2 distance between two uint8 slices.
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
-    key.iter()
-        .zip(target.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
-        .sum::<u32>() as f32
+    assert_equal_lengths(key.len(), target.len());
+    // Keep the common path on a u32 accumulator so LLVM can auto-vectorize it
+    // efficiently. Longer inputs are widened between overflow-safe chunks.
+    if key.len() <= U8_U32_ACCUMULATOR_MAX_LEN {
+        return key
+            .iter()
+            .zip(target.iter())
+            .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+            .sum::<u32>() as f32;
+    }
+
+    key.chunks(U8_U32_ACCUMULATOR_MAX_LEN)
+        .zip(target.chunks(U8_U32_ACCUMULATOR_MAX_LEN))
+        .map(|(key, target)| {
+            key.iter()
+                .zip(target.iter())
+                .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+                .sum::<u32>() as u64
+        })
+        .sum::<u64>() as f32
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -139,14 +129,14 @@ pub fn l2_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
-    let x_chunks = from.chunks_exact(LANES);
-    let y_chunks = to.chunks_exact(LANES);
+    assert_equal_lengths(from.len(), to.len());
+    let (x_chunks, x_remainder) = from.as_chunks::<LANES>();
+    let (y_chunks, y_remainder) = to.as_chunks::<LANES>();
 
-    let s = if !x_chunks.remainder().is_empty() {
-        x_chunks
-            .remainder()
+    let s = if !x_remainder.is_empty() {
+        x_remainder
             .iter()
-            .zip(y_chunks.remainder())
+            .zip(y_remainder)
             .map(|(&x, &y)| {
                 let diff = x.as_() - y.as_();
                 diff * diff
@@ -157,7 +147,7 @@ pub fn l2_scalar<
     };
 
     let mut sums = [Output::zero(); LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             let diff = x[i].as_() - y[i].as_();
             sums[i] += diff * diff;
@@ -170,7 +160,8 @@ pub fn l2_scalar<
 impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        super::l2_u8::l2_u8(x, y) as f32
+        assert_equal_lengths(x.len(), y.len());
+        super::l2_u8::l2_u8_u64(x, y) as f32
     }
 }
 
@@ -197,9 +188,16 @@ mod bf16_kernel {
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        match *SIMD_SUPPORT {
+        assert_equal_lengths(x.len(), y.len());
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::Bf16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 bf16_kernel::l2_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(
@@ -207,19 +205,19 @@ impl L2 for bf16 {
                 kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 bf16_kernel::l2_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 bf16_kernel::l2_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 bf16_kernel::l2_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 bf16_kernel::l2_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
@@ -253,9 +251,16 @@ mod kernel {
 impl L2 for f16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        match *SIMD_SUPPORT {
+        assert_equal_lengths(x.len(), y.len());
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::F16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 kernel::l2_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(
@@ -263,24 +268,24 @@ impl L2 for f16 {
                 kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the f16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
+            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
+            // route; this fallback only extends the tiers the C kernel already
+            // served to Avx512FP16 after checking F16C and FMA.
             _ => l2_scalar::<Self, f32, 16>(x, y),
         }
     }
@@ -289,6 +294,7 @@ impl L2 for f16 {
 impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 or AVX-512 inner kernel on capable hosts, or a portable
@@ -301,6 +307,7 @@ impl L2 for f32 {
         y: &'a [Self],
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
+        assert_batch_layout(x.len(), y.len(), dimension);
         // Exactly one arm compiles; see `Dot::dot_batch` for f32.
         #[cfg(all(
             target_arch = "x86_64",
@@ -335,7 +342,11 @@ impl L2 for f32 {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
+            // `assert_batch_layout` proves every chunk has the same length as
+            // `x`, so call the private kernel directly instead of repeating
+            // the public `L2::l2` validation for every vector.
+            y.chunks_exact(dimension)
+                .map(move |v| l2_f32_dispatched(x, v))
         }
     }
 }
@@ -400,7 +411,7 @@ impl BatchOperation for L2Batch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let difference = _mm256_sub_ps(key_values, vector_values);
                 let squared = _mm256_mul_ps(difference, difference);
@@ -425,7 +436,7 @@ impl BatchOperation for L2Batch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let difference = _mm256_sub_ps(key_values, vector_values);
                 let squared = _mm256_mul_ps(difference, difference);
@@ -498,6 +509,7 @@ fn l2_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
 impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         l2_f64_simd(x, y)
     }
 }
@@ -946,9 +958,6 @@ pub fn l2_distance_batch<'a, T: L2>(
     to: &'a [T],
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
-    assume_eq!(from.len(), dimension);
-    assume_eq!(to.len() % dimension, 0);
-
     T::l2_batch(from, to, dimension)
 }
 
@@ -989,6 +998,12 @@ where
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 ///
+/// # Errors
+///
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
+///
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
@@ -1001,14 +1016,10 @@ pub fn l2_distance_arrow_batch(
         DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
         DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
-            &from
-                .as_primitive::<Int8Type>()
-                .into_iter()
-                .map(|x| x.unwrap() as f32)
-                .collect(),
+            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
-        _ => Err(Error::ComputeError(format!(
+        _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {}",
             from.data_type()
         ))),
@@ -1023,8 +1034,25 @@ mod tests {
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
+    #[test]
+    fn test_l2_rejects_mismatched_lengths() {
+        let short = [1.0_f32];
+        let long = [1.0_f32, 2.0];
+
+        assert!(std::panic::catch_unwind(|| l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_f32(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| f32::l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch(&short, &long, 2)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch(&long, &[1.0_f32; 3], 2)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch::<f32>(&[], &[], 0)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_uint_scalar(&[1, 2], &[1])).is_err());
+        assert!(std::panic::catch_unwind(|| l2_scalar::<u8, f32, 16>(&[1, 2], &[1])).is_err());
+    }
+
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+        dimension_shard, run_vector_pair_proptest,
     };
 
     #[test]
@@ -1162,6 +1190,40 @@ mod tests {
         do_l2_test(&x, &y).unwrap();
     }
 
+    #[rstest::rstest]
+    fn test_l2_distance_f32(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            do_l2_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_distance_f64(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            do_l2_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            let scalar = x
+                .iter()
+                .zip(y.iter())
+                .map(|(&a, &b)| ((a as f64) - (b as f64)).powi(2))
+                .sum::<f64>() as f32;
+            let simd = <f32 as L2>::l2(&x, &y);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
     // Test L2 distance over different types.
     // * L2 is valid over the entire range of f16.
     // * L2 is valid over f32 and bf16 in the range of +-1e12.
@@ -1177,16 +1239,6 @@ mod tests {
             do_l2_test(&x, &y)?;
         }
 
-        #[test]
-        fn test_l2_distance_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
-            do_l2_test(&x, &y)?;
-        }
-
-        #[test]
-        fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
-            do_l2_test(&x, &y)?;
-        }
-
         /// Cross-backend parity: scalar fallback must match the dispatched
         /// SIMD path within numerical tolerance. Exercises `l2_f64_scalar`
         /// directly so the runtime fallback is exercised even on AVX2-capable
@@ -1199,25 +1251,6 @@ mod tests {
             let scalar = l2_f64_scalar(&x, &y);
             let simd = l2_f64_simd(&x, &y);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// Parity check for `l2_f32_dispatched` (Branch B exclusive: the
-        /// auto-vectorised scalar L2 path). The dispatched kernel must
-        /// agree with a portable f64-precision scalar reference within
-        /// numerical tolerance. The reference is hand-rolled here to keep
-        /// this test architecture-agnostic (the x86_64-only `l2_f64_scalar`
-        /// helper is gated above).
-        #[test]
-        fn test_l2_f32_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            let scalar = x
-                .iter()
-                .zip(y.iter())
-                .map(|(&a, &b)| ((a as f64) - (b as f64)).powi(2))
-                .sum::<f64>() as f32;
-            let simd = <f32 as L2>::l2(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback

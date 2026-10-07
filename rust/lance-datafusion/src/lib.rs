@@ -4,6 +4,7 @@
 pub mod aggregate;
 pub mod chunker;
 pub mod dataframe;
+#[cfg(any(test, feature = "datagen"))]
 pub mod datagen;
 pub mod exec;
 pub mod expr;
@@ -21,6 +22,7 @@ pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.datafusion.rs"));
 }
+mod signed_zero;
 pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]

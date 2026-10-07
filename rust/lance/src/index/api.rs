@@ -27,6 +27,10 @@ pub struct IndexSegment {
     fragment_bitmap: RoaringBitmap,
     /// Field IDs whose physical values are encoded in this segment.
     fields: Vec<i32>,
+    /// Field IDs whose values this segment carries but is not keyed on.
+    ///
+    /// Always the trailing entries of `fields`.
+    covering_fields: Vec<i32>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
@@ -37,22 +41,25 @@ pub struct IndexSegment {
 
 impl IndexSegment {
     /// Create a fully described segment with its physical build provenance.
-    pub fn new<I, F>(
+    pub fn new<I, F, C>(
         uuid: Uuid,
         fragment_bitmap: I,
         fields: F,
         index_details: Arc<prost_types::Any>,
         index_version: i32,
         dataset_version: u64,
+        covering_fields: C,
     ) -> Self
     where
         I: IntoIterator<Item = u32>,
         F: IntoIterator<Item = i32>,
+        C: IntoIterator<Item = i32>,
     {
         Self {
             uuid,
             fragment_bitmap: fragment_bitmap.into_iter().collect(),
             fields: fields.into_iter().collect(),
+            covering_fields: covering_fields.into_iter().collect(),
             index_details,
             index_version,
             dataset_version,
@@ -78,6 +85,28 @@ impl IndexSegment {
         &self.fields
     }
 
+    /// Return the fields whose values this segment carries but is not keyed on.
+    ///
+    /// Always the trailing entries of [`Self::fields`].
+    pub fn covering_fields(&self) -> &[i32] {
+        &self.covering_fields
+    }
+
+    /// Return the single column this segment is keyed on, or `None` when it is
+    /// keyed on several -- a genuinely composite index -- or on none at all.
+    ///
+    /// Mirrors [`IndexMetadata::keyed_field`], including its fail-closed
+    /// behavior on a declaration longer than [`Self::fields`]: a segment comes
+    /// from a caller (a distributed build's output, say) that this build never
+    /// validated.
+    pub fn keyed_field(&self) -> Option<i32> {
+        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
+        match &self.fields[..keyed] {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
     /// Return the serialized index details for this segment.
     pub fn index_details(&self) -> &Arc<prost_types::Any> {
         &self.index_details
@@ -100,6 +129,7 @@ impl IndexSegment {
         Uuid,
         RoaringBitmap,
         Vec<i32>,
+        Vec<i32>,
         Arc<prost_types::Any>,
         i32,
         u64,
@@ -108,6 +138,7 @@ impl IndexSegment {
             self.uuid,
             self.fragment_bitmap,
             self.fields,
+            self.covering_fields,
             self.index_details,
             self.index_version,
             self.dataset_version,
@@ -119,6 +150,27 @@ impl IndexSegment {
 pub trait IntoIndexSegment {
     /// Convert into an index segment.
     fn into_index_segment(self) -> Result<IndexSegment>;
+}
+
+impl IndexSegment {
+    /// The segment as index metadata under `name`, for machinery that works
+    /// on manifest entries (the commit-time replay). Files are not carried:
+    /// the commit collects them from the index directory.
+    pub(crate) fn into_metadata(self, name: &str) -> IndexMetadata {
+        IndexMetadata {
+            uuid: self.uuid,
+            fields: self.fields,
+            covering_fields: self.covering_fields,
+            name: name.to_string(),
+            dataset_version: self.dataset_version,
+            fragment_bitmap: Some(self.fragment_bitmap),
+            index_details: Some(self.index_details),
+            index_version: self.index_version,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
 }
 
 impl IntoIndexSegment for IndexSegment {
@@ -149,6 +201,7 @@ impl IntoIndexSegment for IndexMetadata {
             index_details,
             self.index_version,
             self.dataset_version,
+            self.covering_fields,
         ))
     }
 }
@@ -246,7 +299,13 @@ pub trait DatasetIndexExt {
         ))
     }
 
-    /// Read all indices of this Dataset version.
+    /// Read the indices of this Dataset version that this build can use.
+    ///
+    /// An index whose declared type has no reader in this build, or whose format
+    /// version is newer than this build supports, is omitted: it is still in the
+    /// manifest and still belongs to the dataset, but nothing here can decode
+    /// it. Code deciding what the *next* manifest should say must not use this
+    /// list - it would drop what it omits.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
     /// The cache is invalidated when the dataset version (Manifest) is changed.
@@ -337,6 +396,7 @@ pub trait DatasetIndexExt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn test_index_metadata_conversion_preserves_provenance() {
@@ -344,6 +404,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![3, 7],
+            covering_fields: vec![],
             dataset_version: 42,
             fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),
             index_details: Some(Arc::new(prost_types::Any {
@@ -359,5 +420,60 @@ mod tests {
         let segment = metadata.into_index_segment().unwrap();
         assert_eq!(segment.fields(), [3, 7]);
         assert_eq!(segment.dataset_version(), 42);
+    }
+
+    /// Segments arrive from callers this build never validated, so the keyed
+    /// prefix must fail closed on a declaration longer than `fields` rather than
+    /// underflow, exactly as [`IndexMetadata::keyed_field`] does.
+    #[rstest]
+    #[case::not_covered(vec![7], vec![], Some(7))]
+    #[case::covered(vec![7, 11], vec![11], Some(7))]
+    #[case::composite(vec![7, 11], vec![], None)]
+    #[case::malformed_longer_than_fields(vec![7], vec![11, 13], None)]
+    fn test_index_segment_keyed_field(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected: Option<i32>,
+    ) {
+        let segment = IndexSegment::new(
+            Uuid::new_v4(),
+            [0u32],
+            fields,
+            Arc::new(prost_types::Any {
+                type_url: "test".to_string(),
+                value: vec![],
+            }),
+            0,
+            1,
+            covering_fields,
+        );
+
+        assert_eq!(segment.keyed_field(), expected);
+    }
+
+    /// A covering declaration must survive the metadata -> segment -> metadata
+    /// round trip. `IndexSegment` is the hop where it was previously dropped.
+    #[test]
+    fn test_index_segment_preserves_covering_fields() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered".to_string(),
+            fields: vec![7, 11],
+            covering_fields: vec![11],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "test".to_string(),
+                value: vec![],
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let segment = metadata.into_index_segment().unwrap();
+        assert_eq!(segment.fields(), &[7, 11]);
+        assert_eq!(segment.covering_fields(), &[11]);
     }
 }

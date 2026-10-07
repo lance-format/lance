@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::signed_zero::{normalize_zero_comparisons, rewrite_signed_zero_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -17,11 +18,12 @@ use arrow_buffer::OffsetBuffer;
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -181,28 +183,39 @@ impl ScalarUDFImpl for CastListF16Udf {
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
-    state: SessionState,
+    // Functions are looked up in the session's shared state rather than in a
+    // clone of it: planners are created several times per query, and cloning
+    // every function map and rule list for each one is a measurable share of
+    // CPU for short queries.
+    session: SessionContext,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
+}
+
+impl LanceContextProvider {
+    fn new(session: SessionContext) -> Self {
+        let expr_planners = session.state_ref().read().expr_planners().to_vec();
+        Self {
+            options: ConfigOptions::default(),
+            session,
+            expr_planners,
+        }
+    }
+
+    fn with_state<T>(&self, read: impl FnOnce(&SessionState) -> T) -> T {
+        read(&self.session.state_ref().read())
+    }
 }
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        let state = ctx.state();
-        let expr_planners = state.expr_planners().to_vec();
-
-        Self {
-            options: ConfigOptions::default(),
-            state,
-            expr_planners,
-        }
+        Self::new(get_session_context(&LanceExecutionOptions::default()))
     }
 }
 
 impl ContextProvider for LanceContextProvider {
     fn get_table_source(
         &self,
-        name: datafusion::sql::TableReference,
+        name: datafusion::common::TableReference,
     ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Attempt to reference inner table {} not supported",
@@ -211,18 +224,18 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.state.aggregate_functions().get(name).cloned()
+        self.with_state(|state| state.aggregate_functions().get(name).cloned())
     }
 
     fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.state.window_functions().get(name).cloned()
+        self.with_state(|state| state.window_functions().get(name).cloned())
     }
 
     fn get_higher_order_meta(
         &self,
         name: &str,
     ) -> Option<Arc<datafusion::logical_expr::HigherOrderUDF>> {
-        self.state.higher_order_functions().get(name).cloned()
+        self.with_state(|state| state.higher_order_functions().get(name).cloned())
     }
 
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
@@ -230,7 +243,7 @@ impl ContextProvider for LanceContextProvider {
             // TODO: cast should go thru CAST syntax instead of UDF
             // Going thru UDF makes it hard for the optimizer to find no-ops
             "_cast_list_f16" => Some(Arc::new(ScalarUDF::new_from_impl(CastListF16Udf::new()))),
-            _ => self.state.scalar_functions().get(f).cloned(),
+            _ => self.with_state(|state| state.scalar_functions().get(f).cloned()),
         }
     }
 
@@ -244,23 +257,19 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        self.state.scalar_functions().keys().cloned().collect()
+        self.with_state(|state| state.scalar_functions().keys().cloned().collect())
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        self.state.aggregate_functions().keys().cloned().collect()
+        self.with_state(|state| state.aggregate_functions().keys().cloned().collect())
     }
 
     fn udwf_names(&self) -> Vec<String> {
-        self.state.window_functions().keys().cloned().collect()
+        self.with_state(|state| state.window_functions().keys().cloned().collect())
     }
 
     fn higher_order_function_names(&self) -> Vec<String> {
-        self.state
-            .higher_order_functions()
-            .keys()
-            .cloned()
-            .collect()
+        self.with_state(|state| state.higher_order_functions().keys().cloned().collect())
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -357,6 +366,8 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
+            BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
+            BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -1009,6 +1020,43 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
+        // DataFusion rewrites arrow_cast to Expr::Cast, whose Arrow kernel does not support
+        // integer-to-Time32 casts. Convert literal values with Lance's scalar coercion first.
+        let expr = expr
+            .transform_up(|expr| {
+                let coerced = match &expr {
+                    Expr::ScalarFunction(ScalarFunction { func, args })
+                        if func.name() == "arrow_cast" =>
+                    {
+                        match args.as_slice() {
+                            [
+                                Expr::Literal(value, metadata),
+                                Expr::Literal(ScalarValue::Utf8(Some(data_type)), _),
+                            ] => data_type
+                                .parse::<ArrowDataType>()
+                                .ok()
+                                .filter(|data_type| matches!(data_type, ArrowDataType::Time32(_)))
+                                .and_then(|data_type| {
+                                    if matches!(value, ScalarValue::Null) {
+                                        ScalarValue::try_new_null(&data_type).ok()
+                                    } else {
+                                        safe_coerce_scalar(value, &data_type)
+                                    }
+                                })
+                                .map(|value| Expr::Literal(value, metadata.clone())),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+
+                Ok(match coerced {
+                    Some(coerced) => Transformed::yes(coerced),
+                    None => Transformed::no(expr),
+                })
+            })?
+            .data;
+
         // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
         let simplify_context = SimplifyContext::builder()
@@ -1020,7 +1068,24 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // Fold each comparison's own operands and rewrite it before anything above
+        // it folds. `simplify` folds an operand and everything above it in one
+        // pass, so a fully constant predicate whose zero appears only as a result
+        // of folding never presents a zero literal to the rewrite:
+        // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
+        // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
+        // own result.
+        let expr = normalize_zero_comparisons(expr, &|operand| simplifier.simplify(operand))?;
+
+        // Again after simplify, which is what expands `BETWEEN` into two
+        // comparisons and folds the casts `coerce` inserts, so those forms only
+        // become visible on this pass.
+        //
+        // Running the rewrite more than once is safe because its output is a fixed
+        // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
+        let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)
     }
@@ -1033,6 +1098,16 @@ impl Planner {
             df_schema.as_ref(),
             &Default::default(),
         )?)
+    }
+
+    /// Create a [`PhysicalExpr`] using the caller's DataFusion session.
+    pub fn create_physical_expr_with_session(
+        &self,
+        expr: &Expr,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(session.create_physical_expr(expr.clone(), &df_schema)?)
     }
 
     /// Collect the columns in the expression.
@@ -1102,15 +1177,13 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
 #[cfg(test)]
 mod tests {
 
-    use crate::logical_expr::ExprExt;
-
     use super::*;
 
     use arrow::datatypes::Float64Type;
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
@@ -1118,6 +1191,7 @@ mod tests {
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1138,7 +1212,7 @@ mod tests {
 
         let expected = col("i")
             .gt(lit(3_i32))
-            .and(col("st").field_newstyle("x").lt_eq(lit(5.0_f32)))
+            .and(col("st").field("x").lt_eq(lit(5.0_f32)))
             .and(
                 col("s")
                     .eq(lit("str-4"))
@@ -1205,6 +1279,12 @@ mod tests {
             predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![false, true])
         );
+
+        let expr = planner
+            .parse_expr("arrow_cast(NULL, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        assert_eq!(expr, Expr::Literal(ScalarValue::Time32Second(None), None));
     }
 
     #[test]
@@ -1402,6 +1482,40 @@ mod tests {
                 false, false, false, true, true, true, true, false, false, false
             ])
         );
+    }
+
+    #[rstest]
+    #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
+    #[case::left(
+        "value << 1",
+        Operator::BitwiseShiftLeft,
+        vec![0, 2_u64 << 32, ((3_u64 << 32) + 7) << 1]
+    )]
+    fn test_bitwise_shift_expressions(
+        #[case] sql: &str,
+        #[case] expected_op: Operator,
+        #[case] expected: Vec<u64>,
+    ) {
+        let input = vec![0, 1_u64 << 32, (3_u64 << 32) + 7];
+        let batch =
+            RecordBatch::try_from_iter([("value", Arc::new(UInt64Array::from(input)) as ArrayRef)])
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr(sql).unwrap();
+        let Expr::BinaryExpr(binary_expr) = &expr else {
+            panic!("expected binary expression for {sql}, got {expr}");
+        };
+        assert_eq!(binary_expr.op, expected_op);
+
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let values = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(values.as_ref(), &UInt64Array::from(expected));
     }
 
     #[test]
@@ -1688,6 +1802,28 @@ mod tests {
     }
 
     #[test]
+    fn test_arrow_cast_int_literal_to_time32() {
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(Time32SecondArray::from(vec![3725, 3726])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner
+            .parse_filter("v = arrow_cast(3726, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
+    }
+
+    #[test]
     fn test_sql_literals() {
         let cases = &[
             (
@@ -1954,6 +2090,33 @@ mod tests {
     }
 
     #[test]
+    fn test_lance_context_provider_resolves_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        let ctx_provider = LanceContextProvider::new(session.clone());
+        assert!(ctx_provider.get_function_meta("contains_tokens").is_some());
+        assert!(ctx_provider.get_function_meta("lower").is_some());
+        assert!(ctx_provider.get_aggregate_meta("sum").is_some());
+        assert!(ctx_provider.get_window_meta("row_number").is_some());
+        assert!(ctx_provider.get_function_meta("registered_later").is_none());
+
+        // The provider reads the session's functions instead of a copy, so a
+        // function registered on the session afterwards resolves as well.
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "registered_later",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        assert!(ctx_provider.get_function_meta("registered_later").is_some());
+        assert!(
+            ctx_provider
+                .udf_names()
+                .contains(&"registered_later".to_string())
+        );
+    }
+
+    #[test]
     fn test_regexp_match_and_non_empty_captions() {
         // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
         // causing planning/evaluation failures. This should evaluate successfully.
@@ -2013,28 +2176,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_regexp_match_infer_error_without_boolean_coercion() {
-        // With the fix applied, using parse_filter should coerce regexp_match to boolean
-        // even when nested in a larger AND expression, so this should plan successfully.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("keywords", DataType::Utf8, true),
-            Field::new("natural_caption", DataType::Utf8, true),
-            Field::new("poetic_caption", DataType::Utf8, true),
-        ]));
+    #[rstest]
+    #[case::bare("regexp_match(name, 'e[12]')", [false, true, true, false, false, false])]
+    #[case::is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL",
+        [false, true, true, false, false, false]
+    )]
+    #[case::is_null(
+        "regexp_match(name, 'e[12]') IS NULL",
+        [true, false, false, true, true, true]
+    )]
+    #[case::not_bare(
+        "NOT regexp_match(name, 'e[12]')",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_bare(
+        "regexp_match(name, 'e[12]') AND name <> 'name2'",
+        [false, true, false, false, false, false]
+    )]
+    #[case::or_bare(
+        "regexp_match(name, 'e[12]') OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    #[case::not_is_not_null(
+        "NOT (regexp_match(name, 'e[12]') IS NOT NULL)",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_is_null(
+        "regexp_match(name, 'e[12]') IS NULL AND name IS NOT NULL",
+        [true, false, false, false, true, true]
+    )]
+    #[case::or_is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    fn test_regexp_match_filter_coercion(#[case] filter: &str, #[case] expected: [bool; 6]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [
+                Some("name0"),
+                Some("name1"),
+                Some("name2"),
+                None,
+                Some("name4"),
+                Some("name5")
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let result = physical_expr.evaluate(&batch).unwrap();
 
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::is_not_null("regexp_match(name, 'e[12]') IS NOT NULL")]
+    #[case::is_null("regexp_match(name, 'e[12]') IS NULL")]
+    #[case::comparison("regexp_match(name, 'e[12]') = regexp_match(name, 'e[12]')")]
+    fn test_regexp_match_preserves_value_contexts(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let planner = Planner::new(schema);
 
-        let expr = planner
-            .parse_filter(
-                "regexp_match(keywords, 'Liberty|revolution') AND \
-                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
-                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
-            )
-            .unwrap();
-
-        // Should not panic
-        let _physical = planner.create_physical_expr(&expr).unwrap();
+        assert_eq!(
+            planner.parse_filter(filter).unwrap(),
+            planner.parse_expr(filter).unwrap()
+        );
     }
 
     #[test]

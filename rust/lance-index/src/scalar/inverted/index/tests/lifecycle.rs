@@ -19,7 +19,7 @@ async fn build_multi_partition_index(
         // A few distinct tokens per partition so each posting file has real
         // content to read and materialize during prewarm.
         for t in 0..4u32 {
-            builder.tokens.add(format!("tok_{id}_{t}"));
+            builder.tokens.get_or_add(&format!("tok_{id}_{t}"));
             let mut posting =
                 PostingListBuilder::new_with_posting_tail_codec(false, PostingTailCodec::Fixed32);
             let base = id * 1000 + t as u64 * 10;
@@ -144,7 +144,7 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
     let posting_tail_codec = format_version.posting_tail_codec();
     let mut partition =
         InnerBuilder::new_with_format_version(0, false, TokenSetFormat::default(), format_version);
-    partition.tokens.add("hello".to_owned());
+    partition.tokens.get_or_add("hello");
     let mut posting_list =
         PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
     posting_list.add(0, PositionRecorder::Count(1));
@@ -234,7 +234,7 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
         format_version,
         params.posting_block_size(),
     );
-    partition.tokens.add("hello".to_owned());
+    partition.tokens.get_or_add("hello");
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),
@@ -360,6 +360,76 @@ async fn test_merge_segments_preserves_format_version(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case::empty_first(true)]
+#[case::empty_last(false)]
+#[tokio::test]
+async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool) -> Result<()> {
+    let empty_dir = TempObjDir::default();
+    let populated_dir = TempObjDir::default();
+    let dest_dir = TempObjDir::default();
+    let empty_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        empty_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let populated_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        populated_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let dest_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dest_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
+
+    write_test_metadata(&empty_store, Vec::new(), params.clone()).await;
+    let empty = InvertedIndex::load(empty_store, None, &LanceCache::no_cache()).await?;
+    assert_eq!(empty.partition_count(), 0);
+    assert_eq!(empty.format_version(), InvertedListFormatVersion::V1);
+
+    let populated = write_single_partition_index(
+        populated_store,
+        params,
+        TokenSetFormat::default(),
+        "hello",
+        100,
+    )
+    .await?;
+    let segments = if is_empty_first {
+        vec![empty, populated]
+    } else {
+        vec![populated, empty]
+    };
+
+    let created = InvertedIndex::merge_segments(
+        &segments,
+        empty_doc_stream(),
+        dest_store.as_ref(),
+        None,
+        crate::progress::noop_progress(),
+    )
+    .await?;
+    assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V1);
+
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    assert_eq!(merged.format_version(), InvertedListFormatVersion::V1);
+    assert_eq!(merged.index_version(), INVERTED_INDEX_VERSION_V1);
+
+    let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+    let prefilter = Arc::new(NoFilter);
+    let metrics = Arc::new(NoOpMetricsCollector);
+    let (row_ids, _) = merged
+        .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+        .await?;
+    assert_eq!(row_ids, vec![100]);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()> {
     let src_dir_1 = TempObjDir::default();
@@ -431,7 +501,7 @@ async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("test".to_owned());
+    builder.tokens.get_or_add("test");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder.docs.append(100, 1);

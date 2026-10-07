@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Oss};
 use url::Url;
 
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -136,6 +136,7 @@ impl ObjectStoreProvider for OssStoreProvider {
         Ok(ObjectStore {
             scheme: "oss".to_string(),
             inner,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -144,6 +145,8 @@ impl ObjectStoreProvider for OssStoreProvider {
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            paginated_lister: None,
         })
     }
 }

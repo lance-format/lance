@@ -283,7 +283,7 @@ class ShardWriter:
         -------
         dict
             Keys: ``row_count``, ``batch_count``, ``estimated_size_bytes``,
-            ``generation``.
+            ``generation``, ``frozen_count``, ``frozen_bytes``.
         """
         return self._raw.memtable_stats()
 

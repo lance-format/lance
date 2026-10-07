@@ -11,6 +11,8 @@ on:
       - release/**
     paths:
       - Cargo.*
+      - .cargo/config.toml
+      - clippy.toml
       - python/**
       - rust/**
       - protos/**
@@ -73,10 +75,10 @@ jobs:
           ruff format --check --diff python
           ruff check python
           pyright
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
@@ -93,6 +95,39 @@ jobs:
         run: |
           source venv/bin/activate
           pytest --doctest-modules python/lance
+
+  python-rust-test:
+    timeout-minutes: 30
+    name: pylance crate Rust tests
+    runs-on: "ubuntu-24.04-4x"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      # The default `extension-module` feature leaves libpython unlinked, which the
+      # host interpreter resolves at load time but a test binary cannot. Disabling it
+      # links libpython so these tests run instead of only compiling.
+      - name: Test Rust
+        run: cargo test --profile ci --locked --no-default-features
+
   linux-wheel:
     timeout-minutes: 45
     name: Python Linux x86_64 wheel
@@ -185,7 +220,7 @@ jobs:
   compat:
     needs: linux-wheel
     timeout-minutes: 60
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-8x
     name: Compatibility Tests
     defaults:
       run:
@@ -208,11 +243,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
+      # Nearly every test here shells out to an old pylance in its own venv, so the
+      # job spends most of its time waiting on subprocesses rather than on CPU.
+      # Oversubscribing cores follows what nightly_run.yml already does with this
+      # suite. Leaving COMPAT_TEMP_VENV unset is what makes that pay off: the venvs
+      # then land in the shared cache directory, where VenvFactory's flock lets all
+      # workers reuse one venv per version instead of each building its own.
       - name: Run compatibility tests
         run: |
-          make compattest
-        env:
-          COMPAT_TEMP_VENV: 1
+          make compattest PYTEST_WORKERS=$(( $(nproc) * 2 ))
 
   linux-arm:
     timeout-minutes: 45

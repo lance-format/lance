@@ -23,7 +23,6 @@
 //! Emits one `result ...` human line and one JSON line tagged
 //! `impl=lance_fts`, matching the `mem_wal_hnsw_bench` output convention.
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::HashMap;
@@ -718,7 +717,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         qps_nt,
         term_recall_v,
         phrase_recall_v,
-        index.memory_usage() as f64 / 1.0e6,
+        index.resident_bytes_exact() as f64 / 1.0e6,
     );
     println!(
         "{{\"impl\":\"lance_fts\",\"run\":\"{}\",\"docs\":{},\"queries\":{},\"k\":{},\
@@ -738,7 +737,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         term_recall_v,
         phrase_recall_v,
         or_recall_v,
-        index.memory_usage(),
+        index.resident_bytes_exact(),
     );
     Ok(())
 }

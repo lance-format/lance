@@ -5,7 +5,7 @@
 
 use crate::{
     buffer::LanceBuffer,
-    compression::{BlockDecompressor, FixedPerValueDecompressor},
+    compression::{BlockDecompressor, FixedPerValueDecompressor, require_no_block_payload},
     data::{AllNullDataBlock, ConstantDataBlock, DataBlock, FixedWidthDataBlock},
 };
 
@@ -24,7 +24,8 @@ impl ConstantDecompressor {
 }
 
 impl BlockDecompressor for ConstantDecompressor {
-    fn decompress(&self, _data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        require_no_block_payload(data, "Constant")?;
         if let Some(scalar) = self.scalar.clone() {
             Ok(DataBlock::Constant(ConstantDataBlock {
                 data: scalar,
@@ -33,6 +34,10 @@ impl BlockDecompressor for ConstantDecompressor {
         } else {
             Ok(DataBlock::AllNull(AllNullDataBlock { num_values }))
         }
+    }
+
+    fn requires_payload(&self) -> bool {
+        false
     }
 }
 
@@ -53,5 +58,24 @@ impl FixedPerValueDecompressor for ConstantDecompressor {
             .as_ref()
             .map(|s| s.len() as u64 * 8)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_constant_requires_no_payload() {
+        let decompressor = ConstantDecompressor::new(None);
+
+        assert!(!decompressor.requires_payload());
+        assert!(matches!(
+            BlockDecompressor::decompress(&decompressor, None, 3).unwrap(),
+            DataBlock::AllNull(AllNullDataBlock { num_values: 3 })
+        ));
+        assert!(
+            BlockDecompressor::decompress(&decompressor, Some(LanceBuffer::empty()), 3).is_err()
+        );
     }
 }

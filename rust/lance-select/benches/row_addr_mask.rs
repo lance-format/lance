@@ -69,8 +69,7 @@ fn bench_iter_addrs(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                // SAFETY: the map only contains Partial selections; no Full entries.
-                let count: u64 = unsafe { map.clone().into_addr_iter() }.count() as u64;
+                let count: u64 = map.clone().into_addr_iter().count() as u64;
                 std::hint::black_box(count);
             });
         });
@@ -121,9 +120,8 @@ fn bench_iter_runs_partial(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                // SAFETY: map only contains Partial selections.
                 let mut runs: u64 = 0;
-                for _ in unsafe { map.iter_runs() } {
+                for _ in map.iter_runs() {
                     runs += 1;
                 }
                 std::hint::black_box(runs);
@@ -181,7 +179,7 @@ fn bench_range_to_ranges_round_trip(c: &mut Criterion) {
                 // consumer actually does — e.g. GroupingIterator).
                 let mut ids = RowAddrTreeMap::from(src.clone());
                 ids.mask(&mask);
-                let count = unsafe { ids.into_addr_iter() }.count();
+                let count = ids.into_addr_iter().count();
                 std::hint::black_box(count);
             });
         });
@@ -204,8 +202,8 @@ fn bench_range_to_ranges_round_trip_runs(c: &mut Criterion) {
             b.iter(|| {
                 let mut ids = RowAddrTreeMap::from(src.clone());
                 ids.mask(&mask);
-                // SAFETY: only Partial selections in play.
-                let count: u64 = unsafe { ids.iter_runs() }
+                let count: u64 = ids
+                    .iter_runs()
                     .map(|(_, r)| (*r.end() as u64) - (*r.start() as u64) + 1)
                     .sum();
                 std::hint::black_box(count);

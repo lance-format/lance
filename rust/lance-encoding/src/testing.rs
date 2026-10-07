@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use lance_core::{Error, Result, datatypes::Field as LanceField, utils::bit::pad_bytes};
 use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
+use crate::compression::try_packed_struct_per_value;
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
@@ -34,8 +35,7 @@ use crate::{
         try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
         try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
-        try_variable_packed_struct_per_value, try_variable_rle_block, try_variable_width_miniblock,
-        try_variable_width_per_value,
+        try_variable_rle_block, try_variable_width_miniblock, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -173,7 +173,7 @@ impl CompressionStrategy for TestCompressionStrategy {
                 reject_packed_struct_per_value(field, data)?
             }
             TestEncoding::StructuralU32 | TestEncoding::StructuralSparse => {
-                try_variable_packed_struct_per_value(Arc::new(self.clone()), field, data)?
+                try_packed_struct_per_value(Arc::new(self.clone()), field, data)?
             }
         };
         if let Some(compressor) = packed {
@@ -195,7 +195,7 @@ impl CompressionStrategy for TestCompressionStrategy {
         &self,
         field: &LanceField,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
         let rle = match self.encoding {
             TestEncoding::Array | TestEncoding::StructuralU16 => None,
@@ -496,6 +496,9 @@ async fn test_decode(
     expected: Option<Arc<dyn Array>>,
     io: Arc<dyn EncodingsIo>,
     is_structural_encoding: bool,
+    // The rows this read will schedule, used to exercise range-scoped page
+    // initialization.  `None` initializes every page (the eager path).
+    requested_ranges: Option<Arc<[Range<u64>]>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
@@ -506,7 +509,7 @@ async fn test_decode(
         128 * 1024 * 1024,
     ));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
-    let decode_scheduler = DecodeBatchScheduler::try_new(
+    let decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         &lance_schema,
         &column_indices,
         column_infos,
@@ -515,6 +518,7 @@ async fn test_decode(
         Arc::<DecoderPlugins>::default(),
         io,
         cache,
+        requested_ranges.as_deref(),
         &FilterExpression::no_filter(),
         &DecoderConfig::default(),
     )
@@ -610,6 +614,27 @@ impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
 /// Given a field this will test the round trip encoding and decoding of random data
 pub async fn check_basic_random(field: Field) {
     check_specific_random(field, TestCases::basic()).await;
+}
+
+/// Runs one independently schedulable slice of [`check_basic_random`].
+///
+/// The complete matrix is the Cartesian product of all encodings, page sizes,
+/// and slicing modes.  Keeping these axes outside the helper lets expensive
+/// data types preserve the full matrix without concentrating it in one test.
+pub async fn check_basic_random_case(
+    field: Field,
+    encoding: TestEncoding,
+    page_size: u64,
+    use_slicing: bool,
+) {
+    check_specific_random(
+        field,
+        TestCases::basic()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing]),
+    )
+    .await;
 }
 
 pub async fn check_specific_random(field: Field, test_cases: TestCases) {
@@ -715,6 +740,8 @@ pub struct TestCases {
     skip_validation: bool,
     max_page_size: Option<u64>,
     page_sizes: Vec<u64>,
+    slicing_modes: Vec<bool>,
+    ingest_batch_counts: Vec<u32>,
     encodings: Vec<TestEncoding>,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
     expected_encoding: Option<Vec<String>>,
@@ -729,6 +756,8 @@ impl Default for TestCases {
             skip_validation: false,
             max_page_size: None,
             page_sizes: vec![4096, 1024 * 1024],
+            slicing_modes: vec![false, true],
+            ingest_batch_counts: vec![1, 5, 10],
             encodings: TestEncoding::all().collect(),
             verify_encoding: None,
             expected_encoding: None,
@@ -808,6 +837,19 @@ impl TestCases {
 
     pub fn with_page_sizes(mut self, page_sizes: Vec<u64>) -> Self {
         self.page_sizes = page_sizes;
+        self
+    }
+
+    pub fn with_slicing_modes(mut self, slicing_modes: impl IntoIterator<Item = bool>) -> Self {
+        self.slicing_modes = slicing_modes.into_iter().collect();
+        self
+    }
+
+    pub fn with_ingest_batch_counts(
+        mut self,
+        ingest_batch_counts: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        self.ingest_batch_counts = ingest_batch_counts.into_iter().collect();
         self
     }
 
@@ -1329,6 +1371,8 @@ async fn check_round_trip_encoding_inner(
         expected_data.clone(),
         scheduler_copy.clone(),
         is_structural_encoding,
+        // Full scan exercises the eager (initialize-everything) path.
+        None,
         |mut decode_scheduler, tx| {
             async move {
                 decode_scheduler.schedule_range(
@@ -1352,6 +1396,9 @@ async fn check_round_trip_encoding_inner(
             .map(|arr| arr.slice(range.start as usize, num_rows as usize));
         let scheduler = scheduler.clone();
         let range = range.clone();
+        // Range reads exercise the range-scoped (lazy) path: only the pages this
+        // contiguous range overlaps should be initialized.
+        let requested_ranges = Some(Arc::<[Range<u64>]>::from(vec![range.clone()]));
         test_decode(
             num_rows,
             test_cases.batch_size,
@@ -1360,6 +1407,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            requested_ranges,
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_range(
@@ -1408,6 +1456,11 @@ async fn check_round_trip_encoding_inner(
 
         let scheduler = scheduler.clone();
         let indices = indices.clone();
+        // Take reads exercise the lazy path with scattered rows. One range per
+        // index is a superset of the pages `schedule_take` later touches.
+        let requested_ranges = Some(Arc::<[Range<u64>]>::from(
+            indices.iter().map(|&i| i..i + 1).collect::<Vec<_>>(),
+        ));
         test_decode(
             num_rows,
             test_cases.batch_size,
@@ -1416,6 +1469,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            requested_ranges,
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_take(
@@ -1445,7 +1499,7 @@ async fn check_round_trip_random(
     test_cases: &TestCases,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
-        for use_slicing in [false, true] {
+        for use_slicing in test_cases.slicing_modes.iter().copied() {
             for encoding in test_cases.encodings() {
                 if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
                     continue;
@@ -1460,7 +1514,7 @@ async fn check_round_trip_random(
                     field.clone().with_nullable(false)
                 };
 
-                for num_ingest_batches in [1, 5, 10] {
+                for num_ingest_batches in test_cases.ingest_batch_counts.iter().copied() {
                     let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                     let mut data = Vec::new();
 

@@ -10,6 +10,8 @@ use super::*;
 struct PostingMetadataCounter {
     rows_read: std::sync::atomic::AtomicUsize,
     metadata_rows_read: std::sync::atomic::AtomicUsize,
+    posting_rows_read: std::sync::atomic::AtomicUsize,
+    impact_rows_read: std::sync::atomic::AtomicUsize,
     read_range_calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -19,6 +21,14 @@ impl PostingMetadataCounter {
     }
     fn metadata_rows_read(&self) -> usize {
         self.metadata_rows_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn posting_rows_read(&self) -> usize {
+        self.posting_rows_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn impact_rows_read(&self) -> usize {
+        self.impact_rows_read
             .load(std::sync::atomic::Ordering::Relaxed)
     }
     fn read_range_calls(&self) -> usize {
@@ -58,6 +68,22 @@ impl IndexReader for CountingPostingReader {
         if touches_metadata {
             self.counter
                 .metadata_rows_read
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        let touches_posting = projection
+            .map(|columns| columns.contains(&POSTING_COL))
+            .unwrap_or(false);
+        if touches_posting {
+            self.counter
+                .posting_rows_read
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        let touches_impacts = projection
+            .map(|columns| columns.contains(&IMPACT_COL))
+            .unwrap_or(false);
+        if touches_impacts {
+            self.counter
+                .impact_rows_read
                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
         self.inner.read_range(range, projection).await
@@ -175,7 +201,7 @@ async fn load_counted_v2_index(
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for i in 0..num_tokens {
-        builder.tokens.add(format!("t{}", i));
+        builder.tokens.get_or_add(&format!("t{}", i));
         let mut pl = PostingListBuilder::new(false);
         pl.add(i as u32, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -213,6 +239,15 @@ async fn load_counted_v2_index(
         .await
         .unwrap();
     (index, counter, tmpdir)
+}
+
+fn set_test_posting_group_size(index: &mut Arc<InvertedIndex>, group_size: u32) {
+    let index = Arc::get_mut(index).expect("test index should have one owner");
+    let partition =
+        Arc::get_mut(&mut index.partitions[0]).expect("test partition should have one owner");
+    let inverted_list = Arc::get_mut(&mut partition.inverted_list)
+        .expect("test posting reader should have one owner");
+    inverted_list.grouping = PostingGrouping::SyntheticFixed { group_size };
 }
 
 /// IO regression test for the lazy posting-metadata refactor. Builds a
@@ -296,6 +331,53 @@ async fn test_bm25_stats_for_terms_reuses_posting_metadata_cache() {
     );
 }
 
+/// Row-granularity statistics must not cost the posting file any extra IO
+/// when a partition's documents already map one-to-one onto rows, which is
+/// every V3 index and every V1/V2 index that is not a legacy list index. The
+/// deduplicating branch reads posting lists, so it has to stay behind the
+/// duplicate-row-id check rather than run for every legacy-format index.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_keeps_the_lazy_posting_metadata_path() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
+    // A V3 index would take the delegating early return, which proves nothing
+    // about the legacy branch this test exists for.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string()];
+    let documents = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(documents, (100, 100, vec![1]));
+    let metadata_rows = counter.metadata_rows_read();
+    let rows = counter.rows_read();
+    assert_eq!(metadata_rows, 1);
+
+    assert_eq!(
+        index
+            .bm25_row_stats_for_terms(&terms, None, None)
+            .await
+            .unwrap(),
+        documents,
+        "one document per row leaves the two granularities identical",
+    );
+    assert_eq!(
+        counter.metadata_rows_read() - metadata_rows,
+        1,
+        "row statistics should read one metadata row per (term, partition)",
+    );
+    assert_eq!(
+        counter.rows_read() - rows,
+        1,
+        "row statistics must not read the posting list itself (got {} extra rows)",
+        counter.rows_read() - rows,
+    );
+}
+
 #[tokio::test]
 async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
     let cache = LanceCache::with_capacity(1024 * 1024);
@@ -325,6 +407,48 @@ async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
     assert_eq!(warm.index_cache_hits(), terms.len());
 }
 
+/// Row-granularity statistics go through `InvertedPartition::row_stats_for_terms`
+/// on a V1/V2 index, and its posting-metadata lookups must reach the caller's
+/// collector too: the cross-field scorer build is the only consumer, and it
+/// runs under an `ExecutionPlan` whose cache counters would otherwise miss
+/// them entirely.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_records_metadata_cache_stats() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (index, _counter, _tmpdir) = load_counted_v2_index(100, cache.clone()).await;
+    // A V3 index would delegate to the document-granularity path, which
+    // already has its own coverage.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string(), "t1".to_string(), "t2".to_string()];
+    let cold = LocalMetricsCollector::default();
+    let cold_stats = index
+        .bm25_row_stats_for_terms(&terms, None, Some(&cold))
+        .await
+        .unwrap();
+    assert_eq!(cold_stats, (100, 100, vec![1, 1, 1]));
+    assert_eq!(cold.index_cache_misses(), terms.len());
+    assert_eq!(cold.index_cache_hits(), 0);
+
+    let warm = LocalMetricsCollector::default();
+    assert_eq!(
+        index
+            .bm25_row_stats_for_terms(&terms, None, Some(&warm))
+            .await
+            .unwrap(),
+        cold_stats,
+    );
+    assert_eq!(warm.index_cache_misses(), 0);
+    assert_eq!(warm.index_cache_hits(), terms.len());
+}
+
 #[tokio::test]
 async fn test_aggregate_corpus_stats_reuses_cached_value() {
     let (index, _counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
@@ -336,6 +460,101 @@ async fn test_aggregate_corpus_stats_reuses_cached_value() {
 
     let second = index.aggregate_corpus_stats().await.unwrap();
     assert_eq!(second, first);
+}
+
+#[tokio::test]
+async fn test_loaded_bm25_stats_are_all_or_nothing_and_preserve_oov() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(10, LanceCache::no_cache()).await;
+    let posting_reader = &index.partitions[0].inverted_list;
+    let terms = ["t0".to_string(), "missing".to_string(), "t9".to_string()];
+
+    assert!(!posting_reader.posting_lengths_loaded());
+    assert_eq!(posting_reader.loaded_posting_len(0), None);
+    assert_eq!(
+        index.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+        None,
+        "absent corpus statistics must reject the synchronous path"
+    );
+
+    assert_eq!(index.aggregate_corpus_stats().await.unwrap(), (10, 10));
+    assert_eq!(
+        index.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+        None,
+        "an OOV term must not hide an unloaded modern length table"
+    );
+    assert_eq!(counter.metadata_rows_read(), 0);
+
+    posting_reader.ensure_metadata_loaded().await.unwrap();
+    assert!(posting_reader.posting_lengths_loaded());
+    assert_eq!(posting_reader.loaded_posting_len(0), Some(1));
+    assert_eq!(posting_reader.loaded_posting_len(9), Some(1));
+    assert_eq!(posting_reader.loaded_posting_len(10), None);
+
+    let loaded = index
+        .bm25_stats_for_terms_if_loaded(&terms)
+        .unwrap()
+        .unwrap();
+    let asynchronous = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(loaded.stats, (10, 10, vec![1, 0, 1]));
+    assert_eq!(loaded.stats, asynchronous);
+    let dictionary = &index.partitions[0].tokens;
+    assert_eq!(
+        loaded.token_ids.as_ref(),
+        terms
+            .iter()
+            .map(|term| dictionary.get(term))
+            .collect::<Vec<_>>(),
+        "recorded ids must be the partition dictionary's ids, with None for OOV terms"
+    );
+}
+
+#[tokio::test]
+async fn test_loaded_bm25_stats_reports_invalid_loaded_token_id() {
+    let (mut index, _counter, _tmpdir) = load_counted_v2_index(1, LanceCache::no_cache()).await;
+    index.aggregate_corpus_stats().await.unwrap();
+    index.partitions[0]
+        .inverted_list
+        .ensure_metadata_loaded()
+        .await
+        .unwrap();
+
+    {
+        let index = Arc::get_mut(&mut index).expect("test index should have one owner");
+        let partition =
+            Arc::get_mut(&mut index.partitions[0]).expect("test partition should have one owner");
+        let posting_reader = Arc::get_mut(&mut partition.inverted_list)
+            .expect("test posting reader should have one owner");
+        let PostingMetadata::V2 { metadata } = &mut posting_reader.metadata else {
+            panic!("test requires modern posting metadata");
+        };
+        Arc::get_mut(metadata)
+            .expect("test metadata should have one owner")
+            .get_mut()
+            .expect("metadata was loaded above")
+            .lengths
+            .clear();
+    }
+
+    let terms = ["t0".to_string()];
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(
+            std::slice::from_ref(&index),
+            &terms,
+            false,
+        )
+        .unwrap()
+        .is_none(),
+        "the kill switch must short-circuit before loaded-metadata validation"
+    );
+
+    let error = index.bm25_stats_for_terms_if_loaded(&terms).unwrap_err();
+    assert!(matches!(error, Error::Index { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("token 't0' maps to invalid posting token id 0 in partition 0"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -409,6 +628,30 @@ async fn test_no_hit_partition_does_not_load_document_columns() {
     assert!(row_ids.is_empty());
     assert!(scores.is_empty());
     assert!(!documents.lengths_loaded());
+    assert!(!documents.projection_loaded());
+
+    let tokens = Arc::new(Tokens::new(
+        vec!["t0".to_owned(), "missing-token".to_owned()],
+        DocType::Text,
+    ));
+    let (row_ids, scores) = index
+        .bm25_search(
+            tokens,
+            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(row_ids.is_empty());
+    assert!(scores.is_empty());
+    assert!(
+        !documents.lengths_loaded(),
+        "a missing required token must gate the full document-length read"
+    );
     assert!(!documents.projection_loaded());
 }
 
@@ -488,6 +731,230 @@ async fn test_grouped_posting_lists_read_one_group_per_neighborhood() {
     );
 }
 
+#[tokio::test]
+async fn test_cache_aware_exact_cold_read_uses_one_singleton_group() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+    let metrics = LocalMetricsCollector::default();
+
+    let posting = inverted_list
+        .posting_list_with_policy(0, false, &metrics, PostingReadPolicy::CacheAwareExact)
+        .await
+        .unwrap();
+
+    assert_eq!(posting.len(), 1);
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(counter.rows_read(), 1);
+    assert_eq!(counter.metadata_rows_read(), 1);
+    assert_eq!(counter.posting_rows_read(), 1);
+    assert_eq!(counter.impact_rows_read(), 1);
+    assert_eq!(metrics.index_cache_hits(), 0);
+    assert_eq!(metrics.index_cache_misses(), 1);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_cache_aware_exact_singleton_is_singleflight_and_cached() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+    let metrics = Arc::new(LocalMetricsCollector::default());
+
+    let postings = futures::future::join_all((0..8).map(|_| {
+        let inverted_list = inverted_list.clone();
+        let metrics = metrics.clone();
+        async move {
+            inverted_list
+                .posting_list_with_policy(
+                    0,
+                    false,
+                    metrics.as_ref(),
+                    PostingReadPolicy::CacheAwareExact,
+                )
+                .await
+        }
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()
+    .unwrap();
+
+    assert!(postings.iter().all(|posting| posting.len() == 1));
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(counter.rows_read(), 1);
+    assert_eq!(metrics.index_cache_misses(), 1);
+    assert_eq!(metrics.index_cache_hits(), 7);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+
+    let warm_metrics = LocalMetricsCollector::default();
+    inverted_list
+        .posting_list_with_policy(0, false, &warm_metrics, PostingReadPolicy::CacheAwareExact)
+        .await
+        .unwrap();
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(warm_metrics.index_cache_hits(), 1);
+    assert_eq!(warm_metrics.index_cache_misses(), 0);
+    assert_eq!(warm_metrics.parts_loaded.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_cache_aware_exact_reuses_prewarmed_read_ahead_group() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+    inverted_list.prewarm_posting_lists(false, 1).await.unwrap();
+    let calls_after_prewarm = counter.read_range_calls();
+    let rows_after_prewarm = counter.rows_read();
+    let metrics = LocalMetricsCollector::default();
+
+    let posting = inverted_list
+        .posting_list_with_policy(0, false, &metrics, PostingReadPolicy::CacheAwareExact)
+        .await
+        .unwrap();
+
+    assert_eq!(posting.len(), 1);
+    assert_eq!(counter.read_range_calls(), calls_after_prewarm);
+    assert_eq!(counter.rows_read(), rows_after_prewarm);
+    assert_eq!(metrics.index_cache_hits(), 1);
+    assert_eq!(metrics.index_cache_misses(), 0);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_cache_aware_exact_prefers_group_after_singleton_then_prewarm() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+
+    inverted_list
+        .posting_list_with_policy(
+            0,
+            false,
+            &NoOpMetricsCollector,
+            PostingReadPolicy::CacheAwareExact,
+        )
+        .await
+        .unwrap();
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(counter.rows_read(), 1);
+
+    inverted_list.prewarm_posting_lists(false, 1).await.unwrap();
+    let calls_after_prewarm = counter.read_range_calls();
+    let rows_after_prewarm = counter.rows_read();
+    assert!(calls_after_prewarm > 1);
+    assert!(rows_after_prewarm > 1);
+
+    let metrics = LocalMetricsCollector::default();
+    inverted_list
+        .posting_list_with_policy(0, false, &metrics, PostingReadPolicy::CacheAwareExact)
+        .await
+        .unwrap();
+    assert_eq!(counter.read_range_calls(), calls_after_prewarm);
+    assert_eq!(counter.rows_read(), rows_after_prewarm);
+    assert_eq!(metrics.index_cache_hits(), 1);
+    assert_eq!(metrics.index_cache_misses(), 0);
+}
+
+#[tokio::test]
+async fn test_default_posting_read_keeps_read_ahead_group() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+
+    let posting = inverted_list
+        .posting_list(0, false, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+
+    assert_eq!(posting.len(), 1);
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(counter.rows_read(), 4);
+    assert_eq!(counter.metadata_rows_read(), 4);
+    assert_eq!(counter.posting_rows_read(), 4);
+    assert_eq!(counter.impact_rows_read(), 4);
+}
+
+#[tokio::test]
+async fn test_cache_aware_same_group_expansions_share_one_read_ahead_group() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let partition = index.partitions[0].clone();
+    let tokens = Tokens::with_positions(
+        vec!["t0".to_owned(), "t1".to_owned()],
+        vec![0, 0],
+        DocType::Text,
+    );
+    let scorer = MemBM25Scorer::new(
+        8,
+        8,
+        HashMap::from([("t0".to_owned(), 1), ("t1".to_owned(), 1)]),
+    );
+    let metrics = LocalMetricsCollector::default();
+
+    let loaded = partition
+        .load_posting_lists_with_policy(
+            &tokens,
+            &FtsSearchParams::new(),
+            Operator::Or,
+            &scorer,
+            &metrics,
+            PostingLoadOptions::cache_aware_exact(true),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(loaded.postings.len(), 1);
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(counter.rows_read(), 4);
+    assert_eq!(counter.metadata_rows_read(), 4);
+    assert_eq!(counter.posting_rows_read(), 4);
+    assert_eq!(counter.impact_rows_read(), 4);
+    assert_eq!(metrics.index_cache_misses(), 1);
+    assert_eq!(metrics.index_cache_hits(), 1);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_cache_aware_repeated_token_positions_share_one_singleton() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let partition = index.partitions[0].clone();
+    let tokens = Tokens::with_positions(
+        vec!["t0".to_owned(), "t0".to_owned()],
+        vec![0, 1],
+        DocType::Text,
+    );
+    let scorer = MemBM25Scorer::new(8, 8, HashMap::from([("t0".to_owned(), 1)]));
+    let metrics = LocalMetricsCollector::default();
+
+    let loaded = partition
+        .load_posting_lists_with_policy(
+            &tokens,
+            &FtsSearchParams::new(),
+            Operator::And,
+            &scorer,
+            &metrics,
+            PostingLoadOptions::cache_aware_exact(true),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(loaded.postings.len(), 2);
+    assert_eq!(counter.read_range_calls(), 1);
+    assert_eq!(counter.rows_read(), 1);
+    assert_eq!(metrics.index_cache_misses(), 1);
+    assert_eq!(metrics.index_cache_hits(), 1);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+}
+
 /// Build a single-partition v2 index where every token's posting list spans
 /// `docs_per_token` docs. Runtime grouping packs consecutive token rows
 /// into shared cache groups.
@@ -505,7 +972,7 @@ async fn load_v2_index_with_grouped_postings(
     let num_docs = num_tokens * docs_per_token;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token_id in 0..num_tokens {
-        builder.tokens.add(format!("t{token_id}"));
+        builder.tokens.get_or_add(&format!("t{token_id}"));
         let mut pl = PostingListBuilder::new(false);
         for d in 0..docs_per_token {
             let doc_id = (token_id * docs_per_token + d) as u32;
@@ -611,6 +1078,15 @@ async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
         packed_size * 4 < materialized_size * 3,
         "packed group deep_size_of {packed_size}B should be at least 25% smaller than the \
              {materialized_size}B materialized graph for {posting_count} postings"
+    );
+    // Prewarm caches a group per 128 dictionary rows of every partition, and
+    // each is resident and charged at its inline size on top of its buffers,
+    // so a group keeps only the buffers every posting view reads, not an
+    // Arrow array (100+ bytes) per column.
+    let inline_size = std::mem::size_of_val(group.as_ref());
+    assert!(
+        inline_size <= 320,
+        "packed group holds {inline_size}B inline"
     );
 }
 

@@ -651,7 +651,7 @@ where
 #[cfg(feature = "bitpacking")]
 fn typed_view_unchunk(buffer: LanceBuffer, uncompressed_bits: u64, num_values: u64) -> DataBlock {
     InlineBitpacking::new(uncompressed_bits)
-        .decompress(buffer, num_values)
+        .decompress(Some(buffer), num_values)
         .unwrap()
 }
 

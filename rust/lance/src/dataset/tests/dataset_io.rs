@@ -2,7 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
@@ -10,10 +14,16 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+use crate::dataset::mem_wal::DatasetMemWalExt;
+use crate::dataset::schema_evolution::ColumnAlteration;
+use crate::dataset::transaction::Operation;
+use crate::dataset::{
+    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
+    validate_dataset_root_for_drop, write_manifest_file,
+};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
-use crate::{Dataset, Error, Result};
+use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -23,8 +33,8 @@ use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int8DictionaryArray, Int32Array, Int64Array,
-    RecordBatchIterator, StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int8DictionaryArray, Int32Array,
+    Int64Array, RecordBatchIterator, StringArray, UInt8Array, UInt8DictionaryArray,
     cast::as_string_array,
     types::{Float32Type, Int32Type},
 };
@@ -40,8 +50,9 @@ use lance_file::{
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
-use lance_table::format::BasePath;
+use lance_table::format::{BasePath, Fragment, pb};
 use object_store::ObjectStoreExt;
+use prost::Message;
 
 use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
@@ -51,6 +62,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
+use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use rstest::rstest;
@@ -59,6 +71,40 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::zero("0")]
+#[case::negative("-1")]
+#[case::not_a_number("many")]
+fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value: &str) {
+    let error = parse_deep_clone_stream_concurrency(value).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("LANCE_DEEP_CLONE_STREAM_CONCURRENCY"));
+    assert!(message.contains(&format!("{value:?}")));
+}
+
+#[test]
+fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
+    assert_eq!(parse_deep_clone_stream_concurrency("17").unwrap(), 17);
+}
+
+#[rstest]
+#[case::direct_local_copy(64, false, None, 64)]
+#[case::streaming_default_cap(64, true, None, 4)]
+#[case::streaming_configured_below_cap(2, true, None, 2)]
+#[case::streaming_override(64, true, Some(17), 17)]
+fn test_deep_clone_copy_parallelism(
+    #[case] configured: usize,
+    #[case] uses_streaming_copy: bool,
+    #[case] stream_override: Option<usize>,
+    #[case] expected: usize,
+) {
+    assert_eq!(
+        deep_clone_copy_parallelism(configured, uses_streaming_copy, stream_override),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -496,6 +542,78 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
     );
 }
 
+async fn write_multi_fragment_source(uri: &str) -> Dataset {
+    let batch = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 8,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+async fn tag_and_shallow_clone(source: &mut Dataset, clone_uri: &str) -> Dataset {
+    source
+        .tags()
+        .create("to_clone", source.version().version)
+        .await
+        .unwrap();
+    source
+        .shallow_clone(clone_uri, "to_clone", None)
+        .await
+        .unwrap()
+}
+
+fn registry_attempts(dataset: &Dataset) -> u64 {
+    let stats = dataset.session.store_registry().stats();
+    stats.hits + stats.misses
+}
+
+#[derive(Debug, Default)]
+struct CountingObjectStoreWrapper {
+    wraps: AtomicUsize,
+}
+
+impl WrappingObjectStore for CountingObjectStoreWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        self.wraps.fetch_add(1, Ordering::Relaxed);
+        original
+    }
+
+    // Passes requests straight through, so a listing may keep going around it. Only `wrap` is
+    // counted, since the count is what the caching assertions are written against.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+impl CountingObjectStoreWrapper {
+    fn wraps(&self) -> usize {
+        self.wraps.load(Ordering::Relaxed)
+    }
+}
+
+fn first_base_id(dataset: &Dataset) -> u32 {
+    dataset.get_fragments()[0].metadata().files[0]
+        .base_id
+        .expect("shallow clone data files must reference the source base")
+}
+
 #[tokio::test]
 async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -503,17 +621,7 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let source_uri = file_object_store_uri(source_dir.path());
     let clone_uri = file_object_store_uri(clone_dir.path());
 
-    let batch = gen_batch()
-        .col("id", array::step::<Int32Type>())
-        .into_batch_rows(RowCount::from(64))
-        .unwrap();
-    let mut source = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-        &source_uri,
-        None,
-    )
-    .await
-    .unwrap();
+    let mut source = write_multi_fragment_source(&source_uri).await;
     source
         .create_index(
             &["id"],
@@ -525,16 +633,7 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
         .await
         .unwrap();
     source.delete("id < 4").await.unwrap();
-    source
-        .tags()
-        .create("with_artifacts", source.version().version)
-        .await
-        .unwrap();
-
-    let cloned = source
-        .shallow_clone(&clone_uri, "with_artifacts", None)
-        .await
-        .unwrap();
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
     let base = cloned
         .manifest()
         .base_paths
@@ -576,6 +675,224 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let _ = tracker.incremental_stats();
     cloned.index_statistics("id_idx").await.unwrap();
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_shallow_clone_reuses_base_object_store() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let base_id = first_base_id(&cloned);
+
+    let first = cloned.object_store(Some(base_id)).await.unwrap();
+    let second = cloned.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "repeated lookups must reuse the cached base object store"
+    );
+
+    let third = cloned.clone().object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &third),
+        "dataset clones must share the base object store cache"
+    );
+
+    let tracker = Arc::new(IOTracker::default());
+    let wrapped =
+        cloned.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+    let wrapped_store = wrapped.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&first, &wrapped_store),
+        "the wrapped clone must not serve the undecorated store"
+    );
+    let _ = tracker.incremental_stats();
+    wrapped.scan().try_into_batch().await.unwrap();
+    assert!(
+        tracker.incremental_stats().read_iops > 0,
+        "reads on the wrapped clone must go through the wrapper"
+    );
+
+    let fresh = DatasetBuilder::from_uri(&clone_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let attempts_before = registry_attempts(&fresh);
+    let stores = futures::future::try_join_all((0..8).map(|_| fresh.object_store(Some(base_id))))
+        .await
+        .unwrap();
+    assert!(
+        stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])),
+        "concurrent resolutions must share one store"
+    );
+    assert_eq!(
+        registry_attempts(&fresh) - attempts_before,
+        1,
+        "concurrent resolutions must resolve the store exactly once"
+    );
+
+    // A caller can derive wrapper-scoped datasets by applying the same shared
+    // wrapper to a cached dataset. Each derived dataset must retain one base
+    // store for its own lifetime without sharing it with another scope.
+    let shared_wrapper = Arc::new(CountingObjectStoreWrapper::default());
+    let scope_a =
+        fresh.with_object_store_wrappers([shared_wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let scope_b =
+        fresh.with_object_store_wrappers([shared_wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+    let wraps_before = shared_wrapper.wraps();
+    let attempts_before = registry_attempts(&fresh);
+
+    let scope_a_first = scope_a.object_store(Some(base_id)).await.unwrap();
+    let scope_a_second = scope_a.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&scope_a_first, &scope_a_second),
+        "one wrapper scope must reuse its resolved base store"
+    );
+
+    let scope_b_first = scope_b.object_store(Some(base_id)).await.unwrap();
+    let scope_b_second = scope_b.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&scope_b_first, &scope_b_second),
+        "one wrapper scope must reuse its resolved base store"
+    );
+    assert!(
+        !Arc::ptr_eq(&scope_a_first, &scope_b_first),
+        "separate wrapper scopes must not share a stateful base store"
+    );
+    assert!(
+        !Arc::ptr_eq(&scope_a_first.inner, &scope_b_first.inner),
+        "separate wrapper scopes must not share provider-local layers"
+    );
+    assert_eq!(
+        registry_attempts(&fresh) - attempts_before,
+        0,
+        "wrapper-scoped base stores must bypass the global registry cache"
+    );
+    assert_eq!(
+        shared_wrapper.wraps() - wraps_before,
+        2,
+        "each wrapper scope must build its base store exactly once"
+    );
+
+    let read = cloned.scan().try_into_batch().await.unwrap();
+    assert_eq!(read.num_rows(), 64);
+}
+
+#[tokio::test]
+async fn test_base_files_share_one_scheduler_per_scan() {
+    use crate::dataset::fragment::{BaseSchedulers, FragReadConfig};
+    use futures::StreamExt;
+
+    // A shallow clone whose data files all reference the source base.
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let fragments = cloned.get_fragments();
+    assert!(
+        fragments.len() > 1,
+        "need multiple base fragments to exercise sharing"
+    );
+    assert!(
+        fragments
+            .iter()
+            .all(|f| f.metadata().files.iter().all(|df| df.base_id.is_some())),
+        "shallow clone data files must reference the source base"
+    );
+
+    // Open every base fragment through one shared cache, as a scan does.
+    let cache = BaseSchedulers::new(4 * 1024 * 1024);
+    let projection = cloned.schema().clone();
+    for fragment in &fragments {
+        let read_config = FragReadConfig::default().with_base_schedulers(cache.clone());
+        let reader = fragment.open(&projection, read_config).await.unwrap();
+        // Drive the read so the base file is actually opened and its scheduler
+        // resolved through the cache.
+        reader
+            .read_all(1024)
+            .await
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+    }
+
+    // Every fragment shares the source base, so opening all of them built
+    // exactly one scheduler. Reverting the open_current_file_reader change
+    // (a fresh scheduler per file) leaves the cache empty and fails this.
+    assert_eq!(
+        cache.len(),
+        1,
+        "all files of one base must share a single scheduler"
+    );
+}
+
+#[tokio::test]
+async fn test_base_object_store_cache_invalidation() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let extra_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let mut cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let base_id = first_base_id(&cloned);
+    let store = cloned.object_store(Some(base_id)).await.unwrap();
+
+    let rebound = cloned.with_object_store(
+        cloned.object_store.clone(),
+        Some(ObjectStoreParams {
+            block_size: Some(32 * 1024),
+            ..Default::default()
+        }),
+    );
+    let rebound_store = rebound.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&store, &rebound_store),
+        "changed store params must not serve the previously cached base store"
+    );
+
+    cloned.delete("id = 0").await.unwrap();
+    let attempts_before = registry_attempts(&cloned);
+    let retained = cloned.object_store(Some(base_id)).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&store, &retained),
+        "commits that keep base_paths must keep the cache"
+    );
+    assert_eq!(
+        registry_attempts(&cloned) - attempts_before,
+        0,
+        "commits that keep base_paths must not re-resolve the store"
+    );
+
+    let with_extra = Arc::new(cloned)
+        .add_bases(
+            vec![lance_table::format::BasePath::new(
+                0,
+                file_object_store_uri(extra_dir.path()),
+                Some("extra".to_string()),
+                true,
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    let attempts_before = registry_attempts(&with_extra);
+    with_extra.object_store(Some(base_id)).await.unwrap();
+    assert_eq!(
+        registry_attempts(&with_extra) - attempts_before,
+        1,
+        "base_paths changes must reset the cache and re-resolve the store"
+    );
 }
 
 #[cfg(feature = "azure")]
@@ -1106,9 +1423,13 @@ async fn test_write_manifest(
             use_legacy_format: None,
             storage_format: None,
             disable_transaction_file: false,
+            migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
+        // Previously classified from a None inline copy, which validated.
+        true,
     )
     .await
     .unwrap();
@@ -1138,6 +1459,392 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn open_rejects_mixed_file_versions_without_capability() {
+    let uri = TempStdDir::default();
+    create_file(&uri, WriteMode::Create, LanceFileVersion::V2_0).await;
+    let dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+    let mut manifest = read_manifest(
+        dataset.object_store.as_ref(),
+        &dataset.manifest_location.path,
+        dataset.manifest_location.size,
+    )
+    .await
+    .unwrap();
+    let file = &mut Arc::make_mut(&mut manifest.fragments)[0].files[0];
+    file.file_major_version = 2;
+    file.file_minor_version = 1;
+    manifest.version += 1;
+
+    dataset
+        .commit_handler
+        .commit(
+            &mut manifest,
+            None,
+            &dataset.base,
+            dataset.object_store.as_ref(),
+            write_manifest_file_to_path,
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let err = Dataset::open(uri.to_str().unwrap()).await.unwrap_err();
+    assert!(err.to_string().contains("not enabled"), "{err}");
+}
+
+#[tokio::test]
+async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let first =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![0, 1]))]).unwrap();
+    let second =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2, 3]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(first.clone())], schema.clone()),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let file_name = "mixed-v2_1.lance";
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join(file_name))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::create_lazy_writer(
+        ConcreteFileVersion::V2_1,
+        object_writer,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&second).await.unwrap();
+    writer.finish().await.unwrap();
+    let data_file = dataset.create_data_file(file_name, None).await.unwrap();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    Arc::make_mut(&mut manifest.fragments).push(Fragment {
+        id: 1,
+        files: vec![data_file],
+        overlays: vec![],
+        deletion_file: None,
+        row_id_meta: None,
+        physical_rows: Some(second.num_rows()),
+        last_updated_at_version_meta: None,
+        created_at_version_meta: None,
+    });
+    manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.version += 1;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let mixed = Dataset::open(&uri).await.unwrap();
+    let actual = mixed.scan().try_into_batch().await.unwrap();
+    let expected = concat_batches(&schema, &[first, second]).unwrap();
+    assert_eq!(actual, expected);
+
+    let mut filtered_scan = mixed.scan();
+    filtered_scan.filter("i >= 2").unwrap();
+    assert_eq!(filtered_scan.try_into_batch().await.unwrap().num_rows(), 2);
+
+    let taken = mixed
+        .take(&[0, 3], Arc::new(mixed.schema().clone()))
+        .await
+        .unwrap();
+    assert_eq!(taken.num_rows(), 2);
+}
+
+#[tokio::test]
+async fn same_fragment_mixed_v2_files_validate_and_scan() {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Int32, false),
+    ]));
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 0])),
+            Arc::new(Int32Array::from(vec![0, 0])),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let columns = [
+        (
+            "mixed-a-v2_0.lance",
+            ConcreteFileVersion::V2_0,
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "a",
+                    DataType::Int32,
+                    false,
+                )])),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .unwrap(),
+        ),
+        (
+            "mixed-b-v2_1.lance",
+            ConcreteFileVersion::V2_1,
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "b",
+                    DataType::Int32,
+                    false,
+                )])),
+                vec![Arc::new(Int32Array::from(vec![3, 4]))],
+            )
+            .unwrap(),
+        ),
+    ];
+    let mut data_files = Vec::with_capacity(columns.len());
+    for (file_name, version, batch) in columns {
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join(file_name))
+            .await
+            .unwrap();
+        let mut writer = lance_file::versions::create_lazy_writer(
+            version,
+            object_writer,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+        data_files.push(dataset.create_data_file(file_name, None).await.unwrap());
+    }
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    Arc::make_mut(&mut manifest.fragments)[0].files = data_files;
+    manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    manifest.version += 1;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let mixed = Dataset::open(&uri).await.unwrap();
+    mixed.validate().await.unwrap();
+    let actual = mixed.scan().try_into_batch().await.unwrap();
+    let expected = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![3, 4])),
+        ],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_restore_rejects_unknown_target_flags() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let write_config = ManifestWriteConfig {
+        auto_set_feature_flags: false,
+        ..Default::default()
+    };
+    let mut unknown_manifest = dataset.manifest.as_ref().clone();
+    unknown_manifest.version = 2;
+    unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unknown_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut supported_manifest = dataset.manifest.as_ref().clone();
+    supported_manifest.version = 3;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut supported_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = Dataset::commit(
+        &test_uri,
+        Operation::Restore { version: 2 },
+        Some(3),
+        None,
+        None,
+        Default::default(),
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let original_version = dataset.version().version;
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let location = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = dataset.checkout_latest().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert_eq!(dataset.version().version, original_version);
+    assert!(
+        dataset
+            .metadata_cache
+            .get_with_key(&ManifestKey {
+                version: location.version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_none(),
+        "unsupported manifest must not be cached"
+    );
+}
+
+#[tokio::test]
+async fn test_serialized_manifest_rejects_unsupported_reader() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let serialized_manifest = pb::Manifest::from(&unsupported_manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn test_serialized_manifest_rejects_missing_mixed_version_capability() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.data_storage_format = DataStorageFormat::new(ConcreteFileVersion::V2_0);
+    let serialized_manifest = pb::Manifest::from(&manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("not enabled"),
+        "unexpected message: {error}"
+    );
 }
 
 #[tokio::test]
@@ -1275,6 +1982,9 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
     )
     .await
     .unwrap();
+
+    assert!(dataset.manifest.base_paths.is_empty());
+    assert!(!dataset.manifest.has_managed_blobs());
 
     let clone = dataset
         .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
@@ -1521,6 +2231,179 @@ async fn test_deep_clone(
 }
 
 #[tokio::test]
+async fn test_deep_clone_copies_blob_v2_sidecars() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("blob_source");
+    let clone_dir = test_dir.join("blob_clone");
+    let expected_blobs: [&[u8]; 2] = [b"packed!!", b"this payload uses a dedicated sidecar"];
+    let blob_field = blob_field_with_options(
+        "blob",
+        false,
+        BlobFieldOptions::default()
+            .with_inline_size_threshold(4)
+            .with_dedicated_size_threshold(NonZeroUsize::new(12).unwrap()),
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        blob_field,
+    ]));
+    let mut blobs = BlobArrayBuilder::new(2);
+    for value in expected_blobs {
+        blobs.push_bytes(value).unwrap();
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        source_dir.to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.count_fragments(), 2);
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let source_index_file_count =
+        count_files(source.object_store.as_ref(), &source.base, "_indices").await;
+
+    let cloned = Arc::new(
+        source
+            .deep_clone(clone_dir.to_str().unwrap(), source.version().version, None)
+            .await
+            .unwrap(),
+    );
+    let cloned_indices = cloned.load_indices().await.unwrap();
+    assert_eq!(cloned_indices.len(), 1);
+    assert_eq!(cloned_indices[0].name, "id_idx");
+    assert_eq!(
+        count_files(cloned.object_store.as_ref(), &cloned.base, "_indices").await,
+        source_index_file_count
+    );
+
+    let cloned_blobs = cloned.take_blobs_by_indices(&[0, 1], "blob").await.unwrap();
+    for (blob, expected) in cloned_blobs.into_iter().zip(expected_blobs) {
+        let actual = blob.unwrap().read().await.unwrap();
+        assert_eq!(actual.as_ref(), expected);
+    }
+}
+
+#[tokio::test]
+async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .deep_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
+async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .shallow_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
 async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
     use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
 
@@ -1559,8 +2442,8 @@ async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has
 // known platform-specific quirks on Windows (it reads back empty there; see the note in
 // tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
-// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
-// against real cloud stores is platform-agnostic std/tokio I/O.
+// covered on Windows by `test_deep_clone`, and streaming copies against real cloud stores
+// use platform-agnostic std/tokio I/O.
 #[cfg(not(windows))]
 #[rstest]
 #[tokio::test]
@@ -1568,9 +2451,8 @@ async fn test_deep_clone_cross_store(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
-    // Source lives in an in-memory store while the target is a local directory, so the
-    // two stores have different `store_prefix`es and `deep_clone` must stream files from
-    // the source store to the target store (the cross-account code path).
+    // Source lives in an in-memory store while the target is a local directory. Their
+    // different `store_prefix`es exercise separate source and destination implementations.
     let session = Arc::new(Session::default());
     let test_dir = TempStdDir::default();
     let clone_dir = test_dir.join("clone_ds");
@@ -1896,6 +2778,94 @@ async fn test_shallow_clone_multiple_times(
     validate_dataset(&original, 36, 1, 0).await;
 }
 
+/// A chained shallow clone (A -> B -> C) must not restamp an index entry that
+/// already references an earlier base. `Manifest::shallow_clone` carries the
+/// source's `base_paths` over under the same ids, so an index whose files live
+/// in A keeps `base_id = 0` through every hop; unconditionally restamping it
+/// to the newly assigned id would point C at B's `_indices/`, where the files
+/// do not exist, and break indexed queries of every index type.
+#[tokio::test]
+async fn test_chained_shallow_clone_keeps_index_base() {
+    let test_dir = TempStrDir::default();
+    let a_uri = format!("{}/a", test_dir.as_str());
+    let b_uri = format!("{}/b", test_dir.as_str());
+    let c_uri = format!("{}/c", test_dir.as_str());
+
+    // A: two fragments with a committed scalar index; the index files live
+    // only in A's `_indices/`.
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let mut dataset_a = Dataset::write(
+        data,
+        a_uri.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset_a
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let index_base = |dataset: &Dataset, indices: &[lance_table::format::IndexMetadata]| {
+        let index = indices.iter().find(|idx| idx.name == "i_idx").unwrap();
+        (index.base_id, dataset.manifest().base_paths.clone())
+    };
+
+    // First hop: A's own entry gets the newly assigned base (the control).
+    let a_version = dataset_a.version().version;
+    let mut dataset_b = dataset_a
+        .shallow_clone(b_uri.as_str(), a_version, None)
+        .await
+        .unwrap();
+    let b_indices = dataset_b.load_indices().await.unwrap();
+    let (b_base_id, b_base_paths) = index_base(&dataset_b, &b_indices);
+    assert_eq!(b_base_id, Some(0));
+    assert_eq!(b_base_paths.len(), 1);
+    assert_eq!(b_base_paths[&0].path, a_uri);
+    assert_eq!(
+        dataset_b
+            .count_rows(Some("i = 3".to_string()))
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Second hop: the already-stamped entry keeps referencing A through the
+    // carried base path instead of being restamped onto B.
+    let b_version = dataset_b.version().version;
+    let dataset_c = dataset_b
+        .shallow_clone(c_uri.as_str(), b_version, None)
+        .await
+        .unwrap();
+    let c_indices = dataset_c.load_indices().await.unwrap();
+    let (c_base_id, c_base_paths) = index_base(&dataset_c, &c_indices);
+    assert_eq!(c_base_id, Some(0));
+    assert_eq!(c_base_paths.len(), 2);
+    assert_eq!(c_base_paths[&0].path, a_uri);
+    assert_eq!(c_base_paths[&1].path, b_uri);
+
+    // The indexed query resolves the index files from A.
+    assert_eq!(
+        dataset_c
+            .count_rows(Some("i = 3".to_string()))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(dataset_c.count_rows(None).await.unwrap(), 8);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_self_dataset_append(
@@ -2117,6 +3087,82 @@ async fn append_dictionary(
     } else {
         assert!(result.is_ok());
     }
+}
+
+#[rstest]
+#[case::appended_null_value(
+    (0..=i8::MAX)
+        .map(|value| Some(format!("value-{value}")))
+        .collect(),
+    (0..=i8::MAX).map(Some).chain([None]).collect()
+)]
+#[case::existing_unaddressable_null_value(
+    (0..130)
+        .map(|value| (value != 129).then(|| format!("value-{value}")))
+        .collect(),
+    vec![Some(0_i8), None]
+)]
+#[tokio::test]
+async fn write_rejects_dictionary_null_index_outside_declared_key_range(
+    #[case] values: Vec<Option<String>>,
+    #[case] indices: Vec<Option<i8>>,
+) {
+    let dictionary = Arc::new(StringArray::from(values));
+    let indices = Int8Array::from(indices);
+    let dictionary = Int8DictionaryArray::try_new(indices, dictionary).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect_err("the widened indices cannot be represented by Int8");
+
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
+/// `dict:{value}:{index}:false` cannot express a value type whose own logical
+/// string carries ':', so `Schema::try_from` used to panic on the way in rather
+/// than rejecting the write.
+#[tokio::test]
+async fn write_rejects_dictionary_value_type_that_has_no_logical_type() {
+    let values = Decimal128Array::from(vec![Some(100), Some(200), Some(300)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let indices = UInt8Array::from(vec![0, 1, 2, 1]);
+    let dictionary = UInt8DictionaryArray::try_new(indices, Arc::new(values)).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .expect_err("a decimal-valued dictionary has no parseable logical type");
+
+    assert!(matches!(error, Error::Schema { .. }));
+    assert!(error.to_string().contains("does not parse back"));
 }
 
 #[rstest]
@@ -2600,4 +3646,561 @@ async fn test_open_dataset_non_not_found_error_is_not_masked() {
         "Expected IO error but got: {:?}",
         err,
     );
+}
+
+#[tokio::test]
+async fn test_get_fragment_by_id() {
+    // 4 fragments of 10 rows each, ids 0..=3.
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 4);
+
+    for id in 0..4 {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+    }
+    assert!(dataset.get_fragment(4).is_none());
+    assert!(dataset.get_fragment(usize::MAX).is_none());
+
+    // Deleting all rows of fragment 1 leaves a hole in the id space.
+    dataset.delete("i >= 10 AND i < 20").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    assert!(dataset.get_fragment(1).is_none());
+    for id in [0, 2, 3] {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(fragment.id(), id);
+    }
+}
+
+/// Replace the manifest fragments, rebuilding the derived state exactly as
+/// opening a dataset does, so the lookups see a manifest Lance would read off
+/// disk rather than one it just built.
+fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    dataset.fragment_bitmap = Arc::new(
+        dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect(),
+    );
+}
+
+/// Manifests written before fragments were forced into id order (Lance 0.10 and
+/// earlier) and manifests with duplicate fragment ids (Lance 0.16 and earlier)
+/// are still readable -- neither is rejected on open. A lookup that trusted the
+/// sorted-by-id invariant would hand back a different fragment's data.
+#[rstest]
+#[case::unsorted(vec![3, 1, 2, 0])]
+#[case::duplicate_ids(vec![0, 0, 2, 3])]
+#[tokio::test]
+async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let by_id: HashMap<u64, Fragment> = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.clone()))
+        .collect();
+    let fragments: Vec<Fragment> = ids.iter().map(|id| by_id[id].clone()).collect();
+    install_fragments(&mut dataset, fragments);
+
+    for id in ids.iter().map(|id| *id as usize) {
+        let fragment = dataset.get_fragment(id).unwrap();
+        assert_eq!(
+            fragment.id(),
+            id,
+            "get_fragment({id}) returned the wrong fragment"
+        );
+        assert_eq!(
+            fragment.count_rows(None).await.unwrap(),
+            10,
+            "get_fragment({id}) returned unreadable metadata"
+        );
+    }
+    assert!(dataset.get_fragment(4).is_none());
+}
+
+async fn write_tiny_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+    Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+        .await
+        .unwrap()
+}
+
+/// `drop` deletes whatever path it is handed, so the guard must accept a real dataset
+/// even when the user keeps unmanaged files beside it.
+#[rstest]
+#[case::committed_dataset(&[], true)]
+// `cleanup_preserves_unmanaged_dirs_and_files` establishes that a dataset may sit
+// alongside unmanaged files, so those must not block a drop either.
+#[case::dataset_with_unmanaged_files(&["images/clip.mp4", "misc/notes.txt"], true)]
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_accepts_committed_dataset(
+    #[case] extra_entries: &[&str],
+    #[case] expected_ok: bool,
+) {
+    let test_dir = TempStdDir::default();
+    let dataset_dir = test_dir.as_ref().join("t.lance");
+    write_tiny_dataset(dataset_dir.to_str().unwrap()).await;
+    for entry in extra_entries {
+        let path = dataset_dir.join(entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"unmanaged").unwrap();
+    }
+
+    let (object_store, base) = ObjectStore::from_uri(dataset_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    let result = validate_dataset_root_for_drop(&object_store, &base).await;
+
+    assert_eq!(
+        result.is_ok(),
+        expected_ok,
+        "unexpected outcome: {result:?}"
+    );
+}
+
+/// A manifest under a detached version name is still a manifest, so a root holding only
+/// one is a dataset root.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_accepts_detached_manifest() {
+    let source_dir = TempStdDir::default();
+    let source = source_dir.as_ref().join("t.lance");
+    let dataset = write_tiny_dataset(source.to_str().unwrap()).await;
+    let manifest_name = dataset
+        .manifest_location()
+        .path
+        .filename()
+        .unwrap()
+        .to_string();
+    let manifest_bytes = std::fs::read(source.join("_versions").join(manifest_name)).unwrap();
+
+    let test_dir = TempStdDir::default();
+    let detached_dir = test_dir.as_ref().join("_versions");
+    std::fs::create_dir_all(&detached_dir).unwrap();
+    std::fs::write(
+        detached_dir.join("d9223372036854775808.manifest"),
+        &manifest_bytes,
+    )
+    .unwrap();
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .unwrap();
+}
+
+/// A namespace may reserve a table name without ever writing a manifest, and dropping
+/// that reservation has to keep working.
+#[rstest]
+#[case::declared(".lance-reserved")]
+#[case::deregistered(".lance-deregistered")]
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_accepts_namespace_marker(#[case] marker: &str) {
+    let test_dir = TempStdDir::default();
+    std::fs::write(test_dir.as_ref().join(marker), b"table t").unwrap();
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .unwrap();
+}
+
+/// Anything short of a readable manifest must fail closed, because the delete this
+/// guards is recursive and unrecoverable. A file merely sitting under `_versions/`, or
+/// merely named like a manifest, is not evidence: either is trivial to end up with in a
+/// storage root that holds irreplaceable data.
+#[rstest]
+#[case::unrelated_file_under_versions(&["_versions/README", "reports/q1.csv"])]
+#[case::unreadable_manifest(&["_versions/1.manifest", "reports/q1.csv"])]
+#[case::unreadable_v2_manifest(&["_versions/00000000000000000001.manifest", "reports/q1.csv"])]
+#[case::unreadable_detached_manifest(&["_versions/d9223372036854775808.manifest"])]
+#[case::staged_manifest(&["_versions/1.manifest-2e1f0c3a", "data/0.lance"])]
+#[case::data_files_only(&["data/0.lance"])]
+#[case::layout_dirs_only(&["data/0.lance", "tree/branch/data/0.lance"])]
+#[case::home_directory(&["data/0.lance", "notes.txt"])]
+#[case::unrelated_directory(&["reports/q1.csv"])]
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_rejects_paths_without_a_readable_manifest(
+    #[case] entries: &[&str],
+) {
+    let test_dir = TempStdDir::default();
+    for entry in entries {
+        let path = test_dir.as_ref().join(entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a manifest").unwrap();
+    }
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    let err = validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .expect_err("must not authorize a recursive delete without a readable manifest");
+
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("no readable Lance manifest"),
+        "{err}"
+    );
+}
+
+/// A zero-length manifest reads as corrupt rather than as I/O failure, so it must be
+/// reported as "not a dataset root" like any other unreadable manifest.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_rejects_empty_manifest() {
+    let test_dir = TempStdDir::default();
+    let versions = test_dir.as_ref().join("_versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    std::fs::write(versions.join("1.manifest"), b"").unwrap();
+
+    let (object_store, base) = ObjectStore::from_uri(test_dir.to_str().unwrap())
+        .await
+        .unwrap();
+    let err = validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .expect_err("an empty manifest is not evidence of a dataset");
+
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+}
+
+/// The parent of a dataset is not a dataset, however Lance-looking its children are.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_rejects_warehouse_root() {
+    let test_dir = TempStdDir::default();
+    let warehouse = test_dir.as_ref().join("warehouse");
+    write_tiny_dataset(warehouse.join("t.lance").to_str().unwrap()).await;
+
+    let (object_store, base) = ObjectStore::from_uri(warehouse.to_str().unwrap())
+        .await
+        .unwrap();
+    let err = validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .expect_err("a warehouse root must not be droppable");
+
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+}
+
+/// A path that does not exist must stay a not-found error from the delete itself
+/// rather than becoming a validation error, so callers keep the error kind they
+/// already handle.
+#[tokio::test]
+async fn test_validate_dataset_root_for_drop_allows_missing_path() {
+    let test_dir = TempStdDir::default();
+    let missing = test_dir.as_ref().join("does_not_exist");
+
+    let (object_store, base) = ObjectStore::from_uri(missing.to_str().unwrap())
+        .await
+        .unwrap();
+
+    validate_dataset_root_for_drop(&object_store, &base)
+        .await
+        .unwrap();
+}
+
+/// Restore and clone rebuild a manifest from a stored one, never passing
+/// through the Arrow-schema conversion that validates a primary key. Both write
+/// through `write_manifest_file`, so the invariant is enforced there — a schema
+/// that reached a manifest before the write paths were validated cannot be
+/// carried forward into a new version.
+#[tokio::test]
+async fn write_manifest_file_rejects_a_nullable_primary_key() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Stand in for a manifest stored before the write paths were validated.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let id_field = manifest
+        .schema
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    id_field.unenforced_primary_key_position = Some(1);
+    id_field.nullable = true;
+    manifest.version += 1;
+
+    let err = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            timestamp: None,
+            use_stable_row_ids: false,
+            use_legacy_format: None,
+            storage_format: None,
+            disable_transaction_file: false,
+            migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        // Previously classified from a None inline copy, which validated.
+        true,
+    )
+    .await
+    .expect_err("a nullable primary key must not reach a manifest");
+    assert!(
+        format!("{err:?}").contains("must not be nullable"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Stand in for a table written by a released version, where the metadata path
+/// could install a primary key on a column that permits nulls. The forging goes
+/// through `write_manifest_file` classified as schema-preserving, which is
+/// precisely the hole those versions had, so the resulting manifest is the one
+/// an upgrade actually finds on disk.
+///
+/// The two rows are `[1, NULL]`, so the null the key must not hold is really
+/// present and the repairing delete has something to remove.
+async fn write_dataset_with_a_legacy_nullable_primary_key(uri: &str) -> Dataset {
+    forge_legacy_nullable_primary_key(uri, false).await
+}
+
+/// The originally reported sequence initialised MemWAL *before* the key was
+/// installed, so `initialize_mem_wal`'s own check never saw it. That ordering
+/// matters: a MemWAL transaction carries mem-table state, so it is far more
+/// likely to outgrow the inline limit than a bare config update.
+async fn forge_legacy_nullable_primary_key(uri: &str, with_mem_wal: bool) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+        .await
+        .unwrap();
+
+    if with_mem_wal {
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect("MemWAL initialises while the key is still valid");
+    }
+
+    // Carried forward explicitly: passing None here would drop the MemWAL index
+    // the fixture just installed.
+    let indices = dataset.load_indices().await.unwrap().as_ref().clone();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let id_field = manifest
+        .schema
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    id_field.unenforced_primary_key_position = Some(1);
+    manifest.version += 1;
+
+    // Committed below `write_manifest_file` on purpose. Going through it would
+    // make building the fixture depend on the very validation these tests
+    // exercise, so a regression would show up as a fixture that cannot be
+    // built rather than as the behaviour under test changing.
+    manifest.set_timestamp(crate::dataset::timestamp_to_nanos(None));
+    manifest.update_max_fragment_id();
+    dataset
+        .commit_handler
+        .commit(
+            &mut manifest,
+            (!indices.is_empty()).then_some(indices),
+            &dataset.base,
+            dataset.object_store.as_ref(),
+            lance_table::io::commit::write_manifest_file_to_path,
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .expect("forging a legacy manifest must not itself be blocked");
+
+    Dataset::open(uri).await.unwrap()
+}
+
+/// An unrelated config update leaves the key exactly as it found it, so it is
+/// exempt -- and must stay exempt no matter how large its payload is. The
+/// disposition comes from the operation; only the inline copy depends on size.
+#[tokio::test]
+async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
+    use crate::io::commit::MAX_INLINE_TRANSACTION_BYTES;
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+
+    dataset
+        .update_config([("unrelated".to_string(), "small".to_string())])
+        .await
+        .expect("a small unrelated config update must be exempt");
+    let after_small = dataset.version().version;
+
+    dataset
+        .update_config([(
+            "large-unrelated".to_string(),
+            "x".repeat(2 * MAX_INLINE_TRANSACTION_BYTES),
+        )])
+        .await
+        .expect("the same update must stay exempt once its bytes stop inlining");
+
+    assert!(
+        dataset.version().version > after_small,
+        "the spilling update must have committed a new version"
+    );
+}
+
+/// The repair path: drop the offending rows, then tighten the column. Both have
+/// to be reachable on a table that already carries the bad key, or the only
+/// remaining fix is a full overwrite.
+#[tokio::test]
+async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+
+    dataset
+        .delete("id IS NULL")
+        .await
+        .expect("removing the offending rows must not be blocked");
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .await
+        .expect("tightening the column completes the repair");
+
+    let id_field = dataset
+        .schema()
+        .fields
+        .iter()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    assert!(
+        !id_field.nullable,
+        "the key column must end up non-nullable"
+    );
+}
+
+/// The MemWAL variant of the repair path. This is the state the original report
+/// was about, and the one a size-coupled gate blocks: its transactions carry
+/// An overlay attaches files to existing fragments; it carries no schema, so a
+/// dataset that already holds a nullable primary key must still be able to
+/// commit one. `DataOverlay` was missing from the exempt classifier, which
+/// closed that path for exactly the legacy datasets this validation is meant to
+/// leave repairable.
+#[tokio::test]
+async fn an_overlay_commits_on_a_legacy_nullable_primary_key() {
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::transaction::Operation;
+
+    let test_dir = TempStrDir::default();
+    let dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+    let read_version = dataset.manifest.version;
+
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay { groups: vec![] },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .expect("an overlay leaves the schema alone, so the legacy key must not block it");
+
+    assert_eq!(dataset.manifest.version, read_version + 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+}
+
+/// mem-table state, so they stop inlining long before a config update does.
+#[tokio::test]
+async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = forge_legacy_nullable_primary_key(&test_dir, true).await;
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == lance_index::mem_wal::MEM_WAL_INDEX_NAME),
+        "the fixture must really have MemWAL initialised"
+    );
+
+    dataset
+        .update_config([("unrelated".to_string(), "small".to_string())])
+        .await
+        .expect("an unrelated config update must be exempt");
+
+    dataset
+        .delete("id IS NULL")
+        .await
+        .expect("removing the offending rows must not be blocked under MemWAL");
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 }

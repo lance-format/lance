@@ -6,7 +6,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_array::builder::{
@@ -16,8 +15,7 @@ use arrow_array::types::Int32Type;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
-use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_table::format::IndexMetadata;
 use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
@@ -26,21 +24,16 @@ use uuid::Uuid;
 use crate::Dataset;
 use crate::dataset::files::arrow::{TRACKED_FILES_SCHEMA, TrackedFileBatch};
 use crate::dataset::files::file_types::FileType;
+use crate::dataset::files::scan::{ManifestScan, scan_manifests};
 use crate::dataset::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use lance_core::Result;
 use lance_table::io::deletion::relative_deletion_file_path;
-use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 
 mod arrow;
 mod file_types;
+pub(crate) mod scan;
 
 const BATCH_SIZE: usize = 4096;
-/// Memory budget for in-flight manifests (estimated in-memory size).
-const MANIFEST_MEMORY_BUDGET: usize = 1024 * 1024 * 1024; // 1 GB
-/// Estimated ratio of in-memory size to on-disk size for manifests. Found
-/// empirically; manifests are protobuf with significant decompression and
-/// allocator overhead once parsed.
-const MANIFEST_DECOMPRESSION_RATIO: usize = 4;
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     match path.prefix_match(prefix) {
@@ -276,12 +269,6 @@ pub struct TrackedFilesOptions {
     pub progress: Option<Box<dyn Fn(TrackedFilesProgress) + Send + Sync>>,
 }
 
-// A `ManifestLocation` is ~100 bytes, so a 50k-slot mpsc channel costs ~5 MB
-// in the worst case. That's enough headroom for the lister to run well ahead
-// of the reader on datasets with hundreds of thousands of manifests, while
-// still bounding memory.
-const MAX_BUFFERED_LOCATIONS: usize = 50_000;
-
 impl Dataset {
     /// Returns one row per (version, file) for every file referenced in any manifest.
     ///
@@ -309,201 +296,72 @@ impl Dataset {
         &self,
         options: TrackedFilesOptions,
     ) -> SendableRecordBatchStream {
-        use lance_table::io::commit::ManifestLocation;
-
-        let base = self.base.clone();
         let uri = self.uri().to_string();
         let object_store = self.object_store.clone();
-        let commit_handler = self.commit_handler.clone();
+        let base = self.base.clone();
 
         // Pipeline architecture:
         //
-        // Lister ──► tx_locations ──► Reader ──┬──► tx_manifest ──► Emitter ──► tx (output)
-        //                                      └──► tx_indexes  ──► IndexLister ──► tx (output)
+        // scan_manifests ──► Emitter ──┬──► tx (output)
+        //                              └──► tx_indexes ──► IndexLister ──► tx (output)
+        //
+        // The Lister and Reader stages live in `scan::scan_manifests`, shared
+        // with the keep-set walk.
+        let ManifestScan { stream, total, .. } = scan_manifests(self, options.min_version);
 
         // Output channel: Emitter and IndexLister both send batches here.
         let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(4);
-        // Location channel: Lister -> Reader. Large buffer since locations are
-        // small (~100 bytes each) and we want the lister to run ahead.
-        let (tx_locations, mut rx_locations) =
-            tokio::sync::mpsc::channel::<ManifestLocation>(MAX_BUFFERED_LOCATIONS);
-        // Manifest channel: Reader -> Emitter (small buffer for backpressure
-        // since manifests can be large).
-        let (tx_manifest, mut rx_manifest) =
-            tokio::sync::mpsc::channel::<(Arc<lance_table::format::Manifest>, String, usize)>(2);
-        // Index channel: Reader -> IndexLister.
+        // Index channel: Emitter -> IndexLister.
         let (tx_indexes, mut rx_indexes) =
             tokio::sync::mpsc::channel::<(u64, Vec<IndexMetadata>)>(8);
 
-        // Tracks estimated in-memory size of in-flight manifests. Reader adds
-        // before sending; Emitter subtracts after processing.
-        let inflight_mem = Arc::new(AtomicUsize::new(0));
-        let mem_notify = Arc::new(tokio::sync::Notify::new());
-
-        // Progress: total is set by Lister once listing finishes, read by Emitter.
-        let total_manifests: Arc<std::sync::OnceLock<usize>> = Arc::new(std::sync::OnceLock::new());
-
-        // --- Lister task ---
-        // Lists manifest locations, applies min_version filter, and counts the
-        // total. Locations are lightweight so we buffer up to MAX_BUFFERED_LOCATIONS.
-        let tx_err_lister = tx.clone();
-        let os_lister = object_store.clone();
-        let base_lister = base.clone();
-        let total_manifests_lister = total_manifests.clone();
-        let min_version = options.min_version;
-        tokio::spawn(async move {
-            let result: lance_core::Result<()> = async {
-                let mut locations =
-                    commit_handler.list_manifest_locations(&base_lister, &os_lister, false);
-                let mut count = 0usize;
-                while let Some(loc) = locations.next().await {
-                    let loc = loc?;
-                    if let Some(min_v) = min_version
-                        && loc.version < min_v
-                    {
-                        continue;
-                    }
-                    count += 1;
-                    if tx_locations.send(loc).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                let _ = total_manifests_lister.set(count);
-                Ok(())
-            }
-            .await;
-            if let Err(e) = result {
-                let _ = tx_err_lister
-                    .send(Err(datafusion::error::DataFusionError::from(e)))
-                    .await;
-            }
-        });
-
-        // --- Reader task ---
-        // Reads manifests with memory-aware parallelism and fans out to
-        // Emitter (file batches) and IndexLister (index metadata).
-        let tx_err_reader = tx.clone();
-        let os_reader = object_store.clone();
-        let base_reader = base.clone();
-        let inflight_mem_reader = inflight_mem.clone();
-        let mem_notify_reader = mem_notify.clone();
-        tokio::spawn(async move {
-            let result: lance_core::Result<()> = async {
-                let max_parallelism = os_reader.io_parallelism();
-
-                type ManifestResult = lance_core::Result<(
-                    Arc<lance_table::format::Manifest>,
-                    String,
-                    Vec<IndexMetadata>,
-                    usize,
-                )>;
-                let mut in_flight: FuturesUnordered<
-                    std::pin::Pin<Box<dyn Future<Output = ManifestResult> + Send>>,
-                > = FuturesUnordered::new();
-                let mut locations_exhausted = false;
-
-                loop {
-                    let can_launch = !locations_exhausted
-                        && in_flight.len() < max_parallelism
-                        && (in_flight.is_empty()
-                            || inflight_mem_reader.load(Ordering::Acquire)
-                                < MANIFEST_MEMORY_BUDGET);
-
-                    if in_flight.is_empty() && !can_launch {
-                        break;
-                    }
-
-                    tokio::select! {
-                        biased;
-                        // Always drain completed reads first.
-                        Some(item) = in_flight.next(), if !in_flight.is_empty() => {
-                            let (manifest, manifest_path, indexes, estimated) = item?;
-                            let version = manifest.version;
-                            if tx_manifest
-                                .send((manifest, manifest_path, estimated))
-                                .await
-                                .is_err()
-                            {
-                                return Ok(());
-                            }
-                            if !indexes.is_empty()
-                                && tx_indexes.send((version, indexes)).await.is_err()
-                            {
-                                return Ok(());
-                            }
-                        }
-                        // Receive next location and start a read.
-                        loc = rx_locations.recv(), if can_launch => {
-                            match loc {
-                                Some(loc) => {
-                                    let estimated =
-                                        loc.size.unwrap_or(0) as usize
-                                            * MANIFEST_DECOMPRESSION_RATIO;
-                                    inflight_mem_reader.fetch_add(estimated, Ordering::AcqRel);
-
-                                    let os = os_reader.clone();
-                                    let base = base_reader.clone();
-                                    in_flight.push(Box::pin(async move {
-                                        let manifest =
-                                            read_manifest(&os, &loc.path, loc.size).await?;
-                                        let indexes =
-                                            read_manifest_indexes(&os, &loc, &manifest).await?;
-                                        let manifest_path =
-                                            remove_prefix(&loc.path, &base).to_string();
-                                        lance_core::Result::Ok((
-                                            Arc::new(manifest),
-                                            manifest_path,
-                                            indexes,
-                                            estimated,
-                                        ))
-                                    }));
-                                }
-                                None => {
-                                    locations_exhausted = true;
-                                }
-                            }
-                        }
-                        // Wake up when Emitter frees memory.
-                        _ = mem_notify_reader.notified(),
-                            if !can_launch && !in_flight.is_empty() => {}
-                    }
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = result {
-                let _ = tx_err_reader
-                    .send(Err(datafusion::error::DataFusionError::from(e)))
-                    .await;
-            }
-        });
-
         // --- Emitter task ---
-        // Converts manifests into file-row batches, releases memory budget,
-        // and reports progress.
+        // Converts scanned manifests into file-row batches, forwards index
+        // metadata to the IndexLister, and reports progress. Dropping each
+        // `ScannedManifest` releases its share of the scan's memory budget.
         let tx_emitter = tx.clone();
         let uri_emitter = uri.clone();
         let progress_cb = options.progress;
         tokio::spawn(async move {
+            let mut stream = stream;
             let mut processed = 0usize;
-            while let Some((manifest, manifest_path, estimated)) = rx_manifest.recv().await {
-                let batches = manifest_file_batches(&manifest, &uri_emitter, &manifest_path);
+            while let Some(scanned) = stream.next().await {
+                let mut scanned = match scanned {
+                    Ok(scanned) => scanned,
+                    Err(e) => {
+                        let _ = tx_emitter
+                            .send(Err(datafusion::error::DataFusionError::from(e)))
+                            .await;
+                        return;
+                    }
+                };
+
+                let batches =
+                    manifest_file_batches(&scanned.manifest, &uri_emitter, &scanned.manifest_path);
                 for batch_result in batches {
                     let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
                     if tx_emitter.send(df_result).await.is_err() {
                         return;
                     }
                 }
-                drop(manifest);
-                inflight_mem.fetch_sub(estimated, Ordering::AcqRel);
-                mem_notify.notify_one();
+
+                // Fan out to the index lister only after this manifest's rows
+                // are out and its memory is released. Doing it earlier would
+                // block file-row output on a full index channel while still
+                // holding the manifest's share of the scan's memory budget.
+                let version = scanned.manifest.version;
+                let indexes = std::mem::take(&mut scanned.indexes);
+                drop(scanned);
+
+                if !indexes.is_empty() && tx_indexes.send((version, indexes)).await.is_err() {
+                    return;
+                }
 
                 processed += 1;
                 if let Some(ref cb) = progress_cb {
                     cb(TrackedFilesProgress {
                         manifests_processed: processed,
-                        manifests_total: total_manifests.get().copied(),
+                        manifests_total: total.get().copied(),
                     });
                 }
             }

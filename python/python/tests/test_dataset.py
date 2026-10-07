@@ -454,13 +454,19 @@ def test_versions(tmp_path: Path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table1, base_dir)
 
-    assert len(lance.dataset(base_dir).versions()) == 1
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 1
+    assert dataset.version_refs() == [{"version": 1}]
+    assert dataset.latest_version == dataset.version_refs()[-1]["version"]
 
     table2 = pa.Table.from_pylist([{"s": "one"}, {"s": "two"}])
     time.sleep(1)
     lance.write_dataset(table2, base_dir, mode="overwrite")
 
-    assert len(lance.dataset(base_dir).versions()) == 2
+    dataset = lance.dataset(base_dir)
+    assert len(dataset.versions()) == 2
+    assert dataset.version_refs() == [{"version": 1}, {"version": 2}]
+    assert dataset.latest_version == dataset.version_refs()[-1]["version"]
 
     v1, v2 = lance.dataset(base_dir).versions()
     assert v1["version"] == 1
@@ -840,6 +846,51 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
+def test_slice(tmp_path: Path, data_storage_version: str):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(
+        table, base_dir, data_storage_version=data_storage_version, max_rows_per_file=10
+    )
+    dataset = lance.dataset(base_dir)
+
+    # Equivalent to take(range(start, end))
+    assert dataset.slice(10, 20) == dataset.take(list(range(10, 20)))
+
+    # Basic range within a single fragment
+    assert dataset.slice(5, 8) == table.slice(5, 3)
+
+    # Range spanning multiple fragments
+    assert dataset.slice(5, 25) == table.slice(5, 20)
+
+    # Skipping entire fragments
+    assert dataset.slice(50, 75) == table.slice(50, 25)
+
+    # Full dataset
+    assert dataset.slice(0, 100) == table.slice(0, 100)
+
+    # Empty range (start == end)
+    assert dataset.slice(10, 10) == table.slice(10, 0)
+
+    # Range extending past the end of the dataset
+    assert dataset.slice(90, 1000) == table.slice(90, 10)
+
+    # Range entirely past the end of the dataset
+    assert dataset.slice(100, 110) == table.slice(100, 0)
+
+    # With column projection
+    assert dataset.slice(10, 20, columns=["a"]) == table.select(["a"]).slice(10, 10)
+
+    # Invalid start
+    with pytest.raises(ValueError, match="start must be non-negative"):
+        dataset.slice(-1, 10)
+
+    # end < start
+    with pytest.raises(ValueError, match="must be >= start"):
+        dataset.slice(10, 5)
 
 
 def test_take_rowid_rowaddr(tmp_path: Path):
@@ -1714,6 +1765,10 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     ds = lance.write_dataset(table, base_dir, mode="append")
 
     assert len(ds.versions()) == 4
+    with pytest.raises(OSError, match="retain_versions must be greater than 0, got 0"):
+        ds.cleanup_old_versions(retain_versions=0)
+    assert len(ds.versions()) == 4
+
     stats = ds.cleanup_old_versions(retain_versions=3)
     assert stats.old_versions == 1
     assert stats.data_files_removed == 1
@@ -1722,6 +1777,24 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert stats.deletion_files_removed == 0
     assert len(ds.versions()) == 3
     assert ds.count_rows() == len(ds.to_table())
+
+
+def test_cleanup_specific_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_specific_versions"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert [v["version"] for v in ds.versions()] == [1, 2, 3, 4]
+
+    stats = ds.cleanup_old_versions(versions=[2])
+    assert stats.old_versions == 1
+    assert [v["version"] for v in ds.versions()] == [1, 3, 4]
 
 
 def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
@@ -1744,6 +1817,27 @@ def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+def _wait_until_latest_version_is_older_than(dataset, older_than_seconds):
+    latest_timestamp = dataset.versions()[-1]["timestamp"]
+    threshold = latest_timestamp + timedelta(seconds=older_than_seconds)
+    deadline = time.monotonic() + older_than_seconds + 1
+
+    while True:
+        now = (
+            datetime.now(latest_timestamp.tzinfo)
+            if latest_timestamp.tzinfo is not None
+            else datetime.now()
+        )
+        remaining = (threshold - now).total_seconds()
+        if remaining < 0:
+            return
+
+        timeout_remaining = deadline - time.monotonic()
+        if timeout_remaining <= 0:
+            pytest.fail("latest dataset version did not pass the cleanup age threshold")
+        time.sleep(min(remaining + 0.05, timeout_remaining))
+
+
 def test_auto_cleanup(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1758,11 +1852,11 @@ def test_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    dataset = lance.dataset(base_dir)
+    _wait_until_latest_version_is_older_than(dataset, 1)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
-    dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 2
 
 
@@ -1777,7 +1871,7 @@ def test_config_update_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 0.001)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1813,12 +1907,13 @@ def test_auto_cleanup_invalid(tmp_path):
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
 
-    time.sleep(3)
+    dataset = lance.dataset(base_dir)
+    assert "lance.auto_cleanup.interval" not in dataset.config()
+    assert "lance.auto_cleanup.older_than" not in dataset.config()
 
     lance.write_dataset(
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
-    dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 4
 
 
@@ -1836,7 +1931,7 @@ def test_enable_disable_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 1)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1844,12 +1939,14 @@ def test_enable_disable_auto_cleanup(tmp_path):
 
     # this is a transactional commit, so will increase a version
     ds.optimize.disable_auto_cleanup()
+    assert "lance.auto_cleanup.interval" not in ds.config()
+    assert "lance.auto_cleanup.older_than" not in ds.config()
 
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 1)
 
     # wait to see if cleanup would be trigger
     lance.write_dataset(table, base_dir, mode="append")
@@ -1910,10 +2007,12 @@ def test_strict_overwrite(tmp_path: Path):
     )
     with pytest.raises(
         OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
-    ):
+    ) as exc_info:
         lance.LanceDataset.commit(
             base_dir, operation, read_version=dataset_v1.version, max_retries=0
         )
+    # CommitConflict means commit-step retries were exhausted; it is safe to retry.
+    assert exc_info.value.retryable is True
 
 
 def test_commit_timeout(tmp_path: Path):
@@ -2150,6 +2249,68 @@ def test_merge_with_commit(tmp_path: Path):
     tbl = dataset.to_table()
 
     assert tbl == expected
+
+
+@pytest.mark.parametrize(
+    ("delete_predicate", "expected_ids"),
+    [
+        pytest.param("id < 50", list(range(50, 150)), id="leading"),
+        pytest.param(
+            "id >= 50 AND id < 100",
+            list(range(50)) + list(range(100, 150)),
+            id="middle",
+        ),
+        pytest.param("id >= 100", list(range(100)), id="trailing"),
+    ],
+)
+def test_merge_columns_with_deleted_batch_commit(
+    tmp_path: Path, delete_predicate: str, expected_ids: list
+):
+    # A fully deleted read batch must still contribute its rows to the new data
+    # file, otherwise the fragment's data files disagree on the physical row
+    # count. The deleted run is placed at the start, middle, and end because the
+    # updater can only borrow a placeholder row from a batch that has live rows.
+    base_dir = tmp_path / "test"
+    table = pa.table({"id": range(150), "value": range(150)})
+    dataset = lance.write_dataset(table, base_dir, max_rows_per_file=200)
+
+    dataset.delete(delete_predicate)
+    assert dataset.count_rows() == 100
+
+    merged_frags = []
+    schema = None
+    for frag in dataset.get_fragments():
+        live_ids = frag.scanner(columns=["id"]).to_table()["id"].to_pylist()
+        right_table = pa.table(
+            {"merged": pa.array([row_id * 10 for row_id in live_ids], pa.int64())},
+            schema=pa.schema([pa.field("merged", pa.int64(), nullable=False)]),
+        )
+        merged, schema = frag.merge_columns(right_table, batch_size=50)
+        merged_frags.append(merged)
+
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=dataset.version,
+    )
+    dataset.validate()
+
+    assert dataset.to_table() == pa.table(
+        {
+            "id": expected_ids,
+            "value": expected_ids,
+            "merged": [row_id * 10 for row_id in expected_ids],
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field("value", pa.int64()),
+                # The blanks written for the deleted rows are copies of a live row,
+                # so the merged column stays non-nullable end to end.
+                pa.field("merged", pa.int64(), nullable=False),
+            ]
+        ),
+    )
 
 
 def test_merge_with_schema_holes(tmp_path: Path):
@@ -2392,7 +2553,7 @@ def test_merge_data_legacy(tmp_path: Path):
 
     # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
-    with pytest.raises(OSError, match=r"Join produced null values for type: Int64"):
+    with pytest.raises(OSError, match=r"Column 'c' has null values of type: Int64"):
         dataset.merge(new_tab, "a")
 
 
@@ -2499,6 +2660,38 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() > 0
     dataset.delete("true")
     assert dataset.count_rows() == 0
+
+
+@pytest.mark.parametrize(
+    "predicate, remaining_ids",
+    [
+        pytest.param(pc.field("s") != "C:\\temp", [0, 3], id="escaped_string"),
+        pytest.param(
+            pc.field("s").isin(["C:\\temp", 'say "hi"']),
+            [2, 3],
+            id="isin_and_quote",
+        ),
+        pytest.param(~(pc.field("s") == "plain"), [2, 3], id="negation"),
+        pytest.param(pc.field("s").is_null(), [0, 1, 2], id="is_null"),
+    ],
+)
+def test_delete_pyarrow_expression(tmp_path: Path, predicate, remaining_ids):
+    data = pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "vec": pa.array(
+                [[0.0], [1.0], [2.0], [3.0]], type=pa.list_(pa.float32(), 1)
+            ),
+            "s": ["C:\\temp", 'say "hi"', "plain", None],
+        }
+    )
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+
+    deleted_rows = len(data) - len(remaining_ids)
+    assert dataset.count_rows(filter=predicate) == deleted_rows
+    assert dataset.delete(predicate) == {"num_deleted_rows": deleted_rows}
+    assert sorted(dataset.to_table()["id"].to_pylist()) == remaining_ids
 
 
 def check_merge_stats(merge_dict, expected):
@@ -2699,6 +2892,147 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert dataset.count_rows() == 12
     # Newly inserted rows (keys 10, 11) get NULL for column `c` because
     # the source did not provide a value for it and `c` is nullable.
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+
+@pytest.mark.parametrize("container", ["struct", "list"])
+def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: str):
+    blob_field = lance.blob_field("blob")
+    blob_values = lance.blob_array([b"one", b"two"])
+    if container == "struct":
+        nested_values = pa.StructArray.from_arrays(
+            [blob_values],
+            fields=[blob_field],
+        )
+        expected_nested = [{"blob": b"one"}, {"blob": b"two"}]
+    else:
+        nested_values = pa.ListArray.from_arrays(
+            pa.array([0, 1, 2], type=pa.int32()),
+            blob_values,
+            type=pa.list_(blob_field),
+        )
+        expected_nested = [[b"one"], [b"two"]]
+
+    dataset_uri = tmp_path / f"partial_nested_blob_{container}"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "nested": nested_values,
+                "other": pa.array([10, 20]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+    source = pa.table({"id": pa.array([2]), "other": pa.array([200])})
+
+    dataset.merge_insert("id").when_matched_update_all().execute(source)
+
+    result = (
+        lance.dataset(dataset_uri).to_table(blob_handling="all_binary").sort_by("id")
+    )
+    assert result["other"].to_pylist() == [10, 200]
+    assert result["nested"].to_pylist() == expected_nested
+
+
+@pytest.mark.parametrize(
+    "base_version,patch_version",
+    [("2.0", "2.2"), ("2.2", "2.0"), ("2.1", "2.3"), ("2.3", "2.1")],
+)
+def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_version):
+    """`write_mode("rewrite_columns")` patches the source columns into the
+    fragments that already hold the matched rows.
+
+    Compare with `test_merge_insert_subcols`, which runs the same merge in the
+    default `"auto"` mode and gets whole rows rewritten into a new fragment
+    instead.
+    """
+    initial_data = pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "c": range(10, 20),
+        }
+    )
+    # Split across two fragments
+    dataset = lance.write_dataset(
+        initial_data,
+        tmp_path / "dataset",
+        max_rows_per_file=5,
+        data_storage_version=base_version,
+    )
+    fragments_before = [f.fragment_id for f in dataset.get_fragments()]
+
+    new_values = pa.table(
+        {
+            "a": range(3, 5),
+            "b": range(20, 22),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_matched_update_all()
+        .write_mode("rewrite_columns")
+        .data_storage_version(patch_version)
+        .execute(new_values)
+    )
+
+    # No fragment is added, removed, or renumbered, and column `c` (absent from
+    # the source) is neither read nor written.
+    assert [f.fragment_id for f in dataset.get_fragments()] == fragments_before
+    expected = pa.table(
+        {
+            "a": range(10),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 9],
+            "c": range(10, 20),
+        }
+    )
+    dataset = lance.dataset(dataset.uri)
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == {base_version, patch_version}
+    assert dataset.to_table().sort_by("a") == expected
+    assert dataset.to_table(columns=["c", "b", "a"], filter="b >= 20") == (
+        expected.filter(pc.greater_equal(expected["b"], 20)).select(["c", "b", "a"])
+    )
+    assert dataset.take([9, 3, 0, 4, 3]) == expected.take([9, 3, 0, 4, 3])
+
+    # Patching columns cannot add rows, so asking for it explicitly on a merge
+    # that also inserts is rejected rather than quietly rewriting whole rows.
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    with pytest.raises(OSError, match="adds rows, which patching cannot do"):
+        (
+            dataset.merge_insert("a")
+            .when_not_matched_insert_all()
+            .when_matched_update_all()
+            .write_mode("rewrite_columns")
+            .execute(new_values)
+        )
+
+    # The same merge under the default mode picks the row-rewrite sink.
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
     expected = pa.table(
         {
             "a": range(0, 12),
@@ -3439,6 +3773,42 @@ def test_merge_insert_explain_analyze_plan():
     assert "num_files_written" in analysis
 
 
+def test_merge_insert_analyze_plan_matches_execute_routing():
+    """analyze_plan must report the plan the given source would actually run.
+
+    execute() wraps a materialized source in an in-memory table, which reports
+    exact statistics; a stream reports none. DataFusion picks the collected side of
+    the join from those statistics and from the two sides' sizes, so the same merge
+    plans differently depending on which one it is handed. analyze_plan used to
+    coerce every input to a stream, so it reported the stream's plan whatever it
+    was given.
+    """
+    data = pa.table({"id": range(64), "value": [i * 10 for i in range(64)]})
+    dataset = lance.write_dataset(data, "memory://test-merge-analyze-routing")
+
+    def builder():
+        return (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+        )
+
+    # Two source rows against the target's 64 keeps the source the smaller side,
+    # which is what lets the join collect it. Raise it above 64 and the join
+    # collects the target instead and the join type stays Right.
+    source = pa.table({"id": [1, 100], "value": [999, 999]})
+
+    materialized = builder().analyze_plan(source)
+    assert "DataSourceExec" in materialized, materialized
+    assert "StreamingTableExec" not in materialized, materialized
+    assert "join_type=Left" in materialized, materialized
+
+    streaming = builder().analyze_plan(source.to_reader())
+    assert "StreamingTableExec" in streaming, streaming
+    assert "DataSourceExec" not in streaming, streaming
+    assert "join_type=Right" in streaming, streaming
+
+
 def test_merge_insert_use_index():
     """Test that use_index parameter controls whether indices are used."""
     data = pa.table({"id": range(100), "value": [i * 10 for i in range(100)]})
@@ -3645,6 +4015,24 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        pytest.param(pc.field("p") == "C:\\data\\a.csv", id="escaped_string"),
+        pytest.param(pc.field("p").isin(["C:\\data\\a.csv"]), id="isin"),
+    ],
+)
+def test_update_pyarrow_expression(tmp_path: Path, where):
+    data = pa.table(
+        {"id": [0, 1, 2], "p": ["C:\\data\\a.csv", "x", "y"], "n": [0, 0, 0]}
+    )
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+
+    assert dataset.update({"n": "1"}, where=where) == {"num_rows_updated": 1}
+    assert dataset.to_table().sort_by("id")["n"].to_pylist() == [1, 0, 0]
 
 
 def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
@@ -3878,6 +4266,267 @@ def test_update_with_retry_parameters(tmp_path: Path):
     expected = pa.table({"a": range(10), "b": range(1, 11)})
     assert dataset.to_table(columns=["a", "b"]) == expected
     check_update_stats(update_dict, (10,))
+
+
+@pytest.mark.parametrize(
+    "version", [None, "2.0", "2.1", "2.2", "2.3", "stable", "next"]
+)
+def test_update_exact_data_storage_version(tmp_path: Path, version):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}),
+        tmp_path / "dataset",
+        data_storage_version="2.1",
+        max_rows_per_file=1,
+    )
+
+    dataset.update({"value": "value + 1"}, data_storage_version=version)
+
+    files = [
+        file for fragment in dataset.get_fragments() for file in fragment.metadata.files
+    ]
+    exact = {None: "2.1", "stable": "2.2", "next": "2.3"}.get(version, version)
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}" for file in files
+    } == {exact}
+    assert dataset.data_storage_version == "2.1"
+    assert dataset.to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2],
+        "value": [11, 21],
+    }
+
+
+@pytest.mark.parametrize(
+    "version", [None, "2.0", "2.1", "2.2", "2.3", "stable", "next"]
+)
+def test_merge_insert_exact_data_storage_version(tmp_path: Path, version):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}),
+        tmp_path / "dataset",
+        data_storage_version="2.1",
+        max_rows_per_file=1,
+    )
+
+    builder = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    if version is not None:
+        builder.data_storage_version(version)
+    builder.execute(pa.table({"id": [2, 3], "value": [21, 30]}))
+
+    versions = {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    }
+    exact = {None: "2.1", "stable": "2.2", "next": "2.3"}.get(version, version)
+    assert versions == {"2.1", exact}
+    assert dataset.data_storage_version == "2.1"
+    assert dataset.to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3],
+        "value": [10, 21, 30],
+    }
+
+
+def _assert_mixed_version_reads(dataset, expected):
+    expected = expected.sort_by("id")
+    ordered = dataset.to_table(scan_in_order=True)
+    assert ordered.sort_by("id") == expected
+    assert dataset.to_table(columns=["value", "id"]).sort_by("id") == (
+        expected.select(["value", "id"])
+    )
+    assert dataset.to_table(filter="value >= 50").sort_by("id") == expected.filter(
+        pc.greater_equal(expected["value"], 50)
+    )
+    assert dataset.to_table(filter="value IS NULL").sort_by("id") == expected.filter(
+        pc.is_null(expected["value"])
+    )
+    # Updates can move rows to new fragments. Use scan order only for positional
+    # addressing; the full scan above is independently checked against the oracle.
+    indices = [len(ordered) - 1, 0, len(ordered) // 2, 0]
+    assert dataset.take(indices) == ordered.take(indices)
+    assert dataset.take(indices, columns=["value", "id"]) == ordered.take(
+        indices
+    ).select(["value", "id"])
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [
+        ("2.0", "2.1", "2.2", "2.3"),
+        ("2.1", "2.2", "2.3", "2.0"),
+        ("2.2", "2.3", "2.0", "2.1"),
+        ("2.3", "2.0", "2.1", "2.2"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["reencode", "try_binary_copy"])
+def test_mixed_version_mutations_preserve_data(tmp_path: Path, versions, mode):
+    data = pa.table(
+        {
+            "id": range(8),
+            "value": pa.array([10, None, 30, 40, 50, 60, None, 80], pa.int64()),
+            "label": ["zero", None, "", "你好", "four", "five", "six", "seven"],
+            "items": pa.array(
+                [[0], None, [], [None, 3], [4, 5], [], [6], [7]],
+                pa.list_(pa.int64()),
+            ),
+        }
+    )
+    uri = tmp_path / "dataset"
+    dataset = lance.write_dataset(
+        data.slice(0, 4), uri, max_rows_per_file=2, data_storage_version=versions[0]
+    )
+    _assert_mixed_version_reads(lance.dataset(uri), data.slice(0, 4))
+    dataset = lance.write_dataset(
+        data.slice(4),
+        dataset,
+        mode="append",
+        max_rows_per_file=2,
+        data_storage_version=versions[1],
+    )
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == set(versions[:2])
+    _assert_mixed_version_reads(lance.dataset(uri), data)
+
+    expected_rows = data.to_pylist()
+    dataset.update(
+        {"value": "coalesce(value, 0) + 100"},
+        where="id IN (1, 4)",
+        data_storage_version=versions[2],
+    )
+    expected_rows[1]["value"] = 100
+    expected_rows[4]["value"] = 150
+    _assert_mixed_version_reads(
+        lance.dataset(uri), pa.Table.from_pylist(expected_rows, schema=data.schema)
+    )
+
+    merged_rows = [
+        {"id": 2, "value": None, "label": "changed", "items": [9, None]},
+        {"id": 8, "value": 800, "label": "new", "items": []},
+    ]
+    (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .data_storage_version(versions[3])
+        .execute(pa.Table.from_pylist(merged_rows, schema=data.schema))
+    )
+    expected_rows[2] = merged_rows[0]
+    expected_rows.append(merged_rows[1])
+    _assert_mixed_version_reads(
+        lance.dataset(uri), pa.Table.from_pylist(expected_rows, schema=data.schema)
+    )
+
+    dataset.delete("id IN (0, 6)")
+    expected = pa.Table.from_pylist(
+        [row for row in expected_rows if row["id"] not in (0, 6)], schema=data.schema
+    )
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+    retained = dataset.get_fragments()[0].metadata
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=32,
+        excluded_fragment_ids=[retained.id],
+        data_storage_version=versions[0],
+        compaction_mode=mode,
+    )
+    assert metrics.fragments_removed > 0
+    assert retained in [fragment.metadata for fragment in dataset.get_fragments()]
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=32,
+        data_storage_version=versions[1],
+        compaction_mode=mode,
+    )
+    assert len(dataset.get_fragments()) == 1
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+
+@pytest.mark.parametrize("copy_kind", ["shallow_clone", "deep_clone", "branch"])
+def test_mixed_version_snapshot_data_isolation(tmp_path: Path, copy_kind):
+    uri = tmp_path / "source"
+    expected = pa.table(
+        {"id": range(8), "value": pa.array([10, None, 30, 40, 50, 60, None, 80])}
+    )
+    for i, version in enumerate(["2.0", "2.1", "2.2", "2.3"]):
+        dataset = lance.write_dataset(
+            expected.slice(i * 2, 2),
+            uri,
+            mode="create" if i == 0 else "append",
+            data_storage_version=version,
+        )
+    snapshot = dataset.version
+    assert {
+        f"{file.file_major_version}.{file.file_minor_version}"
+        for fragment in dataset.get_fragments()
+        for file in fragment.metadata.files
+    } == {"2.0", "2.1", "2.2", "2.3"}
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    if copy_kind == "branch":
+        copied = dataset.create_branch("copy", snapshot)
+    else:
+        copied = getattr(dataset, copy_kind)(tmp_path / "copy", snapshot)
+    _assert_mixed_version_reads(lance.dataset(copied.uri), expected)
+
+    copied.update({"value": "999"}, where="id = 3", data_storage_version="2.1")
+    copy_rows = expected.to_pylist()
+    copy_rows[3]["value"] = 999
+    copy_expected = pa.Table.from_pylist(copy_rows, schema=expected.schema)
+    _assert_mixed_version_reads(lance.dataset(copied.uri), copy_expected)
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+    dataset.delete("id IN (0, 7)")
+    dataset.optimize.compact_files(data_storage_version="2.2")
+    changed_version = dataset.version
+    changed = expected.slice(1, 6)
+    _assert_mixed_version_reads(lance.dataset(uri), changed)
+    _assert_mixed_version_reads(lance.dataset(uri, version=snapshot), expected)
+    _assert_mixed_version_reads(lance.dataset(copied.uri), copy_expected)
+
+    restored = dataset.checkout_version(snapshot)
+    restored.restore()
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    _assert_mixed_version_reads(lance.dataset(uri, version=changed_version), changed)
+    appended = pa.table({"id": [8], "value": [90]}, schema=expected.schema)
+    lance.write_dataset(appended, restored, mode="append", data_storage_version="2.3")
+    _assert_mixed_version_reads(
+        lance.dataset(uri), pa.concat_tables([expected, appended])
+    )
+    _assert_mixed_version_reads(lance.dataset(copied.uri), copy_expected)
+
+
+@pytest.mark.parametrize("operation", ["update", "merge_insert", "compaction"])
+@pytest.mark.parametrize("version", ["invalid", "legacy"])
+def test_operation_rejects_invalid_data_storage_version(
+    tmp_path: Path, operation, version
+):
+    data = pa.table({"id": [1, 2], "value": [10, 20]})
+    dataset = lance.write_dataset(
+        data, tmp_path / "dataset", data_storage_version="2.1"
+    )
+    # The core validates both the selector and the V1/V2 boundary before committing.
+    error = OSError if operation == "compaction" and version == "legacy" else ValueError
+    message = (
+        "Unknown Lance storage version: invalid"
+        if version == "invalid"
+        else "V1 and V2 storage versions cannot be mixed"
+    )
+    with pytest.raises(error, match=message):
+        if operation == "update":
+            dataset.update({"value": "value + 1"}, data_storage_version=version)
+        elif operation == "merge_insert":
+            dataset.merge_insert("id").data_storage_version(
+                version
+            ).when_matched_update_all().execute(data)
+        else:
+            dataset.optimize.compact_files(data_storage_version=version)
+    assert dataset.version == 1
+    assert dataset.to_table() == data
 
 
 def test_scan_with_batch_size(tmp_path: Path):
@@ -4893,10 +5542,14 @@ def test_legacy_dataset(tmp_path: Path):
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
-    # Append will write v1 if dataset was originally created with v1
-    dataset = lance.write_dataset(
-        table, tmp_path, data_storage_version="stable", mode="append"
-    )
+    # Explicit targets cannot cross the V1/V2 boundary. Omitting the target
+    # continues to use the dataset default.
+    with pytest.raises(OSError, match="V1 and V2 storage versions cannot be mixed"):
+        lance.write_dataset(
+            table, tmp_path, data_storage_version="stable", mode="append"
+        )
+    assert lance.dataset(tmp_path).version == dataset.version
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     fragment = list(dataset.get_fragments())[1]
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
@@ -4912,9 +5565,12 @@ def test_legacy_dataset(tmp_path: Path):
 
     assert len(dataset.get_fragments()) == 0
 
-    dataset = lance.write_dataset(
-        table, tmp_path, data_storage_version="legacy", mode="append"
-    )
+    with pytest.raises(OSError, match="V1 and V2 storage versions cannot be mixed"):
+        lance.write_dataset(
+            table, tmp_path, data_storage_version="legacy", mode="append"
+        )
+    assert lance.dataset(tmp_path).version == dataset.version
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
@@ -4930,9 +5586,12 @@ def test_legacy_dataset(tmp_path: Path):
 
     assert len(dataset.get_fragments()) == 0
 
-    dataset = lance.write_dataset(
-        table, tmp_path, data_storage_version="stable", mode="append"
-    )
+    with pytest.raises(OSError, match="V1 and V2 storage versions cannot be mixed"):
+        lance.write_dataset(
+            table, tmp_path, data_storage_version="stable", mode="append"
+        )
+    assert lance.dataset(tmp_path).version == dataset.version
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
@@ -5194,6 +5853,69 @@ def test_dataset_drop(tmp_path: Path):
         lance.LanceDataset.drop(tmp_path)
 
 
+def test_dataset_drop_rejects_non_dataset_directory(tmp_path: Path):
+    warehouse = tmp_path / "warehouse"
+    lance.write_dataset(pa.table({"x": [0]}), warehouse / "t.lance")
+
+    # Pointing at the parent of a dataset must not wipe out the whole warehouse.
+    with pytest.raises(ValueError, match="no readable Lance manifest"):
+        lance.LanceDataset.drop(warehouse)
+    assert (warehouse / "t.lance").exists()
+
+    lance.LanceDataset.drop(warehouse / "t.lance")
+    assert not (warehouse / "t.lance").exists()
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # A storage root holding a "data" prefix is indistinguishable from the
+        # leftovers of a write that died before committing.
+        ["data/0.lance"],
+        # A file merely sitting under _versions/, or merely named like a manifest, is
+        # not evidence that a dataset was ever committed here.
+        ["_versions/README", "reports/q1.csv"],
+        ["_versions/1.manifest", "reports/q1.csv"],
+    ],
+)
+def test_dataset_drop_rejects_paths_without_readable_manifest(
+    tmp_path: Path, entries: list
+):
+    storage_root = tmp_path / "storage_root"
+    for entry in entries:
+        path = storage_root / entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"irreplaceable")
+
+    with pytest.raises(ValueError, match="no readable Lance manifest"):
+        lance.LanceDataset.drop(storage_root)
+    for entry in entries:
+        assert (storage_root / entry).exists()
+
+
+def test_dataset_drop_allows_create_over_uncommitted_leftovers(tmp_path: Path):
+    # Refusing to drop data files without a manifest costs nothing, because those
+    # leftovers do not stop the dataset from being created and then dropped.
+    dataset_dir = tmp_path / "t.lance"
+    (dataset_dir / "data").mkdir(parents=True)
+    (dataset_dir / "data" / "0.lance").write_bytes(b"partial")
+
+    lance.write_dataset(pa.table({"x": [0]}), dataset_dir)
+    lance.LanceDataset.drop(dataset_dir)
+    assert not dataset_dir.exists()
+
+
+def test_dataset_drop_allows_dataset_with_unmanaged_files(tmp_path: Path):
+    # Cleanup deliberately preserves unmanaged files under a dataset root, so their
+    # presence must not stop a drop either.
+    dataset_dir = tmp_path / "t.lance"
+    lance.write_dataset(pa.table({"x": [0]}), dataset_dir)
+    (dataset_dir / "notes.txt").write_text("kept next to the dataset")
+
+    lance.LanceDataset.drop(dataset_dir)
+    assert not dataset_dir.exists()
+
+
 def test_dataset_schema(tmp_path: Path):
     table = pa.table({"x": [0]})
     ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
@@ -5231,26 +5953,97 @@ def test_data_replacement(tmp_path: Path):
 
 
 def _write_overlay_file(
-    dataset, base_dir: Path, name: str, batch: pa.Table, fields: List[int]
+    dataset,
+    base_dir: Path,
+    name: str,
+    batch: pa.Table,
+    fields: List[int],
+    *,
+    version: Optional[str] = None,
 ):
     """Write an overlay value file (one value column per covered field, no key
     column) and return a DataFile mapping its columns to the given dataset
-    `fields`. The file version is copied from a base data file."""
-    path = base_dir / "data" / name
-    with LanceFileWriter(str(path)) as writer:
-        writer.write_batch(batch)
+    `fields`. Omission uses the exact version of the first base data file."""
     base_df = dataset.get_fragments()[0].metadata.files[0]
+    version = version or f"{base_df.file_major_version}.{base_df.file_minor_version}"
+    path = base_dir / "data" / name
+    with LanceFileWriter(str(path), version=version) as writer:
+        writer.write_batch(batch)
+    major, minor = map(int, version.split("."))
     return lance.fragment.DataFile(
         path=name,
         fields=fields,
         column_indices=list(range(len(fields))),
-        file_major_version=base_df.file_major_version,
-        file_minor_version=base_df.file_minor_version,
+        file_major_version=major,
+        file_minor_version=minor,
         file_size_bytes=os.path.getsize(path),
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+@pytest.fixture
+def enable_unstable_data_overlay_files(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
+@pytest.mark.parametrize("overlay_version", ["2.2", "2.3"])
+@pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
+def test_mixed_version_overlays_preserve_data(
+    tmp_path: Path, enable_unstable_data_overlay_files, overlay_version, mode
+):
+    uri = tmp_path / "dataset"
+    data = pa.table({"id": range(6), "value": [10, 20, 30, 40, 50, 60]})
+    dataset = lance.write_dataset(data.slice(0, 3), uri, data_storage_version="2.0")
+    dataset = lance.write_dataset(
+        data.slice(3), dataset, mode="append", data_storage_version="2.1"
+    )
+    # Only the second fragment has overlays. The newer overlay replaces one
+    # covered value with NULL, while a different updated row is later deleted.
+    for name, offsets, values in [
+        ("older.lance", [0, 1, 2], [400, 500, 600]),
+        ("newer.lance", [0, 2], [None, 999]),
+    ]:
+        file = _write_overlay_file(
+            dataset,
+            uri,
+            name,
+            pa.table({"value": pa.array(values, pa.int64())}),
+            fields=[1],
+            version=overlay_version,
+        )
+        dataset = lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [
+                    lance.LanceOperation.DataOverlayGroup(
+                        1, [lance.LanceOperation.DataOverlayFile(file, offsets=offsets)]
+                    )
+                ]
+            ),
+            read_version=dataset.version,
+        )
+    expected = pa.table({"id": range(6), "value": [10, 20, 30, None, 500, 999]})
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    dataset.delete("value = 500")
+    expected = expected.filter(pc.not_equal(expected["id"], 4))
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+    before = dataset.version
+    options = dict(
+        target_rows_per_fragment=32,
+        data_storage_version="2.2",
+        compaction_mode=mode,
+    )
+    if mode == "force_binary_copy":
+        with pytest.raises(OSError, match="binary copy"):
+            dataset.optimize.compact_files(**options)
+        assert lance.dataset(uri).version == before
+    else:
+        dataset.optimize.compact_files(**options)
+        assert len(dataset.get_fragments()) == 1
+        assert not dataset.get_fragments()[0].metadata.overlays
+    _assert_mixed_version_reads(lance.dataset(uri), expected)
+
+
+def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5282,7 +6075,7 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5336,7 +6129,9 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5376,8 +6171,88 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_offsets_accept_bitmap(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    from lance.bitmap import Bitmap
+
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    # Dense coverage as a single Bitmap.
+    dense_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "dense.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [
+                        lance.LanceOperation.DataOverlayFile(
+                            dense_file, offsets=Bitmap([1, 4])
+                        )
+                    ],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
+
+    # Sparse coverage as a list of per-field iterables, mixing a Bitmap
+    # with a plain list.
+    sparse_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([330], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [
+                        lance.LanceOperation.DataOverlayFile(
+                            sparse_file, offsets=[Bitmap([2]), [3]]
+                        )
+                    ],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("id").to_pylist()[2] == 777
+    assert result.column("val").to_pylist()[3] == 330
+
+
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     import json
+
+    from lance.bitmap import Bitmap
 
     base_dir = tmp_path / "test"
     table = pa.table(
@@ -5408,6 +6283,7 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     # Reading the fragment surfaces its overlays, stamped with the commit version.
     metadata = dataset.get_fragments()[0].metadata
     assert len(metadata.overlays) == 1
+    assert isinstance(metadata.overlays[0].offsets, Bitmap)
     assert metadata.overlays[0].offsets == [1, 4]
     assert metadata.overlays[0].committed_version == overlay_version
 
@@ -5429,7 +6305,232 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
+def test_data_overlay_offsets_accept_one_shot_iterable(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # `offsets` is documented as an Iterable, so a generator must work. The
+    # dense/sparse shape probe must not consume it before the sparse form is
+    # resolved, or the first field's coverage would be silently dropped.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([0, 1, 2], pa.int32()),
+                "val": pa.array([0, 10, 20], pa.int32()),
+            }
+        ),
+        base_dir,
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([999], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(
+        data_file, offsets=(item for item in ([1], [2]))
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    result = dataset.to_table()
+    assert result.column("id").to_pylist() == [0, 777, 2]
+    assert result.column("val").to_pylist() == [0, 10, 999]
+
+
+def test_data_overlay_rejects_invalid_one_shot_iterable(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # A one-shot iterable whose contents are invalid must be rejected at
+    # commit time, not committed as empty coverage that only fails at read.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 10, 20], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "invalid.lance",
+        pa.table({"val": pa.array([999], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=iter([1, "bad"]))
+    with pytest.raises(ValueError, match="offsets must be an iterable"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
+def test_data_overlay_sparse_offsets_round_trip_through_json(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # `to_json` has to normalize per-field Bitmaps to plain lists, the same way
+    # it does a dense one -- `json.dumps` cannot serialize a Bitmap.
+    import json
+
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(4), pa.int32()),
+                "val": pa.array([i * 10 for i in range(4)], pa.int32()),
+            }
+        ),
+        base_dir,
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([330], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[[2], [3]])
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    metadata = dataset.get_fragments()[0].metadata
+    assert metadata.to_json()["overlays"][0]["offsets"] == [[2], [3]]
+
+    restored = lance.fragment.FragmentMetadata.from_json(json.dumps(metadata.to_json()))
+    assert [list(o) for o in restored.overlays[0].offsets] == [[2], [3]]
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [1, 1],  # dense
+        [[1, 1]],  # sparse
+    ],
+    ids=["dense", "sparse"],
+)
+def test_data_overlay_rejects_duplicate_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
+    # Offsets map positionally to value rows: the smallest covered offset to
+    # row 0, the next to row 1, and so on. A repeat would collapse into the
+    # coverage set and shift every later offset onto the wrong row, so it must
+    # be rejected rather than silently corrupting the mapping.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 1, 2], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    with pytest.raises(ValueError, match="must not repeat an offset"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [-1],  # dense
+        [[-1]],  # sparse
+    ],
+    ids=["dense", "sparse"],
+)
+def test_data_overlay_rejects_out_of_range_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
+    # The shape is unambiguous here, so the error must name the bad value
+    # rather than complaining about the shape.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 1, 2], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    with pytest.raises(ValueError, match="unsigned 32-bit integer, got -1"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
+def test_data_overlay_accepts_empty_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # An empty iterable can't distinguish dense from sparse, and doesn't need
+    # to: it covers no rows either way.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 10, 20], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "empty.lance",
+        # A Lance file needs at least one row to carry a schema; the empty
+        # coverage means no row of it is ever read.
+        pa.table({"val": pa.array([99], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[])
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    assert dataset.to_table().column("val").to_pylist() == [0, 10, 20]
+
+
+def test_data_overlay_rejects_invalid_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5441,9 +6542,9 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         fields=[0],
     )
 
-    # offsets is neither a flat list of ints (dense) nor a list of per-field int
-    # lists (sparse), so the coverage shape can't be resolved.
-    with pytest.raises(ValueError, match="offsets must be a list"):
+    # offsets is neither an iterable of ints (dense) nor an iterable of int
+    # iterables (sparse), so the coverage shape can't be resolved.
+    with pytest.raises(ValueError, match="offsets must be an iterable"):
         lance.LanceDataset.commit(
             dataset,
             lance.LanceOperation.DataOverlay(
@@ -5466,15 +6567,16 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
     "offsets",
     [
         [2, 1],  # dense, descending
-        [1, 1],  # dense, duplicate
         [[2, 1]],  # sparse, descending
-        [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
-    # Offsets map positionally to value rows in data_file. A RoaringBitmap would
-    # silently reorder/dedup them, so a non-ascending list must be rejected up
-    # front rather than corrupting the row mapping.
+def test_data_overlay_accepts_any_offset_order(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
+    """Offsets are always resolved in ascending order (the smallest covered
+    offset maps to value-file row 0, the next-smallest to row 1, ...)
+    regardless of what order the caller lists them in — an out-of-order list
+    is accepted and resolves identically to a pre-sorted one."""
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5482,27 +6584,23 @@ def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
         dataset,
         base_dir,
         "ov.lance",
-        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        pa.table({"val": pa.array([100, 200], pa.int32())}),
         fields=[0],
     )
 
-    with pytest.raises(ValueError, match="strictly ascending"):
-        lance.LanceDataset.commit(
-            dataset,
-            lance.LanceOperation.DataOverlay(
-                [
-                    lance.LanceOperation.DataOverlayGroup(
-                        0,
-                        [
-                            lance.LanceOperation.DataOverlayFile(
-                                data_file, offsets=offsets
-                            )
-                        ],
-                    )
-                ]
-            ),
-            read_version=dataset.version,
-        )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    result = dataset.to_table().column("val").to_pylist()
+    # rank 0 (offset 1) -> value row 0 (100); rank 1 (offset 2) -> value row 1 (200)
+    assert result[1] == 100
+    assert result[2] == 200
 
 
 def test_schema_project_drop_column(tmp_path: Path):
@@ -5646,6 +6744,33 @@ def test_dataset_sql(tmp_path: Path):
     complex_result = complex_query.to_batch_records()
     expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
     assert pa.Table.from_batches(complex_result) == expected_complex
+
+
+def test_dataset_sql_batch_size_rows(tmp_path: Path):
+    table = pa.table({"id": range(50)})
+    ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
+
+    batches = list(
+        ds.sql("SELECT * FROM dataset").batch_size(7).build().to_stream_reader()
+    )
+
+    assert sum(batch.num_rows for batch in batches) == 50
+    assert all(batch.num_rows <= 7 for batch in batches)
+
+
+@pytest.mark.parametrize("batch_size", [0, 2**32])
+def test_dataset_sql_rejects_invalid_batch_size(tmp_path: Path, batch_size: int):
+    ds = lance.write_dataset(
+        pa.table({"id": range(3)}), tmp_path / "test_sql_invalid_batch_size"
+    )
+
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 4294967295"):
+        (
+            ds.sql("SELECT * FROM dataset")
+            .batch_size(batch_size)
+            .build()
+            .to_batch_records()
+        )
 
 
 def test_file_reader_options(tmp_path: Path):
@@ -5845,6 +6970,46 @@ def test_commit_message_and_get_properties(tmp_path):
         transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
         == "Use Dataset.commit"
     )
+
+
+def test_get_transactions_on_branch(tmp_path):
+    table = pa.table({"a": [1]})
+    dataset = lance.write_dataset(table, tmp_path)
+    branch = dataset.create_branch("dev")
+
+    branch = lance.write_dataset(table, branch.uri, mode="append")
+    transactions = branch.get_transactions(2)
+
+    assert len(transactions) == 2
+    assert transactions[0] is not None
+    assert isinstance(transactions[0].operation, lance.LanceOperation.Append)
+
+    clone_transaction = transactions[1]
+    assert clone_transaction is not None
+    assert clone_transaction.read_version == dataset.version
+    clone = clone_transaction.operation
+    assert isinstance(clone, lance.LanceOperation.Clone)
+    assert clone.is_shallow
+    assert clone.ref_name is None
+    assert clone.ref_version == dataset.version
+    assert clone.ref_path == dataset.uri
+    assert clone.branch_name == "dev"
+
+
+def test_commit_deep_clone_rejected(tmp_path: Path):
+    source = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "source")
+    clone = lance.LanceOperation.Clone(
+        is_shallow=False,
+        ref_name=None,
+        ref_version=source.version,
+        ref_path=source.uri,
+        branch_name=None,
+    )
+
+    # Committed directly, a deep clone would reference files never copied to
+    # the target; LanceDataset.deep_clone copies them first.
+    with pytest.raises(OSError, match="deep Clone cannot be committed directly"):
+        lance.LanceDataset.commit(tmp_path / "target", clone, read_version=0)
 
 
 def test_commit_with_stable_row_ids(tmp_path: Path):
@@ -6322,6 +7487,19 @@ def test_shallow_clone(tmp_path: Path):
     cloned_by_branch = branch.shallow_clone(clone_branch_v3, 3)
     assert cloned_by_branch.to_table() == table_v3
     assert lance.dataset(clone_branch_v3).to_table() == table_v3
+
+
+def test_deep_clone(tmp_path: Path):
+    source_dir = tmp_path / "deep_src"
+    destination_dir = tmp_path / "deep_clone"
+    expected = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    source = lance.write_dataset(expected, source_dir)
+
+    cloned = source.deep_clone(destination_dir, source.version)
+
+    assert cloned.to_table() == expected
+    assert lance.dataset(destination_dir).to_table() == expected
+    assert list(destination_dir.glob("data/*.lance"))
 
 
 def test_branches(tmp_path: Path):

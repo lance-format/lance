@@ -14,10 +14,10 @@ use object_store::{
     ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions,
 };
-use object_store_opendal::OpendalStore;
 use tokio::sync::RwLock;
 
 use crate::object_store::StorageOptionsAccessor;
+use crate::object_store::opendal_store::OpendalStore;
 use lance_core::Result;
 
 type NormalizeConfigFn = fn(&HashMap<String, String>) -> Result<HashMap<String, String>>;

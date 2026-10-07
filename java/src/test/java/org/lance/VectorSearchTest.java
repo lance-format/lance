@@ -17,10 +17,17 @@ import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.dataset.scanner.Scanner;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -29,6 +36,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -153,6 +161,154 @@ public class VectorSearchTest {
           }
         }
       }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void test_batch_knn(boolean createVectorIndex) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_batch_knn"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        if (createVectorIndex) {
+          testVectorDataset.createIndex(dataset);
+        }
+
+        // Two query vectors, each an exact match for a distinct set of rows. Every
+        // fragment repeats the same per-row vectors, so each query has exactly five
+        // distance-0 matches across the dataset.
+        float[] key0 = new float[32];
+        float[] key1 = new float[32];
+        for (int i = 0; i < 32; i++) {
+          key0[i] = (float) (i + 32); // matches rows with i in {1, 81, 161, 241, 321}
+          key1[i] = (float) i; // matches rows with i in {0, 80, 160, 240, 320}
+        }
+        int k = 5;
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .nearest(
+                    new Query.Builder()
+                        .setColumn(TestVectorDataset.vectorColumnName)
+                        .setKeys(new float[][] {key0, key1})
+                        .setK(k)
+                        .setUseIndex(createVectorIndex)
+                        .build())
+                .build();
+        try (Scanner scanner = dataset.newScan(options)) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            assertTrue(reader.loadNextBatch(), "Expected at least one batch");
+
+            // A batch query prepends a non-nullable query_index column.
+            assertEquals(5, root.getSchema().getFields().size(), "Expected 5 columns");
+            assertEquals("query_index", root.getSchema().getFields().get(0).getName());
+            assertEquals("i", root.getSchema().getFields().get(1).getName());
+            assertEquals("s", root.getSchema().getFields().get(2).getName());
+            assertEquals(
+                TestVectorDataset.vectorColumnName, root.getSchema().getFields().get(3).getName());
+            assertEquals("_distance", root.getSchema().getFields().get(4).getName());
+
+            // N query vectors, up to k results each.
+            assertEquals(2 * k, root.getRowCount(), "Expected N * k results");
+
+            IntVector queryIndexVector = (IntVector) root.getVector("query_index");
+            IntVector iVector = (IntVector) root.getVector("i");
+            Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
+
+            Set<Integer> query0I = new HashSet<>();
+            Set<Integer> query1I = new HashSet<>();
+            float prevDistance = Float.NEGATIVE_INFINITY;
+            int prevQueryIndex = 0;
+            for (int row = 0; row < root.getRowCount(); row++) {
+              int queryIndex = queryIndexVector.get(row);
+              assertTrue(queryIndex == 0 || queryIndex == 1, "Unexpected query_index");
+              // Rows are grouped by query_index; distance ascends within each group.
+              assertTrue(queryIndex >= prevQueryIndex, "Rows should be grouped by query_index");
+              if (queryIndex != prevQueryIndex) {
+                prevDistance = Float.NEGATIVE_INFINITY;
+              }
+              float distance = distanceVector.get(row);
+              assertTrue(distance >= prevDistance, "Distances should ascend within a query group");
+              prevDistance = distance;
+              prevQueryIndex = queryIndex;
+
+              if (queryIndex == 0) {
+                query0I.add(iVector.get(row));
+              } else {
+                query1I.add(iVector.get(row));
+              }
+            }
+
+            assertEquals(
+                new HashSet<>(Arrays.asList(1, 81, 161, 241, 321)),
+                query0I,
+                "Unexpected matches for query 0");
+            assertEquals(
+                new HashSet<>(Arrays.asList(0, 80, 160, 240, 320)),
+                query1I,
+                "Unexpected matches for query 1");
+
+            assertFalse(reader.loadNextBatch(), "Expected only one batch");
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void test_batch_knn_rejects_invalid_keys() {
+    Query.Builder builder = new Query.Builder().setColumn(TestVectorDataset.vectorColumnName);
+    // An empty batch has no query vectors.
+    assertThrows(IllegalArgumentException.class, () -> builder.setKeys(new float[][] {}));
+    // Ragged rows: query vectors must all share one dimension.
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> builder.setKeys(new float[][] {{1.0f, 2.0f}, {1.0f, 2.0f, 3.0f}}));
+    // vectors x dimensions overflowing the flattened int-indexed buffer is rejected up front.
+    // Every row aliases one array, so this costs well under 1 MB.
+    float[] row = new float[1 << 15];
+    float[][] oversized = new float[1 << 16][];
+    Arrays.fill(oversized, row);
+    assertThrows(IllegalArgumentException.class, () -> builder.setKeys(oversized));
+  }
+
+  @Test
+  void test_batch_knn_rejects_multivector_column() {
+    // A list-shaped query against a List<FixedSizeList> column is one multivector query in
+    // the core, which cannot honor the setKeys batch contract (per-query results with
+    // query_index), so the binding must reject it rather than silently change semantics.
+    Field vectorItem =
+        new Field(
+            "item",
+            FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)),
+            null);
+    Field vector =
+        new Field(
+            "item",
+            FieldType.nullable(new ArrowType.FixedSizeList(4)),
+            Collections.singletonList(vectorItem));
+    Field multivector =
+        new Field(
+            "mv", FieldType.nullable(new ArrowType.List()), Collections.singletonList(vector));
+    Schema schema = new Schema(Collections.singletonList(multivector));
+    String datasetPath = tempDir.resolve("test_batch_knn_multivector").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build())) {
+      ScanOptions options =
+          new ScanOptions.Builder()
+              .nearest(
+                  new Query.Builder()
+                      .setColumn("mv")
+                      .setKeys(new float[][] {{1f, 2f, 3f, 4f}, {5f, 6f, 7f, 8f}})
+                      .setK(1)
+                      .build())
+              .build();
+      IllegalArgumentException error =
+          assertThrows(IllegalArgumentException.class, () -> dataset.newScan(options));
+      assertTrue(
+          error.getMessage().contains("not supported on multivector column 'mv'"),
+          "Unexpected error message: " + error.getMessage());
     }
   }
 

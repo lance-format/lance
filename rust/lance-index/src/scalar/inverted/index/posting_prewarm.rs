@@ -63,10 +63,11 @@ impl PostingListReader {
     /// Build posting lists for one chunk's token range from `chunk_batch`, rebasing
     /// global offsets to chunk-local rows. Returns `(global token_id, PostingList)`
     /// pairs identical to the whole-file path, only bounded to one chunk.
-    fn build_prewarm_posting_lists_chunk(
+    fn build_posting_lists_chunk(
         chunk_batch: RecordBatch,
-        chunk: PrewarmChunk<'_>,
-        ctx: &PrewarmBuildCtx<'_>,
+        chunk: PostingChunk<'_>,
+        ctx: &PostingBuildCtx<'_>,
+        mode: ChunkPostingMode,
     ) -> Result<Vec<(u32, PostingList)>> {
         let mut posting_lists = Vec::with_capacity(chunk.token_count);
         for local in 0..chunk.token_count {
@@ -86,7 +87,15 @@ impl PostingListReader {
                 // V2: one posting row per token; row `local` within the chunk.
                 chunk_batch.slice(local, 1)
             };
-            let row_batch = row_batch.shrink_to_fit()?;
+            let row_batch = match mode {
+                // Cached posting lists outlive the read chunk and should not
+                // retain unrelated token rows through shared Arrow buffers.
+                ChunkPostingMode::Prewarm => row_batch.shrink_to_fit()?,
+                // Merge consumes chunks in order, so retaining each chunk until
+                // its turn avoids a deep copy. Legacy-position reads hold only
+                // the caller's bounded concurrent window.
+                ChunkPostingMode::Merge => row_batch,
+            };
             let posting_list = Self::posting_list_from_batch_parts(
                 &row_batch,
                 ctx.max_scores.map(|scores| scores[global]),
@@ -121,7 +130,12 @@ impl PostingListReader {
             }
             PostingMetadata::V2 { .. } => tok_start..tok_end,
         };
-        let batch = self.reader.read_range(row_range, Some(&columns)).await?;
+        let batch = self
+            .reader
+            .get()
+            .await?
+            .read_range(row_range, Some(&columns))
+            .await?;
         Ok(batch)
     }
 
@@ -166,7 +180,7 @@ impl PostingListReader {
         let token_count = self.len();
         let posting_data_size_bytes = self.posting_data_size_bytes();
         let chunk_tokens = chunk_tokens_override
-            .unwrap_or_else(|| prewarm_chunk_tokens(token_count, posting_data_size_bytes))
+            .unwrap_or_else(|| posting_read_chunk_tokens(token_count, posting_data_size_bytes))
             .max(1);
         let chunk_ranges = prewarm_chunk_ranges(&grouping, token_count, chunk_tokens);
         let chunk_count = chunk_ranges.len();
@@ -195,7 +209,13 @@ impl PostingListReader {
                             "materialized prewarm must initialize posting-list build state",
                         );
                         let posting_lists = self
-                            .build_chunk_postings(tok_start, tok_end, with_position, state)
+                            .build_chunk_postings(
+                                tok_start,
+                                tok_end,
+                                with_position,
+                                state,
+                                ChunkPostingMode::Prewarm,
+                            )
                             .await?;
                         self.publish_chunk_postings(
                             posting_lists,
@@ -255,14 +275,15 @@ impl PostingListReader {
     }
 
     /// Read one token-row chunk and build its posting lists off the runtime thread.
-    /// The large batch is dropped inside the blocking task once built, bounding
-    /// resident memory to one chunk.
+    /// Shared buffers are retained only by that chunk's returned posting lists;
+    /// callers bound the number of concurrently retained chunks.
     async fn build_chunk_postings(
         &self,
         tok_start: usize,
         tok_end: usize,
         with_position: bool,
         state: &ChunkBuildState,
+        mode: ChunkPostingMode,
     ) -> Result<Vec<(u32, PostingList)>> {
         let chunk_token_count = tok_end - tok_start;
         let chunk_batch = self
@@ -287,20 +308,20 @@ impl PostingListReader {
         let positions_layout = state.positions_layout;
         let num_docs = self.modern_num_docs;
         let posting_lists = spawn_blocking(move || {
-            let ctx = PrewarmBuildCtx {
+            let ctx = PostingBuildCtx {
                 max_scores: max_scores.as_deref().map(|v| v.as_slice()),
                 lengths: lengths.as_deref().map(|v| v.as_slice()),
                 posting_tail_codec,
                 block_size,
                 positions_layout,
             };
-            let chunk = PrewarmChunk {
+            let chunk = PostingChunk {
                 tok_start,
                 token_count: chunk_token_count,
                 offsets: chunk_offsets.as_deref(),
                 end_row: chunk_end_row,
             };
-            let posting_lists = Self::build_prewarm_posting_lists_chunk(chunk_batch, chunk, &ctx)?;
+            let posting_lists = Self::build_posting_lists_chunk(chunk_batch, chunk, &ctx, mode)?;
             if let Some(num_docs) = num_docs {
                 for (token_id, posting) in &posting_lists {
                     Self::validate_modern_posting(*token_id, posting, num_docs)?;
@@ -311,7 +332,7 @@ impl PostingListReader {
         .await
         .map_err(|err| {
             Error::internal(format!(
-                "Failed to build prewarm posting lists in blocking task: {err}"
+                "Failed to build chunk posting lists in blocking task: {err}"
             ))
         })??;
         for (token_id, _) in &posting_lists {
@@ -481,8 +502,8 @@ impl PostingListReader {
     }
 
     /// Cheap `invert.lance` size estimate (file length from object metadata, no
-    /// data read), used only to size prewarm chunks. Falls back to a row-count
-    /// proxy when the reader can't surface the length (legacy v1).
+    /// data read), used to size bounded posting-list reads. Falls back to a
+    /// row-count proxy when the reader can't surface the length (legacy v1).
     pub(crate) fn posting_data_size_bytes(&self) -> u64 {
         if let Some(size) = self.reader.file_size_bytes() {
             return size;
@@ -493,37 +514,200 @@ impl PostingListReader {
         (self.reader.num_rows() as u64).saturating_mul(ESTIMATED_BYTES_PER_ROW)
     }
 
-    pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
-        let columns = self.posting_columns(with_position);
-        let batch = self
-            .reader
-            .read_range(0..self.reader.num_rows(), Some(&columns))
-            .await?;
-        Ok(batch)
-    }
-
-    pub(crate) async fn read_all(
+    /// Visit every posting list in ascending token-id order while reading the
+    /// partition in bounded chunks. This is used by index merge/finalization:
+    /// a whole-partition Arrow batch can overflow 32-bit list offsets even
+    /// though every individual posting row is valid.
+    pub(super) async fn for_each_posting_list_chunked<F>(
         &self,
         with_position: bool,
-    ) -> Result<impl Iterator<Item = Result<PostingList>> + '_> {
-        // read_all walks every posting list; the bulk metadata is paid for
-        // unconditionally, so just load it once up front and index into it
-        // synchronously below.
+        chunk_tokens_override: Option<usize>,
+        max_list_children_override: Option<u64>,
+        legacy_position_concurrency: usize,
+        mut visit: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(PostingList) -> Result<()>,
+    {
         self.ensure_metadata_loaded().await?;
-        let batch = self.read_batch(with_position).await?;
-        Ok((0..self.len()).map(move |i| {
-            let token_id = i as u32;
-            let range = self.posting_list_range(token_id);
-            let batch = batch.slice(i, range.end - range.start);
-            let (max_score, length) = self.bulk_metadata_for_token(token_id);
-            self.posting_list_from_batch(&batch, max_score, length)
-        }))
+        let token_count = self.len();
+        let chunk_tokens = chunk_tokens_override
+            .unwrap_or_else(|| {
+                posting_read_chunk_tokens(token_count, self.posting_data_size_bytes())
+            })
+            .max(1);
+        let max_list_children = max_list_children_override
+            .unwrap_or(POSTING_READ_MAX_LIST_CHILDREN)
+            .max(1);
+        let chunk_ranges =
+            self.posting_read_chunk_ranges(chunk_tokens, max_list_children, with_position)?;
+        let chunk_count = chunk_ranges.len();
+        let state = self.chunk_build_state();
+
+        if with_position
+            && matches!(&self.metadata, PostingMetadata::V2 { .. })
+            && matches!(self.positions_layout, PositionsLayout::LegacyPerDoc)
+        {
+            let legacy_position_concurrency = legacy_position_concurrency.max(1);
+            let read_build_start = Instant::now();
+            debug!(
+                token_count,
+                chunk_count,
+                legacy_position_concurrency,
+                "legacy per-document posting merge reads started"
+            );
+            let mut posting_chunks = stream::iter(chunk_ranges)
+                .map(|(tok_start, tok_end)| {
+                    self.build_chunk_postings(
+                        tok_start,
+                        tok_end,
+                        with_position,
+                        &state,
+                        ChunkPostingMode::Merge,
+                    )
+                })
+                // Keep token order while allowing singleton remote reads to overlap.
+                .buffered(legacy_position_concurrency);
+            while let Some(posting_lists) = posting_chunks.try_next().await? {
+                for (_, posting_list) in posting_lists {
+                    visit(posting_list)?;
+                }
+            }
+            debug!(
+                token_count,
+                chunk_count,
+                legacy_position_concurrency,
+                read_build_ms = read_build_start.elapsed().as_secs_f64() * 1000.0,
+                "legacy per-document posting merge reads finished"
+            );
+            return Ok(chunk_count);
+        }
+
+        for (tok_start, tok_end) in chunk_ranges {
+            let posting_lists = self
+                .build_chunk_postings(
+                    tok_start,
+                    tok_end,
+                    with_position,
+                    &state,
+                    ChunkPostingMode::Merge,
+                )
+                .await?;
+            for (_, posting_list) in posting_lists {
+                visit(posting_list)?;
+            }
+        }
+        Ok(chunk_count)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn build_chunk_postings_for_test(
+        &self,
+        tok_start: usize,
+        tok_end: usize,
+        with_position: bool,
+        mode: ChunkPostingMode,
+    ) -> Result<Vec<PostingList>> {
+        self.ensure_metadata_loaded().await?;
+        let state = self.chunk_build_state();
+        self.build_chunk_postings(tok_start, tok_end, with_position, &state, mode)
+            .await
+            .map(|postings| postings.into_iter().map(|(_, posting)| posting).collect())
+    }
+
+    /// Plan merge reads by both token count and the child-value count of the
+    /// widest projected `List<i32>` column. V2/V3 posting lengths determine
+    /// posting blocks, position-block offsets, and impact entries exactly.
+    /// Compressed V1 positions use nested per-document lists whose child count
+    /// is not available in metadata, so those reads stay at one token per batch.
+    /// For row-based legacy indexes, persisted posting row offsets provide the
+    /// best available bound.
+    fn posting_read_chunk_ranges(
+        &self,
+        max_tokens: usize,
+        max_list_children: u64,
+        with_position: bool,
+    ) -> Result<Vec<(usize, usize)>> {
+        if with_position
+            && matches!(&self.metadata, PostingMetadata::V2 { .. })
+            && matches!(self.positions_layout, PositionsLayout::LegacyPerDoc)
+        {
+            return Ok((0..self.len())
+                .map(|token_id| (token_id, token_id + 1))
+                .collect());
+        }
+
+        let mut ranges = Vec::new();
+        let mut tok_start = 0usize;
+        while tok_start < self.len() {
+            let mut tok_end = tok_start;
+            let mut list_children = 0u64;
+            while tok_end < self.len() && tok_end - tok_start < max_tokens {
+                let next_children = self.max_list_children_for_token(tok_end, with_position);
+                if next_children > max_list_children {
+                    return Err(Error::index(format!(
+                        "posting token {tok_end} requires {next_children} List child values, exceeding the per-batch limit {max_list_children}"
+                    )));
+                }
+                if tok_end > tok_start
+                    && list_children.saturating_add(next_children) > max_list_children
+                {
+                    break;
+                }
+                list_children = list_children.saturating_add(next_children);
+                tok_end += 1;
+                if list_children >= max_list_children {
+                    break;
+                }
+            }
+            ranges.push((tok_start, tok_end));
+            tok_start = tok_end;
+        }
+        Ok(ranges)
+    }
+
+    fn max_list_children_for_token(&self, token_id: usize, with_position: bool) -> u64 {
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { offsets, .. } => {
+                let start = offsets[token_id];
+                let end = offsets
+                    .get(token_id + 1)
+                    .copied()
+                    .unwrap_or_else(|| self.reader.num_rows());
+                (end - start) as u64
+            }
+            PostingMetadata::V2 { metadata } => {
+                let loaded = metadata
+                    .get()
+                    .expect("v2 metadata must be loaded before planning chunked posting reads");
+                let posting_length = u64::from(loaded.lengths[token_id]);
+                let posting_blocks = posting_length.div_ceil(self.block_size as u64);
+                let impact_entries = self.has_impacts.then(|| {
+                    posting_blocks
+                        .saturating_add(posting_blocks.div_ceil(IMPACT_LEVEL1_BLOCKS as u64))
+                });
+                let position_offsets = (with_position
+                    && matches!(self.positions_layout, PositionsLayout::SharedStream(_)))
+                .then_some(posting_blocks);
+                let legacy_position_docs = (with_position
+                    && matches!(self.positions_layout, PositionsLayout::LegacyPerDoc))
+                .then_some(posting_length);
+                impact_entries
+                    .into_iter()
+                    .chain(position_offsets)
+                    .chain(legacy_position_docs)
+                    .chain(std::iter::once(posting_blocks))
+                    .max()
+                    .unwrap_or(0)
+            }
+        }
     }
 
     /// Sync lookup of `(max_score, length)` from the bulk-loaded metadata.
     /// Only safe after [`Self::ensure_metadata_loaded`]; callers that hold
-    /// the OnceCell-loaded reference (e.g. read_all, prewarm) use this to
-    /// avoid the per-token IO path.
+    /// the OnceCell-loaded reference (e.g. chunked bulk reads and prewarm) use
+    /// this to avoid the per-token IO path.
+    #[cfg(test)]
     pub(super) fn bulk_metadata_for_token(&self, token_id: u32) -> (Option<f32>, Option<u32>) {
         match &self.metadata {
             PostingMetadata::LegacyV1 { max_scores, .. } => {
@@ -556,6 +740,7 @@ impl PostingListReader {
                 PositionsLayout::LegacyPerDoc => {
                     let batch = self
                         .reader
+                        .get().await?
                         .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                         .await
                         .map_err(|e| match e {
@@ -569,6 +754,7 @@ impl PostingListReader {
                 PositionsLayout::SharedStream(codec) => {
                     let batch = self
                         .reader
+                        .get().await?
                         .read_range(
                             self.posting_list_range(token_id),
                             Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
@@ -644,7 +830,17 @@ impl PostingListReader {
     }
 }
 
-/// Loop-invariant state for [`InvertedPartition::build_chunk_postings`]. The
+/// Controls whether posting lists retain their read chunk's Arrow buffers.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ChunkPostingMode {
+    /// Build independently-owned posting lists for the index cache.
+    Prewarm,
+    /// Share each read chunk until ordered merge consumption; compressed legacy
+    /// positions may retain a bounded concurrent window of singleton chunks.
+    Merge,
+}
+
+/// Loop-invariant state for [`PostingListReader::build_chunk_postings`]. The
 /// metadata vecs are `Arc`d so each chunk's blocking build shares them cheaply.
 pub(super) struct ChunkBuildState {
     offsets: Option<Arc<Vec<usize>>>,
@@ -655,10 +851,10 @@ pub(super) struct ChunkBuildState {
     positions_layout: PositionsLayout,
 }
 
-/// Chunk-invariant inputs to [`InvertedPartition::build_prewarm_posting_lists_chunk`]:
+/// Chunk-invariant inputs to [`PostingListReader::build_posting_lists_chunk`]:
 /// the per-partition codec/layout and the (shared, whole-partition) metadata
 /// slices indexed by global token id. These don't change across chunks.
-pub(super) struct PrewarmBuildCtx<'a> {
+pub(super) struct PostingBuildCtx<'a> {
     max_scores: Option<&'a [f32]>,
     lengths: Option<&'a [u32]>,
     posting_tail_codec: PostingTailCodec,
@@ -666,10 +862,10 @@ pub(super) struct PrewarmBuildCtx<'a> {
     positions_layout: PositionsLayout,
 }
 
-/// Per-chunk inputs to [`InvertedPartition::build_prewarm_posting_lists_chunk`]:
+/// Per-chunk inputs to [`PostingListReader::build_posting_lists_chunk`]:
 /// the token sub-range `[tok_start, tok_start + token_count)` and, for legacy
 /// v1, the rebased offset slice plus the chunk's end row.
-pub(super) struct PrewarmChunk<'a> {
+pub(super) struct PostingChunk<'a> {
     tok_start: usize,
     token_count: usize,
     /// Legacy v1 only: `offsets[tok_start..tok_start+token_count]` (no sentinel).

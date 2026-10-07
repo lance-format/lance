@@ -445,6 +445,10 @@ fn find_min_max_indices(array: &ArrayRef) -> Result<(Option<usize>, Option<usize
         Float32 => find_extrema_float!(array, Float32Type),
         Float64 => find_extrema_float!(array, Float64Type),
 
+        // Decimal types
+        Decimal128(_, _) => find_extrema_primitive!(array, Decimal128Type),
+        Decimal256(_, _) => find_extrema_primitive!(array, Decimal256Type),
+
         // Temporal types
         Date32 => find_extrema_primitive!(array, Date32Type),
         Date64 => find_extrema_primitive!(array, Date64Type),
@@ -733,6 +737,26 @@ mod tests {
         DataType::Float64,
         Arc::new(Float64Array::from(vec![3.0f64, 1.0, 2.0])) as ArrayRef,
         "1.0", "3.0"
+    )]
+    #[case::decimal128(
+        DataType::Decimal128(10, 2),
+        Arc::new(
+            Decimal128Array::from(vec![300_i128, 100, 200])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        ) as ArrayRef,
+        "1.00", "3.00"
+    )]
+    #[case::decimal256(
+        DataType::Decimal256(76, 2),
+        Arc::new(
+            Decimal256Array::from_iter_values(
+                [300_i64, 100, 200].into_iter().map(Into::into),
+            )
+            .with_precision_and_scale(76, 2)
+            .unwrap(),
+        ) as ArrayRef,
+        "1.00", "3.00"
     )]
     fn test_rstest_primitives(
         #[case] dt: DataType,

@@ -21,6 +21,7 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
+use lance_arrow::json::convert_json_columns;
 use lance_core::cache::LanceCache;
 use lance_core::utils::path::LancePathExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -362,8 +363,11 @@ impl LanceFileWriter {
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
+        let batch = convert_json_columns(&batch.0)
+            .map_err(lance_core::Error::from)
+            .infer_error()?;
         rt().block_on(None, async {
-            self.inner.lock().await.write_batch(&batch.0).await
+            self.inner.lock().await.write_batch(&batch).await
         })?
         .infer_error()
     }

@@ -33,6 +33,13 @@ use crate::{
 
 use super::binary::BinaryMiniBlockEncoder;
 
+pub(crate) fn map_fsst_error(err: std::io::Error) -> Error {
+    match err.kind() {
+        std::io::ErrorKind::InvalidData => Error::corrupt_file_named("fsst", err.to_string()),
+        _ => err.into(),
+    }
+}
+
 struct FsstCompressed {
     data: VariableWidthBlock,
     symbol_table: Vec<u8>,
@@ -236,7 +243,8 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                     offsets,
                     &mut decompress_bytes_buf,
                     &mut decompress_offset_buf,
-                )?;
+                )
+                .map_err(map_fsst_error)?;
 
                 // Ensure the offsets array is trimmed to exactly num_values + 1 elements
                 decompress_offset_buf.truncate((num_values + 1) as usize);
@@ -266,7 +274,8 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                     offsets,
                     &mut decompress_bytes_buf,
                     &mut decompress_offset_buf,
-                )?;
+                )
+                .map_err(map_fsst_error)?;
 
                 // Ensure the offsets array is trimmed to exactly num_values + 1 elements
                 decompress_offset_buf.truncate((num_values + 1) as usize);
@@ -331,7 +340,8 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                     offsets,
                     &mut decompress_bytes_buf,
                     &mut decompress_offset_buf,
-                )?;
+                )
+                .map_err(map_fsst_error)?;
 
                 // Ensure the offsets array is trimmed to exactly num_values + 1 elements
                 decompress_offset_buf.truncate((num_values + 1) as usize);
@@ -354,7 +364,8 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                     offsets,
                     &mut decompress_bytes_buf,
                     &mut decompress_offset_buf,
-                )?;
+                )
+                .map_err(map_fsst_error)?;
 
                 // Ensure the offsets array is trimmed to exactly num_values + 1 elements
                 decompress_offset_buf.truncate((num_values + 1) as usize);
@@ -379,15 +390,28 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
 mod tests {
     use std::collections::HashMap;
 
+    use arrow_array::StringArray;
+    use fsst::fsst::{FSST_SYMBOL_TABLE_SIZE, compress, decompress};
+    use lance_core::Error;
     use lance_datagen::{ByteCount, RowCount};
 
-    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
+    use super::map_fsst_error;
+    use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fsst() {
+    async fn test_fsst(
+        #[values(false, true)] explicit: bool,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         let test_cases = TestCases::default()
             .with_expected_encoding("fsst")
-            .with_structural_encodings();
+            .with_encoding(encoding);
 
         // Generate data suitable for FSST (large strings, total size > 32KB)
         let arr = lance_datagen::gen_batch()
@@ -397,14 +421,49 @@ mod tests {
             .column(0)
             .clone();
 
-        // Test both explicit metadata and automatic selection
-        // 1. Test with explicit FSST metadata
-        let metadata_explicit =
-            HashMap::from([("lance-encoding:compression".to_string(), "fsst".to_string())]);
-        check_round_trip_encoding_of_data(vec![arr.clone()], &test_cases, metadata_explicit).await;
+        let metadata = if explicit {
+            HashMap::from([("lance-encoding:compression".to_string(), "fsst".to_string())])
+        } else {
+            // Automatic selection requires max_len >= 5 and total_size >= 32KB.
+            HashMap::new()
+        };
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
+    }
 
-        // 2. Test automatic FSST selection based on data characteristics
-        // FSST should be chosen automatically: max_len >= 5 and total_size >= 32KB
-        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    #[test]
+    fn test_corrupt_fsst_symbol_table_is_corrupt_file() {
+        let input = "the rain in spain stays mainly in the plain ".repeat(2048);
+        let array = StringArray::from(vec![input.as_str()]);
+        let mut symbol_table = [0u8; FSST_SYMBOL_TABLE_SIZE];
+        let mut compressed = vec![0u8; array.value_data().len().max(1)];
+        let mut compressed_offsets = vec![0i32; array.value_offsets().len()];
+        compress(
+            symbol_table.as_mut(),
+            array.value_data(),
+            array.value_offsets(),
+            &mut compressed,
+            &mut compressed_offsets,
+        )
+        .unwrap();
+
+        let st_info = u64::from_ne_bytes(symbol_table[..8].try_into().unwrap());
+        assert!(st_info & (1 << 24) != 0, "expected decoder_switch_on input");
+        let n_symbols = (st_info & 255) as usize;
+        assert!(n_symbols > 0);
+        symbol_table[8 + n_symbols * 8] = 9;
+
+        let mut out = vec![0u8; compressed.len() * 8];
+        let mut out_offsets = vec![0i32; compressed_offsets.len()];
+        let err = decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut out,
+            &mut out_offsets,
+        )
+        .map_err(map_fsst_error)
+        .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
+        assert!(err.to_string().contains("symbol length"), "{err}");
     }
 }

@@ -54,7 +54,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Bryan Keller           | bryanck              | Netflix           |                     | Apache Iceberg Committer                           |
 | Aman Kishore           | AmanKishore          | Harvey.ai         |                     |                                                    |
 | Sangwu Lee             | RE-N-Y               | Krea.ai           |                     |                                                    |
-| Jeremy Leibs           | jleibs               | Rerun.io          |                     |                                                    |
+| Jeremy Leibs           | jleibs               | Genesis AI        |                     |                                                    |
 | Haocheng Liu           | HaochengLIU          | Seven Research    | ✓                   |                                                    |
 | Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member              |
 | ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                    |

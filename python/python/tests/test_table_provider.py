@@ -91,3 +91,31 @@ def test_table_loading():
     result = normalize(ctx.table("ffi_lance_table").limit(1, offset=1).collect())
     assert len(result) == 1
     assert result["col1"][0].as_py() == 1
+
+
+def test_custom_udf_filter(tmp_path):
+    pytest.importorskip("datafusion")
+    from datafusion import SessionContext, udf
+
+    def is_even(values: pa.Array) -> pa.Array:
+        return pa.array([value.as_py() % 2 == 0 for value in values], type=pa.bool_())
+
+    is_even_udf = udf(
+        is_even,
+        input_fields=[pa.int64()],
+        return_field=pa.bool_(),
+        volatility="stable",
+        name="is_even",
+    )
+
+    dataset = lance.write_dataset(pa.table({"i": [1, 2, 3, 4]}), str(tmp_path))
+    provider = FFILanceTableProvider(dataset, with_row_id=True, with_row_addr=True)
+
+    ctx = SessionContext()
+    ctx.register_table("numbers", provider)
+    ctx.register_udf(is_even_udf)
+
+    result = normalize(
+        ctx.sql("SELECT i FROM numbers WHERE i = 2 AND is_even(i)").collect()
+    )
+    assert result["i"].to_pylist() == [2]

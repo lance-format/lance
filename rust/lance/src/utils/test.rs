@@ -27,6 +27,7 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+pub mod covering;
 mod failing_store;
 pub mod serializing_cache;
 mod throttle_store;
@@ -530,6 +531,90 @@ pub async fn assert_plan_node_equals(
 
     // Use the extracted string matching logic
     assert_string_matches(&raw_plan_desc, raw_expected)
+}
+
+/// Fragment reuse versions over fragments no dataset has, to size a stored history
+/// without compacting that much data.
+pub fn padding_reuse_versions(count: u64) -> Vec<lance_index::frag_reuse::FragReuseVersion> {
+    use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseVersion};
+    let digest = |id: u64| FragDigest {
+        id,
+        physical_rows: 4,
+        num_deleted_rows: 0,
+    };
+    (0..count)
+        .map(|i| {
+            let old_id = 1_000 + i;
+            let mut changed_row_addrs = Vec::new();
+            roaring::RoaringTreemap::from_iter((old_id << 32)..(old_id << 32) + 4)
+                .serialize_into(&mut changed_row_addrs)
+                .unwrap();
+            FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(old_id)],
+                    new_frags: vec![digest(100_000 + i)],
+                }],
+            }
+        })
+        .collect()
+}
+
+/// Commits `count` padding versions as the dataset's fragment reuse history.
+pub async fn commit_padding_reuse_history(
+    dataset: &mut Dataset,
+    count: usize,
+) -> lance_table::format::IndexMetadata {
+    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+    let details = lance_index::frag_reuse::FragReuseIndexDetails {
+        versions: padding_reuse_versions(count as u64),
+    };
+    let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
+    let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            crate::dataset::transaction::Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![entry.clone()],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    entry
+}
+
+/// The most padding versions whose details still fit inline.
+pub fn inline_padding_capacity() -> usize {
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
+    let versions = padding_reuse_versions(5_000);
+    let fits = |count: usize| {
+        InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
+            versions: versions[..count].to_vec(),
+        })
+        .encoded_len()
+            <= 204_800
+    };
+    let (mut low, mut high) = (0, versions.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    assert!(low < versions.len());
+    low
 }
 
 #[cfg(test)]
