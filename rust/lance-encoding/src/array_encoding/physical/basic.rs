@@ -156,6 +156,16 @@ struct BasicPageDecoder {
 }
 
 impl PrimitivePageDecoder for BasicPageDecoder {
+    fn variable_width_bytes(&self, rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        match &self.mode {
+            DataNullStatus::Some(decoders) => {
+                decoders.values.variable_width_bytes(rows_to_skip, num_rows)
+            }
+            DataNullStatus::All => Ok(Some(0)),
+            DataNullStatus::None(values) => values.variable_width_bytes(rows_to_skip, num_rows),
+        }
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         match &self.mode {
             DataNullStatus::Some(decoders) => {

@@ -437,7 +437,7 @@ fn validate_blob_field(
                         ));
                     }
                 }
-                BlobKind::Managed => {
+                BlobKind::Managed | BlobKind::ManagedWithBase => {
                     let uris = descriptors
                         .column_by_name("blob_uri")
                         .ok_or_else(|| {
@@ -449,9 +449,6 @@ fn validate_blob_field(
                         positions.value(row),
                         sizes.value(row),
                     )?;
-                    // The ID is a snapshot base binding, not a leased sidecar
-                    // number. Concatenation preserves the independent object
-                    // address; the dataset caller owns the base namespace.
                 }
                 BlobKind::Inline | BlobKind::External => {}
             }

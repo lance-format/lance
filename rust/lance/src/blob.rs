@@ -24,7 +24,7 @@ use arrow_array::{
     types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::NullBufferBuilder;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -32,8 +32,8 @@ use lance_arrow::{
 };
 use lance_core::{
     datatypes::{
-        BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
-        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+        BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS,
+        BLOB_V2_PREPARED_TYPE, BlobKind, BlobV2Layout, Field as LanceField, Schema as LanceSchema,
     },
     utils::blob::blob_path,
 };
@@ -128,12 +128,106 @@ pub fn blob_field_with_options(name: &str, nullable: bool, options: BlobFieldOpt
     .with_metadata(metadata)
 }
 
-fn prepared_blob_field_with_metadata(
+pub(crate) fn prepared_blob_field_with_metadata(
     name: &str,
     nullable: bool,
     metadata: HashMap<String, String>,
 ) -> Field {
     Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
+}
+
+fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
+    if field.is_blob_v2() {
+        return match blob_v2_layout(field) {
+            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => {
+                Ok(prepared_blob_field_with_metadata(
+                    field.name(),
+                    field.is_nullable(),
+                    field.metadata().clone(),
+                ))
+            }
+            _ => Err(blob_v2_shape_error(
+                field,
+                &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
+            )),
+        };
+    }
+
+    let data_type = match field.data_type() {
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| logical_to_prepared_blob_field(child.as_ref()).map(Arc::new))
+                .collect::<Result<Vec<_>>>()?
+                .into(),
+        ),
+        DataType::List(child) => DataType::List(Arc::new(logical_to_prepared_blob_field(child)?)),
+        DataType::LargeList(child) => {
+            DataType::LargeList(Arc::new(logical_to_prepared_blob_field(child)?))
+        }
+        _ => field.data_type().clone(),
+    };
+    Ok(field.clone().with_data_type(data_type))
+}
+
+pub(crate) fn logical_to_prepared_blob_schema(schema: &ArrowSchema) -> Result<ArrowSchema> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| logical_to_prepared_blob_field(field.as_ref()).map(Arc::new))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+fn prepared_to_descriptor_blob_field(field: &Field) -> Result<Field> {
+    if field.is_blob_v2() {
+        return match blob_v2_layout(field) {
+            Some(BlobV2Layout::Prepared) | Some(BlobV2Layout::Descriptor) => {
+                Ok(
+                    Field::new(field.name(), BLOB_V2_DESC_TYPE.clone(), field.is_nullable())
+                        .with_metadata(field.metadata().clone()),
+                )
+            }
+            Some(BlobV2Layout::Logical) => Ok(field.clone()),
+            _ => Err(blob_v2_shape_error(
+                field,
+                &[BlobV2Layout::Prepared, BlobV2Layout::Descriptor],
+            )),
+        };
+    }
+
+    let data_type = match field.data_type() {
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| prepared_to_descriptor_blob_field(child.as_ref()).map(Arc::new))
+                .collect::<Result<Vec<_>>>()?
+                .into(),
+        ),
+        DataType::List(child) => {
+            DataType::List(Arc::new(prepared_to_descriptor_blob_field(child)?))
+        }
+        DataType::LargeList(child) => {
+            DataType::LargeList(Arc::new(prepared_to_descriptor_blob_field(child)?))
+        }
+        _ => field.data_type().clone(),
+    };
+    Ok(field.clone().with_data_type(data_type))
+}
+
+pub(crate) fn prepared_to_descriptor_blob_schema(schema: &ArrowSchema) -> Result<ArrowSchema> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| prepared_to_descriptor_blob_field(field.as_ref()).map(Arc::new))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 fn logical_blob_lance_children() -> Result<Vec<LanceField>> {
@@ -463,14 +557,15 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                 }
                 validate_blob_id(blob_id_col.value(row))?;
             }
-            BlobKind::Managed => {
+            BlobKind::Managed | BlobKind::ManagedWithBase => {
                 if uri_col.is_null(row)
-                    || blob_id_col.is_null(row)
+                    || ((kind_col.value(row) == BlobKind::ManagedWithBase as u8)
+                        != blob_id_col.is_valid(row))
                     || blob_size_col.is_null(row)
                     || position_col.is_null(row)
                 {
                     return Err(Error::invalid_input(format!(
-                        "Prepared Managed blob row {row} must set `uri`, `blob_id`, `blob_size`, and `position`"
+                        "Prepared Managed blob row {row} requires `uri`, `blob_size`, and `position`, plus `blob_id` for an explicit base"
                     )));
                 }
                 lance_core::utils::blob::validate_managed_reference(
@@ -551,10 +646,10 @@ pub enum BlobDescriptor {
     },
     /// Payload bytes stored as the full contents of a dedicated sidecar blob.
     Dedicated { blob_id: u32, size: u64 },
-    /// A known range in an immutable Lance-owned object. The exact `base_id`
-    /// must be bound in the same committed snapshot as this descriptor.
+    /// A known range in an immutable Lance-owned object. `None` uses the
+    /// writer's table base; `Some(id)` requires an already registered base.
     Managed {
-        base_id: u32,
+        base_id: Option<u32>,
         uri: String,
         offset: u64,
         size: u64,
@@ -753,10 +848,14 @@ impl BlobDescriptorArrayBuilder {
                     size,
                 } => {
                     validity.append_non_null();
-                    kind_builder.append_value(BlobKind::Managed as u8);
+                    kind_builder.append_value(if base_id.is_some() {
+                        BlobKind::ManagedWithBase as u8
+                    } else {
+                        BlobKind::Managed as u8
+                    });
                     data_builder.append_null();
                     uri_builder.append_value(uri);
-                    blob_id_builder.append_value(base_id);
+                    blob_id_builder.append_option(base_id);
                     blob_size_builder.append_value(size);
                     position_builder.append_value(offset);
                 }
@@ -1354,6 +1453,48 @@ mod tests {
                 .unwrap(),
             "2097152"
         );
+    }
+
+    #[test]
+    fn test_mem_wal_blob_schema_transforms_nested_fields() {
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "record",
+                DataType::Struct(vec![blob_field("payload", true)].into()),
+                true,
+            ),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(blob_field("item", false))),
+                true,
+            ),
+        ]);
+
+        let prepared = logical_to_prepared_blob_schema(&schema).unwrap();
+        let DataType::Struct(record_fields) = prepared.field(0).data_type() else {
+            panic!("record must remain a struct");
+        };
+        assert_eq!(
+            blob_v2_layout(record_fields[0].as_ref()),
+            Some(BlobV2Layout::Prepared)
+        );
+        let DataType::List(item) = prepared.field(1).data_type() else {
+            panic!("items must remain a list");
+        };
+        assert_eq!(blob_v2_layout(item), Some(BlobV2Layout::Prepared));
+
+        let descriptor = prepared_to_descriptor_blob_schema(&prepared).unwrap();
+        let DataType::Struct(record_fields) = descriptor.field(0).data_type() else {
+            panic!("record must remain a struct");
+        };
+        assert_eq!(
+            blob_v2_layout(record_fields[0].as_ref()),
+            Some(BlobV2Layout::Descriptor)
+        );
+        let DataType::List(item) = descriptor.field(1).data_type() else {
+            panic!("items must remain a list");
+        };
+        assert_eq!(blob_v2_layout(item), Some(BlobV2Layout::Descriptor));
     }
 
     #[test]

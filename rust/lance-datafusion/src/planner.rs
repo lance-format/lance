@@ -23,7 +23,7 @@ use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -183,28 +183,39 @@ impl ScalarUDFImpl for CastListF16Udf {
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
-    state: SessionState,
+    // Functions are looked up in the session's shared state rather than in a
+    // clone of it: planners are created several times per query, and cloning
+    // every function map and rule list for each one is a measurable share of
+    // CPU for short queries.
+    session: SessionContext,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
+}
+
+impl LanceContextProvider {
+    fn new(session: SessionContext) -> Self {
+        let expr_planners = session.state_ref().read().expr_planners().to_vec();
+        Self {
+            options: ConfigOptions::default(),
+            session,
+            expr_planners,
+        }
+    }
+
+    fn with_state<T>(&self, read: impl FnOnce(&SessionState) -> T) -> T {
+        read(&self.session.state_ref().read())
+    }
 }
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        let state = ctx.state();
-        let expr_planners = state.expr_planners().to_vec();
-
-        Self {
-            options: ConfigOptions::default(),
-            state,
-            expr_planners,
-        }
+        Self::new(get_session_context(&LanceExecutionOptions::default()))
     }
 }
 
 impl ContextProvider for LanceContextProvider {
     fn get_table_source(
         &self,
-        name: datafusion::sql::TableReference,
+        name: datafusion::common::TableReference,
     ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Attempt to reference inner table {} not supported",
@@ -213,18 +224,18 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.state.aggregate_functions().get(name).cloned()
+        self.with_state(|state| state.aggregate_functions().get(name).cloned())
     }
 
     fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.state.window_functions().get(name).cloned()
+        self.with_state(|state| state.window_functions().get(name).cloned())
     }
 
     fn get_higher_order_meta(
         &self,
         name: &str,
     ) -> Option<Arc<datafusion::logical_expr::HigherOrderUDF>> {
-        self.state.higher_order_functions().get(name).cloned()
+        self.with_state(|state| state.higher_order_functions().get(name).cloned())
     }
 
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
@@ -232,7 +243,7 @@ impl ContextProvider for LanceContextProvider {
             // TODO: cast should go thru CAST syntax instead of UDF
             // Going thru UDF makes it hard for the optimizer to find no-ops
             "_cast_list_f16" => Some(Arc::new(ScalarUDF::new_from_impl(CastListF16Udf::new()))),
-            _ => self.state.scalar_functions().get(f).cloned(),
+            _ => self.with_state(|state| state.scalar_functions().get(f).cloned()),
         }
     }
 
@@ -246,23 +257,19 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        self.state.scalar_functions().keys().cloned().collect()
+        self.with_state(|state| state.scalar_functions().keys().cloned().collect())
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        self.state.aggregate_functions().keys().cloned().collect()
+        self.with_state(|state| state.aggregate_functions().keys().cloned().collect())
     }
 
     fn udwf_names(&self) -> Vec<String> {
-        self.state.window_functions().keys().cloned().collect()
+        self.with_state(|state| state.window_functions().keys().cloned().collect())
     }
 
     fn higher_order_function_names(&self) -> Vec<String> {
-        self.state
-            .higher_order_functions()
-            .keys()
-            .cloned()
-            .collect()
+        self.with_state(|state| state.higher_order_functions().keys().cloned().collect())
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -2083,6 +2090,33 @@ mod tests {
     }
 
     #[test]
+    fn test_lance_context_provider_resolves_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        let ctx_provider = LanceContextProvider::new(session.clone());
+        assert!(ctx_provider.get_function_meta("contains_tokens").is_some());
+        assert!(ctx_provider.get_function_meta("lower").is_some());
+        assert!(ctx_provider.get_aggregate_meta("sum").is_some());
+        assert!(ctx_provider.get_window_meta("row_number").is_some());
+        assert!(ctx_provider.get_function_meta("registered_later").is_none());
+
+        // The provider reads the session's functions instead of a copy, so a
+        // function registered on the session afterwards resolves as well.
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "registered_later",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        assert!(ctx_provider.get_function_meta("registered_later").is_some());
+        assert!(
+            ctx_provider
+                .udf_names()
+                .contains(&"registered_later".to_string())
+        );
+    }
+
+    #[test]
     fn test_regexp_match_and_non_empty_captions() {
         // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
         // causing planning/evaluation failures. This should evaluate successfully.
@@ -2142,28 +2176,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_regexp_match_infer_error_without_boolean_coercion() {
-        // With the fix applied, using parse_filter should coerce regexp_match to boolean
-        // even when nested in a larger AND expression, so this should plan successfully.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("keywords", DataType::Utf8, true),
-            Field::new("natural_caption", DataType::Utf8, true),
-            Field::new("poetic_caption", DataType::Utf8, true),
-        ]));
+    #[rstest]
+    #[case::bare("regexp_match(name, 'e[12]')", [false, true, true, false, false, false])]
+    #[case::is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL",
+        [false, true, true, false, false, false]
+    )]
+    #[case::is_null(
+        "regexp_match(name, 'e[12]') IS NULL",
+        [true, false, false, true, true, true]
+    )]
+    #[case::not_bare(
+        "NOT regexp_match(name, 'e[12]')",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_bare(
+        "regexp_match(name, 'e[12]') AND name <> 'name2'",
+        [false, true, false, false, false, false]
+    )]
+    #[case::or_bare(
+        "regexp_match(name, 'e[12]') OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    #[case::not_is_not_null(
+        "NOT (regexp_match(name, 'e[12]') IS NOT NULL)",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_is_null(
+        "regexp_match(name, 'e[12]') IS NULL AND name IS NOT NULL",
+        [true, false, false, false, true, true]
+    )]
+    #[case::or_is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    fn test_regexp_match_filter_coercion(#[case] filter: &str, #[case] expected: [bool; 6]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [
+                Some("name0"),
+                Some("name1"),
+                Some("name2"),
+                None,
+                Some("name4"),
+                Some("name5")
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let result = physical_expr.evaluate(&batch).unwrap();
 
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::is_not_null("regexp_match(name, 'e[12]') IS NOT NULL")]
+    #[case::is_null("regexp_match(name, 'e[12]') IS NULL")]
+    #[case::comparison("regexp_match(name, 'e[12]') = regexp_match(name, 'e[12]')")]
+    fn test_regexp_match_preserves_value_contexts(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let planner = Planner::new(schema);
 
-        let expr = planner
-            .parse_filter(
-                "regexp_match(keywords, 'Liberty|revolution') AND \
-                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
-                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
-            )
-            .unwrap();
-
-        // Should not panic
-        let _physical = planner.create_physical_expr(&expr).unwrap();
+        assert_eq!(
+            planner.parse_filter(filter).unwrap(),
+            planner.parse_expr(filter).unwrap()
+        );
     }
 
     #[test]

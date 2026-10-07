@@ -7,6 +7,7 @@
 //! update version for each row in a Lance dataset, enabling efficient
 //! cross-version diff operations.
 
+use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 
 use lance_core::Error;
@@ -17,9 +18,28 @@ use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::format::{ExternalFile, Fragment, pb};
+use crate::format::{Fragment, pb};
 use crate::rowids::segment::U64Segment;
 use crate::rowids::{RowIdSequence, read_row_ids};
+
+/// One fragment's row lineage sequences that live outside the manifest, read
+/// ahead of a commit by the caller.
+///
+/// Building a manifest is synchronous and has no object store, so it cannot
+/// read a sequence spilled to a data file column (`RowIdMeta::Column`,
+/// `RowDatasetVersionMeta::Column`). A caller that can do IO loads them first
+/// and hands them over in [`ManifestBuildConfig`](crate::format::ManifestBuildConfig).
+/// Only the spilled sequences need to be present; inline ones are decoded on
+/// the spot.
+#[derive(Debug, Clone, Default)]
+pub struct LoadedRowLineage {
+    pub row_ids: Option<Arc<RowIdSequence>>,
+    pub created_at: Option<Arc<RowDatasetVersionSequence>>,
+    pub last_updated_at: Option<Arc<RowDatasetVersionSequence>>,
+}
+
+/// [`LoadedRowLineage`] per fragment id.
+pub type SpilledRowLineage = HashMap<u64, LoadedRowLineage>;
 
 /// A run of identical versions over a contiguous span of row positions.
 ///
@@ -207,6 +227,28 @@ impl RowDatasetVersionSequence {
         Self { runs: vec![run] }
     }
 
+    /// Run-length encode one version per row, in row offset order.
+    pub fn from_versions(versions: &[u64]) -> Self {
+        let mut runs = Vec::new();
+        let mut run_start = 0u64;
+        for (i, window) in versions.windows(2).enumerate() {
+            if window[0] != window[1] {
+                runs.push(RowDatasetVersionRun {
+                    span: U64Segment::Range(run_start..i as u64 + 1),
+                    version: window[0],
+                });
+                run_start = i as u64 + 1;
+            }
+        }
+        if let Some(last) = versions.last() {
+            runs.push(RowDatasetVersionRun {
+                span: U64Segment::Range(run_start..versions.len() as u64),
+                version: *last,
+            });
+        }
+        Self { runs }
+    }
+
     /// Number of rows tracked by this sequence (sum of run lengths).
     pub fn len(&self) -> u64 {
         self.runs.iter().map(|s| s.len() as u64).sum()
@@ -356,9 +398,24 @@ impl<'a> Iterator for VersionsIter<'a> {
 pub enum RowDatasetVersionMeta {
     /// Small sequences stored inline in the fragment metadata
     Inline(Arc<[u8]>),
-    /// Large sequences stored in external files
-    External(ExternalFile),
+    /// The sequence is spilled to a hidden column of one of the fragment's
+    /// data files, one version per physical row in offset order, at
+    /// [`ROW_CREATED_AT_VERSION_FIELD_ID`](crate::format::ROW_CREATED_AT_VERSION_FIELD_ID)
+    /// or
+    /// [`ROW_LAST_UPDATED_AT_VERSION_FIELD_ID`](crate::format::ROW_LAST_UPDATED_AT_VERSION_FIELD_ID)
+    /// depending on which sequence this is; see
+    /// [`Fragment::row_lineage_file`](crate::format::Fragment::row_lineage_file).
+    /// Reading it needs IO, so it goes through the dataset's loader rather
+    /// than [`Self::load_sequence`].
+    Column,
 }
+
+/// The JSON form of [`RowDatasetVersionMeta::Column`]: `{"column": {}}`, an
+/// empty object under the arm's name, mirroring the empty `RowLineageColumn`
+/// protobuf message. The name alone tells the arms apart; there is nothing to
+/// carry.
+#[derive(Serialize, Deserialize)]
+struct ColumnMarker {}
 
 // Custom Serialize: convert Arc<[u8]> to slice for transparent JSON output
 impl Serialize for RowDatasetVersionMeta {
@@ -367,7 +424,7 @@ impl Serialize for RowDatasetVersionMeta {
         #[serde(untagged)]
         enum Helper<'a> {
             Inline { inline: &'a [u8] },
-            External { external: &'a ExternalFile },
+            Column { column: ColumnMarker },
         }
 
         match self {
@@ -375,7 +432,10 @@ impl Serialize for RowDatasetVersionMeta {
                 inline: data.as_ref(),
             }
             .serialize(serializer),
-            Self::External(file) => Helper::External { external: file }.serialize(serializer),
+            Self::Column => Helper::Column {
+                column: ColumnMarker {},
+            }
+            .serialize(serializer),
         }
     }
 }
@@ -387,12 +447,15 @@ impl<'de> Deserialize<'de> for RowDatasetVersionMeta {
         #[serde(untagged)]
         enum Helper {
             Inline { inline: Vec<u8> },
-            External { external: ExternalFile },
+            Column { column: ColumnMarker },
         }
 
         match Helper::deserialize(deserializer)? {
             Helper::Inline { inline } => Ok(Self::Inline(Arc::from(inline))),
-            Helper::External { external } => Ok(Self::External(external)),
+            Helper::Column { column } => {
+                let ColumnMarker {} = column;
+                Ok(Self::Column)
+            }
         }
     }
 }
@@ -404,18 +467,18 @@ impl RowDatasetVersionMeta {
         Ok(Self::Inline(Arc::from(bytes)))
     }
 
-    /// Create external metadata reference
-    pub fn from_external_file(path: String, offset: u64, size: u64) -> Self {
-        Self::External(ExternalFile { path, offset, size })
-    }
-
-    /// Load the version sequence from this metadata
+    /// Decode the version sequence stored inline in this metadata.
+    ///
+    /// A sequence stored outside the manifest needs IO to read, which this
+    /// synchronous accessor cannot do; it is an error here and is loaded
+    /// through the dataset instead.
     pub fn load_sequence(&self) -> lance_core::Result<RowDatasetVersionSequence> {
         match self {
             Self::Inline(data) => read_dataset_versions(data),
-            Self::External(_file) => {
-                todo!("External file loading not yet implemented")
-            }
+            Self::Column => Err(Error::not_supported(
+                "row version sequence spilled to a data file column cannot be decoded from \
+                 fragment metadata alone",
+            )),
         }
     }
 }
@@ -430,13 +493,9 @@ pub fn last_updated_at_version_meta_to_pb(
                 data.to_vec(),
             )
         }
-        RowDatasetVersionMeta::External(file) => {
-            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                pb::ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                },
+        RowDatasetVersionMeta::Column => {
+            pb::data_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
+                pb::RowLineageColumn {},
             )
         }
     })
@@ -450,13 +509,9 @@ pub fn created_at_version_meta_to_pb(
         RowDatasetVersionMeta::Inline(data) => {
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data.to_vec())
         }
-        RowDatasetVersionMeta::External(file) => {
-            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
-                pb::ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                },
+        RowDatasetVersionMeta::Column => {
+            pb::data_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(
+                pb::RowLineageColumn {},
             )
         }
     })
@@ -637,8 +692,9 @@ pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                 let sequence = read_row_ids(data).unwrap();
                 sequence.len()
             }
-            // Follow existing behavior: external sequence not yet supported here
-            crate::format::RowIdMeta::External(_file) => 0,
+            // Follow existing behavior: a sequence that is not inline needs IO
+            // to read, which this synchronous path cannot do.
+            crate::format::RowIdMeta::Column => 0,
         }
     } else {
         0
@@ -659,11 +715,15 @@ pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
 /// `updated_offsets` are local row offsets (within the fragment) that have been updated.
 /// Existing version metadata is preserved and only the updated positions are set to `current_version`.
 /// If no existing metadata is present, positions default to `prev_version`.
+///
+/// A fragment whose existing versions are spilled has them read from
+/// `spilled`; the refreshed sequence is placed inline.
 pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
     fragment: &mut Fragment,
     updated_offsets: &[usize],
     current_version: u64,
     prev_version: u64,
+    spilled: &SpilledRowLineage,
 ) -> Result<()> {
     // Determine row count for fragment
     let row_count_u64: u64 = if let Some(pr) = fragment.physical_rows {
@@ -674,9 +734,13 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                 let sequence = read_row_ids(data).unwrap();
                 sequence.len()
             }
-            crate::format::RowIdMeta::External(_file) => {
-                // Preserve original behavior for external sequences
-                todo!("External file loading not yet implemented")
+            // Reading these needs IO, which this synchronous path cannot do.
+            // Reachable only for a fragment that also has no `physical_rows`.
+            crate::format::RowIdMeta::Column => {
+                return Err(Error::not_supported(
+                    "refreshing row update versions for a fragment whose row id \
+                     sequence is stored outside the manifest",
+                ));
             }
         }
     } else {
@@ -687,7 +751,26 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
         // Build base version vector from existing meta or previous dataset version
         let mut base_versions: Vec<u64> = Vec::with_capacity(row_count_u64 as usize);
         if let Some(meta) = fragment.last_updated_at_version_meta.as_ref() {
-            if let Ok(base_seq) = meta.load_sequence() {
+            let base_seq = if matches!(meta, RowDatasetVersionMeta::Column) {
+                // The existing versions of the rows this update leaves alone
+                // live in a data file, which this path cannot read. Defaulting
+                // them would silently rewrite their lineage, so the caller has
+                // to have read them ahead of time.
+                let loaded = spilled
+                    .get(&fragment.id)
+                    .and_then(|lineage| lineage.last_updated_at.clone())
+                    .ok_or_else(|| {
+                        Error::not_supported(format!(
+                            "fragment {} stores its last-updated-at versions outside the \
+                             manifest and they were not loaded ahead of the commit",
+                            fragment.id
+                        ))
+                    })?;
+                Some(loaded.as_ref().clone())
+            } else {
+                meta.load_sequence().ok()
+            };
+            if let Some(base_seq) = base_seq {
                 base_versions.extend(base_seq.versions().take(row_count_u64 as usize));
                 base_versions.resize(row_count_u64 as usize, prev_version);
             } else {
@@ -741,13 +824,9 @@ impl TryFrom<pb::data_fragment::LastUpdatedAtVersionSequence> for RowDatasetVers
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
                 Ok(Self::Inline(Arc::from(data)))
             }
-            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                file,
-            ) => Ok(Self::External(ExternalFile {
-                path: file.path,
-                offset: file.offset,
-                size: file.size,
-            })),
+            pb::data_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(_) => {
+                Ok(Self::Column)
+            }
         }
     }
 }
@@ -760,12 +839,8 @@ impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionM
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
                 Ok(Self::Inline(Arc::from(data)))
             }
-            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path,
-                    offset: file.offset,
-                    size: file.size,
-                }))
+            pb::data_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
+                Ok(Self::Column)
             }
         }
     }
@@ -774,6 +849,43 @@ impl TryFrom<pb::data_fragment::CreatedAtVersionSequence> for RowDatasetVersionM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn column_meta_json_is_an_empty_object_under_the_arm_name() {
+        let json = serde_json::to_string(&RowDatasetVersionMeta::Column).unwrap();
+        assert_eq!(json, r#"{"column":{}}"#);
+        let parsed: RowDatasetVersionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, RowDatasetVersionMeta::Column);
+        let inline = RowDatasetVersionMeta::Inline(Arc::from(vec![1u8, 2, 3]));
+        let parsed: RowDatasetVersionMeta =
+            serde_json::from_str(&serde_json::to_string(&inline).unwrap()).unwrap();
+        assert_eq!(parsed, inline);
+    }
+
+    #[test]
+    fn from_versions_run_length_encodes() {
+        assert!(
+            RowDatasetVersionSequence::from_versions(&[])
+                .runs
+                .is_empty()
+        );
+
+        let single = RowDatasetVersionSequence::from_versions(&[3, 3, 3]);
+        assert_eq!(single.runs.len(), 1);
+        assert_eq!(single.runs[0].version, 3);
+        assert_eq!(single.len(), 3);
+
+        let alternating = RowDatasetVersionSequence::from_versions(&[1, 2, 1, 2]);
+        assert_eq!(
+            alternating
+                .runs
+                .iter()
+                .map(|run| run.version)
+                .collect::<Vec<_>>(),
+            [1, 2, 1, 2]
+        );
+        assert_eq!(alternating.versions().collect::<Vec<_>>(), [1, 2, 1, 2]);
+    }
 
     #[test]
     fn test_version_random_access() {
@@ -822,6 +934,7 @@ mod tests {
             &[ROWS - 1],
             3,
             1,
+            &Default::default(),
         )
         .unwrap();
 

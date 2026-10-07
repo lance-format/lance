@@ -337,14 +337,14 @@ impl FieldEncoder for BlobV2StructuralEncoder {
             } else {
                 let kind_val = BlobKind::try_from(kind_col.value(i))?;
                 match kind_val {
-                    BlobKind::Managed => {
+                    BlobKind::Managed | BlobKind::ManagedWithBase => {
                         if uri_col.is_null(i)
-                            || blob_id_col.is_null(i)
+                            || ((kind_val == BlobKind::ManagedWithBase) != blob_id_col.is_valid(i))
                             || packed_position_col.is_null(i)
                             || blob_size_col.is_null(i)
                         {
                             return Err(Error::invalid_input(format!(
-                                "Managed blob row {i} requires URI, base ID, position, and size"
+                                "Managed blob row {i} requires URI, position, and size, plus a base ID for an explicit base"
                             )));
                         }
                         let uri = uri_col.value(i);
@@ -352,10 +352,14 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                         let size = blob_size_col.value(i);
                         lance_core::utils::blob::validate_managed_reference(uri, position, size)?;
                         (
-                            BlobKind::Managed as u8,
+                            kind_val as u8,
                             position,
                             size,
-                            blob_id_col.value(i),
+                            if kind_val == BlobKind::ManagedWithBase {
+                                blob_id_col.value(i)
+                            } else {
+                                0
+                            },
                             uri.to_string(),
                         )
                     }

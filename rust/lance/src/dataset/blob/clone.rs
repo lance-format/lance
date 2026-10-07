@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, GenericListArray, RecordBatch, StringArray, StructArray, UInt32Array,
+    Array, ArrayRef, GenericListArray, RecordBatch, StringArray, StructArray, UInt8Array,
+    UInt32Array,
 };
 use arrow_schema::DataType;
 use lance_core::datatypes::{BlobHandling, BlobKind, Field};
@@ -24,7 +25,7 @@ use super::{
 use crate::dataset::Dataset;
 use crate::dataset::optimize::BlobV2BatchRewritePlan;
 
-type BlobCopies = HashMap<(u32, String), (u32, String)>;
+type BlobCopies = HashMap<(Option<u32>, String), String>;
 
 fn replace_array(copies: &BlobCopies, field: &Field, array: ArrayRef) -> Result<ArrayRef> {
     if !field_contains_blob(field) {
@@ -45,16 +46,22 @@ fn replace_array(copies: &BlobCopies, field: &Field, array: ArrayRef) -> Result<
             blob_ids: column("blob_id")?.as_primitive(),
             blob_uris: column("uri")?.as_string(),
         };
-        let mut ids = columns.blob_ids.values().to_vec();
+        let mut ids = columns.blob_ids.iter().collect::<Vec<_>>();
+        let mut kinds = columns.kinds.values().to_vec();
         let mut uris = Vec::with_capacity(values.len());
         for (row, id) in ids.iter_mut().enumerate() {
             let uri = columns.blob_uris.value(row);
             if !columns.is_null_blob(row)
-                && columns.kinds.value(row) == BlobKind::Managed as u8
-                && let Some(replacement) = copies.get(&(*id, uri.to_string()))
+                && matches!(
+                    BlobKind::try_from(columns.kinds.value(row))?,
+                    BlobKind::Managed | BlobKind::ManagedWithBase
+                )
+                && let Some(replacement) =
+                    copies.get(&(columns.managed_base_id(row), uri.to_string()))
             {
-                *id = replacement.0;
-                uris.push(Some(replacement.1.as_str()));
+                *id = None;
+                kinds[row] = BlobKind::Managed as u8;
+                uris.push(Some(replacement.as_str()));
             } else {
                 uris.push(columns.blob_uris.is_valid(row).then_some(uri));
             }
@@ -65,10 +72,11 @@ fn replace_array(copies: &BlobCopies, field: &Field, array: ArrayRef) -> Result<
             .zip(values.columns())
             .map(|(field, array)| -> ArrayRef {
                 match field.name().as_str() {
-                    "blob_id" => Arc::new(UInt32Array::new(
-                        ids.clone().into(),
-                        columns.blob_ids.nulls().cloned(),
+                    "kind" => Arc::new(UInt8Array::new(
+                        kinds.clone().into(),
+                        columns.kinds.nulls().cloned(),
                     )),
+                    "blob_id" => Arc::new(UInt32Array::from(ids.clone())),
                     "uri" => Arc::new(StringArray::from(uris.clone())),
                     _ => array.clone(),
                 }
@@ -217,27 +225,26 @@ pub async fn copy_blob_columns(
     target.uri = uri.to_string();
     target.base_object_stores = Default::default();
     target.manifest = Arc::new(manifest.clone());
-    manifest.bind_managed_base(target.managed_default_base()?)?;
-    target.manifest = Arc::new(manifest.clone());
     let target = Arc::new(target);
-    let target_base = target.managed_default_base()?;
     let mut copies = HashMap::new();
     for (id, uri) in managed_references(&source, source.scan()).await? {
-        let source_base = source.manifest.base_paths.get(&id).ok_or_else(|| {
-            Error::invalid_input(format!("Managed clone references unknown base ID {id}"))
-        })?;
-        let path = join_base_and_relative_path(
-            &source_base.extract_path(source.session.store_registry())?,
-            &uri,
-        )?;
-        let target_uri = format!("_blobs/{}.blob", Uuid::new_v4());
+        let path = join_base_and_relative_path(&source.blob_base_path(id)?, &uri)?;
+        // Local objects keep their relative address, so their data files can be
+        // copied verbatim. Registered bases may contain colliding object names.
+        let target_uri = if id.is_none() {
+            uri.clone()
+        } else {
+            format!("_blobs/{}.blob", Uuid::new_v4())
+        };
         let target_path = join_base_and_relative_path(&target.base, &target_uri)?;
         source
-            .object_store(Some(id))
+            .object_store(id)
             .await?
             .copy_bulk(&path, &target.object_store, &target_path)
             .await?;
-        copies.insert((id, uri), (target_base.id, target_uri));
+        if id.is_some() {
+            copies.insert((id, uri), target_uri);
+        }
     }
     let rewritten = rewrite_blob_columns(&copies, source, target).await?;
     let fragments = Arc::make_mut(&mut manifest.fragments);

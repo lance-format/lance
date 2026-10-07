@@ -1832,6 +1832,11 @@ impl FtsMemIndex {
                         visit(index, query, terms)?;
                     }
                 }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
+                }
             }
             Ok(())
         }
@@ -1901,6 +1906,11 @@ impl FtsMemIndex {
                     {
                         visit(index, query, scorer, leaves)?;
                     }
+                }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
                 }
             }
             Ok(())
@@ -3626,6 +3636,18 @@ pub struct FtsIndexConfig {
     pub column: String,
     pub params: InvertedIndexParams,
     pub(crate) resolved_field: Option<Arc<ResolvedFtsField>>,
+}
+
+/// `resolved_field` is a cache of the schema lookup, not part of what the index
+/// is, so two configs that resolve the same way are equal whether or not either
+/// has resolved yet.
+impl PartialEq for FtsIndexConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.field_id == other.field_id
+            && self.column == other.column
+            && self.params == other.params
+    }
 }
 
 impl FtsIndexConfig {

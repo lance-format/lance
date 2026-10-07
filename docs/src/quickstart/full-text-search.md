@@ -366,6 +366,88 @@ query_result = ds.to_table(
 )
 ```
 
+### Searching Multiple Columns
+
+When a query should span several text columns (for example `title` and `body`),
+Lance offers two strategies. They differ in how they combine the matches from
+each column.
+
+#### `best_fields` with `MultiMatchQuery`
+
+`MultiMatchQuery` runs the query against each column independently and keeps the
+score of the best matching column for each row. Each column is scored against
+its own corpus statistics, and an optional per-column `boosts` multiplier is
+applied before taking the maximum.
+
+```python
+from lance.query import MultiMatchQuery
+
+query_result = ds.to_table(
+    full_text_query=MultiMatchQuery(
+        "albino elephant",
+        ["title", "body"],
+        boosts=[2.0, 1.0],  # weight title matches twice as much
+    )
+)
+```
+
+This works well when the columns are interchangeable and a strong match in one
+column is enough to make a row relevant.
+
+#### `combined_fields` (BM25F) with `CombinedFieldsQuery`
+
+`CombinedFieldsQuery` instead treats the target columns as one virtual field and
+combines their statistics into a single BM25F score. This makes scores
+comparable across columns, and a query can match with terms spread over
+different columns.
+
+```python
+from lance.query import CombinedFieldsQuery, FullTextOperator
+
+query_result = ds.to_table(
+    full_text_query=CombinedFieldsQuery(
+        "john smith",
+        ["first_name", "last_name"],
+        boosts=[1.0, 1.0],
+        operator=FullTextOperator.AND,
+    )
+)
+```
+
+Prefer `combined_fields` in these cases:
+
+- A term is rare in one column but common in another. Because document
+  frequencies are combined, a chance hit in a short column does not outrank a
+  better match elsewhere. `best_fields` cannot do this.
+- The query terms are spread over several columns. With `operator=AND`,
+  `"john smith"` matches a row whose `first_name` is `"john"` and whose
+  `last_name` is `"smith"`, even though neither column contains both terms.
+  `best_fields` would need a single column to contain the whole query.
+
+Per-column `boosts` set how much each column contributes to the combined term
+frequency. Each weight must be at least `1`, and fractional weights are allowed.
+For example, a title boost of `2` counts every title term twice.
+
+!!! note "Shared tokenizer required"
+
+    All columns in a `CombinedFieldsQuery` must use the same tokenizer and index
+    configuration, because BM25F only makes sense when the columns are tokenized
+    the same way. Mixing configurations raises an error that lists the columns
+    involved.
+
+!!! note "Indexes and unindexed data"
+
+    At least one target column needs an FTS index. Columns without an index, and
+    rows added since the last index build, are read from the data and scored
+    together with the indexed rows. Scanning is slower than reading an index, so
+    optimize the indexes after adding a lot of data.
+
+    BM25F adds up each column's contribution for a whole row, so a column indexed
+    only with `document_granularity="list_element"` is rejected. Its per-element
+    documents have no counterpart in the other columns, and the result has no
+    `_doc_index` column. A column that has both a row index and a list-element
+    index uses the row index.
+
 ## Performance Tips
 
 ### Index Maintenance

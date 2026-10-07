@@ -6,9 +6,6 @@ use object_store::path::Path;
 use crate::{Error, Result};
 
 /// Validate a Managed descriptor's object-relative path and known byte range.
-///
-/// No base ID is reserved. Resolving the base belongs to the snapshot holding
-/// the descriptor, and must fail if that snapshot has no matching binding.
 pub fn validate_managed_reference(uri: &str, position: u64, size: u64) -> Result<Path> {
     if uri.is_empty()
         || uri.starts_with('/')

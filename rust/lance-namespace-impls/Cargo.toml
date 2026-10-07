@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
-rest = ["dep:reqwest", "dep:serde"]
+rest = ["dep:arc-swap", "dep:reqwest", "dep:serde"]
 rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
@@ -32,6 +32,7 @@ lance-namespace.workspace = true
 lance-core.workspace = true
 
 # REST implementation dependencies (optional, enabled by "rest" feature)
+arc-swap = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, features = [
     "charset",
     "gzip",

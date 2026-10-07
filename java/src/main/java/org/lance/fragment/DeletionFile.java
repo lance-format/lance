@@ -95,7 +95,13 @@ public class DeletionFile implements Serializable {
     return id == that.id
         && readVersion == that.readVersion
         && fileType == that.fileType
-        && Objects.equals(numDeletedRows, that.numDeletedRows);
+        && Objects.equals(numDeletedRows, that.numDeletedRows)
+        && Objects.equals(baseId, that.baseId);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(id, readVersion, numDeletedRows, fileType, baseId);
   }
 
   @Override

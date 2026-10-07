@@ -10,7 +10,9 @@ use crate::{
     dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids},
     index::{
         prefilter::DatasetPreFilter,
-        scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
+        scalar_logical::{
+            open_named_scalar_index, open_scalar_index_segments, scalar_index_fragment_bitmap,
+        },
     },
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
@@ -79,6 +81,37 @@ impl ScalarIndexLoader for Dataset {
     }
 }
 
+struct FragmentScopedScalarIndexLoader<'a> {
+    dataset: &'a Dataset,
+    fragments: &'a RoaringBitmap,
+}
+
+#[async_trait]
+impl ScalarIndexLoader for FragmentScopedScalarIndexLoader<'_> {
+    async fn load_index(
+        &self,
+        column: &str,
+        index_name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        open_scalar_index_segments(
+            self.dataset,
+            column,
+            index_name,
+            Some(self.fragments),
+            metrics,
+        )
+        .await
+    }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        self.dataset.row_addr_result_to_row_ids(result).await
+    }
+}
+
 /// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
 ///
 /// Address-domain index results are always positive allow-lists (`AtMost`), so
@@ -121,6 +154,7 @@ pub struct ScalarIndexExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
+    fragment_scope: Option<Arc<RoaringBitmap>>,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -154,7 +188,17 @@ impl ScalarIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
+            fragment_scope: None,
         }
+    }
+
+    /// Restrict which physical scalar index segments are loaded.
+    ///
+    /// This does not restrict the result mask. The consumer remains responsible for applying
+    /// the exact fragment scope, deletion mask, and any required data-level recheck.
+    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+        self.fragment_scope = Some(Arc::new(fragments));
+        self
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -207,15 +251,34 @@ impl ScalarIndexExec {
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
+        fragment_scope: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
-            expr.evaluate(dataset.as_ref(), &metrics).await?
+            match fragment_scope.as_deref() {
+                Some(fragments) if fragments.is_empty() => {
+                    IndexExprResult::exact(RowAddrMask::allow_nothing())
+                }
+                Some(fragments) => {
+                    expr.evaluate(
+                        &FragmentScopedScalarIndexLoader {
+                            dataset: dataset.as_ref(),
+                            fragments,
+                        },
+                        &metrics,
+                    )
+                    .await?
+                }
+                None => expr.evaluate(dataset.as_ref(), &metrics).await?,
+            }
         };
-        let fragments_covered_by_result =
+        let mut fragments_covered_by_result =
             Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+        if let Some(fragment_scope) = fragment_scope {
+            fragments_covered_by_result &= fragment_scope.as_ref();
+        }
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
@@ -260,6 +323,7 @@ impl ExecutionPlan for ScalarIndexExec {
             self.dataset.clone(),
             self.metrics.clone(),
             self.result_format,
+            self.fragment_scope.clone(),
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))

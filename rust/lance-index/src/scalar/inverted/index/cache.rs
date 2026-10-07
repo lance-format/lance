@@ -329,6 +329,10 @@ pub struct PostingListGroup {
     pub(in super::super) storage: PostingListGroupStorage,
 }
 
+// A materialized group owns up to a group's worth of posting lists, next to
+// which the packed variant's extra inline bytes are small, while boxing the
+// packed variant would add a cold pointer chase to every posting view.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(in super::super) enum PostingListGroupStorage {
     Packed(PackedPostingListGroup),
@@ -340,10 +344,58 @@ pub(in super::super) struct PackedPostingListGroup {
     pub(in super::super) batch: RecordBatch,
     pub(in super::super) posting_tail_codec: PostingTailCodec,
     pub(in super::super) block_size: usize,
+    // Every query builds one posting view per (partition, term), so what a
+    // view reads is resolved from `batch` once: views neither search the
+    // schema nor chase `ArrayRef`s into cold array objects. Only those buffers
+    // are kept, since each group holds them inline and prewarm caches one
+    // group per 128 dictionary rows of every partition.
+    posting_offsets: OffsetBuffer<i32>,
+    posting_blocks: LargeBinaryArray,
+    // Inline (max_score, length) values; absent when the reader supplies them.
+    metadata: Option<(ScalarBuffer<f32>, ScalarBuffer<u32>)>,
+    // The impact column position, read only when a slot first decodes its
+    // skip data, and those per-slot states.
+    impacts: Option<(usize, Arc<[OnceLock<ImpactSkipData>]>)>,
     pub(super) first_docs_states: Arc<[OnceLock<Box<[u32]>>]>,
     pub(super) first_docs_state_capacity_bytes: usize,
-    pub(super) impact_states: Option<Arc<[OnceLock<Box<ImpactSkipData>>]>>,
     pub(super) impact_state_capacity_bytes: usize,
+}
+
+/// Position of the named column after checking that it is a non-null
+/// `List<LargeBinary>`, so slot lookups can downcast it infallibly.
+fn packed_list_column(batch: &RecordBatch, column_name: &str) -> Result<Option<usize>> {
+    let Some((position, _)) = batch.schema_ref().column_with_name(column_name) else {
+        return Ok(None);
+    };
+    let lists = batch.column(position).as_list_opt::<i32>().ok_or_else(|| {
+        Error::index(format!(
+            "packed posting group column {column_name} must be List<LargeBinary>"
+        ))
+    })?;
+    if lists.values().as_binary_opt::<i64>().is_none() {
+        return Err(Error::index(format!(
+            "packed posting group column {column_name} must contain LargeBinary values, got {}",
+            lists.values().data_type()
+        )));
+    }
+    if lists.null_count() != 0 {
+        return Err(Error::index(format!(
+            "packed posting group column {column_name} must not contain nulls"
+        )));
+    }
+    Ok(Some(position))
+}
+
+/// Same values as `ListArray::value(slot)` for a list with `offsets` into
+/// `values`, sliced without boxing an `ArrayRef`.
+fn list_slot(
+    offsets: &OffsetBuffer<i32>,
+    values: &LargeBinaryArray,
+    slot: usize,
+) -> LargeBinaryArray {
+    let start = offsets[slot] as usize;
+    let end = offsets[slot + 1] as usize;
+    values.slice(start, end - start)
 }
 
 impl DeepSizeOf for PostingListGroup {
@@ -408,25 +460,14 @@ impl PostingListGroup {
             .metadata
             .insert(POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string());
         let batch = batch.with_schema(Arc::new(schema))?;
-        let postings = batch
-            .column_by_name(POSTING_COL)
-            .and_then(|column| column.as_list_opt::<i32>())
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "packed posting group column {POSTING_COL} must be List<LargeBinary>"
-                ))
-            })?;
-        if postings.values().data_type() != &DataType::LargeBinary {
-            return Err(Error::index(format!(
-                "packed posting group column {POSTING_COL} must contain LargeBinary values, got {}",
-                postings.values().data_type()
-            )));
-        }
-        if postings.null_count() != 0 {
-            return Err(Error::index(
-                "packed posting group column must not contain nulls".to_string(),
-            ));
-        }
+        let posting_column = packed_list_column(&batch, POSTING_COL)?.ok_or_else(|| {
+            Error::index(format!(
+                "packed posting group column {POSTING_COL} must be List<LargeBinary>"
+            ))
+        })?;
+        let postings = batch.column(posting_column).as_list::<i32>();
+        let posting_offsets = postings.offsets().clone();
+        let posting_blocks = postings.values().as_binary::<i64>().clone();
         let total_posting_blocks = (0..batch.num_rows())
             .map(|slot| postings.value_length(slot) as usize)
             .sum::<usize>();
@@ -441,25 +482,10 @@ impl PostingListGroup {
             .len()
             .saturating_mul(std::mem::size_of::<OnceLock<Box<[u32]>>>())
             .saturating_add(total_posting_blocks.saturating_mul(std::mem::size_of::<u32>()));
-        let (impact_states, impact_state_capacity_bytes) = if let Some(impacts) =
-            batch.column_by_name(IMPACT_COL)
+        let (impacts, impact_state_capacity_bytes) = if let Some(impact_column) =
+            packed_list_column(&batch, IMPACT_COL)?
         {
-            let impacts = impacts.as_list_opt::<i32>().ok_or_else(|| {
-                Error::index(format!(
-                    "packed posting group column {IMPACT_COL} must be List<LargeBinary>"
-                ))
-            })?;
-            if impacts.values().data_type() != &DataType::LargeBinary {
-                return Err(Error::index(format!(
-                    "packed posting group column {IMPACT_COL} must contain LargeBinary values, got {}",
-                    impacts.values().data_type()
-                )));
-            }
-            if impacts.null_count() != 0 {
-                return Err(Error::index(format!(
-                    "packed posting group column {IMPACT_COL} must not contain nulls"
-                )));
-            }
+            let impacts = batch.column(impact_column).as_list::<i32>();
             let mut derived_cache_bytes = 0usize;
             for slot in 0..batch.num_rows() {
                 let posting_blocks = postings.value_length(slot) as usize;
@@ -476,28 +502,26 @@ impl PostingListGroup {
                 );
             }
 
-            let states: Arc<[OnceLock<Box<ImpactSkipData>>]> = (0..batch.num_rows())
+            let states: Arc<[OnceLock<ImpactSkipData>]> = (0..batch.num_rows())
                 .map(|_| OnceLock::new())
                 .collect::<Vec<_>>()
                 .into();
             // Account up front for every allocation that the lazy states can
             // eventually retain. The impact entry bytes themselves remain in
             // `batch` and are already charged exactly once above.
-            let per_slot_bytes = std::mem::size_of::<OnceLock<Box<ImpactSkipData>>>()
-                .saturating_add(std::mem::size_of::<ImpactSkipData>());
             let capacity_bytes = states
                 .len()
-                .saturating_mul(per_slot_bytes)
+                .saturating_mul(std::mem::size_of::<OnceLock<ImpactSkipData>>())
                 .saturating_add(derived_cache_bytes);
-            (Some(states), capacity_bytes)
+            (Some((impact_column, states)), capacity_bytes)
         } else {
             (None, 0)
         };
-        match (
+        let metadata = match (
             batch.column_by_name(MAX_SCORE_COL),
             batch.column_by_name(LENGTH_COL),
         ) {
-            (None, None) => {}
+            (None, None) => None,
             (Some(max_scores), Some(lengths)) => {
                 let max_scores = max_scores
                     .as_primitive_opt::<Float32Type>()
@@ -516,22 +540,26 @@ impl PostingListGroup {
                         "packed posting group metadata columns must not contain nulls".to_string(),
                     ));
                 }
+                Some((max_scores.values().clone(), lengths.values().clone()))
             }
             _ => {
                 return Err(Error::index(format!(
                     "packed posting group must contain both {MAX_SCORE_COL} and {LENGTH_COL}, or neither"
                 )));
             }
-        }
+        };
 
         Ok(Self {
             storage: PostingListGroupStorage::Packed(PackedPostingListGroup {
                 batch,
                 posting_tail_codec,
                 block_size,
+                posting_offsets,
+                posting_blocks,
+                metadata,
+                impacts,
                 first_docs_states,
                 first_docs_state_capacity_bytes,
-                impact_states,
                 impact_state_capacity_bytes,
             }),
         })
@@ -551,9 +579,7 @@ impl PostingListGroup {
 
     pub(super) fn needs_external_metadata(&self) -> bool {
         match &self.storage {
-            PostingListGroupStorage::Packed(group) => {
-                group.batch.column_by_name(MAX_SCORE_COL).is_none()
-            }
+            PostingListGroupStorage::Packed(group) => group.metadata.is_none(),
             PostingListGroupStorage::Materialized(_) => false,
         }
     }
@@ -575,86 +601,44 @@ impl PostingListGroup {
                 if slot >= group.batch.num_rows() {
                     return Ok(None);
                 }
-                let postings = group
-                    .batch
-                    .column_by_name(POSTING_COL)
-                    .and_then(|column| column.as_list_opt::<i32>())
-                    .ok_or_else(|| {
-                        Error::index(format!(
-                            "packed posting group column {POSTING_COL} must be List<LargeBinary>"
-                        ))
-                    })?;
-                let blocks = postings.value(slot);
-                let blocks = blocks.as_binary_opt::<i64>().ok_or_else(|| {
-                    Error::index(format!(
-                        "packed posting group slot {slot} is not LargeBinary"
-                    ))
-                })?;
-                let max_score = match group.batch.column_by_name(MAX_SCORE_COL) {
-                    Some(column) => column
-                        .as_primitive_opt::<Float32Type>()
-                        .expect("packed group metadata was validated at construction")
-                        .value(slot),
-                    None => max_score.ok_or_else(|| {
-                        Error::index("packed posting group requires max-score metadata".to_string())
-                    })?,
+                let blocks = list_slot(&group.posting_offsets, &group.posting_blocks, slot);
+                let (max_score, length) = match &group.metadata {
+                    Some((max_scores, lengths)) => (max_scores[slot], lengths[slot]),
+                    None => (
+                        max_score.ok_or_else(|| {
+                            Error::index(
+                                "packed posting group requires max-score metadata".to_string(),
+                            )
+                        })?,
+                        length.ok_or_else(|| {
+                            Error::index(
+                                "packed posting group requires length metadata".to_string(),
+                            )
+                        })?,
+                    ),
                 };
-                let length = match group.batch.column_by_name(LENGTH_COL) {
-                    Some(column) => column
-                        .as_primitive_opt::<UInt32Type>()
-                        .expect("packed group metadata was validated at construction")
-                        .value(slot),
-                    None => length.ok_or_else(|| {
-                        Error::index("packed posting group requires length metadata".to_string())
-                    })?,
-                };
-                let impacts = match (
-                    group.impact_states.as_ref(),
-                    group.batch.column_by_name(IMPACT_COL),
-                ) {
-                    (Some(states), Some(column)) => {
-                        let state = states.get(slot).ok_or_else(|| {
-                            Error::index(format!(
-                                "packed posting group impact state missing slot {slot}"
-                            ))
-                        })?;
-                        let impact_lists = column.as_list_opt::<i32>().ok_or_else(|| {
-                            Error::index(format!(
-                                "packed posting group column {IMPACT_COL} must be List<LargeBinary>"
-                            ))
-                        })?;
-                        let entries = impact_lists.value(slot);
-                        let entries = entries.as_binary_opt::<i64>().ok_or_else(|| {
-                            Error::index(format!(
-                                "packed posting group impact slot {slot} is not LargeBinary"
-                            ))
-                        })?;
-                        let impacts =
-                            state.get_or_init(|| {
-                                Box::new(ImpactSkipData::new(entries.clone(), blocks.len()).expect(
-                                    "packed impact entry count was validated at construction",
-                                ))
-                            });
-                        Some(impacts.as_ref().clone())
-                    }
-                    (None, None) => None,
-                    _ => {
-                        return Err(Error::internal(
-                            "packed posting group impact column/state mismatch".to_string(),
-                        ));
-                    }
-                };
+                let impacts = group.impacts.as_ref().map(|(impact_column, states)| {
+                    states[slot]
+                        .get_or_init(|| {
+                            let impacts = group.batch.column(*impact_column).as_list::<i32>();
+                            let entries =
+                                list_slot(impacts.offsets(), impacts.values().as_binary(), slot);
+                            ImpactSkipData::new(entries, blocks.len())
+                                .expect("packed impact entry count was validated at construction")
+                        })
+                        .clone()
+                });
                 Ok(Some(PostingList::Compressed(
-                    CompressedPostingList::new(
-                        blocks.clone(),
+                    CompressedPostingList::new_packed_slot(
+                        blocks,
                         max_score,
                         length,
                         group.posting_tail_codec,
                         group.block_size,
-                        None,
                         impacts,
-                    )
-                    .with_packed_first_docs(group.first_docs_states.clone(), slot),
+                        group.first_docs_states.clone(),
+                        slot,
+                    ),
                 )))
             }
         }

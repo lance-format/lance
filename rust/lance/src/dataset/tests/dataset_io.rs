@@ -33,8 +33,8 @@ use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int8DictionaryArray, Int32Array, Int64Array,
-    RecordBatchIterator, StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int8DictionaryArray, Int32Array,
+    Int64Array, RecordBatchIterator, StringArray, UInt8Array, UInt8DictionaryArray,
     cast::as_string_array,
     types::{Float32Type, Int32Type},
 };
@@ -783,6 +783,59 @@ async fn test_shallow_clone_reuses_base_object_store() {
 }
 
 #[tokio::test]
+async fn test_base_files_share_one_scheduler_per_scan() {
+    use crate::dataset::fragment::{BaseSchedulers, FragReadConfig};
+    use futures::StreamExt;
+
+    // A shallow clone whose data files all reference the source base.
+    let source_dir = tempfile::tempdir().unwrap();
+    let clone_dir = tempfile::tempdir().unwrap();
+    let source_uri = file_object_store_uri(source_dir.path());
+    let clone_uri = file_object_store_uri(clone_dir.path());
+
+    let mut source = write_multi_fragment_source(&source_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let fragments = cloned.get_fragments();
+    assert!(
+        fragments.len() > 1,
+        "need multiple base fragments to exercise sharing"
+    );
+    assert!(
+        fragments
+            .iter()
+            .all(|f| f.metadata().files.iter().all(|df| df.base_id.is_some())),
+        "shallow clone data files must reference the source base"
+    );
+
+    // Open every base fragment through one shared cache, as a scan does.
+    let cache = BaseSchedulers::new(4 * 1024 * 1024);
+    let projection = cloned.schema().clone();
+    for fragment in &fragments {
+        let read_config = FragReadConfig::default().with_base_schedulers(cache.clone());
+        let reader = fragment.open(&projection, read_config).await.unwrap();
+        // Drive the read so the base file is actually opened and its scheduler
+        // resolved through the cache.
+        reader
+            .read_all(1024)
+            .await
+            .unwrap()
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+    }
+
+    // Every fragment shares the source base, so opening all of them built
+    // exactly one scheduler. Reverting the open_current_file_reader change
+    // (a fresh scheduler per file) leaves the cache empty and fails this.
+    assert_eq!(
+        cache.len(),
+        1,
+        "all files of one base must share a single scheduler"
+    );
+}
+
+#[tokio::test]
 async fn test_base_object_store_cache_invalidation() {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
@@ -1371,6 +1424,7 @@ async fn test_write_manifest(
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -3082,6 +3136,35 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
     );
 }
 
+/// `dict:{value}:{index}:false` cannot express a value type whose own logical
+/// string carries ':', so `Schema::try_from` used to panic on the way in rather
+/// than rejecting the write.
+#[tokio::test]
+async fn write_rejects_dictionary_value_type_that_has_no_logical_type() {
+    let values = Decimal128Array::from(vec![Some(100), Some(200), Some(300)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let indices = UInt8Array::from(vec![0, 1, 2, 1]);
+    let dictionary = UInt8DictionaryArray::try_new(indices, Arc::new(values)).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .expect_err("a decimal-valued dictionary has no parseable logical type");
+
+    assert!(matches!(error, Error::Schema { .. }));
+    assert!(error.to_string().contains("does not parse back"));
+}
+
 #[rstest]
 #[tokio::test]
 async fn overwrite_dataset(
@@ -3904,6 +3987,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,

@@ -52,6 +52,7 @@ A **-1** binding vote is considered a veto for all decision types. Vetoes:
 | Release a new stable minor version of the core project                            | 3                                            | PMC                            | GitHub Discussions                    | 3 days         |
 | Release a new stable patch version of the core project                            | 3                                            | PMC                            | GitHub Discussions                    | N/A            |
 | Lance Format Specification modifications                                      | 3 (excluding proposer)                       | PMC                            | GitHub PR (see [below](#lance-format-specification-changes)) | 72 hours, excluding weekends |
+| Experimental Lance Format Specification feature (stabilization vote)          | 3 (excluding proposer)                       | PMC                            | GitHub Discussions (with a GitHub PR) | 1 week         |
 | Code modifications in the core project (except changes to format specifications)  | 1 (excluding proposer)                       | Maintainers with write access  | GitHub PR                             | N/A            |
 | Release a new stable version of subprojects                                   | 1                                            | PMC                            | GitHub Discussions                    | N/A            |
 | Code modifications in subprojects                                             | 1 (excluding proposer)                       | Contributors with write access | GitHub PR                             | N/A            |
@@ -118,3 +119,39 @@ re-check immediately.
 For a trivial edit that does not change the format — a typo, wording, or
 formatting fix — a PMC member may apply the `format-waived` label to waive the
 vote.
+
+## Experimental Specification Features
+
+Certain format specification changes may be merged as **experimental** before their stabilization vote closes.
+This allows iteration on new features without blocking on a completed vote,
+while preserving the integrity of the stable format and the community's ability to reject or modify the feature.
+
+### Prerequisites
+
+A feature may only be merged as experimental if it satisfies **all** of the following criteria:
+
+1. The feature is clearly marked as experimental in both the protobuf definitions and the documentation.
+2. The feature is **forward compatible**: writers that use the feature do not affect readers that are unaware of it.
+3. The feature is **backward compatible**: writers that do not use the feature do not affect readers that use it.
+4. Dropping the feature will not require a rewrite of existing data.
+
+### Required Commitments
+
+Before merging an experimental feature, the following commitments must be in place:
+
+1. A Github discussion on the feature has been started.  For features that will span multiple PRs this discussion
+should include a design document providing an overview of the entire planned feature.
+2. **Authors** accept that if the stabilization vote is rejected or expires without passing, the feature will be removed.
+3. **Users** accept that breaking changes may be made to experimental features at any time without a separate vote.
+4. **Authors and users** accept that the PMC may request backwards-incompatible changes to the feature during the stabilization process.
+5. The file format has an additional concept of "stable versions".  A stable version may not contain any experimental features.  Before a version can be stabilized, all its features must be stabilized or moved out to the next version.
+
+### Stabilization Workflow
+
+1. Open a PR implementing the new format feature.
+2. Open a discussion of the feature on GitHub Discussions.  This is not a voting discussion.  It is a place for maintainers
+to provide early feedback.
+3. Merge the PR with the feature clearly marked as experimental.
+4. When ready, open a PR to remove the experimental markers.  This is the PR that will carry the vote.  Merging this PR
+stabilized the feature.
+5. If the stabilization PR **fails or expires**, remove the feature from the codebase and specification.
