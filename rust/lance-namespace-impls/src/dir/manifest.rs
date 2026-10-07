@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ID, Result, box_error};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -1096,6 +1096,19 @@ impl ManifestNamespace {
         ]))
     }
 
+    /// Like [`Self::value_row_id_schema`], but for a BTree stream: BTree
+    /// training always reads its id column as `ROW_ADDR`, never `ROW_ID` (see
+    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
+    /// rows with is already an address, not a row id -- see the single
+    /// fragment id 0 invariant in `rewrite_manifest` -- so only the column
+    /// name needs to change, not the values.
+    fn value_row_addr_schema(value_field: Field) -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            value_field,
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]))
+    }
+
     fn string_row_id_batch(
         schema: SchemaRef,
         values: Vec<String>,
@@ -1128,7 +1141,7 @@ impl ManifestNamespace {
 
     fn object_id_index_stream(object_ids: BTreeMap<Arc<str>, u64>) -> SendableRecordBatchStream {
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (object_ids.into_iter(), false, schema),
