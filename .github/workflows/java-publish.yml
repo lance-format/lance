@@ -9,9 +9,6 @@ on:
       - release/**
     paths:
       - .github/workflows/java-publish.yml
-      - ci/publish_java_r2.py
-      - ci/test_publish_java_r2.py
-      - java/pom.xml
   workflow_dispatch:
     inputs:
       mode:
@@ -166,8 +163,8 @@ jobs:
           server-id: ossrh
           server-username: SONATYPE_USER
           server-password: SONATYPE_TOKEN
-          gpg-private-key: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.GPG_PRIVATE_KEY || '' }}
-          gpg-passphrase: GPG_PASSPHRASE
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       - name: Copy native libs
@@ -187,71 +184,37 @@ jobs:
           github.event_name == 'pull_request' ||
           inputs.mode == 'dry_run'
         working-directory: java
-        run: ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true package
+        run: |
+          mvn --batch-mode -DskipTests -Dskip.build.jni=true package
       - name: Publish with Java 11
         if: |
           github.event_name == 'release' ||
           inputs.mode == 'release'
         working-directory: java
         run: |
-          mkdir -p ~/.gnupg
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-          ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false \
-            "-Dgpg.passphrase=$GPG_PASSPHRASE" deploy -P deploy-to-ossrh
+          export GPG_TTY=$(tty)
+          mvn --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
-      - name: Preserve signed bundle for independent R2 retries
-        if: ${{ !cancelled() && hashFiles('java/target/central-publishing/central-bundle.zip') != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: java-central-bundle
-          path: java/target/central-publishing/central-bundle.zip
-          retention-days: 30
-          if-no-files-found: error
-  publish-r2:
-    name: Publish Java packages to R2
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: publish
-    if: github.event_name == 'release' || inputs.mode == 'release'
-    # Hold the lock through ALL metadata/checksum writes. Queuing avoids dropping
-    # pending releases when several builds finish together, including job retries.
-    concurrency:
-      group: java-maven-r2
-      queue: max
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-      - name: Download the original signed Central bundle
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: java-central-bundle
-          path: java-bundle
-      - name: Install R2 publisher
-        run: pip install boto3==1.40.76
-      - name: Upload immutable artifacts and update Maven metadata
+      - name: Upload Java packages to R2
+        if: github.event_name == 'release' || inputs.mode == 'release'
         run: |
-          : "${AWS_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}"
-          : "${AWS_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}"
-          : "${R2_ENDPOINT:?Set R2_ENDPOINT}"
-          : "${R2_BUCKET:?Set R2_BUCKET}"
-          : "${R2_PUBLIC_URL:?Set R2_PUBLIC_URL}"
-          python ci/publish_java_r2.py java-bundle/central-bundle.zip --public-url "$R2_PUBLIC_URL"
+          unzip -q java/target/central-publishing/central-bundle.zip -d "$RUNNER_TEMP/maven"
+          aws s3 cp "$RUNNER_TEMP/maven/" "s3://$R2_BUCKET/" \
+            --recursive --endpoint-url "$R2_ENDPOINT" --only-show-errors
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
-          R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
   report-failure:
     name: Report Workflow Failure
     runs-on: ubuntu-latest
-    needs: [build-linux, build-macos, publish, publish-r2]
+    needs: [build-linux, build-macos, publish]
     if: always() && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
