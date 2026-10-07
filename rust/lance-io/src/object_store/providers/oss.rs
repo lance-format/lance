@@ -134,6 +134,7 @@ impl ObjectStoreProvider for OssStoreProvider {
         }
 
         Ok(ObjectStore {
+            put_if_absent_supported: Default::default(),
             scheme: "oss".to_string(),
             inner,
             local_dir_operations: None,

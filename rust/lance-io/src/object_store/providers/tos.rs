@@ -140,6 +140,7 @@ impl ObjectStoreProvider for TosStoreProvider {
         }
 
         Ok(ObjectStore {
+            put_if_absent_supported: Default::default(),
             scheme: "tos".to_string(),
             inner,
             local_dir_operations: None,

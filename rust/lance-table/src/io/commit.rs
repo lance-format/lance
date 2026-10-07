@@ -1631,6 +1631,9 @@ impl CommitHandler for ConditionalPutCommitHandler {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
+        if object_store.scheme() == "s3" {
+            object_store.validate_put_if_absent(base_path).await?;
+        }
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
         let memory_store = ObjectStore::memory();
@@ -1753,6 +1756,11 @@ mod tests {
 
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMode,
+        PutMultipartOptions, PutPayload, PutResult,
+    };
 
     use super::*;
 
@@ -2181,6 +2189,216 @@ mod tests {
             format!("{:?}", handler),
             "ConditionalPutCommitHandler",
             "{url} should route to ConditionalPutCommitHandler",
+        );
+    }
+
+    /// Models S3-compatible stores that accept conditional PUTs but ignore them.
+    #[derive(Debug)]
+    struct ConditionalPutStore {
+        inner: InMemory,
+        is_create_ignored: bool,
+        create_count: AtomicUsize,
+    }
+
+    impl std::fmt::Display for ConditionalPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ConditionalPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OSObjectStore for ConditionalPutStore {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            mut options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if options.mode == PutMode::Create {
+                self.create_count.fetch_add(1, Ordering::SeqCst);
+                // Yield so concurrent commits contend on the probe's OnceCell.
+                tokio::task::yield_now().await;
+                if self.is_create_ignored {
+                    options.mode = PutMode::Overwrite;
+                }
+            }
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::enforced(false)]
+    #[case::ignored(true)]
+    #[tokio::test]
+    async fn test_s3_commit_checks_conditional_put(#[case] is_create_ignored: bool) {
+        let inner = Arc::new(ConditionalPutStore {
+            inner: InMemory::new(),
+            is_create_ignored,
+            create_count: AtomicUsize::new(0),
+        });
+        let store = ObjectStore::new(
+            inner.clone(),
+            Url::parse("s3://bucket/dataset").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            1,
+            0,
+            None,
+        );
+        let handler = commit_handler_from_url("s3://bucket/dataset", &None)
+            .await
+            .unwrap();
+        let base = Path::from("dataset");
+        let naming_scheme = ManifestNamingScheme::V2;
+        let existing_path = naming_scheme.manifest_path(&base, 1);
+        store
+            .inner
+            .put(&existing_path, b"existing".as_slice().into())
+            .await
+            .unwrap();
+
+        let location = handler
+            .resolve_version_location(&base, 1, &*store.inner)
+            .await
+            .unwrap();
+        assert_eq!(location.path, existing_path);
+        assert_eq!(
+            inner.create_count.load(Ordering::SeqCst),
+            0,
+            "reads must not probe"
+        );
+
+        let mut first = test_manifest();
+        first.version = 2;
+        let mut second = first.clone();
+        let cloned_store = store.clone();
+        let (first_result, second_result) = tokio::join!(
+            handler.commit(
+                &mut first,
+                None,
+                &base,
+                &store,
+                write_manifest_file_to_path,
+                naming_scheme,
+                None
+            ),
+            handler.commit(
+                &mut second,
+                None,
+                &base,
+                &cloned_store,
+                write_manifest_file_to_path,
+                naming_scheme,
+                None
+            ),
+        );
+        if is_create_ignored {
+            for result in [first_result, second_result] {
+                let CommitError::OtherError(error) = result.unwrap_err() else {
+                    panic!("expected unsupported conditional PUT");
+                };
+                assert!(matches!(error, Error::NotSupported { .. }));
+                assert!(error.to_string().contains("If-None-Match"));
+                assert!(error.to_string().contains("distributed commit_lock"));
+            }
+            assert!(
+                !store
+                    .exists(&naming_scheme.manifest_path(&base, 2))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(inner.create_count.load(Ordering::SeqCst), 2);
+
+            // An explicit lock bypasses the probe and remains usable on this store.
+            let lock = TrackingLock {
+                released: Arc::new(AtomicBool::new(false)),
+            };
+            lock.commit(
+                &mut first,
+                None,
+                &base,
+                &store,
+                write_manifest_file_to_path,
+                naming_scheme,
+                None,
+            )
+            .await
+            .unwrap();
+        } else {
+            assert_eq!(
+                usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+                1
+            );
+            let error = first_result.err().or_else(|| second_result.err()).unwrap();
+            assert!(matches!(error, CommitError::CommitConflict));
+            assert_eq!(
+                inner.create_count.load(Ordering::SeqCst),
+                4,
+                "one probe and two commit attempts"
+            );
+        }
+        assert_eq!(
+            store.read_one_all(&existing_path).await.unwrap(),
+            b"existing".as_slice()
+        );
+        let objects = store
+            .inner
+            .list(Some(&base))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            objects
+                .iter()
+                .all(|meta| !meta.location.as_ref().contains(".lance-conditional-put-"))
         );
     }
 

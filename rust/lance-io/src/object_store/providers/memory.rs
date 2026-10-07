@@ -22,6 +22,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
+            put_if_absent_supported: Default::default(),
             inner: Arc::new(InMemory::new()),
             local_dir_operations: None,
             scheme: String::from("memory"),

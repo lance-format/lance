@@ -294,6 +294,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
+            put_if_absent_supported: Default::default(),
             inner,
             local_dir_operations: None,
             scheme,

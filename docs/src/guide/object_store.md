@@ -185,6 +185,21 @@ ds = lance.dataset(
 
 This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environment variables.
 
+!!! warning
+
+    Default writes through `s3://` require the store to enforce create-only
+    `PutObject` requests with `If-None-Match: *`. Some S3-compatible stores,
+    including Garage, accept this header but silently overwrite existing objects,
+    which can lose acknowledged data during concurrent writes.
+
+    Before the first manifest commit, Lance probes this behavior with two
+    create-only PUTs to a unique scratch object under the dataset path and then
+    attempts to delete it. The result is cached for that object-store client. Stores that
+    accept both writes are rejected; use a distributed `commit_lock` in Python
+    or a custom `CommitHandler` in Rust to coordinate all writers instead.
+    Reads do not run the probe. The probe detects ignored conditions; it cannot
+    prove atomicity or protect against later changes to the store's behavior.
+
 ### S3 Express (Directory Bucket)
 
 Lance supports [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) buckets,

@@ -37,6 +37,7 @@ use object_store::{
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OnceCell;
 use url::Url;
 
 use super::local::LocalObjectReader;
@@ -203,6 +204,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // Shared by clones so concurrent writers probe this client only once.
+    put_if_absent_supported: Arc<OnceCell<bool>>,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     scheme: String,
@@ -683,6 +686,7 @@ impl ObjectStore {
 
             let store = Self {
                 inner: tracked_store,
+                put_if_absent_supported: Arc::new(OnceCell::new()),
                 local_dir_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
@@ -1085,6 +1089,77 @@ impl ObjectStore {
                 .await
                 .map(|_| ())
         }
+    }
+
+    /// Verify that the store rejects a create-only PUT to an existing object.
+    ///
+    /// Writes a unique scratch object under `base_path` twice and attempts to
+    /// remove it afterwards. The capability result is shared by clones of this client;
+    /// I/O failures are returned without caching so a later attempt can retry.
+    /// This detects S3-compatible stores that silently ignore `If-None-Match`.
+    /// It does not verify atomicity or guard against later configuration changes.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn example(store: &ObjectStore) -> lance_core::Result<()> {
+    /// store.validate_put_if_absent(&Path::from("dataset")).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn validate_put_if_absent(&self, base_path: &Path) -> Result<()> {
+        let is_supported = self
+            .put_if_absent_supported
+            .get_or_try_init(|| async {
+                let path = base_path
+                    .clone()
+                    .join(format!(".lance-conditional-put-{}", uuid::Uuid::new_v4()));
+                let options = PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                };
+                let result = async {
+                    match self
+                        .inner
+                        .put_opts(&path, Bytes::from_static(b"first").into(), options.clone())
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(object_store::Error::NotSupported { .. }) => return Ok(false),
+                        Err(error) => return Err(error),
+                    }
+                    match self
+                        .inner
+                        .put_opts(&path, Bytes::from_static(b"second").into(), options)
+                        .await
+                    {
+                        Err(
+                            object_store::Error::AlreadyExists { .. }
+                            | object_store::Error::Precondition { .. },
+                        ) => Ok(true),
+                        Ok(_) | Err(object_store::Error::NotSupported { .. }) => Ok(false),
+                        Err(error) => Err(error),
+                    }
+                }
+                .await;
+
+                if let Err(error) = self.inner.delete(&path).await
+                    && !matches!(error, object_store::Error::NotFound { .. })
+                {
+                    log::warn!("Failed to remove conditional PUT probe {}: {}", path, error);
+                }
+                result.map_err(Error::from)
+            })
+            .await?;
+
+        if !is_supported {
+            return Err(Error::not_supported(
+                "The object store does not enforce put-if-not-exists (If-None-Match: *). \
+                 Default S3 commits are disabled to prevent data loss. Provide a distributed \
+                 commit_lock in Python or a custom CommitHandler in Rust.",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
@@ -1859,6 +1934,7 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
+            put_if_absent_supported: Arc::new(OnceCell::new()),
             local_dir_operations: None,
             scheme: scheme.into(),
             block_size,
@@ -1987,6 +2063,51 @@ mod tests {
 
         assert!(matches!(error, object_store::Error::NotSupported { .. }));
         assert!(!store.exists(&path).await.unwrap());
+    }
+
+    #[rstest]
+    #[case::already_exists(false)]
+    #[case::precondition(true)]
+    #[tokio::test]
+    async fn test_validate_put_if_absent_retries_io_errors(#[case] is_precondition: bool) {
+        let mut mock = crate::testing::MockObjectStore::new();
+        let calls = AtomicUsize::new(0);
+        mock.expect_put_opts()
+            .times(4)
+            .returning(move |path, _, options| {
+                assert_eq!(options.mode, PutMode::Create);
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 | 2 => Ok(PutResult {
+                        e_tag: None,
+                        version: None,
+                        extensions: Default::default(),
+                    }),
+                    1 => Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "temporary failure".into(),
+                    }),
+                    _ if is_precondition => Err(object_store::Error::Precondition {
+                        path: path.to_string(),
+                        source: "already exists".into(),
+                    }),
+                    _ => Err(object_store::Error::AlreadyExists {
+                        path: path.to_string(),
+                        source: "already exists".into(),
+                    }),
+                }
+            });
+        mock.expect_delete_stream()
+            .times(2)
+            .returning(|paths| paths);
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(mock);
+        let base = Path::from("dataset");
+
+        let error = store.validate_put_if_absent(&base).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("temporary failure"));
+        store.validate_put_if_absent(&base).await.unwrap();
+        store.clone().validate_put_if_absent(&base).await.unwrap();
     }
 
     #[tokio::test]
