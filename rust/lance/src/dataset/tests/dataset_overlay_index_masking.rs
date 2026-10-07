@@ -3226,6 +3226,121 @@ async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::
     (dataset, staged, rewritten)
 }
 
+/// Commits `age` staged segments, then compacts and merges them, as a
+/// restore-then-compact sequence would leave them.
+async fn btree_merge_and_commit(
+    mut dataset: Dataset,
+    staged: Vec<lance_table::format::IndexMetadata>,
+) -> Dataset {
+    btree_compact(&mut dataset).await;
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    dataset
+}
+
+/// Segments built while an overlay was present hold its values. Restoring a
+/// snapshot from before the overlay takes it away without touching a data file
+/// or adding a newer overlay, so the merge has to notice the overlay is gone.
+#[tokio::test]
+async fn test_btree_merge_drops_coverage_a_restore_took_an_overlay_from() {
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let before_overlay = dataset.manifest.version;
+    let fragment = dataset.get_fragments()[0].id() as u64;
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        fragment,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    let mut dataset = dataset.checkout_version(before_overlay).await.unwrap();
+    dataset.restore().await.unwrap();
+    let dataset = btree_merge_and_commit(dataset, staged).await;
+
+    assert_eq!(
+        ids_matching(&dataset, "age = 0").await,
+        vec![0],
+        "the restored value is missing: the merged index still answers with the \
+         overlay the restore took away"
+    );
+    assert!(ids_matching(&dataset, "age = 999").await.is_empty());
+}
+
+/// Segments built after a row was deleted never indexed it. A restore to before
+/// the delete brings the row back, and the merged index must not claim a
+/// fragment it is missing a row of.
+#[tokio::test]
+async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
+    let mut dataset = create_base_dataset_with(false).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let before_delete = dataset.manifest.version;
+    dataset.delete("id = 3").await.unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset,
+        "age",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "age_staged",
+        fragment_ids,
+    )
+    .await;
+
+    let mut dataset = dataset.checkout_version(before_delete).await.unwrap();
+    dataset.restore().await.unwrap();
+    let dataset = btree_merge_and_commit(dataset, staged).await;
+
+    assert_eq!(
+        ids_matching(&dataset, "age = 30").await,
+        vec![3],
+        "the revived row is missing: the merged index claimed a fragment holding a \
+         row it never indexed"
+    );
+}
+
 /// Rewrite `column` of `fragment` in place, which lands it in a different file.
 async fn replace_column(
     dataset: Dataset,
