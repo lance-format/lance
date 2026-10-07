@@ -9,6 +9,9 @@ on:
       - release/**
     paths:
       - .github/workflows/java-publish.yml
+      - ci/publish_java_r2.py
+      - ci/test_publish_java_r2.py
+      - java/pom.xml
   workflow_dispatch:
     inputs:
       mode:
@@ -163,8 +166,8 @@ jobs:
           server-id: ossrh
           server-username: SONATYPE_USER
           server-password: SONATYPE_TOKEN
-          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
-          gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          gpg-private-key: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.GPG_PRIVATE_KEY || '' }}
+          gpg-passphrase: GPG_PASSPHRASE
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       - name: Copy native libs
@@ -179,30 +182,89 @@ jobs:
         run: |
           git config --global user.email "Lance Github Runner"
           git config --global user.name "dev+gha@lance.org"
-      - name: Dry run
+      - name: Create disposable signing key for dry run
         if: |
           github.event_name == 'pull_request' ||
           inputs.mode == 'dry_run'
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/java-dry-run-gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key 'Lance dry run <dev@lance.org>' rsa2048 sign 1d
+      - name: Build signed bundle and publish to Central unless dry run
         working-directory: java
         run: |
-          mvn --batch-mode -DskipTests -Dskip.build.jni=true package
-      - name: Publish with Java 11
-        if: |
-          github.event_name == 'release' ||
-          inputs.mode == 'release'
-        working-directory: java
-        run: |
-          echo "use-agent" >> ~/.gnupg/gpg.conf
-          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-          export GPG_TTY=$(tty)
-          mvn --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
+          mkdir -p "${GNUPGHOME:-$HOME/.gnupg}"
+          echo "use-agent" >> "${GNUPGHOME:-$HOME/.gnupg}/gpg.conf"
+          echo "pinentry-mode loopback" >> "${GNUPGHOME:-$HOME/.gnupg}/gpg.conf"
+          ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false \
+            "-Dgpg.passphrase=$GPG_PASSPHRASE" "-DskipPublishing=$SKIP_PUBLISHING" \
+            deploy -P deploy-to-ossrh
         env:
-          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
-          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+          SKIP_PUBLISHING: ${{ !(github.event_name == 'release' || inputs.mode == 'release') }}
+          GPG_PASSPHRASE: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.GPG_PASSPHRASE || '' }}
+          # The Central plugin requires a server entry even when upload is skipped.
+          SONATYPE_USER: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.SONATYPE_USER || 'dry-run' }}
+          SONATYPE_TOKEN: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.SONATYPE_TOKEN || 'dry-run' }}
+      - name: Preserve signed bundle for independent R2 retries
+        if: ${{ !cancelled() && hashFiles('java/target/central-publishing/central-bundle.zip') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: java-central-bundle
+          path: java/target/central-publishing/central-bundle.zip
+          retention-days: 30
+          if-no-files-found: error
+      - name: Install bundle validator
+        run: pip install boto3==1.40.76
+      - name: Validate the bundle used by both repositories
+        run: python ci/publish_java_r2.py java/target/central-publishing/central-bundle.zip --validate-only
+  publish-r2:
+    name: Publish Java packages to R2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: publish
+    if: github.event_name == 'release' || inputs.mode == 'release'
+    # Hold the lock through ALL metadata/checksum writes. Queuing avoids dropping
+    # pending releases when several builds finish together, including job retries.
+    concurrency:
+      group: java-maven-r2
+      queue: max
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Download the original signed Central bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: java-central-bundle
+          path: java-bundle
+      - name: Install R2 publisher
+        run: pip install boto3==1.40.76
+      - name: Set up Java for isolated Maven download verification
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: corretto
+          java-version: 11
+      - name: Upload immutable artifacts and update Maven metadata
+        run: |
+          : "${AWS_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}"
+          : "${AWS_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}"
+          : "${R2_ENDPOINT:?Set R2_ENDPOINT}"
+          : "${R2_BUCKET:?Set R2_BUCKET}"
+          : "${R2_PUBLIC_URL:?Set R2_PUBLIC_URL}"
+          python ci/publish_java_r2.py java-bundle/central-bundle.zip --public-url "$R2_PUBLIC_URL"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
   report-failure:
     name: Report Workflow Failure
     runs-on: ubuntu-latest
-    needs: [build-linux, build-macos, publish]
+    needs: [build-linux, build-macos, publish, publish-r2]
     if: always() && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read

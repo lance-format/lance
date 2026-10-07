@@ -214,6 +214,8 @@ JVM engine connectors can be built using the Lance Java SDK. Here are some conne
 
 ## Contributing
 
+For repository configuration and publishing retries, see [Publishing Java packages](RELEASING.md).
+
 From the codebase dimension, the lance project is a multiple-lang project. All Java-related code is located in the `java` directory.
 And the whole `java` dir is a standard maven project can be imported into any IDEs support java project.
 
