@@ -21,6 +21,13 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_table::format::Fragment;
 use lance_table::transaction::{Operation, RewriteGroup, Transaction};
 use roaring::RoaringBitmap;
+#[cfg(feature = "geo")]
+use {
+    crate::utils::test::geo,
+    arrow_array::{Int32Array, RecordBatch, RecordBatchIterator},
+    arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema},
+    lance_index::metrics::NoOpMetricsCollector,
+};
 
 /// Two fragments of four rows: `i` 0..8, a constant `text` and a payload
 /// `w` equal to `i` (a key no index covers, for in-place rewrites).
@@ -1900,4 +1907,79 @@ async fn v0_deferred_vector_segment_merge_keeps_the_legacy_version_pinned() {
     let (_, indexed) = nearest(&dataset, &query, total, true).await;
     assert_eq!(flat.len(), total);
     assert_eq!(indexed, flat, "every row is reachable through the index");
+}
+
+/// RTree under the tagged history: staged segments over both sources of a
+/// stable partition claim the destinations the reader derives for them, and
+/// the merged index holds every row of what it claims.
+#[cfg(feature = "geo")]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_rtree_segments_merge_after_stable_partition() {
+    const ROWS_PER_FRAGMENT: i32 = 4;
+    let dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        geo::line_string_type().to_field("geometry", true),
+    ]));
+    let batches = (0..2)
+        .map(|fragment| {
+            let first = fragment * ROWS_PER_FRAGMENT;
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(
+                        first..first + ROWS_PER_FRAGMENT,
+                    )),
+                    geo::line_strings(first, ROWS_PER_FRAGMENT),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(batches, schema),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::RTree);
+    let sources = fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, sources).await;
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10u32, 11]),
+        "the merged segment claims the destinations the group covers completely"
+    );
+    let mut dataset = dataset;
+    dataset
+        .commit_existing_index_segments(&merged.name, "geometry", vec![merged.clone()])
+        .await
+        .unwrap();
+    let committed = stored_segment(&dataset, &merged.name).await;
+    assert_eq!(
+        derived_coverage(&dataset, &merged.name).await,
+        Some(RoaringBitmap::from_iter([10u32, 11])),
+        "the committed segment serves both destinations directly"
+    );
+    let index = crate::index::scalar::open_scalar_index(
+        &dataset,
+        "geometry",
+        &committed,
+        &NoOpMetricsCollector,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        index.statistics().unwrap()["num_items"].as_u64().unwrap(),
+        (ROWS_PER_FRAGMENT * 2) as u64,
+        "the merged index must hold every row of the fragments it claims"
+    );
 }

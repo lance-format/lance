@@ -1060,7 +1060,7 @@ pub mod geo {
     use geoarrow_array::builder::LineStringBuilder;
     use geoarrow_schema::{Dimension, LineStringType};
 
-    fn line_string_type() -> LineStringType {
+    pub fn line_string_type() -> LineStringType {
         LineStringType::new(Dimension::XY, Default::default())
     }
 

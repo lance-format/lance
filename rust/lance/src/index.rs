@@ -157,10 +157,10 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
 /// representable group coverage while materializing every source.
 ///
 /// Returns the fragments the remap added, or `None` when nothing was remapped.
-/// Coverage only ever moves together with
-/// the row addresses the dataset's own mapping supplies, so where no mapping
-/// applies the coverage shrinks instead — reported, because those rows leave the
-/// merged index and fall back to a flat scan.
+/// Coverage only ever moves together with the row addresses the dataset's own
+/// mapping supplies, so where no mapping applies the coverage shrinks instead —
+/// reported, because those rows leave the merged index and fall back to a flat
+/// scan.
 async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     index_name: &str,
@@ -655,11 +655,9 @@ async fn initial_records(
 /// entries describe: its segment's version to begin with, and then the commit
 /// of whichever compaction last rewrote it. A compaction may carry those rows
 /// forward only if its inputs still match the state they are each recorded
-/// against, and the fragments left at the end must still match theirs. A commit
-/// that rewrites an indexed field puts it in a different file and an overlay
-/// adds one, so one comparison per fragment stands in for every way the data
-/// could have moved on. Where a manifest a comparison needs has been cleaned up,
-/// the answer is that it has.
+/// against, and the fragments left at the end must still match theirs, as
+/// [`indexed_data_differs`] judges a match. Where a manifest a comparison needs
+/// has been cleaned up, the answer is that it has.
 async fn indexed_data_moved_on(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
@@ -5860,8 +5858,6 @@ mod tests {
     /// rewrite that produced the fragments in question.
     #[tokio::test]
     async fn test_a_compaction_is_dated_by_its_own_commit_record() {
-        use crate::dataset::optimize::{CompactionOptions, compact_files};
-
         let test_dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = |values: std::ops::Range<i32>| {
