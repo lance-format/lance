@@ -55,10 +55,11 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
+use lance_select::RowSetOps;
 
 use super::TakeExec;
 use super::filtered_read::FilteredReadExec;
@@ -200,17 +201,7 @@ impl TopKLateMaterialization {
             return Err("read is not eligible".into());
         }
 
-        let fragments = read
-            .options()
-            .fragments
-            .as_deref()
-            .map(Vec::as_slice)
-            .unwrap_or_else(|| dataset.fragments().as_slice());
-        let rows = fragments
-            .iter()
-            .map(|fragment| fragment.physical_rows)
-            .sum::<Option<usize>>();
-        if rows.is_some_and(|rows| fetch >= rows) {
+        if max_rows(read).is_some_and(|rows| fetch >= rows) {
             // The sort drops nothing, so the take would re-read every row.
             return Err("the limit keeps every row".into());
         }
@@ -424,24 +415,28 @@ fn rebind(ordering: &LexOrdering, schema: &ArrowSchema) -> Result<LexOrdering, S
     let exprs = ordering
         .iter()
         .map(|sort| {
-            let expr = sort
-                .expr
-                .clone()
-                .transform(|expr| {
-                    let Some(column) = expr.downcast_ref::<Column>() else {
-                        return Ok(Transformed::no(expr));
-                    };
-                    let index = schema.index_of(column.name())?;
-                    Ok(Transformed::yes(
-                        Arc::new(Column::new(column.name(), index)) as Arc<dyn PhysicalExpr>,
-                    ))
-                })
-                .map_err(|e| e.to_string())?
-                .data;
+            let expr =
+                reassign_expr_columns(sort.expr.clone(), schema).map_err(|e| e.to_string())?;
             Ok(PhysicalSortExpr::new(expr, sort.options))
         })
         .collect::<Result<Vec<_>, String>>()?;
     LexOrdering::new(exprs).ok_or_else(|| "empty ordering".into())
+}
+
+/// An upper bound on the rows `read` can produce: the rows its precomputed plan
+/// selects, else the live rows of its fragments.
+fn max_rows(read: &FilteredReadExec) -> Option<usize> {
+    if let Some(rows) = read.plan().and_then(|plan| plan.rows.len()) {
+        return Some(rows as usize);
+    }
+    read.options()
+        .fragments
+        .as_deref()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| read.dataset().fragments().as_slice())
+        .iter()
+        .map(|fragment| fragment.num_rows().or(fragment.physical_rows))
+        .sum()
 }
 
 #[cfg(test)]
@@ -461,9 +456,9 @@ mod tests {
 
     /// `wide` and `other` are functions of `key`, so a take that fetched the
     /// wrong rows shows up as a mismatch against the unrewritten plan. With
-    /// `deleted`, the top row (`key = 9`) and one mid row are deleted, so row
+    /// `has_deletions`, the top row (`key = 9`) and one mid row are deleted, so row
     /// ids have gaps and the answer changes.
-    async fn dataset(stable_row_ids: bool, deleted: bool) -> Arc<Dataset> {
+    async fn dataset(has_stable_row_ids: bool, has_deletions: bool) -> Arc<Dataset> {
         let batch = arrow_array::record_batch!(
             ("key", Int32, [5, 3, 8, 1, 9, 2, 7, 4, 6, 0]),
             (
@@ -476,7 +471,7 @@ mod tests {
         .unwrap();
         let params = WriteParams {
             max_rows_per_file: 3,
-            enable_stable_row_ids: stable_row_ids,
+            enable_stable_row_ids: has_stable_row_ids,
             ..Default::default()
         };
         let mut dataset = Dataset::write(
@@ -486,20 +481,20 @@ mod tests {
         )
         .await
         .unwrap();
-        if deleted {
+        if has_deletions {
             dataset.delete("key = 9 OR key = 7").await.unwrap();
         }
         Arc::new(dataset)
     }
 
-    fn read(dataset: &Arc<Dataset>, filtered: bool, columns: &[&str]) -> Arc<dyn ExecutionPlan> {
+    fn read(dataset: &Arc<Dataset>, is_filtered: bool, columns: &[&str]) -> Arc<dyn ExecutionPlan> {
         let mut options = FilteredReadOptions::basic_full_read(dataset).with_projection(
             dataset
                 .empty_projection()
                 .union_columns(columns, OnMissing::Error)
                 .unwrap(),
         );
-        if filtered {
+        if is_filtered {
             options = options
                 .with_filter(None, Some(logical_col("other").gt(lit(20))))
                 .unwrap();
@@ -509,7 +504,7 @@ mod tests {
 
     /// `ORDER BY key DESC LIMIT 3`, planned the way DataFusion plans it: a
     /// per-partition top-k under a merge, or one top-k over coalesced input.
-    fn top_k(input: Arc<dyn ExecutionPlan>, partitioned: bool) -> Arc<dyn ExecutionPlan> {
+    fn top_k(input: Arc<dyn ExecutionPlan>, is_partitioned: bool) -> Arc<dyn ExecutionPlan> {
         let ordering = LexOrdering::new([PhysicalSortExpr::new(
             col("key", &input.schema()).unwrap(),
             SortOptions {
@@ -518,7 +513,7 @@ mod tests {
             },
         )])
         .unwrap();
-        if partitioned {
+        if is_partitioned {
             let input = Arc::new(
                 RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(4)).unwrap(),
             );
@@ -569,19 +564,19 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn reads_sort_keys_and_takes_the_rest(
-        #[values(true, false)] partitioned: bool,
-        #[values(true, false)] filtered: bool,
-        #[values(true, false)] projected: bool,
-        #[values(true, false)] stable_row_ids: bool,
-        #[values(true, false)] deleted: bool,
+        #[values(true, false)] is_partitioned: bool,
+        #[values(true, false)] is_filtered: bool,
+        #[values(true, false)] is_projected: bool,
+        #[values(true, false)] has_stable_row_ids: bool,
+        #[values(true, false)] has_deletions: bool,
     ) {
-        let dataset = dataset(stable_row_ids, deleted).await;
-        let mut scan = read(&dataset, filtered, &["key", "wide", "other"]);
-        if projected {
+        let dataset = dataset(has_stable_row_ids, has_deletions).await;
+        let mut scan = read(&dataset, is_filtered, &["key", "wide", "other"]);
+        if is_projected {
             // `SELECT wide, key`: reordered, and `other` dropped.
             scan = project(scan, ["wide", "key"]).unwrap();
         }
-        let plan = top_k(scan, partitioned);
+        let plan = top_k(scan, is_partitioned);
 
         let rewritten = optimize(&TopKLateMaterialization::new(), &plan);
 
@@ -634,19 +629,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_fetch(None, Partitioning::RoundRobinBatch(4), &["key", "wide"], true)]
-    #[case::limit_keeps_every_row(Some(10), Partitioning::RoundRobinBatch(4), &["key", "wide"], true)]
-    #[case::hash_repartition(Some(3), Partitioning::Hash(vec![], 4), &["key", "wide"], true)]
-    #[case::sort_reads_everything(Some(3), Partitioning::RoundRobinBatch(4), &["key"], true)]
-    #[case::read_not_eligible(Some(3), Partitioning::RoundRobinBatch(4), &["key", "wide"], false)]
+    #[case::no_fetch(None, Partitioning::RoundRobinBatch(4), &["key", "wide"], true, false)]
+    #[case::limit_keeps_every_row(Some(10), Partitioning::RoundRobinBatch(4), &["key", "wide"], true, false)]
+    // 10 physical rows, 8 live.
+    #[case::limit_keeps_every_live_row(Some(8), Partitioning::RoundRobinBatch(4), &["key", "wide"], true, true)]
+    #[case::hash_repartition(Some(3), Partitioning::Hash(vec![], 4), &["key", "wide"], true, false)]
+    #[case::sort_reads_everything(Some(3), Partitioning::RoundRobinBatch(4), &["key"], true, false)]
+    #[case::read_not_eligible(Some(3), Partitioning::RoundRobinBatch(4), &["key", "wide"], false, false)]
     #[tokio::test]
     async fn declines(
         #[case] fetch: Option<usize>,
         #[case] partitioning: Partitioning,
         #[case] columns: &[&str],
-        #[case] eligible: bool,
+        #[case] is_eligible: bool,
+        #[case] has_deletions: bool,
     ) {
-        let dataset = dataset(false, false).await;
+        let dataset = dataset(false, has_deletions).await;
         let scan = read(&dataset, false, columns);
         let partitioning = match partitioning {
             Partitioning::Hash(_, n) => {
@@ -664,7 +662,7 @@ mod tests {
             .with_fetch(fetch);
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(SortPreservingMergeExec::new(ordering, Arc::new(sort)).with_fetch(fetch));
-        let rule = TopKLateMaterialization::new().with_read_eligibility(move |_, _| eligible);
+        let rule = TopKLateMaterialization::new().with_read_eligibility(move |_, _| is_eligible);
 
         assert!(Arc::ptr_eq(&optimize(&rule, &plan), &plan));
     }

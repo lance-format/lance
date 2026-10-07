@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::TableType;
 use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, TaskContext};
 use datafusion::logical_expr::var_provider::{VarProvider, VarType};
@@ -22,6 +23,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -72,9 +74,9 @@ fn rule() -> TopKLateMaterialization {
     TopKLateMaterialization::new().with_pass_through(|node| node.is::<MetadataEraserExec>())
 }
 
-fn context(provider: Arc<dyn TableProvider>, with_rule: bool) -> SessionContext {
+fn context(provider: Arc<dyn TableProvider>, has_rule: bool) -> SessionContext {
     let mut state = SessionStateBuilder::new().with_default_features();
-    if with_rule {
+    if has_rule {
         state = state.with_physical_optimizer_rule(Arc::new(rule()));
     }
     let ctx = SessionContext::new_with_state(state.build());
@@ -197,6 +199,25 @@ async fn sql_topk_takes_non_sort_columns_after_the_sort(#[case] sql: &str) {
     );
 }
 
+/// The window relies on the top-k's ordering instead of sorting again, so the
+/// take above the sort must keep reporting it.
+#[tokio::test]
+async fn sql_topk_keeps_its_ordering_for_the_parent() {
+    let dataset = make_dataset().await;
+    let provider = Arc::new(LanceTableProvider::new(dataset, false, false));
+    let sql = "SELECT id, cat, wide, row_number() OVER (PARTITION BY cat ORDER BY id) AS rn \
+               FROM (SELECT id, cat, wide FROM t ORDER BY cat, id LIMIT 20)";
+    let (_, expected) = run(&context(provider.clone(), false), sql).await;
+    let (rewritten, actual) = run(&context(provider, true), sql).await;
+    let shown = displayable(rewritten.as_ref()).indent(true).to_string();
+
+    assert_eq!(take_output_rows(&rewritten), [20], "{shown}");
+    SanityCheckPlan::new()
+        .optimize(rewritten, &ConfigOptions::default())
+        .unwrap_or_else(|e| panic!("{e}\n{shown}"));
+    assert_eq!(actual, expected, "{shown}");
+}
+
 #[tokio::test]
 async fn sql_limit_covering_the_table_is_left_alone() {
     let dataset = make_dataset().await;
@@ -221,12 +242,12 @@ fn erase_metadata(schema: &Schema) -> Schema {
 #[derive(Debug)]
 struct MetadataEraserExec {
     input: Arc<dyn ExecutionPlan>,
-    keeps_every_row: bool,
+    is_row_preserving: bool,
     properties: Arc<PlanProperties>,
 }
 
 impl MetadataEraserExec {
-    fn new(input: Arc<dyn ExecutionPlan>, keeps_every_row: bool) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, is_row_preserving: bool) -> Self {
         let schema = Arc::new(erase_metadata(&input.schema()));
         let properties = Arc::new(
             input
@@ -237,7 +258,7 @@ impl MetadataEraserExec {
         );
         Self {
             input,
-            keeps_every_row,
+            is_row_preserving,
             properties,
         }
     }
@@ -268,7 +289,7 @@ impl ExecutionPlan for MetadataEraserExec {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self::new(
             children.remove(0),
-            self.keeps_every_row,
+            self.is_row_preserving,
         )))
     }
 
@@ -293,7 +314,7 @@ impl ExecutionPlan for MetadataEraserExec {
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
-        if self.keeps_every_row {
+        if self.is_row_preserving {
             CardinalityEffect::Equal
         } else {
             CardinalityEffect::Unknown
@@ -305,7 +326,7 @@ impl ExecutionPlan for MetadataEraserExec {
 #[derive(Debug)]
 struct ErasingTableProvider {
     inner: LanceTableProvider,
-    keeps_every_row: bool,
+    is_row_preserving: bool,
 }
 
 #[async_trait]
@@ -327,7 +348,7 @@ impl TableProvider for ErasingTableProvider {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(MetadataEraserExec::new(
             self.inner.scan(state, projection, filters, limit).await?,
-            self.keeps_every_row,
+            self.is_row_preserving,
         )))
     }
 
@@ -346,12 +367,12 @@ impl TableProvider for ErasingTableProvider {
 #[case::keeps_every_row(true)]
 #[case::unknown_cardinality(false)]
 #[tokio::test]
-async fn sql_topk_through_a_wrapping_provider(#[case] keeps_every_row: bool) {
+async fn sql_topk_through_a_wrapping_provider(#[case] is_row_preserving: bool) {
     let sql = "SELECT id, wide FROM t WHERE cat = 3 ORDER BY id DESC LIMIT 5";
     let dataset = make_dataset().await;
     let provider = Arc::new(ErasingTableProvider {
         inner: LanceTableProvider::new(dataset, false, false),
-        keeps_every_row,
+        is_row_preserving,
     });
     let (plain, expected) = run(&context(provider.clone(), false), sql).await;
     let (rewritten, actual) = run(&context(provider, true), sql).await;
@@ -361,7 +382,7 @@ async fn sql_topk_through_a_wrapping_provider(#[case] keeps_every_row: bool) {
     assert_eq!(rewritten.schema(), plain.schema());
     assert_eq!(actual, expected, "{shown}");
     let take_rows = take_output_rows(&rewritten);
-    if keeps_every_row {
+    if is_row_preserving {
         assert_eq!(take_rows, [5], "{shown}");
         assert_eq!(scans(&rewritten), [["id", "_rowid"]], "{shown}");
     } else {
@@ -403,6 +424,32 @@ async fn topk_keeps_a_precomputed_read_plan() {
             .values(),
         &[19, 18, 17, 16, 15]
     );
+}
+
+/// A precomputed selection no larger than the limit keeps every row, so the
+/// read is left alone.
+#[tokio::test]
+async fn topk_within_a_precomputed_selection_is_left_alone() {
+    let dataset = make_dataset().await;
+    let mut rows = RowAddrTreeMap::new();
+    rows.insert_bitmap(0, (0u32..5).collect());
+    let read = FilteredReadExec::try_new(
+        dataset.clone(),
+        FilteredReadOptions::basic_full_read(&dataset),
+        None,
+    )
+    .unwrap()
+    .with_plan(FilteredReadPlan {
+        rows,
+        filters: Default::default(),
+        scan_range_after_filter: None,
+    })
+    .await
+    .unwrap();
+    let plan = top_5_by_id(Arc::new(read));
+    let rewritten = rule().optimize(plan.clone(), &Default::default()).unwrap();
+
+    assert!(Arc::ptr_eq(&rewritten, &plan));
 }
 
 #[derive(Debug)]

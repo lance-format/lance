@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::projection::ProjectionMapping;
 use futures::FutureExt;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -569,7 +570,7 @@ impl TakeExec {
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
+                .with_eq_properties(Self::output_equivalences(&input, &output_arrow)?),
         );
 
         Ok(Some(Self {
@@ -582,6 +583,29 @@ impl TakeExec {
             metrics: ExecutionPlanMetricsSet::new(),
             batch_size_bytes,
         }))
+    }
+
+    /// The input's orderings and equivalences, carried over when the input
+    /// columns lead the output unchanged. Rows keep their input order.
+    fn output_equivalences(
+        input: &Arc<dyn ExecutionPlan>,
+        output: &SchemaRef,
+    ) -> Result<EquivalenceProperties> {
+        let input_schema = input.schema();
+        let unchanged = input_schema
+            .fields()
+            .iter()
+            .zip(output.fields())
+            .all(|(input_field, output_field)| input_field == output_field);
+        if !unchanged {
+            return Ok(EquivalenceProperties::new(output.clone()));
+        }
+        let indices = (0..input_schema.fields().len()).collect::<Vec<_>>();
+        let mapping = ProjectionMapping::from_indices(&indices, &input_schema)?;
+        Ok(input
+            .properties()
+            .eq_properties
+            .project(&mapping, output.clone()))
     }
 
     /// The output of a take operation will be all columns from the input schema followed
@@ -654,6 +678,10 @@ impl ExecutionPlan for TakeExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
