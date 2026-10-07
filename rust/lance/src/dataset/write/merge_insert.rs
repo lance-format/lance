@@ -643,7 +643,7 @@ impl MergeInsertParams {
 /// [`MergeInsertJob::update_fragments`] deposit their results.
 #[derive(Debug, Default)]
 struct PatchSink {
-    /// Fragments that gained a data file, one entry per task.
+    /// Patched fragments, including key-only matches that only update metadata.
     fragments: Mutex<Vec<Fragment>>,
     /// Physical offsets each fragment had patched. Only populated under stable
     /// row ids, which is the only thing that reads the row-version metadata
@@ -654,7 +654,7 @@ struct PatchSink {
 /// What [`MergeInsertJob::update_fragments`] wrote.
 #[derive(Debug)]
 pub(super) struct PatchedFragments {
-    /// Existing fragments that gained a data file for the patched columns.
+    /// Existing fragments with column patches or updated row-version metadata.
     pub updated_fragments: Vec<Fragment>,
     /// Fragments written for rows that carried no target address.
     pub new_fragments: Vec<Fragment>,
@@ -1640,14 +1640,27 @@ impl MergeInsertJob {
     /// fragments.
     ///
     /// `source` must carry `_rowaddr` plus the columns to write. A null
-    /// `_rowaddr` routes the row to a new fragment.
+    /// `_rowaddr` routes the row to a new fragment. Join columns in `on` are
+    /// written for new rows but preserved in existing fragments.
     pub(super) async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         write_version: ConcreteFileVersion,
+        on: &[String],
     ) -> Result<PatchedFragments> {
+        let source_schema = source.schema();
+        let update_projection: Vec<usize> = source_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| (!on.contains(field.name())).then_some(idx))
+            .collect();
+        let has_updated_columns = update_projection.iter().any(|&idx| {
+            let name = source_schema.field(idx).name();
+            name != ROW_ADDR && name != ROW_ID
+        });
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
@@ -1797,6 +1810,33 @@ impl MergeInsertJob {
                         .entry(metadata.id)
                         .or_default()
                         .extend(offsets);
+                }
+
+                // A key-only match still updates row-version metadata, but
+                // has no column data to write or invalidate.
+                if write_schema.fields.is_empty() {
+                    if dataset.manifest.uses_stable_row_ids() {
+                        let updated_offsets: Vec<usize> = get_row_addr_iter(&batches)
+                            .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset() as usize)
+                            .collect();
+                        let spilled_lineage =
+                            load_spilled_row_lineage(&dataset, [&metadata]).await?;
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                            &mut metadata,
+                            &updated_offsets,
+                            current_version,
+                            dataset.manifest.version,
+                            &spilled_lineage,
+                        )?;
+                    }
+                    patched
+                        .fragments
+                        .lock()
+                        .map_err(|err| {
+                            Error::internal(format!("Failed to lock patched fragments: {err}"))
+                        })?
+                        .push(metadata);
+                    return Ok(reservation_size);
                 }
 
                 if has_full_fragment_coverage {
@@ -2062,6 +2102,13 @@ impl MergeInsertJob {
                     };
                     let metadata = fragment.metadata.clone();
 
+                    // Matched join columns are equal by definition. Retain
+                    // them in the source only for the new-fragment branch.
+                    let batches = batches
+                        .into_iter()
+                        .map(|batch| batch.project(&update_projection))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+
                     let fut = handle_fragment(
                         dataset.clone(),
                         fragment,
@@ -2121,6 +2168,9 @@ impl MergeInsertJob {
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
         for fragment in &mut updated_fragments {
+            if !has_updated_columns {
+                continue;
+            }
             let updated_fields = fragment.files.last().unwrap().fields.clone();
             all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
@@ -2370,11 +2420,8 @@ impl MergeInsertJob {
         {
             blockers.push("the source covers every dataset column, so there is nothing to skip");
         }
-        // A source of nothing but the join key has no new values to write: the
-        // patch would reproduce the key column byte for byte, and still cost a
-        // full-fragment column file plus the invalidation of every index over
-        // the key. Row-rewrite writes more bytes for it, but it does not
-        // invalidate those indices.
+        // A source of nothing but the join key has no new column values to
+        // write, so there is no column patch for this sink to perform.
         if !source_schema
             .fields()
             .iter()
@@ -2946,6 +2993,7 @@ impl MergeInsertJob {
                 self.dataset.manifest.version + 1,
                 target_bases_info,
                 self.params.write_version(&self.dataset),
+                &self.params.on,
             )
             .await?;
 
@@ -4018,6 +4066,7 @@ mod tests {
             dataset.manifest().version + 1,
             None,
             dataset.manifest.data_storage_format.lance_file_format(),
+            &[],
         )
         .await
         .unwrap_err();
@@ -7094,8 +7143,8 @@ mod tests {
                     let data_files = &frag.files;
                     // Updated columns should be only columns in new data files
                     // -2 field ids are tombstoned.
-                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
-                    assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
+                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, 2]);
+                    assert_eq!(data_files[1].fields.as_ref(), &[1]);
                 };
                 has_added_files(&fragments_after[1]);
                 has_added_files(&fragments_after[2]);
@@ -8347,8 +8396,7 @@ mod tests {
         async fn test_merge_insert_subcols_in_place_reports_fields_modified() {
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
 
-            // `value` is field id 1 in the dataset schema; `key` (the join key)
-            // is written too because the source carries it.
+            // Join keys remain unchanged even though the source carries them.
             let value_field_id = ds.schema().field("value").unwrap().id as u32;
             let key_field_id = ds.schema().field("key").unwrap().id as u32;
             let other_field_id = ds.schema().field("other").unwrap().id as u32;
@@ -8377,9 +8425,12 @@ mod tests {
                 } => {
                     assert!(matches!(update_mode, Some(RewriteColumns)));
                     assert!(
-                        fields_modified.contains(&value_field_id)
-                            && fields_modified.contains(&key_field_id),
+                        fields_modified.contains(&value_field_id),
                         "patched fields must be reported, got {fields_modified:?}"
+                    );
+                    assert!(
+                        !fields_modified.contains(&key_field_id),
+                        "join keys must not be reported as modified, got {fields_modified:?}"
                     );
                     assert!(
                         !fields_modified.contains(&other_field_id),
@@ -8388,6 +8439,229 @@ mod tests {
                     );
                 }
                 other => panic!("expected Operation::Update, got: {other:?}"),
+            }
+        }
+
+        #[rstest]
+        #[case::indexed_update(true, false, false)]
+        #[case::indexed_upsert(true, true, false)]
+        #[case::planned_update(false, false, false)]
+        #[case::indexed_key_only(true, true, true)]
+        #[tokio::test]
+        async fn test_merge_insert_subcols_preserves_join_columns(
+            #[case] scalar_index: bool,
+            #[case] insert: bool,
+            #[case] key_only: bool,
+            #[values(false, true)] composite_key: bool,
+            #[values(false, true)] stable_row_ids: bool,
+        ) {
+            let initial = record_batch!(
+                ("id", UInt32, [0, 1, 2, 3, 4, 5]),
+                ("id2", UInt32, [0, 1, 0, 1, 0, 1]),
+                ("value", UInt32, [10, 11, 12, 13, 14, 15]),
+                ("other", UInt32, [20, 21, 22, 23, 24, 25])
+            )
+            .unwrap();
+            let mut ds = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            let on = if composite_key {
+                vec!["id", "id2"]
+            } else {
+                vec!["id"]
+            };
+            if scalar_index {
+                for key in &on {
+                    ds.create_index(
+                        &[*key],
+                        IndexType::BTree,
+                        None,
+                        &ScalarIndexParams::default(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            ds.create_index(
+                &["value"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            let mut ds = Arc::new(ds);
+
+            // Cover fragment 0 entirely and fragment 1 partially, plus an
+            // unmatched key. Reorder source columns to exercise name matching.
+            for (iteration, value) in [100, 200].into_iter().enumerate() {
+                let source = record_batch!(
+                    (
+                        "value",
+                        UInt32,
+                        [Some(value), None, Some(value), Some(value), Some(value)]
+                    ),
+                    ("id2", UInt32, [0, 1, 0, 0, 0]),
+                    ("id", UInt32, [0, 1, 2, 4, 6])
+                )
+                .unwrap();
+                let projection = match (composite_key, key_only) {
+                    (false, false) => vec![0, 2],
+                    (true, false) => vec![0, 1, 2],
+                    (false, true) => vec![2],
+                    (true, true) => vec![1, 2],
+                };
+                let source = source.project(&projection).unwrap();
+                let (updated_ds, stats) = MergeInsertBuilder::try_new(
+                    ds.clone(),
+                    on.iter().map(|key| key.to_string()).collect(),
+                )
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(if insert {
+                    WhenNotMatched::InsertAll
+                } else {
+                    WhenNotMatched::DoNothing
+                })
+                .write_mode(if scalar_index {
+                    MergeInsertWriteMode::Auto
+                } else {
+                    MergeInsertWriteMode::RewriteColumns
+                })
+                .try_build()
+                .unwrap()
+                .execute_reader(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+                ds = updated_ds;
+                assert_eq!(
+                    stats.num_updated_rows,
+                    if insert && iteration == 1 { 5 } else { 4 }
+                );
+                assert_eq!(stats.num_inserted_rows, u64::from(insert && iteration == 0));
+                assert_eq!(stats.num_deleted_rows, 0);
+
+                for fragment in ds.get_fragments().iter().take(2) {
+                    let files = &fragment.metadata().files;
+                    assert_eq!(
+                        files[0].fields.as_ref(),
+                        &[0, 1, if key_only { 2 } else { -2 }, 3]
+                    );
+                    assert_eq!(files.len(), if key_only { 1 } else { 2 });
+                    if !key_only {
+                        assert_eq!(files.last().unwrap().fields.as_ref(), &[2]);
+                    }
+                }
+                if scalar_index {
+                    for key in &on {
+                        let index = ds
+                            .load_scalar_index(
+                                IndexCriteria::default().with_name(&format!("{key}_idx")),
+                            )
+                            .await
+                            .unwrap()
+                            .expect("join key index must remain usable after each merge");
+                        assert_eq!(
+                            index.fragment_bitmap,
+                            Some(RoaringBitmap::from_iter([0, 1]))
+                        );
+                    }
+                }
+                let indices = ds.load_indices().await.unwrap();
+                let value_index = indices
+                    .iter()
+                    .find(|index| index.name == "value_idx")
+                    .unwrap();
+                assert_eq!(
+                    value_index.fragment_bitmap,
+                    Some(if key_only {
+                        RoaringBitmap::from_iter([0, 1])
+                    } else {
+                        RoaringBitmap::new()
+                    })
+                );
+
+                let mut scanner = ds.scan();
+                scanner.scan_in_order(true);
+                if stable_row_ids {
+                    scanner
+                        .project(&[
+                            "id",
+                            "id2",
+                            "value",
+                            "other",
+                            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+                        ])
+                        .unwrap();
+                }
+                let result = scanner.try_into_batch().await.unwrap();
+                assert_eq!(result.num_rows(), if insert { 7 } else { 6 });
+                for row in 0..6 {
+                    assert_eq!(
+                        result["id"].as_primitive::<UInt32Type>().value(row),
+                        row as u32
+                    );
+                    assert_eq!(
+                        result["id2"].as_primitive::<UInt32Type>().value(row),
+                        (row % 2) as u32
+                    );
+                    assert_eq!(
+                        result["other"].as_primitive::<UInt32Type>().value(row),
+                        row as u32 + 20
+                    );
+                    let values = result["value"].as_primitive::<UInt32Type>();
+                    if !key_only && [0, 1, 2, 4].contains(&row) {
+                        assert_eq!(values.is_null(row), row == 1);
+                        if row != 1 {
+                            assert_eq!(values.value(row), value);
+                        }
+                    } else {
+                        assert_eq!(values.value(row), row as u32 + 10);
+                    }
+                    if stable_row_ids {
+                        let versions = result[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                            .as_primitive::<UInt64Type>();
+                        assert_eq!(
+                            versions.value(row),
+                            if [0, 1, 2, 4].contains(&row) {
+                                ds.version().version
+                            } else {
+                                1
+                            }
+                        );
+                    }
+                }
+                if insert {
+                    assert_eq!(result["id"].as_primitive::<UInt32Type>().value(6), 6);
+                    assert_eq!(result["id2"].is_null(6), !composite_key);
+                    if composite_key {
+                        assert_eq!(result["id2"].as_primitive::<UInt32Type>().value(6), 0);
+                    }
+                    assert!(result["other"].is_null(6));
+                    assert_eq!(result["value"].is_null(6), key_only);
+                    if !key_only {
+                        assert_eq!(result["value"].as_primitive::<UInt32Type>().value(6), value);
+                    }
+                    if stable_row_ids {
+                        assert_eq!(
+                            result[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                                .as_primitive::<UInt64Type>()
+                                .value(6),
+                            ds.version().version
+                        );
+                    }
+                }
             }
         }
 
@@ -8732,10 +9006,9 @@ mod tests {
         }
 
         /// A source carrying nothing but the join key has no values to write, so
-        /// `RewriteColumns` cannot help it: the patch would reproduce the key
-        /// column byte for byte at the cost of a full-fragment column file and
-        /// the invalidation of every index over that key. Asking for it must
-        /// error rather than quietly writing whole rows instead.
+        /// `RewriteColumns` requires at least one non-key column to patch.
+        /// Asking for it with only the key must error rather than quietly
+        /// writing whole rows instead.
         #[tokio::test]
         async fn test_merge_insert_rewrite_columns_rejects_key_only_source() {
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
@@ -9375,16 +9648,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Fragment 3 is fully removed.  We could keep it technically but today it is removed
-        // which is also fine.  Fragment 2 is partially and must be removed.
-        //
-        // TODO: We should not be modifying the id_index here.  A merge_insert should not need
-        // to rewrite the id field.  However, it seems we are doing that today.  This should be
-        // fixed in
-        check_indices(&dataset, &[0, 1], &[0, 1]).await;
+        // Join keys stay in their original files, so their index keeps every
+        // fragment. Only the rewritten value column loses index coverage.
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1]).await;
 
-        // One more test but this time we touch all fragments which causes the index to be removed
-        // entirely.
+        // Touching all fragments invalidates the value index entirely while
+        // preserving the join key index.
         let dataset = test_dataset().await;
 
         // Vertical merge insert (full schema), one fragment is deleted and should be removed from
@@ -9407,7 +9676,7 @@ mod tests {
             .await
             .unwrap();
 
-        check_indices(&dataset, &[], &[]).await;
+        check_indices(&dataset, &[0, 1, 2, 3], &[]).await;
     }
 
     #[tokio::test]
@@ -14431,16 +14700,27 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         .await
         .unwrap();
 
+        ds.create_index(
+            &["value_a"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
         let ds = Arc::new(ds);
 
-        // Invalidate fragment 2 (the middle one)
+        // Invalidate fragment 2 (the middle one) in the rewritten value's index.
         let frag2_start = 2 * rows_per_frag;
         let ds = partial_merge_insert(ds, frag2_start..frag2_start + rows_per_frag, 999.0).await;
 
         // Verify pre-compaction state
         let indices = ds.load_indices().await.unwrap();
-        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let idx = indices.iter().find(|i| i.name == "value_a_idx").unwrap();
         assert!(!idx.fragment_bitmap.as_ref().unwrap().contains(2));
+        let key_idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        assert!(key_idx.fragment_bitmap.as_ref().unwrap().contains(2));
 
         // Run compaction with a target that forces merging of the small fragments.
         let mut ds = (*ds).clone();
@@ -14454,7 +14734,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         // Fragment 2 (unindexed) may or may not be compacted on its own.
         // Either way, the old fragment IDs in the bitmap should be replaced.
         let indices = ds.load_indices().await.unwrap();
-        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let idx = indices.iter().find(|i| i.name == "value_a_idx").unwrap();
         let bitmap = idx.fragment_bitmap.as_ref().unwrap();
         for &old_id in &[0u32, 1, 3, 4] {
             assert!(
