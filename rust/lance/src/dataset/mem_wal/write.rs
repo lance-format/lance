@@ -1710,11 +1710,6 @@ fn memtable_reached_flush_threshold(
     )
 }
 
-/// [`memtable_reached_flush_threshold`] over a memtable's contents rather than
-/// the memtable itself, so admission can evaluate the same arms against the
-/// published snapshot without the write lock. One predicate, so a put cannot be
-/// refused for a seal the writer would not have made.
-#[allow(clippy::too_many_arguments)]
 /// Whether a memtable has no room for `incoming` batches and rows.
 ///
 /// Only the batch and row caps count. The byte limits in
@@ -1730,6 +1725,11 @@ fn memtable_cannot_take(
         || store.total_rows().saturating_add(incoming_rows) > max_memtable_rows
 }
 
+/// [`memtable_reached_flush_threshold`] over a memtable's contents rather than
+/// the memtable itself, so admission can evaluate the same arms against the
+/// published snapshot without the write lock. One predicate, so a put cannot be
+/// refused for a seal the writer would not have made.
+#[allow(clippy::too_many_arguments)]
 fn fill_reached_flush_threshold(
     store: &BatchStore,
     resident_bytes: usize,
@@ -4784,10 +4784,10 @@ impl MemTableFlushHandler {
     /// watcher is always signaled and the backpressure queue is always drained
     /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
     /// dropped watch channel and return `Err` instead of the actual outcome.
-    #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     ///
     /// `index_configs` are the indexes the memtable was built with. They are
     /// rebuilt on the generation, without which `fast_search` misses its rows.
+    #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
         memtable: Arc<MemTable>,
