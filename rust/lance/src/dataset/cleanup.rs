@@ -309,13 +309,10 @@ struct CleanupTask<'a> {
     ignored_manifests: HashSet<Path>,
     track_removed_manifests: bool,
     include_referenced_branches: bool,
-    // A successful scan has already added its paths to this cleanup's inspection.
-    // Keep only whether it found owner paths, not another copy of all references.
-    managed_scans: Arc<dashmap::DashMap<ManagedScanKey, Arc<OnceCell<bool>>>>,
 }
 
 /// The visible descriptor rows and base namespace used by one fragment scan.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ManagedScanKey {
     store_prefix: String,
     data_dir: Path,
@@ -338,6 +335,9 @@ struct ExpiredManifest {
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
+    // Completed scans have already added their paths to the sets below. Keep
+    // only whether they found owner paths, not another copy of all references.
+    managed_scans: HashMap<ManagedScanKey, Arc<OnceCell<bool>>>,
     old_manifests: HashMap<Path, ExpiredManifest>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
@@ -494,7 +494,6 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
-            managed_scans: Arc::default(),
         }
     }
 
@@ -632,7 +631,13 @@ impl<'a> CleanupTask<'a> {
                 field_ids: field_ids.clone(),
                 retained,
             };
-            let cell = self.managed_scans.entry(key).or_default().clone();
+            let cell = inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .entry(key)
+                .or_default()
+                .clone();
             let scanned = cell
                 .get_or_try_init(|| async {
                     let paths =
