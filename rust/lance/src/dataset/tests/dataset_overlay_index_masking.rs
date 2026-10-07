@@ -3169,12 +3169,10 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     );
 }
 
-/// A BTree index staged over `age` and then compacted away, ready for whatever
-/// each test does to the fragment the compaction produced. The committed index
-/// sits on `id` so the compaction has one to defer, leaving `age` answered only
-/// by the merged index under test.
-async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::IndexMetadata>, u64)
-{
+/// `age` staged as one segment per fragment, beside a committed index on `id`
+/// that gives a compaction an index to defer. `age` is answered only by the
+/// merged index under test.
+async fn btree_staged() -> (Dataset, Vec<lance_table::format::IndexMetadata>) {
     let mut dataset = create_base_dataset_with(false).await;
     dataset
         .create_index(
@@ -3200,9 +3198,14 @@ async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::
         fragment_ids,
     )
     .await;
+    (dataset, staged)
+}
 
+/// Compact every fragment into one with the index remap deferred, returning the
+/// fragment the compaction produced.
+async fn btree_compact(dataset: &mut Dataset) -> u64 {
     compact_files(
-        &mut dataset,
+        dataset,
         CompactionOptions {
             target_rows_per_fragment: 12,
             defer_index_remap: true,
@@ -3212,7 +3215,14 @@ async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::
     )
     .await
     .unwrap();
-    let rewritten = dataset.get_fragments()[0].id() as u64;
+    dataset.get_fragments()[0].id() as u64
+}
+
+/// [`btree_staged`], then [`btree_compact`].
+async fn btree_staged_over_a_compaction() -> (Dataset, Vec<lance_table::format::IndexMetadata>, u64)
+{
+    let (mut dataset, staged) = btree_staged().await;
+    let rewritten = btree_compact(&mut dataset).await;
     (dataset, staged, rewritten)
 }
 
@@ -3307,110 +3317,96 @@ async fn assert_merge_covers_nothing(
     );
 }
 
-/// A merged RTree index may cover the fragment compaction produced: the remap
-/// puts it there, and no segment has it in its history for the staleness pass to
-/// judge. An overlay on the indexed column is a separate question and takes that
-/// coverage away, because the segments hold the old values for those rows.
+/// A dataset of `fragments` fragments with a committed RTree index, and RTree
+/// segments staged over every fragment. Returns the geometry field id too.
 #[cfg(feature = "geo")]
-#[tokio::test]
-async fn test_rtree_merge_drops_a_remapped_fragment_an_overlay_has_moved_past() {
-    let dir = TempStrDir::default();
+async fn rtree_staged(
+    dir: &TempStrDir,
+    fragments: i32,
+) -> (Dataset, Vec<lance_table::format::IndexMetadata>, i32) {
     let (mut dataset, params) =
-        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, fragments)
+            .await;
     let geometry = dataset.schema().field("geometry").unwrap().id;
     let fragment_ids = rtree_fragment_ids(&dataset);
     let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
-
-    rtree_compact(&mut dataset, 3).await;
-    let rewritten = rtree_fragment_ids(&dataset)[0] as u64;
-    let dataset = rtree_overlay_geometry(dataset, geometry, rewritten).await;
-
-    assert_merge_covers_nothing(
-        &dataset,
-        staged,
-        "whose indexed column an overlay has moved past",
-    )
-    .await;
+    (dataset, staged, geometry)
 }
 
-/// Compacting a fragment that has an overlay materializes the overlay's values
-/// into the new fragment and drops the overlay, so the new fragment carries none
-/// of its own. Segments built before the overlay hold the old values.
+/// When an overlay over the indexed column lands relative to the compactions
+/// that move the staged segments' rows.
 #[cfg(feature = "geo")]
-#[tokio::test]
-async fn test_rtree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
-    let dir = TempStrDir::default();
-    let (mut dataset, params) =
-        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 3).await;
-    let geometry = dataset.schema().field("geometry").unwrap().id;
-    let fragment_ids = rtree_fragment_ids(&dataset);
-    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
-
-    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
-    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
-    rtree_compact(&mut dataset, 3).await;
-
-    assert_merge_covers_nothing(
-        &dataset,
-        staged,
-        "a compaction materialized an overlay into",
-    )
-    .await;
+#[derive(Clone, Copy, Debug)]
+enum OverlayTiming {
+    /// On the fragment a compaction produced. The remap puts the coverage
+    /// there and no segment has that fragment in its history, so only the
+    /// overlay check can take it away.
+    AfterCompaction,
+    /// On a source the compaction then reads. Compacting materializes the
+    /// overlay's values into the new fragment and drops the overlay, so the new
+    /// fragment carries none of its own.
+    BeforeCompaction,
+    /// On a source, then two compactions. The fragment that materialized it is
+    /// itself compacted away, so it is in neither the staged coverage nor the
+    /// final one.
+    BeforeTwoCompactions,
+    /// On the output of one compaction, materialized by the next. The fragment
+    /// it overlaid is named by neither the staged coverage nor the final one,
+    /// and is found only by following what the covered fragments become.
+    BetweenCompactions,
 }
 
-/// The same overlay across two compactions. The fragment that materialized it is
-/// itself compacted away, so it appears in neither the staged coverage nor the
-/// final one, and the old values reach the final fragment all the same.
+/// Segments built before the overlay hold the values it replaced, so wherever
+/// the overlay lands the merged index must cover nothing and let those rows be
+/// rescanned.
 #[cfg(feature = "geo")]
+#[rstest]
+#[case::after_compaction(OverlayTiming::AfterCompaction)]
+#[case::before_compaction(OverlayTiming::BeforeCompaction)]
+#[case::before_two_compactions(OverlayTiming::BeforeTwoCompactions)]
+#[case::between_compactions(OverlayTiming::BetweenCompactions)]
 #[tokio::test]
-async fn test_rtree_merge_drops_a_fragment_two_compactions_carried_a_materialized_overlay_to() {
+async fn test_rtree_merge_drops_coverage_an_overlay_reaches(#[case] timing: OverlayTiming) {
     let dir = TempStrDir::default();
-    let (mut dataset, params) =
-        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
-    let geometry = dataset.schema().field("geometry").unwrap().id;
-    let fragment_ids = rtree_fragment_ids(&dataset);
-    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
+    let fragments = match timing {
+        OverlayTiming::AfterCompaction | OverlayTiming::BeforeCompaction => 3,
+        OverlayTiming::BeforeTwoCompactions | OverlayTiming::BetweenCompactions => 4,
+    };
+    let (mut dataset, staged, geometry) = rtree_staged(&dir, fragments).await;
+    let first = |dataset: &Dataset| rtree_fragment_ids(dataset)[0] as u64;
 
-    let overlaid = rtree_fragment_ids(&dataset)[0] as u64;
-    let mut dataset = rtree_overlay_geometry(dataset, geometry, overlaid).await;
-    rtree_compact(&mut dataset, 2).await;
-    rtree_compact(&mut dataset, 4).await;
-    assert_eq!(dataset.get_fragments().len(), 1);
+    match timing {
+        OverlayTiming::AfterCompaction => {
+            rtree_compact(&mut dataset, 3).await;
+            let produced = first(&dataset);
+            dataset = rtree_overlay_geometry(dataset, geometry, produced).await;
+        }
+        OverlayTiming::BeforeCompaction => {
+            let source = first(&dataset);
+            dataset = rtree_overlay_geometry(dataset, geometry, source).await;
+            rtree_compact(&mut dataset, 3).await;
+        }
+        OverlayTiming::BeforeTwoCompactions => {
+            let source = first(&dataset);
+            dataset = rtree_overlay_geometry(dataset, geometry, source).await;
+            rtree_compact(&mut dataset, 2).await;
+            rtree_compact(&mut dataset, 4).await;
+            assert_eq!(dataset.get_fragments().len(), 1);
+        }
+        OverlayTiming::BetweenCompactions => {
+            rtree_compact(&mut dataset, 2).await;
+            assert_eq!(dataset.get_fragments().len(), 2);
+            let intermediate = first(&dataset);
+            dataset = rtree_overlay_geometry(dataset, geometry, intermediate).await;
+            rtree_compact(&mut dataset, 4).await;
+            assert_eq!(dataset.get_fragments().len(), 1);
+        }
+    }
 
     assert_merge_covers_nothing(
         &dataset,
         staged,
-        "two compactions carried a materialized overlay to",
-    )
-    .await;
-}
-
-/// An overlay that lands on a fragment one compaction produced and is
-/// materialized by the next. The fragment it overlaid is named by neither the
-/// staged coverage nor the final one, so it is found only by following what the
-/// covered fragments become at each compaction.
-#[cfg(feature = "geo")]
-#[tokio::test]
-async fn test_rtree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_on_its_own_output()
-{
-    let dir = TempStrDir::default();
-    let (mut dataset, params) =
-        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 4).await;
-    let geometry = dataset.schema().field("geometry").unwrap().id;
-    let fragment_ids = rtree_fragment_ids(&dataset);
-    let staged = geo::stage_rtree_segments(&mut dataset, &params, fragment_ids).await;
-
-    rtree_compact(&mut dataset, 2).await;
-    assert_eq!(dataset.get_fragments().len(), 2);
-    let intermediate = rtree_fragment_ids(&dataset)[0] as u64;
-    let mut dataset = rtree_overlay_geometry(dataset, geometry, intermediate).await;
-    rtree_compact(&mut dataset, 4).await;
-    assert_eq!(dataset.get_fragments().len(), 1);
-
-    assert_merge_covers_nothing(
-        &dataset,
-        staged,
-        "a compaction materialized an overlay on its own output",
+        &format!("an overlay reached ({timing:?})"),
     )
     .await;
 }
@@ -3454,34 +3450,25 @@ async fn test_rtree_merge_keeps_coverage_when_a_materialized_overlay_is_on_anoth
 /// it into and let those rows be scanned.
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_into() {
-    let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
-
-    let age_schema = dataset.schema().project(&["age"]).unwrap();
-    let batch = RecordBatch::try_new(
-        Arc::new(ArrowSchema::from(&age_schema)),
-        vec![Arc::new(Int32Array::from_iter_values((0..12).map(|_| 999))) as ArrayRef],
+    let (dataset, staged) = btree_staged().await;
+    let source = dataset.get_fragments()[0].id() as u64;
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_overlay",
+        source,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
     )
-    .unwrap();
-    let replacement = dataset
-        .get_fragment(rewritten as usize)
-        .unwrap()
-        .write_columns(futures::stream::iter([Ok(batch)]), &age_schema)
-        .await
-        .unwrap();
-    let read_version = dataset.version().version;
-    let mut dataset = Dataset::commit(
-        WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::DataReplacement {
-            replacements: vec![replacement],
-        },
-        Some(read_version),
-        None,
-        None,
-        Arc::new(Default::default()),
-        false,
-    )
-    .await
-    .unwrap();
+    .await;
+    btree_compact(&mut dataset).await;
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().overlays.is_empty()),
+        "the compaction materializes the overlay into the fragment it writes"
+    );
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     dataset
@@ -3489,10 +3476,14 @@ async fn test_btree_merge_drops_a_fragment_a_compaction_materialized_an_overlay_
         .await
         .unwrap();
     assert_eq!(
-        ids_matching(&dataset, "age = 999").await.len(),
-        12,
-        "the replaced values are missing: the merged index claimed a fragment whose \
-         indexed column was rewritten after the compaction produced it"
+        ids_matching(&dataset, "age = 999").await,
+        vec![0],
+        "the overlaid value is missing: the merged index claimed the fragment the \
+         compaction materialized the overlay into"
+    );
+    assert!(
+        ids_matching(&dataset, "age = 0").await.is_empty(),
+        "the value the overlay replaced is still answered"
     );
 }
 
@@ -3636,29 +3627,48 @@ async fn test_rtree_merge_drops_a_fragment_replaced_before_the_compaction() {
 }
 
 /// The comparison against the fragment the compaction wrote needs the manifest
-/// that wrote it, and cleanup deletes old manifests. With that one gone, the
-/// earliest surviving version holding the fragment is a later commit, which
-/// would compare equal to itself and prove nothing, so the merge gives the
-/// coverage up instead.
+/// that wrote it. With only that one cleaned up, every version before it still
+/// there, the merge cannot establish what the fragment held when it was
+/// produced, and gives the coverage up rather than compare a later version
+/// against itself.
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_up() {
     let (dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
-
-    let dataset = commit_overlay(
-        dataset,
-        "age_overlay",
-        rewritten,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
-        vec![i32_array([Some(999)])],
-    )
-    .await;
-
-    // Everything up to and including the compaction's own commit.
-    dataset
-        .cleanup_old_versions(chrono::Duration::zero(), None, None)
+    let compaction = dataset.manifest.version;
+    let kept = dataset
+        .merge_existing_index_segments(staged.clone())
         .await
         .unwrap();
+    assert_eq!(
+        kept.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([rewritten as u32]),
+        "with its history intact the merge follows the rows through the compaction"
+    );
+
+    let compaction_manifest = dataset
+        .checkout_version(compaction)
+        .await
+        .unwrap()
+        .manifest_location
+        .path
+        .clone();
+    dataset
+        .object_store
+        .delete(&compaction_manifest)
+        .await
+        .unwrap();
+    let retained = dataset
+        .versions()
+        .await
+        .unwrap()
+        .iter()
+        .map(|version| version.version)
+        .collect::<Vec<_>>();
+    assert!(!retained.contains(&compaction));
+    assert!(
+        (1..compaction).all(|version| retained.contains(&version)),
+        "only the compaction's own manifest is gone"
+    );
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert!(
