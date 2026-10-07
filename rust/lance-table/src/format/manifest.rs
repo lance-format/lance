@@ -175,6 +175,11 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Whether this table requires independently addressed Managed Blob support.
+    pub fn has_managed_blobs(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -674,6 +679,25 @@ pub struct BasePath {
 }
 
 impl BasePath {
+    /// Choose an unused exact base ID without reserving zero or overflowing at
+    /// `u32::MAX`. The caller must publish the binding with its references and
+    /// reject a concurrent attempt to bind the chosen ID to another location.
+    pub fn unused_id(bases: impl IntoIterator<Item = u32>) -> Result<u32> {
+        let mut ids = bases.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut candidate = 0u32;
+        for id in ids {
+            if id != candidate {
+                break;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("All u32 base IDs are already registered"))?;
+        }
+        Ok(candidate)
+    }
+
     /// Create a new BasePath
     ///
     /// # Arguments

@@ -167,7 +167,7 @@ message Manifest {
    *
    * The flag identities are the same as for reader_feature_flags, but the values of
    * reader_feature_flags and writer_feature_flags are not required to be identical.
-   * * 1 << 14: the manifest also sets max_allocated_field_id. A writer must
+   * * 1 << 15: the manifest also sets max_allocated_field_id. A writer must
    *   assign new field IDs above that value and advance it in the same commit.
    *   The field and flag must either both be set or both be absent.
    */

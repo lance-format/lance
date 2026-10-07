@@ -4992,13 +4992,14 @@ mod tests {
             let error = crate::io::commit::commit_new_dataset(
                 &dataset.object_store,
                 None,
-                dataset.commit_handler.as_ref(),
+                &dataset.commit_handler,
                 &clone.base,
+                clone.uri(),
                 &transaction,
                 &Default::default(),
                 clone.manifest_location.naming_scheme,
                 dataset.metadata_cache.as_ref(),
-                dataset.session.store_registry(),
+                dataset.session.clone(),
             )
             .await
             .unwrap_err();
