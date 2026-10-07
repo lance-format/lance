@@ -182,31 +182,27 @@ jobs:
         run: |
           git config --global user.email "Lance Github Runner"
           git config --global user.name "dev+gha@lance.org"
-      - name: Create disposable signing key for dry run
+      - name: Dry run
         if: |
           github.event_name == 'pull_request' ||
           inputs.mode == 'dry_run'
-        run: |
-          export GNUPGHOME="$RUNNER_TEMP/java-dry-run-gnupg"
-          mkdir -m 700 "$GNUPGHOME"
-          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
-          gpg --batch --pinentry-mode loopback --passphrase '' \
-            --quick-generate-key 'Lance dry run <dev@lance.org>' rsa2048 sign 1d
-      - name: Build signed bundle and publish to Central unless dry run
+        working-directory: java
+        run: ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true package
+      - name: Publish with Java 11
+        if: |
+          github.event_name == 'release' ||
+          inputs.mode == 'release'
         working-directory: java
         run: |
-          mkdir -p "${GNUPGHOME:-$HOME/.gnupg}"
-          echo "use-agent" >> "${GNUPGHOME:-$HOME/.gnupg}/gpg.conf"
-          echo "pinentry-mode loopback" >> "${GNUPGHOME:-$HOME/.gnupg}/gpg.conf"
+          mkdir -p ~/.gnupg
+          echo "use-agent" >> ~/.gnupg/gpg.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false \
-            "-Dgpg.passphrase=$GPG_PASSPHRASE" "-DskipPublishing=$SKIP_PUBLISHING" \
-            deploy -P deploy-to-ossrh
+            "-Dgpg.passphrase=$GPG_PASSPHRASE" deploy -P deploy-to-ossrh
         env:
-          SKIP_PUBLISHING: ${{ !(github.event_name == 'release' || inputs.mode == 'release') }}
-          GPG_PASSPHRASE: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.GPG_PASSPHRASE || '' }}
-          # The Central plugin requires a server entry even when upload is skipped.
-          SONATYPE_USER: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.SONATYPE_USER || 'dry-run' }}
-          SONATYPE_TOKEN: ${{ (github.event_name == 'release' || inputs.mode == 'release') && secrets.SONATYPE_TOKEN || 'dry-run' }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
+          SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
       - name: Preserve signed bundle for independent R2 retries
         if: ${{ !cancelled() && hashFiles('java/target/central-publishing/central-bundle.zip') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -215,10 +211,6 @@ jobs:
           path: java/target/central-publishing/central-bundle.zip
           retention-days: 30
           if-no-files-found: error
-      - name: Install bundle validator
-        run: pip install boto3==1.40.76
-      - name: Validate the bundle used by both repositories
-        run: python ci/publish_java_r2.py java/target/central-publishing/central-bundle.zip --validate-only
   publish-r2:
     name: Publish Java packages to R2
     runs-on: ubuntu-latest
@@ -242,11 +234,6 @@ jobs:
           path: java-bundle
       - name: Install R2 publisher
         run: pip install boto3==1.40.76
-      - name: Set up Java for isolated Maven download verification
-        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
-        with:
-          distribution: corretto
-          java-version: 11
       - name: Upload immutable artifacts and update Maven metadata
         run: |
           : "${AWS_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}"

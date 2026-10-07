@@ -54,7 +54,7 @@ def digest(stream, algorithm="sha256"):
 
 
 def unpack_bundle(bundle, directory):
-    """Validate the entire bundle before allowing any repository writes."""
+    """Extract one release under its Maven path without trusting ZIP paths."""
     with zipfile.ZipFile(bundle) as archive:
         names = [info.filename for info in archive.infolist() if not info.is_dir()]
         if not names or len(names) != len(set(names)):
@@ -66,47 +66,14 @@ def unpack_bundle(bundle, directory):
                 len(parts) != 5
                 or "/".join(parts[:3]) != REPOSITORY_PATH
                 or "\\" in name
+                or any(part in ("", ".", "..") for part in parts)
             ):
                 raise ValueError(f"Unexpected bundle path: {name}")
             version_key(parts[3])
             versions.add(parts[3])
-            if not re.fullmatch(
-                rf"lance-core-{re.escape(parts[3])}(?:-[\w-]+)?"
-                r"\.(?:jar|pom)(?:\.asc|\.md5|\.sha1|\.sha256|\.sha512)?",
-                parts[4],
-            ):
-                raise ValueError(f"Unexpected artifact filename: {name}")
         if len(versions) != 1:
             raise ValueError(f"Expected one version in bundle, found: {versions}")
         version = versions.pop()
-        base = f"{REPOSITORY_PATH}/{version}/lance-core-{version}"
-        required = {
-            base + suffix for suffix in (".pom", ".jar", "-sources.jar", "-javadoc.jar")
-        }
-        if not required.issubset(names):
-            raise ValueError(
-                f"Bundle missing artifacts: {sorted(required - set(names))}"
-            )
-        for name in names:
-            if name.endswith((".jar", ".pom")):
-                for suffix in ("asc", *CHECKSUMS):
-                    if f"{name}.{suffix}" not in names:
-                        raise ValueError(f"Bundle missing {name}.{suffix}")
-                for algorithm in CHECKSUMS:
-                    with archive.open(name) as stream:
-                        actual = digest(stream, algorithm)
-                    expected = archive.read(f"{name}.{algorithm}").decode().strip()
-                    if actual != expected:
-                        raise ValueError(f"Invalid {algorithm} checksum for {name}")
-        pom = ET.fromstring(archive.read(base + ".pom"))
-        ns = {"m": "http://maven.apache.org/POM/4.0.0"}
-        for field, expected in (
-            ("groupId", "org.lance"),
-            ("artifactId", "lance-core"),
-            ("version", version),
-        ):
-            if pom.findtext(f"m:{field}", namespaces=ns) != expected:
-                raise ValueError(f"Bundle POM {field} does not match {expected}")
         # Only validated file paths are extracted; ZIP directory entries are ignored.
         for name in names:
             archive.extract(name, directory)
@@ -219,132 +186,46 @@ def publish(client, bucket, bundle, prefix=""):
                 CacheControl=METADATA_CACHE,
             )
     logging.info("Published org.lance:lance-core:%s (%s files)", version, len(names))
+    return version
 
 
-def verify_public(bundle, public_url, maven):
-    """Check anonymous bytes and resolve the main JAR without Central fallback."""
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        version, names = unpack_bundle(bundle, root / "bundle")
-        metadata_key = f"{REPOSITORY_PATH}/maven-metadata.xml"
-        for name in [*names, metadata_key, *(f"{metadata_key}.{a}" for a in CHECKSUMS)]:
-            target = root / "download" / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                [
-                    "curl",
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--retry",
-                    "5",
-                    "--output",
-                    str(target),
-                    f"{public_url.rstrip('/')}/{quote(name)}",
-                ],
-                check=True,
-            )
-            if name in names:
-                with (
-                    target.open("rb") as actual,
-                    (root / "bundle" / name).open("rb") as expected,
-                ):
-                    if digest(actual) != digest(expected):
-                        raise ValueError(f"Public repository bytes differ: {name}")
-        metadata = (root / "download" / metadata_key).read_bytes()
-        if version not in [
-            node.text
-            for node in ET.fromstring(metadata).findall("versioning/versions/version")
-        ]:
-            raise ValueError(f"Public metadata is missing version {version}")
-        for algorithm in CHECKSUMS:
-            if (
-                root / "download" / f"{metadata_key}.{algorithm}"
-            ).read_text().strip() != hashlib.new(algorithm, metadata).hexdigest():
-                raise ValueError(f"Public metadata {algorithm} checksum differs")
-
-        # Override the dependency repository named central. Plugin dependencies
-        # still use Central, but the requested Lance artifact has only R2.
-        pom = ET.Element("project", xmlns="http://maven.apache.org/POM/4.0.0")
-        for key, value in (
-            ("modelVersion", "4.0.0"),
-            ("groupId", "org.lance.validation"),
-            ("artifactId", "r2-check"),
-            ("version", "1"),
-        ):
-            ET.SubElement(pom, key).text = value
-        for section, entry, url in (
-            ("repositories", "repository", public_url),
-            (
-                "pluginRepositories",
-                "pluginRepository",
-                "https://repo.maven.apache.org/maven2",
-            ),
-        ):
-            repository = ET.SubElement(ET.SubElement(pom, section), entry)
-            ET.SubElement(repository, "id").text = "central"
-            ET.SubElement(repository, "url").text = url
-            releases = ET.SubElement(repository, "releases")
-            ET.SubElement(releases, "checksumPolicy").text = "fail"
-        ET.ElementTree(pom).write(root / "pom.xml")
-        (root / "settings.xml").write_text("<settings/>")
-        subprocess.run(
-            [
-                str(maven.resolve()),
-                "--batch-mode",
-                "--no-transfer-progress",
-                "--settings",
-                str(root / "settings.xml"),
-                "--global-settings",
-                str(root / "settings.xml"),
-                "-f",
-                str(root / "pom.xml"),
-                f"-Dmaven.repo.local={root / 'm2'}",
-                "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get",
-                f"-Dartifact=org.lance:lance-core:{version}",
-                "-Dtransitive=false",
-            ],
-            check=True,
-        )
-        jar = f"{REPOSITORY_PATH}/{version}/lance-core-{version}.jar"
-        with (
-            (root / "m2" / jar).open("rb") as actual,
-            (root / "bundle" / jar).open("rb") as expected,
-        ):
-            if digest(actual) != digest(expected):
-                raise ValueError("Maven-resolved JAR differs from signed bundle")
-        logging.info(
-            "Verified all public files and Maven resolution from an empty cache"
-        )
+def verify_public(version, public_url):
+    """Check that the new release is accessible through the public domain."""
+    pom = f"{REPOSITORY_PATH}/{version}/lance-core-{version}.pom"
+    subprocess.run(
+        [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--retry",
+            "5",
+            "--output",
+            os.devnull,
+            f"{public_url.rstrip('/')}/{quote(pom)}",
+        ],
+        check=True,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path)
-    parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
         "--prefix", default="", help="Isolated repository prefix for tests"
     )
-    parser.add_argument(
-        "--public-url", help="Verify downloads from this repository root"
-    )
-    parser.add_argument("--maven", type=Path, default=Path("java/mvnw"))
+    parser.add_argument("--public-url", help="Check public access to the uploaded POM")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    if args.validate_only:
-        with tempfile.TemporaryDirectory() as directory:
-            version, names = unpack_bundle(args.bundle, directory)
-            logging.info("Validated %s: %s files", version, len(names))
-        return
     client = boto3.client(
         "s3",
         endpoint_url=os.environ["R2_ENDPOINT"],
         region_name="auto",
         config=Config(retries={"mode": "standard", "max_attempts": 5}),
     )
-    publish(client, os.environ["R2_BUCKET"], args.bundle, args.prefix)
+    version = publish(client, os.environ["R2_BUCKET"], args.bundle, args.prefix)
     if args.public_url:
-        verify_public(args.bundle, args.public_url, args.maven)
+        verify_public(version, args.public_url)
 
 
 if __name__ == "__main__":

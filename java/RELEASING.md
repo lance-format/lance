@@ -5,8 +5,8 @@ and RC releases to both Maven Central and the R2 repository at
 `https://maven.lance.org`. The R2 job runs after Central succeeds and uploads the
 same signed Central bundle. A release is complete only when both jobs succeed.
 
-Pull requests and manual `dry_run` runs build and validate the signed bundle with
-a disposable signing key. They do not upload to either Maven repository.
+Pull requests and manual `dry_run` runs build the Java package without publishing
+to either Maven repository.
 
 ## Repository configuration
 
@@ -46,8 +46,8 @@ The publisher accepts identical existing files and rejects conflicting bytes.
 It uploads all version files before merging metadata. Interrupted metadata or
 checksum updates are repaired by retrying. The workflow serializes R2 jobs with
 one concurrency group; manual publishers must not run alongside those jobs.
-After upload, the job verifies every file through the public domain and resolves
-the main JAR with Maven using an empty cache and no Central fallback for Lance.
+After upload, the job checks that the new POM is accessible through the public
+domain.
 
 ## Consuming the R2 repository
 
