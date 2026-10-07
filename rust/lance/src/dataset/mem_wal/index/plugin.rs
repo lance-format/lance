@@ -487,11 +487,11 @@ pub trait PrimaryKeyIndex: MemIndex {
 #[async_trait::async_trait]
 pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
     /// A short name, used in plans and errors. Conventionally the index type's
-    /// own name, for example `Bitmap`.
+    /// own name, for example `BTree`.
     fn name(&self) -> &str;
 
     /// The name of the protobuf details message identifying the base-table
-    /// index this plugin maintains, for example `BitmapIndexDetails`.
+    /// index this plugin maintains, for example `BTreeIndexDetails`.
     ///
     /// The name alone, without a package: the package varies with the dataset
     /// version, and a type url matches when its message name is exactly this.

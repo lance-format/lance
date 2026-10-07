@@ -60,8 +60,8 @@ const MAX_CHUNK_SIZE: usize = 1 << 20;
 ///
 /// An index with one node per row reaches the cap almost at once, so the ramp
 /// costs it nothing. An index with one node per *distinct value* may never get
-/// there — a bitmap over a handful of values would otherwise be charged a
-/// megabyte to hold four nodes, which is the case that kind exists for.
+/// there: one over a handful of values would otherwise be charged a megabyte to
+/// hold four nodes.
 const FIRST_CHUNK_SIZE: usize = 4 << 10;
 
 /// Node header. The variable-length forward-pointer tower (`height` slots of

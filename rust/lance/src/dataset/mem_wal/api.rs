@@ -2004,20 +2004,21 @@ mod tests {
             .unwrap();
     }
 
-    /// Claims the base table's bitmap index and maintains it as a B-tree.
+    /// Claims a kind no built-in plugin maintains (the base table's zone map)
+    /// and maintains it as a B-tree.
     #[derive(Debug)]
-    struct BitmapAsBTree;
+    struct UnclaimedKindAsBTree;
 
     #[async_trait::async_trait]
-    impl super::super::index::MemIndexPlugin for BitmapAsBTree {
+    impl super::super::index::MemIndexPlugin for UnclaimedKindAsBTree {
         fn name(&self) -> &str {
-            "BitmapAsBTree"
+            "UnclaimedKindAsBTree"
         }
         fn details_message(&self) -> &str {
-            "BitmapIndexDetails"
+            "ZoneMapIndexDetails"
         }
         fn flush_index_type(&self) -> IndexType {
-            IndexType::Bitmap
+            IndexType::ZoneMap
         }
         fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
             btree_plugin().training_criteria()
@@ -2040,10 +2041,10 @@ mod tests {
             .clone()
     }
 
-    async fn id_v_dataset_with_bitmap_and_btree(uri: &str) -> Dataset {
+    async fn id_v_dataset_with_zone_map_and_btree(uri: &str) -> Dataset {
         let mut dataset = id_v_dataset(uri, &[1, 2, 3]).await;
         for (column, kind, name) in [
-            ("id", IndexType::Bitmap, "id_bitmap"),
+            ("id", IndexType::ZoneMap, "id_zone_map"),
             ("v", IndexType::BTree, "v_btree"),
         ] {
             dataset
@@ -2066,7 +2067,7 @@ mod tests {
     async fn test_maintain_all_skips_an_index_no_plugin_claims() {
         let tmp = tempfile::tempdir().unwrap();
         let uri = format!("{}/base", tmp.path().display());
-        let mut dataset = id_v_dataset_with_bitmap_and_btree(&uri).await;
+        let mut dataset = id_v_dataset_with_zone_map_and_btree(&uri).await;
         dataset
             .initialize_mem_wal()
             .unsharded()
@@ -2089,14 +2090,14 @@ mod tests {
     async fn test_a_named_set_is_validated_against_the_writers_plugins() {
         let tmp = tempfile::tempdir().unwrap();
         let uri = format!("{}/base", tmp.path().display());
-        let mut dataset = id_v_dataset_with_bitmap_and_btree(&uri).await;
+        let mut dataset = id_v_dataset_with_zone_map_and_btree(&uri).await;
         dataset
             .initialize_mem_wal()
             .unsharded()
             .execute()
             .await
             .unwrap();
-        let named = Some(vec!["id_bitmap".to_string()]);
+        let named = Some(vec!["id_zone_map".to_string()]);
 
         let error = dataset
             .update_mem_wal_maintained_indexes(named.clone())
@@ -2106,10 +2107,10 @@ mod tests {
             matches!(error, lance_core::Error::InvalidInput { .. }),
             "{error:?}"
         );
-        assert!(error.to_string().contains("id_bitmap"), "{error}");
+        assert!(error.to_string().contains("id_zone_map"), "{error}");
 
         let registry = MemIndexRegistry::default()
-            .with_plugin(Arc::new(BitmapAsBTree))
+            .with_plugin(Arc::new(UnclaimedKindAsBTree))
             .unwrap();
         dataset
             .update_mem_wal_maintained_indexes_with(named, &registry)
@@ -2118,12 +2119,12 @@ mod tests {
 
         let shard_id = Uuid::new_v4();
         let config = ShardWriterConfig::new(shard_id)
-            .with_mem_index_plugin(Arc::new(BitmapAsBTree))
+            .with_mem_index_plugin(Arc::new(UnclaimedKindAsBTree))
             .unwrap();
         let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
         assert_eq!(
             writer.maintained_index_names(),
-            vec!["id_bitmap".to_string()]
+            vec!["id_zone_map".to_string()]
         );
         writer.close().await.unwrap();
     }

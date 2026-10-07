@@ -1266,7 +1266,7 @@ mod tests {
             "StubIndexDetails"
         }
         fn flush_index_type(&self) -> IndexType {
-            IndexType::Bitmap
+            IndexType::BTree
         }
         fn training_criteria(&self) -> TrainingCriteria {
             TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
