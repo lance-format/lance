@@ -119,7 +119,9 @@ impl TopKLateMaterialization {
     /// Also walk through custom nodes for which `pass_through` returns `true`.
     /// Such a node must keep every row, column, and value of its single input
     /// (it may rewrite schema metadata), and must hold no column indices, as
-    /// it is rebuilt over the narrowed read with `with_new_children`.
+    /// it is rebuilt over the narrowed read with `with_new_children`. It must
+    /// also report [`CardinalityEffect::Equal`] and no fetch, or the rule
+    /// declines.
     pub fn with_pass_through(
         mut self,
         pass_through: impl Fn(&dyn ExecutionPlan) -> bool + Send + Sync + 'static,
