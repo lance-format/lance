@@ -397,8 +397,7 @@ pub async fn build_per_segment_filters(
             .deleted_fragment_bitmap(&dataset.fragment_bitmap)
             .unwrap_or_default();
         effective_union |= &effective;
-        filters
-            .push(build_old_data_filter(dataset, &effective, &deleted, address_domain).await?);
+        filters.push(build_old_data_filter(dataset, &effective, &deleted, address_domain).await?);
     }
     Ok((effective_union, filters))
 }
