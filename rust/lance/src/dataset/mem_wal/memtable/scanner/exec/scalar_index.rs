@@ -10,7 +10,10 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow::compute::{and, filter_record_batch, prep_null_mask_filter};
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
+use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -161,157 +164,92 @@ impl ScalarIndexExec {
         }
     }
 
-    /// Keep only the candidate rows the filter accepts.
+    /// Read the rows at `positions` (ascending), one stored batch at a time.
     ///
-    /// Evaluated once per stored batch rather than once per row: the candidates
-    /// from one batch arrive together, and a spatial or string predicate costs
-    /// far more per call than the mask does per row.
-    fn retain_matching_rows(
+    /// A touched batch is filtered with a mask, as a full read filters it,
+    /// rather than gathered row by row: a broad answer then costs no more than
+    /// reading every row, and a batch without a match is never read. `recheck`
+    /// is the whole filter, applied when the indexes did not settle it; it runs
+    /// once per touched batch.
+    fn read_rows(
         &self,
-        batch_rows: Vec<(usize, usize, u64)>,
-        recheck: &PhysicalExprRef,
-    ) -> DataFusionResult<Vec<(usize, usize, u64)>> {
-        let mut kept = Vec::with_capacity(batch_rows.len());
-        let mut current: Option<(usize, BooleanArray)> = None;
-        for (batch_id, row_in_batch, position) in batch_rows {
-            if current.as_ref().is_none_or(|(id, _)| *id != batch_id) {
-                let Some(stored) = self.batch_store.get(batch_id) else {
-                    continue;
-                };
-                let evaluated = recheck.evaluate(&stored.data)?;
-                let mask = evaluated.into_array(stored.data.num_rows())?;
-                let mask = mask
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "a filter must evaluate to a boolean".to_string(),
-                        )
-                    })?
-                    .clone();
-                current = Some((batch_id, mask));
+        positions: &[u64],
+        recheck: Option<&PhysicalExprRef>,
+    ) -> DataFusionResult<Vec<RecordBatch>> {
+        let mut results = Vec::new();
+        let mut next = 0;
+        for stored in self.batch_store.iter() {
+            if next == positions.len() {
+                break;
             }
-            // A null result is not a match, as it is not in a full scan.
-            if current
-                .as_ref()
-                .is_some_and(|(_, mask)| mask.is_valid(row_in_batch) && mask.value(row_in_batch))
-            {
-                kept.push((batch_id, row_in_batch, position));
+            let start = stored.row_offset;
+            let end = start + stored.num_rows as u64;
+            let first = next;
+            while next < positions.len() && positions[next] < end {
+                next += 1;
             }
-        }
-        Ok(kept)
-    }
-
-    /// Convert row positions to batch_id, row_within_batch, and original row_position tuples.
-    fn positions_to_batch_rows(&self, positions: &[u64]) -> Vec<(usize, usize, u64)> {
-        // Build a map of batch_id -> (start_row, end_row)
-        let mut batch_ranges = Vec::new();
-        let mut current_row = 0usize;
-
-        for stored_batch in self.batch_store.iter() {
-            let batch_start = current_row;
-            let batch_end = current_row + stored_batch.num_rows;
-            batch_ranges.push((batch_start, batch_end));
-            current_row = batch_end;
-        }
-
-        // Batch ranges are contiguous and ascending, so the owning batch is a
-        // binary search rather than a walk. A linear scan here cost one pass
-        // over every batch for every matching row.
-        let mut result = Vec::with_capacity(positions.len());
-        for &pos in positions {
-            let pos_usize = pos as usize;
-            let found = batch_ranges.partition_point(|(start, _)| *start <= pos_usize);
-            if found == 0 {
+            let in_batch = &positions[first..next];
+            if in_batch.is_empty() {
                 continue;
             }
-            let batch_id = found - 1;
-            let (start, end) = batch_ranges[batch_id];
-            if pos_usize < end {
-                result.push((batch_id, pos_usize - start, pos));
+
+            let mut selected = BooleanBufferBuilder::new(stored.num_rows);
+            selected.append_n(stored.num_rows, false);
+            for &position in in_batch {
+                selected.set_bit((position - start) as usize, true);
             }
-        }
-        result
-    }
-
-    /// Materialize rows from batch store.
-    fn materialize_rows(
-        &self,
-        batch_rows: &[(usize, usize, u64)],
-    ) -> DataFusionResult<Vec<RecordBatch>> {
-        if batch_rows.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Group rows by batch, preserving row_position for _rowid
-        let mut batches_to_rows: std::collections::HashMap<usize, Vec<(usize, u64)>> =
-            std::collections::HashMap::new();
-        for &(batch_id, row_in_batch, row_position) in batch_rows {
-            batches_to_rows
-                .entry(batch_id)
-                .or_default()
-                .push((row_in_batch, row_position));
-        }
-
-        let mut results = Vec::new();
-        for (batch_id, rows_with_positions) in batches_to_rows {
-            if let Some(stored) = self.batch_store.get(batch_id) {
-                let data = scan_record_batch(&stored.data)?;
-                // Extract row indices and row positions
-                let row_indices: Vec<u32> = rows_with_positions
-                    .iter()
-                    .map(|&(row_in_batch, _)| row_in_batch as u32)
-                    .collect();
-                let row_positions: Vec<u64> = rows_with_positions
-                    .iter()
-                    .map(|&(_, row_position)| row_position)
-                    .collect();
-
-                // Use take to select specific rows
-                let indices = arrow_array::UInt32Array::from(row_indices);
-
-                let columns: std::result::Result<Vec<_>, datafusion::error::DataFusionError> = data
-                    .columns()
-                    .iter()
-                    .map(|col| {
-                        arrow_select::take::take(col.as_ref(), &indices, None).map_err(|e| {
-                            datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                        })
-                    })
-                    .collect();
-
-                let columns = columns?;
-
-                // Apply projection
-                let source_schema = data.schema();
-                let mut final_columns: Vec<Arc<dyn arrow_array::Array>> =
-                    if let Some(ref proj_indices) = self.projection {
-                        take_projected_columns(
-                            &columns,
-                            source_schema.fields(),
-                            proj_indices,
-                            self.output_schema.as_ref(),
-                            row_positions.len(),
-                        )?
-                    } else {
-                        columns
-                    };
-
-                // Add _rowid column if requested
-                if self.with_row_id {
-                    final_columns.push(Arc::new(UInt64Array::from(row_positions.clone())));
+            let mut mask = BooleanArray::new(selected.finish(), None);
+            if let Some(recheck) = recheck {
+                let evaluated = recheck
+                    .evaluate(&stored.data)?
+                    .into_array(stored.num_rows)?;
+                let evaluated = evaluated.as_boolean_opt().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(
+                        "a filter must evaluate to a boolean".to_string(),
+                    )
+                })?;
+                mask = and(&mask, evaluated)?;
+                // A null result is not a match, as it is not in a full scan.
+                if mask.null_count() > 0 {
+                    mask = prep_null_mask_filter(&mask);
                 }
-
-                // Add _rowaddr column if requested (same value as row position)
-                if self.with_row_address {
-                    final_columns.push(Arc::new(UInt64Array::from(row_positions)));
-                }
-
-                let batch = RecordBatch::try_new(self.output_schema.clone(), final_columns)?;
-                results.push(batch);
             }
-        }
+            let kept = mask.true_count();
+            if kept == 0 {
+                continue;
+            }
 
+            let data = scan_record_batch(&stored.data)?;
+            let data = if kept == stored.num_rows {
+                data
+            } else {
+                filter_record_batch(&data, &mask)?
+            };
+            let row_positions: Vec<u64> = mask
+                .values()
+                .set_indices()
+                .map(|row| start + row as u64)
+                .collect();
+
+            let mut columns: Vec<Arc<dyn Array>> = match &self.projection {
+                Some(projection) => take_projected_columns(
+                    data.columns(),
+                    data.schema().fields(),
+                    projection,
+                    self.output_schema.as_ref(),
+                    kept,
+                )?,
+                None => data.columns().to_vec(),
+            };
+            if self.with_row_id {
+                columns.push(Arc::new(UInt64Array::from(row_positions.clone())));
+            }
+            // A memtable row's address is its position.
+            if self.with_row_address {
+                columns.push(Arc::new(UInt64Array::from(row_positions)));
+            }
+            results.push(RecordBatch::try_new(self.output_schema.clone(), columns)?);
+        }
         Ok(results)
     }
 }
@@ -376,24 +314,21 @@ impl ExecutionPlan for ScalarIndexExec {
         // Query the index
         let (positions, exact) = self.query_index();
 
-        // Convert positions to batch/row pairs with visibility filtering
-        let mut batch_rows = self.positions_to_batch_rows(&positions);
-
         // An index that only narrows hands back candidates, and so does an
         // exact index answer to part of the filter, so the filter decides here.
         // Dropping this would surface rows that do not match.
-        if !exact || !self.is_filter_covered {
+        let recheck = if !exact || !self.is_filter_covered {
             let Some(recheck) = &self.recheck else {
                 return Err(datafusion::error::DataFusionError::Internal(
                     "the indexes did not decide the filter, but no filter was given to re-check with"
                         .to_string(),
                 ));
             };
-            batch_rows = self.retain_matching_rows(batch_rows, recheck)?;
-        }
-
-        // Materialize the rows
-        let batches = self.materialize_rows(&batch_rows)?;
+            Some(recheck)
+        } else {
+            None
+        };
+        let batches = self.read_rows(&positions, recheck)?;
 
         let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
 
