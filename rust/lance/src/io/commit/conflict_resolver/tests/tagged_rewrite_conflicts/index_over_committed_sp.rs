@@ -257,11 +257,11 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
 
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
-    let (mut stale, segment) = stage(&dataset, "i", IndexType::BTree, vec![0, 1]).await;
+    let (mut stale, segment) = stage(&dataset, "text", IndexType::BTree, vec![0, 1]).await;
     let tagged = make_tagged(dataset).await;
 
-    // Patch `text` of the row `i = 3` (fragment 11) in place; the source
-    // carries the key column, so `i` is rewritten in place as well.
+    // Patch the indexed `text` of the row `i = 3` (fragment 11) in place.
+    // The join key `i` is preserved, so its index would retain coverage.
     let schema = Arc::new(ArrowSchema::from(
         &tagged.schema().project(&["i", "text"]).unwrap(),
     ));
@@ -290,7 +290,7 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
     );
 
     stale
-        .commit_existing_index_segments("idx", "i", vec![segment.clone()])
+        .commit_existing_index_segments("idx", "text", vec![segment.clone()])
         .await
         .unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
@@ -305,8 +305,8 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
         stored_bitmap(&stored)
     );
     assert_eq!(
-        i_values(&dataset, Some("i = 3"), true).await,
-        i_values(&dataset, Some("i = 3"), false).await
+        i_values(&dataset, Some("text = 'patched'"), true).await,
+        i_values(&dataset, Some("text = 'patched'"), false).await
     );
     assert_eq!(
         i_values(&dataset, None, true).await,
@@ -327,7 +327,10 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
             .fold(RoaringBitmap::new(), |acc, b| acc | b),
         RoaringBitmap::from_iter([10u32, 11])
     );
-    assert_eq!(assert_index_serves(&dataset, "i = 3").await, vec![3]);
+    assert_eq!(
+        assert_index_serves(&dataset, "text = 'patched'").await,
+        vec![3]
+    );
 }
 
 /// The same race with `alter_columns`: a cast of the indexed column landed
