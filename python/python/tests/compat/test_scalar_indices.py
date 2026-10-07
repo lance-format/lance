@@ -15,6 +15,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+from packaging.version import Version
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -67,7 +68,7 @@ class BTreeIndex(UpgradeDowngradeTest):
         # has already rebuilt the index in the newer format, so the older
         # build can no longer see it here and must fall back to a full scan
         # -- still correct, just not re-asserted as "indexed" in that case.
-        if lance.__version__ != self.compat_version:
+        if Version(lance.__version__) != Version(self.compat_version):
             explain = ds.scanner(filter="btree == 7").explain_plan()
             assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
 
@@ -124,9 +125,13 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         class's methods run under both the old venv and the current build,
         at different points of the upgrade/downgrade round trip). The old
         venv has exactly that pylance version installed, so comparing it
-        against the live `lance.__version__` tells the two apart.
+        against the live `lance.__version__` tells the two apart. Compared
+        as `Version`, not raw strings: `lance.__version__` reports Cargo's
+        semver-style pre-release format (`14.0.0-beta.1`) while
+        `self.compat_version` comes from PyPI's PEP 440 format (`14.0.0b1`)
+        for the same release.
         """
-        return lance.__version__ == self.compat_version
+        return Version(lance.__version__) == Version(self.compat_version)
 
     def create(self):
         """Create a stable-row-id dataset with a BTREE index."""
