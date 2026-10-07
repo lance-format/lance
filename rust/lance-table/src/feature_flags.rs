@@ -79,9 +79,8 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
 /// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
 pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
-/// Reserved for fragment trees. Readers and writers reject it until implemented.
-///
-/// Bit 11 is spilled row lineage, so this takes the next free bit.
+/// Fragment records are stored in immutable tree objects outside the manifest.
+/// Native Dataset readers and writers reject this layout until integration.
 pub const FLAG_FRAGMENT_TREE: u64 = 1 << 12;
 /// Index key fields and covering fields are declared independently.
 ///
@@ -114,6 +113,12 @@ const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 pub(crate) const STICKY_PAIRED_FLAGS: u64 =
     FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX;
 
+/// Requirements that cannot be rederived while tree fragment records are lazy.
+pub(crate) const FRAGMENT_FEATURE_FLAGS: u64 = FLAG_DELETION_FILES
+    | FLAG_STABLE_ROW_IDS
+    | FLAG_UNSTABLE_DATA_OVERLAY_FILES
+    | FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
@@ -139,9 +144,21 @@ pub fn apply_feature_flags(
         & FLAG_COVERED_INDEX_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
 
+    // Untouched external fragment records still contribute these requirements.
+    let fragment_flags = if manifest.fragment_tree.is_some() {
+        (manifest.reader_feature_flags | manifest.writer_feature_flags) & FRAGMENT_FEATURE_FLAGS
+    } else {
+        0
+    };
+
     // Reset flags
-    manifest.reader_feature_flags = 0;
-    manifest.writer_feature_flags = 0;
+    manifest.reader_feature_flags = fragment_flags;
+    manifest.writer_feature_flags = fragment_flags;
+
+    if manifest.fragment_tree.is_some() {
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_TREE;
+    }
 
     let has_deletion_files = manifest
         .fragments
@@ -284,7 +301,6 @@ fn supported_flags_when(
         FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
         spilled_row_lineage_enabled,
     );
-    // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     supported
@@ -420,11 +436,26 @@ mod tests {
     fn test_fragment_tree_flag_is_reserved_not_supported() {
         assert_eq!(FLAG_FRAGMENT_TREE, 4096);
         assert_eq!(
-            FLAG_FRAGMENT_TREE & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS | FLAG_FRAGMENT_REUSE_INDEX),
+            FLAG_FRAGMENT_TREE
+                & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS
+                    | FLAG_FRAGMENT_REUSE_INDEX
+                    | FLAG_UNSTABLE_SPILLED_ROW_LINEAGE),
             0
         );
         assert!(!can_read_dataset(FLAG_FRAGMENT_TREE));
         assert!(!can_write_dataset(FLAG_FRAGMENT_TREE));
+
+        let mut manifest = empty_manifest();
+        manifest.fragment_tree = Some(std::sync::Arc::new(Default::default()));
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        for result in [
+            ensure_can_read_manifest(&manifest),
+            ensure_can_write_manifest(&manifest),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("Flags: 4096"));
+        }
     }
 
     #[test]
@@ -460,6 +491,50 @@ mod tests {
         let flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
         assert!(!can_read_dataset(flags));
         assert!(!can_write_dataset(flags));
+    }
+
+    #[test]
+    fn lazy_fragment_metadata_preserves_fragment_feature_requirements() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            std::sync::Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(std::sync::Arc::new(Default::default()));
+        let features = FLAG_DELETION_FILES
+            | FLAG_STABLE_ROW_IDS
+            | FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            | FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+        manifest.reader_feature_flags = features;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, features | FLAG_FRAGMENT_TREE);
+        assert_eq!(manifest.writer_feature_flags, features | FLAG_FRAGMENT_TREE);
+
+        let next_version = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let cloned =
+            manifest.shallow_clone(None, "memory://source".to_string(), 7, None, String::new());
+        for mut derived in [next_version, cloned] {
+            apply_feature_flags(&mut derived, false, false).unwrap();
+            assert_eq!(
+                derived.reader_feature_flags & (features | FLAG_FRAGMENT_TREE),
+                features | FLAG_FRAGMENT_TREE
+            );
+            assert_eq!(
+                derived.writer_feature_flags & (features | FLAG_FRAGMENT_TREE),
+                features | FLAG_FRAGMENT_TREE
+            );
+        }
+
+        // A flat replacement derives its requirements from its own fragments.
+        manifest.fragment_tree = None;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, 0);
+        assert_eq!(manifest.writer_feature_flags, 0);
     }
 
     #[test]

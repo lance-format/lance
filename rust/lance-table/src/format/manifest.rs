@@ -19,7 +19,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::{Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
+use crate::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_TREE, FRAGMENT_FEATURE_FLAGS, STICKY_PAIRED_FLAGS,
+};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -54,6 +56,11 @@ pub struct Manifest {
     /// This list is stored in order, sorted by fragment id.  However, the fragment id
     /// sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
+
+    /// Experimental fragment tree descriptor. This API may change at any time.
+    /// `None` means [`Self::fragments`] is the complete state. A tree requires
+    /// the fragment metadata reader/writer feature flag.
+    pub fragment_tree: Option<Arc<pb::FragmentTree>>,
 
     /// The file position of the version aux data.
     pub version_aux_data: usize,
@@ -171,6 +178,12 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Replace resident fragments and rebuild row offsets, preserving the ID allocator.
+    pub fn set_fragments(&mut self, fragments: Vec<Fragment>) {
+        self.fragment_offsets = compute_fragment_offsets(&fragments);
+        self.fragments = Arc::new(fragments);
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -200,6 +213,7 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            fragment_tree: None,
         }
     }
 
@@ -209,6 +223,12 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let inherited_flags = STICKY_PAIRED_FLAGS
+            | if previous.fragment_tree.is_some() {
+                FLAG_FRAGMENT_TREE | FRAGMENT_FEATURE_FLAGS
+            } else {
+                0
+            };
 
         Self {
             schema,
@@ -220,8 +240,8 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
-            writer_feature_flags: previous.writer_feature_flags & STICKY_PAIRED_FLAGS,
+            reader_feature_flags: previous.reader_feature_flags & inherited_flags,
+            writer_feature_flags: previous.writer_feature_flags & inherited_flags,
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             transaction_section: None,
@@ -231,13 +251,13 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            fragment_tree: previous.fragment_tree.clone(),
         }
     }
 
-    /// Performs a shallow_clone of the manifest entirely in memory without:
-    /// - Any persistent storage operations
-    /// - Modifications to the original data
-    /// - If the shallow clone is for branch, ref_name is the source branch
+    /// Clone the manifest in memory. For a branch, `ref_name` names the source.
+    /// Tree descriptors are copied unchanged. Before publication, the caller
+    /// must rebuild the tree or remap its references to the source dataset.
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
@@ -246,6 +266,13 @@ impl Manifest {
         branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
+        let inherited_flags = FLAG_COVERED_INDEX_METADATA
+            | STICKY_PAIRED_FLAGS
+            | if self.fragment_tree.is_some() {
+                FLAG_FRAGMENT_TREE | FRAGMENT_FEATURE_FLAGS
+            } else {
+                0
+            };
         let cloned_fragments = self
             .fragments
             .as_ref()
@@ -286,14 +313,13 @@ impl Manifest {
             // over-fencing a clone is harmless, under-fencing one is not.
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them.
-            reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
-            writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+            reader_feature_flags: self.reader_feature_flags & inherited_flags,
+            writer_feature_flags: self.writer_feature_flags & inherited_flags,
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
+            fragment_tree: self.fragment_tree.clone(),
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
@@ -964,6 +990,49 @@ impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
     fn try_from(p: pb::Manifest) -> Result<Self> {
+        let has_tree = p.fragment_tree.is_some();
+        let tree_flag = p.reader_feature_flags & crate::feature_flags::FLAG_FRAGMENT_TREE != 0;
+        let writer_tree_flag =
+            p.writer_feature_flags & crate::feature_flags::FLAG_FRAGMENT_TREE != 0;
+        if has_tree != tree_flag
+            || has_tree != writer_tree_flag
+            || (has_tree && !p.fragments.is_empty())
+        {
+            return Err(Error::corrupt_file_named(
+                "Manifest",
+                format!(
+                    "Manifest version {} has inconsistent fragment metadata: descriptor={}, reader_flag={}, writer_flag={}, flat_fragments={}",
+                    p.version,
+                    has_tree,
+                    tree_flag,
+                    writer_tree_flag,
+                    p.fragments.len()
+                ),
+            ));
+        }
+        if p.fragment_tree
+            .as_ref()
+            .is_some_and(|metadata| metadata.layout.is_none())
+        {
+            return Err(Error::corrupt_file_named(
+                "Manifest",
+                format!(
+                    "Manifest version {} has an empty fragment metadata encoding",
+                    p.version
+                ),
+            ));
+        }
+        if has_tree {
+            let mut ids = std::collections::BTreeSet::new();
+            for base in &p.base_paths {
+                if !ids.insert(base.id) {
+                    return Err(Error::corrupt_file_named(
+                        "Manifest",
+                        format!("duplicate base path id {}", base.id),
+                    ));
+                }
+            }
+        }
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -1046,6 +1115,12 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
+            fragment_tree: p
+                .fragment_tree
+                .and_then(|metadata| metadata.layout)
+                .map(|encoding| match encoding {
+                    pb::fragment_tree_metadata::Layout::Tree(snapshot) => Arc::new(snapshot),
+                }),
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
@@ -1090,8 +1165,11 @@ impl From<&Manifest> for pb::Manifest {
                     prerelease: wv.prerelease.clone(),
                     build_metadata: wv.build_metadata.clone(),
                 }),
-            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            fragment_tree: None,
+            fragments: if m.fragment_tree.is_some() {
+                Vec::new()
+            } else {
+                m.fragments.iter().map(pb::DataFragment::from).collect()
+            },
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1123,6 +1201,14 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
             transaction_section_deprecated: None,
+            fragment_tree: m
+                .fragment_tree
+                .as_ref()
+                .map(|tree| pb::FragmentTreeMetadata {
+                    layout: Some(pb::fragment_tree_metadata::Layout::Tree(
+                        tree.as_ref().clone(),
+                    )),
+                }),
         }
     }
 }
@@ -1187,9 +1273,11 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
+    use crate::feature_flags::{
+        FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, FLAG_USE_V2_FORMAT_DEPRECATED, apply_feature_flags,
+    };
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
-    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use crate::format::{DataFile, DeletionFile, DeletionFileType, ROW_ID_FIELD_ID, RowIdMeta};
     use std::num::NonZero;
 
     use super::*;
@@ -1197,6 +1285,112 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[rstest::rstest]
+    #[case::flat(false, false, false, false, true)]
+    #[case::tree(true, true, true, false, true)]
+    #[case::reader_missing(true, false, true, false, false)]
+    #[case::writer_missing(true, true, false, false, false)]
+    #[case::descriptor_missing(false, true, true, false, false)]
+    #[case::two_layouts(true, true, true, true, false)]
+    fn fragment_tree_requires_paired_flags(
+        #[case] descriptor: bool,
+        #[case] reader: bool,
+        #[case] writer: bool,
+        #[case] flat_records: bool,
+        #[case] accepted: bool,
+    ) {
+        let flag = crate::feature_flags::FLAG_FRAGMENT_TREE;
+        let mut manifest = pb::Manifest::from(&Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        ));
+        manifest.fragment_tree = descriptor.then(|| pb::FragmentTreeMetadata {
+            layout: Some(pb::fragment_tree_metadata::Layout::Tree(Default::default())),
+        });
+        manifest.reader_feature_flags = if reader { flag } else { 0 };
+        manifest.writer_feature_flags = if writer { flag } else { 0 };
+        if flat_records {
+            manifest.fragments.push(Default::default());
+        }
+        let decoded = Manifest::try_from(manifest);
+        assert_eq!(decoded.is_ok(), accepted);
+        if !accepted {
+            let error = decoded.unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains(&format!("writer_flag={writer}")));
+        }
+    }
+
+    #[test]
+    fn resident_tree_fragments_are_not_duplicated_in_the_manifest() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(Arc::new(Default::default()));
+        let mut fragment = Fragment::new(0).with_file(
+            "lineage.lance".to_string(),
+            vec![ROW_ID_FIELD_ID],
+            vec![0],
+            ConcreteFileVersion::V2_2,
+            None,
+        );
+        fragment.physical_rows = Some(7);
+        fragment.row_id_meta = Some(RowIdMeta::Column);
+        manifest.set_fragments(vec![fragment]);
+        apply_feature_flags(&mut manifest, true, false).unwrap();
+        assert_eq!(manifest.fragments_by_offset_range(0..7).len(), 1);
+        let encoded = pb::Manifest::from(&manifest);
+        assert!(encoded.fragments.is_empty());
+        let mut decoded = Manifest::try_from(encoded).unwrap();
+        assert_eq!(decoded.fragment_tree, manifest.fragment_tree);
+        // The records are now lazy, but still require the lineage capability.
+        apply_feature_flags(&mut decoded, true, false).unwrap();
+        assert_eq!(decoded.reader_feature_flags, manifest.reader_feature_flags);
+        assert_eq!(decoded.writer_feature_flags, manifest.writer_feature_flags);
+        assert_ne!(
+            decoded.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            0
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0)]
+    #[case::nonzero(7)]
+    fn fragment_tree_rejects_duplicate_base_ids(#[case] id: u32) {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(Arc::new(Default::default()));
+        manifest.reader_feature_flags = FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags = FLAG_FRAGMENT_TREE;
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.base_paths = vec![
+            pb::BasePath {
+                id,
+                path: "memory://first".into(),
+                is_dataset_root: true,
+                ..Default::default()
+            },
+            pb::BasePath {
+                id,
+                path: "memory://second".into(),
+                is_dataset_root: true,
+                ..Default::default()
+            },
+        ];
+        let error = Manifest::try_from(encoded).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("duplicate base path id"));
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same

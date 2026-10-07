@@ -251,32 +251,62 @@ impl DataFile {
     }
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
-        if self.uses_v1_data_file_encoding() {
-            // A tombstone marks a field superseded by a later data file. It is
-            // not a field id, so it carries no ordering; the live ids around it
-            // must still be sorted and distinct.
-            let live: Vec<i32> = self
-                .fields
-                .iter()
-                .copied()
-                .filter(|field| *field != TOMBSTONE_FIELD_ID)
-                .collect();
-            if !live.windows(2).all(|w| w[0] < w[1]) {
-                return Err(Error::corrupt_file(
-                    base_path.clone().join(self.path.clone()),
-                    "contained unsorted or duplicate field ids",
-                ));
-            }
-        } else if self.column_indices.len() < self.fields.len() {
-            // Every recorded field id must have a column index, but not every column needs
-            // to be associated with a field id (extra columns are allowed).
+        validate_data_file(
+            &self.path,
+            &self.fields,
+            &self.column_indices,
+            (self.file_major_version, self.file_minor_version),
+            base_path,
+        )
+    }
+}
+
+impl pb::DataFile {
+    /// [`DataFile::validate`] on the encoded entry, so a writer can reject a
+    /// file its readers would reject without decoding the record that holds it.
+    pub(crate) fn validate(&self, base_path: &Path) -> Result<()> {
+        validate_data_file(
+            &self.path,
+            &self.fields,
+            &self.column_indices,
+            (self.file_major_version, self.file_minor_version),
+            base_path,
+        )
+    }
+}
+
+fn validate_data_file(
+    path: &str,
+    fields: &[i32],
+    column_indices: &[i32],
+    (file_major_version, file_minor_version): (u32, u32),
+    base_path: &Path,
+) -> Result<()> {
+    let uses_v1_encoding = file_major_version == 0 && file_minor_version < 3;
+    if uses_v1_encoding {
+        // A tombstone marks a field superseded by a later data file. It is
+        // not a field id, so it carries no ordering; the live ids around it
+        // must still be sorted and distinct.
+        let live: Vec<i32> = fields
+            .iter()
+            .copied()
+            .filter(|field| *field != TOMBSTONE_FIELD_ID)
+            .collect();
+        if !live.windows(2).all(|w| w[0] < w[1]) {
             return Err(Error::corrupt_file(
-                base_path.clone().join(self.path.clone()),
-                "contained fewer column_indices than fields",
+                base_path.clone().join(path),
+                "contained unsorted or duplicate field ids",
             ));
         }
-        Ok(())
+    } else if column_indices.len() < fields.len() {
+        // Every recorded field id must have a column index, but not every column needs
+        // to be associated with a field id (extra columns are allowed).
+        return Err(Error::corrupt_file(
+            base_path.clone().join(path),
+            "contained fewer column_indices than fields",
+        ));
     }
+    Ok(())
 }
 
 impl From<&DataFile> for pb::DataFile {
@@ -343,15 +373,19 @@ impl<T: Eq + std::hash::Hash + Clone> Default for InternCache<T> {
 }
 
 impl<T: Eq + std::hash::Hash + Clone> InternCache<T> {
-    fn intern(&mut self, v: Vec<T>) -> Arc<[T]> {
+    fn get(&self, v: &[T]) -> Option<Arc<[T]>> {
+        match self {
+            Self::Small(entries) => entries
+                .iter()
+                .find(|existing| existing.as_ref() == v)
+                .cloned(),
+            Self::Large(map) => map.get_key_value(v).map(|(existing, _)| existing.clone()),
+        }
+    }
+
+    fn insert(&mut self, arc: Arc<[T]>) -> Arc<[T]> {
         match self {
             Self::Small(entries) => {
-                for existing in entries.iter() {
-                    if existing.as_ref() == v.as_slice() {
-                        return existing.clone();
-                    }
-                }
-                let arc: Arc<[T]> = Arc::from(v);
                 entries.push(arc.clone());
                 if entries.len() > INTERN_CACHE_UPGRADE_THRESHOLD {
                     let mut map = HashMap::with_capacity(entries.len());
@@ -363,15 +397,24 @@ impl<T: Eq + std::hash::Hash + Clone> InternCache<T> {
                 arc
             }
             Self::Large(map) => {
-                if let Some((existing, _)) = map.get_key_value(v.as_slice()) {
-                    existing.clone()
-                } else {
-                    let arc: Arc<[T]> = Arc::from(v);
-                    map.insert(arc.clone(), ());
-                    arc
-                }
+                map.insert(arc.clone(), ());
+                arc
             }
         }
+    }
+
+    fn intern(&mut self, v: Vec<T>) -> Arc<[T]> {
+        if let Some(existing) = self.get(v.as_slice()) {
+            return existing;
+        }
+        self.insert(Arc::from(v))
+    }
+
+    fn intern_slice(&mut self, v: &[T]) -> Arc<[T]> {
+        if let Some(existing) = self.get(v) {
+            return existing;
+        }
+        self.insert(Arc::from(v))
     }
 }
 
@@ -406,6 +449,16 @@ impl DataFileFieldInterner {
                 Ok(RowDatasetVersionMeta::Column)
             }
         }
+    }
+
+    /// Share one allocation for an already-decoded field-id or column-index list.
+    pub fn intern_field_ids(&mut self, ids: &[i32]) -> Arc<[i32]> {
+        self.fields.intern_slice(ids)
+    }
+
+    /// Share one allocation for an already-decoded column-index list.
+    pub fn intern_column_indices(&mut self, ids: &[i32]) -> Arc<[i32]> {
+        self.column_indices.intern_slice(ids)
     }
 
     /// Convert a protobuf `DataFile`, interning `fields` and `column_indices`.
@@ -912,10 +965,13 @@ impl From<&Fragment> for pb::DataFragment {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
+    use crate::io::manifest::read_manifest;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use lance_core::utils::tempfile::TempDir;
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
+    use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use roaring::RoaringBitmap;
     use serde_json::{Value, json};
@@ -1248,5 +1304,79 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[rstest::rstest]
+    #[case::original(None, true)]
+    #[case::tombstone(Some(vec![0, TOMBSTONE_FIELD_ID, 1]), true)]
+    #[case::unsorted(Some(vec![1, TOMBSTONE_FIELD_ID, 0]), false)]
+    #[case::duplicate(Some(vec![0, TOMBSTONE_FIELD_ID, 0]), false)]
+    #[tokio::test]
+    async fn encoded_validation_preserves_legacy_rules(
+        #[case] fields: Option<Vec<i32>>,
+        #[case] is_valid: bool,
+    ) {
+        let tmp = TempDir::default();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test_data/v0.5.9/dataset_with_fragments/_versions/1.manifest"
+            ),
+            tmp.std_path().join("1.manifest"),
+        )
+        .unwrap();
+        let manifest = read_manifest(
+            &ObjectStore::local(),
+            &tmp.obj_path().join("1.manifest"),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut file = manifest.fragments[0].files[0].clone();
+        assert!(file.uses_v1_data_file_encoding());
+        assert_eq!(file.fields.as_ref(), &[0]);
+        assert!(file.column_indices.is_empty());
+        if let Some(fields) = fields {
+            file.fields = fields.into();
+        }
+        let decoded = file.validate(&tmp.obj_path());
+        let encoded = pb::DataFile::from(&file).validate(&tmp.obj_path());
+        if is_valid {
+            decoded.unwrap();
+            encoded.unwrap();
+        } else {
+            let errors = [decoded.unwrap_err(), encoded.unwrap_err()];
+            for error in &errors {
+                assert!(matches!(error, Error::CorruptFile { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("unsorted or duplicate field ids")
+                );
+            }
+            assert_eq!(errors[0].to_string(), errors[1].to_string());
+        }
+    }
+
+    #[test]
+    fn intern_slice_reuses_the_same_allocation() {
+        let mut intern = DataFileFieldInterner::default();
+        let first = intern.intern_field_ids(&[0, 1, 2]);
+        let second = intern.intern_field_ids(&[0, 1, 2]);
+        assert!(Arc::ptr_eq(&first, &second));
+        let other = intern.intern_field_ids(&[0, 1]);
+        assert!(!Arc::ptr_eq(&first, &other));
+        let from_vec = intern
+            .intern_data_file(pb::DataFile {
+                path: "a.lance".into(),
+                fields: vec![0, 1, 2],
+                column_indices: vec![0, 1, 2],
+                file_major_version: MAJOR_VERSION as u32,
+                file_minor_version: MINOR_VERSION as u32,
+                file_size_bytes: 0,
+                base_id: None,
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &from_vec.fields));
     }
 }

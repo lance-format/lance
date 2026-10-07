@@ -4,7 +4,12 @@
 use std::io::Result;
 
 fn main() -> Result<()> {
-    println!("cargo:rerun-if-changed=protos");
+    // Watch files explicitly: Cargo may miss changes through the protos symlink.
+    println!("cargo:rerun-if-changed=protos/table.proto");
+    println!("cargo:rerun-if-changed=protos/fragment_metadata.proto");
+    println!("cargo:rerun-if-changed=protos/file.proto");
+    println!("cargo:rerun-if-changed=protos/transaction.proto");
+    println!("cargo:rerun-if-changed=protos/rowids.proto");
 
     #[cfg(feature = "protoc")]
     // Use vendored protobuf compiler if requested.
@@ -19,9 +24,34 @@ fn main() -> Result<()> {
     // Inline row id sequences are ~98% of a large manifest. Decoding them as
     // `Bytes` slices the fetched buffer instead of copying into a `Vec<u8>`.
     prost_build.bytes([".lance.table.DataFragment.inline_row_ids"]);
+    for name in [
+        "FragmentTree",
+        "FragmentTreeRoot",
+        "FragmentTreeChild",
+        "FragmentTreeMutation",
+        "FragmentAction",
+        "AddDataFile",
+        "RemoveDataFile",
+        "ReplaceDataFile",
+        "AddDeletionFile",
+        "ClearDeletionFile",
+        "DataFragment",
+        "DataFile",
+        "DataOverlayFile",
+        "FieldCoverage",
+        "DeletionFile",
+        "ExternalFile",
+        "RowLineageColumn",
+    ] {
+        prost_build.type_attribute(
+            format!(".lance.table.{name}"),
+            "#[derive(lance_core::deepsize::DeepSizeOf)]",
+        );
+    }
     prost_build.compile_protos(
         &[
             "./protos/table.proto",
+            "./protos/fragment_metadata.proto",
             "./protos/transaction.proto",
             "./protos/rowids.proto",
         ],

@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::traits::{ProtoStruct, Reader};
 use lance_core::{Error, Result};
 
+#[cfg(feature = "test-util")]
+pub mod failpoint;
 pub mod tracking_store;
 
 /// Chunk size for splitting a large metadata read into concurrent range requests.
