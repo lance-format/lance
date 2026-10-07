@@ -106,6 +106,7 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::index_caches::{
     DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
 };
@@ -417,10 +418,6 @@ impl Snapshot {
         Self { dataset, fragments }
     }
 
-    fn version(&self) -> u64 {
-        self.dataset.manifest.version
-    }
-
     fn fragment(&self, id: u32) -> Option<&Fragment> {
         self.fragments
             .get(&id)
@@ -524,23 +521,80 @@ impl<'a> History<'a> {
     }
 }
 
-/// Whether `fragment` holds different data for the `indexed` fields in `after`
-/// than it did in `before`. Any commit that rewrites one of those fields puts it
-/// in a different file and an overlay adds one, so this one comparison stands in
-/// for every way the data could have moved on.
-fn indexed_data_differs(
+/// The overlays on `fragment` over any of the `indexed` fields, by what they are:
+/// the commit that introduced each and the file holding its values.
+fn indexed_overlays<'a>(
+    fragment: &'a Fragment,
+    indexed: &HashSet<i32>,
+) -> HashSet<(u64, Option<u32>, &'a str)> {
+    fragment
+        .overlays
+        .iter()
+        .filter(|overlay| {
+            overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| indexed.contains(field_id))
+        })
+        .map(|overlay| {
+            (
+                overlay.committed_version,
+                overlay.data_file.base_id,
+                overlay.data_file.path.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// Whether `after` has a row live in `fragment` that `before` had deleted. Rows
+/// are deleted cumulatively, so only a restore brings one back, and an index
+/// built while it was deleted never saw it.
+async fn revives_rows(
+    before: &Snapshot,
+    after: &Snapshot,
+    then: &Fragment,
+    now: &Fragment,
+) -> Result<bool> {
+    let Some(deleted_then) = &then.deletion_file else {
+        return Ok(false);
+    };
+    let Some(deleted_now) = &now.deletion_file else {
+        return Ok(true);
+    };
+    if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
+        return Ok(false);
+    }
+    let rows_then = read_dataset_deletion_file(&before.dataset, then.id, deleted_then).await?;
+    let rows_now = read_dataset_deletion_file(&after.dataset, now.id, deleted_now).await?;
+    Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
+}
+
+/// Whether `fragment` holds different indexed data in `after` than it did in
+/// `before`.
+///
+/// A commit that rewrites an indexed field puts it in a different file, and an
+/// overlay is added or, by a restore, taken away; so the files and the overlays
+/// over those fields must both be the same. A row that was deleted must still
+/// be deleted. Together these stand in for every way the data could have moved,
+/// in either direction.
+async fn indexed_data_differs(
     before: &Snapshot,
     after: &Snapshot,
     fragment: u32,
     indexed: &HashSet<i32>,
-) -> bool {
+) -> Result<bool> {
     let (Some(then), Some(now)) = (before.fragment(fragment), after.fragment(fragment)) else {
-        return true;
+        return Ok(true);
     };
     let files_then = fragment_field_files(&before.dataset, then, indexed);
-    files_then.is_none()
+    if files_then.is_none()
         || files_then != fragment_field_files(&after.dataset, now, indexed)
-        || has_overlay_newer_than(now, before.version(), indexed)
+        || indexed_overlays(then, indexed) != indexed_overlays(now, indexed)
+    {
+        return Ok(true);
+    }
+    revives_rows(before, after, then, now).await
 }
 
 /// Where each covered fragment's index entries were recorded.
@@ -650,7 +704,7 @@ async fn indexed_data_moved_on(
                 let Some(against) = history.at(recorded).await? else {
                     return Ok(true);
                 };
-                if indexed_data_differs(&against, &before_commit, old, &indexed) {
+                if indexed_data_differs(&against, &before_commit, old, &indexed).await? {
                     return Ok(true);
                 }
             }
@@ -688,7 +742,7 @@ async fn indexed_data_moved_on(
         let Some(against) = history.at(recorded).await? else {
             return Ok(true);
         };
-        if indexed_data_differs(&against, &current, fragment, &indexed) {
+        if indexed_data_differs(&against, &current, fragment, &indexed).await? {
             return Ok(true);
         }
     }
