@@ -529,6 +529,10 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
     ) -> Result<String> {
         // If a custom `goosefs_root` is provided, include it in the prefix so
         // that stores built with different roots don't accidentally collide.
+        //
+        // The prefix is the registry cache key (logged via Debug / the
+        // cache-key debug lines), so it uses the resolved master address
+        // (host[:port]); it never carries an embedded `userinfo@`.
         let opts = StorageOptions(storage_options.cloned().unwrap_or_default());
         let authority = Self::resolve_master_addr(url, &opts).unwrap_or_default();
         let root = Self::resolve_root(&opts);
@@ -677,6 +681,23 @@ mod tests {
         assert_eq!(default_prefix, "goosefs$host:9200");
         assert_eq!(custom_prefix, "goosefs$host:9200#/tenant-a");
         assert_ne!(default_prefix, custom_prefix);
+    }
+
+    /// URL-embedded credentials must never reach the cache-key prefix — it is
+    /// the registry cache key, logged via the cache-key debug lines. host:port
+    /// is preserved so distinct clusters still get separate caches.
+    #[test]
+    fn test_calculate_object_store_prefix_strips_userinfo() {
+        let provider = GooseFsStoreProvider;
+
+        let url = Url::parse("goosefs://user:s3cret@myhost:9200/data").unwrap();
+        let prefix = provider.calculate_object_store_prefix(&url, None).unwrap();
+        assert_eq!(prefix, "goosefs$myhost:9200");
+        assert!(
+            !prefix.contains("s3cret"),
+            "prefix leaked the secret: {prefix}"
+        );
+        assert!(!prefix.contains("user"), "prefix leaked userinfo: {prefix}");
     }
 
     fn master_option_map(addr: Option<&str>) -> Option<HashMap<String, String>> {

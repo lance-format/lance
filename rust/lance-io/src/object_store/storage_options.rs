@@ -98,6 +98,17 @@ pub trait StorageOptionsProvider: Send + Sync + fmt::Debug {
     /// For example: `"namespace[dir(root=/data)],table[db$schema$table1]"`
     ///
     /// The ID should uniquely identify the provider's configuration.
+    ///
+    /// # Security
+    ///
+    /// The ObjectStore registry keys its cache on this ID, so it is the *only*
+    /// isolation boundary between providers. If this provider vends credentials
+    /// that differ by tenant, user, role, or any other principal, `provider_id()`
+    /// **MUST** encode that distinguishing identity. Two providers that return the
+    /// same ID share one cached `ObjectStore` — and therefore one resolved
+    /// credential chain — so a constant ID across principals causes the first
+    /// caller's credentials to be reused for every subsequent caller
+    /// (cross-tenant credential sharing).
     fn provider_id(&self) -> String;
 }
 
