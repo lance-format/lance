@@ -667,8 +667,7 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
-                // A memtable from before a schema change stores the table's
-                // older names. One that matches the table needs no resolver.
+                // A memtable created before a schema change uses old column names.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(
@@ -709,10 +708,8 @@ impl LsmVectorSearchPlanner {
                     // the predicate masks rows before the memtable top-k cut.
                     scanner.filter_expr(stored);
                 }
-                // A predicate that runs above the resolution runs after the
-                // top-k, so that case ranks every row the memtable holds
-                // exactly -- the graph would cut to its own beam first -- and
-                // leaves the cut to the filter and the union.
+                // A filter applied after the scan would run after the top-k cut,
+                // so search every row exactly and let the filter cut instead.
                 let k = match above {
                     None => k,
                     Some(_) => {

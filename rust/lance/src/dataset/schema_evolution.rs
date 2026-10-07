@@ -491,13 +491,9 @@ enum Unsupported {
     /// can be accepted after the check and before the commit. That row is then
     /// in a table whose schema forbids it, and every later merge of it fails.
     Tightening,
-    /// A writer caches the schema it resolves the primary key through, and two
-    /// writers holding different names for it read the same row differently: a
-    /// sharded one hashes a different column and places the row in the wrong
-    /// shard, and either one can align a batch so the values land under the
-    /// wrong field ids. Nothing downstream separates the two schemas — a swap
-    /// leaves every name and type known to both — and the sweep does not heal
-    /// what is already stored.
+    /// Writers cache the primary key by name. A writer that has not seen the
+    /// rename can send a row to the wrong shard or store values under the
+    /// wrong field ids, and nothing later repairs it.
     RenameKey,
 }
 
@@ -1514,9 +1510,7 @@ mod test {
         }
     }
 
-    /// The key is how a writer identifies a row, so a writer that has not seen
-    /// a rename reads the same batch differently — wrong shard on a sharded
-    /// table, wrong field ids on any. Every other column renames freely.
+    /// Renaming a primary key column is refused; other columns rename freely.
     #[tokio::test]
     async fn alter_columns_on_a_mem_wal_table_refuses_renaming_the_key() {
         use crate::dataset::mem_wal::DatasetMemWalExt;

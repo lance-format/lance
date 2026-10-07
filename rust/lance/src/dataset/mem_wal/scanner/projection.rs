@@ -73,11 +73,8 @@ pub(super) fn resolve_data_fields(
     Ok(arrow_schema.fields().iter().cloned().collect())
 }
 
-/// [`resolve_data_fields`], dropping a name the schema does not have.
-///
-/// A generation read projects under the table's names while reading a memtable
-/// that predates them, so a name the table has since dropped is an absence to
-/// fill, not a caller error.
+/// [`resolve_data_fields`], but skips names the schema does not have instead
+/// of failing.
 pub(super) fn resolve_data_fields_or_drop(
     data_names: &[String],
     base_schema: &SchemaRef,

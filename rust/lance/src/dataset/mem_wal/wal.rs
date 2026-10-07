@@ -42,7 +42,7 @@ use super::memtable::batch_store::{BatchStore, StoredBatch};
 /// Key for storing writer epoch in Arrow IPC file schema metadata.
 pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
 /// The memtable generation an entry's batches belong to. Absent in WAL-only
-/// mode, which holds no memtable.
+/// mode.
 pub const GENERATION_KEY: &str = "generation";
 
 /// Metadata keys a WAL entry carries about itself rather than about its batches.
@@ -1573,10 +1573,7 @@ fn serialize_appender_batches(
 ) -> Result<Vec<u8>> {
     let schema = batches[0].schema();
     let mut metadata = schema.metadata().clone();
-    // These keys describe the entry, not the batch, so the writer owns every one
-    // of them: a caller carrying the same key in its own schema metadata must
-    // not be able to speak for the writer. Cleared first, then set to whatever
-    // this entry actually is.
+    // Only the writer sets these keys. Drop any the caller's schema carries.
     for reserved in RESERVED_ENTRY_KEYS {
         metadata.remove(*reserved);
     }
@@ -1648,7 +1645,6 @@ fn serialize_fence_sentinel(writer_epoch: u64) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// What one WAL entry's bytes decode to.
 struct DecodedEntry {
     writer_epoch: u64,
     target: Option<MemTableDataTarget>,
@@ -2877,12 +2873,11 @@ mod tests {
         );
     }
 
-    /// Generation 0 belongs to the base table, so a caller must not be able to
-    /// claim it — or any other generation — through its own schema metadata.
+    /// Reserved keys in the caller's schema metadata are ignored; only the
+    /// writer sets them.
     #[test]
     fn an_entry_takes_its_generation_from_the_writer_not_the_batch() {
-        // Every reserved key, forged. Built from the list itself, so a key
-        // added to it is covered here without anyone remembering to.
+        // Built from the list so newly reserved keys are covered too.
         let forged: std::collections::HashMap<String, String> = RESERVED_ENTRY_KEYS
             .iter()
             .map(|key| (key.to_string(), "0".to_string()))
@@ -2893,7 +2888,6 @@ mod tests {
         ));
         let batch = create_test_batch(&schema, 1);
 
-        // WAL-only mode holds no memtable, so the entry names no generation.
         let bytes =
             serialize_appender_batches(std::slice::from_ref(&batch), 7, None, None).unwrap();
         let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
@@ -2906,7 +2900,6 @@ mod tests {
             "nor pass itself off as a fence sentinel, which carries no batches"
         );
 
-        // And a writer that does name one is the one that wins.
         let bytes = serialize_appender_batches(&[batch], 7, None, Some(4)).unwrap();
         let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
         assert_eq!(decoded.generation, Some(4));

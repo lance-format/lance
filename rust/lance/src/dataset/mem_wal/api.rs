@@ -823,12 +823,10 @@ enum OnUnsupportedIndex {
 }
 
 impl ShardWriter {
-    /// [`ShardWriter::evolve_schema`] to `dataset`'s current schema and
-    /// maintained index set, derived the way [`DatasetMemWalExt::mem_wal_writer`]
-    /// derives them when it opens a writer.
+    /// Moves this writer onto `dataset`'s current schema and maintained indexes.
     ///
-    /// `dataset` is the base table this writer's shard belongs to, read after
-    /// the schema change. `Ok(None)` when the writer already holds both.
+    /// Pass the base table as read after the schema change. Returns `Ok(None)`
+    /// when the writer is already up to date.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -863,7 +861,7 @@ enum OnMissingIndex {
     Skip,
 }
 
-/// The MemWAL index details every writer operation on `dataset` needs.
+/// Loads the MemWAL index details, failing if MemWAL is not initialized.
 async fn require_mem_wal_details(dataset: &Dataset) -> Result<MemWalIndexDetails> {
     let index = dataset
         .open_mem_wal_index(&NoOpMetricsCollector)
@@ -878,9 +876,7 @@ async fn require_mem_wal_details(dataset: &Dataset) -> Result<MemWalIndexDetails
 
 /// The index configs a writer on `dataset` maintains.
 ///
-/// Every path that hands a set to a writer — opening one, refreshing its set,
-/// moving it onto a new schema — derives it here, so none of them can resolve
-/// the maintained-index intent differently from the others.
+/// Every path that gives a writer its indexes uses this, so they all agree.
 async fn maintained_index_configs(
     dataset: &Dataset,
     details: &MemWalIndexDetails,

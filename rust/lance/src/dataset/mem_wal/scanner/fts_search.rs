@@ -265,32 +265,25 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     visit(&query.query)
 }
 
-/// `query` bound to the names a generation stores its queried columns under.
+/// Bind `query` to the names a generation stores its columns under.
 ///
-/// `stored_columns` pairs each queried column, as the table names it, with the
-/// name the generation stores it under. The query is not limited here: each arm
-/// applies its own limit rule.
+/// `stored_columns` pairs each table name with its stored name. No limit is
+/// set here; each caller applies its own.
 fn bind_to_stored_columns(
     query: &FullTextSearchQuery,
     columns: &[String],
     stored_columns: &[(String, String)],
 ) -> Result<FullTextSearchQuery> {
     match stored_columns {
-        // Every queried column is stored under the name the table still uses,
-        // so the tree reaches the scanner as the other arms get it -- a
-        // cross-column predicate keeps its own leaf bindings, which rebinding
-        // would collapse onto one field.
+        // No column was renamed: keep each leaf bound to its own column.
         _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => match columns {
             [column] => query.clone().with_column(column.clone()),
             _ => Ok(query.clone()),
         },
-        // One column, moved: bind the whole tree to the name this generation
-        // stores it under.
+        // One renamed column: bind the query to its stored name.
         [(_, stored)] => query.clone().with_column(stored.clone()),
-        // Several columns, at least one of them renamed. Each leaf would need
-        // its own name and `with_column` rebinds the whole tree, collapsing a
-        // cross-column predicate onto one field -- which answers a different
-        // question. Refuse rather than rank on the wrong column silently.
+        // Several columns and one was renamed. `with_column` would bind every
+        // leaf to the same column, so refuse instead of ranking the wrong one.
         moved => {
             let renamed: Vec<String> = moved
                 .iter()
@@ -1058,8 +1051,7 @@ impl LsmFtsSearchPlanner {
                     ..
                 } => {
                     // A memtable created before a schema change indexes the
-                    // column under the name it had then, or not at all if the
-                    // column did not exist yet.
+                    // column under its old name, or not at all if it is newer.
                     if memtable_matches_table(schema, &self.identity_schema) {
                         index_store.fts_document_granularities_by_column(column)
                     } else {
@@ -1250,8 +1242,7 @@ impl LsmFtsSearchPlanner {
                 ..
             } => {
                 let document_granularity = query_document_granularity(query)?;
-                // A memtable from before a schema change stores the table's
-                // older names; `None` is the steady state.
+                // `Some` only for a memtable created before a schema change.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(
@@ -1261,16 +1252,14 @@ impl LsmFtsSearchPlanner {
                             self.fts_scanner_projection(projection),
                         )
                     });
-                // Each queried column as the table names it, paired with the
-                // name this memtable stores it under.
+                // (table name, stored name) for each queried column.
                 let mut stored_columns = Vec::with_capacity(columns.len());
                 for column in columns {
                     let stored = match &generation {
                         None => column.clone(),
                         Some(generation) => match generation.stored_fts_name(column) {
                             Some(stored) => stored.to_string(),
-                            // Created before the column existed, so it has
-                            // nothing to match.
+                            // Created before the column existed: nothing matches.
                             None => {
                                 return self.empty_plan(
                                     &self.canonical_fts_schema(projection, document_granularity)?,
@@ -1354,9 +1343,8 @@ impl LsmFtsSearchPlanner {
                     return scanner.create_plan().await;
                 };
 
-                // A predicate this memtable cannot answer as written runs above
-                // the resolution, which is after the search has taken its top-k
-                // by score, so a memtable with a deferred predicate does not cut.
+                // If part of the filter runs after the search, don't limit the
+                // search: the limit would drop rows before that filter sees them.
                 let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
                 scanner.project(&generation.stored_projection())?;
                 if let Some(stored) = stored_filter {
@@ -5346,15 +5334,10 @@ mod tests {
         );
     }
 
-    /// An unrelated column added to the table is enough to route a memtable
-    /// through the resolver, and a nested path only resolves if the map pairs
-    /// full paths. Resolving the top level alone reads `meta.b` as a column the
-    /// memtable never stored, and the search returns nothing for its rows.
+    /// Full-text search on a field inside a list of structs still matches after
+    /// an unrelated column is added to the table.
     #[tokio::test]
     async fn a_list_of_struct_fts_still_matches_after_an_unrelated_column_is_added() {
-        // A full-text path elides a list's element (`tags.body`), a projection
-        // spells it out (`tags.item.body`). Resolving only one of the two leaves
-        // the other reading as a column the generation never stored.
         let item_fields: arrow_schema::Fields = vec![
             Arc::new(Field::new("a", DataType::Int64, true)),
             Arc::new(Field::new("body", DataType::Utf8, true)),

@@ -440,9 +440,8 @@ impl LsmScanPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
-                // A memtable from before a schema change stores the table's
-                // older names, and resolves the way a generation sealed then
-                // does. One that matches the table needs no resolver.
+                // `Some` only for a memtable created before a schema change;
+                // it resolves like a flushed generation.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(
@@ -467,12 +466,10 @@ impl LsmScanPlanner {
                 }
                 scanner.with_row_address();
 
-                // The dedup scan applies the filter post-dedup; pushing it into
-                // the raw scan would resurrect older versions of keys whose
-                // newest version fails the predicate. Folding `NOT _tombstone`
-                // in is correct: a tombstone wins the position-based dedup,
-                // suppressing the older real row, and is then dropped by this
-                // predicate. A memtable without the column gets no fold.
+                // Filter after dedup: filtering the raw scan would bring back an
+                // older version of a key whose newest version fails the filter.
+                // Adding `NOT _tombstone` is safe: a tombstone still wins the
+                // dedup, hiding the older row, and is then dropped.
                 let folded;
                 let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
                     folded = fold_not_tombstone(stored_filter.as_ref());

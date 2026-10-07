@@ -116,16 +116,13 @@ pub struct LsmPointLookupPlanner {
     /// generation's columns to the table's. Defaults to `base_schema`, which
     /// carries them when the caller built it from a Lance schema.
     identity_schema: SchemaRef,
-    /// Whether every in-memory memtable stores the table's columns as the table
-    /// declares them. The probe fast paths read a memtable's batches by the
-    /// table's names, so a memtable created before a schema change sends the
-    /// lookup to the plan path, which resolves it. Settled once per planner so
-    /// the hot path stays a flag test.
+    /// Whether every in-memory memtable uses the table's current schema. The
+    /// fast paths read columns by the table's names, so if any memtable was
+    /// created before a schema change, lookups take the slower plan path.
     in_memory_matches_table: bool,
 }
 
 /// Whether every in-memory memtable `collector` holds matches `table_schema`.
-/// See [`memtable_matches_table`].
 fn in_memory_matches_table(collector: &LsmDataSourceCollector, table_schema: &Schema) -> bool {
     collector
         .in_memory_refs_newest_first()
@@ -777,9 +774,8 @@ impl LsmPointLookupPlanner {
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
-                // A memtable created before a schema change holds the names the
-                // table had then, and is resolved as a generation sealed at that
-                // point would be.
+                // A memtable created before a schema change still uses the old
+                // column names, so read it like a flushed generation of that age.
                 let generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
                         GenerationRead::for_memtable(
@@ -812,8 +808,7 @@ impl LsmPointLookupPlanner {
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
                 let raw = Box::pin(scanner.create_plan()).await?;
-                // `_rowid` is not one of the table's columns, so it passes
-                // through the resolution for the sort below.
+                // `_rowid` is not a table column; it passes through unchanged.
                 let raw = match &generation {
                     None => raw,
                     Some(generation) => generation.reconcile(raw)?,
@@ -2704,9 +2699,8 @@ mod tests {
         assert_eq!(sorted_ids(&batch), vec![1, 3]);
     }
 
-    /// A projection naming a nested path must keep the parent it selects from.
-    /// Resolving only the top level drops `meta` from the carry schema, and the
-    /// lookup fails outright rather than returning the row.
+    /// A lookup projecting a nested field still finds the row after an
+    /// unrelated column is added.
     #[tokio::test]
     async fn a_nested_point_lookup_survives_an_unrelated_column_add() {
         let stored_schema = create_nested_schema();
@@ -2752,10 +2746,8 @@ mod tests {
         }
     }
 
-    /// Two children of one struct, selected in the reverse of declaration order.
-    /// The resolved output must follow the selection, as the canonical
-    /// projection does, or the later relabel pairs children positionally and
-    /// one child answers with the other's value.
+    /// Struct children selected out of declaration order come back in the
+    /// selected order, so no child gets another child's values.
     #[tokio::test]
     async fn a_nested_projection_keeps_selection_order() {
         let stored_schema = create_nested_schema();

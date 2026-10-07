@@ -1255,10 +1255,8 @@ pub enum TriggerMemTableFlush {
     Flush {
         /// The frozen memtable to flush.
         memtable: Arc<MemTable>,
-        /// The secondary indexes the memtable was built with, rebuilt on its
-        /// generation. Carried with the memtable rather than read off the
-        /// writer: a schema change replaces the writer's set, and a memtable
-        /// sealed under the old schema still names its columns the old way.
+        /// The indexes the memtable was built with. Not read from the writer,
+        /// whose set changes with the schema while this memtable keeps the old one.
         index_configs: Arc<[MemIndexConfig]>,
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,

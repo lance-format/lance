@@ -47,18 +47,14 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 pub(super) struct GenerationRead {
     /// The generation's own schema, carrying its field ids.
     stored_schema: Schema,
-    /// The generation's name for a column → the table's name for it, matched
-    /// by field id. Carried as names because everything downstream is
-    /// name-addressed: a scan projection takes names, and so do the column
-    /// references in a DataFusion predicate. Columns the table no longer has
-    /// are absent.
-    /// The table's name for a column to the name this generation stores it
-    /// under — the direction every caller asks in.
+    /// The table's name for a column → the name this generation stores it
+    /// under, matched by field id. Kept as names because scan projections and
+    /// predicates refer to columns by name. Columns the table no longer has are
+    /// absent.
     names: HashMap<String, String>,
-    /// Every name this generation stores, for asking whether one of its
-    /// columns is the table's at all.
+    /// The stored names that belong to one of the table's columns.
     stored_columns: HashSet<String>,
-    /// The same, under the spellings a full-text path uses.
+    /// Like `names`, but for full-text paths.
     fts_names: HashMap<String, String>,
     /// The table's schema, also carrying field ids.
     table_schema: SchemaRef,
@@ -85,11 +81,10 @@ impl GenerationRead {
         )
     }
 
-    /// An in-memory memtable, read under the table's schema.
+    /// Read a memtable under the table's schema.
     ///
-    /// A memtable keeps the schema its writer created it under, field ids
-    /// included, so a memtable created before a schema change resolves the way
-    /// a generation sealed before it does.
+    /// A memtable keeps the schema it was created with, so one created before a
+    /// schema change resolves like a flushed generation does.
     pub(super) fn for_memtable(
         memtable_schema: &Schema,
         table_schema: &SchemaRef,
@@ -112,7 +107,7 @@ impl GenerationRead {
     ) -> Self {
         let (names, fts_names) = stored_names(&stored_schema, table_schema);
         let stored_columns = names.keys().cloned().collect::<HashSet<_>>();
-        // Inverted once here rather than scanned per lookup.
+        // Invert once so a lookup is a map get, not a scan.
         let invert = |m: HashMap<String, String>| {
             m.into_iter()
                 .map(|(stored, in_table)| (in_table, stored))
@@ -136,20 +131,17 @@ impl GenerationRead {
         self.names.get(column).map(String::as_str)
     }
 
-    /// [`Self::stored_name`] for a full-text path, which elides a list's
-    /// element where a projection spells it out. Kept apart from the projection
-    /// map rather than merged into it: a struct child named `item` inside a
-    /// list has the same spelling as the element itself, and one map would have
-    /// to answer both with the same field.
+    /// [`Self::stored_name`] for a full-text path, which leaves out a list's
+    /// element name. A separate map because a struct child named `item` inside
+    /// a list has the same path as the list element.
     pub(super) fn stored_fts_name(&self, column: &str) -> Option<&str> {
         self.fts_names.get(column).map(String::as_str)
     }
 
-    /// The primary key under the names this generation stores it under.
+    /// The primary key columns under this generation's names.
     ///
-    /// Every generation stores every primary key column — a key cannot be
-    /// added or dropped under a MemWAL — so a key it does not resolve is an
-    /// error rather than an absence.
+    /// Primary key columns cannot be added or dropped, so a missing one is an
+    /// error.
     pub(super) fn stored_pk_columns(&self) -> Result<Vec<String>> {
         self.pk_columns
             .iter()
@@ -269,9 +261,8 @@ impl GenerationRead {
         stored_field.data_type() == declared.data_type()
     }
 
-    /// [`Self::reconcile`], then a predicate naming a column the generation does
-    /// not store, which can only be answered once the rows carry the table's
-    /// names.
+    /// [`Self::reconcile`], then apply a filter that could only run once rows
+    /// carry the table's names.
     pub(super) fn reconcile_above(
         &self,
         scan: Arc<dyn ExecutionPlan>,
@@ -330,11 +321,8 @@ impl GenerationRead {
     /// Each arm's canonical projection restores the table's nullability once
     /// tombstones are dropped.
     fn target(&self, source: &Schema) -> Result<SchemaRef> {
-        // Resolved the way the canonical projection resolves, so the two agree
-        // on child order, on how sibling selections of one parent merge, and on
-        // the shape a container keeps. Dropping rather than refusing an unknown
-        // name: a generation read projects under the table's names while
-        // reading a memtable that predates them.
+        // Resolve like the canonical projection so both produce the same shape.
+        // Unknown names are dropped, not refused: a memtable can predate them.
         let data_names: Vec<String> = self
             .projection
             .iter()
@@ -342,8 +330,8 @@ impl GenerationRead {
             .cloned()
             .collect();
         let resolved = resolve_data_fields_or_drop(&data_names, &self.table_schema)?;
-        // The resolver renumbers as it projects; `Plan::resolve` below pairs
-        // source to target by id, so the table's own ids go back on.
+        // The resolver renumbers field ids, and `Plan::resolve` matches by id,
+        // so put the table's ids back.
         let resolved = with_ids_from(
             &Schema::new(
                 resolved
@@ -378,11 +366,9 @@ impl GenerationRead {
 }
 
 /// Whether a memtable stores the table's columns exactly as the table declares
-/// them, so it can be read without [`GenerationRead`].
+/// them, so it can skip [`GenerationRead`].
 ///
-/// Checked positionally: a memtable created under the table's schema holds its
-/// columns in the same order, followed only by `_tombstone`. Anything else takes
-/// the resolving read, which is correct for every layout and costs a projection.
+/// Compared by position: same columns in the same order, then only `_tombstone`.
 pub(super) fn memtable_matches_table(memtable_schema: &Schema, table_schema: &Schema) -> bool {
     let stored = memtable_schema.fields();
     let declared = table_schema.fields();
@@ -398,8 +384,7 @@ pub(super) fn memtable_matches_table(memtable_schema: &Schema, table_schema: &Sc
                         (Some(stored_id), Some(declared_id)) => {
                             stored_id == declared_id && stored.data_type() == declared.data_type()
                         }
-                        // Without ids on both sides only names relate the two, and
-                        // nested ids would make otherwise equal types differ.
+                        // Without ids on both sides, compare types ignoring nested ids.
                         _ => stored.data_type().equals_datatype(declared.data_type()),
                     }
             })
@@ -427,16 +412,13 @@ fn stored_names(
     table_schema: &Schema,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
     let table = field_paths(table_schema);
-    // Keyed on the spelling as well as the id: a list's element has a physical
-    // path and an elided one, and pairing one schema's elided path with the
-    // other's physical one would answer a full-text lookup with a projection
-    // path, which the index does not know.
+    // Keyed by id and path style: a list element has a projection path and a
+    // full-text path, and mixing them would give the index a path it lacks.
     let by_id: HashMap<(i32, bool), &String> = table
         .iter()
         .filter_map(|(id, elided, path)| id.map(|id| ((id, *elided), path)))
         .collect();
-    // A caller that supplies no ids leaves only names to match on, so a path
-    // resolves to itself when the table still has it.
+    // Without ids, match by name: a path maps to itself if the table has it.
     if by_id.is_empty() {
         let known: std::collections::HashSet<&String> =
             table.iter().map(|(_, _, path)| path).collect();
@@ -464,10 +446,7 @@ fn stored_names(
     (physical, fts)
 }
 
-/// The fields nested inside `data_type`, each one carrying an id of its own.
-///
-/// The same shape `arrow_schema_with_field_ids` stamps and `with_ids_from`
-/// restores, so a path exists for every field that has an id.
+/// The fields nested inside `data_type`, each with its own field id.
 fn nested_children(data_type: &DataType) -> Vec<&Arc<Field>> {
     match data_type {
         DataType::Struct(children) => children.iter().collect(),
@@ -479,20 +458,14 @@ fn nested_children(data_type: &DataType) -> Vec<&Arc<Field>> {
     }
 }
 
-/// Every field the schema stores, as its lance id and the dotted path naming it.
+/// Every field in the schema, nested ones included, as (field id, is full-text
+/// path, dotted path).
 ///
-/// A struct's child and a list's element are fields with ids of their own, so a
-/// path like `meta.body` only relates two schemas through the ids along it.
-///
-/// A list's element is named in two ways and both appear: a projection spells
-/// it out (`tags.item.body`) while full-text search elides it (`tags.body`), so
-/// a map holding only one of them answers for only one of the callers.
-///
-/// A generation numbers its own columns in its own schema, so those ids collide
-/// with the table's. They and their children are left out.
+/// Fields inside a list get both paths: a projection writes `tags.item.body`,
+/// full-text search writes `tags.body`. `_tombstone` and system columns are
+/// skipped because their ids collide with the table's.
 fn field_paths(schema: &Schema) -> Vec<(Option<i32>, bool, String)> {
-    /// `physical` spells every field out; `elided` drops the element names a
-    /// full-text path leaves implicit.
+    /// `elided` is `physical` without the list element names.
     fn walk(
         field: &Field,
         physical: &mut Vec<String>,
@@ -504,18 +477,15 @@ fn field_paths(schema: &Schema) -> Vec<(Option<i32>, bool, String)> {
         if !in_list {
             elided.push(field.name().clone());
         }
-        // The minimal form, not the SQL-expression one: a caller asks for a
-        // column under the name its index metadata and its projection use, and
-        // SQL quoting would wrap anything with a hyphen in backticks and stop
-        // matching either.
+        // Not the SQL form: its backtick quoting would stop matching the names
+        // used by index metadata and projections.
         let id = field_id_of(field);
         let as_path = |segments: &[String]| {
             format_field_path_minimal(&segments.iter().map(String::as_str).collect::<Vec<_>>())
         };
         let physical_path = as_path(physical);
-        // A full-text path for every field, so the map that serves those
-        // lookups is complete on its own and no lookup has to fall back to the
-        // projection map, where a different field can wear the same spelling.
+        // Every field gets a full-text path, so full-text lookups never need the
+        // projection map, where another field can have the same path.
         if !in_list {
             out.push((id, true, as_path(elided)));
         }
@@ -815,10 +785,7 @@ mod tests {
         assert_eq!(names.get(TOMBSTONE), None, "not one of the table's columns");
     }
 
-    /// A full-text lookup asks under the name the table uses now and must get
-    /// back the name the generation stored, the way a projection lookup does.
-    /// Reading the map the other way loses every hit the moment a list's text
-    /// child is renamed.
+    /// A full-text lookup of a renamed list child returns the stored name.
     #[test]
     fn a_full_text_alias_resolves_the_current_name_to_the_stored_one() {
         let list = |child: &str, id: i32| {
@@ -829,12 +796,10 @@ mod tests {
             ));
             Schema::new(vec![with_id("tags", DataType::List(element), 1)])
         };
-        // The same field id either side: a rename moves the name, not the id.
         let (_, fts) = stored_names(&list("body", 3), &list("text", 3));
         let read = GenerationRead {
             names: HashMap::new(),
             stored_columns: HashSet::new(),
-            // Held the way the lookup asks: the table's name to the stored one.
             fts_names: fts
                 .into_iter()
                 .map(|(stored, in_table)| (in_table, stored))
@@ -851,10 +816,8 @@ mod tests {
         );
     }
 
-    /// A list's element and a struct child named `item` inside it spell the
-    /// same path — one as a projection, one as a full-text alias. Held in one
-    /// map, whichever was inserted last answers for both, and the projection
-    /// reads an existing column as absent and fills it with nulls.
+    /// A list element and a struct child named `item` inside it keep separate
+    /// mappings even though their paths match.
     #[test]
     fn a_list_element_and_a_child_named_item_do_not_share_a_mapping() {
         let child = Arc::new(with_id("item", DataType::Utf8, 3));

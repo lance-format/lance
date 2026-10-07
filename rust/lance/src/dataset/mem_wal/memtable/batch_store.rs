@@ -227,9 +227,9 @@ pub struct BatchStore {
     /// Final generation/data-file identity for batches in this store.
     target: Option<MemTableDataTarget>,
 
-    /// The memtable generation these batches belong to. A WAL entry records it,
-    /// so replay rebuilds the boundaries the writer made rather than re-deriving
-    /// them from a row cap it may be reopened with a different value of.
+    /// The memtable generation these batches belong to. Recorded in each WAL
+    /// entry so replay keeps the writer's generation boundaries, even if the
+    /// shard is reopened with a different size limit.
     generation: u64,
 }
 
