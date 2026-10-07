@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
-use lance_core::{Error, Result, utils::address::RowAddress};
+use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
@@ -123,72 +123,32 @@ async fn live_row_ids(
     })
 }
 
-/// The live physical addresses of an "effective" fragment set: every
-/// `(fragment, offset)` not marked gone by that fragment's deletion vector.
-///
-/// Coarse `Fragments` filtering (whole-fragment granularity) cannot tell a
-/// fragment's still-valid rows from ones a same-fragment update superseded --
-/// under stable row ids, updating an indexed column deletes the row's old
-/// physical copy and writes the new value elsewhere, but the old fragment
-/// keeps its id and stays "effective". An address-domain index's stored old
-/// data is exact physical addresses, so it needs this same exact-membership
-/// treatment `build_stable_row_id_filter` gives row ids, just without needing
-/// the row-id sequence: an address only needs the deletion vector.
-async fn build_live_row_addr_filter(
-    dataset: &Dataset,
-    effective_old_frags: &RoaringBitmap,
-) -> Result<RowAddrTreeMap> {
-    let mut live = RowAddrTreeMap::new();
-    for frag_id in effective_old_frags.iter() {
-        let Some(fragment) = dataset.get_fragment(frag_id as usize) else {
-            continue;
-        };
-        let Some(physical_rows) = fragment.metadata().physical_rows else {
-            continue;
-        };
-        // Propagate a deletion-vector read failure rather than swallowing it: a
-        // swallowed error would fall through to "no deletions", putting the
-        // deleted rows back into the allow-list as stale entries.
-        let deletion_vector = if fragment.metadata().deletion_file.is_some() {
-            fragment.get_deletion_vector().await?
-        } else {
-            None
-        };
-        for offset in 0..physical_rows {
-            let offset = offset as u32;
-            if deletion_vector
-                .as_ref()
-                .is_some_and(|dv| dv.contains(offset))
-            {
-                continue;
-            }
-            live.insert(u64::from(RowAddress::new_from_parts(frag_id, offset)));
-        }
-    }
-    Ok(live)
-}
-
 /// Build the [`OldIndexDataFilter`] that must be applied to existing index
 /// rows when their owning fragments have been pruned by compaction or
 /// deletions.
 ///
 /// `address_domain` must be `true` when the consuming index stores physical
 /// row addresses rather than row ids (see
-/// `ScalarIndex::results_are_row_addresses`). Such an index needs exact
-/// address-level filtering regardless of the dataset's row-id scheme: a
-/// same-fragment update can leave some of a still-"effective" fragment's rows
-/// live and others superseded (see [`build_live_row_addr_filter`]), which
-/// coarse fragment-granularity filtering cannot distinguish.
+/// `ScalarIndex::results_are_row_addresses`). `build_stable_row_id_filter`
+/// below produces row ids, which would be the wrong domain to filter such an
+/// index's stored addresses against, so an address-domain index always falls
+/// back to coarse `Fragments` filtering instead, regardless of the dataset's
+/// row-id scheme.
+///
+/// That coarse filtering cannot tell a still-"effective" fragment's live rows
+/// from ones a same-fragment update superseded (under stable row ids,
+/// updating an indexed column deletes the row's old physical copy and writes
+/// the new value elsewhere, but the old fragment keeps its id and stays
+/// "effective"), so an address-domain index can merge in a stale posting this
+/// way. Exact address-level filtering would avoid that; left as a future
+/// optimization.
 pub async fn build_old_data_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
     deleted_old_frags: &RoaringBitmap,
     address_domain: bool,
 ) -> Result<Option<OldIndexDataFilter>> {
-    if address_domain {
-        let valid_old_addrs = build_live_row_addr_filter(dataset, effective_old_frags).await?;
-        Ok(Some(OldIndexDataFilter::RowIds(valid_old_addrs)))
-    } else if dataset.manifest.uses_stable_row_ids() {
+    if !address_domain && dataset.manifest.uses_stable_row_ids() {
         let valid_old_row_ids = build_stable_row_id_filter(dataset, effective_old_frags).await?;
         Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
     } else {
@@ -4944,10 +4904,17 @@ mod tests {
     /// silently reintroduce the stale entries this fix removes. Simulate an
     /// unreadable deletion vector by deleting the file the manifest still
     /// references, then assert optimize errors instead of succeeding.
+    ///
+    /// Bitmap rather than BTree: this guarantee comes from
+    /// `build_stable_row_id_filter`, which only the row-id-domain merge path
+    /// (still used by Bitmap) goes through. BTree is always address-domain
+    /// now and merges through the coarse `Fragments` filter instead, which
+    /// never reads a deletion vector, so it cannot surface this error.
     #[tokio::test]
     async fn test_optimize_errors_when_deletion_vector_unreadable() {
         use crate::dataset::UpdateBuilder;
         use arrow_array::Int32Array;
+        use lance_index::scalar::BuiltinIndexType;
         use lance_table::io::deletion::deletion_file_path;
 
         let test_dir = TempStrDir::default();
@@ -4980,9 +4947,9 @@ mod tests {
         dataset
             .create_index(
                 &["num"],
-                IndexType::BTree,
+                IndexType::Bitmap,
                 None,
-                &ScalarIndexParams::default(),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
                 true,
             )
             .await
