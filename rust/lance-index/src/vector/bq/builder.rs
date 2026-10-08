@@ -192,10 +192,13 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
         let mut next = current + 1;
         while next <= max_code {
             let threshold = next as f32 / value;
-            if threshold < t_end {
-                debug_assert!(u32::try_from(idx).is_ok());
-                thresholds.push(((threshold.to_bits() as u64) << u32::BITS) | idx as u64);
+            if threshold >= t_end {
+                // Thresholds increase with next, so no later event can enter
+                // the search interval. Keep the division unchanged at its edge.
+                break;
             }
+            debug_assert!(u32::try_from(idx).is_ok());
+            thresholds.push(((threshold.to_bits() as u64) << u32::BITS) | idx as u64);
             next += 1;
         }
     }
@@ -1066,6 +1069,12 @@ mod tests {
         for ex_bits in 1..=8 {
             let expected = reference_best_ex_rescale_factor(&values, ex_bits);
             let actual = best_ex_rescale_factor(&values, ex_bits);
+            assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
+
+            // Many dimensions exhaust the interval before reaching max_code.
+            let sparse = [1.0, f32::MIN_POSITIVE, 0.0, 0.001, 0.01, 0.1, 0.5, 0.9];
+            let expected = reference_best_ex_rescale_factor(&sparse, ex_bits);
+            let actual = best_ex_rescale_factor(&sparse, ex_bits);
             assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
         }
     }
