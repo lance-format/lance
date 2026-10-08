@@ -409,8 +409,6 @@ async fn open_pk_index(
     }
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
-    // The sidecar is always freshly built by `to_training_batches`, never a
-    // legacy segment, so it's always at the current (row-address-domain) version.
     let index = plugin
         .load_index(
             store.clone(),
