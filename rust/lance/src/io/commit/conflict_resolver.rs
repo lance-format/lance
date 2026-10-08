@@ -1322,13 +1322,12 @@ impl<'a> TransactionRebase<'a> {
                         return Ok(());
                     }
                     // if index remapping is deferred, there is no conflict with
-                    // concurrent CreateIndex of column indices.
+                    // concurrent CreateIndex of column indices. On an untagged table the
+                    // latest manifest shows whether it was (`load_untagged_deferred_groups`),
+                    // falling back to the rewrite's in-memory reuse update.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-
-                    // Untagged: the latest manifest shows whether the rewrite deferred
-                    // (`load_untagged_deferred_groups`), else its in-memory update.
                     let deferred = is_untagged_deferred_rewrite(
                         self.untagged_deferred_groups.as_ref(),
                         groups,
