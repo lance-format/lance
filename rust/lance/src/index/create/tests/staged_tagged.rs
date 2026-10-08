@@ -1909,9 +1909,8 @@ async fn v0_deferred_vector_segment_merge_keeps_the_legacy_version_pinned() {
     assert_eq!(indexed, flat, "every row is reachable through the index");
 }
 
-/// RTree under the tagged history: staged segments over both sources of a
-/// stable partition claim the destinations the reader derives for them, and
-/// the merged index holds every row of what it claims.
+/// RTree on a tagged history: segments covering a stable partition's sources
+/// claim its destinations and hold every row of them.
 #[cfg(feature = "geo")]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]

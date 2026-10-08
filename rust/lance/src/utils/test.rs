@@ -1012,8 +1012,7 @@ impl CommitHandler for AmbiguousCommitHandler {
     }
 }
 
-/// One uncommitted scalar index segment per named fragment, each covering only
-/// that fragment, ready to be merged once a compaction has rewritten them.
+/// One uncommitted scalar index segment per named fragment.
 #[cfg(test)]
 pub async fn stage_index_segments(
     dataset: &mut Dataset,
@@ -1076,9 +1075,7 @@ pub mod geo {
         builder.finish().to_array_ref()
     }
 
-    /// An `id` and `geometry` schema with one batch per fragment. Writing these
-    /// with `max_rows_per_file = rows_per_fragment` puts each batch in its own
-    /// fragment.
+    /// `id` and `geometry` batches, one per fragment.
     pub fn batches(rows_per_fragment: i32, fragments: i32) -> (Arc<ArrowSchema>, Vec<RecordBatch>) {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
@@ -1098,9 +1095,8 @@ pub mod geo {
         (schema, batches)
     }
 
-    /// Geometry fragments with one committed RTree index, so a deferred
-    /// compaction has something to defer and writes the reuse mapping a merge
-    /// reads.
+    /// Geometry fragments with a committed RTree index, so a deferred
+    /// compaction writes a reuse mapping.
     pub async fn dataset_with_committed_rtree_index(
         uri: &str,
         rows_per_fragment: i32,
@@ -1113,8 +1109,6 @@ pub mod geo {
             uri,
             Some(WriteParams {
                 max_rows_per_file: rows_per_fragment as usize,
-                // Compaction moves every row address, which is what makes staged
-                // coverage need the reuse index.
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -1154,7 +1148,7 @@ pub mod geo {
         .await
     }
 
-    /// A compaction that leaves its index remap to the reuse index.
+    /// A compaction with deferred index remap.
     pub fn deferred_compaction(
         rows_per_fragment: i32,
         fragments_per_group: i32,
