@@ -65,20 +65,30 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 #### InvertedIndexParams Structure
 
-| Field               | Type    | Default   | Description                                                    |
-|---------------------|---------|-----------|----------------------------------------------------------------|
-| `base_tokenizer`    | String  | "simple"  | Base tokenizer type (see Tokenizers section)                   |
-| `language`          | String  | "English" | Language for stemming and stop words                           |
-| `with_position`     | Boolean | false     | Store term positions for phrase queries (increases index size) |
-| `max_token_length`  | UInt32? | None      | Maximum token length (tokens longer than this are removed)     |
-| `lower_case`        | Boolean | true      | Convert tokens to lowercase                                    |
-| `stem`              | Boolean | false     | Apply language-specific stemming                               |
-| `remove_stop_words` | Boolean | false     | Remove common stop words for the specified language            |
-| `ascii_folding`     | Boolean | true      | Convert accented characters to ASCII equivalents               |
-| `min_gram`          | UInt32  | 2         | Minimum n-gram length (only for ngram tokenizer)               |
-| `max_gram`          | UInt32  | 15        | Maximum n-gram length (only for ngram tokenizer)               |
-| `prefix_only`       | Boolean | false     | Generate only prefix n-grams (only for ngram tokenizer)        |
-| `block_size`        | UInt32  | 128       | Documents per compressed posting block. Must be 128 or 256. Missing values from older indexes read as 128. `256` is experimental and may introduce breaking changes. |
+| Field                | Type           | Default            | Description                                                    |
+|----------------------|----------------|--------------------|----------------------------------------------------------------|
+| `lance_tokenizer`    | String?        | null               | Document-level tokenizer: `text` for string documents, `json` for JSON string documents. When absent, it is inferred from the Arrow field type during index build. |
+| `base_tokenizer`     | String         | "simple"           | Lexical tokenizer type (see Tokenizers section)                |
+| `language`           | String         | "English"          | Language for stemming and stop words                           |
+| `with_position`      | Boolean        | false              | Store term positions for phrase queries (increases index size) |
+| `max_token_length`   | UInt32?        | 40                 | Remove tokens longer than this. Null disables the limit.       |
+| `lower_case`         | Boolean        | true               | Convert tokens to lowercase                                    |
+| `stem`               | Boolean        | true (code: false) | Apply language-specific stemming                               |
+| `remove_stop_words`  | Boolean        | true (code: false) | Remove common stop words for the specified language            |
+| `custom_stop_words`  | Array<String>? | null               | Replace the built-in stop word list. Null uses the built-in list for `language`. |
+| `ascii_folding`      | Boolean        | true               | Convert accented characters to ASCII equivalents               |
+| `min_ngram_length`   | UInt32         | 3                  | Minimum n-gram length (only for ngram tokenizer)               |
+| `max_ngram_length`   | UInt32         | 3                  | Maximum n-gram length (only for ngram tokenizer)               |
+| `prefix_only`        | Boolean        | false              | Generate only prefix n-grams (only for ngram tokenizer)        |
+| `block_size`         | UInt32         | 128                | Documents per compressed posting block. Must be 128 or 256. Missing values from older indexes read as 128. `256` is experimental and may introduce breaking changes. |
+| `split_identifiers`  | Boolean        | false              | Split code identifiers into subwords (code tokenizer only)     |
+| `split_on_numerics`  | Boolean        | false (code: true) | Split identifier subwords at letter/number boundaries (code tokenizer only) |
+| `preserve_original`  | Boolean        | false (code: true) | Index the complete identifier in addition to its subwords (code tokenizer only) |
+| `index_operators`    | Boolean        | false              | Index operator tokens such as `::`, `->`, and `!=` (code tokenizer only) |
+
+The defaults above are for the text analyzer profile (`base_tokenizer = "simple"`); entries marked `(code: ...)` show the `code` profile's values. The `ngram` tokenizer disables stemming and stop word removal unless they are set explicitly. The `analyzer` key (`"text"` or `"code"`) is an input-only preset that is expanded into `base_tokenizer` and the flags above before params are persisted.
+
+The `document_granularity` field is persisted in the index details, not in this params object. Three creation-time fields are accepted for builds but are not persisted with the index: `memory_limit` (build memory cap in MiB), `num_workers` (build worker count), and `format_version` (on-disk posting-list format). Creation resolves `format_version` as: explicit value, then the `LANCE_FTS_FORMAT_VERSION` environment variable, then the configuration default -- code analysis writes format version 3; text analysis writes version 2 with block size 128 and version 3 with block size 256. Code analysis always requires format version 3. Existing indexes keep their format version when they are updated or optimized.
 
 ## Tokenizers
 
@@ -91,6 +101,7 @@ The full text search index supports multiple tokenizer types for different text 
 | **simple**     | Splits on whitespace and punctuation, removes non-alphanumeric characters | General text (default) |
 | **whitespace** | Splits only on whitespace characters                                      | Preserve punctuation   |
 | **raw**        | No tokenization, treats entire text as single token                       | Exact matching         |
+| **code**       | Code-aware tokenization of identifiers, with optional subword splitting   | Source code search     |
 | **ngram**      | Breaks text into overlapping character sequences                          | Substring/fuzzy search |
 | **icu**        | ICU dictionary-based Unicode word segmentation                            | Mixed-language text    |
 | **icu/split**  | ICU segmentation with simple-style delimiter splitting                    | Mixed-language identifiers |
@@ -109,6 +120,18 @@ By default, Lance preserves ICU word segments as returned by ICU. Use `base_toke
   - Unicode-aware word boundary detection
   - Dictionary-based segmentation for Chinese, Japanese, Khmer, Lao, Myanmar, and Thai
   - No external language model download required
+
+#### Code Tokenizer (Source code)
+
+The `code` tokenizer lexes source code instead of natural language: whitespace and punctuation delimit tokens, identifiers are kept whole by default, and identifiers can optionally be split into subwords. Select it with `base_tokenizer: "code"`, or with the `analyzer: "code"` preset in client SDKs, which also applies the code profile defaults. Stemming and stop word removal are disabled by default for this tokenizer.
+
+- **Flags** (only valid for the `code` tokenizer):
+  - `split_identifiers` (default `false`): split each identifier into subwords, e.g. `getUserName` becomes `get`, `user`, and `name`.
+  - `split_on_numerics` (default `true` for the code tokenizer): split subwords at letter/number boundaries, e.g. `HTML2JSON` becomes `html`, `2`, and `json`.
+  - `preserve_original` (default `true` for the code tokenizer): also index the complete identifier, e.g. `getUserName` in addition to its subwords.
+  - `index_operators` (default `false`): also index operator tokens such as `::`, `->`, and `!=`.
+- **Word delimiter stage**: when `split_identifiers` is enabled, a word-delimiter filter splits identifiers at case, digit, and delimiter boundaries. A preserved original shares the position of its first subword, and the remaining subwords follow at consecutive positions.
+- **Format version**: the `code` tokenizer requires on-disk FTS format version 3. Creating a code index with an explicit lower `format_version`, or while `LANCE_FTS_FORMAT_VERSION` is set to `1` or `2`, fails; without an override, code indexes default to version 3.
 
 #### Jieba Tokenizer (Chinese)
 
@@ -147,6 +170,7 @@ Token filters are applied in sequence after the base tokenizer:
 
 | Filter           | Description                                 | Configuration                   |
 |------------------|---------------------------------------------|---------------------------------|
+| **WordDelimiter** | Splits identifier tokens into subwords at case, digit, and delimiter boundaries (`code` tokenizer only; applied before the filters below) | `split_identifiers`, `split_on_numerics`, `preserve_original` |
 | **RemoveLong**   | Removes tokens exceeding max_token_length   | `max_token_length`              |
 | **LowerCase**    | Converts tokens to lowercase                | `lower_case` (default: true)    |
 | **Stemmer**      | Reduces words to their root form            | `stem`, `language`              |
