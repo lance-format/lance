@@ -69,7 +69,7 @@ pub fn overlay_affects_index(
 }
 
 /// Whether `field_id` is, contains, or is nested in an indexed field.
-fn field_affects_index(field_id: i32, indexed_field_ids: &[i32], schema: &Schema) -> bool {
+pub fn field_affects_index(field_id: i32, indexed_field_ids: &[i32], schema: &Schema) -> bool {
     let overlay_ancestry = schema.field_ancestry_by_id(field_id);
     indexed_field_ids.iter().any(|indexed_field_id| {
         *indexed_field_id == field_id
