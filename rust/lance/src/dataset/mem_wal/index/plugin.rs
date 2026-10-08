@@ -432,8 +432,9 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// `None` means "I cannot help with this one" and the caller scans. That is
     /// a different answer from an empty result, which claims no row matches: a
     /// bloom filter asked for a range has no opinion, and asked for a value it
-    /// has never seen it has a firm one. Returning `None` for a query
-    /// [`can_answer`](Self::can_answer) accepted is an error the caller reports.
+    /// has never seen it has a firm one. For a query
+    /// [`can_answer`](Self::can_answer) accepted, `None` should only decline
+    /// [`SearchContext::match_budget`]; a filter's caller then reads every row.
     ///
     /// A filter query is answered with [`MemMatches::Filter`], a search with
     /// [`MemMatches::Ranked`]. Ranked scores are merged with every other

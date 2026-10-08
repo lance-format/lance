@@ -567,7 +567,7 @@ pub struct MemTableScanner {
     pk_columns: Option<Vec<String>>,
     /// Whether [`Self::create_dedup_plan`] may answer a filter from the filter
     /// indexes. Off reads every visible row.
-    dedup_from_indexes: bool,
+    memtable_filter_indexes: bool,
 }
 
 impl MemTableScanner {
@@ -608,7 +608,7 @@ impl MemTableScanner {
             with_row_id: false,
             with_row_address: false,
             pk_columns: None,
-            dedup_from_indexes: false,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -616,8 +616,8 @@ impl MemTableScanner {
     /// keeping a match only when it is its key's newest visible version. When
     /// the indexes match too many rows to be worth checking one by one, every
     /// visible row is read instead, as without this. Needs a primary-key index.
-    pub fn dedup_from_indexes(&mut self, enabled: bool) -> &mut Self {
-        self.dedup_from_indexes = enabled;
+    pub fn with_memtable_filter_indexes(&mut self, enabled: bool) -> &mut Self {
+        self.memtable_filter_indexes = enabled;
         self
     }
 
@@ -1168,10 +1168,11 @@ impl MemTableScanner {
 
     /// Plan a newest-per-PK active-arm scan via `MemTableDedupScanExec` —
     /// dedup runs before the predicate so a PK whose newest version fails the
-    /// filter cannot leak an older version that passes. Unlike
-    /// `plan_full_scan`, this never takes the BTree skip (dedup needs
-    /// every version) and never pushes a limit (the LSM caps results above
-    /// the cross-source merge).
+    /// filter cannot leak an older version that passes. With
+    /// [`Self::with_memtable_filter_indexes`] on, a filter the indexes answer
+    /// narrowly is read from their matches instead, each kept only if it is its
+    /// key's newest visible version. It never pushes a limit (the LSM caps
+    /// results above the cross-source merge).
     pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
         validate_pk_types(&self.schema, pk_columns)?;
 
@@ -1217,7 +1218,7 @@ impl MemTableScanner {
         // The newest-version check seeks the primary-key index, so without one
         // there is nothing to check against.
         let (true, Some(filter), true) = (
-            self.dedup_from_indexes,
+            self.memtable_filter_indexes,
             filter_expr.as_ref(),
             self.indexes.has_pk_index(),
         ) else {
@@ -1273,15 +1274,6 @@ impl MemTableScanner {
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
 
-    /// Plan a vector similarity search.
-    ///
-    /// Always emits a plan whose output schema includes `_distance`: dispatches
-    /// to [`VectorIndexExec`] when an index answers the search, otherwise to
-    /// [`MemTableBruteForceVectorExec`]. The brute-force arm exists because the
-    /// active memtable is the LSM's unindexed-rows path — when the HNSW config
-    /// hasn't reached this writer yet (cold-start, or rows written between an
-    /// index commit and the next memtable rotation), KNN must still produce
-    /// correct, distance-bearing results so the LSM-level merge stays sound.
     /// Compile the optional logical `filter` into a physical predicate against
     /// the memtable schema. Shared by the vector and FTS search arms; mirrors the
     /// compilation in [`Self::plan_full_scan`] (`optimize_expr` before
@@ -1295,6 +1287,15 @@ impl MemTableScanner {
         Ok(Some(planner.create_physical_expr(&optimized)?))
     }
 
+    /// Plan a vector similarity search.
+    ///
+    /// Always emits a plan whose output schema includes `_distance`: dispatches
+    /// to [`VectorIndexExec`] when an index answers the search, otherwise to
+    /// [`MemTableBruteForceVectorExec`]. The brute-force arm exists because the
+    /// active memtable is the LSM's unindexed-rows path — when the HNSW config
+    /// hasn't reached this writer yet (cold-start, or rows written between an
+    /// index commit and the next memtable rotation), KNN must still produce
+    /// correct, distance-bearing results so the LSM-level merge stays sound.
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
         let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
@@ -1488,7 +1489,7 @@ mod tests {
     /// integer, string and composite keys — whether the matches are checked one
     /// by one or are too many and every row is read.
     #[tokio::test]
-    async fn dedup_from_indexes_answers_like_reading_every_row() {
+    async fn memtable_filter_indexes_answer_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
         use crate::dataset::mem_wal::wal::WriterCursors;
         use arrow_array::cast::AsArray;
@@ -1498,13 +1499,17 @@ mod tests {
             "red", "blue", "green", "amber", "black", "white", "grey", "pink", "cyan", "teal",
             "navy", "lime", "plum", "rose", "sand", "gold",
         ];
-        const FILTERS: [&str; 6] = [
+        const FILTERS: [&str; 9] = [
             "colour = 'red'",
             "colour IN ('red', 'blue')",
             "colour IS NULL",
             "colour = 'red' OR colour = 'green'",
             "colour > 'c'",
             "colour = 'red' AND b > 1",
+            // Empty ranges: inverted, and a single point excluded at one end.
+            "colour BETWEEN 'red' AND 'blue'",
+            "colour > 'red' AND colour < 'blue'",
+            "colour > 'red' AND colour <= 'red'",
         ];
 
         let mut seed: u64 = 0x5eed;
@@ -1595,7 +1600,7 @@ mod tests {
                         MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
                     scanner.filter(&filter).unwrap();
                     scanner.with_row_address();
-                    scanner.dedup_from_indexes(from_indexes);
+                    scanner.with_memtable_filter_indexes(from_indexes);
                     let plan = scanner.create_dedup_plan(&pk_columns).await.unwrap();
                     let ctx = datafusion::prelude::SessionContext::new();
                     let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
@@ -1636,7 +1641,7 @@ mod tests {
     /// The match budget is a request an index may ignore. One that lists every
     /// match anyway must still not have each of them checked.
     #[tokio::test]
-    async fn dedup_from_indexes_reads_every_row_past_the_budget_whatever_the_index() {
+    async fn memtable_filter_indexes_read_every_row_past_the_budget_whatever_the_index() {
         use crate::dataset::mem_wal::index::{
             FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, MemMatches,
             MemQuery, ResolveContext, ResolvedIndex, SearchContext,
@@ -1730,7 +1735,7 @@ mod tests {
             let mut scanner =
                 MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
             scanner.filter(filter).unwrap();
-            scanner.dedup_from_indexes(true);
+            scanner.with_memtable_filter_indexes(true);
             let plan = scanner
                 .create_dedup_plan(&["id".to_string()])
                 .await

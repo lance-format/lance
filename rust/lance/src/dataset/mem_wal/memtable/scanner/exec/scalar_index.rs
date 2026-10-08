@@ -115,9 +115,10 @@ impl ScalarIndexExec {
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing data
-    /// * `indexes` - Index registry holding the scalar index for the column
+    /// * `indexes` - The memtable's indexes, which answer `index_expr`
     /// * `index_expr` - The index searches the filter was split into
     /// * `recheck` - The whole filter, compiled, for rows an index only narrowed
+    /// * `is_filter_covered` - Whether `index_expr` is the whole filter
     /// * `readable_count` - Exclusive count of batch positions this scan may read
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
@@ -228,9 +229,15 @@ impl ScalarIndexExec {
                 let exact = result.is_exact();
                 (Some(result.at_most.into()), exact)
             }
-            // A failing index must not silently answer "no rows". Every visible
-            // row is a candidate and the filter decides, which is a scan.
-            Err(_) => (None, false),
+            // A failing index must not answer "no rows". Every visible row is a
+            // candidate and the filter decides, which is a scan.
+            Err(error) => {
+                log::warn!(
+                    "a memtable index failed to search {}; reading every row instead: {error}",
+                    self.index_expr
+                );
+                (None, false)
+            }
         }
     }
 
@@ -410,9 +417,10 @@ impl DisplayAs for ScalarIndexExec {
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ScalarIndexExec\nquery={}\nrechecked={}\nwith_row_id={}\nwith_row_address={}",
+                    "ScalarIndexExec\nquery={}\nrechecked={}\nnewest_only={}\nwith_row_id={}\nwith_row_address={}",
                     self.index_expr.to_expr(),
                     self.recheck.is_some(),
+                    self.newest_of.is_some(),
                     self.with_row_id,
                     self.with_row_address
                 )

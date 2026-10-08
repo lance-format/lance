@@ -478,7 +478,7 @@ impl LsmScanPlanner {
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
-                scanner.dedup_from_indexes(self.memtable_filter_indexes);
+                scanner.with_memtable_filter_indexes(self.memtable_filter_indexes);
 
                 scanner.create_dedup_plan(&self.pk_columns).await
             }
@@ -1518,7 +1518,7 @@ mod integration_tests {
         );
         assert!(
             !plan_str.contains("ScalarIndexExec"),
-            "Active filtered read no longer uses the BTree skip"
+            "the active memtable's filtered read reads every row unless its filter indexes are turned on"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets
@@ -2241,7 +2241,9 @@ mod integration_tests {
         use arrow_array::BooleanArray;
         use lance_core::datatypes::Schema as LanceSchema;
 
-        const FILTERS: [&str; 9] = [
+        const FILTERS: [&str; 11] = [
+            "cat BETWEEN 30 AND 10",
+            "cat > 20 AND cat <= 20",
             "cat = 3",
             "cat IN (1, 2)",
             "name = 'n2'",

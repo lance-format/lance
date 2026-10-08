@@ -9,8 +9,8 @@
 //! tree of index searches and a leftover expression, and the tree's leaves are
 //! `AnyQuery` values the indexes answer directly.
 //!
-//! The consequences are worth stating, because this is where most of the
-//! memtable's filter capability comes from and none of it is written here:
+//! So the memtable's filter capability comes from the plugins' parsers rather
+//! than from code here:
 //!
 //! * Every expression shape a plugin's [`ScalarQueryParser`] claims — ranges
 //!   with either bound inclusive, `IN`, `IS NULL`, `LIKE 'prefix%'`, a spatial

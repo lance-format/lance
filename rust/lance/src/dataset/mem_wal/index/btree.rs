@@ -1776,8 +1776,7 @@ mod tests {
     }
 
     /// Null sorts outside every range, which is what SQL says and what the
-    /// on-disk index does. The previous implementation walked a whole snapshot
-    /// and let nulls through whenever the lower bound was open.
+    /// on-disk index does, including a range whose lower bound is open.
     #[test]
     fn test_range_never_returns_nulls() {
         let index = BTreeMemIndex::new(0, "v".to_string());
