@@ -4622,6 +4622,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-compat"
+version = "14.0.0-beta.7"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-ord",
+ "arrow-row",
+ "arrow-schema",
+ "arrow-select",
+ "datafusion",
+ "datafusion-common",
+ "futures",
+ "half",
+ "lance-arrow-scalar",
+ "lance-arrow-stats",
+ "lance-datafusion",
+ "lance-index",
+ "rstest",
+ "tokio",
+]
+
+[[package]]
 name = "lance-core"
 version = "14.0.0-beta.7"
 dependencies = [

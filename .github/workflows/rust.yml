@@ -96,6 +96,12 @@ jobs:
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Clippy
         run: cargo clippy --profile ci --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
+      # The `lance-compat` ordering fixtures are `test = false`, which
+      # `--all-targets` skips (and a named `--test` is ignored next to
+      # `--tests`), so lint them in their own invocation. `--workspace` keeps
+      # feature unification identical to the step above.
+      - name: Clippy (Arrow ordering fixtures)
+        run: cargo clippy --profile ci --locked --workspace --features ${{ env.ALL_FEATURES }} --test arrow_ordering -- -D warnings
 
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)

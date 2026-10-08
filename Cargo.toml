@@ -3,6 +3,7 @@ members = [
     "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
+    "rust/lance-compat",
     "rust/lance-core",
     "rust/lance-datagen",
     "rust/lance-encoding",
