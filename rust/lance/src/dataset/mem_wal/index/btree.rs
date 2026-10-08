@@ -23,6 +23,7 @@
 //! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
 //!   key (fat node, but handles arbitrary scalar types).
 
+use std::collections::HashSet;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1399,7 +1400,8 @@ impl BTreeMemIndex {
     /// The backing walk is half-open, so an inclusive upper bound adds that
     /// key's positions and an exclusive lower bound removes them. Both are one
     /// extra point lookup, which is what the ordered structure is good at.
-    /// `None` once more than `limit` rows match.
+    /// `None` once more than `limit` rows match, counting the rows an
+    /// exclusive lower bound then removes.
     fn bounded_range(
         &self,
         lower: &Bound<ScalarValue>,
@@ -1414,11 +1416,22 @@ impl BTreeMemIndex {
             Bound::Included(value) | Bound::Excluded(value) => Some(value),
             Bound::Unbounded => None,
         };
+        if let (Some(low), Some(high)) = (lower_value, upper_value) {
+            let empty = match (lower, upper) {
+                (Bound::Included(_), Bound::Included(_)) => low > high,
+                _ => low >= high,
+            };
+            if empty {
+                return Some(Vec::new());
+            }
+        }
 
         let mut positions = self.range_within(lower_value, upper_value, limit)?;
         if let Bound::Excluded(value) = lower {
-            let excluded = self.get(value);
-            positions.retain(|position| !excluded.contains(position));
+            let excluded: HashSet<RowPosition> = self.get(value).into_iter().collect();
+            if !excluded.is_empty() {
+                positions.retain(|position| !excluded.contains(position));
+            }
         }
         if let Bound::Included(value) = upper {
             positions.extend(self.get_within(value, limit - positions.len())?);
@@ -1575,6 +1588,69 @@ mod tests {
         assert_eq!(
             found(SargableQuery::IsIn((20..31).map(value).collect())),
             None
+        );
+    }
+
+    /// Exclusive and inverted bounds, on each backend: an exclusive lower bound
+    /// drops every row of its key however many there are, and a range whose
+    /// bounds cross matches nothing, even with an inclusive upper bound.
+    #[rstest]
+    #[case::fixed_int(DataType::Int32)]
+    #[case::bytes(DataType::Utf8)]
+    #[case::scalar(DataType::Float64)]
+    fn exclusive_and_inverted_ranges(#[case] data_type: DataType) {
+        let value = |n: i32| match data_type {
+            DataType::Int32 => ScalarValue::Int32(Some(n)),
+            DataType::Utf8 => ScalarValue::Utf8(Some(format!("{n:03}"))),
+            _ => ScalarValue::Float64(Some(n as f64)),
+        };
+        let batch = |values: Vec<i32>| {
+            let array = ScalarValue::iter_to_array(values.into_iter().map(value)).unwrap();
+            let schema = ArrowSchema::new(vec![Field::new("v", array.data_type().clone(), true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap()
+        };
+        let index = BTreeMemIndex::new(0, "v".to_string());
+        // Many zeros, more ones, a few twos and threes.
+        let values: Vec<i32> = (0..20_000)
+            .map(|row| match row % 20 {
+                0..=1 => 0,
+                2..=17 => 1,
+                18 => 2,
+                _ => 3,
+            })
+            .collect();
+        index.insert(&batch(values.clone()), 0).unwrap();
+
+        let count = |lower: Bound<i32>, upper: Bound<i32>| {
+            let query = SargableQuery::Range(lower.map(value), upper.map(value));
+            MemIndex::search(&index, &query, &SearchContext::new(u64::MAX))
+                .unwrap()
+                .expect("a range is answered")
+                .as_filter()
+                .expect("a filter answer")
+                .at_most
+                .len()
+        };
+        let rows_of = |n: i32| values.iter().filter(|v| **v == n).count() as u64;
+        use Bound::{Excluded, Included, Unbounded};
+        assert_eq!(count(Excluded(0), Excluded(2)), rows_of(1), "0 < v < 2");
+        assert_eq!(
+            count(Excluded(0), Unbounded),
+            rows_of(1) + rows_of(2) + rows_of(3)
+        );
+        assert_eq!(
+            count(Excluded(0), Included(2)),
+            rows_of(1) + rows_of(2),
+            "0 < v <= 2"
+        );
+        assert_eq!(count(Included(3), Included(1)), 0, "v BETWEEN 3 AND 1");
+        assert_eq!(count(Included(3), Excluded(1)), 0, "3 <= v < 1");
+        assert_eq!(count(Excluded(1), Included(1)), 0, "1 < v <= 1");
+        assert_eq!(count(Included(1), Excluded(1)), 0, "1 <= v < 1");
+        assert_eq!(
+            count(Included(1), Included(1)),
+            rows_of(1),
+            "v BETWEEN 1 AND 1"
         );
     }
 
