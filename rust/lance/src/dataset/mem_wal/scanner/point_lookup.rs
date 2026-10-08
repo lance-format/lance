@@ -714,7 +714,10 @@ impl LsmPointLookupPlanner {
                 // rustc's depth limit up this point-lookup chain, and boxing inside
                 // `create_plan` instead triggers a `Box<Future>: Send` solver overflow
                 // (E0275 downstream). Same for the other arms below.
-                Box::pin(scanner.create_plan()).await?
+                let scan = Box::pin(scanner.create_plan()).await?;
+                // The source schema narrows a struct in declaration order, the
+                // canonical one in selection order; cast the children by name.
+                project_to_canonical(scan, &target)?
             }
             LsmDataSource::SsTable { path, .. } => {
                 let dataset = open_sstable(
@@ -2786,5 +2789,93 @@ mod tests {
                 "the output follows the selection, not the declaration"
             );
         }
+    }
+
+    /// Where the planned lookup reads the key from.
+    #[derive(Clone, Copy, Debug)]
+    enum NestedArm {
+        Base,
+        SsTable,
+        ActiveMemTable,
+    }
+
+    /// The planned lookup (not the in-memory fast path) narrows a struct the
+    /// way the fast path does, from whichever source holds the key. A WAL shard
+    /// sends a nested selection as its leaf paths, so `meta` itself is never
+    /// named.
+    #[rstest]
+    #[case::base(NestedArm::Base)]
+    #[case::sstable(NestedArm::SsTable)]
+    #[case::active_memtable(NestedArm::ActiveMemTable)]
+    #[tokio::test]
+    async fn a_planned_lookup_narrows_a_struct_selected_by_leaf_paths(#[case] arm: NestedArm) {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        use futures::TryStreamExt;
+
+        let schema = create_nested_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let batch = create_nested_batch(&schema, &[1, 2]);
+        let collector = match arm {
+            NestedArm::Base => {
+                let base = Arc::new(create_dataset(&base_uri, vec![batch]).await);
+                LsmDataSourceCollector::new(base, vec![])
+            }
+            NestedArm::SsTable => {
+                let shard_id = Uuid::new_v4();
+                let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+                create_dataset(&gen1_uri, vec![batch]).await;
+                let shard = ShardSnapshot::new(shard_id)
+                    .with_current_generation(2)
+                    .with_sstable(1, "gen_1".to_string());
+                LsmDataSourceCollector::without_base_table(base_uri, vec![shard])
+            }
+            NestedArm::ActiveMemTable => {
+                LsmDataSourceCollector::without_base_table(base_uri, vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: active_memtable_ref(&schema, &[batch], 1),
+                            frozen: vec![],
+                        },
+                    )
+            }
+        };
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
+
+        let projection = ["id", "meta.b", "meta.a"].map(String::from);
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(2))], Some(&projection))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+        assert_eq!(rows.len(), 1, "expected exactly one row for pk=2");
+        let row = rows[0];
+
+        assert_eq!(id_at(row), 2);
+        assert_eq!(meta_children(row), vec!["b", "a"]);
+        let meta = row.column_by_name("meta").unwrap().as_struct();
+        assert_eq!(
+            meta.column_by_name("a")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            20
+        );
+        assert_eq!(
+            meta.column_by_name("b")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            "b_2"
+        );
     }
 }
