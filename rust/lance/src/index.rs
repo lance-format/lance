@@ -157,10 +157,8 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
 /// representable group coverage while materializing every source.
 ///
 /// Returns the fragments the remap added, or `None` when nothing was remapped.
-/// Coverage only ever moves together with the row addresses the dataset's own
-/// mapping supplies, so where no mapping applies the coverage shrinks instead —
-/// reported, because those rows leave the merged index and fall back to a flat
-/// scan.
+/// Coverage only moves with the row addresses the reuse index maps; elsewhere it
+/// shrinks, and those rows fall back to a flat scan.
 async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     index_name: &str,
@@ -251,9 +249,8 @@ async fn remap_merged_segment_coverage(
         return Ok(None);
     };
 
-    // Coverage may follow the rows through a compaction only while nothing else
-    // has rewritten the indexed fields on the way, and only while the manifests
-    // that would show it are still there to be read.
+    // Coverage may follow rows through a compaction only if nothing else changed
+    // the indexed fields on the way, and the manifests to check that still exist.
     if indexed_data_moved_on(dataset, &frag_reuse_index, segments).await? {
         tracing::warn!(
             index_name,
@@ -301,8 +298,7 @@ async fn remap_merged_segment_coverage(
         );
     }
 
-    // Fragments the remap added. Compaction created them after these segments
-    // were built, so none of the segments has them in its history.
+    // Fragments the remap added: compaction created them after the segments were built.
     let introduced = &merged_coverage - &staged_coverage;
 
     for segment in segments {
@@ -387,9 +383,7 @@ fn fragment_field_files<'a>(
         .collect()
 }
 
-/// Whether `fragment` carries an overlay over one of the `indexed` fields
-/// committed after `version`. An index built at `version` holds the old values
-/// for those rows.
+/// Whether `fragment` has an overlay on an `indexed` field committed after `version`.
 fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i32>) -> bool {
     fragment.overlays.iter().any(|overlay| {
         overlay.committed_version > version
@@ -401,7 +395,7 @@ fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i
     })
 }
 
-/// A version a coverage proof reads, with its fragments found by id.
+/// A dataset version with its fragments indexed by id.
 struct Snapshot {
     dataset: Dataset,
     fragments: HashMap<u32, usize>,
@@ -425,11 +419,10 @@ impl Snapshot {
     }
 }
 
-/// The versions a coverage proof reads, each opened once.
+/// Dataset versions read by the coverage check, each opened once.
 ///
-/// A version counts as gone only when the dataset no longer lists it. Any other
-/// failure to read one is an error: a transient fault must not cost coverage
-/// that the merged index would then never get back.
+/// A version is gone only if the dataset no longer lists it; any other read
+/// failure is an error, so a transient fault cannot drop coverage for good.
 struct History<'a> {
     dataset: &'a Dataset,
     /// Every version the dataset still lists, ascending.
@@ -439,8 +432,7 @@ struct History<'a> {
 
 impl<'a> History<'a> {
     async fn new(dataset: &'a Dataset) -> Result<Self> {
-        // Ids only: reading every retained manifest to list them would cost more
-        // than the handful of snapshots a proof actually opens.
+        // Ids only; manifests are opened on demand.
         let retained = dataset
             .version_refs()
             .await?
@@ -486,14 +478,9 @@ impl<'a> History<'a> {
         Ok(Some(snapshot))
     }
 
-    /// The commit of the compaction recorded at `recorded`, confirmed to have
-    /// produced `produced`.
-    ///
-    /// The reuse index records each compaction at the version immediately before
-    /// its commit, so the commit is the next one. An entry an older build wrote
-    /// recorded something else, so the commit's own record has to agree;
-    /// where it is gone or does not, nothing about the compaction's output can
-    /// be proven.
+    /// The version that committed the compaction the reuse index records at
+    /// `recorded` (always `recorded + 1`), or `None` unless that commit is a
+    /// rewrite that produced `produced`.
     async fn rewrite_commit(
         &self,
         recorded: u64,
@@ -521,8 +508,7 @@ impl<'a> History<'a> {
     }
 }
 
-/// The overlays on `fragment` over any of the `indexed` fields, by what they are:
-/// the commit that introduced each and the file holding its values.
+/// The overlays on `fragment` over `indexed` fields, as (version, base, path).
 fn indexed_overlays<'a>(
     fragment: &'a Fragment,
     indexed: &HashSet<i32>,
@@ -547,9 +533,8 @@ fn indexed_overlays<'a>(
         .collect()
 }
 
-/// Whether `after` has a row live in `fragment` that `before` had deleted. Rows
-/// are deleted cumulatively, so only a restore brings one back, and an index
-/// built while it was deleted never saw it.
+/// Whether a row deleted in `before` is live again in `after` (only a restore
+/// does this; an index built in between never saw the row).
 async fn revives_rows(
     before: &Snapshot,
     after: &Snapshot,
@@ -570,14 +555,8 @@ async fn revives_rows(
     Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
 }
 
-/// Whether `fragment` holds different indexed data in `after` than it did in
-/// `before`.
-///
-/// A commit that rewrites an indexed field puts it in a different file, and an
-/// overlay is added or, by a restore, taken away; so the files and the overlays
-/// over those fields must both be the same. A row that was deleted must still
-/// be deleted. Together these stand in for every way the data could have moved,
-/// in either direction.
+/// Whether `fragment`'s indexed data differs between `before` and `after`: a
+/// different file or overlay set for the indexed fields, or a revived row.
 async fn indexed_data_differs(
     before: &Snapshot,
     after: &Snapshot,
@@ -597,21 +576,16 @@ async fn indexed_data_differs(
     revives_rows(before, after, then, now).await
 }
 
-/// Where each covered fragment's index entries were recorded.
-///
-/// A fragment starts at the version of the segment covering it. Where a
-/// compaction committed after a segment was built, the commit moved that
-/// segment's coverage onto the fragments it produced, which that version does
-/// not have; the entries then describe the inputs the compaction read, so
-/// those are followed from the segment's version instead. `None` where neither
-/// applies, and nothing about the fragment can be proven.
+/// The version each covered fragment's index entries describe: its segment's
+/// version, or for a fragment a later compaction produced, that compaction's
+/// inputs at the segment's version. `None` if a fragment fits neither.
 async fn initial_records(
     history: &mut History<'_>,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<Option<HashMap<u32, u64>>> {
     let mut by_version = segments.iter().collect::<Vec<_>>();
-    // Oldest first, so a fragment two segments cover is held to the older one.
+    // Oldest first: a fragment two segments cover is checked against the older.
     by_version.sort_by_key(|segment| segment.dataset_version);
 
     let mut following = HashMap::new();
@@ -648,16 +622,10 @@ async fn initial_records(
     Ok(Some(following))
 }
 
-/// Whether the data these segments indexed has moved on from the fragments the
-/// merge would have them cover.
-///
-/// Each fragment being followed carries the version whose state its index
-/// entries describe: its segment's version to begin with, and then the commit
-/// of whichever compaction last rewrote it. A compaction may carry those rows
-/// forward only if its inputs still match the state they are each recorded
-/// against, and the fragments left at the end must still match theirs, as
-/// [`indexed_data_differs`] judges a match. Where a manifest a comparison needs
-/// has been cleaned up, the answer is that it has.
+/// Whether the indexed data changed since the segments were built, following
+/// each fragment through the compactions that rewrote it. Each compaction's
+/// inputs, and the final fragments, must match their recorded version
+/// ([`indexed_data_differs`]). A cleaned-up manifest counts as changed.
 async fn indexed_data_moved_on(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
@@ -718,8 +686,7 @@ async fn indexed_data_moved_on(
         else {
             return Ok(true);
         };
-        // Only the groups this compaction rewrote advance; every other followed
-        // fragment stays recorded against the version it already was.
+        // Only this compaction's groups advance.
         for group in ours {
             for old in &group.old_frags {
                 following.remove(&(old.id as u32));
@@ -732,8 +699,7 @@ async fn indexed_data_moved_on(
 
     let current = history.current();
     for (fragment, recorded) in following {
-        // A fragment the manifest no longer has is intersected out of the
-        // coverage regardless, so it claims nothing and has nothing to match.
+        // A fragment no longer in the manifest is dropped from coverage anyway.
         if current.fragment(fragment).is_none() {
             continue;
         }
@@ -766,9 +732,8 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
     Ok(indexed_field_ids)
 }
 
-/// `historically_missing_exempt` names fragments compaction created after these
-/// segments were built. Missing them from a segment's history is expected, not
-/// stale, so that one rule is waived. Every other check below still applies.
+/// `historically_missing_exempt`: fragments compaction created after the
+/// segments were built, so their absence from a segment's history is expected.
 async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
@@ -831,9 +796,8 @@ async fn prune_stale_segment_coverage(
                             .as_ref()
                             .is_some_and(|lineage| lineage.contains(*fragment_id));
                     };
-                    // An exempt fragment has no counterpart in the segment's
-                    // history, so there are no files to compare. The overlay
-                    // check below needs none and still applies.
+                    // An exempt fragment has no historical files to compare;
+                    // the overlay check still applies.
                     let changed_files = historical_fragment.is_some_and(|historical_fragment| {
                         let historical_files = fragment_field_files(
                             &historical,
@@ -2792,9 +2756,7 @@ impl DatasetIndexExt for Dataset {
 
         validate_segment_params_compatible(&[], &source_segments)?;
 
-        // Checked before the coverage work below, which reads historical
-        // versions: without `geo` the merge cannot happen at all, so that work
-        // would be wasted.
+        // Before the coverage work below, which would be wasted without `geo`.
         #[cfg(not(feature = "geo"))]
         if all_rtree {
             return Err(Error::not_supported(
@@ -2819,8 +2781,7 @@ impl DatasetIndexExt for Dataset {
         } else {
             frag_reuse::plan_staged_segments(self, &source_segments).await?
         };
-        // Runs first: the staleness pass below drops every covered fragment that
-        // no longer exists, which is exactly the ones this remap moves.
+        // Before the staleness pass, which drops the retired fragments this remaps.
         let remapped_fragments = if !all_vector {
             let index_name = source_segments[0].name.clone();
             remap_merged_segment_coverage(self, &index_name, &mut source_segments, staged.as_ref())
@@ -2836,8 +2797,7 @@ impl DatasetIndexExt for Dataset {
                 .cloned()
                 .map(IntoIndexSegment::into_index_segment)
                 .collect::<Result<Vec<_>>>()?;
-            // Only what the remap added. A fragment missing from a segment's
-            // history for any other reason is coverage it cannot serve.
+            // Only fragments the remap added are exempt.
             let exempt = remapped_fragments.unwrap_or_default();
             prune_stale_segment_coverage(self, &mut source_coverage, true, &exempt, true).await?;
             for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
@@ -5853,9 +5813,8 @@ mod tests {
         );
     }
 
-    /// A compaction is dated by its own commit record: the version after the
-    /// one the reuse index records it at, and only if that commit is the
-    /// rewrite that produced the fragments in question.
+    /// A compaction's commit is the version after its reuse record, and only if
+    /// that commit is the rewrite that produced the fragments.
     #[tokio::test]
     async fn test_a_compaction_is_dated_by_its_own_commit_record() {
         let test_dir = TempStrDir::default();
@@ -5875,7 +5834,7 @@ mod tests {
         let mut dataset = Dataset::write(reader, &test_dir, Some(params))
             .await
             .unwrap();
-        // An index, so the deferred compaction records itself in the reuse index.
+        // An index, so the deferred compaction writes a reuse record.
         dataset
             .create_index(
                 &["id"],
@@ -6139,8 +6098,7 @@ mod tests {
         );
     }
 
-    /// The number of rows the merged index holds, to weigh against the rows in
-    /// the fragments its coverage claims.
+    /// Rows the merged index holds.
     #[cfg(feature = "geo")]
     async fn merged_rtree_item_count(dataset: &Dataset, merged: &IndexMetadata) -> u64 {
         let index = crate::index::scalar::open_scalar_index(
@@ -6154,14 +6112,8 @@ mod tests {
         index.statistics().unwrap()["num_items"].as_u64().unwrap()
     }
 
-    /// Sources staged before a deferred compaction cover fragments the rewrite
-    /// has since retired. RTree loads them through `open_scalar_index`, which
-    /// applies the dataset's reuse index as a row-address remapper, so the
-    /// merged coverage follows those addresses into the fragment the rewrite
-    /// produced -- but only when the segments cover the whole rewrite group.
-    /// Covering part of it leaves that fragment holding rows none of them
-    /// indexed, and claiming it would drop those rows from results instead of
-    /// scanning for them.
+    /// RTree segments staged before a deferred compaction: merged coverage moves
+    /// to the compacted fragment only if the segments cover the whole group.
     #[cfg(feature = "geo")]
     #[rstest]
     #[case::whole_group(true)]
@@ -6206,9 +6158,7 @@ mod tests {
             surviving,
             "coverage must name the fragment the rewrite produced"
         );
-        // Claiming the rewritten fragment is only correct because the merged
-        // index holds every row it has. A claim wider than the content
-        // suppresses the scan fallback and loses rows from query results.
+        // The claim is only correct if the index holds every row of the fragment.
         assert_eq!(
             merged_rtree_item_count(&dataset, &merged).await,
             (ROWS_PER_FRAGMENT * FRAGMENTS) as u64,
