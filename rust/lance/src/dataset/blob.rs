@@ -5680,6 +5680,11 @@ mod tests {
             assert_eq!(blob.unwrap().read().await.unwrap().as_ref(), payload);
         }
         assert_eq!(dataset.manifest.base_paths.len(), 1);
+        let flags = lance_table::feature_flags::FLAG_MANAGED_BLOBS
+            | lance_table::feature_flags::FLAG_BASE_PATHS
+            | lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+        assert_eq!(dataset.manifest.reader_feature_flags & flags, flags);
+        assert_eq!(dataset.manifest.writer_feature_flags & flags, flags);
         assert_eq!(
             dataset.manifest.base_paths[&7].is_dataset_root,
             is_dataset_root
@@ -5992,6 +5997,103 @@ mod tests {
             values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"pppppppppppppppp"
         );
+    }
+
+    #[rstest]
+    #[case::append(WriteMode::Append)]
+    #[case::overwrite(WriteMode::Overwrite)]
+    #[tokio::test]
+    async fn managed_flag_activates_on_blob_write(#[case] mode: WriteMode) {
+        let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let files = dataset.manifest.fragments[0].files.clone();
+        dataset.delete("_rowid = 1").await.unwrap();
+        assert!(!dataset.manifest.has_managed_blobs());
+        assert_eq!(dataset.manifest.fragments[0].files, files);
+        assert!(dataset.manifest.fragments[0].deletion_file.is_some());
+
+        // Preserve the released field's thresholds when appending. Even an
+        // inline-only batch publishes new Blob descriptors and activates the fence.
+        let metadata = dataset.schema().field("blob").unwrap().metadata.clone();
+        let schema = Arc::new(Schema::new(vec![
+            blob_field("blob", true).with_metadata(metadata),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_bytes(b"inline").unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &dir.path_str(),
+            Some(WriteParams {
+                mode,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        let mut scan = dataset.scan();
+        scan.blob_handling(BlobHandling::AllBinary);
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["blob"].as_binary::<i64>().value(batch.num_rows() - 1),
+            b"inline"
+        );
+    }
+
+    #[rstest]
+    #[case::drop_column(false)]
+    #[case::overwrite(true)]
+    #[tokio::test]
+    async fn managed_flag_survives_removing_blob_columns(#[case] overwrite: bool) {
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_bytes(b"inline").unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1])), blobs.finish().unwrap()],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if overwrite {
+            let batch = arrow_array::record_batch!(("id", Int32, [2])).unwrap();
+            dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Arc::new(dataset.clone()),
+                Some(WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        } else {
+            dataset.drop_columns(&["blob"]).await.unwrap();
+        }
+        dataset
+            .update_config([("test", "metadata-only")])
+            .await
+            .unwrap();
+        let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        assert!(dataset.schema().field("blob").is_none());
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap().num_rows(), 1);
     }
 
     #[rstest]

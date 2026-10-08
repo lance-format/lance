@@ -2751,6 +2751,328 @@ mod tests {
         ))
     }
 
+    // Tiny dedicated objects make individual row retention observable without
+    // large payloads or partially live packed objects masking a missing reference.
+    fn managed_blob_batch() -> RecordBatch {
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"first").unwrap();
+        blobs.push_bytes(b"second").unwrap();
+        let field = blob_field("blob", false).with_metadata(HashMap::from([
+            ("ARROW:extension:name".into(), "lance.blob.v2".into()),
+            (
+                "lance-encoding:blob-inline-size-threshold".into(),
+                "0".into(),
+            ),
+            (
+                "lance-encoding:blob-dedicated-size-threshold".into(),
+                "1".into(),
+            ),
+        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            field,
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::unprotected(None)]
+    #[case::tag(Some("tag"))]
+    #[case::branch(Some("branch"))]
+    #[tokio::test]
+    async fn managed_cleanup_preserves_protected_rows(#[case] protection: Option<&str>) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("before", "delete")]).await.unwrap();
+        let protected_version = dataset.version_id();
+        let protected = match protection {
+            Some("tag") => {
+                dataset
+                    .tags()
+                    .create("keep", protected_version)
+                    .await
+                    .unwrap();
+                Some(dataset.clone())
+            }
+            Some("branch") => Some(
+                fixture
+                    .create_branch_and_load(&mut dataset, "keep", protected_version)
+                    .await
+                    .unwrap(),
+            ),
+            _ => None,
+        };
+        dataset.delete("id = 0").await.unwrap();
+        dataset.update_config([("after", "delete")]).await.unwrap();
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.count_blob_files().await.unwrap(),
+            if protected.is_some() { 2 } else { 1 }
+        );
+        let values = Arc::new(dataset)
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"second"
+        );
+        if let Some(protected) = protected {
+            let values = Arc::new(protected)
+                .take_blobs_by_indices(&[0], "blob")
+                .await
+                .unwrap();
+            assert_eq!(
+                values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+                b"first"
+            );
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn managed_cleanup_distinguishes_column_projections(
+        #[values(false, true)] keep_old: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            batch.schema().field(0).clone(),
+            batch.schema().field(1).clone(),
+            batch.schema().field(1).clone().with_name("other"),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                batch.column(0).clone(),
+                batch.column(1).clone(),
+                batch.column(1).clone(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("before", "drop")]).await.unwrap();
+        let old = dataset.clone();
+        if keep_old {
+            dataset
+                .tags()
+                .create("keep", dataset.version_id())
+                .await
+                .unwrap();
+        }
+        dataset.drop_columns(&["other"]).await.unwrap();
+        dataset.update_config([("after", "drop")]).await.unwrap();
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 4);
+        if keep_old {
+            // Both views are retained and share the physical file. Scanning the
+            // narrower view first must not hide the old view's second column.
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let inspection = Mutex::new(CleanupInspection::default());
+            task.inspect_managed_blobs(&dataset, true, &inspection)
+                .await
+                .unwrap();
+            task.inspect_managed_blobs(&old, true, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(
+                inspection
+                    .lock()
+                    .unwrap()
+                    .referenced_files
+                    .managed_blob_paths
+                    .len(),
+                4
+            );
+        }
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.count_blob_files().await.unwrap(),
+            if keep_old { 4 } else { 2 }
+        );
+        let values = Arc::new(dataset)
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        for (value, expected) in values
+            .iter()
+            .zip([b"first".as_slice(), b"second".as_slice()])
+        {
+            assert_eq!(
+                value.as_ref().unwrap().read().await.unwrap().as_ref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_cleanup_deduplicates_reads_and_retries_failures() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("version", "2")]).await.unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_count = reads.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_descriptors",
+            Arc::new(move |op, path| {
+                if op.starts_with("get") && path.extension() == Some("lance") {
+                    read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+        // Warm the session's file metadata cache, then measure one descriptor scan.
+        for _ in 0..2 {
+            reads.store(0, std::sync::atomic::Ordering::SeqCst);
+            task.inspect_managed_blobs(&dataset, false, &Mutex::new(CleanupInspection::default()))
+                .await
+                .unwrap();
+        }
+        let single_scan_reads = reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(single_scan_reads > 0);
+        let inspection = Mutex::new(CleanupInspection::default());
+        for retained in [false, true] {
+            let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+            let scans = (0..8).map(|_| task.inspect_managed_blobs(&dataset, retained, &inspection));
+            for result in futures::future::join_all(scans).await {
+                assert!(result.unwrap());
+            }
+            let after = reads.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(after - before, single_scan_reads);
+            task.inspect_managed_blobs(&dataset, retained, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), after);
+        }
+        assert_eq!(inspection.lock().unwrap().managed_scans.len(), 2);
+        assert_eq!(
+            inspection
+                .lock()
+                .unwrap()
+                .referenced_files
+                .managed_blob_paths
+                .len(),
+            2
+        );
+
+        let file = dataset
+            .data_dir()
+            .join(dataset.manifest.fragments[0].files[0].path.as_str());
+        let saved = dataset
+            .object_store
+            .inner
+            .get(&file)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        dataset.object_store.inner.delete(&file).await.unwrap();
+        let before = fixture.count_files().await.unwrap();
+        let result = dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await;
+        assert!(result.unwrap_err().is_not_found());
+        assert_eq!(fixture.count_files().await.unwrap(), before);
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
+
+        // A missing expired descriptor must not publish successful completion.
+        let inspection = Mutex::new(CleanupInspection::default());
+        assert!(
+            !task
+                .inspect_managed_blobs(&dataset, false, &inspection)
+                .await
+                .unwrap()
+        );
+        assert!(
+            inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .values()
+                .all(|cell| cell.get().is_none())
+        );
+        dataset
+            .object_store
+            .inner
+            .put(&file, saved.into())
+            .await
+            .unwrap();
+        assert!(
+            task.inspect_managed_blobs(&dataset, false, &inspection)
+                .await
+                .unwrap()
+        );
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
+    }
+
     #[tokio::test]
     async fn cleanup_unreferenced_data_files() {
         // We should clean up data files that are only referenced
