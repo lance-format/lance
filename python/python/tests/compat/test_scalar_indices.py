@@ -15,7 +15,6 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from packaging.version import Version
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -68,7 +67,12 @@ class BTreeIndex(UpgradeDowngradeTest):
         # has already rebuilt the index in the newer format, so the older
         # build can no longer see it here and must fall back to a full scan
         # -- still correct, just not re-asserted as "indexed" in that case.
-        if Version(lance.__version__) != Version(self.compat_version):
+        #
+        # Checked via _running_in_old_venv, not a lance.__version__ /
+        # compat_version comparison: the current build's own version is not a
+        # fixed marker distinct from every pinned release (see that flag's
+        # docstring on UpgradeDowngradeTest).
+        if not self._running_in_old_venv:
             explain = ds.scanner(filter="btree == 7").explain_plan()
             assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
 
@@ -125,8 +129,14 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
     def _is_old_build(self) -> bool:
         """True while this method body is executing inside the pinned old
         venv under test.
+
+        Reads _running_in_old_venv (set by VenvExecutor.execute_method), not
+        a lance.__version__ / compat_version comparison: the current build's
+        own version is not a fixed marker distinct from every pinned release
+        under test -- see that flag's docstring on UpgradeDowngradeTest for
+        the version-collision this caused (lance-format/lance#9481).
         """
-        return Version(lance.__version__) == Version(self.compat_version)
+        return self._running_in_old_venv
 
     def _debug(self, label: str):
         """Temporary diagnostics for the upgrade/downgrade[14.0.0b3] failure.
