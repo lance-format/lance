@@ -61,6 +61,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
+use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::{DataFile, Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -384,15 +385,17 @@ fn fragment_field_files<'a>(
 }
 
 /// Whether `fragment` has an overlay on an `indexed` field committed after `version`.
-fn has_overlay_newer_than(fragment: &Fragment, version: u64, indexed: &HashSet<i32>) -> bool {
-    fragment.overlays.iter().any(|overlay| {
-        overlay.committed_version > version
-            && overlay
-                .data_file
-                .fields
-                .iter()
-                .any(|field_id| indexed.contains(field_id))
-    })
+fn has_overlay_newer_than(
+    fragment: &Fragment,
+    version: u64,
+    indexed: &HashSet<i32>,
+    schema: &LanceSchema,
+) -> bool {
+    let indexed = indexed.iter().copied().collect::<Vec<_>>();
+    fragment
+        .overlays
+        .iter()
+        .any(|overlay| overlay_affects_index(overlay, &indexed, version, schema))
 }
 
 /// A dataset version with its fragments indexed by id.
@@ -512,7 +515,9 @@ impl<'a> History<'a> {
 fn indexed_overlays<'a>(
     fragment: &'a Fragment,
     indexed: &HashSet<i32>,
+    schema: &LanceSchema,
 ) -> HashSet<(u64, Option<u32>, &'a str)> {
+    let indexed = indexed.iter().copied().collect::<Vec<_>>();
     fragment
         .overlays
         .iter()
@@ -521,7 +526,7 @@ fn indexed_overlays<'a>(
                 .data_file
                 .fields
                 .iter()
-                .any(|field_id| indexed.contains(field_id))
+                .any(|field_id| field_affects_index(*field_id, &indexed, schema))
         })
         .map(|overlay| {
             (
@@ -569,7 +574,8 @@ async fn indexed_data_differs(
     let files_then = fragment_field_files(&before.dataset, then, indexed);
     if files_then.is_none()
         || files_then != fragment_field_files(&after.dataset, now, indexed)
-        || indexed_overlays(then, indexed) != indexed_overlays(now, indexed)
+        || indexed_overlays(then, indexed, after.dataset.schema())
+            != indexed_overlays(now, indexed, after.dataset.schema())
     {
         return Ok(true);
     }
@@ -809,7 +815,12 @@ async fn prune_stale_segment_coverage(
                         historical_files.is_none() || historical_files != current_files
                     });
                     let changed_overlays = prune_newer_overlays
-                        && has_overlay_newer_than(current_fragment, version, &indexed_field_ids);
+                        && has_overlay_newer_than(
+                            current_fragment,
+                            version,
+                            &indexed_field_ids,
+                            dataset.schema(),
+                        );
                     changed_files || changed_overlays
                 })
                 .collect::<Vec<_>>();
