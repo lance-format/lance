@@ -16,15 +16,18 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
@@ -778,24 +781,39 @@ impl FilteredReadStream {
         };
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
-        let (row_id_sequence, num_logical_rows, index_upper_ranges) =
-            if dataset.manifest.uses_stable_row_ids() {
-                let (row_id_sequence, index_upper_ranges) =
-                    if let Some(routing) = stable_index_routing {
-                        (routing.row_id_sequence, routing.upper_ranges)
-                    } else {
-                        (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
-                    };
-                let num_logical_rows = row_id_sequence.len();
-                (row_id_sequence, num_logical_rows, index_upper_ranges)
+        let num_deleted_rows = deletion_vector
+            .as_ref()
+            .map_or(0_u64, |deletion_vector| deletion_vector.len() as u64);
+        // Row-ID sequences describe physical slots, including tombstoned slots. Scan ranges use
+        // visible ordinals, so ordinary scans must exclude the loaded deletions in either row-ID
+        // mode. When deleted rows are requested the deletion vector is intentionally absent.
+        let num_logical_rows =
+            num_physical_rows
+                .checked_sub(num_deleted_rows)
+                .ok_or_else(|| {
+                    Error::corrupt_file(
+                        dataset.base.clone(),
+                        format!(
+                            "Fragment {} has {} physical rows but {} deleted rows",
+                            frag.id, num_physical_rows, num_deleted_rows
+                        ),
+                    )
+                })?;
+        let (row_id_sequence, index_upper_ranges) = if dataset.manifest.uses_stable_row_ids() {
+            let (row_id_sequence, index_upper_ranges) = if let Some(routing) = stable_index_routing
+            {
+                (routing.row_id_sequence, routing.upper_ranges)
             } else {
-                debug_assert!(stable_index_routing.is_none());
-                let row_ids_start = frag.id << 32;
-                let row_ids_end = row_ids_start + num_physical_rows;
-                let num_logical_rows = file_fragment.count_rows(None).await? as u64;
-                let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
-                (addrs_as_ids, num_logical_rows, None)
+                (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
             };
+            (row_id_sequence, index_upper_ranges)
+        } else {
+            debug_assert!(stable_index_routing.is_none());
+            let row_ids_start = frag.id << 32;
+            let row_ids_end = row_ids_start + num_physical_rows;
+            let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
+            (addrs_as_ids, None)
+        };
         Ok(LoadedFragment {
             row_id_sequence,
             index_upper_ranges,
@@ -1971,6 +1989,36 @@ impl FilteredReadOptions {
         self
     }
 
+    /// [`Self::with_projection`], keeping the filters planned by
+    /// [`Self::with_physical_filters`] (and their session bindings) rebound to
+    /// the new projection.
+    pub(crate) fn with_projection_keeping_filters(
+        mut self,
+        projection: Projection,
+    ) -> Result<Self> {
+        self.projection = projection;
+        for (filter, physical_filter) in &mut self.physical_filters {
+            let projection = self
+                .projection
+                .clone()
+                .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
+            let schema = public_blob_v2_binary_projection_schema(&projection);
+            *physical_filter = physical_filter
+                .clone()
+                .transform(|expr| {
+                    let Some(column) = expr.downcast_ref::<Column>() else {
+                        return Ok(Transformed::no(expr));
+                    };
+                    let index = schema.index_of(column.name())?;
+                    Ok(Transformed::yes(
+                        Arc::new(Column::new(column.name(), index)) as Arc<dyn PhysicalExpr>,
+                    ))
+                })?
+                .data;
+        }
+        Ok(self)
+    }
+
     /// Specify the size of the I/O buffer (in bytes) to use for the scan
     ///
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
@@ -2243,13 +2291,23 @@ impl FilteredReadExec {
             ),
         ));
 
+        // Row-stream reads preserve input order, but can drop identity columns.
+        // Remap sort expressions to the output schema and retain only valid prefixes.
+        let orderings = input
+            .equivalence_properties()
+            .oeq_class()
+            .iter()
+            .filter_map(|ordering| project_ordering(ordering, &output_schema));
+        let equivalence_properties =
+            EquivalenceProperties::new_with_orderings(output_schema.clone(), orderings);
+
         // Partitioning and emission behavior follow the input
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_schema)),
+                .with_eq_properties(equivalence_properties),
         );
 
         let bare_lance_schema = fields_to_read.to_bare_schema();
@@ -2706,6 +2764,20 @@ impl FilteredReadExec {
         }
     }
 
+    /// This read with `projection`, keeping its precomputed plan and
+    /// session-planned filters.
+    pub(crate) fn with_projection(&self, projection: Projection) -> Result<Self> {
+        let options = self
+            .options
+            .clone()
+            .with_projection_keeping_filters(projection)?;
+        let read = Self::try_new(self.dataset.clone(), options, self.index_input().cloned())?;
+        if let Some(plan) = self.plan.get() {
+            let _ = read.plan.set(plan.clone());
+        }
+        Ok(read)
+    }
+
     /// Return the pre-computed plan if one exists, without triggering initialization.
     pub fn plan(&self) -> Option<FilteredReadPlan> {
         self.plan.get().map(|p| p.to_external_plan())
@@ -2743,6 +2815,15 @@ impl FilteredReadExec {
             self.schema(),
             lazy_stream,
         )))
+    }
+
+    fn retained_physical_row_count(&self, fragments: &[Fragment]) -> Option<u64> {
+        self.dataset.manifest().writer_version.as_ref()?;
+        fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows)
+            .sum::<Option<usize>>()
+            .map(|physical_rows| physical_rows as u64)
     }
 }
 
@@ -3300,6 +3381,12 @@ impl ExecutionPlan for FilteredReadExec {
         vec![false; self.children().len()]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Row-stream reads realign fetched rows to the incoming keys and emit
+        // concurrent batches in input order. Row-set inputs only select scan rows.
+        vec![self.row_stream_input().is_some(); self.children().len()]
+    }
+
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -3321,20 +3408,35 @@ impl ExecutionPlan for FilteredReadExec {
             .clone()
             .unwrap_or_else(|| self.dataset.fragments().clone());
 
-        if fragments.iter().any(|f| f.num_rows().is_none()) {
-            return Err(DataFusionError::Internal(
-                "Fragments are missing row count stats".to_string(),
-            ));
-        }
-
-        let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
+        let total_rows = if self.options.with_deleted_rows {
+            if self.options.scan_range_before_filter.is_some()
+                || self.options.scan_range_after_filter.is_some()
+            {
+                return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
+            }
+            let Some(total_rows) = self.retained_physical_row_count(fragments.as_ref()) else {
+                return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
+            };
+            total_rows
+        } else {
+            if fragments.iter().any(|f| f.num_rows().is_none()) {
+                return Err(DataFusionError::Internal(
+                    "Fragments are missing row count stats".to_string(),
+                ));
+            }
+            fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum()
+        };
 
         let Some(filter) = self.options.full_filter.as_ref() else {
             // If there is no filter, we just return the total number of rows (sans any before-filter range)
             // divided by the number of partitions.
             let total_rows =
                 if let Some(scan_range_before_filter) = &self.options.scan_range_before_filter {
-                    total_rows.min(scan_range_before_filter.end - scan_range_before_filter.start)
+                    // The range slices the scanned fragments end to end, so the scan emits
+                    // the part of it overlapping rows that exist. A range reaching past the
+                    // last of those rows yields the rows up to it, not its full width.
+                    let end = scan_range_before_filter.end.min(total_rows);
+                    end.saturating_sub(scan_range_before_filter.start)
                 } else {
                     total_rows
                 };
@@ -4365,6 +4467,48 @@ mod tests {
         fixture.test_plan(options, &u32s(vec![])).await;
     }
 
+    /// The reported row count steers DataFusion's `COUNT(*)` folding and its limit
+    /// pushdown, so it has to match what the scan emits. `scan_range_before_filter`
+    /// slices the scanned fragments end to end, so a range reaching past the last of
+    /// those rows yields the rows up to it, not the range's full width.
+    #[rstest]
+    #[case::no_range(None, None, 250)]
+    #[case::within_the_dataset(None, Some(25..125), 100)]
+    #[case::past_the_last_row(None, Some(200..300), 50)]
+    #[case::starting_past_the_last_row(None, Some(300..400), 0)]
+    #[case::past_the_last_row_of_a_fragment_subset(Some(vec![2]), Some(25..125), 25)]
+    #[test_log::test(tokio::test)]
+    async fn test_range_statistics_match_the_scan(
+        #[case] fragment_ids: Option<Vec<u32>>,
+        #[case] range: Option<Range<u64>>,
+        #[case] expected_rows: usize,
+    ) {
+        let fixture = TestFixture::new().await;
+
+        let mut options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        if let Some(fragment_ids) = fragment_ids {
+            options = options.with_fragments(fixture.frags(&fragment_ids));
+        }
+        if let Some(range) = range {
+            options = options.with_scan_range_before_filter(range).unwrap();
+        }
+
+        let plan = fixture.make_plan(options).await;
+
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
+
+        // The estimate is only worth anything if it matches what the scan emits.
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let scanned: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(scanned, expected_rows);
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_batch_size() {
         let fixture = TestFixture::new().await;
@@ -4631,6 +4775,10 @@ mod tests {
             .unwrap()
             .with_projection(fixture.dataset.empty_projection().with_row_id());
         let plan = fixture.make_plan(options).await;
+        assert_eq!(
+            plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Exact(300)
+        );
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let num_rows = stream
             .map_ok(|batch| batch.num_rows())
@@ -4638,6 +4786,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(num_rows, 300);
+        let mut scanner = fixture.dataset.scan();
+        scanner.with_row_id().include_deleted_rows();
+        assert_eq!(scanner.count_rows().await.unwrap(), 300);
+
+        let filter = fixture.filter_plan("not_indexed >= 250", false).await;
+        let options = base_options
+            .with_deleted_rows()
+            .unwrap()
+            .with_filter_plan(filter);
+        let plan = fixture.make_plan(options.clone()).await;
+        assert_eq!(
+            plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(300)
+        );
+        fixture.test_plan(options, &u32s(vec![250..400])).await;
     }
 
     /// A stale (not rebuilt after a delete) index hit drops on the live view
@@ -5837,6 +6000,9 @@ mod tests {
         use super::*;
         use arrow_array::{Float32Array, LargeBinaryArray, StringArray, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use datafusion::physical_plan::sorts::sort::SortExec;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use lance_datafusion::exec::OneShotExec;
         use rstest::rstest;
@@ -5958,6 +6124,74 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
+        }
+
+        #[rstest]
+        #[case::retain_ordering(true, false)]
+        #[case::remap_and_keep_prefix(false, false)]
+        #[case::retain_key_ordering(true, true)]
+        #[case::drop_missing_leading_key(false, true)]
+        #[tokio::test]
+        async fn row_stream_preserves_ordering_properties(
+            #[case] retain_row_id: bool,
+            #[case] order_by_row_id_first: bool,
+        ) {
+            let fixture = take_fixture(false).await;
+            let batch = arrow_array::record_batch!(
+                ("_rowid", UInt64, [2, 0, 1]),
+                ("payload", Float32, [1.0, 3.0, 2.0])
+            )
+            .unwrap();
+            let input = rows_input(vec![batch]);
+            let columns = if order_by_row_id_first {
+                [ROW_ID, "payload"]
+            } else {
+                ["payload", ROW_ID]
+            };
+            let ordering =
+                LexOrdering::new(columns.iter().map(|name| {
+                    PhysicalSortExpr::new_default(col(name, &input.schema()).unwrap())
+                }))
+                .unwrap();
+            let sorted = Arc::new(SortExec::new(ordering, input.clone()));
+            let mut projection = fixture
+                .dataset
+                .empty_projection()
+                .union_column("i", OnMissing::Error)
+                .unwrap();
+            projection.with_row_id = retain_row_id;
+            let plan = Arc::new(
+                FilteredReadExec::try_new(
+                    fixture.dataset.clone(),
+                    FilteredReadOptions::new(projection),
+                    Some(sorted),
+                )
+                .unwrap(),
+            );
+            assert_eq!(plan.maintains_input_order(), vec![true]);
+
+            let expected = LexOrdering::new(
+                columns
+                    .iter()
+                    .take_while(|name| **name != ROW_ID || retain_row_id)
+                    .map(|name| PhysicalSortExpr::new_default(col(name, &plan.schema()).unwrap()))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(plan.properties().output_ordering(), expected.as_ref());
+
+            // Replacing the input must not leave stale ordering properties.
+            let rebuilt = plan.with_new_children(vec![input]).unwrap();
+            assert!(rebuilt.output_ordering().is_none());
+            assert_eq!(rebuilt.maintains_input_order(), vec![true]);
+
+            let scan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::basic_full_read(&fixture.dataset),
+                None,
+            )
+            .unwrap();
+            assert!(scan.maintains_input_order().is_empty());
+            assert!(scan.properties().output_ordering().is_none());
         }
 
         #[rstest]

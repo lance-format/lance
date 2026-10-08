@@ -2423,12 +2423,7 @@ impl SparseStructuralScheduler {
         let mut rows_counter = 0_u64;
         let mut offset_bytes = value_buf_position;
         let mut chunk_meta = Vec::with_capacity(meta_bytes.len() / 8);
-        for chunk in meta_bytes.chunks_exact(8) {
-            let entry: [u8; 8] = chunk.try_into().map_err(|_| {
-                Error::invalid_input_source(
-                    "Sparse layout chunk metadata entry is not 8 bytes".into(),
-                )
-            })?;
+        for entry in meta_bytes.as_chunks::<8>().0 {
             let divided_bytes_minus_one = u32::from_le_bytes(
                 entry
                     .get(..4)

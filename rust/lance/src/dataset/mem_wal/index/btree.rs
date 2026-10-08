@@ -1060,8 +1060,23 @@ impl BTreeMemIndex {
 
         // Expand each (value, [positions]) group into one row per position, in
         // sorted (value, position) order.
+        //
+        // The skiplist is a multiset: the same `(value, position)` is stored
+        // once per insert, and a row can be indexed more than once (a WAL
+        // replay re-indexes every buffered batch on top of what the flusher
+        // already indexed). The on-disk BTree turns each page's row ids into a
+        // `RoaringBitmap` via `from_sorted_iter`, which requires strictly
+        // increasing input, so a repeated position poisons the whole page:
+        // every later probe fails with "from_sorted_iter called with non-sorted
+        // input". Positions within a group are sorted, so a dedup here is the
+        // cheapest place to guarantee the invariant.
         for (value, positions) in &snapshot {
+            let mut last: Option<RowPosition> = None;
             for position in positions {
+                if last == Some(*position) {
+                    continue;
+                }
+                last = Some(*position);
                 values.push(value.0.clone());
                 row_ids.push(*position);
                 if values.len() >= batch_size {
@@ -1096,7 +1111,7 @@ fn build_training_batch(
 }
 
 /// Configuration for a BTree scalar index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BTreeIndexConfig {
     /// Index name.
     pub name: String,
@@ -1333,6 +1348,66 @@ mod tests {
             (0..6).map(|i| row_ids.value(i)).collect::<Vec<_>>(),
             vec![0, 1, 2, 3, 4, 5]
         );
+    }
+
+    /// A row indexed twice (the flusher indexed it, then a WAL replay indexed
+    /// every buffered batch again) must appear once in the training batches.
+    /// The on-disk BTree builds a `RoaringBitmap` per page with
+    /// `from_sorted_iter`, which rejects a repeated row id and poisons the
+    /// page for every later probe.
+    #[test]
+    fn test_btree_index_to_training_batches_dedups_repeated_positions() {
+        use lance_core::ROW_ID;
+        use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+
+        // Int and bytes backends both dedup; check each.
+        let schema = create_test_schema();
+        let index = BTreeMemIndex::new(0, "id".to_string());
+        let batch = create_test_batch(&schema, 0);
+        index.insert(&batch, 0).unwrap();
+        index.insert(&batch, 0).unwrap();
+        assert_eq!(index.len(), 6, "the memtable index itself is a multiset");
+
+        let batches = index.to_training_batches(100).unwrap();
+        assert_eq!(batches.len(), 1);
+        let row_ids = batches[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values(), &[0, 1, 2]);
+        let values = batches[0]
+            .column_by_name(VALUE_COLUMN_NAME)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[0, 1, 2]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "item:a", "item:b",
+            ]))],
+        )
+        .unwrap();
+        let index = BTreeMemIndex::new(0, "id".to_string());
+        index.insert(&batch, 0).unwrap();
+        index.insert(&batch, 0).unwrap();
+        let batches = index.to_training_batches(100).unwrap();
+        let row_ids = batches[0]
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values(), &[0, 1]);
     }
 
     #[test]

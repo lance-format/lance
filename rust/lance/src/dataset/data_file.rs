@@ -182,8 +182,10 @@ impl DataFileTarget {
         Ok(())
     }
 
-    /// Delete an abandoned target's staging parts, final file, and managed Blob
-    /// payloads, including objects left by failed writes or assembly.
+    /// Delete an abandoned target's staging parts, final file, and file-relative
+    /// Packed/Dedicated sidecars, including those left by failed writes or assembly.
+    /// Independent Managed objects are not owned by this target; unreferenced
+    /// objects follow the dataset's ordinary garbage-collection policy.
     ///
     /// The caller must stop all users and ensure no current or retained dataset
     /// version, checkpoint, or future commit needs this target. Lance does not

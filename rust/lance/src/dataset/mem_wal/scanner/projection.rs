@@ -15,17 +15,20 @@
 //! - [`project_to_canonical`] — wraps a plan to emit `target_schema`,
 //!   NULL-filling system / `_distance` cols missing from the source.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
+use lance_core::datatypes::{Schema as LanceSchema, parse_field_path};
 use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
 
 use super::exec::SchemaRelabelExec;
+use crate::dataset::mem_wal::TOMBSTONE;
 
 /// Column name for distance in vector search results.
 pub const DISTANCE_COLUMN: &str = "_distance";
@@ -47,6 +50,35 @@ pub fn wants_row_address(projection: Option<&[String]>) -> bool {
 /// Auto-managed by the planner; must never reach `scanner.project()`.
 fn is_auto_managed(col: &str) -> bool {
     col == DISTANCE_COLUMN || is_system_column(col)
+}
+
+/// Resolve projection names — dotted paths included — into the narrowed Arrow
+/// fields they select.
+///
+/// [`LanceSchema::project`] does the two things a flat name lookup cannot: it
+/// narrows a struct to the selected leaf (`meta.a` -> `meta: Struct<a>`) and
+/// merges sibling leaves of one parent into a single field (`meta.a` +
+/// `meta.c` -> `meta: Struct<a, c>`). Fields come back in first-mention order
+/// of their top-level column.
+pub(super) fn resolve_data_fields(
+    data_names: &[String],
+    base_schema: &SchemaRef,
+) -> Result<Vec<Arc<Field>>> {
+    if data_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
+    let projected = lance_schema.project(data_names)?;
+    let arrow_schema = Schema::from(&projected);
+    Ok(arrow_schema.fields().iter().cloned().collect())
+}
+
+/// Top-level column a (possibly dotted) projection name addresses.
+pub(super) fn top_level_of(name: &str) -> Result<String> {
+    parse_field_path(name)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| lance_core::Error::invalid_input(format!("empty projection name: {}", name)))
 }
 
 /// Projection to pass to underlying scanners: user cols minus
@@ -84,17 +116,21 @@ pub fn validate_projection_names(
     let Some(user_projection) = user_projection else {
         return Ok(());
     };
+    let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
     for name in user_projection {
-        if is_system_column(name)
-            || extra_columns.contains(&name.as_str())
-            || base_schema.field_with_name(name).is_ok()
-        {
+        if is_system_column(name) || extra_columns.contains(&name.as_str()) {
             continue;
         }
-        return Err(lance_core::Error::invalid_input(format!(
-            "Column '{}' not found in schema",
-            name
-        )));
+        // `resolve` walks the dotted path and reports whether every segment
+        // exists. `project` is not a substitute: it errors on a missing
+        // top-level column but yields an empty struct for a missing *child*,
+        // so `meta.nope` would slip through.
+        if lance_schema.resolve(name.as_str()).is_none() {
+            return Err(lance_core::Error::invalid_input(format!(
+                "Column '{}' not found in schema",
+                name
+            )));
+        }
     }
     Ok(())
 }
@@ -104,14 +140,16 @@ pub fn validate_projection_names(
 /// System cols → nullable `UInt64` at user position (filled by
 /// `project_to_canonical`). `_distance` (when `include_distance`) →
 /// nullable `Float32` at user position, appended if absent. PKs appended.
-/// Callers should run [`validate_projection_names`] before using this with a
-/// user-supplied projection.
+///
+/// Nested paths resolve to their narrowed struct: `meta.a` contributes
+/// `meta: Struct<a>`, and sibling leaves collapse into one field at the
+/// parent's first-mentioned position.
 pub fn canonical_output_schema(
     user_projection: Option<&[String]>,
     base_schema: &SchemaRef,
     pk_columns: &[String],
     include_distance: bool,
-) -> SchemaRef {
+) -> Result<SchemaRef> {
     let mut ordered: Vec<String> = if let Some(p) = user_projection {
         p.to_vec()
     } else {
@@ -132,24 +170,36 @@ pub fn canonical_output_schema(
         ordered.push(DISTANCE_COLUMN.to_string());
     }
 
-    let fields: Vec<Arc<Field>> = ordered
+    let data_names: Vec<String> = ordered
         .iter()
-        .filter_map(|name| {
-            if name == DISTANCE_COLUMN {
-                include_distance
-                    .then(|| Arc::new(Field::new(DISTANCE_COLUMN, DataType::Float32, true)))
-            } else if is_system_column(name) {
-                Some(Arc::new(Field::new(name.clone(), DataType::UInt64, true)))
-            } else {
-                base_schema
-                    .field_with_name(name)
-                    .ok()
-                    .map(|f| Arc::new(f.clone()))
-            }
-        })
+        .filter(|n| !is_auto_managed(n))
+        .cloned()
+        .collect();
+    let mut by_name: HashMap<String, Arc<Field>> = resolve_data_fields(&data_names, base_schema)?
+        .into_iter()
+        .map(|f| (f.name().clone(), f))
         .collect();
 
-    Arc::new(Schema::new(fields))
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(ordered.len());
+    for name in &ordered {
+        if name == DISTANCE_COLUMN {
+            if include_distance {
+                fields.push(Arc::new(Field::new(
+                    DISTANCE_COLUMN,
+                    DataType::Float32,
+                    true,
+                )));
+            }
+        } else if is_system_column(name) {
+            fields.push(Arc::new(Field::new(name.clone(), DataType::UInt64, true)));
+        } else if let Some(field) = by_name.remove(&top_level_of(name)?) {
+            // `remove` is what collapses a second mention of the same parent
+            // (`meta.a` then `meta.c`) into the single merged field.
+            fields.push(field);
+        }
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 /// Wrap `plan` so the named columns become typed NULL literals; all
@@ -206,9 +256,13 @@ pub(super) fn force_schema(
     Arc::new(SchemaRelabelExec::new(plan, target_schema.clone()))
 }
 
-/// Wrap `plan` to emit exactly `target_schema`. Source columns are
-/// forwarded by name; system / `_distance` cols missing from the source
-/// are NULL-filled. Other missing columns are an internal error.
+/// Wrap `plan` to emit exactly `target_schema`. Source columns are forwarded by
+/// name; anything the source lacks is filled with typed nulls.
+///
+/// The null fill exists for MemWAL generation arms, where a column the table
+/// declares really does hold nothing for rows written before it. Do not use it
+/// to normalise a plan whose columns should all be present: a missing column is
+/// then silently null instead of an error.
 ///
 /// Reports `target_schema` exactly, nullability included — see [`force_schema`].
 pub fn project_to_canonical(
@@ -221,20 +275,33 @@ pub fn project_to_canonical(
     for field in target_schema.fields() {
         let name = field.name();
         let expr: Arc<dyn PhysicalExpr> = match input_schema.column_with_name(name) {
-            Some((idx, _)) => Arc::new(Column::new(name, idx)),
+            Some((idx, source)) if source.data_type() == field.data_type() => {
+                Arc::new(Column::new(name, idx))
+            }
+            // Arms reaching the union are already reconciled to the table's
+            // types, so this is the base arm meeting a canonical schema that
+            // widens one -- a cast the table itself declares.
+            Some((idx, _)) => Arc::new(CastExpr::new(
+                Arc::new(Column::new(name, idx)),
+                field.data_type().clone(),
+                None,
+            )),
             None if is_system_column(name) => Arc::new(Literal::new(ScalarValue::UInt64(None))),
             None if name == DISTANCE_COLUMN => Arc::new(Literal::new(ScalarValue::Float32(None))),
-            None => {
-                return Err(lance_core::Error::internal(format!(
-                    "Column '{}' missing from canonical projection source schema (have: {:?})",
-                    name,
-                    input_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect::<Vec<_>>()
-                )));
-            }
+            // A generation that predates deletes carries no tombstone column;
+            // its rows are all live. The column is non-nullable, so a null here
+            // fails the scan outright.
+            None if name == TOMBSTONE => Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
+            // A source sealed before this column existed. Typed nulls are what
+            // it holds for those rows.
+            None => Arc::new(Literal::new(
+                ScalarValue::try_from(field.data_type()).map_err(|e| {
+                    lance_core::Error::internal(format!(
+                        "no null literal for column '{name}' of type {}: {e}",
+                        field.data_type()
+                    ))
+                })?,
+            )),
         };
         project_exprs.push((expr, name.clone()));
     }
@@ -303,7 +370,7 @@ mod tests {
         let s = schema();
         let pks = vec!["id".to_string()];
         let user = vec!["_distance".to_string(), "vector".to_string()];
-        let out = canonical_output_schema(Some(&user), &s, &pks, true);
+        let out = canonical_output_schema(Some(&user), &s, &pks, true).unwrap();
         let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_distance", "vector", "id"]);
         assert_eq!(
@@ -322,7 +389,7 @@ mod tests {
             "_rowaddr".to_string(),
             "_rowoffset".to_string(),
         ];
-        let out = canonical_output_schema(Some(&user), &s, &pks, false);
+        let out = canonical_output_schema(Some(&user), &s, &pks, false).unwrap();
         let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
@@ -340,7 +407,7 @@ mod tests {
         let s = schema();
         let pks = vec!["id".to_string()];
         let user = vec!["vector".to_string()];
-        let out = canonical_output_schema(Some(&user), &s, &pks, true);
+        let out = canonical_output_schema(Some(&user), &s, &pks, true).unwrap();
         let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["vector", "id", "_distance"]);
     }
@@ -350,10 +417,84 @@ mod tests {
         let s = schema();
         let pks = vec!["id".to_string()];
         let user = vec!["_distance".to_string(), "vector".to_string()];
-        let out = canonical_output_schema(Some(&user), &s, &pks, false);
+        let out = canonical_output_schema(Some(&user), &s, &pks, false).unwrap();
         let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
         // _distance dropped because include_distance=false (e.g. point lookup / scan).
         assert_eq!(names, vec!["vector", "id"]);
+    }
+
+    /// `meta: Struct<a, b, c>` alongside flat columns.
+    fn nested_schema() -> SchemaRef {
+        use arrow_schema::Fields;
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "meta",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Int64, true),
+                    Field::new("b", DataType::Utf8, true),
+                    Field::new("c", DataType::Float64, true),
+                ])),
+                true,
+            ),
+        ]))
+    }
+
+    fn struct_children(schema: &SchemaRef, name: &str) -> Vec<String> {
+        match schema.field_with_name(name).unwrap().data_type() {
+            DataType::Struct(fields) => fields.iter().map(|f| f.name().clone()).collect(),
+            other => panic!("{name} is not a struct: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_schema_narrows_a_struct_to_the_selected_leaf() {
+        let s = nested_schema();
+        let pks = vec!["id".to_string()];
+        let user = vec!["meta.a".to_string()];
+        let out = canonical_output_schema(Some(&user), &s, &pks, false).unwrap();
+        let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["meta", "id"]);
+        assert_eq!(struct_children(&out, "meta"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn canonical_schema_merges_sibling_leaves_at_the_parents_position() {
+        let s = nested_schema();
+        let pks = vec!["id".to_string()];
+        // Two leaves of one parent must collapse into a single `meta` column,
+        // seated where the parent was first mentioned.
+        let user = vec!["meta.a".to_string(), "id".to_string(), "meta.c".to_string()];
+        let out = canonical_output_schema(Some(&user), &s, &pks, false).unwrap();
+        let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["meta", "id"]);
+        assert_eq!(
+            struct_children(&out, "meta"),
+            vec!["a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_schema_keeps_a_whole_struct_whole() {
+        let s = nested_schema();
+        let pks = vec!["id".to_string()];
+        let user = vec!["meta".to_string()];
+        let out = canonical_output_schema(Some(&user), &s, &pks, false).unwrap();
+        assert_eq!(
+            struct_children(&out, "meta"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_accepts_a_nested_path_and_rejects_a_bogus_child() {
+        let s = nested_schema();
+        validate_projection_names(Some(&["meta.a".to_string()]), &s, &[]).unwrap();
+        let err = validate_projection_names(Some(&["meta.nope".to_string()]), &s, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("meta.nope"),
+            "error should name the bad column, got: {err}"
+        );
     }
 
     #[test]

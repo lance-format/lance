@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
-use arrow::array::Float32Array;
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
@@ -21,9 +21,9 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     DocumentGranularity,
     query::{
-        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-        PhraseQuery as FtsPhraseQuery,
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery,
+        CombinedFieldsQuery as FtsCombinedFieldsQuery, FtsQuery, MatchQuery as FtsMatchQuery,
+        MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur, PhraseQuery as FtsPhraseQuery,
     },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -173,6 +173,33 @@ pub(crate) fn build_full_text_search_query<'a>(
             query = query.with_operator(operator);
 
             Ok(FtsQuery::MultiMatch(query))
+        }
+        "COMBINED_FIELDS" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let columns: Vec<String> =
+                import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                    let jstr = JString::from(elem);
+                    let value: String = env.get_string(&jstr)?.into();
+                    Ok(value)
+                })?;
+
+            let boosts: Option<Vec<f32>> =
+                env.get_optional_from_method(&java_obj, "getBoosts", |env, list_obj| {
+                    import_vec_to_rust(env, &list_obj, |env, elem| {
+                        env.get_f32_from_method(&elem, "floatValue")
+                    })
+                })?;
+            let operator = env.get_fts_operator_from_method(&java_obj)?;
+
+            // Column uniqueness and boost (>= 1) validation live in the Rust core;
+            // `?` surfaces those errors across the JNI boundary.
+            let mut query = FtsCombinedFieldsQuery::try_new(query_text, columns)?;
+            if let Some(boosts) = boosts {
+                query = query.try_with_boosts(boosts)?;
+            }
+            query = query.with_operator(operator);
+
+            Ok(FtsQuery::CombinedFields(query))
         }
         "BOOST" => {
             let positive_obj = env
@@ -381,9 +408,49 @@ pub(crate) fn build_scanner_with_options<'a>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        scanner
-            .nearest(&column, &key, k)
-            .map_err(|err| Error::input_error(err.to_string()))?;
+        let query_vector_dim = env
+            .call_method(&java_obj, "getQueryVectorDim", "()I", &[])?
+            .i()?;
+        if query_vector_dim > 0 {
+            // The core interprets a list-shaped query against a multivector column as ONE
+            // multivector query (no `query_index`), which would silently break the
+            // `setKeys` batch contract, so reject it here.
+            if let Some(field) = dataset.schema().field(&column)
+                && matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            {
+                return Err(Error::input_error(format!(
+                    "Batch vector search (setKeys) is not supported on multivector column '{}' \
+                     of type {:?}",
+                    column,
+                    field.data_type()
+                )));
+            }
+            // Batch nearest-neighbor search: the flat buffer packs multiple query
+            // vectors of `query_vector_dim` values each. Wrapping it in a FixedSizeList
+            // makes the core scanner run a shared partition scan across the batch and
+            // emit a `query_index` column tagging each result row with its query.
+            let batch_keys = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                query_vector_dim,
+                Arc::new(key) as ArrayRef,
+                None,
+            )
+            .map_err(|e| {
+                Error::input_error(format!(
+                    "Failed to construct FixedSizeListArray for batch query: {e}"
+                ))
+            })?;
+            scanner
+                .nearest(&column, &batch_keys, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        } else {
+            scanner
+                .nearest(&column, &key, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        }
 
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);

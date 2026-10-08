@@ -918,18 +918,24 @@ impl RleEncoder {
             8 => buffer.as_ref().iter().map(|value| *value as u64).max(),
             16 => buffer
                 .as_ref()
-                .chunks_exact(2)
-                .map(|value| u16::from_le_bytes(value.try_into().unwrap()) as u64)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|value| u16::from_le_bytes(*value) as u64)
                 .max(),
             32 => buffer
                 .as_ref()
-                .chunks_exact(4)
-                .map(|value| u32::from_le_bytes(value.try_into().unwrap()) as u64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|value| u32::from_le_bytes(*value) as u64)
                 .max(),
             64 => buffer
                 .as_ref()
-                .chunks_exact(8)
-                .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|value| u64::from_le_bytes(*value))
                 .max(),
             _ => {
                 return Err(Error::invalid_input_source(

@@ -31,15 +31,15 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 1 << 5;
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 1 << 6;
 /// Some index declares covering columns: `IndexMetadata.covering_fields` names
-/// columns the index carries values for but is not keyed on.
+/// columns the index carries values for, whether or not it is also keyed on
+/// them.
 ///
-/// Covering makes `fields` mean "keyed columns followed by carried columns"
-/// rather than "the columns this index is searched on". A reader without this
-/// bit still selects a vector index by testing membership of `fields`, so it
-/// would answer a query on a merely-carried column with an index keyed on a
-/// different column and return wrong neighbours with no error. A writer without
-/// it would maintain the index as though every entry of `fields` were keyed.
-/// Both must refuse the table.
+/// Without [`FLAG_INDEPENDENT_COVERING_FIELDS`], the carried columns form the
+/// trailing suffix of `fields` in emission order. A reader without this bit still selects
+/// a vector index by testing membership of `fields`, so it would answer a query
+/// on a merely-carried column with an index keyed on a different column and
+/// return wrong neighbours with no error. A writer without it would maintain the
+/// index as though every entry of `fields` were keyed. Both must refuse the table.
 ///
 /// This takes the bit reclaimed from the retired MemWAL index-catchup flag
 /// (<https://github.com/lance-format/lance/pull/8680>), which is the boundary the
@@ -56,33 +56,80 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The table uses stable row ids and carries a fragment reuse index.
 ///
-/// Reserved ahead of its implementation. This build treats the bit as unknown
-/// (see `supported_flags_when`), so a build that knows the flag but not the
-/// handling behind it cannot open such a table.
+/// Understood only by debug builds until support is released (see
+/// [`frag_reuse_with_stable_row_ids_enabled`]).
 pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// Tagged FRI requires a reader that interprets its mappings and a writer that
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+/// Some fragment stores a row lineage sequence -- its row ids, or its
+/// created-at or last-updated-at versions -- as a hidden column of a data file
+/// rather than inline in the manifest (`RowIdMeta::Column`,
+/// `RowDatasetVersionMeta::Column`).
+///
+/// A reader without this bit sees an unset `row_id_sequence` oneof and would
+/// take the fragment to have no row ids at all, on a table whose manifest says
+/// every fragment has them; a writer without it would carry the fragment
+/// forward and drop the sequence. Both must refuse the table.
+///
+/// Every earlier build has its unknown boundary at or below this bit, so each
+/// already refuses such a dataset without a change of its own. Spilled row
+/// lineage is not yet a released feature: this build understands the bit only
+/// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
+/// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
+pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Reserved for fragment trees. Readers and writers reject it until implemented.
+///
+/// Bit 11 is spilled row lineage, so this takes the next free bit.
+pub const FLAG_FRAGMENT_TREE: u64 = 1 << 12;
+/// Index key fields and covering fields are declared independently.
+///
+/// When this flag is set, `IndexMetadata.fields` contains only the columns the
+/// index is keyed on and `IndexMetadata.covering_fields` separately contains
+/// the columns whose values the index carries. A field may occur in both lists.
+/// The flag requires [`FLAG_COVERED_INDEX_METADATA`] in both feature words, and
+/// the two are retained together while the independent bit is set.
+///
+/// Reserved ahead of its implementation. This build masks the bit out in
+/// `supported_flags_when`, so it cannot open a table and apply the legacy
+/// suffix contract to independent declarations.
+pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 13;
+/// Blob v2 descriptors may independently address Lance-owned objects. Readers
+/// must resolve their explicit bases and writers/GC must preserve those references.
+/// This capability is sticky, including across restore, and requires both words.
+pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
+
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 11;
+pub const FLAG_UNKNOWN: u64 = 1 << 15;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
-// Same fence for the stable-row-id fragment-reuse bit: the released build's
-// boundary is bit 8, so anything at or above it is refused there.
-const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 8);
+// Same fence for this bit: v12.0.0 refuses bit 9 and up.
+const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 9);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_FRAGMENT_TREE < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
+const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
+
+pub(crate) const STICKY_PAIRED_FLAGS: u64 =
+    FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX | FLAG_MANAGED_BLOBS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
+
+/// Environment variable that opts a release build into reading and writing row
+/// lineage sequences spilled to hidden data file columns before the feature is
+/// generally released.
+pub const ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV: &str =
+    "LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE";
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -153,6 +200,15 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
+    let has_spilled_row_lineage = manifest
+        .fragments
+        .iter()
+        .any(|frag| frag.has_spilled_row_lineage());
+    if has_spilled_row_lineage {
+        manifest.reader_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+        manifest.writer_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -188,6 +244,20 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
+/// Whether this build understands row lineage sequences spilled to data file
+/// columns: always in debug builds, and in release builds only when
+/// [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set, like data overlay files.
+pub fn spilled_row_lineage_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_some()
+}
+
+/// Debug builds only, with no environment override, until continuous recording
+/// and retention land. Hidden because it is removed then.
+#[doc(hidden)]
+pub fn frag_reuse_with_stable_row_ids_enabled() -> bool {
+    cfg!(debug_assertions)
+}
+
 /// Clear `flag` from `flags` when its gating feature is not enabled in this
 /// build; leave it set otherwise. One call per unstable flag, so support for
 /// several unstable features chains cleanly.
@@ -197,26 +267,42 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
     }
 }
 
-/// The feature-flag bits this build understands, given whether overlay support
-/// is enabled. Split out from [`supported_flags`] so the policy is testable
+/// The feature-flag bits this build understands, given which unstable features
+/// are enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
-fn supported_flags_when(overlay_enabled: bool) -> u64 {
+fn supported_flags_when(
+    overlay_enabled: bool,
+    spilled_row_lineage_enabled: bool,
+    frag_reuse_with_stable_row_ids_enabled: bool,
+) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
+    mark_supported(
+        &mut supported,
+        FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+        frag_reuse_with_stable_row_ids_enabled,
+    );
+    mark_supported(
+        &mut supported,
+        FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+        spilled_row_lineage_enabled,
+    );
     // Reserved, not implemented: see the flag's doc comment.
-    mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
-    // Bit 10 now falls below the unknown boundary, so keep tagged FRI refused
-    // until its reader/writer handling lands.
-    mark_supported(&mut supported, FLAG_FRAGMENT_REUSE_INDEX, false);
+    mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
+    mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     supported
 }
 
 fn supported_flags() -> u64 {
-    supported_flags_when(data_overlay_files_enabled())
+    supported_flags_when(
+        data_overlay_files_enabled(),
+        spilled_row_lineage_enabled(),
+        frag_reuse_with_stable_row_ids_enabled(),
+    )
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
@@ -272,14 +358,29 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
-    let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
-    if reader != writer {
+    if (manifest.reader_feature_flags ^ manifest.writer_feature_flags) & FLAG_FRAGMENT_REUSE_INDEX
+        != 0
+    {
         return Err(Error::corrupt_file_named(
             "manifest",
-            "Manifest has only one of the mixed data-file-version reader and writer feature bits set, \
-             so its semantics are undefined",
+            "FRI requires both reader and writer feature flags",
         ));
+    }
+
+    for (flag, name) in [
+        (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
+        (FLAG_MANAGED_BLOBS, "Managed Blob"),
+    ] {
+        let reader = manifest.reader_feature_flags & flag != 0;
+        let writer = manifest.writer_feature_flags & flag != 0;
+        if reader != writer {
+            return Err(Error::corrupt_file_named(
+                "manifest",
+                format!(
+                    "Manifest has only one of the {name} reader and writer feature bits set, so its semantics are undefined"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -291,6 +392,20 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tagged_fri_flag_is_supported_and_sticky() {
+        let flag = super::FLAG_FRAGMENT_REUSE_INDEX;
+        assert!(super::can_read_dataset(flag));
+        assert!(super::can_write_dataset(flag));
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = flag;
+        assert!(super::ensure_can_read_manifest(&manifest).is_err());
+        manifest.writer_feature_flags = flag;
+        super::apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & flag, flag);
+        assert_eq!(manifest.writer_feature_flags & flag, flag);
+    }
+
     /// The covering fence only works if the bit is one the current released
     /// build already rejects. That build's unknown boundary is 128, so the bit
     /// has to be 128 and this build has to have moved its own boundary past it
@@ -314,40 +429,50 @@ mod tests {
     use super::*;
     use crate::format::BasePath;
 
-    /// Reserved ahead of its implementation: refused for reading and writing
-    /// until the handling lands, so a build from the gap cannot open the table.
     #[test]
-    fn test_frag_reuse_with_stable_row_ids_flag_is_reserved_not_supported() {
-        use crate::format::{DataStorageFormat, Manifest};
-        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        assert!(!can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
-        assert!(!can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
-
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]);
-        let mut manifest = Manifest::new(
-            Schema::try_from(&arrow_schema).unwrap(),
-            Arc::new(vec![]),
-            DataStorageFormat::default(),
-            HashMap::new(),
+    fn test_fragment_tree_flag_is_reserved_not_supported() {
+        assert_eq!(FLAG_FRAGMENT_TREE, 4096);
+        assert_eq!(
+            FLAG_FRAGMENT_TREE & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS | FLAG_FRAGMENT_REUSE_INDEX),
+            0
         );
-        manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        assert!(matches!(
-            ensure_can_read_manifest(&manifest).unwrap_err(),
-            Error::NotSupported { .. }
-        ));
-        assert!(matches!(
-            ensure_can_write_manifest(&manifest).unwrap_err(),
-            Error::NotSupported { .. }
-        ));
+        assert!(!can_read_dataset(FLAG_FRAGMENT_TREE));
+        assert!(!can_write_dataset(FLAG_FRAGMENT_TREE));
+    }
+
+    #[test]
+    fn test_frag_reuse_with_stable_row_ids_flag_release_gating() {
+        // v12.0.0's unknown boundary, so every released client refuses it.
+        assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, 512);
+        let without_support = supported_flags_when(true, true, false);
+        assert_ne!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !without_support, 0);
+        assert_eq!(FLAG_STABLE_ROW_IDS & !without_support, 0);
+        let enabled = supported_flags_when(false, false, true);
+        assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !enabled, 0);
+        for unrelated in [
+            FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+            FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            FLAG_FRAGMENT_TREE,
+            FLAG_UNKNOWN,
+        ] {
+            assert_ne!(unrelated & !enabled, 0);
+        }
+        assert_eq!(
+            can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS),
+            frag_reuse_with_stable_row_ids_enabled()
+        );
+        assert_eq!(
+            can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS),
+            frag_reuse_with_stable_row_ids_enabled()
+        );
+    }
+
+    #[test]
+    fn test_independent_covering_fields_flag_is_reserved() {
+        assert_eq!(FLAG_INDEPENDENT_COVERING_FIELDS, 8192);
+        let flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert!(!can_read_dataset(flags));
+        assert!(!can_write_dataset(flags));
     }
 
     #[test]
@@ -378,13 +503,29 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false);
+        let supported = supported_flags_when(false, false, false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true);
+        let supported = supported_flags_when(true, false, false);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
+    }
+
+    #[test]
+    fn test_spilled_row_lineage_flag_release_gating() {
+        // Every earlier build has its unknown boundary at or below this bit
+        // (256 for v11, 512 for the v12 and v13 pre-releases, 2048 on main
+        // before this flag), so each refuses the dataset without a change of
+        // its own.
+        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, 2048);
+        // A build that has not opted in refuses the dataset; one that has
+        // understands it, and either way the other known flags still pass.
+        let supported = supported_flags_when(true, false, false);
+        assert_ne!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
+        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS & !supported, 0);
+        let supported = supported_flags_when(true, true, false);
+        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
     }
 
     #[test]
@@ -422,6 +563,73 @@ mod tests {
         );
         assert_ne!(
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+            0
+        );
+    }
+
+    #[test]
+    fn test_apply_feature_flags_sets_spilled_row_lineage_flag() {
+        use crate::format::{DataFile, DataStorageFormat, Fragment, ROW_ID_FIELD_ID, RowIdMeta};
+        use crate::rowids::version::RowDatasetVersionMeta;
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let spilled =
+            DataFile::new_legacy_from_fields("lineage.lance", vec![ROW_ID_FIELD_ID], None);
+        // Each of the three sequences on its own is enough to require the flag.
+        let mut spilled_fragments = Vec::new();
+        for kind in 0..3 {
+            let mut fragment = Fragment::new(kind);
+            fragment.files.push(spilled.clone());
+            // Every fragment of a stable-row-id table carries row ids; the
+            // version-only cases keep theirs inline.
+            fragment.row_id_meta = Some(RowIdMeta::Inline(vec![].into()));
+            match kind {
+                0 => fragment.row_id_meta = Some(RowIdMeta::Column),
+                1 => fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column),
+                _ => fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column),
+            }
+            spilled_fragments.push(fragment);
+        }
+        for fragment in spilled_fragments {
+            let mut manifest = Manifest::new(
+                schema.clone(),
+                Arc::new(vec![fragment]),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            apply_feature_flags(&mut manifest, true, false).unwrap();
+            assert_ne!(
+                manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                0
+            );
+            assert_ne!(
+                manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                0
+            );
+        }
+
+        // An inline sequence does not, so a table whose sequences all fit in
+        // the manifest stays readable by builds without the flag.
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(vec![].into()));
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        apply_feature_flags(&mut manifest, true, false).unwrap();
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
             0
         );
     }
@@ -598,6 +806,38 @@ mod tests {
         assert!(err.to_string().contains("cannot be written"), "{err}");
     }
 
+    #[rstest::rstest]
+    #[case::reader_only(true, false)]
+    #[case::writer_only(false, true)]
+    #[case::paired(true, true)]
+    fn managed_capability_is_paired_and_sticky(#[case] reader: bool, #[case] writer: bool) {
+        let mut source = empty_manifest();
+        source.reader_feature_flags = if reader { FLAG_MANAGED_BLOBS } else { 0 };
+        source.writer_feature_flags = if writer { FLAG_MANAGED_BLOBS } else { 0 };
+        if reader != writer {
+            for error in [
+                ensure_can_read_manifest(&source).unwrap_err(),
+                ensure_can_write_manifest(&source).unwrap_err(),
+            ] {
+                assert!(matches!(error, Error::CorruptFile { .. }));
+                assert!(error.to_string().contains("Managed Blob"));
+            }
+            return;
+        }
+        ensure_can_read_manifest(&source).unwrap();
+        ensure_can_write_manifest(&source).unwrap();
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+        apply_feature_flags(&mut destination, false, false).unwrap();
+        assert!(destination.has_managed_blobs());
+        assert_eq!(
+            destination.writer_feature_flags & FLAG_MANAGED_BLOBS,
+            FLAG_MANAGED_BLOBS
+        );
+        // The released v11.0.0 client only accepts bits below 128.
+        assert_ne!(destination.reader_feature_flags & !(128 - 1), 0);
+    }
+
     fn empty_manifest() -> Manifest {
         use crate::format::DataStorageFormat;
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -615,11 +855,14 @@ mod tests {
     }
 
     #[test]
-    fn mixed_capability_is_below_the_unknown_boundary() {
+    fn paired_capabilities_are_below_the_unknown_boundary() {
         assert!(can_read_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
         assert!(can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(can_read_dataset(FLAG_MANAGED_BLOBS));
+        assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
 }

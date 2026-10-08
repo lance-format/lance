@@ -16,7 +16,6 @@ use super::scanner::get_default_batch_size;
 use super::versions;
 use super::write::{GenericWriter, cleanup_data_fragments};
 use crate::dataset::FileFragment;
-use crate::dataset::utils::SchemaAdapter;
 
 /// Update or insert a new column.
 ///
@@ -44,9 +43,6 @@ pub struct Updater {
 
     /// The schema the new files will be written in. This only contains new columns.
     write_schema: Option<Schema>,
-
-    /// The adapter to convert the logical data to physical data.
-    schema_adapter: Option<SchemaAdapter>,
 
     allow_external_blob_outside_bases: bool,
 
@@ -121,7 +117,6 @@ impl Updater {
             final_schema,
             // The schema adapter needs the data schema, not the logical schema, so it can't be
             // created until after the first batch is read.
-            schema_adapter: None,
             allow_external_blob_outside_bases: false,
             write_version,
             finished: false,
@@ -244,15 +239,6 @@ impl Updater {
                     .await?,
             );
         }
-
-        let schema_adapter = if let Some(schema_adapter) = self.schema_adapter.as_ref() {
-            schema_adapter
-        } else {
-            self.schema_adapter = Some(SchemaAdapter::new(batch.schema()));
-            self.schema_adapter.as_ref().unwrap()
-        };
-
-        let batch = schema_adapter.to_physical_batch(batch)?;
 
         let writer = self.writer.as_mut().unwrap();
 

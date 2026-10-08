@@ -4,10 +4,11 @@ This guide provides tips and tricks for optimizing the performance of your Lance
 
 ## Logging
 
-Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
-library you are using. For rust, you will need to configure a logging subscriber. For more details
-ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
-logging subscriber that logs to stderr.
+Lance emits log messages through the `log` crate and structured events through the `tracing` crate.
+Rust applications configure their own logger and tracing subscriber, including filtering and output
+destinations; the Rust library does not install either globally. See the
+[log](https://docs.rs/log/latest/log/) and [tracing](https://docs.rs/tracing/latest/tracing/) docs.
+The Python and Java clients configure a default logger that logs to stderr.
 
 The Python/Java logger can be configured with several environment variables:
 

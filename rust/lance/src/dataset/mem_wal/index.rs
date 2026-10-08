@@ -324,7 +324,7 @@ impl MemIndexKind {
 ///
 /// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
 /// grow with future config (e.g. shard-specific tuning).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MemIndexConfig {
     /// BTree index for scalar fields (point lookups, range queries).
     BTree(BTreeIndexConfig),
