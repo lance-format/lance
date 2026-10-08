@@ -13768,19 +13768,9 @@ mod tests {
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
     }
 
-    /// An in-place update on a compaction's output is withdrawn from the index.
-    #[rstest]
-    #[case::other_process(false)]
-    #[case::same_process(true)]
-    #[tokio::test]
-    async fn test_reindex_withdraws_an_in_place_update_after_compaction(
-        #[case] same_process: bool,
-    ) {
-        use crate::dataset::{
-            MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
-        };
-        let dir = TempStrDir::default();
-        // `spare` keeps the update in place.
+    /// Two fragments of `id`, `val` and `spare`, indexed on `id`. `spare` keeps
+    /// an update of `val` in place.
+    async fn indexed_three_column_dataset(uri: &str) -> Dataset {
         let batch = record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),
             ("val", Int32, (0..12).map(|v| v * 10).collect::<Vec<_>>()),
@@ -13795,18 +13785,25 @@ mod tests {
             ..Default::default()
         };
         let reader = RecordBatchIterator::new([Ok(batch)], schema);
-        let mut dataset = Dataset::write(reader, dir.as_str(), Some(params))
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
         create_scalar_index(&mut dataset, "id", false).await;
-        let mut builder = index_builder(&dataset, dir.as_str(), same_process).await;
-        let options = CompactionOptions {
+        dataset
+    }
+
+    fn compact_into_one(fold_overlays: bool) -> CompactionOptions {
+        CompactionOptions {
             target_rows_per_fragment: 12,
             defer_index_remap: true,
+            max_overlays_per_fragment: fold_overlays.then_some(0),
             ..Default::default()
-        };
-        compact_files(&mut dataset, options, None).await.unwrap();
+        }
+    }
 
+    /// Sets `val` of row 0 to 999, rewriting the column in place.
+    async fn update_val_in_place(dataset: Dataset) {
+        use crate::dataset::{
+            MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+        };
         let patch = record_batch!(("id", Int32, vec![0]), ("val", Int32, vec![999])).unwrap();
         let schema = patch.schema();
         let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
@@ -13820,7 +13817,114 @@ mod tests {
             .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
             .await
             .unwrap();
+    }
+
+    /// An in-place update on a compaction's output is withdrawn from the index.
+    #[rstest]
+    #[case::other_process(false)]
+    #[case::same_process(true)]
+    #[tokio::test]
+    async fn test_reindex_withdraws_an_in_place_update_after_compaction(
+        #[case] same_process: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_three_column_dataset(dir.as_str()).await;
+        let mut builder = index_builder(&dataset, dir.as_str(), same_process).await;
+        compact_files(&mut dataset, compact_into_one(false), None)
+            .await
+            .unwrap();
+        update_val_in_place(dataset).await;
 
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
+    }
+
+    /// Runs `change` against the dataset the first time an index commit is
+    /// attempted, so that attempt loses the race and retries.
+    #[derive(Debug, Default)]
+    struct ChangeBeforeIndexCommit {
+        pending: std::sync::Mutex<Option<Dataset>>,
+        fold_overlay: bool,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommitHandler for ChangeBeforeIndexCommit {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let is_index = transaction
+                .as_ref()
+                .and_then(|transaction| transaction.as_pb().operation.as_ref())
+                .is_some_and(|operation| matches!(operation, PbOperation::CreateIndex(_)));
+            if is_index {
+                self.attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let pending = self.pending.lock().unwrap().take();
+                if let Some(mut dataset) = pending {
+                    if self.fold_overlay {
+                        let fragment_id = dataset.fragments()[0].id;
+                        dataset = commit_overlay(
+                            dataset,
+                            fragment_id,
+                            &[1],
+                            OverlayCoverage::dense(bitmap([0])),
+                            vec![i32_array([Some(999)])],
+                        )
+                        .await;
+                        compact_files(&mut dataset, compact_into_one(true), None)
+                            .await
+                            .unwrap();
+                    } else {
+                        update_val_in_place(dataset).await;
+                    }
+                }
+            }
+            ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    /// A change that makes an index commit retry is checked against the
+    /// rewrites the first attempt already let through.
+    #[rstest]
+    #[case::in_place_update(false)]
+    #[case::folded_overlay(true)]
+    #[tokio::test]
+    async fn test_reindex_retry_rechecks_rewrites_seen_before(#[case] fold_overlay: bool) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_three_column_dataset(dir.as_str()).await;
+        let race = Arc::new(ChangeBeforeIndexCommit {
+            fold_overlay,
+            ..Default::default()
+        });
+        let mut builder = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(crate::session::Session::default()))
+            .with_commit_handler(race.clone())
+            .load()
+            .await
+            .unwrap();
+        compact_files(&mut dataset, compact_into_one(false), None)
+            .await
+            .unwrap();
+        *race.pending.lock().unwrap() = Some(dataset);
+
+        assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
+        assert_eq!(race.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

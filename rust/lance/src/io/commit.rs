@@ -1692,6 +1692,10 @@ pub(crate) async fn commit_transaction(
         indices: read_version_indices.as_slice(),
     });
 
+    // An index commit re-checks everything since its read version on every
+    // attempt, so no rebase state has to survive a lost commit race.
+    let replay_from_read_version = matches!(transaction.operation, Operation::CreateIndex { .. });
+    let read_transaction = transaction;
     let mut transaction = transaction.clone();
     // What a rewrite on a tagged fragment reuse history assembled for the
     // attempt; handed to the manifest build, never written back into
@@ -1723,7 +1727,12 @@ pub(crate) async fn commit_transaction(
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
         if !strict_overwrite {
-            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+            let checked_since = if replay_from_read_version {
+                &read_version_dataset
+            } else {
+                &dataset
+            };
+            (dataset, other_transactions) = load_and_sort_new_transactions(checked_since).await?;
 
             ensure_can_write_manifest(&dataset.manifest)?;
 
@@ -1732,6 +1741,9 @@ pub(crate) async fn commit_transaction(
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
 
+            if replay_from_read_version {
+                transaction = read_transaction.clone();
+            }
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
