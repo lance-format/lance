@@ -71,6 +71,9 @@ use lance_index::prefilter::NoFilter;
 use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::storage::{
+    RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
+};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
 use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 use lance_index::vector::hnsw::HnswMetadata;
@@ -997,6 +1000,27 @@ pub(crate) async fn optimize_vector_indices_v2(
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                derive_hnsw_params(reference_index.as_ref()),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_index_sources(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
+        }
+        // IVF_HNSW_RQ
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
@@ -3022,10 +3046,12 @@ async fn read_hnsw_build_params_from_sources(
 }
 
 fn hnsw_build_params_eq(left: &HnswBuildParams, right: &HnswBuildParams) -> bool {
+    // prefetch_distance only tunes read-ahead during graph walks; segments built
+    // with different values still produce structurally compatible graphs, so it
+    // must not gate segment merges.
     left.max_level == right.max_level
         && left.m == right.m
         && left.ef_construction == right.ef_construction
-        && left.prefetch_distance == right.prefetch_distance
 }
 
 async fn write_hnsw_root_index_from_auxiliary(
@@ -3151,6 +3177,13 @@ async fn build_hnsw_from_storage_batch(
                 read_storage_metadata::<ScalarQuantizationMetadata>(aux_reader, SQ_METADATA_KEY)?;
             let storage =
                 ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+            HNSW::index_vectors(&storage, hnsw_params.clone())
+        }
+        "IVF_HNSW_RQ" => {
+            let metadata =
+                read_storage_metadata::<RabitQuantizationMetadata>(aux_reader, RABIT_METADATA_KEY)?;
+            let storage =
+                RabitQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
             HNSW::index_vectors(&storage, hnsw_params.clone())
         }
         other => Err(Error::index(format!(
@@ -7805,5 +7838,23 @@ mod tests {
                 file.path
             );
         }
+    }
+
+    #[test]
+    fn test_hnsw_build_params_eq_ignores_prefetch_distance() {
+        let base = HnswBuildParams::default();
+        let mut other_prefetch = base.clone();
+        other_prefetch.prefetch_distance = base.prefetch_distance.map(|v| v + 1);
+        assert!(
+            hnsw_build_params_eq(&base, &other_prefetch),
+            "prefetch_distance is a search-time knob and must not gate segment merges"
+        );
+
+        let mut other_m = base.clone();
+        other_m.m += 1;
+        assert!(
+            !hnsw_build_params_eq(&base, &other_m),
+            "graph structure parameters must still be compared"
+        );
     }
 }

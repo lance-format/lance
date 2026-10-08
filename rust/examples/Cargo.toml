@@ -24,6 +24,10 @@ name = "ivf_hnsw"
 path = "src/ivf_hnsw.rs"
 
 [[example]]
+name = "ivf_hnsw_rq"
+path = "src/ivf_hnsw_rq.rs"
+
+[[example]]
 name = "llm_dataset_creation"
 path = "src/llm_dataset_creation.rs"
 
@@ -33,8 +37,10 @@ path = "src/write_read_ds.rs"
 
 [dependencies]
 arrow = { workspace = true }
+arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+lance-arrow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 itertools = { workspace = true }
 futures = { workspace = true }

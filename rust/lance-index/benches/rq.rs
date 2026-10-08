@@ -248,6 +248,7 @@ fn ex_code_storage_load(c: &mut Criterion) {
         num_bits: NUM_BITS,
         packed: true,
         query_estimator: RabitQueryEstimator::RawQuery,
+        with_sym_columns: false,
     };
     let code_len = LOAD_DIM / 8;
     let binary_codes = (0..LOAD_ROWS * code_len)

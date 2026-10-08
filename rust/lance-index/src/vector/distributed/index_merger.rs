@@ -26,7 +26,8 @@ use crate::vector::bq::storage::{
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
-    SCALE_FACTORS_FIELD,
+    SCALE_FACTORS_FIELD, SYM_GAMMA_FIELD, SYM_IP_CENT_FIELD, SYM_RHO_FIELD, SYM_UNORM_FIELD,
+    sym_bin_codes_field,
 };
 use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
@@ -382,6 +383,13 @@ pub async fn init_writer_for_rq(
         fields.push(ex_code_field);
         fields.push(EX_ADD_FACTORS_FIELD.clone());
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
+    }
+    if rq_meta.uses_sym_columns() {
+        fields.push(sym_bin_codes_field(rq_meta.rotated_dim()));
+        fields.push(SYM_RHO_FIELD.clone());
+        fields.push(SYM_GAMMA_FIELD.clone());
+        fields.push(SYM_UNORM_FIELD.clone());
+        fields.push(SYM_IP_CENT_FIELD.clone());
     }
     let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
@@ -973,6 +981,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                     "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                     "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
+                    "IVF_HNSW_RQ" => SupportedIvfIndexType::IvfHnswRq,
                     other => {
                         return Err(Error::index(format!(
                             "Unsupported index type in shard index.idx: {}",
@@ -1102,7 +1111,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     v2w_opt = Some(w);
                 }
             }
-            SupportedIvfIndexType::IvfRq => {
+            SupportedIvfIndexType::IvfRq | SupportedIvfIndexType::IvfHnswRq => {
                 let rq_json = if let Some(rq_json) = reader
                     .metadata()
                     .file_schema
@@ -1171,6 +1180,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                         || existing_rq.num_bits != rq_meta_parsed.num_bits
                         || existing_rq.rotation_type != rq_meta_parsed.rotation_type
                         || existing_rq.query_estimator != rq_meta_parsed.query_estimator
+                        || existing_rq.with_sym_columns != rq_meta_parsed.with_sym_columns
                         || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
                 {
                     return Err(Error::index(format!(
@@ -1603,7 +1613,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     .await?;
             }
         }
-        SupportedIvfIndexType::IvfRq => {
+        SupportedIvfIndexType::IvfRq | SupportedIvfIndexType::IvfHnswRq => {
             let partition_window_size = *PARTITION_WINDOW_SIZE;
             let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
             let mut shard_merge_reader = ShardMergeReader::new(
@@ -2753,6 +2763,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
 
         write_rq_partial_aux(
@@ -2885,6 +2896,7 @@ mod tests {
             num_bits: 1,
             packed: true,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
 
         write_rq_partial_aux(
@@ -2947,6 +2959,7 @@ mod tests {
             num_bits: 4,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
 
         write_rq_partial_aux(

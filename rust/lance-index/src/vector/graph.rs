@@ -262,6 +262,11 @@ fn process_neighbors_with_look_ahead<F>(
 {
     match look_ahead {
         Some(look_ahead) => {
+            // Prime the pipeline, otherwise the first `look_ahead` neighbors of
+            // every hop are fetched cold.
+            for neighbor in neighbors.iter().take(look_ahead) {
+                dist_calc.prefetch(*neighbor);
+            }
             for i in 0..neighbors.len().saturating_sub(look_ahead) {
                 dist_calc.prefetch(neighbors[i + look_ahead]);
                 process_neighbor(neighbors[i]);

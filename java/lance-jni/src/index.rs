@@ -212,7 +212,9 @@ fn determine_index_type<'local>(
         } else if lower.contains("rtree") {
             Some("RTREE")
         } else if lower.contains("ivfhnsw") {
-            if lower.contains("sq") {
+            if lower.contains("rq") {
+                Some("IVF_HNSW_RQ")
+            } else if lower.contains("sq") {
                 Some("IVF_HNSW_SQ")
             } else if lower.contains("pq") {
                 Some("IVF_HNSW_PQ")

@@ -1034,6 +1034,10 @@ def test_index_type(tmp_path):
             "IVF_HNSW_FLAT",
             {"max_level": 2, "m": 4, "ef_construction": 16},
         ),
+        (
+            "IVF_HNSW_RQ",
+            {"num_bits": 5, "max_level": 2, "m": 4, "ef_construction": 16},
+        ),
     ]
     rng = np.random.default_rng(42)
     vectors = rng.standard_normal((64, 32), dtype=np.float32)
@@ -1416,7 +1420,9 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
-def _assert_recall_at_least(ds, query, metric=None, k=10, recall_requirement=0.5):
+def _assert_recall_at_least(
+    ds, query, metric=None, k=10, recall_requirement=0.5, **index_kwargs
+):
     nearest = {"column": "vector", "q": query, "k": k}
     if metric is not None:
         nearest["metric"] = metric
@@ -1426,6 +1432,7 @@ def _assert_recall_at_least(ds, query, metric=None, k=10, recall_requirement=0.5
         "index_type": "IVF_RQ",
         "num_partitions": 4,
         "num_bits": 9,
+        **index_kwargs,
     }
     if metric is not None:
         create_index_kwargs["metric"] = metric
@@ -1512,6 +1519,56 @@ def test_create_ivf_rq_mostly_null():
         nearest={"column": "vector", "q": q, "k": 10},
     )
     assert result.num_rows == 10
+
+
+def test_create_ivf_hnsw_rq_index():
+    ds = lance.write_dataset(create_table(nvec=256, ndim=32), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=2,
+        num_bits=2,
+    )
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_RQ"
+
+    q = np.random.randn(32).astype(np.float32)
+    result = ds.to_table(nearest={"column": "vector", "q": q, "k": 10})
+    assert result.num_rows == 10
+
+    # 1-bit IVF_HNSW_RQ is supported: the graph walks without an ex-code
+    # rerank layer.
+    ds_1bit = lance.write_dataset(create_table(nvec=64, ndim=32), "memory://")
+    ds_1bit = ds_1bit.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=1,
+        num_bits=1,
+    )
+    stats_1bit = ds_1bit.stats.index_stats("vector_idx")
+    assert stats_1bit["index_type"] == "IVF_HNSW_RQ"
+    assert stats_1bit["indices"][0]["sub_index"]["num_bits"] == 1
+
+    # IVF_HNSW_RQ defaults to 5-bit: the ex-code reranks the 1-bit warmup.
+    ds_default = lance.write_dataset(create_table(nvec=64, ndim=32), "memory://")
+    ds_default = ds_default.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=1,
+    )
+    stats_default = ds_default.stats.index_stats("vector_idx")
+    assert stats_default["indices"][0]["sub_index"]["num_bits"] == 5
+
+
+def test_create_ivf_hnsw_rq_recall():
+    rng = np.random.default_rng(42)
+    mat = rng.standard_normal((1000, 128)).astype(np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(range(len(mat))))
+
+    ds = lance.write_dataset(tbl, "memory://")
+    ds = _assert_recall_at_least(ds, mat[0], index_type="IVF_HNSW_RQ", num_bits=5)
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["index_type"] == "IVF_HNSW_RQ"
 
 
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):

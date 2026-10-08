@@ -449,6 +449,7 @@ pub fn get_vector_index_params(
                 },
             )?;
 
+            let has_hnsw = hnsw_params.is_some();
             if let Some(hnsw_params) = hnsw_params {
                 stages.push(StageParams::Hnsw(hnsw_params));
             }
@@ -531,7 +532,12 @@ pub fn get_vector_index_params(
                 },
             )?;
 
-            if let Some(rq_params) = rq_params {
+            if let Some(mut rq_params) = rq_params {
+                if has_hnsw {
+                    // Same contract as VectorIndexParams::with_ivf_hnsw_rq_params:
+                    // write `__sym_*` and walk on the 1-bit warmup.
+                    rq_params.with_sym_columns = true;
+                }
                 stages.push(StageParams::RQ(rq_params));
             }
 

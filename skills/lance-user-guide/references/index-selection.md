@@ -29,6 +29,7 @@ Common combinations:
 - `IVF_HNSW_SQ`: IVF clustering + HNSW + SQ
 - `IVF_SQ`: IVF clustering + SQ
 - `IVF_RQ`: IVF clustering + RQ
+- `IVF_HNSW_RQ`: IVF clustering + HNSW + multi-bit RQ (`num_bits > 1`)
 - `IVF_FLAT`: IVF clustering + no quantization (exact vectors within clusters)
 
 If you are unsure which types are supported in the user's environment, recommend starting with `IVF_PQ` and fall back to "try and see" (the API will error on unsupported types).

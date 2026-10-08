@@ -1719,6 +1719,7 @@ mod tests {
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{Dimension, RowCount, array};
     use lance_file::version::LanceFileVersion;
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
@@ -2797,6 +2798,17 @@ mod tests {
                     prefetch_distance: Some(1),
                 },
                 SQBuildParams::default()
+            ),
+            VectorIndexParams::with_ivf_hnsw_rq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams {
+                    max_level: 3,
+                    m: 12,
+                    ef_construction: 80,
+                    prefetch_distance: Some(1),
+                },
+                RQBuildParams::new(5)
             )
         )]
         index_params: VectorIndexParams,
@@ -2895,7 +2907,10 @@ mod tests {
         );
         if matches!(
             index_params.index_type(),
-            IndexType::IvfHnswFlat | IndexType::IvfHnswPq | IndexType::IvfHnswSq
+            IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq
         ) {
             let hnsw_params = logical_index
                 .iter()

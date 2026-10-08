@@ -535,6 +535,21 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
             .iter()
             .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
     }
+
+    /// Re-score `results` and keep the first `k`. Default is truncate-only.
+    ///
+    /// Returns `true` when scores were recomputed. PQ/SQ/FLAT keep the
+    /// HNSW beam order.
+    fn rerank(
+        &self,
+        _query: ArrayRef,
+        _dist_q_c: f32,
+        k: usize,
+        results: &mut Vec<OrderedNode>,
+    ) -> bool {
+        results.truncate(k);
+        false
+    }
 }
 
 pub struct StorageBuilder<Q: Quantization> {

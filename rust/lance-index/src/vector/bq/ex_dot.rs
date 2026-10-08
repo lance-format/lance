@@ -278,6 +278,18 @@ fn unpack_group(ex_bits: u8, group_codes: &[u8], out: &mut [u8; 64]) {
     }
 }
 
+/// Extra-code of `dim_idx` from a blocked row (natural dim order).
+pub fn blocked_ex_code_value(row_codes: &[u8], dim_idx: usize, ex_bits: u8) -> u8 {
+    debug_assert!((1..=8).contains(&ex_bits));
+    let dims = group_dims(ex_bits);
+    let bytes = group_bytes(ex_bits);
+    let group = dim_idx / dims;
+    let start = group * bytes;
+    let mut unpacked = [0u8; EX_DOT_BLOCK_DIMS];
+    unpack_group(ex_bits, &row_codes[start..start + bytes], &mut unpacked);
+    unpacked[dim_idx % dims]
+}
+
 /// Decode a validated blocked row into per-dim values, reusing `values`.
 pub(crate) fn unpack_blocked_row(codes: &[u8], ex_bits: u8, dim: usize, values: &mut Vec<u8>) {
     values.clear();

@@ -191,6 +191,10 @@ name = "residual_transform"
 harness = false
 
 [[bench]]
+name = "sym_dist"
+harness = false
+
+[[bench]]
 name = "two_file_shuffle_read"
 harness = false
 

@@ -163,6 +163,25 @@ public class JNITest {
   }
 
   @Test
+  public void testIvfHnswRqIndexParams() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(15).build();
+    HnswBuildParams hnsw =
+        new HnswBuildParams.Builder()
+            .setMaxLevel((short) 10)
+            .setM(30)
+            .setEfConstruction(200)
+            .setPrefetchDistance(3)
+            .build();
+    RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 2).build();
+
+    JniTestHelper.parseIndexParams(
+        IndexParams.builder()
+            .setVectorIndexParams(
+                VectorIndexParams.withIvfHnswRqParams(DistanceType.L2, ivf, hnsw, rq))
+            .build());
+  }
+
+  @Test
   public void testInvalidCombinationPqAndSq() {
     IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(10).build();
     PQBuildParams pq = new PQBuildParams.Builder().build();

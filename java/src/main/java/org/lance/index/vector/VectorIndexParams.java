@@ -45,8 +45,11 @@ public class VectorIndexParams {
         > 1) {
       throw new IllegalArgumentException("Only one of PQ, SQ, or RQ can be specified at a time.");
     }
-    if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
-      throw new IllegalArgumentException("HNSW must be combined with either PQ or SQ");
+    if (hnswParams.isPresent()
+        && !pqParams.isPresent()
+        && !sqParams.isPresent()
+        && !rqParams.isPresent()) {
+      throw new IllegalArgumentException("HNSW must be combined with PQ, SQ, or RQ");
     }
   }
 
@@ -169,6 +172,26 @@ public class VectorIndexParams {
         .setDistanceType(distanceType)
         .setHnswParams(hnsw)
         .setSqParams(sq)
+        .build();
+  }
+
+  /**
+   * Create a new IVF HNSW index with RQ quantizer. The dataset is partitioned into IVF partitions,
+   * and each partition builds an HNSW graph. 1-bit {@code numBits} is supported; it builds the
+   * graph without an ex-code rerank layer.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param ivf the IVF build parameters
+   * @param hnsw the HNSW build parameters
+   * @param rq the RQ build parameters
+   * @return the VectorIndexParams
+   */
+  public static VectorIndexParams withIvfHnswRqParams(
+      DistanceType distanceType, IvfBuildParams ivf, HnswBuildParams hnsw, RQBuildParams rq) {
+    return new Builder(ivf)
+        .setDistanceType(distanceType)
+        .setHnswParams(hnsw)
+        .setRqParams(rq)
         .build();
   }
 

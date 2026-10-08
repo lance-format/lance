@@ -2411,6 +2411,7 @@ impl DirectoryNamespace {
             "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(IndexType::IvfHnswRq),
             other => Err(NamespaceError::InvalidInput {
                 message: format!("Unsupported index_type '{}'", other),
             }
@@ -2560,6 +2561,15 @@ impl DirectoryNamespace {
                     IvfBuildParams::default(),
                     HnswBuildParams::default(),
                     SQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfHnswRq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_hnsw_rq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    HnswBuildParams::default(),
+                    RQBuildParams::new(5),
                 ),
             },
             IndexType::IvfHnswPq => DirectoryIndexParams::Vector {
@@ -6238,6 +6248,31 @@ mod tests {
             )),
             "unexpected error message: {message}"
         );
+    }
+
+    #[test]
+    fn test_build_index_params_ivf_hnsw_rq_default_num_bits() {
+        // SymRaBitQ reranks the 1-bit warmup with the ex-code, so IVF_HNSW_RQ
+        // defaults to the same 5-bit width as the other entry points.
+        let request = CreateTableIndexRequest::new("vector".to_string(), "IVF_HNSW_RQ".to_string());
+
+        let DirectoryIndexParams::Vector {
+            index_type: IndexType::IvfHnswRq,
+            params,
+        } = DirectoryNamespace::build_index_params(&request).unwrap()
+        else {
+            panic!("expected IVF_HNSW_RQ vector index params");
+        };
+        match params.stages.as_slice() {
+            [
+                StageParams::Ivf(_),
+                StageParams::Hnsw(_),
+                StageParams::RQ(rq),
+            ] => {
+                assert_eq!(rq.num_bits, 5)
+            }
+            stages => panic!("expected IVF, HNSW and RQ stages, got {stages:?}"),
+        }
     }
 
     #[test]

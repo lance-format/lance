@@ -482,6 +482,30 @@ impl VectorIndexParams {
         }
     }
 
+    /// Create index parameters with `IVF`, `HNSW` and `RQ` parameters.
+    ///
+    /// Sets `with_sym_columns` so the index writes `__sym_*`. Flat `IVF_RQ` does not.
+    pub fn with_ivf_hnsw_rq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+        mut rq: RQBuildParams,
+    ) -> Self {
+        rq.with_sym_columns = true;
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::Hnsw(hnsw),
+            StageParams::RQ(rq),
+        ];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+            skip_transpose: false,
+            runtime_hints: HashMap::new(),
+        }
+    }
+
     pub fn index_type(&self) -> IndexType {
         let len = self.stages.len();
         match (len, self.stages.get(1), self.stages.last()) {
@@ -493,6 +517,7 @@ impl VectorIndexParams {
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::RQ(_))) => IndexType::IvfHnswRq,
             _ => IndexType::Vector,
         }
     }
@@ -1107,6 +1132,40 @@ pub(crate) async fn build_distributed_vector_index(
             return Ok((segment_uuid, summary.files));
         }
 
+        IndexType::IvfHnswRq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let StageParams::RQ(rq_params) = &stages[2] else {
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let ivf_model = make_ivf_model();
+            let summary = IvfIndexBuilder::<HNSW, RabitQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir.clone(),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(rq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model)
+            .with_transpose(false)
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+            return Ok((segment_uuid, summary.files));
+        }
+
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
                 return Err(Error::index(format!(
@@ -1485,6 +1544,36 @@ async fn build_vector_index_impl(
             .await?;
             Ok(summary.files)
         }
+        IndexType::IvfHnswRq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let StageParams::RQ(rq_params) = &stages[2] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let summary = IvfIndexBuilder::<HNSW, RabitQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().clone().join(uuid.to_string()),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(rq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_optional_fragment_filter(fragment_ids)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+            Ok(summary.files)
+        }
         _ => Err(Error::index(format!(
             "Build Vector Index: invalid index type: {:?}",
             index_type
@@ -1742,9 +1831,22 @@ pub(crate) async fn build_vector_index_incremental(
                     return Ok(summary);
                 }
                 QuantizationType::Rabit => {
-                    return Err(Error::index(
-                        "Rabit quantization is not supported for HNSW index".to_string(),
-                    ));
+                    let summary = IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                        OptimizeOptions::append(),
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                    return Ok(summary);
                 }
             }
         }
@@ -2111,9 +2213,14 @@ pub async fn initialize_vector_index(
                     )
                 }
                 QuantizationType::Rabit => {
-                    return Err(Error::index(
-                        "Rabit quantization is not supported for HNSW index".to_string(),
-                    ));
+                    let rabit_quantizer: RabitQuantizer = quantizer.try_into()?;
+                    let rabit_params = derive_rabit_params(&rabit_quantizer);
+                    VectorIndexParams::with_ivf_hnsw_rq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        rabit_params,
+                    )
                 }
             }
         }
@@ -2225,6 +2332,8 @@ fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
         rotation_type: rabit_quantizer.rotation_type(),
         rotation: None,
+        query_estimator: rabit_quantizer.metadata_ref().query_estimator,
+        with_sym_columns: rabit_quantizer.metadata_ref().with_sym_columns,
     }
 }
 
@@ -2293,7 +2402,7 @@ fn vector_index_type(index: &dyn VectorIndex) -> IndexType {
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
         (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
-        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::Vector,
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
     }
 }
 
@@ -2374,10 +2483,15 @@ pub(crate) fn fresh_vector_segment_params(
             )
         }
         (SubIndexType::Hnsw, QuantizationType::Rabit) => {
-            return Err(Error::index(
-                "Cannot build a fresh IVF_HNSW_RQ segment: this index type is unsupported"
-                    .to_string(),
-            ));
+            let quantizer: RabitQuantizer = quantizer.try_into()?;
+            let mut rq_params = derive_rabit_params(&quantizer);
+            rq_params.with_sym_columns = true;
+            VectorIndexParams::with_ivf_hnsw_rq_params(
+                metric_type,
+                ivf_params,
+                derive_hnsw_params(index),
+                rq_params,
+            )
         }
     })
 }

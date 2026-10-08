@@ -4050,6 +4050,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_FLAT",
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
+            "IVF_HNSW_RQ",
             "IVF_RQ",
         ]
         if index_type not in valid_index_types:
@@ -4388,7 +4389,8 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.
         index_type : str
             The type of the index.
-            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
+            ``"IVF_PQ, IVF_HNSW_PQ, IVF_HNSW_SQ, IVF_HNSW_RQ and IVF_RQ"`` are
+            supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -4519,6 +4521,13 @@ class LanceDataset(pa.dataset.Dataset):
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
 
+        Optional parameters for `IVF_HNSW_RQ`:
+
+            - num_bits
+                The number of bits for RQ. Default is 5. Values above 1 add an
+                ex-code rerank layer, which improves recall at the cost of
+                storage and build time.
+
         Optional parameters for `IVF_HNSW_*`:
             max_level
                 Int, the maximum number of levels in the graph.
@@ -4551,6 +4560,18 @@ class LanceDataset(pa.dataset.Dataset):
                 "vector",
                 "IVF_HNSW_SQ",
                 num_partitions=256,
+            )
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_HNSW_RQ",
+                num_partitions=256,
+                num_bits=5,
             )
 
         Experimental Accelerator (GPU) support:
@@ -7199,10 +7220,10 @@ class ScannerBuilder:
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently only affects
-            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-            setting. ``fast`` favors lower latency and may reduce recall,
-            ``normal`` uses the default balance, and ``accurate`` favors higher
-            recall and may increase latency.
+            RQ-quantized indexes, such as IVF_RQ and IVF_HNSW_RQ. Other index
+            types ignore this setting. ``fast`` favors lower latency and may
+            reduce recall, ``normal`` uses the default balance, and
+            ``accurate`` favors higher recall and may increase latency.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -8499,10 +8520,10 @@ def _build_vector_search_query(
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently only affects
-        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-        setting. ``fast`` favors lower latency and may reduce recall,
-        ``normal`` uses the default balance, and ``accurate`` favors higher
-        recall and may increase latency.
+        RQ-quantized indexes, such as IVF_RQ and IVF_HNSW_RQ. Other index
+        types ignore this setting. ``fast`` favors lower latency and may
+        reduce recall, ``normal`` uses the default balance, and ``accurate``
+        favors higher recall and may increase latency.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper

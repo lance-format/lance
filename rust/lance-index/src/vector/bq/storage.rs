@@ -14,7 +14,8 @@ use std::sync::{
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
@@ -53,9 +54,14 @@ use crate::vector::bq::ex_dot::{
 };
 use crate::vector::bq::prune::{PRUNE_LANES, ScaledLowerBoundTerms, scaled_prune_mask_kernel};
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
+use crate::vector::bq::sym::{
+    ResidualWarmupQuery, SymFactors, const_scaling_factor_3ex, padded_code_dim,
+    prepare_residual_warmup_query, sym_bin_code_bytes, sym_dist, warmup_ip_x0_q,
+};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
-    SCALE_FACTORS_COLUMN,
+    SCALE_FACTORS_COLUMN, SYM_BIN_CODES_COLUMN, SYM_COLUMNS, SYM_GAMMA_COLUMN, SYM_IP_CENT_COLUMN,
+    SYM_RHO_COLUMN, SYM_UNORM_COLUMN,
 };
 use crate::vector::bq::{
     RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
@@ -67,6 +73,7 @@ use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
 };
+use crate::vector::utils::do_prefetch;
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
@@ -265,6 +272,10 @@ pub struct RabitQuantizationMetadata {
     pub packed: bool,
     #[serde(default = "default_query_estimator_compat")]
     pub query_estimator: RabitQueryEstimator,
+    /// Whether the storage carries the SymRaBitQ `__sym_*` columns.
+    /// Only `IVF_HNSW_RQ` sets this. Absent on older metadata, so default false.
+    #[serde(default)]
+    pub with_sym_columns: bool,
 }
 
 impl RabitQuantizationMetadata {
@@ -281,6 +292,11 @@ impl RabitQuantizationMetadata {
 
     pub fn binary_code_bytes(&self) -> usize {
         rabit_binary_code_bytes(self.rotated_dim())
+    }
+
+    /// The `__sym_*` columns back the HNSW walk. Flat `IVF_RQ` never sets this.
+    pub fn uses_sym_columns(&self) -> bool {
+        self.with_sym_columns
     }
 }
 
@@ -497,6 +513,45 @@ pub struct RabitQuantizationStorage {
     packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
+    /// `__sym_*` columns, cloned at load so HNSW `from_id` does not re-resolve them.
+    sym_pair: Option<CachedSymPair>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSymPair {
+    bin: FixedSizeListArray,
+    rho: Float32Array,
+    gamma: Float32Array,
+    unorm: Float32Array,
+    ip_cent: Float32Array,
+    /// Lib `get_const_scaling_factors`, resolved once per load.
+    t_const: f64,
+}
+
+impl CachedSymPair {
+    fn from_batch_if_present(batch: &RecordBatch, code_dim: usize) -> Option<Self> {
+        has_sym_columns(batch).then(|| Self {
+            bin: batch[SYM_BIN_CODES_COLUMN].as_fixed_size_list().clone(),
+            rho: batch[SYM_RHO_COLUMN].as_primitive::<Float32Type>().clone(),
+            gamma: batch[SYM_GAMMA_COLUMN]
+                .as_primitive::<Float32Type>()
+                .clone(),
+            unorm: batch[SYM_UNORM_COLUMN]
+                .as_primitive::<Float32Type>()
+                .clone(),
+            ip_cent: batch[SYM_IP_CENT_COLUMN]
+                .as_primitive::<Float32Type>()
+                .clone(),
+            t_const: const_scaling_factor_3ex(padded_code_dim(code_dim)),
+        })
+    }
+
+    fn bin_values(&self) -> (&[u8], usize) {
+        (
+            self.bin.values().as_primitive::<UInt8Type>().values(),
+            self.bin.value_length() as usize,
+        )
+    }
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -514,6 +569,55 @@ impl DeepSizeOf for RabitQuantizationStorage {
 impl RabitQuantizationStorage {
     fn code_dim(&self) -> usize {
         self.metadata.code_dim()
+    }
+
+    fn sym_pair_table(&self) -> SymPairTable<'_> {
+        let pair = self
+            .sym_pair
+            .as_ref()
+            .expect("SymRaBitQ storage requires cached __sym_* columns");
+        let (bin, bin_stride) = pair.bin_values();
+        let (ex, ex_stride) = match self.ex_codes.as_ref() {
+            Some(ex) => (
+                ex.values().as_primitive::<UInt8Type>().values().as_ref(),
+                ex.value_length() as usize,
+            ),
+            None => (&[][..], 0),
+        };
+        SymPairTable {
+            bin,
+            bin_stride,
+            ex,
+            ex_stride,
+            rho: pair.rho.values(),
+            gamma: pair.gamma.values(),
+            unorm: pair.unorm.values(),
+            ip_cent: pair.ip_cent.values(),
+            code_dim: self.code_dim(),
+            num_bits: self.metadata.num_bits,
+            distance_type: self.distance_type,
+        }
+    }
+
+    fn require_sym_from_id(&self) {
+        if self.sym_pair.is_none() {
+            unimplemented!("RabitQ does not support dist_calculator_from_id");
+        }
+        if !matches!(self.distance_type, DistanceType::L2 | DistanceType::Dot) {
+            unimplemented!("SymRaBitQ from_id only supports L2 and Dot");
+        }
+    }
+
+    /// Attach the Lib 4-bit warmup so `distance(id)` scores the 1-bit HNSW walk
+    /// from `__sym_bin_codes`. `with_sym_columns` implies binary-only walk
+    /// scoring for every `num_bits`; `rerank` and `dist_calculator_from_id`
+    /// deliberately build their calculators without it.
+    fn maybe_enable_sym_warmup<'a>(&'a self, calc: &mut RabitDistCalculator<'a>) {
+        if self.metadata.with_sym_columns
+            && let Some(pair) = &self.sym_pair
+        {
+            calc.enable_sym_warmup(pair);
+        }
     }
 
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
@@ -838,6 +942,81 @@ struct RabitQueryFactors {
     error: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SymPairRow<'a> {
+    factors: SymFactors,
+    bin: &'a [u8],
+    ex: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
+struct SymPairTable<'a> {
+    bin: &'a [u8],
+    bin_stride: usize,
+    ex: &'a [u8],
+    ex_stride: usize,
+    rho: &'a [f32],
+    gamma: &'a [f32],
+    unorm: &'a [f32],
+    ip_cent: &'a [f32],
+    code_dim: usize,
+    num_bits: u8,
+    distance_type: DistanceType,
+}
+
+impl<'a> SymPairTable<'a> {
+    fn row(&self, id: usize) -> SymPairRow<'a> {
+        let bin_off = id * self.bin_stride;
+        let ex_off = id * self.ex_stride;
+        SymPairRow {
+            factors: SymFactors {
+                rho: self.rho[id],
+                gamma: self.gamma[id],
+                unorm: self.unorm[id],
+                ip_cent: self.ip_cent[id],
+            },
+            bin: &self.bin[bin_off..bin_off + self.bin_stride],
+            ex: &self.ex[ex_off..ex_off + self.ex_stride],
+        }
+    }
+
+    fn distance(&self, a: SymPairRow<'a>, b: SymPairRow<'a>) -> f32 {
+        sym_dist(
+            &a.factors,
+            a.bin,
+            a.ex,
+            &b.factors,
+            b.bin,
+            b.ex,
+            self.code_dim,
+            self.num_bits,
+            self.distance_type,
+        )
+    }
+}
+
+struct SymFromIdCalculator<'a> {
+    src: SymPairRow<'a>,
+    table: SymPairTable<'a>,
+    n: usize,
+}
+
+impl DistCalculator for SymFromIdCalculator<'_> {
+    fn distance(&self, id: u32) -> f32 {
+        self.table.distance(self.src, self.table.row(id as usize))
+    }
+
+    fn distance_all(&self, _: usize) -> Vec<f32> {
+        (0..self.n as u32).map(|id| self.distance(id)).collect()
+    }
+
+    fn prefetch(&self, id: u32) {
+        let row = self.table.row(id as usize);
+        do_prefetch(row.bin.as_ptr_range());
+        do_prefetch(row.ex.as_ptr_range());
+    }
+}
+
 struct RabitDistCalculatorParts<'a> {
     dim: usize,
     dist_table: Cow<'a, [f32]>,
@@ -904,6 +1083,12 @@ pub struct RabitDistCalculator<'a> {
 
     sum_q: f32,
     sqrt_d: f32,
+    /// Set by `dist_calculator_from_id`. Query calculators leave this empty.
+    sym: Option<SymFromIdCalculator<'a>>,
+    /// Contiguous `__sym_bin_codes` for the 1-bit walk.
+    sym_bin: Option<(&'a [u8], usize)>,
+    /// Lib 4-bit query warmup. Set only for the HNSW walk.
+    sym_warmup: Option<ResidualWarmupQuery>,
 }
 
 impl<'a> RabitDistCalculator<'a> {
@@ -952,7 +1137,28 @@ impl<'a> RabitDistCalculator<'a> {
             add_factor_offset: 0.0,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
+            sym: None,
+            sym_bin: None,
+            sym_warmup: None,
         }
+    }
+
+    fn enable_sym_warmup(&mut self, pair: &'a CachedSymPair) {
+        let (bin, stride) = pair.bin_values();
+        self.sym_bin = Some((bin, stride));
+        let rotated = &self.ex_query.as_ref()[..self.dim];
+        self.sym_warmup = Some(prepare_residual_warmup_query(rotated, pair.t_const));
+    }
+
+    /// Whether `distance(id)` scores 1-bit only, reading the per-row add/scale
+    /// factors of every candidate instead of the ex codes. The HNSW walk
+    /// (`sym_warmup`) is binary-only for every `num_bits`; multi-bit raw-query
+    /// rescoring (`rerank`) is not.
+    fn scores_binary_only(&self) -> bool {
+        self.sym_warmup.is_some()
+            || self.num_bits <= 1
+            || self.approx_mode == ApproxMode::Fast
+            || self.query_estimator == RabitQueryEstimator::ResidualQuery
     }
 
     /// `sum_d query[d] * ex_code[d]` for the candidate's packed ex codes.
@@ -1846,9 +2052,88 @@ pub(crate) fn load_blocked_ex_codes(
     Ok((batch, blocked))
 }
 
+pub(crate) fn has_sym_columns(batch: &RecordBatch) -> bool {
+    SYM_COLUMNS
+        .iter()
+        .all(|name| batch.column_by_name(name).is_some())
+}
+
+fn require_sym_columns(batch: &RecordBatch, metadata: &RabitQuantizationMetadata) -> Result<()> {
+    if !metadata.uses_sym_columns() {
+        return Ok(());
+    }
+    if !has_sym_columns(batch) {
+        return Err(Error::index(format!(
+            "IVF_HNSW_RQ num_bits={} requires the {:?} columns; rebuild the index",
+            metadata.num_bits, SYM_COLUMNS
+        )));
+    }
+    // The symmetric distance kernels read these columns through raw pointers, so
+    // a corrupt partition file must be rejected here before any unchecked access.
+    let bin_codes_column = batch[SYM_BIN_CODES_COLUMN].as_ref();
+    let bin_codes = bin_codes_column.as_fixed_size_list_opt().ok_or_else(|| {
+        Error::corrupt_file_named(
+            SYM_BIN_CODES_COLUMN,
+            format!(
+                "expected a fixed-size list of u8, got {:?}",
+                bin_codes_column.data_type()
+            ),
+        )
+    })?;
+    let expected_bytes = sym_bin_code_bytes(metadata.code_dim());
+    if bin_codes.value_length() as usize != expected_bytes {
+        return Err(Error::corrupt_file_named(
+            SYM_BIN_CODES_COLUMN,
+            format!(
+                "binary code width mismatch: column has {} bytes per row, metadata code_dim={} requires {} bytes",
+                bin_codes.value_length(),
+                metadata.code_dim(),
+                expected_bytes
+            ),
+        ));
+    }
+    for name in [
+        SYM_RHO_COLUMN,
+        SYM_GAMMA_COLUMN,
+        SYM_UNORM_COLUMN,
+        SYM_IP_CENT_COLUMN,
+    ] {
+        let factor_column = batch[name].as_ref();
+        if factor_column.as_primitive_opt::<Float32Type>().is_none() {
+            return Err(Error::corrupt_file_named(
+                name,
+                format!(
+                    "expected a float32 column, got {:?}",
+                    factor_column.data_type()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
+        if let Some(sym) = &self.sym {
+            return sym.distance(id);
+        }
+        if let (Some((bin, stride)), Some(warmup)) = (self.sym_bin, self.sym_warmup.as_ref()) {
+            let id = id as usize;
+            let off = id * stride;
+            let ip = warmup_ip_x0_q(
+                &bin[off..off + stride],
+                &warmup.planes,
+                warmup.delta,
+                warmup.vl,
+            );
+            // Same factor wrap as `raw_query_binary_distance`, with the warmup
+            // 4-bit estimate standing in for the exact 1-bit IP. The
+            // scale/offset pair only diverges from the identity for Dot.
+            return self.add_factor_scale * (self.add_factors[id] - self.add_factor_offset)
+                + self.query_factor
+                + self.scale_factors[id] * (ip + warmup.k1xsumq);
+        }
         let id = id as usize;
         let code_len = rabit_binary_code_bytes(self.dim);
         let num_vectors = self.codes.len() / code_len;
@@ -1951,6 +2236,32 @@ impl DistCalculator for RabitDistCalculator<'_> {
             quantized_dists,
             quantized_dists_table,
         );
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, id: u32) {
+        if let Some(sym) = &self.sym {
+            sym.prefetch(id);
+            return;
+        }
+        let id = id as usize;
+        if let Some((bin, stride)) = self.sym_bin {
+            let off = id * stride;
+            do_prefetch(bin[off..off + stride].as_ptr_range());
+        }
+        if self.scores_binary_only() {
+            // The 1-bit walk reads add/scale for every candidate; they live in
+            // their own columns rather than next to the code.
+            do_prefetch(self.add_factors[id..id + 1].as_ptr_range());
+            do_prefetch(self.scale_factors[id..id + 1].as_ptr_range());
+        } else if let Some(ex) = self.ex_codes
+            && self.ex_code_len > 0
+        {
+            // Only the multi-bit rescore (`rerank`) reaches this branch; the
+            // walk calculator is binary-only and never reads ex codes.
+            let off = id * self.ex_code_len;
+            do_prefetch(ex[off..off + self.ex_code_len].as_ptr_range());
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2175,14 +2486,16 @@ impl VectorStore for RabitQuantizationStorage {
             padded
         };
 
-        self.distance_calculator_from_parts(RabitDistCalculatorParts {
+        let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
             dim: code_dim,
             dist_table: Cow::Owned(dist_table),
             ex_query: Cow::Owned(ex_query),
             sum_q,
             query_factors,
             approx_mode: ApproxMode::Normal,
-        })
+        });
+        self.maybe_enable_sym_warmup(&mut calc);
+        calc
     }
 
     // qr = (q-c)
@@ -2208,7 +2521,7 @@ impl VectorStore for RabitQuantizationStorage {
             debug_assert_eq!(raw_query.ex_bits, self.metadata.num_bits - 1);
             let query_factors =
                 self.raw_query_factors(dist_q_c, &raw_query.rotated_query, rotated_centroid);
-            return self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
                 dim: code_dim,
                 dist_table: Cow::Borrowed(&raw_query.dist_table),
                 ex_query: Cow::Borrowed(kernel_query(
@@ -2219,6 +2532,8 @@ impl VectorStore for RabitQuantizationStorage {
                 query_factors,
                 approx_mode: options.approx_mode,
             });
+            self.maybe_enable_sym_warmup(&mut calc);
+            return calc;
         }
 
         let dist_table_len = code_dim * 4;
@@ -2274,7 +2589,7 @@ impl VectorStore for RabitQuantizationStorage {
         };
 
         let ex_query_start = code_dim + dist_table_len;
-        self.distance_calculator_from_parts(RabitDistCalculatorParts {
+        let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
             dim: code_dim,
             dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_query_start]),
             ex_query: Cow::Borrowed(kernel_query(
@@ -2284,13 +2599,76 @@ impl VectorStore for RabitQuantizationStorage {
             sum_q,
             query_factors,
             approx_mode: options.approx_mode,
-        })
+        });
+        self.maybe_enable_sym_warmup(&mut calc);
+        calc
     }
 
-    // TODO: implement this
-    // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
-    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        unimplemented!("RabitQ does not support dist_calculator_from_id")
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+        self.require_sym_from_id();
+        let table = self.sym_pair_table();
+        let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: self.code_dim(),
+            dist_table: Cow::Owned(Vec::new()),
+            ex_query: Cow::Owned(Vec::new()),
+            sum_q: 0.0,
+            query_factors: RabitQueryFactors {
+                add_scale: 1.0,
+                add_offset: 0.0,
+                add: 0.0,
+                error: 0.0,
+            },
+            approx_mode: ApproxMode::Normal,
+        });
+        calc.sym = Some(SymFromIdCalculator {
+            src: table.row(id as usize),
+            table,
+            n: self.len(),
+        });
+        calc
+    }
+
+    fn rerank(
+        &self,
+        query: ArrayRef,
+        dist_q_c: f32,
+        k: usize,
+        results: &mut Vec<OrderedNode>,
+    ) -> bool {
+        if self.metadata.num_bits <= 1 || results.is_empty() {
+            results.truncate(k);
+            return false;
+        }
+        // Walk scores are the 1-bit warmup. Rescore the beam with ex codes.
+        let code_dim = self.code_dim();
+        let rotated_qr = self.rotate_query_vector(code_dim, &query);
+        let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
+        let query_factors = self.raw_query_factors(dist_q_c, &rotated_qr, None);
+        let sum_q = rotated_qr.iter().copied().sum();
+        let ex_query = if code_dim.is_multiple_of(EX_DOT_BLOCK_DIMS) {
+            rotated_qr
+        } else {
+            let mut padded = vec![0.0; padded_query_len(code_dim)];
+            pad_query_into(&rotated_qr, &mut padded);
+            padded
+        };
+        let calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: code_dim,
+            dist_table: Cow::Owned(dist_table),
+            ex_query: Cow::Owned(ex_query),
+            sum_q,
+            query_factors,
+            approx_mode: ApproxMode::Normal,
+        });
+        for i in 0..results.len() {
+            if let Some(next) = results.get(i + 1) {
+                calc.prefetch(next.id);
+            }
+            results[i].dist = OrderedFloat(calc.distance(results[i].id));
+        }
+        results.sort_unstable_by_key(|node| node.dist);
+        results.truncate(k);
+        true
     }
 }
 
@@ -2540,6 +2918,12 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 expected_code_bytes
             )));
         }
+        if metadata.with_sym_columns && metadata.query_estimator != RabitQueryEstimator::RawQuery {
+            return Err(Error::invalid_input(
+                "SymRaBitQ (with_sym_columns) storage must use the raw-query estimator; rebuild the index"
+                    .to_string(),
+            ));
+        }
         let add_factors = batch[ADD_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
@@ -2602,6 +2986,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 metadata.num_bits
             )));
         }
+        require_sym_columns(&batch, metadata)?;
 
         let (batch, codes) = if !metadata.packed {
             let codes = pack_codes(&codes);
@@ -2616,6 +3001,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         metadata.packed = true;
         let packed_ex_codes =
             maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
+        let sym_pair = CachedSymPair::from_batch_if_present(&batch, metadata.rotated_dim());
 
         let storage = Self {
             metadata,
@@ -2630,6 +3016,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            sym_pair,
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
@@ -2721,6 +3108,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let ex_scale_factors = batch
             .column_by_name(EX_SCALE_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
+        let sym_pair = CachedSymPair::from_batch_if_present(&batch, self.metadata.rotated_dim());
 
         Ok(Self {
             metadata: self.metadata.clone(),
@@ -2735,6 +3123,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             ex_add_factors,
             ex_scale_factors,
             row_ids: new_row_ids,
+            sym_pair,
         })
     }
 }
@@ -2859,8 +3248,14 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
+    use crate::vector::bq::transform::{
+        RQTransformer, SYM_GAMMA_FIELD, SYM_IP_CENT_FIELD, SYM_RHO_FIELD, SYM_UNORM_FIELD,
+        sym_bin_codes_field,
+    };
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
+    use crate::vector::transform::Transformer;
+    use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -3299,6 +3694,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
@@ -3425,6 +3821,7 @@ mod tests {
                         num_bits,
                         packed: false,
                         query_estimator: RabitQueryEstimator::RawQuery,
+                        with_sym_columns: false,
                     };
                     let codes = FixedSizeListArray::try_new_from_values(
                         UInt8Array::from(code_bytes),
@@ -3589,6 +3986,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
@@ -3760,6 +4158,7 @@ mod tests {
             num_bits,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let code_len = rabit_binary_code_bytes(code_dim);
         let codes = FixedSizeListArray::try_new_from_values(
@@ -3964,6 +4363,7 @@ mod tests {
             num_bits,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let codes = FixedSizeListArray::try_new_from_values(
             UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 19) as u8)),
@@ -4048,6 +4448,7 @@ mod tests {
             num_bits,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let codes = FixedSizeListArray::try_new_from_values(
             UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 19) as u8)),
@@ -4366,6 +4767,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0x00]), 1).unwrap();
@@ -4400,6 +4802,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            with_sym_columns: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
@@ -5109,5 +5512,352 @@ mod tests {
                  error {error} over the {quantization_bound} quantization bound",
             );
         }
+    }
+
+    /// Build a storage through the production transformer so the `__sym_*`
+    /// columns and factors match what IVF_HNSW_RQ writes.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_residuals_storage(
+        num_bits: u8,
+        dim: usize,
+        residuals: &[f32],
+        centroid_value: f32,
+        distance_type: DistanceType,
+        query_estimator: RabitQueryEstimator,
+        with_sym_columns: bool,
+    ) -> RabitQuantizationStorage {
+        let num_rows = residuals.len() / dim;
+        let mut rq = RabitQuantizer::new_with_rotation::<Float32Type>(
+            num_bits,
+            dim as i32,
+            RQRotationType::Fast,
+        );
+        rq.metadata.query_estimator = query_estimator;
+        rq.metadata.with_sym_columns = with_sym_columns;
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![centroid_value; dim]),
+            dim as i32,
+        )
+        .unwrap();
+        let transformer =
+            RQTransformer::new(rq.clone(), distance_type, centroids, "vector").unwrap();
+        let centroid_dists: Vec<f32> = residuals
+            .chunks_exact(dim)
+            .map(|row| row.iter().map(|value| value * value).sum())
+            .collect();
+        let residual_vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(residuals.to_vec()),
+            dim as i32,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(residual_vectors) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0u32; num_rows])) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(centroid_dists)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let transformed = transformer.transform(&batch).unwrap();
+        let with_row_ids = transformed
+            .try_with_column(
+                lance_core::ROW_ID_FIELD.clone(),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            )
+            .unwrap();
+        let mut metadata = rq.metadata(None);
+        metadata.query_estimator = query_estimator;
+        RabitQuantizationStorage::try_from_batch(with_row_ids, &metadata, distance_type, None)
+            .unwrap()
+    }
+
+    /// IVF_HNSW_RQ production shape: raw-query estimator + with_sym_columns.
+    fn encoded_multi_bit_sym_storage(
+        num_bits: u8,
+        distance_type: DistanceType,
+    ) -> RabitQuantizationStorage {
+        let dim = 64usize;
+        let num_rows = 4usize;
+        let mut residuals = Vec::with_capacity(num_rows * dim);
+        for row in 0..num_rows {
+            for d in 0..dim {
+                residuals.push((row as f32 + 1.0) * ((d % 7) as f32 - 3.0) * 0.15);
+            }
+        }
+        encode_residuals_storage(
+            num_bits,
+            dim,
+            &residuals,
+            0.25,
+            distance_type,
+            RabitQueryEstimator::RawQuery,
+            true,
+        )
+    }
+
+    fn residual_query_array(dim: usize) -> (ArrayRef, f32) {
+        let values: Vec<f32> = (0..dim).map(|d| ((d % 5) as f32 - 2.0) * 0.2).collect();
+        let dist_q_c = values.iter().map(|value| value * value).sum();
+        (Arc::new(Float32Array::from(values)) as ArrayRef, dist_q_c)
+    }
+
+    /// The warmup wrap shares its factors with the raw-query path
+    /// (`raw_query_binary_distance`); only the 1-bit IP is approximated by the
+    /// Lib 4-bit warmup.
+    fn expected_warmup_distance(
+        storage: &RabitQuantizationStorage,
+        query: &dyn Array,
+        dist_q_c: f32,
+        id: usize,
+    ) -> f32 {
+        let rotated = storage.rotate_query_vector(storage.code_dim(), query);
+        let pair = storage.sym_pair.as_ref().unwrap();
+        let warmup = prepare_residual_warmup_query(&rotated, pair.t_const);
+        let (bin, stride) = pair.bin_values();
+        let ip = warmup_ip_x0_q(
+            &bin[id * stride..id * stride + stride],
+            &warmup.planes,
+            warmup.delta,
+            warmup.vl,
+        );
+        let factors = storage.raw_query_factors(dist_q_c, &rotated, None);
+        factors.add_scale * (storage.add_factors.values()[id] - factors.add_offset)
+            + factors.add
+            + storage.scale_factors.values()[id] * (ip + warmup.k1xsumq)
+    }
+
+    #[test]
+    fn test_sym_warmup_distance_uses_raw_query_factor_wrap() {
+        // num_bits=1 exercises the no-ex-code sym path; 5 exercises split codes.
+        // Dot is the only metric with a non-identity add-factor wrap.
+        for num_bits in [1u8, 5] {
+            for distance_type in [DistanceType::L2, DistanceType::Dot] {
+                let storage = encoded_multi_bit_sym_storage(num_bits, distance_type);
+                let (query, dist_q_c) = residual_query_array(storage.code_dim());
+                let calc = storage.dist_calculator(query.clone(), dist_q_c);
+                for id in 0..storage.len() {
+                    let got = calc.distance(id as u32);
+                    let want = expected_warmup_distance(&storage, query.as_ref(), dist_q_c, id);
+                    assert!(
+                        (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                        "{num_bits}-bit {distance_type:?} warmup distance({id}): {got} != {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rerank_rescores_walk_results_with_ex_codes() {
+        let storage = encoded_multi_bit_sym_storage(5, DistanceType::L2);
+        let code_dim = storage.code_dim();
+        let (query, dist_q_c) = residual_query_array(code_dim);
+
+        // The walk scores on the 1-bit warmup approximation.
+        let walk = storage.dist_calculator(query.clone(), dist_q_c);
+        let mut results: Vec<OrderedNode> = (0..storage.len() as u32)
+            .map(|id| OrderedNode::new(id, walk.distance(id).into()))
+            .collect();
+        let walk_dists: HashMap<u32, f32> =
+            results.iter().map(|node| (node.id, node.dist.0)).collect();
+
+        // Reference: the raw-query multi-bit calculator `rerank` builds.
+        let rotated = storage.rotate_query_vector(code_dim, &query);
+        let query_factors = storage.raw_query_factors(dist_q_c, &rotated, None);
+        let reference = storage.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: code_dim,
+            dist_table: Cow::Owned(build_dist_table_direct::<Float32Type>(&rotated)),
+            ex_query: Cow::Owned(rotated.clone()),
+            sum_q: rotated.iter().copied().sum(),
+            query_factors,
+            approx_mode: ApproxMode::Normal,
+        });
+
+        assert!(storage.rerank(query, dist_q_c, storage.len(), &mut results));
+        assert_eq!(results.len(), storage.len());
+        for node in &results {
+            let want = reference.distance(node.id);
+            assert!(
+                (node.dist.0 - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "id={}: rerank={} != raw-query multi-bit {want}",
+                node.id,
+                node.dist.0
+            );
+        }
+        assert!(
+            results.windows(2).all(|pair| pair[0].dist <= pair[1].dist),
+            "rerank must leave results sorted by the rescored distance"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|node| (node.dist.0 - walk_dists[&node.id]).abs() > 1e-4),
+            "rescoring with ex codes must move at least one walk score"
+        );
+    }
+
+    #[test]
+    fn test_from_id_distance_matches_sym_dist() {
+        for num_bits in [1u8, 5] {
+            for distance_type in [DistanceType::L2, DistanceType::Dot] {
+                let storage = encoded_multi_bit_sym_storage(num_bits, distance_type);
+                let table = storage.sym_pair_table();
+                for u in 0..storage.len() {
+                    let calc = storage.dist_calculator_from_id(u as u32);
+                    for v in 0..storage.len() {
+                        let want = table.distance(table.row(u), table.row(v));
+                        let got = calc.distance(v as u32);
+                        assert!(
+                            (got - want).abs() <= 1e-5,
+                            "{num_bits}-bit {distance_type:?} from_id({u}).distance({v}): {got} != {want}"
+                        );
+                        let between_uv = storage.dist_between(u as u32, v as u32);
+                        let between_vu = storage.dist_between(v as u32, u as u32);
+                        assert!(
+                            (between_uv - between_vu).abs() <= 1e-5,
+                            "{num_bits}-bit {distance_type:?} dist_between({u},{v})={between_uv} != dist_between({v},{u})={between_vu}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn attach_sym_columns(
+        batch: RecordBatch,
+        code_dim: usize,
+        bin: FixedSizeListArray,
+    ) -> RecordBatch {
+        let num_rows = batch.num_rows();
+        let ones = Arc::new(Float32Array::from(vec![1.0; num_rows])) as ArrayRef;
+        batch
+            .try_with_column(sym_bin_codes_field(code_dim), Arc::new(bin))
+            .unwrap()
+            .try_with_column(SYM_RHO_FIELD.clone(), ones.clone())
+            .unwrap()
+            .try_with_column(SYM_GAMMA_FIELD.clone(), ones.clone())
+            .unwrap()
+            .try_with_column(SYM_UNORM_FIELD.clone(), ones.clone())
+            .unwrap()
+            .try_with_column(SYM_IP_CENT_FIELD.clone(), ones)
+            .unwrap()
+    }
+
+    fn attach_zero_sym_columns(batch: RecordBatch, code_dim: usize) -> RecordBatch {
+        let num_rows = batch.num_rows();
+        let bin_len = sym_bin_code_bytes(code_dim);
+        let bin = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![0u8; num_rows * bin_len]),
+            bin_len as i32,
+        )
+        .unwrap();
+        attach_sym_columns(batch, code_dim, bin)
+    }
+
+    #[test]
+    fn test_try_from_batch_requires_sym_columns_for_multi_bit_rq() {
+        let original_codes = make_test_codes(50, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 2);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 2;
+        metadata.with_sym_columns = true;
+        let complete =
+            attach_zero_sym_columns(make_test_batch_with_ex(original_codes, ex_codes), code_dim);
+
+        for column in SYM_COLUMNS {
+            let err = RabitQuantizationStorage::try_from_batch(
+                complete.drop_column(column).unwrap(),
+                &metadata,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(column) && msg.contains("rebuild"),
+                "{column}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_from_batch_rejects_sym_columns_with_wrong_width() {
+        let original_codes = make_test_codes(4, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 2);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 2;
+        metadata.with_sym_columns = true;
+        let complete =
+            attach_zero_sym_columns(make_test_batch_with_ex(original_codes, ex_codes), code_dim);
+        let num_rows = complete.num_rows();
+
+        // A wider-than-expected __sym_bin_codes row would make the distance
+        // kernels read past the query buffer, so it must be rejected at load.
+        let wrong_bin_len = sym_bin_code_bytes(code_dim) + 8;
+        let wrong_bin = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![0u8; num_rows * wrong_bin_len]),
+            wrong_bin_len as i32,
+        )
+        .unwrap();
+        let corrupt = complete
+            .drop_column(SYM_BIN_CODES_COLUMN)
+            .unwrap()
+            .try_with_column(
+                Field::new(SYM_BIN_CODES_COLUMN, wrong_bin.data_type().clone(), true),
+                Arc::new(wrong_bin),
+            )
+            .unwrap();
+        let err =
+            RabitQuantizationStorage::try_from_batch(corrupt, &metadata, DistanceType::L2, None)
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "unexpected variant: {err:?}"
+        );
+        assert!(err.to_string().contains("width mismatch"), "{}", err);
+    }
+
+    #[test]
+    fn test_try_from_batch_rejects_sym_columns_without_raw_query() {
+        let original_codes = make_test_codes(4, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 2);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 2;
+        metadata.with_sym_columns = true;
+        metadata.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let err = RabitQuantizationStorage::try_from_batch(
+            make_test_batch_with_ex(original_codes, ex_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("raw-query estimator"), "{}", err);
+    }
+
+    #[test]
+    fn test_try_from_batch_opens_multi_bit_raw_query_without_sym_columns() {
+        // Released multi-bit IVF_RQ indexes predate the sym columns entirely.
+        let original_codes = make_test_codes(50, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 2);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 2;
+        assert_eq!(metadata.query_estimator, RabitQueryEstimator::RawQuery);
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch_with_ex(original_codes, ex_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        assert!(storage.sym_pair.is_none());
     }
 }

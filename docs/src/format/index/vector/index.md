@@ -45,6 +45,7 @@ Here are the commonly used combinations:
 | **IVF_HNSW_SQ** | Inverted File with HNSW and Scalar Quantization | Uses IVF for coarse clustering and HNSW for fine-grained search with scalar quantization |
 | **IVF_SQ**      | Inverted File with Scalar Quantization          | Combines IVF clustering with scalar quantization for balanced compression                |
 | **IVF_RQ**      | Inverted File with RabitQ                       | Combines IVF clustering with RabitQ for extreme compression using binary quantization    |
+| **IVF_HNSW_RQ** | Inverted File with HNSW and RabitQ              | Uses IVF for coarse clustering and HNSW for graph search with multi-bit RabitQ           |
 | **IVF_FLAT**    | Inverted File without quantization              | Uses IVF clustering with exact vector storage for precise search within clusters         |
 
 ### Versioning
@@ -52,6 +53,10 @@ Here are the commonly used combinations:
 The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
+
+`IVF_RQ` records `index_version` 2. `IVF_HNSW_RQ` records `index_version` 3.
+Version 3 is the `__sym_*` columns on the auxiliary file. An `IVF_RQ` file does not
+contain those columns, so `IVF_RQ` stays at 2.
 
 ## Storage Layout (V3)
 
@@ -102,7 +107,7 @@ Contains basic index configuration information in JSON:
 
 | JSON Key        | Type   | Expected Values                                           |
 | --------------- | ------ | --------------------------------------------------------- |
-| `type`          | String | Index type (e.g., "IVF_PQ", "IVF_RQ", "IVF_HNSW", "FLAT") |
+| `type`          | String | Index type (e.g., "IVF_PQ", "IVF_RQ", "IVF_HNSW_RQ", "IVF_HNSW", "FLAT") |
 | `distance_type` | String | Distance metric (e.g., "l2", "cosine", "dot")             |
 
 ##### "lance:ivf"
@@ -136,7 +141,7 @@ The `params` object contains the following HNSW construction parameters:
 | `max_level`         | u16           | Maximum level of the HNSW graph                                | 7       |
 | `m`                 | usize         | Number of connections to establish while inserting new element | 20      |
 | `ef_construction`   | usize         | Size of the dynamic list for candidates                        | 150     |
-| `prefetch_distance` | Option<usize> | Number of vectors ahead to prefetch while building             | Some(2) |
+| `prefetch_distance` | Option<usize> | Number of vectors ahead to prefetch while building             | Some(6) |
 
 #### Lance File Global Buffer
 
@@ -215,11 +220,23 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 | `__blocked_ex_codes` | list<uint8>[next_multiple_of(code_dim, 64) * (num_bits - 1) / 8] | true | `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ, in the blocked layout  |
 | `__add_factors_ex`   | float32                                          | true     | `num_bits > 1`              | Additive correction factors for ex-code distance computation    |
 | `__scale_factors_ex` | float32                                          | true     | `num_bits > 1`              | Scale correction factors for ex-code distance computation       |
+| `__sym_bin_codes`    | list<uint8>[ceil(code_dim / 64) * 8]             | true     | `with_sym_columns`          | 1-bit residual sign codes for the HNSW walk                     |
+| `__sym_rho`          | float32                                          | true     | `with_sym_columns`          | L2 norm of the rotated residual                                 |
+| `__sym_gamma`        | float32                                          | true     | `with_sym_columns`          | Normalized inner product of the rotated residual and its centered code |
+| `__sym_unorm`        | float32                                          | true     | `with_sym_columns`          | L2 norm of the centered multi-bit code                          |
+| `__sym_ip_cent`      | float32                                          | true     | `with_sym_columns`          | Inner product of the rotated residual and its centroid, plus half the centroid's squared norm |
 
 !!! note
     Indexes written before the blocked ex-code layout store the same bits in
     `__ex_codes`, sized `ceil(dimension * (num_bits - 1) / 8)`. Readers still
     accept that column and repack it at load time; writers no longer emit it.
+
+!!! note
+    Only `IVF_HNSW_RQ` sets `with_sym_columns`. `IVF_RQ` leaves it false and does
+    not write the five `__sym_*` columns. `__sym_bin_codes` is a different bit
+    layout from `_rabit_codes`: each 64 dimensions are one `u64` word, a positive
+    rotated residual sets the bit, dimension 0 is bit 63, and the word is stored
+    little-endian. `with_sym_columns` requires `query_estimator` `raw_query`.
 
 #### Arrow Schema Metadata
 
@@ -285,6 +302,7 @@ For **RabitQ (RQ)**:
 | `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
 | `query_estimator`     | string | Distance estimator layout: `residual_query` or `raw_query`. Missing values are read as `residual_query` for compatibility with released 1-bit IVF_RQ indexes. |
+| `with_sym_columns`    | bool   | When true, the auxiliary file also stores the five `__sym_*` columns. Only `IVF_HNSW_RQ` sets this. Missing values are false. |
 
 #### Lance File Global Buffer
 
