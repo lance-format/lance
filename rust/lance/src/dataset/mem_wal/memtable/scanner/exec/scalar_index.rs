@@ -19,12 +19,15 @@ use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::Result;
@@ -46,6 +49,15 @@ const MATCH_BUDGET_SHARE: u64 = 16;
 /// Matches always worth listing, whatever the share: about 30 µs of listing,
 /// below what reading a memtable costs.
 const MIN_MATCH_BUDGET: u64 = 4096;
+
+/// The share for a read that returns only each key's newest version. Each
+/// match then costs a seek in the primary-key index, and the read it replaces
+/// hashes every visible key: on 125,000 in-memory rows the two cross between
+/// 1/8 and 1/4 of the rows matching, alike for every index kind measured.
+const NEWEST_ONLY_MATCH_BUDGET_SHARE: u64 = 8;
+
+/// Metric counting the matches checked for being their key's newest version.
+const NEWEST_CHECKS_METRIC: &str = "newest_checks";
 
 /// Execution-plan node answering a filter from the memtable's indexes,
 /// filtered by visibility.
@@ -75,6 +87,14 @@ pub struct ScalarIndexExec {
     with_row_id: bool,
     /// Whether to include _rowaddr column (same as row position) in output.
     with_row_address: bool,
+    /// Keep only the newest visible version of each primary key, given the key
+    /// columns' positions in the stored batches. An older version can match a
+    /// filter its key's newest version fails, and must not be returned.
+    newest_of: Option<Vec<usize>>,
+    /// Run instead when the indexes match too many rows to be worth listing.
+    /// Required with `newest_of`: checking every visible row's key costs more
+    /// than the scan this stands in for.
+    broad_fallback: Option<Arc<dyn ExecutionPlan>>,
 }
 
 impl Debug for ScalarIndexExec {
@@ -136,7 +156,30 @@ impl ScalarIndexExec {
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
             with_row_address,
+            newest_of: None,
+            broad_fallback: None,
         })
+    }
+
+    /// Return only the newest visible version of each primary key, reading
+    /// with `broad_fallback` when the indexes match too many rows to list.
+    pub fn with_newest_check(
+        mut self,
+        pk_indices: Vec<usize>,
+        broad_fallback: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        self.newest_of = Some(pk_indices);
+        self.broad_fallback = Some(broad_fallback);
+        self
+    }
+
+    /// How many matches are worth listing out of `visible_rows`.
+    fn match_budget(&self, visible_rows: u64) -> u64 {
+        if self.newest_of.is_some() {
+            visible_rows / NEWEST_ONLY_MATCH_BUDGET_SHARE
+        } else {
+            (visible_rows / MATCH_BUDGET_SHARE).max(MIN_MATCH_BUDGET)
+        }
     }
 
     /// Last row position within `readable_count`, or None if nothing is
@@ -167,14 +210,20 @@ impl ScalarIndexExec {
             return (Some(Vec::new()), true);
         };
         let visible_rows = max_readable_row + 1;
+        let budget = self.match_budget(visible_rows);
         let mut ctx = SearchContext::new(max_readable_row);
-        // A declined search leaves the rows to the filter, so only offer an
-        // index the choice when there is one to apply.
-        if self.recheck.is_some() {
-            ctx = ctx.with_match_budget((visible_rows / MATCH_BUDGET_SHARE).max(MIN_MATCH_BUDGET));
+        // A declined search leaves the rows to the filter or to the fallback,
+        // so only offer an index the choice when there is one to apply.
+        if self.recheck.is_some() || self.broad_fallback.is_some() {
+            ctx = ctx.with_match_budget(budget);
         }
         match evaluate_index_filter(&self.index_expr, &self.indexes, &ctx) {
             Ok(result) if result.at_most.len() == visible_rows => (None, result.is_exact()),
+            // A budget is a request, so an index may list past it. The fallback
+            // is cheaper than checking that many rows' keys.
+            Ok(result) if self.broad_fallback.is_some() && result.at_most.len() > budget => {
+                (None, result.is_exact())
+            }
             Ok(result) => {
                 let exact = result.is_exact();
                 (Some(result.at_most.into()), exact)
@@ -196,6 +245,8 @@ impl ScalarIndexExec {
         &self,
         candidates: Option<&[u64]>,
         recheck: Option<&PhysicalExprRef>,
+        max_readable_row: Option<u64>,
+        newest_checks: &Count,
     ) -> DataFusionResult<Vec<RecordBatch>> {
         let mut results = Vec::new();
         let mut next = 0;
@@ -248,6 +299,20 @@ impl ScalarIndexExec {
                 }
                 mask = Some(combined);
             }
+            if let (Some(pk_indices), Some(max_readable_row)) = (&self.newest_of, max_readable_row)
+            {
+                let checked = mask
+                    .as_ref()
+                    .map_or(stored.num_rows, |mask| mask.true_count());
+                newest_checks.add(checked);
+                mask = Some(self.keep_newest(
+                    &stored.data,
+                    start,
+                    mask,
+                    pk_indices,
+                    max_readable_row,
+                )?);
+            }
             let kept = mask
                 .as_ref()
                 .map_or(stored.num_rows, |mask| mask.true_count());
@@ -289,6 +354,39 @@ impl ScalarIndexExec {
         }
         Ok(results)
     }
+
+    /// Narrow `mask` (every row when `None`) to the rows that are their key's
+    /// newest visible version: one seek in the primary-key index per row.
+    fn keep_newest(
+        &self,
+        data: &RecordBatch,
+        start: u64,
+        mask: Option<BooleanArray>,
+        pk_indices: &[usize],
+        max_readable_row: u64,
+    ) -> DataFusionResult<BooleanArray> {
+        let rows = data.num_rows();
+        let mut keep = BooleanBufferBuilder::new(rows);
+        keep.append_n(rows, false);
+        let mut check = |row: usize| -> DataFusionResult<()> {
+            let values = pk_indices
+                .iter()
+                .map(|&column| ScalarValue::try_from_array(data.column(column), row))
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            if self
+                .indexes
+                .pk_is_newest(&values, start + row as u64, max_readable_row)
+            {
+                keep.set_bit(row, true);
+            }
+            Ok(())
+        };
+        match &mask {
+            Some(mask) => mask.values().set_indices().try_for_each(&mut check)?,
+            None => (0..rows).try_for_each(&mut check)?,
+        }
+        Ok(BooleanArray::new(keep.finish(), None))
+    }
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -297,9 +395,14 @@ impl DisplayAs for ScalarIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ScalarIndexExec: query={}, rechecked={}, with_row_id={}, with_row_address={}",
+                    "ScalarIndexExec: query={}, rechecked={}{}, with_row_id={}, with_row_address={}",
                     self.index_expr.to_expr(),
                     self.recheck.is_some(),
+                    if self.newest_of.is_some() {
+                        ", newest_only=true"
+                    } else {
+                        ""
+                    },
                     self.with_row_id,
                     self.with_row_address
                 )
@@ -345,11 +448,17 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
+        partition: usize,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        // Query the index
+        let newest_checks =
+            MetricBuilder::new(&self.metrics).counter(NEWEST_CHECKS_METRIC, partition);
         let (positions, exact) = self.query_index();
+        if positions.is_none()
+            && let Some(fallback) = &self.broad_fallback
+        {
+            return fallback.execute(partition, context);
+        }
 
         // An index that only narrows hands back candidates, and so does an
         // exact index answer to part of the filter, so the filter decides here.
@@ -365,7 +474,12 @@ impl ExecutionPlan for ScalarIndexExec {
         } else {
             None
         };
-        let batches = self.read_rows(positions.as_deref(), recheck)?;
+        let batches = self.read_rows(
+            positions.as_deref(),
+            recheck,
+            self.compute_max_readable_row(),
+            &newest_checks,
+        )?;
 
         let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
 

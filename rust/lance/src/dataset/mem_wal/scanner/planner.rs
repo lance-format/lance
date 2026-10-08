@@ -58,6 +58,8 @@ pub struct LsmScanPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
+    /// See [`super::LsmScanner::with_memtable_filter_indexes`].
+    memtable_filter_indexes: bool,
 }
 
 impl LsmScanPlanner {
@@ -77,7 +79,14 @@ impl LsmScanPlanner {
             store_params: None,
             sstable_cache: None,
             warmer: None,
+            memtable_filter_indexes: false,
         }
+    }
+
+    /// See [`super::LsmScanner::with_memtable_filter_indexes`].
+    pub fn with_memtable_filter_indexes(mut self, enabled: bool) -> Self {
+        self.memtable_filter_indexes = enabled;
+        self
     }
 
     /// Set the session used to open SSTables.
@@ -469,6 +478,7 @@ impl LsmScanPlanner {
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
+                scanner.dedup_from_indexes(self.memtable_filter_indexes);
 
                 scanner.create_dedup_plan(&self.pk_columns).await
             }
@@ -2216,6 +2226,88 @@ mod integration_tests {
             vec![1, 3, 4],
             "id=2 deleted; tombstone row not surfaced"
         );
+    }
+
+    /// Answering the in-memory arm from its filter indexes is opt-in, and
+    /// returns the same rows: the newest version of each key, deletes applied.
+    #[tokio::test]
+    async fn test_lsm_scan_memtable_filter_indexes_are_opt_in() {
+        use crate::dataset::mem_wal::index::MemIndexSpec;
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3, 4], "base")],
+            )
+            .await,
+        );
+        // Key 6 is written, then deleted; key 4 is overwritten in memory.
+        let active_batch = ts_batch(
+            &mem_schema,
+            &[
+                (4, Some("active_4"), false),
+                (5, Some("active_5"), false),
+                (6, Some("active_6"), false),
+                (6, None, true),
+            ],
+        );
+        // The key's own index answers no filter, so the filter names a column
+        // with an index of its own.
+        let bs = Arc::new(BatchStore::with_capacity(4));
+        let lance_schema = LanceSchema::try_from(mem_schema.as_ref()).unwrap();
+        let mut ix = IndexStore::from_specs(
+            &[MemIndexSpec::btree("name_idx", 1, "name")],
+            &lance_schema,
+            16,
+            4,
+        )
+        .unwrap();
+        ix.enable_pk_index(&[("id".to_string(), 0)]);
+        let (position, offset, _) = bs.append(active_batch.clone()).unwrap();
+        ix.insert_with_batch_position(&active_batch, offset, Some(position))
+            .unwrap();
+        let ix = Arc::new(ix);
+
+        for enabled in [false, true] {
+            let scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+                .with_in_memory_memtables(
+                    Uuid::new_v4(),
+                    InMemoryMemTables {
+                        active: InMemoryMemTableRef {
+                            batch_store: bs.clone(),
+                            index_store: ix.clone(),
+                            schema: mem_schema.clone(),
+                            generation: 2,
+                        },
+                        frozen: vec![],
+                    },
+                )
+                .with_memtable_filter_indexes(enabled)
+                .filter("name IN ('active_4', 'active_5', 'active_6')")
+                .unwrap();
+            let plan = scanner.create_plan().await.unwrap();
+            let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_sorted_ids(&batches),
+                vec![4, 5],
+                "enabled={enabled}"
+            );
+        }
     }
 
     #[tokio::test]
