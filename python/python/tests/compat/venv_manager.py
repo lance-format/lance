@@ -348,6 +348,20 @@ class VenvExecutor:
             env=env,
         )
 
+    def _recent_stderr(self, max_lines: int = 200) -> str:
+        """Return the tail of the runner's captured stderr, if any.
+
+        A method running in the venv cannot use plain `print()` -- stdout is
+        the binary RPC channel back to this process -- but `print(...,
+        file=sys.stderr)` is safe, and this is what surfaces it.
+        """
+        try:
+            text = self._stderr_path.read_text()
+        except (OSError, AttributeError):
+            return ""
+        lines = [line for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[-max_lines:])
+
     def _last_panic(self) -> str:
         """Pull the panic message from the runner's captured stderr, if any."""
         try:
@@ -446,6 +460,9 @@ class VenvExecutor:
                     f"{response['exception_type']}: {response['exception_msg']}\n"
                     f"\nTraceback from venv:\n{response['traceback']}"
                 )
+                stderr_tail = self._recent_stderr()
+                if stderr_tail:
+                    error_msg += f"\n\nRecent stderr from venv:\n{stderr_tail}"
                 raise RuntimeError(error_msg)
 
         except (BrokenPipeError, EOFError, struct.error) as e:

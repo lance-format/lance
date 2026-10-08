@@ -128,6 +128,52 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         """
         return Version(lance.__version__) == Version(self.compat_version)
 
+    def _debug(self, label: str):
+        """Temporary diagnostics for the upgrade/downgrade[14.0.0b3] failure.
+
+        Writes to stderr, not stdout: a method running in the old venv
+        communicates its return value back over stdout as a binary protocol
+        (see venv_runner.py), so a plain print() here would corrupt it.
+        venv_manager.VenvExecutor.execute_method now attaches the recent
+        stderr tail to any error it raises, so this reaches the CI log
+        whenever the test around it fails.
+        """
+        import sys
+
+        try:
+            ds = lance.dataset(self.path)
+            try:
+                segments = [
+                    {
+                        "name": idx.name,
+                        "segments": [
+                            {
+                                "uuid": str(seg.uuid),
+                                "index_version": seg.index_version,
+                                "fragment_ids": sorted(seg.fragment_ids),
+                            }
+                            for seg in idx.segments
+                        ],
+                    }
+                    for idx in ds.describe_indices()
+                ]
+            except Exception as e:
+                segments = f"<describe_indices() failed: {e!r}>"
+            explain = ds.scanner(filter="btree == 7").explain_plan()
+        except Exception as e:
+            segments = None
+            explain = f"<failed to open dataset: {e!r}>"
+        print(
+            f"[DEBUG BTreeRowAddressDomainIndex] {label}: "
+            f"lance.__version__={lance.__version__!r} "
+            f"compat_version={self.compat_version!r} "
+            f"is_old_build={self._is_old_build()} "
+            f"segments={segments}\n"
+            f"explain=\n{explain}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     def create(self):
         """Create a stable-row-id dataset with a BTREE index."""
         shutil.rmtree(self.path, ignore_errors=True)
@@ -145,8 +191,10 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
             enable_stable_row_ids=True,
         )
         dataset.create_scalar_index("btree", "BTREE")
+        self._debug("after create")
 
     def _assert_queryable(self, expect_index_used: bool):
+        self._debug(f"_assert_queryable(expect_index_used={expect_index_used})")
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
         assert table.num_rows == 1
@@ -180,6 +228,7 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
             }
         )
         ds.insert(data)
+        self._debug("check_write: after insert, before optimize")
         # For a build that cannot see this index at all, there is nothing
         # registered to update, so this is a safe no-op rather than an
         # error. For the current build updating a legacy row-id-domain
@@ -187,6 +236,7 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         # docstring.
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
+        self._debug("check_write: after optimize_indices + compact_files")
 
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
