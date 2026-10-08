@@ -1312,7 +1312,7 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
         use arrow_schema::DataType;
 
         let (column, _) = ctx.single_column()?;
-        ctx.check_columns_resolve()?;
+        ctx.check_top_level_columns()?;
         let field = ctx
             .schema
             .field(column)

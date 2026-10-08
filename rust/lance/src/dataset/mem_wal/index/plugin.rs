@@ -106,6 +106,25 @@ impl MemIndexBuildContext<'_> {
         }
     }
 
+    /// [`check_columns_resolve`](Self::check_columns_resolve), and that each
+    /// covered column is a top-level field.
+    ///
+    /// For a kind that reads its column from a batch by name, which finds only
+    /// top-level columns.
+    pub fn check_top_level_columns(&self) -> Result<()> {
+        self.check_columns_resolve()?;
+        for column in self.columns {
+            if !self.schema.fields.iter().any(|field| &field.name == column) {
+                return Err(Error::invalid_input(format!(
+                    "index '{}' covers the nested column '{column}'; this kind maintains only \
+                     top-level columns",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Check that every covered column is in the schema under the field id the
     /// spec names.
     ///

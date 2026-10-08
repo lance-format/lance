@@ -1508,7 +1508,7 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
     /// any column type the schema can hold. Existence is the only rule.
     fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
         ctx.single_column()?;
-        ctx.check_columns_resolve()
+        ctx.check_top_level_columns()
     }
 
     fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {

@@ -59,7 +59,8 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::index::{
-    MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type, validate_index_specs,
+    MemIndexPlugin, MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type,
+    validate_index_specs,
 };
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
@@ -1058,69 +1059,29 @@ async fn build_index_specs(
             return Err(unsupported_index_type(index_name, type_url, registry));
         };
 
-        let columns = index_meta
-            .fields
-            .iter()
-            .map(|field_id| {
-                dataset
-                    .schema()
-                    .field_by_id(*field_id)
-                    .map(|field| field.name.clone())
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "index '{index_name}' names field {field_id}, which is not in the \
-                             dataset schema"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // The plugin decides what it covers and what it needs; nothing here
-        // knows one kind from another.
-        let resolved = plugin
-            .resolve(&ResolveContext {
-                name: index_name,
-                dataset,
-                index_meta: &index_meta,
-                schema: &shard_schema,
-                columns: &columns,
-                overrides: overrides.get(index_name).map(|o| o.as_ref()),
-            })
-            .await?;
-
-        let field_ids = match resolved.field_ids {
-            Some(field_ids) if field_ids.len() == resolved.columns.len() => field_ids,
-            Some(field_ids) => {
-                return Err(Error::invalid_input(format!(
-                    "index '{index_name}' resolved {} columns but {} field ids",
-                    resolved.columns.len(),
-                    field_ids.len()
-                )));
-            }
-            None => resolved
-                .columns
-                .iter()
-                .map(|column| {
-                    shard_schema
-                    .field(column)
-                    .map(|field| field.id)
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "index '{index_name}' resolved to column '{column}', which is not in \
-                             the shard schema"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        };
-
-        let spec = MemIndexSpec {
-            name: index_name.clone(),
-            field_ids,
-            columns: resolved.columns,
+        let spec = match spec_for_index(
+            dataset,
+            index_name,
+            &index_meta,
             plugin,
-            params: resolved.params,
-            details: index_meta.index_details.clone(),
+            &shard_schema,
+            overrides,
+        )
+        .await?
+        {
+            Ok(spec) => spec,
+            // As below: an index nobody named must not make the table
+            // unwritable because its columns cannot be resolved.
+            Err(error) if on_unsupported == OnUnsupportedIndex::Skip => {
+                log::warn!(
+                    "index '{}' is not one the fresh tier can maintain ({}); \
+                     it will not be maintained",
+                    index_name,
+                    error
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
         };
 
         // Nobody named this one, so a table must not become unwritable for
@@ -1144,6 +1105,99 @@ async fn build_index_specs(
         index_specs.push(spec);
     }
     Ok(index_specs)
+}
+
+/// The spec for one base-table index that `plugin` maintains.
+///
+/// The inner error is an index whose columns cannot be resolved against the
+/// shard schema; the outer one is anything else, such as settings the plugin
+/// refuses.
+async fn spec_for_index(
+    dataset: &Dataset,
+    index_name: &str,
+    index_meta: &lance_table::format::IndexMetadata,
+    plugin: Arc<dyn MemIndexPlugin>,
+    shard_schema: &LanceSchema,
+    overrides: &HashMap<String, Arc<dyn Any + Send + Sync>>,
+) -> Result<Result<MemIndexSpec>> {
+    let columns = match index_meta
+        .fields
+        .iter()
+        .map(|field_id| column_path(dataset.schema(), index_name, *field_id))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(columns) => columns,
+        Err(error) => return Ok(Err(error)),
+    };
+
+    // The plugin decides what it covers and what it needs; nothing here
+    // knows one kind from another.
+    let resolved = plugin
+        .resolve(&ResolveContext {
+            name: index_name,
+            dataset,
+            index_meta,
+            schema: shard_schema,
+            columns: &columns,
+            overrides: overrides.get(index_name).map(|o| o.as_ref()),
+        })
+        .await?;
+
+    let field_ids = match resolved.field_ids {
+        // The base-table index's own columns: its own field ids, so a
+        // lookup by name can never land on a different field.
+        None if resolved.columns == columns => Ok(index_meta.fields.clone()),
+        Some(field_ids) if field_ids.len() == resolved.columns.len() => Ok(field_ids),
+        Some(field_ids) => {
+            return Err(Error::invalid_input(format!(
+                "index '{index_name}' resolved {} columns but {} field ids",
+                resolved.columns.len(),
+                field_ids.len()
+            )));
+        }
+        None => resolved
+            .columns
+            .iter()
+            .map(|column| {
+                shard_schema
+                    .field(column)
+                    .map(|field| field.id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "index '{index_name}' resolved to column '{column}', which is not in \
+                         the shard schema"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>(),
+    };
+    let field_ids = match field_ids {
+        Ok(field_ids) => field_ids,
+        Err(error) => return Ok(Err(error)),
+    };
+
+    Ok(Ok(MemIndexSpec {
+        name: index_name.to_string(),
+        field_ids,
+        columns: resolved.columns,
+        plugin,
+        params: resolved.params,
+        details: index_meta.index_details.clone(),
+    }))
+}
+
+/// The path a query uses for field `field_id`: its name at the top level, and
+/// its full path from the root when nested.
+fn column_path(schema: &LanceSchema, index_name: &str, field_id: i32) -> Result<String> {
+    let ancestry = schema.field_ancestry_by_id(field_id).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "index '{index_name}' names field {field_id}, which is not in the dataset schema"
+        ))
+    })?;
+    match ancestry.as_slice() {
+        [field] => Ok(field.name.clone()),
+        _ => schema.field_path_minimal(field_id),
+    }
 }
 
 /// Whether the MemWAL can maintain `index_names` on `dataset`.
@@ -2095,6 +2149,120 @@ mod tests {
             vec!["v_btree".to_string()]
         );
         writer.close().await.unwrap();
+    }
+
+    /// An index on a nested field is skipped when maintaining every index, so
+    /// the table stays writable, and a top-level field sharing the nested
+    /// field's name keeps its own index under its own field id.
+    #[tokio::test]
+    async fn test_maintain_all_skips_a_nested_index_and_keeps_a_same_named_top_level_one() {
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+
+        for with_top_level_code in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let uri = format!("{}/base", tmp.path().display());
+            let attrs_fields = Fields::from(vec![Field::new("code", DataType::Int32, true)]);
+            let mut fields = vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("attrs", DataType::Struct(attrs_fields.clone()), true),
+            ];
+            if with_top_level_code {
+                fields.push(Field::new("code", DataType::Int32, true));
+            }
+            let schema = Arc::new(ArrowSchema::new(fields));
+            let rows = |ids: std::ops::Range<i32>| {
+                let n = ids.len();
+                let attrs = StructArray::new(
+                    attrs_fields.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        ids.clone().map(|i| i % 7),
+                    ))],
+                    // Every third row's struct is null.
+                    Some(ids.clone().map(|i| i % 3 != 0).collect()),
+                );
+                let mut columns: Vec<arrow_array::ArrayRef> = vec![
+                    Arc::new(Int32Array::from_iter_values(ids.clone())),
+                    Arc::new(attrs),
+                ];
+                if with_top_level_code {
+                    columns.push(Arc::new(Int32Array::from_iter_values(ids.map(|i| i % 5))));
+                }
+                assert_eq!(columns[0].len(), n);
+                RecordBatch::try_new(schema.clone(), columns).unwrap()
+            };
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(rows(0..30))], schema.clone()),
+                &uri,
+                Some(WriteParams::default()),
+            )
+            .await
+            .unwrap();
+            let mut indexes = vec![("attrs.code", "nested_code_btree")];
+            if with_top_level_code {
+                indexes.push(("code", "code_btree"));
+            }
+            for (column, name) in &indexes {
+                dataset
+                    .create_index(
+                        &[*column],
+                        IndexType::BTree,
+                        Some(name.to_string()),
+                        &ScalarIndexParams::default(),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            }
+            dataset
+                .initialize_mem_wal()
+                .unsharded()
+                .execute()
+                .await
+                .unwrap();
+
+            let expected: Vec<String> = if with_top_level_code {
+                vec!["code_btree".to_string()]
+            } else {
+                Vec::new()
+            };
+            let shard_id = Uuid::new_v4();
+            for round in 0..2 {
+                let writer = dataset
+                    .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    writer.maintained_index_names().await,
+                    expected,
+                    "top-level code: {with_top_level_code}, round {round}"
+                );
+                writer
+                    .put(vec![rows(100 * (round + 1)..100 * (round + 1) + 20)])
+                    .await
+                    .unwrap();
+                // Closing flushes the memtable, and the next round reopens the
+                // shard over what it wrote.
+                writer.close().await.unwrap();
+            }
+            if with_top_level_code {
+                let lance_schema = dataset.schema();
+                let spec = maintained_index_specs(
+                    &dataset,
+                    &require_mem_wal_details(&dataset).await.unwrap(),
+                    &ShardWriterConfig::new(shard_id),
+                )
+                .await
+                .unwrap();
+                assert_eq!(spec.len(), 1);
+                assert_eq!(spec[0].columns, vec!["code".to_string()]);
+                assert_eq!(
+                    spec[0].field_ids,
+                    vec![lance_schema.field("code").unwrap().id],
+                    "bound to the top-level field, not the nested one of the same name"
+                );
+            }
+        }
     }
 
     /// A named set is judged by the plugins the writers will have: refused when
