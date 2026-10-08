@@ -3623,6 +3623,56 @@ async fn test_btree_merge_drops_a_fragment_replaced_since_the_compaction() {
     );
 }
 
+/// An in-place update on the compaction's output drops coverage (BTree).
+#[tokio::test]
+async fn test_btree_merge_drops_a_fragment_updated_in_place_since_the_compaction() {
+    use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
+    let (mut dataset, staged, rewritten) = btree_staged_over_a_compaction().await;
+    // A column the patch leaves alone, so the update rewrites `age` in place.
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![("spare".into(), "42".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let patch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("age", DataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(Int32Array::from(vec![999])),
+        ],
+    )
+    .unwrap();
+    let schema = patch.schema();
+    let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+    merge
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns);
+    let (dataset, _) = merge
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+        .await
+        .unwrap();
+    let mut dataset = Arc::unwrap_or_clone(dataset);
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 1, "the update must stay in place");
+    assert_eq!(fragments[0].id() as u64, rewritten);
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("age_staged", "age", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(ids_matching(&dataset, "age = 999").await.len(), 1);
+}
+
 /// An overlay on the compaction's output drops coverage (BTree).
 #[tokio::test]
 async fn test_btree_merge_drops_a_fragment_overlaid_since_the_compaction() {
