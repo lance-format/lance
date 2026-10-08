@@ -1085,7 +1085,10 @@ mod tests {
             let cache =
                 LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(capacity)));
             assert_eq!(cache.max_entry_bytes(), Some(capacity as u64));
-            let admitted = ResidentColumnsSetting::Auto.admits(store, cache.max_entry_bytes());
+            let has_pin_budget = cache.pinned_stats().cap_bytes > 0;
+            assert!(has_pin_budget, "{capacity}");
+            let admitted =
+                ResidentColumnsSetting::Auto.admits(store, cache.max_entry_bytes(), has_pin_budget);
             assert_eq!(admitted, capacity >= 2 * charge, "{capacity}");
             // Lease the store as an index that keeps it resident does.
             let file = test_file(&format!("auto-admits-{capacity}"));

@@ -311,6 +311,12 @@ layered_lazy_counters! {
         /// cache's largest admissible entry than `auto` allows, so `auto`
         /// kept the small columns in the file (`on` keeps them resident).
         resident_columns_oversize,
+        /// Index opens under `auto` whose resident store would fit the index
+        /// cache but whose cache has no pin budget (a backend that never
+        /// pins, such as Moka), so `auto` kept the small columns in the
+        /// file rather than keep a store a lease cannot pin (`on` keeps
+        /// them resident).
+        resident_columns_unpinnable,
         /// Index opens that leased the cached resident store before their
         /// first index-cache access.
         resident_columns_preopen_leases,
