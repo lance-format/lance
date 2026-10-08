@@ -20,6 +20,7 @@ import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.BTreeIndexParams;
@@ -53,7 +54,11 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -2402,6 +2407,53 @@ public class DatasetTest {
             "BTree",
             stats.get("index_type"),
             "Index statistics should contain index_type information");
+
+        Index physicalSegment =
+            dataset.getIndexes().stream()
+                .filter(index -> TestVectorDataset.indexName.equals(index.name()))
+                .findFirst()
+                .orElseThrow();
+        IndexSegmentStatistics segmentStatistics =
+            dataset
+                .getIndexSegmentStatistics(
+                    TestVectorDataset.indexName, Collections.singletonList(physicalSegment.uuid()))
+                .get(0);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+          output.writeObject(segmentStatistics);
+        }
+        IndexSegmentStatistics restored;
+        try (ObjectInputStream input =
+            new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+          restored = (IndexSegmentStatistics) input.readObject();
+        }
+        assertEquals(segmentStatistics.getIndexUuid(), restored.getIndexUuid());
+        assertEquals(
+            stats,
+            dataset.getIndexStatisticsFromSegments(
+                TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Arrays.asList(restored, restored)));
+        dataset.delete("i = 0");
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexSegmentStatistics(
+                    "", Collections.singletonList(physicalSegment.uuid())));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexSegmentStatistics(TestVectorDataset.indexName, null));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexStatisticsFromSegments(TestVectorDataset.indexName, null));
       }
     }
   }

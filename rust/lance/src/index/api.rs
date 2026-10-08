@@ -10,9 +10,22 @@ use lance_index::{
 };
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Error, Result};
+
+/// Opaque native statistics tied to the collecting dataset's read version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexSegmentStatistics {
+    /// Manifest read version, not the segment's build version.
+    pub read_version: u64,
+    pub index_uuid: Uuid,
+    /// Empty when the segment covers no fragments.
+    pub index_type_uri: String,
+    /// Index-specific payload; `{}` when the segment covers no fragments.
+    pub statistics: serde_json::Value,
+}
 
 /// A single physical segment of a logical index.
 ///
@@ -370,6 +383,23 @@ pub trait DatasetIndexExt {
 
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    /// Returns results in UUID request order at the current manifest version.
+    /// UUIDs must be nonempty, unique, and belong to `index_name`; system indices are unsupported.
+    async fn index_segment_statistics(
+        &self,
+        index_name: &str,
+        index_uuids: &[Uuid],
+    ) -> Result<Vec<IndexSegmentStatistics>>;
+
+    /// Requires exactly one result per segment from this dataset and read version.
+    /// Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+    /// Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+    async fn index_statistics_from_segments(
+        &self,
+        index_name: &str,
+        segment_statistics: Vec<IndexSegmentStatistics>,
+    ) -> Result<String>;
 
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(

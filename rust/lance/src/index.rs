@@ -100,7 +100,9 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
-pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
+pub use crate::index::api::{
+    DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment,
+};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -3021,6 +3023,71 @@ impl DatasetIndexExt for Dataset {
             .await
     }
 
+    async fn index_segment_statistics(
+        &self,
+        index_name: &str,
+        index_uuids: &[Uuid],
+    ) -> Result<Vec<IndexSegmentStatistics>> {
+        if index_uuids.is_empty() {
+            return Err(Error::invalid_input(
+                "At least one index segment UUID is required".to_string(),
+            ));
+        }
+        let metadatas = self.load_indices_by_name(index_name).await?;
+        if metadatas.iter().any(is_system_index) {
+            return Err(Error::invalid_input(
+                "Segment statistics are not supported for system indexes".to_string(),
+            ));
+        }
+        let metadata_by_uuid: HashMap<_, _> = metadatas
+            .iter()
+            .map(|metadata| (metadata.uuid, metadata))
+            .collect();
+        let mut seen_uuids = HashSet::with_capacity(index_uuids.len());
+        let mut statistics = Vec::with_capacity(index_uuids.len());
+        for index_uuid in index_uuids {
+            if !seen_uuids.insert(*index_uuid) {
+                return Err(Error::invalid_input(format!(
+                    "Duplicate index segment UUID: {index_uuid}"
+                )));
+            }
+            let metadata = metadata_by_uuid.get(index_uuid).ok_or_else(|| {
+                Error::index_not_found(format!("name={index_name}, uuid={index_uuid}"))
+            })?;
+            let field_id = metadata.fields.first().ok_or_else(|| {
+                Error::index(format!("Index segment {index_uuid} has no indexed field"))
+            })?;
+            let field_path = self.schema().field_path(*field_id)?;
+            statistics.push(collect_index_segment_statistics(self, metadata, &field_path).await?);
+        }
+        Ok(statistics)
+    }
+
+    async fn index_statistics_from_segments(
+        &self,
+        index_name: &str,
+        segment_statistics: Vec<IndexSegmentStatistics>,
+    ) -> Result<String> {
+        let metadatas = self.load_indices_by_name(index_name).await?;
+        if metadatas.iter().any(is_system_index) {
+            return Err(Error::invalid_input(
+                "Segment statistics are not supported for system indexes".to_string(),
+            ));
+        }
+        if metadatas.is_empty() {
+            return Err(Error::index_not_found(format!("name={index_name}")));
+        }
+        serialize_regular_index_statistics(self, index_name, &metadatas, segment_statistics)
+            .await?
+            .ok_or_else(|| {
+                Error::index(
+                    "Outdated fragment metadata: use index_statistics to migrate before \
+                     collecting distributed segment statistics"
+                        .to_string(),
+                )
+            })
+    }
+
     async fn read_index_partition(
         &self,
         index_name: &str,
@@ -3165,8 +3232,67 @@ async fn index_statistics_scalar(
     let field_id = metadatas[0].fields[0];
     let field_path = ds.schema().field_path(field_id)?;
 
-    let (indices_stats, index_uri, num_indices, updated_at) =
-        collect_regular_indices_statistics(ds, metadatas, &field_path).await?;
+    let segment_statistics =
+        collect_regular_indices_statistics(ds, &metadatas, &field_path).await?;
+    match serialize_regular_index_statistics(ds, index_name, &metadatas, segment_statistics).await?
+    {
+        Some(statistics) => Ok(statistics),
+        None => migrate_and_recompute_index_statistics(ds, index_name).await,
+    }
+}
+
+async fn serialize_regular_index_statistics(
+    ds: &Dataset,
+    index_name: &str,
+    metadatas: &[IndexMetadata],
+    segment_statistics: Vec<IndexSegmentStatistics>,
+) -> Result<Option<String>> {
+    if segment_statistics.len() != metadatas.len() {
+        return Err(Error::invalid_input(format!(
+            "Expected {} segment statistics for index {index_name}, got {}",
+            metadatas.len(),
+            segment_statistics.len()
+        )));
+    }
+    let expected_uuids: HashSet<_> = metadatas.iter().map(|metadata| metadata.uuid).collect();
+    let mut statistics_by_uuid = HashMap::with_capacity(segment_statistics.len());
+    for statistics in segment_statistics {
+        if statistics.read_version != ds.manifest.version {
+            return Err(Error::invalid_input(format!(
+                "Index segment {} statistics are from dataset version {}, expected {}",
+                statistics.index_uuid, statistics.read_version, ds.manifest.version
+            )));
+        }
+        if !expected_uuids.contains(&statistics.index_uuid) {
+            return Err(Error::invalid_input(format!(
+                "Segment {} does not belong to index {index_name} at this snapshot",
+                statistics.index_uuid
+            )));
+        }
+        if statistics_by_uuid
+            .insert(statistics.index_uuid, statistics)
+            .is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "Duplicate segment statistics for index {index_name}"
+            )));
+        }
+    }
+    let mut indices_stats = Vec::with_capacity(metadatas.len());
+    let mut index_uri = None;
+    for metadata in metadatas {
+        let statistics = statistics_by_uuid.remove(&metadata.uuid).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Missing statistics for index segment {}",
+                metadata.uuid
+            ))
+        })?;
+        if !statistics.index_type_uri.is_empty() {
+            index_uri.get_or_insert(statistics.index_type_uri);
+        }
+        indices_stats.push(statistics.statistics);
+    }
+    let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
 
     let index_type_hint = indices_stats
         .first()
@@ -3182,9 +3308,15 @@ async fn index_statistics_scalar(
         num_unindexed_rows,
     )) = gather_fragment_statistics(ds, index_name).await?
     else {
-        return migrate_and_recompute_index_statistics(ds, index_name).await;
+        return Ok(None);
     };
 
+    let num_indices = metadatas.len();
+    let updated_at = metadatas
+        .iter()
+        .filter_map(|metadata| metadata.created_at)
+        .max()
+        .map(|timestamp| timestamp.timestamp_millis() as u64);
     let stats = json!({
         "index_type": index_type,
         "name": index_name,
@@ -3200,65 +3332,64 @@ async fn index_statistics_scalar(
         "updated_at_timestamp_ms": updated_at,
     });
 
-    serialize_index_statistics(&stats)
+    serialize_index_statistics(&stats).map(Some)
 }
 
 async fn collect_regular_indices_statistics(
     ds: &Dataset,
-    metadatas: Vec<IndexMetadata>,
+    metadatas: &[IndexMetadata],
     field_path: &str,
-) -> Result<(Vec<serde_json::Value>, String, usize, Option<u64>)> {
-    let num_indices = metadatas.len();
-    let updated_at = metadatas
-        .iter()
-        .filter_map(|m| m.created_at)
-        .max()
-        .map(|dt| dt.timestamp_millis() as u64);
-
-    let mut indices_stats = Vec::with_capacity(num_indices);
-    let mut index_uri: Option<String> = None;
-
-    for meta in metadatas.iter() {
-        // An index that covers no fragments has no file to load statistics
-        // from: it carries its definition and nothing else until there is
-        // enough data to train it.
-        if meta
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(roaring::RoaringBitmap::is_empty)
-        {
-            indices_stats.push(serde_json::json!({}));
-            continue;
-        }
-        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
-        let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
-        if index_uri.is_none() {
-            index_uri = Some(index_details.type_url.clone());
-        }
-
-        let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-        if let Ok(plugin) = index_details_wrapper.get_plugin()
-            && let Some(stats) = plugin
-                .load_statistics(index_store.clone(), index_details.as_ref())
-                .await?
-        {
-            indices_stats.push(stats);
-            continue;
-        }
-
-        let index = ds
-            .open_generic_index(field_path, &meta.uuid, &NoOpMetricsCollector)
-            .await?;
-
-        indices_stats.push(index.statistics()?);
+) -> Result<Vec<IndexSegmentStatistics>> {
+    let mut statistics = Vec::with_capacity(metadatas.len());
+    for metadata in metadatas {
+        statistics.push(collect_index_segment_statistics(ds, metadata, field_path).await?);
     }
+    Ok(statistics)
+}
 
-    Ok((
-        indices_stats,
-        index_uri.unwrap_or_else(|| "unknown".to_string()),
-        num_indices,
-        updated_at,
-    ))
+async fn collect_index_segment_statistics(
+    ds: &Dataset,
+    metadata: &IndexMetadata,
+    field_path: &str,
+) -> Result<IndexSegmentStatistics> {
+    if metadata
+        .fragment_bitmap
+        .as_ref()
+        .is_some_and(RoaringBitmap::is_empty)
+    {
+        return Ok(IndexSegmentStatistics {
+            read_version: ds.manifest.version,
+            index_uuid: metadata.uuid,
+            index_type_uri: String::new(),
+            statistics: json!({}),
+        });
+    }
+    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, metadata).await?);
+    let index_details = scalar::fetch_index_details(ds, field_path, metadata).await?;
+    let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+    let stored_statistics = match index_details_wrapper.get_plugin() {
+        Ok(plugin) => {
+            plugin
+                .load_statistics(index_store, index_details.as_ref())
+                .await?
+        }
+        Err(_) => None,
+    };
+    let statistics = match stored_statistics {
+        Some(statistics) => statistics,
+        None => {
+            let index = ds
+                .open_generic_index(field_path, &metadata.uuid, &NoOpMetricsCollector)
+                .await?;
+            index.statistics()?
+        }
+    };
+    Ok(IndexSegmentStatistics {
+        read_version: ds.manifest.version,
+        index_uuid: metadata.uuid,
+        index_type_uri: index_details.type_url.clone(),
+        statistics,
+    })
 }
 
 async fn gather_fragment_statistics(
@@ -5935,6 +6066,357 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[rstest]
+    #[case::empty_first(true)]
+    #[case::empty_last(false)]
+    #[tokio::test]
+    async fn test_index_statistics_from_segments(#[case] is_empty_first: bool) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..8))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragment_ids: Vec<_> = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let empty_segment =
+            CreateIndexBuilder::new(&mut dataset, &["status"], IndexType::Bitmap, &params)
+                .name("status_idx".to_string())
+                .fragments(Vec::new())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        assert!(empty_segment.fragment_bitmap.as_ref().unwrap().is_empty());
+        let empty_uuid = empty_segment.uuid;
+        let mut segments = Vec::new();
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["status"], IndexType::Bitmap, &params)
+                    .name("status_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        if is_empty_first {
+            segments.insert(0, empty_segment);
+        } else {
+            segments.push(empty_segment);
+        }
+        dataset
+            .commit_existing_index_segments("status_idx", "status", segments.clone())
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 5);
+
+        let index_uuids: Vec<_> = segments.iter().rev().map(|segment| segment.uuid).collect();
+        let mut statistics = dataset
+            .index_segment_statistics("status_idx", &index_uuids)
+            .await
+            .unwrap();
+        assert_eq!(
+            statistics
+                .iter()
+                .map(|statistics| statistics.index_uuid)
+                .collect::<Vec<_>>(),
+            index_uuids
+        );
+        let empty_statistics = statistics
+            .iter()
+            .find(|statistics| statistics.index_uuid == empty_uuid)
+            .unwrap();
+        assert!(empty_statistics.index_type_uri.is_empty());
+        assert_eq!(empty_statistics.statistics, json!({}));
+        for result in &statistics {
+            let encoded = serde_json::to_string(&result).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IndexSegmentStatistics>(&encoded).unwrap(),
+                *result
+            );
+        }
+        let expected: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("status_idx").await.unwrap()).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(
+            &dataset
+                .index_statistics_from_segments("status_idx", statistics.clone())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual["index_type"], "Bitmap");
+        assert_eq!(actual["num_segments"], 5);
+        assert_eq!(actual["num_indexed_rows"], 8);
+        assert_eq!(actual["num_unindexed_rows"], 0);
+        let empty_position = usize::from(!is_empty_first) * 4;
+        assert_eq!(actual["indices"][empty_position], json!({}));
+        assert_eq!(actual["segments"][empty_position], json!({}));
+
+        let mut duplicate = statistics.clone();
+        duplicate[1] = duplicate[0].clone();
+        let mut foreign = statistics.clone();
+        foreign[0].index_uuid = Uuid::new_v4();
+        let mut stale = statistics.clone();
+        stale[0].read_version += 1;
+        for (invalid, expected_message) in [
+            (
+                Vec::new(),
+                "Expected 5 segment statistics for index status_idx, got 0",
+            ),
+            (
+                statistics[..4].to_vec(),
+                "Expected 5 segment statistics for index status_idx, got 4",
+            ),
+            (
+                duplicate,
+                "Duplicate segment statistics for index status_idx",
+            ),
+            (
+                foreign,
+                "does not belong to index status_idx at this snapshot",
+            ),
+            (stale, "statistics are from dataset version"),
+        ] {
+            let error = dataset
+                .index_statistics_from_segments("status_idx", invalid)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains(expected_message), "{error}");
+        }
+        let unknown_uuid = Uuid::new_v4();
+        let error = dataset
+            .index_segment_statistics("status_idx", &[unknown_uuid])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::IndexNotFound { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("name=status_idx, uuid={unknown_uuid}")),
+            "{error}"
+        );
+        for (invalid_uuids, expected_message) in [
+            (Vec::new(), "At least one index segment UUID is required"),
+            (
+                vec![index_uuids[0], index_uuids[0]],
+                "Duplicate index segment UUID",
+            ),
+        ] {
+            let error = dataset
+                .index_segment_statistics("status_idx", &invalid_uuids)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains(expected_message), "{error}");
+        }
+        let error = dataset
+            .index_statistics_from_segments("missing", statistics.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::IndexNotFound { .. }), "{error}");
+        assert!(error.to_string().contains("name=missing"), "{error}");
+
+        dataset.delete("status = 0").await.unwrap();
+        let index_uuids: Vec<_> = dataset
+            .load_indices_by_name("status_idx")
+            .await
+            .unwrap()
+            .iter()
+            .map(|metadata| metadata.uuid)
+            .collect();
+        statistics.retain(|statistics| index_uuids.contains(&statistics.index_uuid));
+        assert_eq!(statistics.len(), 4);
+        let error = dataset
+            .index_statistics_from_segments("status_idx", statistics)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("statistics are from dataset version"),
+            "{error}"
+        );
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let statistics = dataset
+            .index_segment_statistics("status_idx", &index_uuids)
+            .await
+            .unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("status_idx").await.unwrap()).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(
+            &dataset
+                .index_statistics_from_segments("status_idx", statistics)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual["num_indexed_rows"], 7);
+        assert_eq!(actual["num_unindexed_rows"], 8);
+    }
+
+    #[tokio::test]
+    async fn test_index_statistics_from_segments_rejects_system_index() {
+        let data = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 4,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let metadata = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = dataset
+            .index_segment_statistics(FRAG_REUSE_INDEX_NAME, &[metadata.uuid])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Segment statistics are not supported for system indexes"),
+            "{error}"
+        );
+        let error = dataset
+            .index_statistics_from_segments(
+                FRAG_REUSE_INDEX_NAME,
+                vec![IndexSegmentStatistics {
+                    read_version: dataset.manifest.version,
+                    index_uuid: metadata.uuid,
+                    index_type_uri: String::new(),
+                    statistics: json!({}),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Segment statistics are not supported for system indexes"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_statistics_from_segments_requires_migration() {
+        let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let test_uri = test_dir.path_str();
+        let mut dataset = Dataset::open(&test_uri).await.unwrap();
+        let original_version = dataset.manifest.version;
+        let metadata = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let index_uuids: Vec<_> = metadata.iter().map(|metadata| metadata.uuid).collect();
+        let statistics = dataset
+            .index_segment_statistics("vector_idx", &index_uuids)
+            .await
+            .unwrap();
+        let error = dataset
+            .index_statistics_from_segments("vector_idx", statistics)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Index { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Outdated fragment metadata: use index_statistics to migrate"),
+            "{error}"
+        );
+        assert_eq!(dataset.manifest.version, original_version);
+        let reopened = Dataset::open(&test_uri).await.unwrap();
+        assert_eq!(reopened.manifest.version, original_version);
+        let reopened_metadata = reopened.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            reopened_metadata
+                .iter()
+                .map(|metadata| &metadata.fragment_bitmap)
+                .collect::<Vec<_>>(),
+            metadata
+                .iter()
+                .map(|metadata| &metadata.fragment_bitmap)
+                .collect::<Vec<_>>()
+        );
+
+        let expected: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+        dataset.checkout_latest().await.unwrap();
+        assert!(dataset.manifest.version > original_version);
+        let statistics = dataset
+            .index_segment_statistics("vector_idx", &index_uuids)
+            .await
+            .unwrap();
+        let actual: serde_json::Value = serde_json::from_str(
+            &dataset
+                .index_statistics_from_segments("vector_idx", statistics)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
