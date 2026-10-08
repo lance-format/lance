@@ -449,6 +449,36 @@ def test_schema_metadata(tmp_path: Path):
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
 
+def _manifest_file_size(base_dir: Path, version: int) -> int:
+    """Return the on-disk size of the manifest file for ``version``.
+
+    Manifest files may use V1 (``_versions/{version}.manifest``) or V2
+    (``_versions/{u64::MAX - version:020}.manifest``) naming, so resolve by
+    parsing the version back out of the file name rather than guessing.
+    """
+    candidates = []
+    for path in (base_dir / "_versions").glob("*.manifest"):
+        try:
+            number = int(path.stem)
+        except ValueError:
+            # Detached versions are named ``d{version}.manifest``; they are not
+            # part of the attached version history, so skip them.
+            continue
+        # V2 stores the bitwise-inverted version so that the newest version
+        # sorts first lexicographically.
+        candidates.append(
+            (number if number < (1 << 63) else (1 << 64) - 1 - number, path)
+        )
+
+    matches = [
+        path for candidate_version, path in candidates if candidate_version == version
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one manifest file for version {version}"
+    )
+    return matches[0].stat().st_size
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -476,6 +506,16 @@ def test_versions(tmp_path: Path):
     assert v1["timestamp"] < v2["timestamp"]
     assert isinstance(v1["metadata"], dict)
     assert isinstance(v2["metadata"], dict)
+
+    # manifest_size must be pinned to the on-disk manifest file for each version.
+    for version in (v1, v2):
+        manifest_size = version["manifest_size"]
+        assert manifest_size is not None
+        assert manifest_size > 0
+        # The key is always present, but the value is optional by contract.
+        assert version.get("manifest_size") == _manifest_file_size(
+            base_dir, version["version"]
+        )
 
 
 def test_version_id(tmp_path: Path):
