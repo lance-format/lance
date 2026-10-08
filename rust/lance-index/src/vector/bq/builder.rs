@@ -96,7 +96,12 @@ impl ExQuantizationScratch {
         if ex_bits == 0 {
             return Self::default();
         }
-        let max_events = dim * ((1usize << ex_bits) - 1);
+        let max_code = (1usize << ex_bits) - 1;
+        // Only the tight search interval can emit events. Allow one extra
+        // transition per dimension for rounding at either interval boundary.
+        let events_per_dim =
+            (max_code as f64 * (1.0 - EX_TIGHT_START[ex_bits as usize] as f64)).ceil() as usize + 1;
+        let max_events = dim * events_per_dim.min(max_code);
         // Growing buffers on workers can realloc blocks from another malloc
         // arena. Allocate the known bounds once and reuse them across rows.
         Self {
@@ -104,14 +109,17 @@ impl ExQuantizationScratch {
             current_codes: Vec::with_capacity(dim),
             thresholds: Vec::with_capacity(max_events),
             radix: Vec::with_capacity(max_events),
-            comparison: Vec::with_capacity(max_events),
+            comparison: Vec::new(),
             offsets: Vec::with_capacity(dim),
         }
     }
 }
 
-// Amortize scratch allocation without changing the global Rayon thread pool.
-const QUANTIZATION_MIN_ROWS_PER_JOB: usize = 64;
+fn quantization_min_len(num_rows: usize) -> usize {
+    // Leave enough jobs for load balancing while bounding scratch creation.
+    // A fixed row minimum serializes small and trailing batches.
+    (num_rows / (rayon::current_num_threads() * 4)).max(1)
+}
 
 /// Sort packed `(positive_f32_bits, index)` values by their floating-point key.
 ///
@@ -183,6 +191,11 @@ fn sort_ex_thresholds(
         let next = offset + *count;
         *count = offset;
         offset = next;
+    }
+    // Allocate the fallback only when needed, but reserve the same event bound
+    // as radix scratch so later rows cannot repeatedly grow this buffer.
+    if comparison.capacity() < radix.capacity() {
+        comparison.reserve(radix.capacity() - comparison.len());
     }
     comparison.resize(values.len(), (0.0, 0));
     for &value in values.iter() {
@@ -775,7 +788,7 @@ impl RabitQuantizer {
                 .zip(ex_code_values.par_chunks_mut(code_dim))
                 .zip(ex_res_dot_dists.par_iter_mut())
                 .zip(rotated_residuals.par_chunks(code_dim))
-                .with_min_len(QUANTIZATION_MIN_ROWS_PER_JOB)
+                .with_min_len(quantization_min_len(n))
                 .for_each_init(
                     || ExQuantizationScratch::new(code_dim, ex_bits),
                     |scratch, (((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
@@ -1018,6 +1031,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use approx::assert_relative_eq;
     use arrow::datatypes::Float32Type;
@@ -1177,6 +1192,75 @@ mod tests {
                 .map(|&(key, idx)| ((key.to_bits() as u64) << 32) | idx as u64)
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[rstest]
+    #[case::one_thread(1)]
+    #[case::eight_threads(8)]
+    #[case::thirty_two_threads(32)]
+    fn test_quantization_grain_preserves_parallel_jobs(#[case] threads: usize) {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        for rows in [1, 63, 64, 65, 127, 128, 129, 8192] {
+            let jobs = AtomicUsize::new(0);
+            let mut values = vec![0usize; rows];
+            pool.install(|| {
+                values
+                    .par_iter_mut()
+                    .with_min_len(quantization_min_len(rows))
+                    .for_each_init(
+                        || jobs.fetch_add(1, Ordering::Relaxed),
+                        |_, value| *value += 1,
+                    );
+            });
+            assert!(values.iter().all(|&value| value == 1));
+            let jobs = jobs.load(Ordering::Relaxed);
+            assert!(jobs <= rows.min(threads * 8), "rows={rows}, jobs={jobs}");
+            if rows >= threads {
+                assert!(jobs >= threads, "rows={rows}, jobs={jobs}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::one_extra_bit(1)]
+    #[case::two_extra_bits(2)]
+    #[case::three_extra_bits(3)]
+    #[case::four_extra_bits(4)]
+    #[case::five_extra_bits(5)]
+    #[case::six_extra_bits(6)]
+    #[case::seven_extra_bits(7)]
+    #[case::eight_extra_bits(8)]
+    fn test_quantization_scratch_capacity_at_search_bounds(#[case] ex_bits: u8) {
+        let dim = 64;
+        let mut scratch = ExQuantizationScratch::new(dim, ex_bits);
+        let capacity = scratch.thresholds.capacity();
+        assert_eq!(scratch.comparison.capacity(), 0);
+        let max_code = (1usize << ex_bits) - 1;
+        let edge = max_code as f32 / (max_code + 10) as f32;
+        for ratio in [
+            0.0,
+            f32::MIN_POSITIVE,
+            0.01,
+            0.1,
+            0.5,
+            f32::from_bits(edge.to_bits() - 1),
+            edge,
+            f32::from_bits(edge.to_bits() + 1),
+            1.0,
+        ] {
+            scratch.abs_normalized.fill(ratio);
+            scratch.abs_normalized.resize(dim, ratio);
+            scratch.abs_normalized[0] = 1.0;
+            let expected = reference_best_ex_rescale_factor(&scratch.abs_normalized, ex_bits);
+            let actual = best_ex_rescale_factor(&mut scratch, ex_bits);
+            assert_eq!(actual.to_bits(), expected.to_bits(), "ratio={ratio}");
+            assert_eq!(scratch.thresholds.capacity(), capacity);
+            assert_eq!(scratch.radix.capacity(), capacity);
+            assert!(scratch.comparison.capacity() <= capacity);
         }
     }
 
