@@ -6329,9 +6329,10 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
     ]
-    # BTree now always stores row addresses, which bumped its on-disk format
-    # version; every other index type here is still at version 0.
-    index_versions = [0, 0, 1, 0, 0, 0]
+    # BTree only stores row addresses (bumping its on-disk format version to
+    # 1) on a dataset with stable row ids; this dataset doesn't enable them,
+    # so BTree stays at version 0 along with every other index type here.
+    index_versions = [0, 0, 0, 0, 0, 0]
 
     for i in range(len(indices)):
         assert indices[i].name == names[i]

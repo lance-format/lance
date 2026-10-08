@@ -13240,7 +13240,18 @@ mod tests {
         let mut unreadable = current.clone();
         match kind {
             UnreadableIndexKind::NewerVersion => {
-                unreadable[0].index_version = current[0].index_version + 1;
+                // Derive the unsupported version from what this build's
+                // plugin actually reports as its max supported version,
+                // rather than from the freshly created index's own version:
+                // BTree now varies that baseline by whether the dataset uses
+                // stable row ids (see BTREE_ROW_ID_DOMAIN_VERSION), so
+                // `current + 1` no longer reliably lands past what this
+                // build can read.
+                let max_supported =
+                    crate::index::scalar::IndexDetails(current[0].index_details.clone().unwrap())
+                        .index_version()
+                        .unwrap();
+                unreadable[0].index_version = (max_supported + 1) as i32;
             }
             UnreadableIndexKind::UnknownType => {
                 unreadable[0].index_details = Some(Arc::new(prost_types::Any {
@@ -13288,9 +13299,23 @@ mod tests {
         index_name: &str,
         kind: UnreadableIndexKind,
     ) -> Dataset {
-        let mut dataset = Dataset::write(two_column_reader(), uri, None)
-            .await
-            .unwrap();
+        // Stable row ids so the BTree indices this fixture creates are
+        // address-domain (index_version 1): `hide_index_as`'s NewerVersion
+        // kind computes an unsupported version as `current + 1`, which only
+        // exceeds what this build supports starting from that baseline. On a
+        // dataset without stable row ids, BTree is created at index_version 0
+        // instead (see BTREE_ROW_ID_DOMAIN_VERSION), and 0 + 1 is this
+        // build's own max supported version, not an unsupported one.
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
         dataset
