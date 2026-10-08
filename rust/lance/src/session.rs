@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_core::cache::{
-    CacheBackend, CacheDiagnostics, CacheLoadOrigin, CacheMetricsKind, CacheSnapshotMode,
-    LanceCache, QuickCacheBackend, QuickCacheShardPolicy,
+    CacheBackend, CacheDiagnostics, CacheMetricsKind, CacheSnapshotMode, LanceCache,
+    QuickCacheBackend, QuickCacheShardPolicy,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -145,14 +145,6 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    pub(crate) fn with_cache_load_origin(&self, origin: CacheLoadOrigin) -> Self {
-        let mut session = self.clone();
-        session.index_cache = GlobalIndexCache(self.index_cache.0.with_load_origin(origin));
-        session.metadata_cache =
-            GlobalMetadataCache(self.metadata_cache.0.with_load_origin(origin));
-        session
-    }
-
     /// Create a new session.
     ///
     /// Parameters:

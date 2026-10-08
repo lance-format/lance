@@ -10,7 +10,6 @@ use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
-use lance_core::cache::CacheLoadOrigin;
 use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
@@ -551,16 +550,6 @@ impl From<Schema> for ProjectionRequest {
 }
 
 impl Dataset {
-    pub(crate) fn with_cache_load_origin(&self, origin: CacheLoadOrigin) -> Self {
-        let mut dataset = self.clone();
-        dataset.index_cache = Arc::new(DSIndexCache(self.index_cache.0.with_load_origin(origin)));
-        dataset.metadata_cache = Arc::new(DSMetadataCache(
-            self.metadata_cache.0.with_load_origin(origin),
-        ));
-        dataset.session = Arc::new(self.session.with_cache_load_origin(origin));
-        dataset
-    }
-
     /// Open an existing dataset.
     ///
     /// See also [DatasetBuilder].

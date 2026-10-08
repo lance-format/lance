@@ -75,6 +75,7 @@ harness = false
 [[bench]]
 name = "cache_metrics_export"
 harness = false
+required-features = ["metrics"]
 
 [lints]
 workspace = true

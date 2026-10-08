@@ -231,7 +231,9 @@ where
 #[derive(Debug)]
 struct CacheState {
     backend: Arc<dyn CacheBackend>,
+    #[cfg(feature = "metrics")]
     cache_kind: CacheMetricsKind,
+    #[cfg(feature = "metrics")]
     backend_kind: CacheBackendKind,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -248,7 +250,9 @@ impl CacheState {
         telemetry::register_backend(&backend);
         Self {
             backend,
+            #[cfg(feature = "metrics")]
             cache_kind,
+            #[cfg(feature = "metrics")]
             backend_kind,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -298,21 +302,16 @@ impl CacheState {
         if origin == CacheLoadOrigin::Warm {
             self.activity.record_warm_error(
                 self.type_activity.activity(by_type),
-                self.cache_kind,
-                self.backend_kind,
-                self.type_export_name(by_type),
+                self.type_activity.event_metric_keys(by_type),
             );
         }
         #[cfg(feature = "metrics")]
         {
             self.type_activity
                 .note_event(by_type, self.cache_kind, self.backend_kind);
-            telemetry::lookup_error(
-                self.cache_kind,
-                self.backend_kind,
-                self.type_activity.export_name(by_type),
-                reason,
-            );
+            self.type_activity
+                .event_metric_keys(by_type)
+                .lookup_error(reason);
         }
         #[cfg(not(feature = "metrics"))]
         let _ = reason;
@@ -331,18 +330,6 @@ impl CacheState {
         self.record_lookup_error(by_type, "type_mismatch", origin);
     }
 
-    fn type_export_name(&self, by_type: diagnostics::TypeActivityHandle) -> &'static str {
-        #[cfg(feature = "metrics")]
-        {
-            self.type_activity.export_name(by_type)
-        }
-        #[cfg(not(feature = "metrics"))]
-        {
-            let _ = by_type;
-            ""
-        }
-    }
-
     fn record_warm_attempt(
         &self,
         by_type: diagnostics::TypeActivityHandle,
@@ -356,9 +343,7 @@ impl CacheState {
             .note_event(by_type, self.cache_kind, self.backend_kind);
         self.activity.record_warm_attempt(
             self.type_activity.activity(by_type),
-            self.cache_kind,
-            self.backend_kind,
-            self.type_export_name(by_type),
+            self.type_activity.event_metric_keys(by_type),
         );
     }
 
@@ -366,9 +351,7 @@ impl CacheState {
         if origin == CacheLoadOrigin::Warm {
             self.activity.record_warm_hit(
                 self.type_activity.activity(by_type),
-                self.cache_kind,
-                self.backend_kind,
-                self.type_export_name(by_type),
+                self.type_activity.event_metric_keys(by_type),
             );
         }
     }
@@ -382,9 +365,7 @@ impl CacheState {
         if origin == CacheLoadOrigin::Warm {
             self.activity.record_warm_insert(
                 self.type_activity.activity(by_type),
-                self.cache_kind,
-                self.backend_kind,
-                self.type_export_name(by_type),
+                self.type_activity.event_metric_keys(by_type),
                 size_bytes.try_into().unwrap_or(u64::MAX),
             );
         }
@@ -829,15 +810,9 @@ impl LanceCache {
             state
                 .type_activity
                 .note_event(by_type, state.cache_kind, state.backend_kind);
-            #[cfg(feature = "metrics")]
-            let export_name = state.type_activity.export_name(by_type);
-            #[cfg(not(feature = "metrics"))]
-            let export_name = "";
             let guard = state.activity.start_load(
                 state.type_activity.activity(by_type),
-                state.cache_kind,
-                state.backend_kind,
-                export_name,
+                state.type_activity.event_metric_keys(by_type),
                 origin,
             );
             let result = loader().await;
@@ -847,9 +822,7 @@ impl LanceCache {
             if origin == CacheLoadOrigin::Warm {
                 state.activity.record_warm_load_bytes(
                     state.type_activity.activity(by_type),
-                    state.cache_kind,
-                    state.backend_kind,
-                    export_name,
+                    state.type_activity.event_metric_keys(by_type),
                     size.try_into().unwrap_or(u64::MAX),
                 );
             }
@@ -984,15 +957,9 @@ impl LanceCache {
             state
                 .type_activity
                 .note_event(by_type, state.cache_kind, state.backend_kind);
-            #[cfg(feature = "metrics")]
-            let export_name = state.type_activity.export_name(by_type);
-            #[cfg(not(feature = "metrics"))]
-            let export_name = "";
             let guard = state.activity.start_load(
                 state.type_activity.activity(by_type),
-                state.cache_kind,
-                state.backend_kind,
-                export_name,
+                state.type_activity.event_metric_keys(by_type),
                 origin,
             );
             let result = loader().await;
@@ -1002,9 +969,7 @@ impl LanceCache {
             if origin == CacheLoadOrigin::Warm {
                 state.activity.record_warm_load_bytes(
                     state.type_activity.activity(by_type),
-                    state.cache_kind,
-                    state.backend_kind,
-                    export_name,
+                    state.type_activity.event_metric_keys(by_type),
                     size.try_into().unwrap_or(u64::MAX),
                 );
             }

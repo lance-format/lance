@@ -46,7 +46,6 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
-use lance_core::cache::CacheLoadOrigin;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
@@ -808,7 +807,7 @@ impl DatasetMemWalExt for Dataset {
         snapshots: &[ShardSnapshot],
         cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
-        let session = Arc::new(self.session().with_cache_load_origin(CacheLoadOrigin::Warm));
+        let session = self.session();
         // Every open below targets a generation URI, never the base's own.
         let store_params = self.store_params().map(derived_store_params);
         // Resolve SSTable paths exactly as the LSM collector does, so the
@@ -833,8 +832,7 @@ impl DatasetMemWalExt for Dataset {
                         let dataset =
                             open_sstable(&path, Some(session), store_params.as_ref(), cache, None)
                                 .await?;
-                        prewarm_all_indexes(&dataset.with_cache_load_origin(CacheLoadOrigin::Warm))
-                            .await
+                        prewarm_all_indexes(&dataset).await
                     }
                 })
             })

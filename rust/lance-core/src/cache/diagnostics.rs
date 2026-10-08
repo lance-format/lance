@@ -3,7 +3,9 @@
 
 //! Native diagnostics, available independently of an installed metrics recorder.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(test, feature = "metrics"))]
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -464,13 +466,15 @@ struct TypeRegistration {
     export_name: &'static str,
     #[cfg(feature = "metrics")]
     export_overflow: bool,
+    #[cfg(feature = "metrics")]
+    lookup_metric_keys: super::telemetry::LookupMetricKeys,
+    #[cfg(feature = "metrics")]
+    event_metric_keys: OnceLock<Box<super::telemetry::EventMetricKeys>>,
 }
 
 #[derive(Debug)]
 pub(super) struct TypeActivitySlot {
     registration: OnceLock<TypeRegistration>,
-    #[cfg(feature = "metrics")]
-    lookup_metric_keys: OnceLock<super::telemetry::LookupMetricKeys>,
     hits: AtomicU64,
     misses: AtomicU64,
     activity: ActivityCounters,
@@ -489,8 +493,6 @@ impl TypeActivitySlot {
     fn new() -> Self {
         Self {
             registration: OnceLock::new(),
-            #[cfg(feature = "metrics")]
-            lookup_metric_keys: OnceLock::new(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             activity: ActivityCounters::default(),
@@ -528,6 +530,7 @@ pub(super) struct TypeActivityRegistry {
     slots: Box<[TypeActivitySlot]>,
     other: TypeActivitySlot,
     registration: Mutex<()>,
+    full: AtomicBool,
     type_label_overflow_events: AtomicU64,
     #[cfg(feature = "metrics")]
     cache_kind: CacheMetricsKind,
@@ -535,6 +538,10 @@ pub(super) struct TypeActivityRegistry {
     backend_kind: CacheBackendKind,
     #[cfg(feature = "metrics")]
     aggregate_lookup_metric_keys: super::telemetry::LookupMetricKeys,
+    #[cfg(feature = "metrics")]
+    aggregate_event_metric_keys: OnceLock<Box<super::telemetry::EventMetricKeys>>,
+    #[cfg(all(test, feature = "metrics"))]
+    registration_pause: Option<(Barrier, Barrier)>,
 }
 
 impl TypeActivityRegistry {
@@ -560,21 +567,21 @@ impl TypeActivityRegistry {
                 export_name: "other",
                 #[cfg(feature = "metrics")]
                 export_overflow: true,
+                #[cfg(feature = "metrics")]
+                lookup_metric_keys: super::telemetry::LookupMetricKeys::by_type(
+                    cache_kind,
+                    backend_kind,
+                    "other",
+                ),
+                #[cfg(feature = "metrics")]
+                event_metric_keys: OnceLock::new(),
             })
-            .unwrap_or_else(|_| unreachable!());
-        #[cfg(feature = "metrics")]
-        other
-            .lookup_metric_keys
-            .set(super::telemetry::LookupMetricKeys::by_type(
-                cache_kind,
-                backend_kind,
-                "other",
-            ))
             .unwrap_or_else(|_| unreachable!());
         Self {
             slots: (0..capacity).map(|_| TypeActivitySlot::new()).collect(),
             other,
             registration: Mutex::new(()),
+            full: AtomicBool::new(false),
             type_label_overflow_events: AtomicU64::new(0),
             #[cfg(feature = "metrics")]
             cache_kind,
@@ -585,6 +592,10 @@ impl TypeActivityRegistry {
                 cache_kind,
                 backend_kind,
             ),
+            #[cfg(feature = "metrics")]
+            aggregate_event_metric_keys: OnceLock::new(),
+            #[cfg(all(test, feature = "metrics"))]
+            registration_pause: None,
         }
     }
 
@@ -592,6 +603,11 @@ impl TypeActivityRegistry {
     pub(super) fn get(&self, type_name: &'static str) -> TypeActivityHandle {
         if type_name == "other" {
             return self.other_handle();
+        }
+        if self.full.load(Ordering::Acquire) {
+            // The final slot was published before `full`, so this scan sees
+            // every registered type and can classify an unknown type as other.
+            return self.find(type_name).unwrap_or_else(|| self.other_handle());
         }
         if let Some(handle) = self.find(type_name) {
             return handle;
@@ -621,16 +637,24 @@ impl TypeActivityRegistry {
                 export_name,
                 #[cfg(feature = "metrics")]
                 export_overflow,
+                #[cfg(feature = "metrics")]
+                lookup_metric_keys: super::telemetry::LookupMetricKeys::by_type(
+                    self.cache_kind,
+                    self.backend_kind,
+                    export_name,
+                ),
+                #[cfg(feature = "metrics")]
+                event_metric_keys: OnceLock::new(),
             })
             .unwrap_or_else(|_| unreachable!());
-        #[cfg(feature = "metrics")]
-        slot.lookup_metric_keys
-            .set(super::telemetry::LookupMetricKeys::by_type(
-                self.cache_kind,
-                self.backend_kind,
-                export_name,
-            ))
-            .unwrap_or_else(|_| unreachable!());
+        if index + 1 == self.slots.len() {
+            self.full.store(true, Ordering::Release);
+        }
+        #[cfg(all(test, feature = "metrics"))]
+        if let Some((published, resume)) = &self.registration_pause {
+            published.wait();
+            resume.wait();
+        }
         TypeActivityHandle(index as u8)
     }
 
@@ -674,11 +698,6 @@ impl TypeActivityRegistry {
     }
 
     #[cfg(feature = "metrics")]
-    pub(super) fn export_name(&self, handle: TypeActivityHandle) -> &'static str {
-        self.slot(handle).registration().export_name
-    }
-
-    #[cfg(feature = "metrics")]
     pub(super) fn lookup_metric_keys(
         &self,
         handle: TypeActivityHandle,
@@ -686,11 +705,41 @@ impl TypeActivityRegistry {
     ) -> (&metrics::Key, &metrics::Key) {
         let type_key = self
             .slot(handle)
+            .registration()
             .lookup_metric_keys
-            .get()
-            .expect("cache type lookup metric keys must be registered before use")
             .get(is_hit);
         (self.aggregate_lookup_metric_keys.get(is_hit), type_key)
+    }
+
+    #[inline]
+    pub(super) fn event_metric_keys(
+        &self,
+        handle: TypeActivityHandle,
+    ) -> super::telemetry::CacheMetricKeys<'_> {
+        #[cfg(feature = "metrics")]
+        {
+            let aggregate = self.aggregate_event_metric_keys.get_or_init(|| {
+                Box::new(super::telemetry::EventMetricKeys::new(
+                    self.cache_kind,
+                    self.backend_kind,
+                    None,
+                ))
+            });
+            let registration = self.slot(handle).registration();
+            let by_type = registration.event_metric_keys.get_or_init(|| {
+                Box::new(super::telemetry::EventMetricKeys::new(
+                    self.cache_kind,
+                    self.backend_kind,
+                    Some(registration.export_name),
+                ))
+            });
+            super::telemetry::CacheMetricKeys::new(aggregate, by_type)
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = handle;
+            super::telemetry::CacheMetricKeys::empty()
+        }
     }
 
     #[cfg(feature = "metrics")]
@@ -871,37 +920,31 @@ impl ActivityCounters {
     pub fn record_warm_attempt(
         &self,
         by_type: Option<&Self>,
-        cache_kind: CacheMetricsKind,
-        backend_kind: CacheBackendKind,
-        type_name: &'static str,
+        metric_keys: super::telemetry::CacheMetricKeys<'_>,
     ) {
         self.warm.attempts.fetch_add(1, Ordering::Relaxed);
         if let Some(by_type) = by_type {
             by_type.warm.attempts.fetch_add(1, Ordering::Relaxed);
         }
-        super::telemetry::warm_attempt(cache_kind, backend_kind, type_name);
+        metric_keys.warm_attempt();
     }
 
     pub fn record_warm_hit(
         &self,
         by_type: Option<&Self>,
-        cache_kind: CacheMetricsKind,
-        backend_kind: CacheBackendKind,
-        type_name: &'static str,
+        metric_keys: super::telemetry::CacheMetricKeys<'_>,
     ) {
         self.warm.hits.fetch_add(1, Ordering::Relaxed);
         if let Some(by_type) = by_type {
             by_type.warm.hits.fetch_add(1, Ordering::Relaxed);
         }
-        super::telemetry::warm_hit(cache_kind, backend_kind, type_name);
+        metric_keys.warm_hit();
     }
 
     pub fn record_warm_insert(
         &self,
         by_type: Option<&Self>,
-        cache_kind: CacheMetricsKind,
-        backend_kind: CacheBackendKind,
-        type_name: &'static str,
+        metric_keys: super::telemetry::CacheMetricKeys<'_>,
         bytes: u64,
     ) {
         self.warm.loads_started.fetch_add(1, Ordering::Relaxed);
@@ -912,45 +955,39 @@ impl ActivityCounters {
             by_type.warm.loads_succeeded.fetch_add(1, Ordering::Relaxed);
             add_bytes(&by_type.warm.load_bytes, bytes);
         }
-        super::telemetry::warm_load(cache_kind, backend_kind, type_name, "success");
-        super::telemetry::warm_load_bytes(cache_kind, backend_kind, type_name, bytes);
+        metric_keys.warm_load("success");
+        metric_keys.warm_load_bytes(bytes);
     }
 
     pub fn record_warm_load_bytes(
         &self,
         by_type: Option<&Self>,
-        cache_kind: CacheMetricsKind,
-        backend_kind: CacheBackendKind,
-        type_name: &'static str,
+        metric_keys: super::telemetry::CacheMetricKeys<'_>,
         bytes: u64,
     ) {
         add_bytes(&self.warm.load_bytes, bytes);
         if let Some(by_type) = by_type {
             add_bytes(&by_type.warm.load_bytes, bytes);
         }
-        super::telemetry::warm_load_bytes(cache_kind, backend_kind, type_name, bytes);
+        metric_keys.warm_load_bytes(bytes);
     }
 
     pub fn record_warm_error(
         &self,
         by_type: Option<&Self>,
-        cache_kind: CacheMetricsKind,
-        backend_kind: CacheBackendKind,
-        type_name: &'static str,
+        metric_keys: super::telemetry::CacheMetricKeys<'_>,
     ) {
         self.warm.errors.fetch_add(1, Ordering::Relaxed);
         if let Some(by_type) = by_type {
             by_type.warm.errors.fetch_add(1, Ordering::Relaxed);
         }
-        super::telemetry::warm_error(cache_kind, backend_kind, type_name);
+        metric_keys.warm_error();
     }
 
     pub fn start_load<'a>(
         &'a self,
         by_type: Option<&'a Self>,
-        cache_kind: CacheMetricsKind,
-        backend_kind: CacheBackendKind,
-        type_name: &'static str,
+        metric_keys: super::telemetry::CacheMetricKeys<'a>,
         origin: CacheLoadOrigin,
     ) -> LoadGuard<'a> {
         self.started.fetch_add(1, Ordering::Relaxed);
@@ -965,18 +1002,13 @@ impl ActivityCounters {
                 by_type.warm.loads_started.fetch_add(1, Ordering::Relaxed);
             }
         }
-        #[cfg(feature = "metrics")]
-        super::telemetry::load_started(cache_kind, backend_kind, type_name);
-        #[cfg(not(feature = "metrics"))]
-        let _ = type_name;
+        metric_keys.load_started();
         LoadGuard {
             counters: self,
             by_type,
             start: Some(Instant::now()),
-            cache_kind,
-            backend_kind,
+            metric_keys,
             origin,
-            type_name,
         }
     }
 }
@@ -987,10 +1019,8 @@ pub(super) struct LoadGuard<'a> {
     // Taking the start time marks completion without a separate flag. Keeping
     // this guard small also limits the size of skipped boxed loader futures.
     start: Option<Instant>,
-    cache_kind: CacheMetricsKind,
-    backend_kind: CacheBackendKind,
+    metric_keys: super::telemetry::CacheMetricKeys<'a>,
     origin: CacheLoadOrigin,
-    type_name: &'static str,
 }
 
 impl LoadGuard<'_> {
@@ -1015,12 +1045,8 @@ impl LoadGuard<'_> {
                 };
                 by_type_count.fetch_add(1, Ordering::Relaxed);
             }
-            super::telemetry::warm_load(
-                self.cache_kind,
-                self.backend_kind,
-                self.type_name,
-                if is_success { "success" } else { "error" },
-            );
+            self.metric_keys
+                .warm_load(if is_success { "success" } else { "error" });
         }
         self.record(
             count,
@@ -1047,16 +1073,7 @@ impl LoadGuard<'_> {
             by_type.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
         self.counters.in_flight.fetch_sub(1, Ordering::Relaxed);
-        #[cfg(feature = "metrics")]
-        super::telemetry::load_finished(
-            self.cache_kind,
-            self.backend_kind,
-            self.type_name,
-            outcome,
-            elapsed,
-        );
-        #[cfg(not(feature = "metrics"))]
-        super::telemetry::load_finished(self.cache_kind, self.backend_kind, "", outcome, elapsed);
+        self.metric_keys.load_finished(outcome, elapsed);
     }
 }
 
@@ -1075,12 +1092,7 @@ impl Drop for LoadGuard<'_> {
             if let Some(by_type) = self.by_type {
                 by_type.warm.loads_cancelled.fetch_add(1, Ordering::Relaxed);
             }
-            super::telemetry::warm_load(
-                self.cache_kind,
-                self.backend_kind,
-                self.type_name,
-                "cancelled",
-            );
+            self.metric_keys.warm_load("cancelled");
         }
         self.counters
             .cancelled_duration
@@ -1093,22 +1105,7 @@ impl Drop for LoadGuard<'_> {
             by_type.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
         self.counters.in_flight.fetch_sub(1, Ordering::Relaxed);
-        #[cfg(feature = "metrics")]
-        super::telemetry::load_finished(
-            self.cache_kind,
-            self.backend_kind,
-            self.type_name,
-            "cancelled",
-            elapsed,
-        );
-        #[cfg(not(feature = "metrics"))]
-        super::telemetry::load_finished(
-            self.cache_kind,
-            self.backend_kind,
-            "",
-            "cancelled",
-            elapsed,
-        );
+        self.metric_keys.load_finished("cancelled", elapsed);
     }
 }
 
@@ -1151,5 +1148,72 @@ mod tests {
         assert!(overflow_events >= 1);
         #[cfg(not(feature = "metrics"))]
         assert_eq!(overflow_events, 0);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn event_metric_keys_do_not_expand_unused_type_slots() {
+        assert!(
+            std::mem::size_of::<TypeRegistration>()
+                < std::mem::size_of::<super::super::telemetry::EventMetricKeys>()
+        );
+
+        let registry = TypeActivityRegistry::with_capacity(
+            2,
+            CacheMetricsKind::Index,
+            CacheBackendKind::Quick,
+        );
+        let first = registry.get("test.First");
+        assert!(registry.aggregate_event_metric_keys.get().is_none());
+        assert!(
+            registry
+                .slot(first)
+                .registration()
+                .event_metric_keys
+                .get()
+                .is_none()
+        );
+
+        registry.event_metric_keys(first);
+        assert!(registry.aggregate_event_metric_keys.get().is_some());
+        assert!(
+            registry
+                .slot(first)
+                .registration()
+                .event_metric_keys
+                .get()
+                .is_some()
+        );
+        assert!(registry.slots[1].registration.get().is_none());
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn concurrent_first_type_registration_exposes_initialized_metric_keys() {
+        let mut registry = TypeActivityRegistry::with_capacity(
+            2,
+            CacheMetricsKind::Index,
+            CacheBackendKind::Quick,
+        );
+        registry.registration_pause = Some((Barrier::new(2), Barrier::new(2)));
+        std::thread::scope(|scope| {
+            let registering = scope.spawn(|| registry.get("test.Concurrent"));
+            let (published, resume) = registry.registration_pause.as_ref().unwrap();
+            published.wait();
+
+            // A registered slot must be ready while its registering thread is paused.
+            let observed = std::panic::catch_unwind(|| {
+                let handle = registry.get("test.Concurrent");
+                for is_hit in [true, false] {
+                    let (aggregate, by_type) = registry.lookup_metric_keys(handle, is_hit);
+                    assert_eq!(aggregate.name(), super::super::telemetry::METRIC_LOOKUPS);
+                    assert_eq!(by_type.name(), super::super::telemetry::METRIC_LOOKUPS);
+                }
+                assert_eq!(registry.slot(handle).diagnostic_name(), "test.Concurrent");
+            });
+            resume.wait();
+            assert_eq!(registering.join().unwrap().0, 0);
+            observed.unwrap();
+        });
     }
 }
