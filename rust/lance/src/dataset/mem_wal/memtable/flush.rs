@@ -646,12 +646,14 @@ impl MemTableFlusher {
         })
     }
 
-    /// Build every index the memtable maintained into the flushed generation.
+    /// Build every index in `index_specs` into the flushed generation, one at a
+    /// time.
     ///
-    /// One loop over the indexes, not one per kind. Each index says what it can
-    /// hand over — nothing, a stream of training rows, or a file it wrote
-    /// itself — and the three answers are the only cases here. Adding a kind
-    /// adds nothing to this function.
+    /// Each index the memtable holds under that same spec says what it can hand
+    /// over: nothing, a stream of training rows, or a file it wrote itself. A
+    /// scalar index the memtable lacks, or holds under another definition, is
+    /// built from the generation's rows; a vector or full-text one is left out,
+    /// since only the memtable's own index can build it.
     ///
     /// Returns index metadata without committing; the caller writes a single
     /// manifest with all of it.
@@ -670,32 +672,29 @@ impl MemTableFlusher {
             return Ok(vec![]);
         };
 
-        // Ask every index first, while the dataset is only borrowed shared;
-        // building then needs it mutably.
-        let mut outcomes = Vec::new();
-        for spec in index_specs {
-            let Some(index) = registry.get_index(&spec.name) else {
-                continue;
-            };
-            let generation = GenerationWrite {
-                path: gen_path,
-                object_store: &self.object_store,
-                dataset,
-                total_rows,
-                name: &spec.name,
-                storage_version,
-            };
-            let outcome = index
-                .flush(&FlushContext {
-                    batch_size: TRAINING_BATCH_SIZE,
-                    generation: Some(&generation),
-                })
-                .await?;
-            outcomes.push((spec, outcome));
-        }
-
         let mut created_indexes = Vec::new();
-        for (spec, outcome) in outcomes {
+        for spec in index_specs {
+            let index_type = spec.plugin.flush_index_type();
+            let outcome = match registry.index_built_from(spec) {
+                Some(index) => {
+                    let generation = GenerationWrite {
+                        path: gen_path,
+                        object_store: &self.object_store,
+                        dataset,
+                        total_rows,
+                        name: &spec.name,
+                        storage_version,
+                    };
+                    index
+                        .flush(&FlushContext {
+                            batch_size: TRAINING_BATCH_SIZE,
+                            generation: Some(&generation),
+                        })
+                        .await?
+                }
+                None if index_type.is_scalar() => FlushOutcome::BuildFromGeneration,
+                None => continue,
+            };
             let training_data = match outcome {
                 FlushOutcome::Skip => continue,
                 // The index wrote its own file; nothing left to build.
@@ -710,7 +709,6 @@ impl MemTableFlusher {
             // The flush builds scalar indexes only; any other kind writes its
             // own file. Skipping instead would flush a generation that index
             // searches cannot see.
-            let index_type = spec.plugin.flush_index_type();
             if !index_type.is_scalar() {
                 return Err(Error::invalid_input(format!(
                     "index '{}' asked the flush to build a {index_type} index, which the flush \
@@ -1277,6 +1275,98 @@ mod tests {
         assert_eq!(rows.get(&1), Some(&"a2".to_string()));
         assert_eq!(rows.get(&2), Some(&"b".to_string()));
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
+    }
+
+    /// A writer's index set can change while a memtable is open. Flushing it
+    /// under the new set builds each scalar index from what the memtable holds
+    /// only when it holds that index under the same definition: an index it
+    /// lacks, or holds under another column, is built from the generation's
+    /// rows, and every one of them answers like a full read.
+    #[tokio::test]
+    async fn a_flush_builds_an_index_the_memtable_holds_differently_from_its_rows() {
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        use super::super::super::index::{IndexStore, MemIndexSpec};
+        use crate::index::DatasetIndexExt;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let schema = create_pk_schema();
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let mut indexes = IndexStore::from_specs(
+            &[MemIndexSpec::btree("moved", 1, "name")],
+            &lance_schema,
+            64,
+            8,
+        )
+        .unwrap();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        memtable.set_indexes(indexes);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|i| format!("n{}", i % 5)),
+                )),
+            ],
+        )
+        .unwrap();
+        let durable = memtable.insert(batch).await.unwrap() + 1;
+
+        // `moved` now covers `id` instead of `name`; `added` is new.
+        let specs = [
+            MemIndexSpec::btree("moved", 0, "id"),
+            MemIndexSpec::btree("added", 1, "name"),
+        ];
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            shard_id,
+            manifest_store,
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+            .await
+            .unwrap();
+
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri.trim_end_matches('/'),
+            shard_id,
+            result.sstable.path
+        );
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let fields = |name: &str| {
+            indices
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap_or_else(|| panic!("{name} was built"))
+                .fields
+                .clone()
+        };
+        assert_eq!(fields("moved"), vec![0], "built on its new column");
+        assert_eq!(fields("added"), vec![1]);
+        for filter in ["id = 7", "id >= 15", "name = 'n3'"] {
+            let count = |use_index: bool| {
+                let mut scan = dataset.scan();
+                scan.filter(filter).unwrap();
+                scan.use_scalar_index(use_index);
+                async move { scan.try_into_batch().await.unwrap().num_rows() }
+            };
+            assert_eq!(count(true).await, count(false).await, "{filter}");
+        }
     }
 
     /// Flushing a memtable with a primary-key index writes a standalone sidecar

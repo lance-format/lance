@@ -263,15 +263,12 @@ pub enum MemTableVisibility {
 /// and therefore safe for scanners to read). Scanners snapshot the latter at plan
 /// construction time so every plan keys on a stable MVCC cursor.
 pub struct IndexStore {
-    /// BTree indexes keyed by index name. `Arc` so the primary-key BTrees can be
-    /// shared into [`Self::pk_btrees`] without a second copy or a second insert.
-    /// Every index this memtable maintains, by name.
-    ///
-    /// One collection rather than one per kind. Three separate bugs came from
-    /// the previous shape — a kind wired into one write path and not the
-    /// other, left out of the memory total, and missed by the flush — and each
-    /// was a collection someone forgot. There is nothing left to forget.
+    /// Every index this memtable maintains, by name, whatever its kind. The
+    /// write path, the memory total and the flush all walk this one map.
     indexes: HashMap<String, Arc<dyn MemIndex>>,
+    /// The spec each index in `indexes` was built from, by name. A flush uses
+    /// an index's contents only for the spec it was built from.
+    specs: HashMap<String, MemIndexSpec>,
     /// How a filter expression reaches these indexes.
     ///
     /// Built once, from the plugins, because a query parser is settled by the
@@ -312,6 +309,7 @@ impl Default for IndexStore {
     fn default() -> Self {
         Self {
             indexes: HashMap::new(),
+            specs: HashMap::new(),
             filter_catalog: Arc::new(MemIndexCatalog::default()),
 
             pk_index: None,
@@ -377,6 +375,7 @@ impl IndexStore {
         for spec in specs {
             let index = spec.build(schema, max_rows, max_batches)?;
             registry.indexes.insert(spec.name.clone(), index);
+            registry.specs.insert(spec.name.clone(), spec.clone());
         }
         registry.filter_catalog = MemIndexCatalog::for_specs(specs, schema);
         Ok(registry)
@@ -511,13 +510,14 @@ impl IndexStore {
         self.pk_index = match pk_columns {
             [] => None,
             [(column, field_id)] => {
-                // Reuse a user B-tree on the same column when there is one: the
-                // primary-key lookup wants exactly what it already holds, and a
+                // Reuse a user B-tree on exactly this column when there is one:
+                // the primary-key lookup wants what it already holds, and a
                 // second copy would double both the memory and the insert work.
+                // An index over more columns keys on something else.
                 let existing = self
                     .indexes
                     .iter()
-                    .filter(|(_, index)| index.columns().iter().any(|c| c == column))
+                    .filter(|(_, index)| index.columns() == std::slice::from_ref(column))
                     .find_map(|(name, index)| {
                         index.clone().as_primary_key().map(|pk| (name.clone(), pk))
                     });
@@ -923,6 +923,18 @@ impl IndexStore {
     /// The index named `name`, whatever kind maintains it.
     pub fn get_index(&self, name: &str) -> Option<&Arc<dyn MemIndex>> {
         self.indexes.get(name)
+    }
+
+    /// The index named `name`, if it was built from `spec`: the same kind,
+    /// columns, settings and base index. `None` for an index this store lacks
+    /// or holds under another definition, such as one a writer's later index
+    /// set redefined.
+    pub(crate) fn index_built_from(&self, spec: &MemIndexSpec) -> Option<&Arc<dyn MemIndex>> {
+        let built = self.specs.get(&spec.name)?;
+        built
+            .same_index(spec)
+            .then(|| self.indexes.get(&spec.name))
+            .flatten()
     }
 
     /// Every index in the store, by name.
