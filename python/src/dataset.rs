@@ -921,6 +921,18 @@ fn cleanup_explanation(
     }
 }
 
+fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("version", version.version)?;
+    dict.set_item(
+        "timestamp",
+        version.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+    )?;
+    let tup: Vec<(&String, &String)> = version.metadata.iter().collect();
+    dict.set_item("metadata", tup.into_py_dict(py)?)?;
+    dict.into_py_any(py)
+}
+
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
@@ -2127,20 +2139,15 @@ impl Dataset {
         let versions = self_.list_versions()?;
         let pyvers: Vec<Py<PyAny>> = versions
             .iter()
-            .map(|v| {
-                let dict = PyDict::new(py);
-                dict.set_item("version", v.version).unwrap();
-                dict.set_item(
-                    "timestamp",
-                    v.timestamp.timestamp_nanos_opt().unwrap_or_default(),
-                )
-                .unwrap();
-                let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
-                dict.set_item("metadata", tup.into_py_dict(py)?).unwrap();
-                dict.into_py_any(py)
-            })
+            .map(|v| version_to_py(py, v))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    /// Fetches the currently checked out version of the dataset, with its
+    /// timestamp and the summary of its manifest.
+    fn current_version(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        version_to_py(py, &self.ds.version())
     }
 
     fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {

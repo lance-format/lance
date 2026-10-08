@@ -227,7 +227,7 @@ pub async fn copy_blob_columns(
     target.manifest = Arc::new(manifest.clone());
     let target = Arc::new(target);
     let mut copies = HashMap::new();
-    for (id, uri) in managed_references(&source).await? {
+    for (id, uri) in managed_references(&source, source.scan()).await? {
         let path = join_base_and_relative_path(&source.blob_base_path(id)?, &uri)?;
         // Local objects keep their relative address, so their data files can be
         // copied verbatim. Registered bases may contain colliding object names.

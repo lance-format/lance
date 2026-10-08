@@ -3703,6 +3703,12 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
+    /// Loads scalar-index planning information from an explicitly selected metadata set.
+    async fn scalar_index_info_for_segments(
+        &self,
+        segments: &[IndexMetadata],
+    ) -> Result<ScalarIndexInfo>;
+
     /// Return the fragments that are not covered by any of the deltas of the index.
     async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
 
@@ -4483,6 +4489,14 @@ impl DatasetIndexInternalExt for Dataset {
     #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
+        self.scalar_index_info_for_segments(indices.as_ref()).await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    async fn scalar_index_info_for_segments(
+        &self,
+        indices: &[IndexMetadata],
+    ) -> Result<ScalarIndexInfo> {
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
         // (column, index_name) → union of every contributing IndexMetadata's

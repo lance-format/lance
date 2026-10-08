@@ -16,6 +16,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -25,6 +26,7 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
@@ -1987,6 +1989,36 @@ impl FilteredReadOptions {
         self
     }
 
+    /// [`Self::with_projection`], keeping the filters planned by
+    /// [`Self::with_physical_filters`] (and their session bindings) rebound to
+    /// the new projection.
+    pub(crate) fn with_projection_keeping_filters(
+        mut self,
+        projection: Projection,
+    ) -> Result<Self> {
+        self.projection = projection;
+        for (filter, physical_filter) in &mut self.physical_filters {
+            let projection = self
+                .projection
+                .clone()
+                .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
+            let schema = public_blob_v2_binary_projection_schema(&projection);
+            *physical_filter = physical_filter
+                .clone()
+                .transform(|expr| {
+                    let Some(column) = expr.downcast_ref::<Column>() else {
+                        return Ok(Transformed::no(expr));
+                    };
+                    let index = schema.index_of(column.name())?;
+                    Ok(Transformed::yes(
+                        Arc::new(Column::new(column.name(), index)) as Arc<dyn PhysicalExpr>,
+                    ))
+                })?
+                .data;
+        }
+        Ok(self)
+    }
+
     /// Specify the size of the I/O buffer (in bytes) to use for the scan
     ///
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
@@ -2730,6 +2762,20 @@ impl FilteredReadExec {
             RowSelector::RowStream(source) => Some(&source.plan),
             _ => None,
         }
+    }
+
+    /// This read with `projection`, keeping its precomputed plan and
+    /// session-planned filters.
+    pub(crate) fn with_projection(&self, projection: Projection) -> Result<Self> {
+        let options = self
+            .options
+            .clone()
+            .with_projection_keeping_filters(projection)?;
+        let read = Self::try_new(self.dataset.clone(), options, self.index_input().cloned())?;
+        if let Some(plan) = self.plan.get() {
+            let _ = read.plan.set(plan.clone());
+        }
+        Ok(read)
     }
 
     /// Return the pre-computed plan if one exists, without triggering initialization.

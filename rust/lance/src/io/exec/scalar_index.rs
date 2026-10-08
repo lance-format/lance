@@ -81,13 +81,14 @@ impl ScalarIndexLoader for Dataset {
     }
 }
 
-struct FragmentScopedScalarIndexLoader<'a> {
+struct ScopedScalarIndexLoader<'a> {
     dataset: &'a Dataset,
-    fragments: &'a RoaringBitmap,
+    fragments: Option<&'a RoaringBitmap>,
+    segment_uuids: Option<&'a HashSet<uuid::Uuid>>,
 }
 
 #[async_trait]
-impl ScalarIndexLoader for FragmentScopedScalarIndexLoader<'_> {
+impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
     async fn load_index(
         &self,
         column: &str,
@@ -98,7 +99,8 @@ impl ScalarIndexLoader for FragmentScopedScalarIndexLoader<'_> {
             self.dataset,
             column,
             index_name,
-            Some(self.fragments),
+            self.fragments,
+            self.segment_uuids,
             metrics,
         )
         .await
@@ -155,6 +157,7 @@ pub struct ScalarIndexExec {
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
     fragment_scope: Option<Arc<RoaringBitmap>>,
+    segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -189,6 +192,7 @@ impl ScalarIndexExec {
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
             fragment_scope: None,
+            segment_uuids: None,
         }
     }
 
@@ -198,6 +202,12 @@ impl ScalarIndexExec {
     /// the exact fragment scope, deletion mask, and any required data-level recheck.
     pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
+        self
+    }
+
+    /// Restrict index loading to these physical scalar index segments.
+    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+        self.segment_uuids = Some(segment_uuids);
         self
     }
 
@@ -252,26 +262,39 @@ impl ScalarIndexExec {
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
         fragment_scope: Option<Arc<RoaringBitmap>>,
+        segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
-            match fragment_scope.as_deref() {
-                Some(fragments) if fragments.is_empty() => {
+            match (fragment_scope.as_deref(), segment_uuids.as_deref()) {
+                (Some(fragments), _) if fragments.is_empty() => {
                     IndexExprResult::exact(RowAddrMask::allow_nothing())
                 }
-                Some(fragments) => {
+                (Some(fragments), segment_uuids) => {
                     expr.evaluate(
-                        &FragmentScopedScalarIndexLoader {
+                        &ScopedScalarIndexLoader {
                             dataset: dataset.as_ref(),
-                            fragments,
+                            fragments: Some(fragments),
+                            segment_uuids,
                         },
                         &metrics,
                     )
                     .await?
                 }
-                None => expr.evaluate(dataset.as_ref(), &metrics).await?,
+                (None, Some(segment_uuids)) => {
+                    expr.evaluate(
+                        &ScopedScalarIndexLoader {
+                            dataset: dataset.as_ref(),
+                            fragments: None,
+                            segment_uuids: Some(segment_uuids),
+                        },
+                        &metrics,
+                    )
+                    .await?
+                }
+                (None, None) => expr.evaluate(dataset.as_ref(), &metrics).await?,
             }
         };
         let mut fragments_covered_by_result =
@@ -324,6 +347,7 @@ impl ExecutionPlan for ScalarIndexExec {
             self.metrics.clone(),
             self.result_format,
             self.fragment_scope.clone(),
+            self.segment_uuids.clone(),
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
@@ -860,6 +884,8 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
+    /// Physical segments to open. `None` loads the whole logical index.
+    segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
     /// Row addresses blocked from the index result due to data overlay files committed after the
     /// index was built. ANDead into the candidate mask before row ID materialisation so that stale
     /// index entries never reach downstream operators.
@@ -936,10 +962,17 @@ impl MaterializeIndexExec {
             dataset,
             expr,
             fragments,
+            segment_uuids: None,
             overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Restrict index loading to these physical scalar index segments.
+    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+        self.segment_uuids = Some(segment_uuids);
+        self
     }
 
     /// Block specific row addresses (see the `overlay_block` field) from the index result.
@@ -953,10 +986,18 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        segment_uuids: Option<Arc<HashSet<uuid::Uuid>>>,
         overlay_block: Option<RowAddrMask>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
-        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
+        // Legacy storage materializes index hits here. UUID selection has to be applied at load
+        // time; evaluating against the dataset opens every segment of the logical index.
+        let loader = ScopedScalarIndexLoader {
+            dataset: dataset.as_ref(),
+            fragments: None,
+            segment_uuids: segment_uuids.as_deref(),
+        };
+        let expr_result = expr.evaluate(&loader, metrics.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -1121,6 +1162,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            self.segment_uuids.clone(),
             self.overlay_block.clone(),
             metrics,
         );
