@@ -57,12 +57,14 @@ pub struct TransactionRebase<'a> {
     current_lineage: Option<TaggedLineage>,
     /// The latest manifest's live fragments, loaded with `current_lineage`.
     current_live: Option<RoaringBitmap>,
-    /// For a CreateIndex on a table whose fragment reuse history is v0: the
-    /// source fragments of every group the latest manifest's entry still
-    /// records, one sorted id list per group. `None` when not loaded (not a
-    /// CreateIndex, a tagged table, or an FRI cleanup); an empty set when
-    /// the table has no entry. See [`Self::load_current_lineage`].
-    current_v0_reuse_sources: Option<HashSet<Vec<u64>>>,
+    /// The rewrite groups whose index remap was deferred and is still
+    /// recorded in the latest manifest's untagged (v0) fragment reuse index.
+    /// Each group is stored as its sorted source fragment ids.
+    ///
+    /// Only loaded for a CreateIndex on an untagged table. It is empty when
+    /// the table has no fragment reuse index, and `None` when it was not
+    /// loaded. See [`Self::load_untagged_deferred_groups`].
+    untagged_deferred_groups: Option<HashSet<Vec<u64>>>,
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
@@ -282,7 +284,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
-                    current_v0_reuse_sources: None,
+                    untagged_deferred_groups: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments,
@@ -319,7 +321,7 @@ impl<'a> TransactionRebase<'a> {
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
-                        current_v0_reuse_sources: None,
+                        untagged_deferred_groups: None,
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
@@ -340,7 +342,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
-                    current_v0_reuse_sources: None,
+                    untagged_deferred_groups: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -379,7 +381,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
-                    current_v0_reuse_sources: None,
+                    untagged_deferred_groups: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -402,7 +404,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
-                    current_v0_reuse_sources: None,
+                    untagged_deferred_groups: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -425,7 +427,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
-                    current_v0_reuse_sources: None,
+                    untagged_deferred_groups: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -447,7 +449,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
-                    current_v0_reuse_sources: None,
+                    untagged_deferred_groups: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -539,8 +541,8 @@ impl<'a> TransactionRebase<'a> {
 
     /// Load what a CreateIndex needs from the LATEST manifest before the
     /// per-version checks run: the lineage its tagged fragment reuse entry
-    /// records, or on a v0 table the rewrite groups its v0 entry records
-    /// (`load_current_v0_reuse_sources`). A committed rewrite is read back
+    /// records, or on an untagged table the deferred rewrite groups
+    /// (`load_untagged_deferred_groups`). A committed rewrite is read back
     /// from its transaction file, where `frag_reuse` is never serialized, so
     /// the entry is the only durable evidence that a rewrite deferred its
     /// index remap (see the Rewrite arm of `check_create_index_txn`). A no-op
@@ -554,7 +556,7 @@ impl<'a> TransactionRebase<'a> {
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
         else {
-            self.load_current_v0_reuse_sources(dataset, &indices)
+            self.load_untagged_deferred_groups(dataset, &indices)
                 .await?;
             return Ok(());
         };
@@ -565,25 +567,23 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// The v0 counterpart of the tagged lineage: which rewrite groups the
-    /// latest manifest's v0 fragment reuse entry still records.
+    /// Loads [`Self::untagged_deferred_groups`] from the latest manifest. This
+    /// is the untagged counterpart of the tagged lineage.
     ///
-    /// A committed rewrite is read back from its transaction file, where
-    /// `frag_reuse_index` is never serialized, so a CreateIndex committing
-    /// from another process cannot see that a concurrent rewrite deferred its
-    /// index remap. The v0 entry is durable evidence of exactly that: a
-    /// deferred rewrite appends one version whose groups name the rewritten
-    /// source fragments, and fragment ids are never reused, so a group's
-    /// sources identify the rewrite. Reading the LATEST entry (not the one at
-    /// the rewrite's version) also answers whether the record is still there:
-    /// a cleanup may have trimmed it while this index was being built, and
-    /// an index committed against a trimmed record would keep pointing at
-    /// the retired fragments with nothing left to translate them.
+    /// The transaction file of a committed rewrite does not include its
+    /// `frag_reuse_index`, so an index built in another process cannot tell
+    /// from it whether the rewrite deferred its remap. The fragment reuse
+    /// index can: a deferred rewrite records each of its groups there. Groups
+    /// are matched by source fragment ids, which are never reused.
     ///
-    /// Not loaded for an FRI cleanup, which `finish_create_index` re-derives
-    /// against the latest entry itself, nor on a table governed by the tagged
-    /// format.
-    async fn load_current_v0_reuse_sources(
+    /// Reading the latest manifest also tells whether the record still
+    /// exists. A cleanup can trim it while the index is being built, and an
+    /// index committed after that would point at retired fragments that
+    /// nothing translates any more.
+    ///
+    /// Skipped for a fragment reuse index cleanup, which
+    /// `finish_create_index` checks itself, and for tagged tables.
+    async fn load_untagged_deferred_groups(
         &mut self,
         dataset: &Dataset,
         indices: &[IndexMetadata],
@@ -606,16 +606,18 @@ impl<'a> TransactionRebase<'a> {
         ) {
             return Ok(());
         }
-        let mut sources = HashSet::new();
+        let mut deferred_groups = HashSet::new();
         if let Some(entry) = entry {
             let details = load_frag_reuse_index_details(dataset, entry).await?;
-            for version in details.versions.iter() {
-                for group in version.groups.iter() {
-                    sources.insert(sorted_ids(group.old_frags.iter().map(|f| f.id)));
-                }
-            }
+            deferred_groups.extend(
+                details
+                    .versions
+                    .iter()
+                    .flat_map(|version| version.groups.iter())
+                    .map(|group| sorted_ids(group.old_frags.iter().map(|f| f.id))),
+            );
         }
-        self.current_v0_reuse_sources = Some(sources);
+        self.untagged_deferred_groups = Some(deferred_groups);
         Ok(())
     }
 
@@ -1324,19 +1326,19 @@ impl<'a> TransactionRebase<'a> {
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    // On a v0 table the latest manifest's entry decides (see
-                    // `load_current_v0_reuse_sources`): it is the only evidence
-                    // available when the rewrite committed from another
-                    // process, and it also catches a record trimmed while this
-                    // index was being built. Without it, fall back to the
-                    // in-memory update a same-process rewrite carries.
-                    let v0_sources = self.current_v0_reuse_sources.as_ref();
-                    let deferred_v0 = v0_rewrite_recorded(v0_sources, groups).unwrap_or_else(|| {
+                    // On an untagged table, the latest manifest decides (see
+                    // `load_untagged_deferred_groups`). It works when the
+                    // rewrite committed in another process, and it catches a
+                    // record trimmed while this index was being built. If it
+                    // was not loaded, fall back to the in-memory update that
+                    // a rewrite from this process carries.
+                    let deferred_groups = self.untagged_deferred_groups.as_ref();
+                    let deferred_untagged = is_untagged_deferred_rewrite(deferred_groups, groups).unwrap_or_else(|| {
                         frag_reuse_index
                             .as_ref()
                             .is_some_and(|entry| !is_tagged(entry))
                     });
-                    if deferred_v0 {
+                    if deferred_untagged {
                         let ngram_coverage = new_indices
                             .iter()
                             .filter(|idx| {
@@ -3255,21 +3257,17 @@ fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
 
-/// Whether the latest v0 entry (`sources`, see
-/// `TransactionRebase::load_current_v0_reuse_sources`) still records every
-/// group of a committed rewrite, i.e. whether that rewrite deferred its index
-/// remap and its mapping has not been trimmed since. `None` when no v0
-/// evidence was loaded.
-fn v0_rewrite_recorded(
-    sources: Option<&HashSet<Vec<u64>>>,
+/// Whether every group of a committed rewrite is in `deferred_groups`,
+/// meaning the rewrite deferred its index remap and the record has not been
+/// trimmed. Returns `None` when `deferred_groups` was not loaded.
+fn is_untagged_deferred_rewrite(
+    deferred_groups: Option<&HashSet<Vec<u64>>>,
     groups: &[RewriteGroup],
 ) -> Option<bool> {
-    let sources = sources?;
-    Some(
-        groups
-            .iter()
-            .all(|group| sources.contains(&sorted_ids(group.old_fragments.iter().map(|f| f.id)))),
-    )
+    let deferred_groups = deferred_groups?;
+    Some(groups.iter().all(|group| {
+        deferred_groups.contains(&sorted_ids(group.old_fragments.iter().map(|f| f.id)))
+    }))
 }
 
 /// Fragment ids as a sorted list, the key a rewrite group is matched by.
@@ -4501,7 +4499,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4721,7 +4719,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4788,7 +4786,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4937,7 +4935,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4987,7 +4985,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5010,7 +5008,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5098,7 +5096,7 @@ mod tests {
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
-                        current_v0_reuse_sources: None,
+                        untagged_deferred_groups: None,
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
@@ -5156,7 +5154,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5295,7 +5293,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5363,7 +5361,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5425,7 +5423,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5454,7 +5452,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5506,7 +5504,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5569,7 +5567,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5635,7 +5633,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5684,7 +5682,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5734,7 +5732,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5811,7 +5809,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5894,7 +5892,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -6597,7 +6595,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
-                current_v0_reuse_sources: None,
+                untagged_deferred_groups: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -6668,7 +6666,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6714,7 +6712,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6761,7 +6759,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6808,7 +6806,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6866,7 +6864,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6899,7 +6897,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6953,7 +6951,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
-            current_v0_reuse_sources: None,
+            untagged_deferred_groups: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,

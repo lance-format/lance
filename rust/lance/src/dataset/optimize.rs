@@ -6914,109 +6914,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_concurrent_compaction_reindex_compaction_commit_first() {
-        let mut data_gen = BatchGenerator::new()
+    /// `rows` rows of `i` and `j`, both counting up from `start`.
+    fn ij_rows(start: i32, rows: i32) -> impl arrow_array::RecordBatchReader + use<> {
+        BatchGenerator::new()
             .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
+                IncrementingInt32::new().start(start).named("i".to_owned()),
             ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+            .col(Box::new(
+                IncrementingInt32::new().start(start).named("j".to_owned()),
+            ))
+            .batch(rows)
+    }
 
-        let mut dataset = Dataset::write(
-            data_gen.batch(6_000),
-            "memory://test/table",
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Create an index
-        let index_name = Some("scalar".into());
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                index_name.clone(),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-
-        // Write some more data for reindexing
+    /// Appends `rows` rows from `start` in fragments of 1_000 rows and moves
+    /// `dataset` to the new version.
+    async fn append_ij(dataset: &mut Dataset, start: i32, rows: i32) {
         Dataset::write(
-            data_gen.batch(6_000),
+            ij_rows(start, rows),
             WriteDestination::Dataset(Arc::new(dataset.clone())),
             Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
+                max_rows_per_file: 1_000,
                 mode: WriteMode::Append,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-
         dataset.checkout_latest().await.unwrap();
-        let mut dataset_clone = dataset.clone();
-
-        // First commit a compaction with deferred remap
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 2_000,
-                defer_index_remap: true,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Concurrent reindex should succeed
-        dataset_clone
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                index_name.clone(),
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Check new index does not cover the compacted files
-        dataset.checkout_latest().await.unwrap();
-
-        let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
-            panic!("scalar index must be available");
-        };
-        let index_frags = scalar_index
-            .fragment_bitmap
-            .unwrap()
-            .iter()
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            index_frags,
-            dataset
-                .fragments()
-                .iter()
-                .map(|f| f.id as u32)
-                .collect::<HashSet<_>>()
-        )
     }
 
-    /// Writes 12 fragments of 1_000 rows with columns `i` and `j`, a scalar
-    /// index `scalar` on `i` covering the first 6, and returns the dataset at
-    /// `uri` opened in its own session.
-    async fn v0_fri_conflict_fixture(uri: &str) -> Dataset {
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())))
-            .col(Box::new(IncrementingInt32::new().named("j".to_owned())));
+    /// Six fragments of 1_000 rows indexed by `scalar` on `i`, followed by
+    /// `appended` unindexed rows in fragments of 1_000.
+    async fn indexed_ij_dataset(uri: &str, appended: i32) -> Dataset {
         let mut dataset = Dataset::write(
-            data_gen.batch(6_000),
+            ij_rows(0, 6_000),
             uri,
             Some(WriteParams {
                 max_rows_per_file: 1_000,
@@ -7025,28 +6956,8 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("scalar".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-        Dataset::write(
-            data_gen.batch(6_000),
-            WriteDestination::Dataset(Arc::new(dataset.clone())),
-            Some(WriteParams {
-                max_rows_per_file: 1_000,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        dataset.checkout_latest().await.unwrap();
+        create_scalar_index(&mut dataset, "i", false).await;
+        append_ij(&mut dataset, 6_000, appended).await;
         dataset
     }
 
@@ -7068,48 +6979,158 @@ mod tests {
         }
     }
 
+    /// Builds a new index `j_idx` on `j` from `dataset`'s version.
+    async fn index_j(dataset: &mut Dataset) -> Result<()> {
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("j_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    fn assert_retryable_conflict(result: Result<()>) {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got: {error:?}"
+        );
+    }
+
+    async fn assert_scalar_covers_every_fragment(dataset: &mut Dataset) {
+        dataset.checkout_latest().await.unwrap();
+        let scalar = dataset.load_index_by_name("scalar").await.unwrap().unwrap();
+        let live: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+        assert_eq!(scalar.fragment_bitmap.unwrap(), live);
+    }
+
+    async fn assert_each_j_found_once(dataset: &mut Dataset, values: &[i32]) {
+        dataset.checkout_latest().await.unwrap();
+        for value in values {
+            let filter = format!("j = {value}");
+            assert_eq!(
+                dataset.count_rows(Some(filter)).await.unwrap(),
+                1,
+                "j = {value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_compaction_reindex_compaction_commit_first() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = indexed_ij_dataset(test_dir.as_str(), 6_000).await;
+        let mut reindex = dataset.clone();
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+        create_scalar_index(&mut reindex, "i", true).await;
+
+        assert_scalar_covers_every_fragment(&mut dataset).await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_compaction_reindex_reindex_commit_first() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = indexed_ij_dataset(test_dir.as_str(), 6_000).await;
+        let mut compaction = dataset.clone();
+
+        create_scalar_index(&mut dataset, "i", true).await;
+        compact_files(&mut compaction, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+
+        assert_scalar_covers_every_fragment(&mut dataset).await;
+    }
+
     /// A reindex committing from another process sees a deferred compaction
     /// only as its transaction file, which never carries the reuse update.
-    /// The v0 entry in the latest manifest is the durable evidence that the
+    /// The fragment reuse index in the latest manifest is the durable evidence that the
     /// compaction deferred its remap, so the reindex lands instead of
     /// retrying.
     #[tokio::test]
     async fn test_concurrent_compaction_reindex_across_processes() {
         let test_dir = TempStrDir::default();
         let uri = test_dir.as_str();
-        let mut dataset = v0_fri_conflict_fixture(uri).await;
+        let mut dataset = indexed_ij_dataset(uri, 6_000).await;
         let mut other_process = open_in_new_session(uri).await;
 
         compact_files(&mut dataset, defer_remap_compaction(), None)
             .await
             .unwrap();
+        create_scalar_index(&mut other_process, "i", true).await;
 
-        other_process
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("scalar".into()),
-                &ScalarIndexParams::default(),
-                true,
-            )
+        assert_scalar_covers_every_fragment(&mut dataset).await;
+    }
+
+    /// Every compaction committed while the reindex was built is found in the
+    /// latest entry, not just the first one.
+    #[tokio::test]
+    async fn test_reindex_across_processes_after_several_deferred_compactions() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = indexed_ij_dataset(uri, 6_000).await;
+        let mut other_process = open_in_new_session(uri).await;
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
             .await
             .unwrap();
+        append_ij(&mut dataset, 12_000, 4_000).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4_000,
+            ..defer_remap_compaction()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        index_j(&mut other_process).await.unwrap();
+
+        assert_each_j_found_once(&mut dataset, &[500, 5_500, 11_500]).await;
+    }
+
+    /// A fragment appended after the reindex read the table can be compacted
+    /// together with one the reindex covers. The reindex still lands across
+    /// processes; the commit leaves that group's output out of its coverage,
+    /// so those rows are scanned rather than lost.
+    #[tokio::test]
+    async fn test_reindex_across_processes_with_partially_covered_group() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = indexed_ij_dataset(uri, 5_000).await;
+        // Reads fragments 0..=10; fragment 11 lands after it.
+        let mut other_process = open_in_new_session(uri).await;
+        append_ij(&mut dataset, 11_000, 1_000).await;
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+        let reuse = dataset.frag_reuse_index().await.unwrap().unwrap();
+        let split_group = reuse
+            .details
+            .versions
+            .iter()
+            .flat_map(|version| version.groups.iter())
+            .find(|group| group.old_frags.iter().any(|f| f.id == 11))
+            .unwrap();
+        assert!(
+            split_group.old_frags.iter().any(|f| f.id <= 10),
+            "the fixture must compact fragment 11 with one the reindex covers"
+        );
+        index_j(&mut other_process).await.unwrap();
 
         dataset.checkout_latest().await.unwrap();
-        let scalar_index = dataset.load_index_by_name("scalar").await.unwrap().unwrap();
-        let index_frags = scalar_index
-            .fragment_bitmap
-            .unwrap()
-            .iter()
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            index_frags,
-            dataset
-                .fragments()
+        let j_idx = dataset.load_index_by_name("j_idx").await.unwrap().unwrap();
+        let coverage = j_idx.fragment_bitmap.unwrap();
+        assert!(
+            split_group
+                .new_frags
                 .iter()
-                .map(|f| f.id as u32)
-                .collect::<HashSet<_>>()
+                .all(|f| !coverage.contains(f.id as u32))
         );
+        assert_each_j_found_once(&mut dataset, &[500, 10_500, 11_500]).await;
     }
 
     /// A deferred compaction's reuse record can be trimmed while an index is
@@ -7121,9 +7142,8 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_retries_when_deferred_compaction_was_trimmed() {
         let test_dir = TempStrDir::default();
-        let uri = test_dir.as_str();
-        let mut dataset = v0_fri_conflict_fixture(uri).await;
-        let mut index_builder = dataset.clone();
+        let mut dataset = indexed_ij_dataset(test_dir.as_str(), 6_000).await;
+        let mut same_process = dataset.clone();
 
         compact_files(&mut dataset, defer_remap_compaction(), None)
             .await
@@ -7132,196 +7152,15 @@ mod tests {
             .await
             .unwrap();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        let fri = dataset
-            .load_indices()
-            .await
-            .unwrap()
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .cloned();
-        if let Some(fri) = fri {
-            let details = load_frag_reuse_index_details(&dataset, &fri).await.unwrap();
-            assert!(details.versions.is_empty(), "the trim must drop the record");
-        }
-
-        // A new index on `j`, built from the pre-compaction snapshot: no name
-        // clash with the remap, so only the reuse evidence can stop it.
-        let error = index_builder
-            .create_index(
-                &["j"],
-                IndexType::Scalar,
-                Some("j_idx".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap_err();
+        let reuse = dataset.frag_reuse_index().await.unwrap();
         assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "expected RetryableCommitConflict, got: {error:?}"
-        );
-    }
-
-    /// Appends `rows` rows of `i` and `j`, both counting up from `start`, in
-    /// fragments of 1_000 rows.
-    async fn append_ij(dataset: &Dataset, start: i32, rows: i32) {
-        Dataset::write(
-            BatchGenerator::new()
-                .col(Box::new(
-                    IncrementingInt32::new().start(start).named("i".to_owned()),
-                ))
-                .col(Box::new(
-                    IncrementingInt32::new().start(start).named("j".to_owned()),
-                ))
-                .batch(rows),
-            WriteDestination::Dataset(Arc::new(dataset.clone())),
-            Some(WriteParams {
-                max_rows_per_file: 1_000,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-    }
-
-    /// Every compaction committed while the reindex was built is found in the
-    /// latest entry, not just the first one.
-    #[tokio::test]
-    async fn test_reindex_across_processes_after_several_deferred_compactions() {
-        let test_dir = TempStrDir::default();
-        let uri = test_dir.as_str();
-        let mut dataset = v0_fri_conflict_fixture(uri).await;
-        let mut other_process = open_in_new_session(uri).await;
-
-        compact_files(&mut dataset, defer_remap_compaction(), None)
-            .await
-            .unwrap();
-        append_ij(&dataset, 12_000, 4_000).await;
-        dataset.checkout_latest().await.unwrap();
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 4_000,
-                defer_index_remap: true,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        other_process
-            .create_index(
-                &["j"],
-                IndexType::Scalar,
-                Some("j_idx".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-
-        dataset.checkout_latest().await.unwrap();
-        for value in [500, 5_500, 11_500] {
-            assert_eq!(
-                dataset
-                    .count_rows(Some(format!("j = {value}")))
-                    .await
-                    .unwrap(),
-                1,
-                "j = {value}"
-            );
-        }
-    }
-
-    /// A fragment appended after the reindex read the table can be compacted
-    /// together with one the reindex covers. The reindex still lands across
-    /// processes; the commit leaves that group's output out of its coverage,
-    /// so those rows are scanned rather than lost.
-    #[tokio::test]
-    async fn test_reindex_across_processes_with_partially_covered_group() {
-        let test_dir = TempStrDir::default();
-        let uri = test_dir.as_str();
-        let mut dataset = Dataset::write(
-            BatchGenerator::new()
-                .col(Box::new(IncrementingInt32::new().named("i".to_owned())))
-                .col(Box::new(IncrementingInt32::new().named("j".to_owned())))
-                .batch(6_000),
-            uri,
-            Some(WriteParams {
-                max_rows_per_file: 1_000,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("scalar".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-        append_ij(&dataset, 6_000, 5_000).await;
-        // Reads fragments 0..=10; fragment 11 lands after it.
-        let mut other_process = open_in_new_session(uri).await;
-        append_ij(&dataset, 11_000, 1_000).await;
-        dataset.checkout_latest().await.unwrap();
-
-        compact_files(&mut dataset, defer_remap_compaction(), None)
-            .await
-            .unwrap();
-        let fri = dataset
-            .load_indices()
-            .await
-            .unwrap()
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .cloned()
-            .unwrap();
-        let details = load_frag_reuse_index_details(&dataset, &fri).await.unwrap();
-        let split_group = details
-            .versions
-            .iter()
-            .flat_map(|version| version.groups.iter())
-            .find(|group| group.old_frags.iter().any(|f| f.id == 11))
-            .unwrap();
-        assert!(
-            split_group.old_frags.iter().any(|f| f.id <= 10),
-            "the fixture must compact fragment 11 with one the reindex covers"
+            reuse.is_none_or(|reuse| reuse.details.versions.is_empty()),
+            "the trim must drop the record"
         );
 
-        other_process
-            .create_index(
-                &["j"],
-                IndexType::Scalar,
-                Some("j_idx".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-
-        dataset.checkout_latest().await.unwrap();
-        let j_idx = dataset.load_index_by_name("j_idx").await.unwrap().unwrap();
-        let coverage = j_idx.fragment_bitmap.unwrap();
-        for new_frag in split_group.new_frags.iter() {
-            assert!(!coverage.contains(new_frag.id as u32));
-        }
-        for value in [500, 10_500, 11_500] {
-            assert_eq!(
-                dataset
-                    .count_rows(Some(format!("j = {value}")))
-                    .await
-                    .unwrap(),
-                1,
-                "j = {value}"
-            );
-        }
+        // A new index, so no name clash with the remap: only the reuse
+        // evidence can stop it.
+        assert_retryable_conflict(index_j(&mut same_process).await);
     }
 
     /// A reuse entry left on the table by an earlier deferred compaction says
@@ -7331,133 +7170,20 @@ mod tests {
     async fn test_reindex_conflicts_with_eager_compaction_despite_existing_fri() {
         let test_dir = TempStrDir::default();
         let uri = test_dir.as_str();
-        let mut dataset = v0_fri_conflict_fixture(uri).await;
+        let mut dataset = indexed_ij_dataset(uri, 6_000).await;
         compact_files(&mut dataset, defer_remap_compaction(), None)
             .await
             .unwrap();
-        append_ij(&dataset, 12_000, 4_000).await;
-        dataset.checkout_latest().await.unwrap();
+        append_ij(&mut dataset, 12_000, 4_000).await;
         let mut other_process = open_in_new_session(uri).await;
 
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 2_000,
-                defer_index_remap: false,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        let error = other_process
-            .create_index(
-                &["j"],
-                IndexType::Scalar,
-                Some("j_idx".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "expected RetryableCommitConflict, got: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_compaction_reindex_reindex_commit_first() {
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset = Dataset::write(
-            data_gen.batch(6_000),
-            "memory://test/table",
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Create an index
-        let index_name = Some("scalar".into());
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                index_name.clone(),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-
-        // Write some more data for reindexing
-        Dataset::write(
-            data_gen.batch(6_000),
-            WriteDestination::Dataset(Arc::new(dataset.clone())),
-            Some(WriteParams {
-                max_rows_per_file: 1_000, // 6 files
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        dataset.checkout_latest().await.unwrap();
-        let mut dataset_clone = dataset.clone();
-
-        // Concurrent reindex should succeed
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                index_name.clone(),
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
-
-        // First commit a compaction with deferred remap
-        compact_files(
-            &mut dataset_clone,
-            CompactionOptions {
-                target_rows_per_fragment: 2_000,
-                defer_index_remap: true,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Check new index is auto-remapped
-        dataset.checkout_latest().await.unwrap();
-        let Some(scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
-            panic!("scalar index must be available");
+        let eager = CompactionOptions {
+            defer_index_remap: false,
+            ..defer_remap_compaction()
         };
-        let index_frags = scalar_index
-            .fragment_bitmap
-            .unwrap()
-            .iter()
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            index_frags,
-            dataset
-                .fragments()
-                .iter()
-                .map(|f| f.id as u32)
-                .collect::<HashSet<_>>()
-        )
+        compact_files(&mut dataset, eager, None).await.unwrap();
+
+        assert_retryable_conflict(index_j(&mut other_process).await);
     }
 
     #[tokio::test]
