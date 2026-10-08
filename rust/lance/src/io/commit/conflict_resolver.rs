@@ -1321,24 +1321,24 @@ impl<'a> TransactionRebase<'a> {
                     if self_is_tagged_trim {
                         return Ok(());
                     }
-                    // if a reuse update is present, index remapping is deferred and
-                    // there is no conflict with concurrent CreateIndex of column indices.
+                    // if index remapping is deferred, there is no conflict with
+                    // concurrent CreateIndex of column indices.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    // On an untagged table, the latest manifest decides (see
-                    // `load_untagged_deferred_groups`). It works when the
-                    // rewrite committed in another process, and it catches a
-                    // record trimmed while this index was being built. If it
-                    // was not loaded, fall back to the in-memory update that
-                    // a rewrite from this process carries.
-                    let deferred_groups = self.untagged_deferred_groups.as_ref();
-                    let deferred_untagged = is_untagged_deferred_rewrite(deferred_groups, groups).unwrap_or_else(|| {
+
+                    // Untagged: the latest manifest shows whether the rewrite deferred
+                    // (`load_untagged_deferred_groups`), else its in-memory update.
+                    let deferred = is_untagged_deferred_rewrite(
+                        self.untagged_deferred_groups.as_ref(),
+                        groups,
+                    )
+                    .unwrap_or_else(|| {
                         frag_reuse_index
                             .as_ref()
                             .is_some_and(|entry| !is_tagged(entry))
                     });
-                    if deferred_untagged {
+                    if deferred {
                         let ngram_coverage = new_indices
                             .iter()
                             .filter(|idx| {
