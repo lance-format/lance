@@ -49,6 +49,7 @@ use super::{
 };
 use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::dataset::updater::OutputSchema;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
 use crate::{
@@ -1864,7 +1865,10 @@ impl MergeInsertJob {
                     let mut updater = fragment
                         .updater_with_version(
                             Some(&read_columns),
-                            Some((write_schema, dataset.schema().clone())),
+                            OutputSchema::Known {
+                                write: write_schema,
+                                complete: dataset.schema().clone(),
+                            },
                             None,
                             None,
                             write_version,
