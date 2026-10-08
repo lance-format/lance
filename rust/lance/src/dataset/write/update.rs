@@ -1671,10 +1671,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Bitmap specifically: this test's point is that a row-id-domain index
-        // on an untouched column picks up a rewritten row's new fragment for
-        // free, which needs a row-id-domain index to demonstrate. `str`'s low
-        // cardinality (6 values) also suits bitmap well.
+        // Need to use a row-id-domain index (while we still have one)
         let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
             .create_index(

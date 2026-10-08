@@ -125,17 +125,6 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
     def _is_old_build(self) -> bool:
         """True while this method body is executing inside the pinned old
         venv under test.
-
-        `self.compat_version` names the historical release under test
-        regardless of which build actually executes a given method (this
-        class's methods run under both the old venv and the current build,
-        at different points of the upgrade/downgrade round trip). The old
-        venv has exactly that pylance version installed, so comparing it
-        against the live `lance.__version__` tells the two apart. Compared
-        as `Version`, not raw strings: `lance.__version__` reports Cargo's
-        semver-style pre-release format (`14.0.0-beta.1`) while
-        `self.compat_version` comes from PyPI's PEP 440 format (`14.0.0b1`)
-        for the same release.
         """
         return Version(lance.__version__) == Version(self.compat_version)
 
