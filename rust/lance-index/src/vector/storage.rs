@@ -11,7 +11,7 @@ use crate::vector::bq::layered::{
 use crate::vector::bq::layered_stats;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
 use crate::vector::bq::plane_rows::{PACKED_COLUMNS, PlaneRowsSpec};
-use crate::vector::bq::resident::{ResidentColumnStore, is_resident};
+use crate::vector::bq::resident::{ResidentColumnStore, ResidentLoadTrigger, is_resident};
 use crate::vector::bq::storage::{RQRowLayout, normalize_entry_codes};
 use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::{QuantizationMetadata, QuantizationType, QuantizerStorage};
@@ -1078,13 +1078,15 @@ fn sign_bounds_from(value: Option<&str>) -> Result<SignBounds> {
 /// reads fetch only the code and bounds columns from the file: `auto`
 /// (default), `on` or `off`. `auto` is on wherever the opening index's cache
 /// can pin the store, whatever the origin (see
-/// [`ResidentColumnsSetting::admits`]). The store is an entry of the index
-/// cache, charged in its budget and leased, so kept in RAM, while an index
-/// of the file is live (see [`ResidentColumns`]); [`resident_columns_bytes`]
-/// gives its size without I/O. Results are the same either way. `on` or
-/// `off` here overrides the setting of the session opening an index, which
-/// `auto` defers to (see [`ResidentColumnsSetting::resolve_with_session`]).
-/// Read once per process; resolved when an index opens.
+/// [`ResidentColumnsSetting::admits`]). An index of the file loads the store
+/// when it opens, unless a live index or the index cache already holds it.
+/// The store is an entry of the index cache, charged in its budget and
+/// leased, so kept in RAM, while an index of the file is live (see
+/// [`ResidentColumns`]); [`resident_columns_bytes`] gives its size without
+/// I/O. Results are the same either way. `on` or `off` here overrides the
+/// setting of the session opening an index, which `auto` defers to (see
+/// [`ResidentColumnsSetting::resolve_with_session`]). Read once per process;
+/// resolved when an index opens.
 pub const RESIDENT_COLUMNS_ENV: &str = "LANCE_RQ_RESIDENT_COLUMNS";
 
 /// The size of an IVF_RQ storage file's resident store, known without
@@ -2096,7 +2098,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// This storage's handle on the resident store of its file, which leases
     /// the store while the storage lives. It loads only while
-    /// [`Self::resident_columns_enabled`].
+    /// [`Self::resident_columns_enabled`], when the index opens
+    /// ([`Self::load_resident_store`]).
     pub fn resident_columns(&self) -> &ResidentColumns {
         &self.resident_columns
     }
@@ -2133,6 +2136,22 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// [`Self::with_resident_columns_enabled`].
     pub fn resident_columns_enabled(&self) -> bool {
         self.resident_columns_enabled
+    }
+
+    /// Load the resident store through this storage's handle, admitted to
+    /// and leased in the index cache the handle is bound to, unless it is
+    /// loaded already: an index loads its store when it opens, so that no
+    /// read loads it. The load's I/O is added to `io_stats`. Nothing to load
+    /// unless [`Self::resident_columns_enabled`], which a plane-row file
+    /// never is.
+    pub async fn load_resident_store(&self, io_stats: Option<&IoStats>) -> Result<()> {
+        if !self.resident_columns_enabled {
+            return Ok(());
+        }
+        self.resident_columns
+            .get_or_load(&self.reader, io_stats, ResidentLoadTrigger::Open)
+            .await
+            .map(|_| ())
     }
 
     /// Bytes the resident store holds for this storage's file, loaded or
@@ -2480,8 +2499,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// code-only entry: the columns the resident store keeps are copies of
     /// its rows, the others the entry's, in the order a storage built from
     /// a read of the file holds them, so the storage is that one, bit for
-    /// bit and byte for byte. The first build loads the store, whose I/O is
-    /// added to `load_stats`.
+    /// bit and byte for byte. The index loaded the store when it opened; a
+    /// storage built outside an index open loads it on its first build, as a
+    /// fallback, and adds the load's I/O to `load_stats`.
     pub async fn partition_from_codes(
         &self,
         part_id: usize,
@@ -2530,7 +2550,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// entry in `cache` ([`PartitionCodesKey`]), loaded from the file on a
     /// miss and admitted when `write_cache`, and whether the entry was a hit.
     /// Every read attaches the resident columns ([`Self::partition_from_codes`]),
-    /// so a hit reads nothing from the file once the store is loaded.
+    /// which the index loaded when it opened, so a hit reads nothing from the
+    /// file.
     pub async fn load_partition_cached(
         &self,
         part_id: usize,
@@ -2849,8 +2870,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// entry ([`EntryColumns::Codes`]) gets copies of the resident store's
     /// rows at the rows' file offsets, in the plane's column order, so the
     /// batch is the one, bit for bit and byte for byte, that a read of the
-    /// file returns (see [`Self::read_plane`]). The first attach loads the
-    /// store, whose I/O is added to `load_stats`.
+    /// file returns (see [`Self::read_plane`]). The index loaded the store
+    /// when it opened; a storage built outside an index open loads it on its
+    /// first attach, as a fallback, and adds the load's I/O to `load_stats`.
     pub async fn attach_resident(
         &self,
         part_id: usize,
@@ -3520,8 +3542,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// The resident store, when [`Self::resident_columns_enabled`] and it
-    /// keeps some of `schema`'s columns. The first read loads it, and the
-    /// load's I/O is added to that read's `io_stats`.
+    /// keeps some of `schema`'s columns. The index loaded it when it opened
+    /// ([`Self::load_resident_store`]); a read loads it only as a fallback,
+    /// for a storage built outside an index open, which counts
+    /// `resident_columns_read_loads` and adds the load's I/O to that read's
+    /// `io_stats`.
     async fn resident_store(
         &self,
         schema: &arrow_schema::Schema,
@@ -3532,7 +3557,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             return Ok(None);
         }
         self.resident_columns
-            .get_or_load(&self.reader, io_stats)
+            .get_or_load(&self.reader, io_stats, ResidentLoadTrigger::Read)
             .await
             .map(Some)
     }

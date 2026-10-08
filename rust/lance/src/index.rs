@@ -3053,12 +3053,14 @@ impl DatasetIndexInternalExt for Dataset {
         )
         .await;
         // What the session declares about the index, for whichever IVF open
-        // or reconstruction below runs.
+        // or reconstruction below runs, and where a reconstruction adds the
+        // I/O of a resident store load.
         let open_context = IvfOpenContext {
             origin_latency_hint: self.session.index_origin_latency(),
             resident_columns: self.session.index_resident_columns(),
             file_cache: Some(file_cache),
             resident_lease,
+            io_stats: metrics.io_stats(),
         };
 
         // Check sized cache first (v2+ indices with serializable state).

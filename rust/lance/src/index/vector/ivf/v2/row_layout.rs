@@ -1073,6 +1073,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::index::vector::ivf::v2::IVFIndex;
     use crate::index::{DatasetIndexInternalExt, vector::VectorIndex};
+    use crate::session::{ResidentColumnsSetting, Session};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::flat::index::FlatIndex;
 
@@ -1406,6 +1407,28 @@ mod tests {
         assert_eq!(index.row_layout(), RQRowLayout::PlaneRows);
         assert!(!index.resident_columns_enabled());
         assert_eq!(index.resident_columns_bytes(), 0);
+        // A plane-row file keeps no small columns apart, so its open loads no
+        // store whatever residency the session asks for.
+        for setting in [
+            ResidentColumnsSetting::Auto,
+            ResidentColumnsSetting::On,
+            ResidentColumnsSetting::Off,
+        ] {
+            let session = Session::default().with_index_resident_columns(setting);
+            let reopened = crate::DatasetBuilder::from_uri(&copy_path)
+                .with_session(Arc::new(session))
+                .load()
+                .await
+                .unwrap();
+            let index = open_index(&reopened).await;
+            let index = index.as_any().downcast_ref::<IvfRq>().unwrap();
+            assert!(!index.resident_columns_enabled(), "{setting}");
+            assert_eq!(
+                index.storage.resident_columns().loaded_bytes(),
+                None,
+                "{setting}"
+            );
+        }
 
         assert_same_results(&source, &converted, layered).await;
         let verification = verify_rq_row_layout(&source, &converted, INDEX_NAME)
