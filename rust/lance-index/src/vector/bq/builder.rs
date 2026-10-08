@@ -288,18 +288,25 @@ fn best_ex_rescale_factor(scratch: &mut ExQuantizationScratch, ex_bits: u8) -> f
     best_t
 }
 
-fn quantize_ex_code(
+fn quantize_ex_code<F>(
     rotated: &[f32],
     ex_bits: u8,
     ex_code_dst: &mut [u8],
     ex_code_values_dst: &mut [u8],
     scratch: &mut ExQuantizationScratch,
-) -> f32 {
+    mut visit: F,
+) -> f32
+where
+    F: FnMut(usize, f32, u8, u8),
+{
     debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
     let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
     if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
         ex_code_dst.fill(0);
         ex_code_values_dst.fill(0);
+        for (idx, &value) in rotated.iter().enumerate() {
+            visit(idx, value, u8::from(value.is_sign_positive()), 0);
+        }
         return 0.0;
     }
 
@@ -314,10 +321,11 @@ fn quantize_ex_code(
     let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
     let mut residual_dot_code = 0.0f32;
 
-    for ((&value, &abs_value), ex_code_value) in rotated
+    for (idx, ((&value, &abs_value), ex_code_value)) in rotated
         .iter()
         .zip(scratch.abs_normalized.iter())
         .zip(ex_code_values_dst.iter_mut())
+        .enumerate()
     {
         let mut ex_code = ((t * abs_value) + EX_QUANTIZATION_EPSILON)
             .floor()
@@ -329,6 +337,7 @@ fn quantize_ex_code(
         let full_code = ((sign_code as u32) << ex_bits) + ex_code as u32;
         residual_dot_code += value * (full_code as f32 + code_bias);
         *ex_code_value = ex_code;
+        visit(idx, value, sign_code, ex_code);
     }
 
     crate::vector::bq::ex_dot::pack_blocked_row(ex_code_values_dst, ex_bits, ex_code_dst);
@@ -336,35 +345,46 @@ fn quantize_ex_code(
 }
 
 impl RabitQuantizer {
-    /// Consume each rotated row and its unpacked codes before reusing scratch.
-    pub(crate) fn quantize_with_factors<F>(
+    /// Encode each rotated row and consume its codes before reusing scratch.
+    pub(crate) fn quantize_with_factors<'c, 'o, I, F>(
         &self,
         vectors: &FixedSizeListArray,
+        destinations: I,
         factors: F,
-    ) -> Result<(RabitQuantizedBatch, Vec<RabitRowFactors>)>
+    ) -> Result<RabitQuantizedBatch>
     where
-        F: Fn(usize, &[f32], Option<&[u8]>, f32) -> RabitRowFactors + Sync,
+        I: IndexedParallelIterator,
+        F: Fn(usize, I::Item) -> RabitRowFactors<'c, 'o> + Sync,
     {
         match vectors.value_type() {
-            DataType::Float16 => self.transform_with_factors::<Float16Type, F>(vectors, factors),
-            DataType::Float32 => self.transform_with_factors::<Float32Type, F>(vectors, factors),
-            DataType::Float64 => self.transform_with_factors::<Float64Type, F>(vectors, factors),
+            DataType::Float16 => {
+                self.transform_with_factors::<Float16Type, I, F>(vectors, destinations, factors)
+            }
+            DataType::Float32 => {
+                self.transform_with_factors::<Float32Type, I, F>(vectors, destinations, factors)
+            }
+            DataType::Float64 => {
+                self.transform_with_factors::<Float64Type, I, F>(vectors, destinations, factors)
+            }
             value_type => Err(Error::invalid_input(format!(
                 "Unsupported data type: {value_type:?}"
             ))),
         }
     }
 
-    fn transform_with_factors<T, F>(
+    fn transform_with_factors<'c, 'o, T, I, F>(
         &self,
         vectors: &FixedSizeListArray,
+        destinations: I,
         factors: F,
-    ) -> Result<(RabitQuantizedBatch, Vec<RabitRowFactors>)>
+    ) -> Result<RabitQuantizedBatch>
     where
         T: ArrowFloatType,
         T::Native: AsPrimitive<f32> + Sync,
-        F: Fn(usize, &[f32], Option<&[u8]>, f32) -> RabitRowFactors + Sync,
+        I: IndexedParallelIterator,
+        F: Fn(usize, I::Item) -> RabitRowFactors<'c, 'o> + Sync,
     {
+        debug_assert_eq!(destinations.len(), vectors.len());
         let values = vectors
             .values()
             .as_any()
@@ -383,7 +403,6 @@ impl RabitQuantizer {
         let ex_stride = ex_code_bytes.max(1);
         let mut codes = vec![0; vectors.len() * code_bytes];
         let mut ex_codes = vec![0; vectors.len() * ex_stride];
-        let mut row_factors = vec![RabitRowFactors::default(); vectors.len()];
         let matrix_rotated = match self.rotation_type() {
             RQRotationType::Matrix => {
                 let input = ndarray::ArrayView2::from_shape((vectors.len(), self.dim()), values)
@@ -398,15 +417,15 @@ impl RabitQuantizer {
         codes
             .par_chunks_mut(code_bytes)
             .zip(ex_codes.par_chunks_mut(ex_stride))
-            .zip(row_factors.par_iter_mut())
+            .zip(destinations)
             .zip(values.par_chunks_exact(self.dim()))
             .enumerate()
-            .with_min_len(QUANTIZATION_MIN_ROWS_PER_JOB)
+            .with_min_len(quantization_min_len(vectors.len()))
             .for_each_init(
                 || {
                     (
                         vec![0.0f32; dim],
-                        vec![0u8; dim],
+                        vec![0u8; if ex_bits == 0 { 0 } else { dim }],
                         ExQuantizationScratch::new(dim, ex_bits),
                     )
                 },
@@ -419,44 +438,44 @@ impl RabitQuantizer {
                     } else if let Some(signs) = signs {
                         apply_fast_rotation(input, rotated, signs);
                     }
-                    pack_sign_bits(code_dst, rotated);
+                    let mut row_factors = factors(row, factor_dst);
+                    code_dst.fill(0);
+                    let mut visit = |idx: usize, value, sign: u8, extra| {
+                        code_dst[idx / 8] |= sign << (idx % 8);
+                        row_factors.observe(idx, value, sign, extra);
+                    };
                     let ex_dot = if ex_bits != 0 {
-                        quantize_ex_code(rotated, ex_bits, ex_dst, ex_values, scratch)
+                        quantize_ex_code(rotated, ex_bits, ex_dst, ex_values, scratch, visit)
                     } else {
+                        for (idx, &value) in rotated.iter().enumerate() {
+                            visit(idx, value, u8::from(value.is_sign_positive()), 0);
+                        }
                         0.0
                     };
-                    *factor_dst = factors(
-                        row,
-                        rotated,
-                        (ex_bits != 0).then_some(ex_values.as_slice()),
-                        ex_dot,
-                    );
+                    row_factors.finish(ex_dot);
                 },
             );
 
-        Ok((
-            RabitQuantizedBatch {
-                binary_codes: Arc::new(FixedSizeListArray::try_new_from_values(
-                    UInt8Array::from(codes),
-                    code_bytes as i32,
-                )?),
-                ex_codes: if ex_bits != 0 {
-                    Some(Arc::new(FixedSizeListArray::try_new_from_values(
-                        UInt8Array::from(ex_codes),
-                        ex_code_bytes as i32,
-                    )?))
-                } else {
-                    None
-                },
-                #[cfg(test)]
-                rotated_residuals: None,
-                #[cfg(test)]
-                ex_code_values: None,
-                #[cfg(test)]
-                ex_res_dot_dists: None,
+        Ok(RabitQuantizedBatch {
+            binary_codes: Arc::new(FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(codes),
+                code_bytes as i32,
+            )?),
+            ex_codes: if ex_bits != 0 {
+                Some(Arc::new(FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(ex_codes),
+                    ex_code_bytes as i32,
+                )?))
+            } else {
+                None
             },
-            row_factors,
-        ))
+            #[cfg(test)]
+            rotated_residuals: None,
+            #[cfg(test)]
+            ex_code_values: None,
+            #[cfg(test)]
+            ex_res_dot_dists: None,
+        })
     }
 
     pub fn new<T: ArrowFloatType>(num_bits: u8, dim: i32) -> Self {
@@ -918,8 +937,14 @@ impl RabitQuantizer {
                 .for_each_init(
                     || ExQuantizationScratch::new(code_dim, ex_bits),
                     |scratch, (((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
-                        *ex_dot_dst =
-                            quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst, scratch);
+                        *ex_dot_dst = quantize_ex_code(
+                            rotated,
+                            ex_bits,
+                            ex_dst,
+                            ex_values_dst,
+                            scratch,
+                            |_, _, _, _| {},
+                        );
                     },
                 );
         }

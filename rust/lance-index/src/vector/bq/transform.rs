@@ -13,6 +13,7 @@ use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, norm_squared_fsl};
+use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
@@ -86,39 +87,43 @@ impl RQTransformer {
             }
         }
         let ex_bits = rabit_ex_bits(self.rq.num_bits())?;
-        let (codes, factors) = self.rq.quantize_with_factors(
+        let num_rows = residual_vectors.len();
+        let mut add = vec![0.0; num_rows];
+        let mut scale = vec![0.0; num_rows];
+        let mut error = vec![0.0; num_rows];
+        let ex_rows = if ex_bits == 0 { 0 } else { num_rows };
+        let mut ex_add = vec![0.0; ex_rows];
+        let mut ex_scale = vec![0.0; ex_rows];
+        let extra = if ex_bits == 0 {
+            rayon::iter::Either::Left((0..num_rows).into_par_iter().map(|_| None))
+        } else {
+            rayon::iter::Either::Right(ex_add.par_iter_mut().zip(ex_scale.par_iter_mut()).map(Some))
+        };
+        let destinations = (&mut add, &mut scale, &mut error)
+            .into_par_iter()
+            .zip(extra);
+        let codes = self.rq.quantize_with_factors(
             residual_vectors,
-            |row, residual, ex_values, ex_dot| {
+            destinations,
+            |row, ((add, scale, error), extra)| {
                 let start = part_ids.value(row) as usize * dim;
-                compute_row_factors(
-                    self.distance_type,
-                    res_norm_square.value(row),
-                    residual,
-                    &rotated_centroids[start..start + dim],
-                    ex_values,
-                    ex_dot,
+                RabitRowFactors {
+                    distance_type: self.distance_type,
+                    norm_square: res_norm_square.value(row),
+                    centroid: &rotated_centroids[start..start + dim],
                     ex_bits,
-                )
+                    ex_code_bias: -((1u32 << ex_bits) as f32 - 0.5),
+                    binary_res_dot: 0.0,
+                    binary_cent_dot: 0.0,
+                    ex_cent_dot: 0.0,
+                    residual_centroid_dot: 0.0,
+                    add,
+                    scale,
+                    error,
+                    extra,
+                }
             },
         )?;
-        let mut add = Vec::with_capacity(factors.len());
-        let mut scale = Vec::with_capacity(factors.len());
-        let mut error = Vec::with_capacity(factors.len());
-        let mut ex_add = Vec::new();
-        let mut ex_scale = Vec::new();
-        if ex_bits != 0 {
-            ex_add.reserve(factors.len());
-            ex_scale.reserve(factors.len());
-        }
-        for factor in factors {
-            add.push(factor.add);
-            scale.push(factor.scale);
-            error.push(factor.error);
-            if ex_bits != 0 {
-                ex_add.push(factor.ex_add);
-                ex_scale.push(factor.ex_scale);
-            }
-        }
         let mut batch = batch
             .try_with_column(self.rq.field(), codes.binary_codes)?
             .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(Float32Array::from(add)))?
@@ -182,63 +187,71 @@ struct RabitRawQueryFactors {
     ex_scale_factors: Option<Float32Array>,
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct RabitRowFactors {
-    add: f32,
-    scale: f32,
-    error: f32,
-    ex_add: f32,
-    ex_scale: f32,
-}
-
-fn compute_row_factors(
+pub(crate) struct RabitRowFactors<'c, 'o> {
     distance_type: DistanceType,
     norm_square: f32,
-    residual: &[f32],
-    centroid: &[f32],
-    ex_values: Option<&[u8]>,
-    ex_res_dot: f32,
+    centroid: &'c [f32],
     ex_bits: u8,
-) -> RabitRowFactors {
-    let ex_code_bias = -((1u32 << ex_bits) as f32 - 0.5);
-    let mut binary_res_dot = 0.0f32;
-    let mut binary_cent_dot = 0.0f32;
-    let mut ex_cent_dot = 0.0f32;
-    let mut residual_centroid_dot = 0.0f32;
-    for (dim_idx, (&residual_value, &centroid_value)) in residual.iter().zip(centroid).enumerate() {
-        let binary_code = u32::from(residual_value.is_sign_positive());
-        let binary_factor = binary_factor_value(residual_value);
-        binary_res_dot += residual_value * binary_factor;
-        binary_cent_dot += centroid_value * binary_factor;
-        if let Some(ex_values) = ex_values {
+    ex_code_bias: f32,
+    binary_res_dot: f32,
+    binary_cent_dot: f32,
+    ex_cent_dot: f32,
+    residual_centroid_dot: f32,
+    add: &'o mut f32,
+    scale: &'o mut f32,
+    error: &'o mut f32,
+    extra: Option<(&'o mut f32, &'o mut f32)>,
+}
+
+impl RabitRowFactors<'_, '_> {
+    pub(crate) fn observe(&mut self, dim: usize, residual: f32, sign: u8, extra: u8) {
+        let centroid = self.centroid[dim];
+        let binary_factor = if sign == 1 { 0.5 } else { -0.5 };
+        // Keep each accumulator's original dimension order while consuming the
+        // code directly from quantization, before scratch is reused.
+        self.binary_res_dot += residual * binary_factor;
+        self.binary_cent_dot += centroid * binary_factor;
+        if self.extra.is_some() {
             let ex_factor =
-                ((binary_code << ex_bits) + ex_values[dim_idx] as u32) as f32 + ex_code_bias;
-            ex_cent_dot += centroid_value * ex_factor;
+                (((sign as u32) << self.ex_bits) + extra as u32) as f32 + self.ex_code_bias;
+            self.ex_cent_dot += centroid * ex_factor;
         }
-        residual_centroid_dot += residual_value * centroid_value;
+        if self.distance_type == DistanceType::Dot {
+            self.residual_centroid_dot += residual * centroid;
+        }
     }
-    let binary_correction = factor_ratio(norm_square * binary_cent_dot, binary_res_dot);
-    let ex_correction = factor_ratio(norm_square * ex_cent_dot, ex_res_dot);
-    let error = error_factor_value(distance_type, norm_square, binary_res_dot, residual.len());
-    match distance_type {
-        DistanceType::L2 => RabitRowFactors {
-            add: norm_square + 2.0 * binary_correction,
-            scale: factor_ratio(-2.0 * norm_square, binary_res_dot),
-            error,
-            ex_add: norm_square + 2.0 * ex_correction,
-            ex_scale: factor_ratio(-2.0 * norm_square, ex_res_dot),
-        },
-        DistanceType::Dot => {
-            let dot_base = 1.0 - residual_centroid_dot;
-            RabitRowFactors {
-                add: dot_base + binary_correction,
-                scale: factor_ratio(-norm_square, binary_res_dot),
-                error,
-                ex_add: dot_base + ex_correction,
-                ex_scale: factor_ratio(-norm_square, ex_res_dot),
+
+    pub(crate) fn finish(self, ex_res_dot: f32) {
+        let binary_correction =
+            factor_ratio(self.norm_square * self.binary_cent_dot, self.binary_res_dot);
+        *self.error = error_factor_value(
+            self.distance_type,
+            self.norm_square,
+            self.binary_res_dot,
+            self.centroid.len(),
+        );
+        match self.distance_type {
+            DistanceType::L2 => {
+                *self.add = self.norm_square + 2.0 * binary_correction;
+                *self.scale = factor_ratio(-2.0 * self.norm_square, self.binary_res_dot);
+                if let Some((add, scale)) = self.extra {
+                    let correction = factor_ratio(self.norm_square * self.ex_cent_dot, ex_res_dot);
+                    *add = self.norm_square + 2.0 * correction;
+                    *scale = factor_ratio(-2.0 * self.norm_square, ex_res_dot);
+                }
             }
+            DistanceType::Dot => {
+                let dot_base = 1.0 - self.residual_centroid_dot;
+                *self.add = dot_base + binary_correction;
+                *self.scale = factor_ratio(-self.norm_square, self.binary_res_dot);
+                if let Some((add, scale)) = self.extra {
+                    let correction = factor_ratio(self.norm_square * self.ex_cent_dot, ex_res_dot);
+                    *add = dot_base + correction;
+                    *scale = factor_ratio(-self.norm_square, ex_res_dot);
+                }
+            }
+            _ => unreachable!(),
         }
-        _ => unreachable!(),
     }
 }
 
@@ -251,6 +264,7 @@ fn factor_ratio(numerator: f32, denominator: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn binary_factor_value(rotated_residual: f32) -> f32 {
     if rotated_residual.is_sign_positive() {
@@ -597,12 +611,13 @@ mod tests {
     };
 
     #[rstest]
-    #[case(RQRotationType::Fast, 8)]
-    #[case(RQRotationType::Fast, 768)]
-    #[case(RQRotationType::Matrix, 8)]
+    #[case::fast_small(RQRotationType::Fast, 8, 16)]
+    #[case::fast_parallel(RQRotationType::Fast, 768, 129)]
+    #[case::matrix(RQRotationType::Matrix, 8, 16)]
     fn test_fused_quantization_matches_split_pipeline(
         #[case] rotation: RQRotationType,
         #[case] dim: usize,
+        #[case] num_rows: usize,
         #[values(1, 3, 5, 9)] bits: u8,
         #[values(DistanceType::L2, DistanceType::Dot)] distance: DistanceType,
         #[values(
@@ -633,10 +648,12 @@ mod tests {
         .unwrap();
         let transformer = RQTransformer::new(rq.clone(), distance, centroids, "vector").unwrap();
         let values = Float32Array::from(
-            (0..18 * dim)
+            (0..(num_rows + 2) * dim)
                 .map(|i| {
                     if i / dim == 2 {
                         0.0
+                    } else if i / dim == 3 {
+                        ((i * 31 % 107) as f32 - 53.0) * 1.0e-20
                     } else {
                         ((i * 31 % 107) as f32 - 53.0) / 64.0
                     }
@@ -646,9 +663,9 @@ mod tests {
         let values = arrow::compute::cast(&values, &value_type).unwrap();
         let residuals = FixedSizeListArray::try_new_from_values(values, dim as i32)
             .unwrap()
-            .slice(1, 16);
+            .slice(1, num_rows);
         let norm = Float32Array::from(lance_linalg::distance::norm_squared_fsl(&residuals));
-        let parts = UInt32Array::from((0..16).map(|i| i % 3).collect::<Vec<u32>>());
+        let parts = UInt32Array::from((0..num_rows).map(|i| (i % 3) as u32).collect::<Vec<_>>());
         let batch = RecordBatch::try_from_iter(vec![
             ("vector", Arc::new(residuals.clone()) as ArrayRef),
             (CENTROID_DIST_COLUMN, Arc::new(norm.clone()) as ArrayRef),
@@ -725,7 +742,7 @@ mod tests {
             .unwrap()
             .try_with_column(
                 arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, false),
-                Arc::new(UInt32Array::from(vec![u32::MAX; 16])),
+                Arc::new(UInt32Array::from(vec![u32::MAX; num_rows])),
             )
             .unwrap();
         let error = transformer.transform(&bad_parts).unwrap_err();
