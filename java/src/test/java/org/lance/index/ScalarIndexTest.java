@@ -781,13 +781,13 @@ public class ScalarIndexTest {
                   dataset.newScan(
                       new ScanOptions.Builder()
                           .fragmentIds(Collections.singletonList(fragment.getId()))
-                          .withRowId(true)
+                          .withRowAddress(true)
                           .columns(Collections.singletonList("id"))
                           .build());
               ArrowReader arrowReader = scanner.scanBatches(); ) {
             while (arrowReader.loadNextBatch()) {
               VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
               IntVector idVec = (IntVector) root.getVector("id");
               for (int i = 0; i < root.getRowCount(); i++) {
                 data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
@@ -821,12 +821,12 @@ public class ScalarIndexTest {
         new Schema(
             Arrays.asList(
                 Field.nullable("value", new ArrowType.Int(32, true)),
-                Field.nullable("_rowid", new ArrowType.Int(64, false))),
+                Field.nullable("_rowaddr", new ArrowType.Int(64, false))),
             null);
     try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
       root.allocateNew();
       IntVector idVec = (IntVector) root.getVector("value");
-      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
       for (int i = 0; i < preprocessedData.size(); i++) {
         long[] dataPair = preprocessedData.get(i);
         idVec.setSafe(i, (int) dataPair[0]);
