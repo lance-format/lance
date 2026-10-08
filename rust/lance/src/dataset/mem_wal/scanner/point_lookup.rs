@@ -2375,7 +2375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_against_from_configs_built_index() {
+    async fn test_lookup_against_from_specs_built_index() {
         // A point lookup against an index built the production way
         // (`IndexStore::from_specs`) resolves correctly via the seek-and-stop
         // skiplist probe.

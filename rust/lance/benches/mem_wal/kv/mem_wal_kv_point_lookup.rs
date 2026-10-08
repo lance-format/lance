@@ -144,7 +144,7 @@ fn build_queries(rows: usize, queries: usize, miss_ratio: f64, seed: u64) -> Vec
 /// watermark, pick the newest matching row position, and slice that one row
 /// out of the BatchStore. Returns `None` if the key isn't present/visible.
 ///
-/// This mirrors what `BTreeIndexExec` does internally, minus the plan/stream
+/// This mirrors what `ScalarIndexExec` does internally, minus the plan/stream
 /// machinery — it is the lower bound on how fast the current MemTable index
 /// can answer a point lookup. Single-active-memtable only (the bench never
 /// flushes), `KEY_COL` BTree assumed present.

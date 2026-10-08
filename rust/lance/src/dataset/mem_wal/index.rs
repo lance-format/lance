@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_configs() {
+    fn test_from_specs() {
         let configs = vec![
             MemIndexSpec::btree("pk_idx", 0, "id"),
             MemIndexSpec::fts("search_idx", 2, "description"),
