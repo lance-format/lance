@@ -13710,4 +13710,140 @@ mod tests {
             Some(4)
         );
     }
+
+    /// An index builder in this process (`same_process`) or another one.
+    async fn index_builder(dataset: &Dataset, uri: &str, same_process: bool) -> Dataset {
+        if same_process {
+            dataset.clone()
+        } else {
+            open_in_new_session(uri).await
+        }
+    }
+
+    /// Builds `val_idx` from `builder`, then checks that the updated value 999
+    /// and not the old value 0 is found, by the index as by a scan.
+    async fn assert_val_idx_sees_update(builder: &mut Dataset, uri: &str) {
+        builder
+            .create_index(
+                &["val"],
+                IndexType::Scalar,
+                Some("val_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let latest = open_in_new_session(uri).await;
+        let mut scan = latest.scan();
+        scan.use_scalar_index(false).filter("val = 999").unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+        let indexed = (
+            latest.count_rows(Some("val = 999".into())).await.unwrap(),
+            latest.count_rows(Some("val = 0".into())).await.unwrap(),
+        );
+        assert_eq!(indexed, (1, 0));
+    }
+
+    /// A deferred compaction that folds in an overlay newer than the index
+    /// leaves nothing to mask the stale values, so its rows are withdrawn from
+    /// the index rather than claimed.
+    #[rstest]
+    #[case::folded_by_first_compaction(false, false)]
+    #[case::folded_by_first_compaction_same_process(false, true)]
+    #[case::folded_by_second_compaction(true, false)]
+    #[case::folded_by_second_compaction_same_process(true, true)]
+    #[tokio::test]
+    async fn test_reindex_withdraws_a_folded_overlay(
+        #[case] compact_first: bool,
+        #[case] same_process: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = create_base_dataset(dir.as_str()).await;
+        create_scalar_index(&mut dataset, "id", false).await;
+        let mut builder = index_builder(&dataset, dir.as_str(), same_process).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        if compact_first {
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+        }
+        let fragment_id = dataset.fragments()[0].id;
+        dataset = commit_overlay(
+            dataset,
+            fragment_id,
+            &[1],
+            OverlayCoverage::dense(bitmap([0])),
+            vec![i32_array([Some(999)])],
+        )
+        .await;
+        let fold = CompactionOptions {
+            max_overlays_per_fragment: Some(0),
+            ..options
+        };
+        compact_files(&mut dataset, fold, None).await.unwrap();
+        assert!(dataset.fragments().iter().all(|f| f.overlays.is_empty()));
+
+        assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
+    }
+
+    /// An in-place column update on a fragment a deferred compaction produced
+    /// withdraws the index's coverage of the fragments it came from.
+    #[rstest]
+    #[case::other_process(false)]
+    #[case::same_process(true)]
+    #[tokio::test]
+    async fn test_reindex_withdraws_an_in_place_update_after_compaction(
+        #[case] same_process: bool,
+    ) {
+        use crate::dataset::{
+            MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+        };
+        let dir = TempStrDir::default();
+        // `spare` is left alone by the update, so it rewrites `val` in place.
+        let batch = record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            ("val", Int32, (0..12).map(|v| v * 10).collect::<Vec<_>>()),
+            ("spare", Int32, vec![42; 12])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let params = WriteParams {
+            max_rows_per_file: 6,
+            max_rows_per_group: 6,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, dir.as_str(), Some(params))
+            .await
+            .unwrap();
+        create_scalar_index(&mut dataset, "id", false).await;
+        let mut builder = index_builder(&dataset, dir.as_str(), same_process).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let patch = record_batch!(("id", Int32, vec![0]), ("val", Int32, vec![999])).unwrap();
+        let schema = patch.schema();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns);
+        merge
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+            .await
+            .unwrap();
+
+        assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
+    }
 }
