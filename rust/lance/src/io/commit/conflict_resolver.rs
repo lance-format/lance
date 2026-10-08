@@ -531,18 +531,20 @@ impl<'a> TransactionRebase<'a> {
     ///
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
-    /// Load what a CreateIndex needs from the LATEST manifest before the
-    /// per-version checks run: the lineage its tagged fragment reuse entry
-    /// records. A committed rewrite is read back from its transaction file,
-    /// where `frag_reuse` is never serialized, so the entry is the only
-    /// durable evidence that a rewrite appended a transition (see the Rewrite
-    /// arm of `check_create_index_txn`). A no-op for every other operation.
     /// Mark this rebase as the staged-segment replay; see `staged_replay`.
     pub(crate) fn for_staged_replay(mut self) -> Self {
         self.staged_replay = true;
         self
     }
 
+    /// Load what a CreateIndex needs from the LATEST manifest before the
+    /// per-version checks run: the lineage its tagged fragment reuse entry
+    /// records, or on a v0 table the rewrite groups its v0 entry records
+    /// (`load_current_v0_reuse_sources`). A committed rewrite is read back
+    /// from its transaction file, where `frag_reuse` is never serialized, so
+    /// the entry is the only durable evidence that a rewrite deferred its
+    /// index remap (see the Rewrite arm of `check_create_index_txn`). A no-op
+    /// for every other operation.
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
@@ -1328,8 +1330,8 @@ impl<'a> TransactionRebase<'a> {
                     // process, and it also catches a record trimmed while this
                     // index was being built. Without it, fall back to the
                     // in-memory update a same-process rewrite carries.
-                    let deferred_v0 = v0_rewrite_recorded(self.current_v0_reuse_sources.as_ref(), groups)
-                        .unwrap_or_else(|| {
+                    let v0_sources = self.current_v0_reuse_sources.as_ref();
+                    let deferred_v0 = v0_rewrite_recorded(v0_sources, groups).unwrap_or_else(|| {
                         frag_reuse_index
                             .as_ref()
                             .is_some_and(|entry| !is_tagged(entry))

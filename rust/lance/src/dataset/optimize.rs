@@ -7162,6 +7162,168 @@ mod tests {
         );
     }
 
+    /// Appends `rows` rows of `i` and `j`, both counting up from `start`, in
+    /// fragments of 1_000 rows.
+    async fn append_ij(dataset: &Dataset, start: i32, rows: i32) {
+        Dataset::write(
+            BatchGenerator::new()
+                .col(Box::new(
+                    IncrementingInt32::new().start(start).named("i".to_owned()),
+                ))
+                .col(Box::new(
+                    IncrementingInt32::new().start(start).named("j".to_owned()),
+                ))
+                .batch(rows),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Every compaction committed while the reindex was built is found in the
+    /// latest entry, not just the first one.
+    #[tokio::test]
+    async fn test_reindex_across_processes_after_several_deferred_compactions() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = v0_fri_conflict_fixture(uri).await;
+        let mut other_process = open_in_new_session(uri).await;
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+        append_ij(&dataset, 12_000, 4_000).await;
+        dataset.checkout_latest().await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 4_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        other_process
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("j_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        for value in [500, 5_500, 11_500] {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("j = {value}")))
+                    .await
+                    .unwrap(),
+                1,
+                "j = {value}"
+            );
+        }
+    }
+
+    /// A fragment appended after the reindex read the table can be compacted
+    /// together with one the reindex covers. The reindex still lands across
+    /// processes; the commit leaves that group's output out of its coverage,
+    /// so those rows are scanned rather than lost.
+    #[tokio::test]
+    async fn test_reindex_across_processes_with_partially_covered_group() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            BatchGenerator::new()
+                .col(Box::new(IncrementingInt32::new().named("i".to_owned())))
+                .col(Box::new(IncrementingInt32::new().named("j".to_owned())))
+                .batch(6_000),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        append_ij(&dataset, 6_000, 5_000).await;
+        // Reads fragments 0..=10; fragment 11 lands after it.
+        let mut other_process = open_in_new_session(uri).await;
+        append_ij(&dataset, 11_000, 1_000).await;
+        dataset.checkout_latest().await.unwrap();
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+        let fri = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .cloned()
+            .unwrap();
+        let details = load_frag_reuse_index_details(&dataset, &fri).await.unwrap();
+        let split_group = details
+            .versions
+            .iter()
+            .flat_map(|version| version.groups.iter())
+            .find(|group| group.old_frags.iter().any(|f| f.id == 11))
+            .unwrap();
+        assert!(
+            split_group.old_frags.iter().any(|f| f.id <= 10),
+            "the fixture must compact fragment 11 with one the reindex covers"
+        );
+
+        other_process
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("j_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        let j_idx = dataset.load_index_by_name("j_idx").await.unwrap().unwrap();
+        let coverage = j_idx.fragment_bitmap.unwrap();
+        for new_frag in split_group.new_frags.iter() {
+            assert!(!coverage.contains(new_frag.id as u32));
+        }
+        for value in [500, 10_500, 11_500] {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("j = {value}")))
+                    .await
+                    .unwrap(),
+                1,
+                "j = {value}"
+            );
+        }
+    }
+
     /// A reuse entry left on the table by an earlier deferred compaction says
     /// nothing about a later compaction that remapped indexes eagerly: that
     /// one still conflicts with a concurrent reindex covering its fragments.
@@ -7173,20 +7335,7 @@ mod tests {
         compact_files(&mut dataset, defer_remap_compaction(), None)
             .await
             .unwrap();
-        Dataset::write(
-            BatchGenerator::new()
-                .col(Box::new(IncrementingInt32::new().named("i".to_owned())))
-                .col(Box::new(IncrementingInt32::new().named("j".to_owned())))
-                .batch(4_000),
-            WriteDestination::Dataset(Arc::new(dataset.clone())),
-            Some(WriteParams {
-                max_rows_per_file: 1_000,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        append_ij(&dataset, 12_000, 4_000).await;
         dataset.checkout_latest().await.unwrap();
         let mut other_process = open_in_new_session(uri).await;
 
