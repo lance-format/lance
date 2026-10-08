@@ -14035,4 +14035,242 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum WorkloadOp {
+        Append,
+        Delete,
+        Update,
+        Compact,
+        /// Coalition's remap job: remap the committed index, then trim.
+        RemapAndTrim,
+        /// Cleans up versions between the build's and the latest.
+        CleanUpVersions,
+    }
+
+    async fn build_val_idx(dataset: &mut Dataset, replace: bool) -> Result<()> {
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::BTree,
+                Some("val_idx".into()),
+                &ScalarIndexParams::default(),
+                replace,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// Runs `ops` from a writer while a rebuild of `val_idx` built from the
+    /// version before them commits from another process. Returns the commit's
+    /// error, if any; on success every lookup must match a scan.
+    async fn rebuild_under_workload(seed: u64, ops: &[WorkloadOp]) -> Option<Error> {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |bound: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % bound
+        };
+        let batch = record_batch!(
+            ("id", Int32, (0..240).collect::<Vec<_>>()),
+            ("val", Int32, (0..240).map(|v| v * 10).collect::<Vec<_>>()),
+            ("spare", Int32, vec![42; 240])
+        )
+        .unwrap();
+        let params = WriteParams {
+            max_rows_per_file: 20,
+            max_rows_per_group: 20,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut writer = Dataset::write(reader, uri, Some(params.clone()))
+            .await
+            .unwrap();
+        build_val_idx(&mut writer, false).await.unwrap();
+        let read_version = writer.manifest.version;
+        writer.tags().create("rebuild", read_version).await.unwrap();
+        let mut builder = open_in_new_session(uri).await;
+
+        let mut next_id = 240;
+        let mut updates = 0;
+        for op in ops {
+            writer.checkout_latest().await.unwrap();
+            match op {
+                WorkloadOp::Append => {
+                    let ids = (next_id..next_id + 20).collect::<Vec<_>>();
+                    next_id += 20;
+                    let batch = record_batch!(
+                        ("id", Int32, ids.clone()),
+                        ("val", Int32, ids.iter().map(|v| v * 10).collect::<Vec<_>>()),
+                        ("spare", Int32, vec![42; 20])
+                    )
+                    .unwrap();
+                    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+                    writer.append(reader, None).await.unwrap();
+                }
+                WorkloadOp::Delete => {
+                    let filter = format!("id % 11 = {}", next(11));
+                    writer.delete(&filter).await.unwrap();
+                }
+                WorkloadOp::Update => {
+                    use crate::dataset::{
+                        MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+                    };
+                    let mut ids = Vec::new();
+                    while ids.len() < 3 {
+                        let id = next(next_id as u64) as i32;
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                    let vals = ids
+                        .iter()
+                        .map(|_| {
+                            updates += 1;
+                            1_000_000 + updates
+                        })
+                        .collect::<Vec<_>>();
+                    let patch = record_batch!(("id", Int32, ids), ("val", Int32, vals)).unwrap();
+                    let schema = patch.schema();
+                    let mut merge =
+                        MergeInsertBuilder::try_new(Arc::new(writer.clone()), vec!["id".into()])
+                            .unwrap();
+                    merge
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched(WhenNotMatched::DoNothing)
+                        .write_mode(MergeInsertWriteMode::RewriteColumns);
+                    merge
+                        .try_build()
+                        .unwrap()
+                        .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+                        .await
+                        .unwrap();
+                }
+                WorkloadOp::Compact => {
+                    let options = CompactionOptions {
+                        target_rows_per_fragment: 60,
+                        defer_index_remap: true,
+                        ..Default::default()
+                    };
+                    compact_files(&mut writer, options, None).await.unwrap();
+                }
+                WorkloadOp::RemapAndTrim => {
+                    if writer.frag_reuse_index().await.unwrap().is_some() {
+                        remapping::remap_column_index(
+                            &mut writer,
+                            &["val"],
+                            Some("val_idx".into()),
+                        )
+                        .await
+                        .unwrap();
+                        cleanup_frag_reuse_index(&mut writer).await.unwrap();
+                    }
+                }
+                WorkloadOp::CleanUpVersions => {
+                    let latest = open_in_new_session(uri).await;
+                    let gone = (read_version + 1..latest.manifest.version)
+                        .filter(|_| next(2) == 0)
+                        .collect::<Vec<_>>();
+                    if !gone.is_empty() {
+                        let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+                            .versions(gone)
+                            .unwrap()
+                            .build();
+                        latest.cleanup_with_policy(policy).await.unwrap();
+                    }
+                }
+            }
+        }
+
+        if let Err(error) = build_val_idx(&mut builder, true).await {
+            return Some(error);
+        }
+        let latest = open_in_new_session(uri).await;
+        let mut scan = latest.scan();
+        scan.use_scalar_index(false).project(&["val"]).unwrap();
+        let mut expected = HashMap::<i32, usize>::new();
+        let batch = scan.try_into_batch().await.unwrap();
+        for val in batch["val"].as_primitive::<Int32Type>().values() {
+            *expected.entry(*val).or_default() += 1;
+        }
+        let probes = (0..next_id)
+            .map(|id| id * 10)
+            .chain((1..=updates).map(|n| 1_000_000 + n))
+            .collect::<Vec<_>>();
+        for value in probes {
+            let found = latest
+                .count_rows(Some(format!("val = {value}")))
+                .await
+                .unwrap();
+            let want = expected.get(&value).copied().unwrap_or(0);
+            assert_eq!(found, want, "seed {seed} ops {ops:?}: val = {value}");
+        }
+        for bound in [0, 500, 1_200, 2_400, 1_000_010] {
+            let filter = format!("val < {bound}");
+            let found = latest.count_rows(Some(filter.clone())).await.unwrap();
+            let want = expected
+                .iter()
+                .filter(|(v, _)| **v < bound)
+                .map(|(_, n)| n)
+                .sum::<usize>();
+            assert_eq!(found, want, "seed {seed} ops {ops:?}: {filter}");
+        }
+        None
+    }
+
+    /// `len` operations drawn from `kinds` by `seed`.
+    fn workload(seed: u64, kinds: &[WorkloadOp], len: usize) -> Vec<WorkloadOp> {
+        let mut state = seed.wrapping_add(1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                kinds[(state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize % kinds.len()]
+            })
+            .collect()
+    }
+
+    /// Coalition's workload: writes and deferred compactions from other
+    /// processes during a full rebuild. The rebuild must commit, and every
+    /// lookup must match a scan.
+    #[tokio::test]
+    async fn test_rebuild_commits_under_writes_and_deferred_compactions() {
+        use WorkloadOp::*;
+        for seed in 0..12 {
+            let ops = workload(seed, &[Append, Delete, Update, Compact, Compact], 8);
+            if let Some(error) = Box::pin(rebuild_under_workload(seed, &ops)).await {
+                panic!("seed {seed} ops {ops:?}: rebuild refused: {error}");
+            }
+        }
+    }
+
+    /// With the remap job and version cleanup in the mix, a rebuild may be
+    /// refused with a retryable conflict, but a commit is always correct.
+    #[tokio::test]
+    async fn test_rebuild_under_remap_and_cleanup_is_correct_or_retries() {
+        use WorkloadOp::*;
+        for seed in 0..12 {
+            let kinds = [
+                Append,
+                Delete,
+                Update,
+                Compact,
+                Compact,
+                RemapAndTrim,
+                CleanUpVersions,
+            ];
+            let ops = workload(seed, &kinds, 8);
+            if let Some(error) = Box::pin(rebuild_under_workload(seed, &ops)).await {
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "seed {seed} ops {ops:?}: {error}"
+                );
+            }
+        }
+    }
 }
