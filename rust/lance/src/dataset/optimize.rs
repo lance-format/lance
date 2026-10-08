@@ -6926,8 +6926,7 @@ mod tests {
             .batch(rows)
     }
 
-    /// Appends `rows` rows from `start` in fragments of 1_000 rows and moves
-    /// `dataset` to the new version.
+    /// Appends `rows` rows from `start` and checks out the new version.
     async fn append_ij(dataset: &mut Dataset, start: i32, rows: i32) {
         Dataset::write(
             ij_rows(start, rows),
@@ -6943,8 +6942,7 @@ mod tests {
         dataset.checkout_latest().await.unwrap();
     }
 
-    /// Six fragments of 1_000 rows indexed by `scalar` on `i`, followed by
-    /// `appended` unindexed rows in fragments of 1_000.
+    /// Six fragments indexed by `scalar` on `i`, then `appended` unindexed rows.
     async fn indexed_ij_dataset(uri: &str, appended: i32) -> Dataset {
         let mut dataset = Dataset::write(
             ij_rows(0, 6_000),
@@ -6961,8 +6959,7 @@ mod tests {
         dataset
     }
 
-    /// The same dataset opened in a fresh session: nothing another handle
-    /// committed is in its caches, as for a writer in another process.
+    /// Opens the dataset in a fresh session, like another process would.
     async fn open_in_new_session(uri: &str) -> Dataset {
         crate::dataset::builder::DatasetBuilder::from_uri(uri)
             .with_session(Arc::new(crate::session::Session::default()))
@@ -6979,7 +6976,6 @@ mod tests {
         }
     }
 
-    /// Builds a new index `j_idx` on `j` from `dataset`'s version.
     async fn index_j(dataset: &mut Dataset) -> Result<()> {
         dataset
             .create_index(
@@ -7048,11 +7044,7 @@ mod tests {
         assert_scalar_covers_every_fragment(&mut dataset).await;
     }
 
-    /// A reindex committing from another process sees a deferred compaction
-    /// only as its transaction file, which never carries the reuse update.
-    /// The fragment reuse index in the latest manifest is the durable evidence that the
-    /// compaction deferred its remap, so the reindex lands instead of
-    /// retrying.
+    /// A reindex from another process commits past a deferred compaction.
     #[tokio::test]
     async fn test_concurrent_compaction_reindex_across_processes() {
         let test_dir = TempStrDir::default();
@@ -7068,8 +7060,6 @@ mod tests {
         assert_scalar_covers_every_fragment(&mut dataset).await;
     }
 
-    /// Every compaction committed while the reindex was built is found in the
-    /// latest entry, not just the first one.
     #[tokio::test]
     async fn test_reindex_across_processes_after_several_deferred_compactions() {
         let test_dir = TempStrDir::default();
@@ -7091,10 +7081,7 @@ mod tests {
         assert_each_j_found_once(&mut dataset, &[500, 5_500, 11_500]).await;
     }
 
-    /// A fragment appended after the reindex read the table can be compacted
-    /// together with one the reindex covers. The reindex still lands across
-    /// processes; the commit leaves that group's output out of its coverage,
-    /// so those rows are scanned rather than lost.
+    /// A group mixing covered and newer fragments is left out of the index.
     #[tokio::test]
     async fn test_reindex_across_processes_with_partially_covered_group() {
         let test_dir = TempStrDir::default();
@@ -7133,12 +7120,7 @@ mod tests {
         assert_each_j_found_once(&mut dataset, &[500, 10_500, 11_500]).await;
     }
 
-    /// A deferred compaction's reuse record can be trimmed while an index is
-    /// still being built: the trim only waits for committed indexes. An index
-    /// committed after that would keep pointing at the retired fragments with
-    /// no record left to translate them, so the latest entry decides and the
-    /// commit retries -- even in the process that ran the compaction, where
-    /// the in-memory reuse update alone would have let it through.
+    /// A reindex retries if the compaction's reuse record was trimmed meanwhile.
     #[tokio::test]
     async fn test_reindex_retries_when_deferred_compaction_was_trimmed() {
         let test_dir = TempStrDir::default();
@@ -7158,14 +7140,10 @@ mod tests {
             "the trim must drop the record"
         );
 
-        // A new index, so no name clash with the remap: only the reuse
-        // evidence can stop it.
         assert_retryable_conflict(index_j(&mut same_process).await);
     }
 
-    /// A reuse entry left on the table by an earlier deferred compaction says
-    /// nothing about a later compaction that remapped indexes eagerly: that
-    /// one still conflicts with a concurrent reindex covering its fragments.
+    /// An eager compaction still conflicts, even with an older reuse record.
     #[tokio::test]
     async fn test_reindex_conflicts_with_eager_compaction_despite_existing_fri() {
         let test_dir = TempStrDir::default();
@@ -13711,7 +13689,6 @@ mod tests {
         );
     }
 
-    /// An index builder in this process (`same_process`) or another one.
     async fn index_builder(dataset: &Dataset, uri: &str, same_process: bool) -> Dataset {
         if same_process {
             dataset.clone()
@@ -13720,8 +13697,7 @@ mod tests {
         }
     }
 
-    /// Builds `val_idx` from `builder`, then checks that the updated value 999
-    /// and not the old value 0 is found, by the index as by a scan.
+    /// Builds `val_idx` and checks it finds the updated value 999, not 0.
     async fn assert_val_idx_sees_update(builder: &mut Dataset, uri: &str) {
         builder
             .create_index(
@@ -13744,17 +13720,17 @@ mod tests {
         assert_eq!(indexed, (1, 0));
     }
 
-    /// A deferred compaction that folds in an overlay newer than the index
-    /// leaves nothing to mask the stale values, so its rows are withdrawn from
-    /// the index rather than claimed.
+    /// An overlay folded in by a deferred compaction is withdrawn from the index.
     #[rstest]
-    #[case::folded_by_first_compaction(false, false)]
-    #[case::folded_by_first_compaction_same_process(false, true)]
-    #[case::folded_by_second_compaction(true, false)]
-    #[case::folded_by_second_compaction_same_process(true, true)]
+    #[case::folded_by_first_compaction(false, true, false)]
+    #[case::folded_by_first_compaction_same_process(false, true, true)]
+    #[case::folded_by_second_compaction(true, true, false)]
+    #[case::folded_by_second_compaction_same_process(true, true, true)]
+    #[case::left_on_compaction_output(true, false, false)]
     #[tokio::test]
     async fn test_reindex_withdraws_a_folded_overlay(
         #[case] compact_first: bool,
+        #[case] fold: bool,
         #[case] same_process: bool,
     ) {
         let dir = TempStrDir::default();
@@ -13780,18 +13756,19 @@ mod tests {
             vec![i32_array([Some(999)])],
         )
         .await;
-        let fold = CompactionOptions {
-            max_overlays_per_fragment: Some(0),
-            ..options
-        };
-        compact_files(&mut dataset, fold, None).await.unwrap();
-        assert!(dataset.fragments().iter().all(|f| f.overlays.is_empty()));
+        if fold {
+            let fold = CompactionOptions {
+                max_overlays_per_fragment: Some(0),
+                ..options
+            };
+            compact_files(&mut dataset, fold, None).await.unwrap();
+            assert!(dataset.fragments().iter().all(|f| f.overlays.is_empty()));
+        }
 
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
     }
 
-    /// An in-place column update on a fragment a deferred compaction produced
-    /// withdraws the index's coverage of the fragments it came from.
+    /// An in-place update on a compaction's output is withdrawn from the index.
     #[rstest]
     #[case::other_process(false)]
     #[case::same_process(true)]
@@ -13803,7 +13780,7 @@ mod tests {
             MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
         };
         let dir = TempStrDir::default();
-        // `spare` is left alone by the update, so it rewrites `val` in place.
+        // `spare` keeps the update in place.
         let batch = record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),
             ("val", Int32, (0..12).map(|v| v * 10).collect::<Vec<_>>()),
