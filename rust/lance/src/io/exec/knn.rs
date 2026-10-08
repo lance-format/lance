@@ -3770,7 +3770,7 @@ mod tests {
     #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
     #[case::bounded_dot("bounded_dot", false)]
-    #[case::large_k_dot("large_k_dot", false)]
+    #[case::uncalibrated_dot("uncalibrated_dot", false)]
     #[case::hamming("hamming", false)]
     #[case::float16_column("f16", false)]
     #[case::float64_query("query_f64", false)]
@@ -3782,17 +3782,18 @@ mod tests {
     #[case::legacy("legacy", false)]
     #[case::bounded("bounded", false)]
     #[case::fixed("fixed", false)]
-    #[case::large_k("large_k", false)]
+    #[case::uncalibrated("uncalibrated", false)]
     #[case::refine("refine", false)]
     fn test_auto_policy_gates_before_reading_experimental_config(
         #[case] scenario: &str,
         #[case] reads_config: bool,
+        #[values(1, 100, 101, 200, 500, 1000)] k: usize,
     ) {
         let mut query = base_query();
-        query.k = if matches!(scenario, "large_k" | "large_k_dot") {
-            101
+        query.k = if matches!(scenario, "uncalibrated" | "uncalibrated_dot") {
+            1001
         } else {
-            1
+            k
         };
         query.key = match scenario {
             "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
@@ -3821,7 +3822,7 @@ mod tests {
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
                 "cosine" => DistanceType::Cosine,
-                "dot" | "fixed_dot" | "bounded_dot" | "large_k_dot" => DistanceType::Dot,
+                "dot" | "fixed_dot" | "bounded_dot" | "uncalibrated_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },

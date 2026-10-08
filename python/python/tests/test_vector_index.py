@@ -87,6 +87,100 @@ def test_dot_auto_probe_overrides(tmp_path, monkeypatch, query_scale):
     assert set(bounded["id"].to_pylist()) == expected
 
 
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+@pytest.mark.parametrize("k", [100, 101, 1000])
+@pytest.mark.parametrize("segments", [1, 2])
+def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, segments):
+    rng = np.random.default_rng(2254)
+    centroids = np.eye(16, dtype=np.float32)
+    vectors = np.tile(np.repeat(centroids, 128, axis=0), (segments, 1))
+    vectors += rng.normal(0, 0.001, vectors.shape).astype(np.float32)
+    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    dataset = lance.write_dataset(
+        table.slice(0, 2048), tmp_path / "ds.lance", max_rows_per_file=512
+    )
+    dataset.create_index(
+        "vector", "IVF_FLAT", metric=metric, num_partitions=16, ivf_centroids=centroids
+    )
+    if segments == 2:
+        dataset = lance.write_dataset(table.slice(2048), dataset.uri, mode="append")
+        dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    assert dataset.stats.index_stats("vector_idx")["num_segments"] == segments
+    # Distinct centroid scores make recall meaningful even after late expansion.
+    query = np.linspace(1, 0.1, 16, dtype=np.float32)
+    nearest = {"column": "vector", "q": query, "k": k, "metric": metric}
+    if metric == "l2":
+        distances = np.sum((vectors - query) ** 2, axis=1)
+    elif metric == "cosine":
+        distances = -(vectors @ query) / np.linalg.norm(vectors, axis=1)
+    else:
+        distances = -(vectors @ query)
+    expected = set(np.argsort(distances)[:k].tolist())
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "2")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "2")
+
+    def search(**options):
+        captured = []
+        result = dataset.scanner(
+            columns=["id"], scan_stats_callback=captured.append, **options
+        ).to_table()
+        return result, captured[0].all_counts["partitions_searched"]
+
+    # Assess recall with the calibrated defaults. The deliberately tiny override
+    # below only guarantees enough results after late expansion, not full recall.
+    with monkeypatch.context() as defaults:
+        for variable in (
+            "LANCE_AUTO_PROBE_MARGIN",
+            "LANCE_AUTO_MIN_INITIAL_NPROBES",
+            "LANCE_AUTO_MAX_INITIAL_NPROBES",
+        ):
+            defaults.delenv(variable)
+        default, _ = search(nearest=nearest)
+        assert len(set(default["id"].to_pylist()) & expected) / k >= 0.95
+
+    # The initial cap applies on both sides of the k=100 profile boundary.
+    result, partitions = search(nearest=nearest)
+    assert len(result) == k
+    if k <= 256:
+        fixed, _ = search(nearest={**nearest, "nprobes": 2})
+        assert partitions == 2 * segments
+        assert set(result["id"].to_pylist()) == set(fixed["id"].to_pylist())
+    else:
+        # Two partitions hold fewer than k rows, so late probing continues.
+        assert partitions > 2 * segments
+
+    # Filters and deletions that leave fewer than k rows in the initial budget
+    # must not stop at the initial cap.
+    small_k = min(k, 101)
+    filtered, partitions = search(
+        nearest={**nearest, "k": small_k}, filter="id % 8 = 0", prefilter=True
+    )
+    assert len(filtered) == small_k
+    assert all(i % 8 == 0 for i in filtered["id"].to_pylist())
+    assert partitions > 2 * segments
+    dataset.delete("id % 8 != 0")
+    deleted, partitions = search(nearest={**nearest, "k": small_k})
+    assert len(deleted) == small_k
+    assert all(i % 8 == 0 for i in deleted["id"].to_pylist())
+    assert partitions > 2 * segments
+
+    # Caller minimums can exceed the learned initial cap. Explicit maximums
+    # and fixed budgets still bypass the experimental overrides entirely.
+    minimum, partitions = search(
+        nearest={**nearest, "k": small_k, "minimum_nprobes": 8}
+    )
+    assert len(minimum) == small_k
+    assert partitions == 8 * segments
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        search(nearest=nearest)
+    for bounds in ({"nprobes": 2}, {"maximum_nprobes": 2}):
+        bounded, partitions = search(nearest={**nearest, **bounds})
+        assert 0 < len(bounded) <= min(k, 32 * segments)
+        assert partitions <= 2 * segments
+
+
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
