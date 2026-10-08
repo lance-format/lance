@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::NewColumnTransform;
 use arrow_array::{Decimal128Array, UInt64Array};
 
 const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
@@ -10,6 +11,25 @@ const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
     LanceFileVersion::V2_2,
     LanceFileVersion::V2_3,
 ];
+
+async fn write_two_column_schema_evolution_dataset(uri: &str) -> Dataset {
+    let batch =
+        arrow_array::record_batch!(("a", Int32, [1, 2, 3, 4]), ("b", Int32, [10, 20, 30, 40]))
+            .unwrap();
+    let schema = batch.schema();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            max_rows_per_group: 2,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
 
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
@@ -821,6 +841,338 @@ async fn test_binary_copy_fallback_to_common_compaction() {
 
     let after = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(before, after);
+}
+
+#[rstest]
+#[case::unstable_row_ids(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn test_try_binary_copy_falls_back_for_file_less_fragment(
+    #[case] enable_stable_row_ids: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let initial_batch = arrow_array::record_batch!(("a", Int32, [1, 2])).unwrap();
+    let initial_schema = initial_batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(initial_batch)], initial_schema),
+        &test_dir,
+        Some(WriteParams {
+            enable_stable_row_ids,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Put b in its own file so dropping a leaves the first fragment with an
+    // exact schema mapping and no extra physical columns.
+    let added_batch = arrow_array::record_batch!(("b", Int32, [Some(10), Some(20)])).unwrap();
+    let added_schema = added_batch.schema();
+    assert!(added_schema.field_with_name("b").unwrap().is_nullable());
+    dataset
+        .add_columns(
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(added_batch)],
+                added_schema,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let append_batch = arrow_array::record_batch!(("a", Int32, [3, 4])).unwrap();
+    let append_schema = append_batch.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+            Some(WriteParams {
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    dataset.drop_columns(&["a"]).await.unwrap();
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    assert!(!fragments[0].files.is_empty());
+    assert!(fragments[1].files.is_empty());
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(can_use_binary_copy(&dataset, &options, &fragments[..1]).await);
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+    let error = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..options.clone()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("binary copy is not supported"));
+
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let expected =
+        arrow_array::record_batch!(("b", Int32, [Some(10), Some(20), None, None])).unwrap();
+    assert_eq!(before, expected);
+    let row_ids_before = if enable_stable_row_ids {
+        Some(dataset.scan().with_row_id().try_into_batch().await.unwrap())
+    } else {
+        None
+    };
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    dataset.validate().await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let dataset = Dataset::open(&test_dir).await.unwrap();
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(after, expected);
+    if let Some(row_ids_before) = row_ids_before {
+        let row_ids_after = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        assert_eq!(row_ids_after, row_ids_before);
+    }
+}
+
+#[tokio::test]
+async fn test_try_binary_copy_falls_back_after_all_null_column_addition() {
+    let test_dir = TempStrDir::default();
+    let batch = arrow_array::record_batch!(("a", Int32, [1, 2, 3, 4])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            max_rows_per_group: 2,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                "nulls",
+                DataType::Int32,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    assert!(fragments.iter().all(|fragment| fragment.files.len() == 1));
+    assert!(
+        fragments
+            .iter()
+            .flat_map(|fragment| &fragment.files)
+            .all(|file| file.fields.len() == 1)
+    );
+
+    let expected = arrow_array::record_batch!(
+        ("a", Int32, [1, 2, 3, 4]),
+        (
+            "nulls",
+            Int32,
+            [None::<i32>, None::<i32>, None::<i32>, None::<i32>]
+        )
+    )
+    .unwrap();
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(dataset.get_fragments().len(), 1);
+}
+
+#[tokio::test]
+async fn test_try_binary_copy_falls_back_after_physical_column_drop() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_two_column_schema_evolution_dataset(&test_dir).await;
+    dataset.drop_columns(&["a"]).await.unwrap();
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    assert!(fragments.iter().all(|fragment| !fragment.files.is_empty()));
+
+    let expected = arrow_array::record_batch!(("b", Int32, [10, 20, 30, 40])).unwrap();
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+
+    let force_options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+        ..Default::default()
+    };
+    let error = compact_files(&mut dataset, force_options, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("binary copy is not supported"));
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(dataset.get_fragments().len(), 1);
+}
+
+#[tokio::test]
+async fn test_can_use_binary_copy_rejects_extra_physical_columns() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_two_column_schema_evolution_dataset(&test_dir).await;
+    dataset.drop_columns(&["b"]).await.unwrap();
+    let mut fragments = dataset.manifest.fragments.as_ref().clone();
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let (fields, column_indices) =
+        lance_file::versions::data_file_columns(version, dataset.schema());
+    for fragment in &mut fragments {
+        // Even a mapping that only lists the surviving column cannot make
+        // binary copy discard the extra physical column in the source file.
+        fragment.files[0].fields = fields.clone().into();
+        fragment.files[0].column_indices = column_indices.clone().into();
+    }
+    let options = CompactionOptions {
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+}
+
+#[tokio::test]
+async fn test_try_binary_copy_rejects_same_count_schema_replacement() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_two_column_schema_evolution_dataset(&test_dir).await;
+    dataset.drop_columns(&["a"]).await.unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                "c",
+                DataType::Int32,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let current_field_ids = dataset.schema().field_ids();
+    for file in fragments.iter().flat_map(|fragment| &fragment.files) {
+        assert_eq!(file.fields.len(), current_field_ids.len());
+        assert_ne!(file.fields.as_ref(), current_field_ids.as_slice());
+    }
+
+    let expected = arrow_array::record_batch!(
+        ("b", Int32, [10, 20, 30, 40]),
+        (
+            "c",
+            Int32,
+            [None::<i32>, None::<i32>, None::<i32>, None::<i32>]
+        )
+    )
+    .unwrap();
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(dataset.get_fragments().len(), 1);
+}
+
+#[tokio::test]
+async fn test_try_binary_copy_materializes_data_overlay() {
+    let test_dir = TempStrDir::default();
+    let dataset = create_base_dataset(&test_dir).await;
+    let mut dataset = commit_overlay(
+        dataset,
+        0,
+        &[1],
+        OverlayCoverage::dense(bitmap([1, 4])),
+        vec![i32_array([Some(111), None])],
+    )
+    .await;
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(fragments[0].overlays.len(), 1);
+    let before = id_val_map(&dataset).await;
+    assert_eq!(before.get(&1), Some(&Some(111)));
+    assert_eq!(before.get(&4), Some(&None));
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    assert_eq!(id_val_map(&dataset).await, before);
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().overlays.is_empty())
+    );
 }
 
 #[tokio::test]
