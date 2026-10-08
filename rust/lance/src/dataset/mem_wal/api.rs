@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
+use lance_index::metrics::NoOpMetricsCollector;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -804,36 +805,9 @@ impl DatasetMemWalExt for Dataset {
         shard_id: Uuid,
         mut config: ShardWriterConfig,
     ) -> Result<ShardWriter> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        // Load MemWalIndex to get maintained_indexes
-        let mem_wal_index = self
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                )
-            })?;
-
-        config.shard_spec_id =
-            resolve_writer_shard_spec_id(&mem_wal_index.details, config.shard_spec_id)?;
-
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
-
-        // The writer's per-index tuning reaches the plugins as opaque values,
-        // each recognising its own.
-        let overrides = writer_overrides(&config)?;
-        let index_specs = build_index_specs(
-            self,
-            &maintained_indexes,
-            &overrides,
-            &config.mem_index_registry,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+        let details = require_mem_wal_details(self).await?;
+        config.shard_spec_id = resolve_writer_shard_spec_id(&details, config.shard_spec_id)?;
+        let index_specs = maintained_index_specs(self, &details, &config).await?;
 
         // Set shard_id in config
         config.shard_id = shard_id;
@@ -866,30 +840,8 @@ impl DatasetMemWalExt for Dataset {
         &self,
         writer: &ShardWriter,
     ) -> Result<Option<SealFence>> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        let mem_wal_index = self
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                )
-            })?;
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
-        // The writer's own plugins and tuning, so a refresh resolves the set the
-        // same way the open did.
-        let config = writer.config();
-        let index_specs = build_index_specs(
-            self,
-            &maintained_indexes,
-            &writer_overrides(config)?,
-            &config.mem_index_registry,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+        let details = require_mem_wal_details(self).await?;
+        let index_specs = maintained_index_specs(self, &details, writer.config()).await?;
         writer.replace_index_configs(index_specs).await
     }
 }
@@ -906,6 +858,31 @@ enum OnUnsupportedIndex {
     Skip,
 }
 
+impl ShardWriter {
+    /// Moves this writer onto `dataset`'s current schema and maintained indexes.
+    ///
+    /// Pass the base table as read after the schema change. Returns `Ok(None)`
+    /// when the writer is already up to date.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::mem_wal::ShardWriter;
+    /// # async fn doc(writer: &ShardWriter, dataset: &Dataset) -> Result<()> {
+    /// writer.evolve_to(dataset).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<SealFence>> {
+        let details = require_mem_wal_details(dataset).await?;
+        let index_specs = maintained_index_specs(dataset, &details, self.config()).await?;
+        self.evolve_schema(
+            Arc::new(super::arrow_schema_with_field_ids(dataset.schema())),
+            index_specs,
+        )
+        .await
+    }
+}
+
 /// Whether an index the set names but the dataset does not have is fatal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OnMissingIndex {
@@ -917,6 +894,40 @@ enum OnMissingIndex {
     /// here would refuse every read on the table for something that costs only
     /// the fresh tier's copy of one index.
     Skip,
+}
+
+/// Loads the MemWAL index details, failing if MemWAL is not initialized.
+async fn require_mem_wal_details(dataset: &Dataset) -> Result<MemWalIndexDetails> {
+    let index = dataset
+        .open_mem_wal_index(&NoOpMetricsCollector)
+        .await?
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
+            )
+        })?;
+    Ok(index.details.clone())
+}
+
+/// The index specs a writer on `dataset` maintains, built with the writer's
+/// own plugins and tuning.
+///
+/// Every path that gives a writer its indexes uses this, so they all agree.
+async fn maintained_index_specs(
+    dataset: &Dataset,
+    details: &MemWalIndexDetails,
+    config: &ShardWriterConfig,
+) -> Result<Vec<MemIndexSpec>> {
+    let (index_names, on_unsupported) = resolve_maintained_indexes(dataset, details).await?;
+    build_index_specs(
+        dataset,
+        &index_names,
+        &writer_overrides(config)?,
+        &config.mem_index_registry,
+        OnMissingIndex::Skip,
+        on_unsupported,
+    )
+    .await
 }
 
 /// The indexes a MemTable should carry, and how to treat one this writer cannot
@@ -2079,7 +2090,10 @@ mod tests {
             .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
             .await
             .unwrap();
-        assert_eq!(writer.maintained_index_names(), vec!["v_btree".to_string()]);
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["v_btree".to_string()]
+        );
         writer.close().await.unwrap();
     }
 
@@ -2123,7 +2137,7 @@ mod tests {
             .unwrap();
         let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
         assert_eq!(
-            writer.maintained_index_names(),
+            writer.maintained_index_names().await,
             vec!["id_zone_map".to_string()]
         );
         writer.close().await.unwrap();
@@ -2182,7 +2196,7 @@ mod tests {
             .with_index_override("vector_idx", HnswBuildParams::default());
         let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
         assert_eq!(
-            writer.maintained_index_names(),
+            writer.maintained_index_names().await,
             vec!["vector_idx".to_string()]
         );
         writer.close().await.unwrap();

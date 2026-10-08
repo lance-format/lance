@@ -287,6 +287,7 @@ impl MemTable {
             batch_capacity,
             global_offset,
             target.clone(),
+            generation,
         ));
 
         // Create memtable_flush_completion cell immediately so backpressure can

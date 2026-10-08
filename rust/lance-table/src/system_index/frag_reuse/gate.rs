@@ -322,7 +322,8 @@ pub fn classify(
         Operation::Rewrite { .. }
         | Operation::CreateIndex { .. }
         | Operation::DataOverlay { .. }
-        | Operation::Clone { .. } => Err(Error::not_supported(
+        | Operation::Clone { .. }
+        | Operation::Unknown { .. } => Err(Error::not_supported(
             "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
         )),
     }

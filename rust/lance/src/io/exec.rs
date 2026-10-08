@@ -28,6 +28,7 @@ pub mod table_identifier;
 mod take;
 #[cfg(test)]
 pub mod testing;
+pub mod topk_late_materialization;
 pub mod utils;
 
 pub use filter::LanceFilterExec;

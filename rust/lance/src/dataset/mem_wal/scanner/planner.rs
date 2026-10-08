@@ -18,7 +18,7 @@ use crate::dataset::mem_wal::TOMBSTONE;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -433,11 +433,7 @@ impl LsmScanPlanner {
                 // generation's own planning nests deeply enough that leaving
                 // this future inlined pushes the `Send` proof past rustc's
                 // recursion limit for callers stacked above it.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -449,38 +445,60 @@ impl LsmScanPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-
-                // Asked for under the table's own names, which is what a
-                // memtable stores them under: a memtable is created from the
-                // schema its writer holds, so a reader planning against that
-                // same schema needs no resolution. Pairing a memtable with a
-                // schema it was not created from is outside this contract --
-                // pass the memtable its own schema, or reopen the writer.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+
+                // `Some` only for a memtable created before a schema change;
+                // it resolves like a flushed generation.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(filter),
+                    None => (filter.cloned(), None),
+                };
+
+                match &generation {
+                    Some(generation) => {
+                        scanner.project(&generation.stored_projection())?;
+                    }
+                    None => {
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
+                }
                 scanner.with_row_address();
 
-                // The dedup scan applies the filter post-dedup; pushing it
-                // into the raw scan would resurrect older versions of PKs
-                // whose newest version fails the predicate. Folding
-                // `NOT _tombstone` here is correct: a tombstone wins the
-                // position-based dedup (suppressing the older real row) and is
-                // then dropped by this predicate. A memtable without the column
-                // (legacy / test) gets no fold.
+                // Filter after dedup: filtering the raw scan would bring back an
+                // older version of a key whose newest version fails the filter.
+                // Adding `NOT _tombstone` is safe: a tombstone still wins the
+                // dedup, hiding the older row, and is then dropped.
                 let folded;
                 let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
-                    folded = fold_not_tombstone(filter);
+                    folded = fold_not_tombstone(stored_filter.as_ref());
                     Some(&folded)
                 } else {
-                    filter
+                    stored_filter.as_ref()
                 };
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
                 scanner.with_memtable_filter_indexes(self.memtable_filter_indexes);
 
-                scanner.create_dedup_plan(&self.pk_columns).await
+                let pk_columns = match &generation {
+                    Some(generation) => generation.stored_pk_columns()?,
+                    None => self.pk_columns.clone(),
+                };
+                let deduped = Box::pin(scanner.create_dedup_plan(&pk_columns)).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(deduped, &above),
+                    None => Ok(deduped),
+                }
             }
         }
     }

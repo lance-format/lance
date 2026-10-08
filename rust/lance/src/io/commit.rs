@@ -69,7 +69,6 @@ use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::is_system_index;
-use lance_io::object_store::ObjectStoreRegistry;
 use log;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -280,8 +279,11 @@ async fn verify_commit_outcome(
     }
 
     // Durable form of this attempt's transaction, matching what the commit
-    // path serialized.
-    let transaction_pb = pb::Transaction::from(transaction);
+    // path serialized. The commit path already rejected anything that fails
+    // to serialize, so this cannot fail in practice; stay conservative if it does.
+    let Ok(transaction_pb) = pb::Transaction::try_from(transaction) else {
+        return CommitOutcome::Unknown;
+    };
 
     let mut backoff = Backoff::default();
     let failure = loop {
@@ -421,15 +423,16 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    commit_handler: &dyn CommitHandler,
+    commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
+    uri: &str,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
-    store_registry: Arc<ObjectStoreRegistry>,
+    session: Arc<Session>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -450,7 +453,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(store_registry.clone(), ref_path.as_str())?;
+            ObjectStore::extract_path_from_uri(session.store_registry(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
@@ -458,7 +461,7 @@ async fn do_commit_new_dataset(
             source_store,
             &source_manifest_location,
             ref_path.as_str(),
-            &Session::default(),
+            &session,
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
@@ -477,12 +480,8 @@ async fn do_commit_new_dataset(
         } else {
             vec![]
         };
-        let new_base_id = source_manifest
-            .base_paths
-            .keys()
-            .max()
-            .map(|id| *id + 1)
-            .unwrap_or(0);
+        let new_base_id =
+            lance_table::format::BasePath::unused_id(source_manifest.base_paths.keys().copied())?;
         let mut updated_indices = Vec::with_capacity(indices.len());
         for mut index in indices {
             if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
@@ -501,7 +500,7 @@ async fn do_commit_new_dataset(
                         source_store,
                         &source_base_path,
                         &source_manifest,
-                        store_registry.clone(),
+                        session.store_registry(),
                         &index,
                         base_remap,
                         object_store,
@@ -523,7 +522,12 @@ async fn do_commit_new_dataset(
             }
             updated_indices.push(index);
         }
-        Some((source_manifest, new_base_id, updated_indices))
+        Some((
+            source_manifest,
+            source_manifest_location,
+            new_base_id,
+            updated_indices,
+        ))
     } else {
         None
     };
@@ -548,7 +552,7 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_manifest, new_base_id, updated_indices)),
+        Some((source_manifest, source_manifest_location, new_base_id, updated_indices)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
@@ -562,8 +566,10 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
-            let mut new_manifest = source_manifest;
-            new_manifest.base_paths.clear();
+            let mut new_manifest = source_manifest.clone();
+            if !source_manifest.has_managed_blobs() {
+                new_manifest.base_paths.clear();
+            }
             new_manifest.branch = None;
             new_manifest.tag = None;
             new_manifest.index_section = None; // will be rewritten below
@@ -580,6 +586,31 @@ async fn do_commit_new_dataset(
             }
             new_manifest.fragments = Arc::new(new_frags);
 
+            if source_manifest.has_managed_blobs() {
+                let source_store = source_store.unwrap_or(object_store);
+                let source = Dataset::checkout_manifest(
+                    Arc::new(source_store.clone()),
+                    ObjectStore::extract_path_from_uri(session.store_registry(), ref_path)?,
+                    ref_path.clone(),
+                    Arc::new(source_manifest.clone()),
+                    source_manifest_location.clone(),
+                    session.clone(),
+                    commit_handler.clone(),
+                    None,
+                    None,
+                    None,
+                )?;
+                crate::dataset::blob::clone::copy_blob_columns(
+                    Arc::new(source),
+                    Arc::new(object_store.clone()),
+                    base_path.clone(),
+                    uri,
+                    &mut new_manifest,
+                )
+                .boxed()
+                .await?;
+            }
+
             (new_manifest, updated_indices)
         }
     } else {
@@ -594,7 +625,7 @@ async fn do_commit_new_dataset(
 
     let result = write_manifest_file(
         object_store,
-        commit_handler,
+        commit_handler.as_ref(),
         base_path,
         &mut manifest,
         if indices.is_empty() {
@@ -624,7 +655,7 @@ async fn do_commit_new_dataset(
             // transaction file a landed manifest would reference).
             match verify_commit_outcome(
                 object_store,
-                commit_handler,
+                commit_handler.as_ref(),
                 base_path,
                 manifest.version,
                 transaction,
@@ -663,7 +694,7 @@ async fn do_commit_new_dataset(
         Err(CommitError::OtherError(err)) => {
             match verify_commit_outcome(
                 object_store,
-                commit_handler,
+                commit_handler.as_ref(),
                 base_path,
                 manifest.version,
                 transaction,
@@ -730,24 +761,26 @@ async fn record_new_dataset_commit(
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    commit_handler: &dyn CommitHandler,
+    commit_handler: &Arc<dyn CommitHandler>,
     base_path: &Path,
+    uri: &str,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
-    store_registry: Arc<ObjectStoreRegistry>,
+    session: Arc<Session>,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
         source_store,
         commit_handler,
         base_path,
+        uri,
         transaction,
         write_config,
         manifest_naming_scheme,
         metadata_cache,
-        store_registry,
+        session,
     )
     .await
 }
@@ -1250,7 +1283,7 @@ pub(crate) async fn do_commit_detached_transaction(
              fragment reuse entry; commit the rewrite on the main version chain",
         ));
     }
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -1391,7 +1424,11 @@ pub(crate) async fn do_commit_detached_transaction(
                 }
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
-                inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
+                inline_tx = if inline_transaction {
+                    Some(pb::Transaction::try_from(transaction)?.into())
+                } else {
+                    None
+                };
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
@@ -1714,7 +1751,7 @@ pub(crate) async fn commit_transaction(
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
-        let pb_transaction = pb::Transaction::from(&transaction);
+        let pb_transaction = pb::Transaction::try_from(&transaction)?;
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
         // Classified from the operation itself. Reading it back off the inline
         // copy would tie the verdict to the payload size instead.
@@ -2179,7 +2216,7 @@ mod tests {
         let file_name = write_transaction_file(
             &object_store,
             &base_path,
-            &pb::Transaction::from(&transaction),
+            &pb::Transaction::try_from(&transaction).unwrap(),
         )
         .await
         .unwrap();
@@ -3988,7 +4025,7 @@ mod tests {
             None,
         );
         // What the commit wrote, and what verification reads back.
-        let durable = pb::Transaction::from(&transaction);
+        let durable = pb::Transaction::try_from(&transaction).unwrap();
         let read_back = pb::Transaction::decode(durable.encode_to_vec().as_slice()).unwrap();
         // The old comparison (read-back deserialized into memory, compared
         // with `Transaction::eq`) misclassifies our own landed commit: the
@@ -4001,6 +4038,6 @@ mod tests {
         );
         // The comparison `verify_commit_outcome` performs: read-back durable
         // form against the regenerated durable form of this attempt.
-        assert_eq!(read_back, pb::Transaction::from(&transaction));
+        assert_eq!(read_back, pb::Transaction::try_from(&transaction).unwrap());
     }
 }
