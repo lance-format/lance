@@ -14,7 +14,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
+    dataset::transaction::{DataOverlayGroup, Operation, RewriteGroup, Transaction, UpdateMode},
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
@@ -57,6 +57,12 @@ pub struct TransactionRebase<'a> {
     current_lineage: Option<TaggedLineage>,
     /// The latest manifest's live fragments, loaded with `current_lineage`.
     current_live: Option<RoaringBitmap>,
+    /// For a CreateIndex on a table whose fragment reuse history is v0: the
+    /// source fragments of every group the latest manifest's entry still
+    /// records, one sorted id list per group. `None` when not loaded (not a
+    /// CreateIndex, a tagged table, or an FRI cleanup); an empty set when
+    /// the table has no entry. See [`Self::load_current_lineage`].
+    current_v0_reuse_sources: Option<HashSet<Vec<u64>>>,
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
@@ -276,6 +282,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    current_v0_reuse_sources: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments,
@@ -312,6 +319,7 @@ impl<'a> TransactionRebase<'a> {
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
+                        current_v0_reuse_sources: None,
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
@@ -332,6 +340,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    current_v0_reuse_sources: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -370,6 +379,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    current_v0_reuse_sources: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -392,6 +402,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    current_v0_reuse_sources: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -414,6 +425,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    current_v0_reuse_sources: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -435,6 +447,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    current_v0_reuse_sources: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -539,12 +552,68 @@ impl<'a> TransactionRebase<'a> {
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
         else {
+            self.load_current_v0_reuse_sources(dataset, &indices)
+                .await?;
             return Ok(());
         };
         let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?;
         self.current_lineage = Some(TaggedLineage::new(entry, Some(Arc::new(ledger))));
         self.current_live = Some(dataset.fragment_bitmap.as_ref().clone());
         self.current_schema = Some(dataset.schema().clone());
+        Ok(())
+    }
+
+    /// The v0 counterpart of the tagged lineage: which rewrite groups the
+    /// latest manifest's v0 fragment reuse entry still records.
+    ///
+    /// A committed rewrite is read back from its transaction file, where
+    /// `frag_reuse_index` is never serialized, so a CreateIndex committing
+    /// from another process cannot see that a concurrent rewrite deferred its
+    /// index remap. The v0 entry is durable evidence of exactly that: a
+    /// deferred rewrite appends one version whose groups name the rewritten
+    /// source fragments, and fragment ids are never reused, so a group's
+    /// sources identify the rewrite. Reading the LATEST entry (not the one at
+    /// the rewrite's version) also answers whether the record is still there:
+    /// a cleanup may have trimmed it while this index was being built, and
+    /// an index committed against a trimmed record would keep pointing at
+    /// the retired fragments with nothing left to translate them.
+    ///
+    /// Not loaded for an FRI cleanup, which `finish_create_index` re-derives
+    /// against the latest entry itself, nor on a table governed by the tagged
+    /// format.
+    async fn load_current_v0_reuse_sources(
+        &mut self,
+        dataset: &Dataset,
+        indices: &[IndexMetadata],
+    ) -> Result<()> {
+        let Operation::CreateIndex { new_indices, .. } = &self.transaction.operation else {
+            return Ok(());
+        };
+        if new_indices
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        {
+            return Ok(());
+        }
+        let entry = indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
+        if lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+            &dataset.manifest,
+            entry,
+        ) {
+            return Ok(());
+        }
+        let mut sources = HashSet::new();
+        if let Some(entry) = entry {
+            let details = load_frag_reuse_index_details(dataset, entry).await?;
+            for version in details.versions.iter() {
+                for group in version.groups.iter() {
+                    sources.insert(sorted_ids(group.old_frags.iter().map(|f| f.id)));
+                }
+            }
+        }
+        self.current_v0_reuse_sources = Some(sources);
         Ok(())
     }
 
@@ -1253,10 +1322,19 @@ impl<'a> TransactionRebase<'a> {
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    if frag_reuse_index
-                        .as_ref()
-                        .is_some_and(|entry| !is_tagged(entry))
-                    {
+                    // On a v0 table the latest manifest's entry decides (see
+                    // `load_current_v0_reuse_sources`): it is the only evidence
+                    // available when the rewrite committed from another
+                    // process, and it also catches a record trimmed while this
+                    // index was being built. Without it, fall back to the
+                    // in-memory update a same-process rewrite carries.
+                    let deferred_v0 = v0_rewrite_recorded(self.current_v0_reuse_sources.as_ref(), groups)
+                        .unwrap_or_else(|| {
+                        frag_reuse_index
+                            .as_ref()
+                            .is_some_and(|entry| !is_tagged(entry))
+                    });
+                    if deferred_v0 {
                         let ngram_coverage = new_indices
                             .iter()
                             .filter(|idx| {
@@ -3175,6 +3253,30 @@ fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
 
+/// Whether the latest v0 entry (`sources`, see
+/// `TransactionRebase::load_current_v0_reuse_sources`) still records every
+/// group of a committed rewrite, i.e. whether that rewrite deferred its index
+/// remap and its mapping has not been trimmed since. `None` when no v0
+/// evidence was loaded.
+fn v0_rewrite_recorded(
+    sources: Option<&HashSet<Vec<u64>>>,
+    groups: &[RewriteGroup],
+) -> Option<bool> {
+    let sources = sources?;
+    Some(
+        groups
+            .iter()
+            .all(|group| sources.contains(&sorted_ids(group.old_fragments.iter().map(|f| f.id)))),
+    )
+}
+
+/// Fragment ids as a sorted list, the key a rewrite group is matched by.
+fn sorted_ids(ids: impl Iterator<Item = u64>) -> Vec<u64> {
+    let mut ids: Vec<u64> = ids.collect();
+    ids.sort_unstable();
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use std::{num::NonZero, sync::Arc};
@@ -4397,6 +4499,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4616,6 +4719,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4682,6 +4786,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4830,6 +4935,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4879,6 +4985,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4901,6 +5008,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4988,6 +5096,7 @@ mod tests {
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
+                        current_v0_reuse_sources: None,
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
@@ -5045,6 +5154,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5183,6 +5293,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5250,6 +5361,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5311,6 +5423,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5339,6 +5452,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5390,6 +5504,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5452,6 +5567,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5517,6 +5633,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5565,6 +5682,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5614,6 +5732,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5690,6 +5809,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5772,6 +5892,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -6474,6 +6595,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                current_v0_reuse_sources: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -6544,6 +6666,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6589,6 +6712,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6635,6 +6759,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6681,6 +6806,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6738,6 +6864,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6770,6 +6897,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6823,6 +6951,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            current_v0_reuse_sources: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,

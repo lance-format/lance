@@ -7008,6 +7008,216 @@ mod tests {
         )
     }
 
+    /// Writes 12 fragments of 1_000 rows with columns `i` and `j`, a scalar
+    /// index `scalar` on `i` covering the first 6, and returns the dataset at
+    /// `uri` opened in its own session.
+    async fn v0_fri_conflict_fixture(uri: &str) -> Dataset {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())))
+            .col(Box::new(IncrementingInt32::new().named("j".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        Dataset::write(
+            data_gen.batch(6_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        dataset
+    }
+
+    /// The same dataset opened in a fresh session: nothing another handle
+    /// committed is in its caches, as for a writer in another process.
+    async fn open_in_new_session(uri: &str) -> Dataset {
+        crate::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_session(Arc::new(crate::session::Session::default()))
+            .load()
+            .await
+            .unwrap()
+    }
+
+    fn defer_remap_compaction() -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        }
+    }
+
+    /// A reindex committing from another process sees a deferred compaction
+    /// only as its transaction file, which never carries the reuse update.
+    /// The v0 entry in the latest manifest is the durable evidence that the
+    /// compaction deferred its remap, so the reindex lands instead of
+    /// retrying.
+    #[tokio::test]
+    async fn test_concurrent_compaction_reindex_across_processes() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = v0_fri_conflict_fixture(uri).await;
+        let mut other_process = open_in_new_session(uri).await;
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+
+        other_process
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+        let scalar_index = dataset.load_index_by_name("scalar").await.unwrap().unwrap();
+        let index_frags = scalar_index
+            .fragment_bitmap
+            .unwrap()
+            .iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            index_frags,
+            dataset
+                .fragments()
+                .iter()
+                .map(|f| f.id as u32)
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    /// A deferred compaction's reuse record can be trimmed while an index is
+    /// still being built: the trim only waits for committed indexes. An index
+    /// committed after that would keep pointing at the retired fragments with
+    /// no record left to translate them, so the latest entry decides and the
+    /// commit retries -- even in the process that ran the compaction, where
+    /// the in-memory reuse update alone would have let it through.
+    #[tokio::test]
+    async fn test_reindex_retries_when_deferred_compaction_was_trimmed() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = v0_fri_conflict_fixture(uri).await;
+        let mut index_builder = dataset.clone();
+
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+        remapping::remap_column_index(&mut dataset, &["i"], Some("scalar".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let fri = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .cloned();
+        if let Some(fri) = fri {
+            let details = load_frag_reuse_index_details(&dataset, &fri).await.unwrap();
+            assert!(details.versions.is_empty(), "the trim must drop the record");
+        }
+
+        // A new index on `j`, built from the pre-compaction snapshot: no name
+        // clash with the remap, so only the reuse evidence can stop it.
+        let error = index_builder
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("j_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got: {error:?}"
+        );
+    }
+
+    /// A reuse entry left on the table by an earlier deferred compaction says
+    /// nothing about a later compaction that remapped indexes eagerly: that
+    /// one still conflicts with a concurrent reindex covering its fragments.
+    #[tokio::test]
+    async fn test_reindex_conflicts_with_eager_compaction_despite_existing_fri() {
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = v0_fri_conflict_fixture(uri).await;
+        compact_files(&mut dataset, defer_remap_compaction(), None)
+            .await
+            .unwrap();
+        Dataset::write(
+            BatchGenerator::new()
+                .col(Box::new(IncrementingInt32::new().named("i".to_owned())))
+                .col(Box::new(IncrementingInt32::new().named("j".to_owned())))
+                .batch(4_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let mut other_process = open_in_new_session(uri).await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error = other_process
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("j_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_concurrent_compaction_reindex_reindex_commit_first() {
         let mut data_gen = BatchGenerator::new()
