@@ -1316,10 +1316,11 @@ fn entry_columns_from(value: Option<&str>) -> Result<EntryColumns> {
 
 /// How a read of an IVF_RQ index with resident small columns attaches the
 /// store's rows to a batch of a whole partition or plane that is never
-/// cached: `share` (default) or `copy`. Gathered rows, and whole reads that
-/// become cache entries, are always copied. An ablation and diagnostic
-/// knob: results are the same either way. Read once per process; an invalid
-/// value fails every IVF_RQ index open.
+/// cached: `share` (default) or `copy`. Gathered rows, whole reads that
+/// become cache entries, and partitions streamed out of the index to its
+/// caller are always copied. An ablation and diagnostic knob: results are
+/// the same either way. Read once per process; an invalid value fails every
+/// IVF_RQ index open.
 pub const RESIDENT_ATTACH_ENV: &str = "LANCE_RQ_RESIDENT_ATTACH";
 
 /// The value of [`RESIDENT_ATTACH_ENV`].
@@ -1328,7 +1329,8 @@ pub enum ResidentAttach {
     /// A whole partition or plane gets views of the store's buffers, each
     /// of exactly its rows' bytes, so the read copies nothing and the batch
     /// is charged what a copy is. A view keeps its store column's whole
-    /// allocation alive until it drops, so no view may reach a cache entry.
+    /// allocation alive until it drops, so no view may reach a cache entry
+    /// or outlive the read that made it.
     #[default]
     Share,
     /// Every attach copies the store's rows into buffers of their own, as
@@ -2287,8 +2289,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// or plane that is never cached: views of the store
     /// ([`ResidentAttach::Share`]) unless the index set
     /// [`ResidentAttach::Copy`] with [`Self::with_resident_attach`].
-    /// Gathered rows, and whole reads that become cache entries, are always
-    /// copied.
+    /// Gathered rows, whole reads that become cache entries, and partitions
+    /// streamed out of the index are always copied.
     pub fn resident_attach(&self) -> ResidentAttach {
         self.resident_attach
     }
@@ -2597,18 +2599,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// The storage of native partition `part_id` built from `codes`, its
     /// code-only entry: the columns the resident store keeps are the store's
-    /// rows, attached as [`Self::resident_attach`] says (views of the store
-    /// by default), the others the entry's, in the order a storage built
-    /// from a read of the file holds them, so the storage is that one, bit
-    /// for bit and byte for byte. The storage is built for one read and never
-    /// cached: views of the store must not reach the cache. The index loaded
-    /// the store when it opened; a storage built outside an index open loads
-    /// it on its first build, as a fallback, and adds the load's I/O to
-    /// `load_stats`. Counted in `code_only_partition_builds`.
+    /// rows, attached as `attach` says, the others the entry's, in the order
+    /// a storage built from a read of the file holds them, so the storage is
+    /// that one, bit for bit and byte for byte. A read's own storage takes
+    /// [`Self::resident_attach`] (views of the store by default); one handed
+    /// out of the index, which may outlive the index and its lease on the
+    /// store, takes [`ResidentAttach::Copy`]. The storage is built for one
+    /// read and never cached: views of the store must not reach the cache.
+    /// The index loaded the store when it opened; a storage built outside an
+    /// index open loads it on its first build, as a fallback, and adds the
+    /// load's I/O to `load_stats`. Counted in `code_only_partition_builds`.
     pub async fn partition_from_codes(
         &self,
         part_id: usize,
         codes: &PartitionCodes,
+        attach: ResidentAttach,
         load_stats: Option<&IoStats>,
     ) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
@@ -2642,12 +2647,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let started = Instant::now();
         let batch = match store {
             None => RecordBatch::new_empty(schema),
-            Some(store) => store.attach(
-                schema,
-                Some(entry),
-                ResidentRows::Range(range),
-                self.resident_attach,
-            )?,
+            Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
         };
         let storage = Q::Storage::try_from_batch_with_remapper(
             batch,
@@ -2664,15 +2664,17 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// The storage of native partition `part_id` read through its code-only
     /// entry in `cache` ([`PartitionCodesKey`]), loaded from the file on a
     /// miss and admitted when `write_cache`, and whether the entry was a hit.
-    /// Every read attaches the resident columns ([`Self::partition_from_codes`]),
-    /// which the index loaded when it opened, so a hit reads nothing from the
-    /// file. The entry holds the codes alone; the storage, which by default
-    /// views the store's rows, is built for this read and never cached.
+    /// Every read attaches the resident columns as `attach` says
+    /// ([`Self::partition_from_codes`]); the index loaded them when it
+    /// opened, so a hit reads nothing from the file. The entry holds the
+    /// codes alone; the storage, which views the store's rows under
+    /// [`ResidentAttach::Share`], is built for this read and never cached.
     pub async fn load_partition_cached(
         &self,
         part_id: usize,
         cache: &WeakLanceCache,
         write_cache: bool,
+        attach: ResidentAttach,
         io_stats: Option<IoStats>,
     ) -> Result<(Q::Storage, bool)> {
         let key = PartitionCodesKey { partition: part_id };
@@ -2698,7 +2700,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             (Arc::new(codes), false)
         };
         let storage = self
-            .partition_from_codes(part_id, &codes, io_stats.as_ref())
+            .partition_from_codes(part_id, &codes, attach, io_stats.as_ref())
             .await?;
         Ok((storage, hit))
     }
