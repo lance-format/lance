@@ -604,12 +604,24 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Whether this CreateIndex may be let past deferred compactions on an
-    /// untagged table, which needs every version since its read version.
+    /// Whether this CreateIndex covers rows a recorded deferred compaction
+    /// moved, which needs every version since its read version to follow.
     pub(crate) fn relies_on_untagged_reuse(&self) -> bool {
-        self.untagged_reuse
-            .as_ref()
-            .is_some_and(|reuse| !reuse.deferred_groups.is_empty())
+        let Some(reuse) = &self.untagged_reuse else {
+            return false;
+        };
+        let Operation::CreateIndex { new_indices, .. } = &self.transaction.operation else {
+            return false;
+        };
+        new_indices.iter().any(|index| {
+            index.fragment_bitmap.as_ref().is_none_or(|bitmap| {
+                reuse
+                    .deferred_groups
+                    .iter()
+                    .flatten()
+                    .any(|id| bitmap.contains(*id as u32))
+            })
+        })
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {

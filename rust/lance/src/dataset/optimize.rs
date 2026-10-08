@@ -13941,7 +13941,7 @@ mod tests {
             .load()
             .await
             .unwrap();
-        // Keeps the build's version through the cleanup below.
+        // Keeps the build's version if the race cleans up versions.
         dataset
             .tags()
             .create("index-build", dataset.manifest.version)
@@ -13966,6 +13966,44 @@ mod tests {
 
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
         assert_eq!(race.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A gap in the versions since the build does not matter when no recorded
+    /// compaction moved the index's rows.
+    #[tokio::test]
+    async fn test_reindex_commits_over_a_gap_no_compaction_it_covers_is_in() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_three_column_dataset(dir.as_str()).await;
+        // Recorded before the build, so the index never covers its sources.
+        compact_files(&mut dataset, compact_into_one(false), None)
+            .await
+            .unwrap();
+        let read_version = dataset.manifest.version;
+        dataset
+            .tags()
+            .create("index-build", read_version)
+            .await
+            .unwrap();
+        let mut builder = open_in_new_session(dir.as_str()).await;
+        update_val_in_place(dataset.clone()).await;
+        dataset.checkout_latest().await.unwrap();
+        update_val_in_place(dataset).await;
+        let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+            .versions(vec![read_version + 1])
+            .unwrap()
+            .build();
+        let latest = open_in_new_session(dir.as_str()).await;
+        latest.cleanup_with_policy(policy).await.unwrap();
+        assert!(
+            !latest
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|version| version.version == read_version + 1)
+        );
+
+        assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
     }
 
     /// A retry that cannot see a compaction it relies on, because cleanup
