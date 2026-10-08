@@ -58,6 +58,8 @@ pub struct LsmScanPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
+    /// See [`super::LsmScanner::with_memtable_filter_indexes`].
+    memtable_filter_indexes: bool,
 }
 
 impl LsmScanPlanner {
@@ -77,7 +79,14 @@ impl LsmScanPlanner {
             store_params: None,
             sstable_cache: None,
             warmer: None,
+            memtable_filter_indexes: false,
         }
+    }
+
+    /// See [`super::LsmScanner::with_memtable_filter_indexes`].
+    pub fn with_memtable_filter_indexes(mut self, enabled: bool) -> Self {
+        self.memtable_filter_indexes = enabled;
+        self
     }
 
     /// Set the session used to open SSTables.
@@ -479,6 +488,7 @@ impl LsmScanPlanner {
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
+                scanner.with_memtable_filter_indexes(self.memtable_filter_indexes);
 
                 let pk_columns = match &generation {
                     Some(generation) => generation.stored_pk_columns()?,
@@ -1522,16 +1532,16 @@ mod integration_tests {
         );
 
         // 2. The active arm uses the fused dedup scan: it deduplicates to
-        //    newest-per-PK *before* applying the predicate, so it deliberately
-        //    forgoes the index route (the dedup must see every
-        //    version). See MemTableDedupScanExec.
+        //    newest-per-PK *before* applying the predicate, so by default it
+        //    forgoes the index route (the dedup must see every version). See
+        //    MemTableDedupScanExec.
         assert!(
             plan_str.contains("MemTableDedupScanExec"),
             "Active memtable should use the fused dedup scan"
         );
         assert!(
             !plan_str.contains("ScalarMemIndexExec"),
-            "the active memtable must not use the index route"
+            "the active memtable's filtered read reads every row unless its filter indexes are turned on"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets
@@ -2239,6 +2249,270 @@ mod integration_tests {
             vec![1, 3, 4],
             "id=2 deleted; tombstone row not surfaced"
         );
+    }
+
+    /// Across a base table, a flushed generation, and frozen and active
+    /// memtables, a scan from the memtables' filter indexes returns what
+    /// reading every row returns, whatever the filter, projection, limit and
+    /// offset.
+    #[tokio::test]
+    async fn test_lsm_scan_from_memtable_filter_indexes_answers_like_a_full_read() {
+        use crate::dataset::mem_wal::TOMBSTONE;
+        use crate::dataset::mem_wal::index::MemIndexSpec;
+        use crate::dataset::mem_wal::memtable::scanner::newest_checks;
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use arrow_array::BooleanArray;
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        const FILTERS: [&str; 11] = [
+            "cat BETWEEN 30 AND 10",
+            "cat > 20 AND cat <= 20",
+            "cat = 3",
+            "cat IN (1, 2)",
+            "name = 'n2'",
+            "cat > 30 AND name = 'n1'",
+            "cat = 3 OR name = 'n4'",
+            "name IS NULL",
+            "cat < 3",
+            "cat = 3 AND id > 100",
+            "cat = 3 AND name LIKE 'n%'",
+        ];
+        let pk_field = || {
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            )]))
+        };
+        let disk_schema = Arc::new(ArrowSchema::new(vec![
+            pk_field(),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("cat", DataType::Int32, true),
+        ]));
+        let mem_schema = Arc::new(ArrowSchema::new(vec![
+            pk_field(),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("cat", DataType::Int32, true),
+            Field::new(TOMBSTONE, DataType::Boolean, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(mem_schema.as_ref()).unwrap();
+
+        let mut seed: u64 = 0x15a;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        // (id, name, cat, deleted) rows.
+        type Row = (i32, Option<String>, Option<i32>, bool);
+        let rows = |next: &mut dyn FnMut(u64) -> u64, count: usize, deletes: bool| -> Vec<Row> {
+            (0..count)
+                .map(|_| {
+                    let deleted = deletes && next(6) == 0;
+                    let name = (!deleted && next(12) != 0).then(|| format!("n{}", next(30)));
+                    let cat = (!deleted && next(12) != 0).then(|| next(40) as i32);
+                    (next(400) as i32, name, cat, deleted)
+                })
+                .collect()
+        };
+        let disk_batch = |rows: &[Row]| {
+            RecordBatch::try_new(
+                disk_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(StringArray::from_iter(rows.iter().map(|r| r.1.clone()))),
+                    Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.2))),
+                ],
+            )
+            .unwrap()
+        };
+        let mem_batch = |rows: &[Row]| {
+            RecordBatch::try_new(
+                mem_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(StringArray::from_iter(rows.iter().map(|r| r.1.clone()))),
+                    Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.2))),
+                    Arc::new(BooleanArray::from_iter(rows.iter().map(|r| Some(r.3)))),
+                ],
+            )
+            .unwrap()
+        };
+        let memtable = |batches: &[RecordBatch], durable: Option<usize>| {
+            let mut indexes = IndexStore::from_specs(
+                &[
+                    MemIndexSpec::btree("name_idx", 1, "name"),
+                    MemIndexSpec::btree("cat_idx", 2, "cat"),
+                ],
+                &lance_schema,
+                1024,
+                64,
+            )
+            .unwrap();
+            indexes.enable_pk_index(&[("id".to_string(), 0)]);
+            let cursors = Arc::new(WriterCursors::new(true));
+            indexes.set_durability(cursors.clone(), 0);
+            let store = Arc::new(BatchStore::with_capacity(64));
+            for (position, batch) in batches.iter().enumerate() {
+                let (_, offset, _) = store.append(batch.clone()).unwrap();
+                indexes
+                    .insert_with_batch_position(batch, offset, Some(position))
+                    .unwrap();
+            }
+            cursors.advance_durable(durable.unwrap_or(batches.len()));
+            (store, Arc::new(indexes))
+        };
+
+        let (mut checked, mut index_reads) = (0, 0);
+        for round in 0..12 {
+            let temp = tempfile::tempdir().unwrap();
+            let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+            let base_rows = rows(&mut next, 300, false);
+            let base = Arc::new(create_dataset(&base_uri, vec![disk_batch(&base_rows)]).await);
+            let shard_id = Uuid::new_v4();
+            let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+            create_dataset(&gen1_uri, vec![disk_batch(&rows(&mut next, 100, false))]).await;
+            let snapshot = ShardSnapshot::new(shard_id)
+                .with_current_generation(3)
+                .with_sstable(1, "gen_1".to_string());
+
+            let frozen_batches: Vec<RecordBatch> = (0..4)
+                .map(|_| mem_batch(&rows(&mut next, 60, true)))
+                .collect();
+            let active_count = 1 + next(4) as usize;
+            let active_batches: Vec<RecordBatch> = (0..active_count)
+                .map(|_| mem_batch(&rows(&mut next, 60, true)))
+                .collect();
+            let durable = next(active_count as u64 + 1) as usize;
+            let (frozen_store, frozen_index) = memtable(&frozen_batches, None);
+            let (active_store, active_index) = memtable(&active_batches, Some(durable));
+            let in_memory = InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store: active_store,
+                    index_store: active_index,
+                    schema: mem_schema.clone(),
+                    generation: 3,
+                },
+                frozen: vec![InMemoryMemTableRef {
+                    batch_store: frozen_store,
+                    index_store: frozen_index,
+                    schema: mem_schema.clone(),
+                    generation: 2,
+                }],
+            };
+
+            for filter in FILTERS {
+                for projection in [None, Some(vec!["id", "cat"])] {
+                    for (limit, offset) in [(None, None), (Some(3), None), (Some(4), Some(2))] {
+                        let checks_cell = std::cell::RefCell::new(0usize);
+                        let checks = &checks_cell;
+                        let read = |enabled: bool| {
+                            let mut scanner = LsmScanner::new(
+                                base.clone(),
+                                vec![snapshot.clone()],
+                                vec!["id".to_string()],
+                            )
+                            .with_in_memory_memtables(shard_id, in_memory.clone())
+                            .with_memtable_filter_indexes(enabled)
+                            .filter(filter)
+                            .unwrap();
+                            if let Some(columns) = &projection {
+                                scanner = scanner.project(columns).unwrap();
+                            }
+                            let scanner = scanner.limit(limit, offset).unwrap();
+                            async move {
+                                let plan = scanner.create_plan().await.unwrap();
+                                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                                    .indent(true)
+                                    .to_string();
+                                assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
+                                let ctx = datafusion::prelude::SessionContext::new();
+                                let batches = datafusion::physical_plan::collect(
+                                    plan.clone(),
+                                    ctx.task_ctx(),
+                                )
+                                .await
+                                .unwrap();
+                                *checks.borrow_mut() += newest_checks(&plan);
+                                let mut out: Vec<(i32, Option<i32>)> = Vec::new();
+                                for batch in &batches {
+                                    let id = batch.column_by_name("id").unwrap();
+                                    let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+                                    let cat = batch.column_by_name("cat").unwrap();
+                                    let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
+                                    for row in 0..batch.num_rows() {
+                                        out.push((
+                                            id.value(row),
+                                            cat.is_valid(row).then(|| cat.value(row)),
+                                        ));
+                                    }
+                                }
+                                out.sort_unstable();
+                                out
+                            }
+                        };
+                        let context = format!(
+                            "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
+                        );
+                        let full = read(false).await;
+                        assert_eq!(*checks.borrow(), 0, "{context}: the setting is off");
+                        let from_indexes = read(true).await;
+                        if *checks.borrow() > 0 {
+                            index_reads += 1;
+                        }
+                        if limit.is_none() {
+                            assert_eq!(from_indexes, full, "{context}");
+                        } else {
+                            // An unordered limit may return any rows that match.
+                            assert_eq!(from_indexes.len(), full.len(), "{context}");
+                            let mut all =
+                                read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
+                            all.sort_unstable();
+                            for row in &from_indexes {
+                                assert!(all.contains(row), "{context}: {row:?} does not match");
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 12 * FILTERS.len() * 2 * 3);
+        assert!(
+            index_reads * 2 > checked,
+            "most reads must take the index route: {index_reads} of {checked}"
+        );
+
+        async fn read_all(
+            base: &Arc<Dataset>,
+            snapshot: &ShardSnapshot,
+            shard_id: Uuid,
+            in_memory: &InMemoryMemTables,
+            filter: &str,
+        ) -> Vec<(i32, Option<i32>)> {
+            let batches: Vec<RecordBatch> =
+                LsmScanner::new(base.clone(), vec![snapshot.clone()], vec!["id".to_string()])
+                    .with_in_memory_memtables(shard_id, in_memory.clone())
+                    .filter(filter)
+                    .unwrap()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+            let mut out = Vec::new();
+            for batch in &batches {
+                let id = batch.column_by_name("id").unwrap();
+                let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+                let cat = batch.column_by_name("cat").unwrap();
+                let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
+                for row in 0..batch.num_rows() {
+                    out.push((id.value(row), cat.is_valid(row).then(|| cat.value(row))));
+                }
+            }
+            out
+        }
     }
 
     #[tokio::test]

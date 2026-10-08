@@ -39,4 +39,20 @@ mod exec;
 
 pub use builder::MemTableScanner;
 pub(crate) use builder::local_fts_query;
+
+/// The matches a plan checked for being their key's newest version: zero when
+/// every visible row was read instead.
+#[cfg(test)]
+pub(crate) fn newest_checks(
+    plan: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> usize {
+    plan.metrics()
+        .and_then(|metrics| metrics.sum_by_name(exec::NEWEST_CHECKS_METRIC))
+        .map_or(0, |value| value.as_usize())
+        + plan
+            .children()
+            .into_iter()
+            .map(newest_checks)
+            .sum::<usize>()
+}
 pub use exec::{FtsIndexExec, MemTableScanExec, ScalarMemIndexExec, VectorIndexExec};

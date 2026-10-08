@@ -33,6 +33,8 @@ use crate::dataset::mem_wal::write::BatchStore;
 pub use brute_force_vector::MemTableBruteForceVectorExec;
 pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::{FtsIndexExec, SCORE_COLUMN};
+#[cfg(test)]
+pub use scalar_index::NEWEST_CHECKS_METRIC;
 pub use scalar_index::ScalarMemIndexExec;
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;

@@ -26,6 +26,8 @@ use super::{
 pub enum Deviation {
     /// None: only the type differs.
     None,
+    /// Lists every match, whatever budget it is offered.
+    IgnoresMatchBudget,
     /// Answers probes, declines every real search.
     DeclinesRealSearches,
     /// Declines probes, answers every real search.
@@ -190,6 +192,9 @@ impl MemIndex for WrappedIndex {
                 })
             }
             _ if !self.can_answer(query) => Ok(None),
+            Deviation::IgnoresMatchBudget => self
+                .inner
+                .search(query, &SearchContext::new(ctx.max_visible)),
             _ => self.inner.search(query, ctx),
         }
     }

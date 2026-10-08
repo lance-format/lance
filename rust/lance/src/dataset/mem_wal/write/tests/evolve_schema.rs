@@ -537,6 +537,113 @@ mod evolve {
         writer.close().await.unwrap();
     }
 
+    /// A memtable written before a rename answers a filter on the new name from
+    /// its indexes on the old one, keeping each key's newest version.
+    #[tokio::test]
+    async fn test_memtable_filter_indexes_answer_across_a_rename() {
+        use crate::dataset::ColumnAlteration;
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use datafusion::prelude::{col, lit};
+        use lance_index::scalar::ScalarIndexParams;
+
+        let schema = create_test_schema(4);
+        let uri = format!("shared-memory://evolve-filter-{}/", Uuid::new_v4().simple());
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(create_test_batch(&schema, 0, 10, 4))], schema.clone()),
+            &uri,
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::BTree,
+                Some("text_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["text_btree"])
+            .execute()
+            .await
+            .unwrap();
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id)
+                    .with_max_wal_flush_interval(std::time::Duration::from_millis(10))
+                    .with_frozen_memtable_grace(std::time::Duration::from_secs(3600)),
+            )
+            .await
+            .unwrap();
+        // Key 102 is rewritten under the old name, key 103 under the new one.
+        writer
+            .put(vec![rows_under(
+                &schema,
+                &[(101, "alpha"), (102, "beta"), (103, "gamma")],
+            )])
+            .await
+            .unwrap();
+        writer
+            .put(vec![rows_under(&schema, &[(102, "beta again")])])
+            .await
+            .unwrap();
+        dataset
+            .alter_columns(&[ColumnAlteration::new("text".into()).rename("body".into())])
+            .await
+            .unwrap();
+        writer.evolve_to(&dataset).await.unwrap();
+        let evolved: ArrowSchema = dataset.schema().into();
+        writer
+            .put(vec![rows_under(&evolved, &[(103, "gamma again")])])
+            .await
+            .unwrap();
+
+        let memtables = writer.in_memory_memtable_refs().await.unwrap();
+        assert_eq!(
+            memtables.frozen.len(),
+            1,
+            "the pre-rename memtable is in memory"
+        );
+        for (filter, expected) in [
+            (col("body").eq(lit("beta")), vec![]),
+            (col("body").eq(lit("beta again")), vec![102]),
+            (col("body").eq(lit("gamma")), vec![]),
+            (col("body").eq(lit("gamma again")), vec![103]),
+            (col("body").gt_eq(lit("alpha")), vec![101, 102, 103]),
+        ] {
+            for enabled in [false, true] {
+                let scanner = LsmScanner::without_base_table(
+                    Arc::new(evolved.clone()),
+                    dataset.uri(),
+                    vec![],
+                    vec!["id".to_string()],
+                )
+                .with_identity_schema(writer_schema_of(&dataset))
+                .with_in_memory_memtables(shard_id, memtables.clone())
+                .with_memtable_filter_indexes(enabled)
+                .filter_expr(filter.clone());
+                let plan = scanner.create_plan().await.unwrap();
+                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
+                let batch = scanner.try_into_batch().await.unwrap();
+                let mut ids = batch["id"].as_primitive::<Int64Type>().values().to_vec();
+                ids.sort_unstable();
+                assert_eq!(ids, expected, "{filter} with filter indexes {enabled}");
+            }
+        }
+        writer.close().await.unwrap();
+    }
+
     /// Rows in a memtable written before a rename and an added column read back
     /// under the new names, with the new column null, on every read path.
     #[tokio::test]
