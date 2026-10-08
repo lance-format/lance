@@ -30,7 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use datafusion::logical_expr::Expr;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::{Cast, Expr};
 use lance_core::Result;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::scalar::expression::{
@@ -112,7 +113,7 @@ pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<In
     if catalog.is_empty() {
         return Ok(None);
     }
-    let split = apply_scalar_indices(filter.clone(), catalog)?;
+    let split = apply_scalar_indices(see_through_relabelling(filter, catalog), catalog)?;
     let Some(query) = &split.scalar_query else {
         return Ok(None);
     };
@@ -122,6 +123,31 @@ pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<In
         return Ok(None);
     }
     Ok(Some(split))
+}
+
+/// `filter` with each cast of an indexed column removed when the cast changes
+/// only the column's nested field names or metadata.
+///
+/// A memtable's schema carries Lance field ids on nested fields, so comparing a
+/// list column with a list literal coerces the column to the literal's type —
+/// a cast that leaves every value as it was, but hides the column from the
+/// parser that would otherwise claim the expression. The filter evaluated over
+/// the rows keeps its cast; only the index split looks through it.
+fn see_through_relabelling(filter: &Expr, catalog: &MemIndexCatalog) -> Expr {
+    filter
+        .clone()
+        .transform_up(|expr| {
+            if let Expr::Cast(Cast { expr: inner, field }) = &expr
+                && let Expr::Column(column) = inner.as_ref()
+                && catalog
+                    .get_index(&column.name)
+                    .is_some_and(|(column_type, _)| column_type.equals_datatype(field.data_type()))
+            {
+                return Ok(Transformed::yes(inner.as_ref().clone()));
+            }
+            Ok(Transformed::no(expr))
+        })
+        .map_or_else(|_| filter.clone(), |transformed| transformed.data)
 }
 
 /// Whether the memtable can evaluate this tree. See the module note on `NOT`.
@@ -199,6 +225,51 @@ mod tests {
     use lance_index::scalar::SargableQuery;
 
     use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
+
+    /// A list column whose nested field carries a field id is cast to a list
+    /// literal's type when compared with one. The cast changes no value, so a
+    /// label-list parser must still claim the comparison.
+    #[test]
+    fn an_index_sees_through_a_cast_that_only_relabels_nested_fields() {
+        use lance_index::scalar::expression::LabelListQueryParser;
+        use std::collections::HashMap as Map;
+
+        let item = Field::new("item", arrow_schema::DataType::Utf8, true)
+            .with_metadata(Map::from([("lance:field_id".to_string(), "3".to_string())]));
+        let tags = arrow_schema::DataType::List(Arc::new(item));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "tags",
+            tags.clone(),
+            true,
+        )]));
+        let planner = Planner::new(schema);
+        let filter = planner
+            .optimize_expr(
+                planner
+                    .parse_filter("array_has_any(tags, make_array('t7'))")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            filter.to_string().contains("CAST(tags"),
+            "the comparison must cast the column for this test to mean anything: {filter}"
+        );
+
+        let catalog = MemIndexCatalog {
+            columns: HashMap::from([(
+                "tags".to_string(),
+                (
+                    tags,
+                    MultiQueryParser::single(Box::new(LabelListQueryParser::new(
+                        "tags_idx".to_string(),
+                        "LabelList".to_string(),
+                    ))),
+                ),
+            )]),
+        };
+        let split = plan_filter(&filter, &catalog).unwrap();
+        assert!(split.is_some(), "the label list must claim {filter}");
+    }
 
     fn schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
