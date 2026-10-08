@@ -444,6 +444,14 @@ class VenvExecutor:
 
         # Ensure subprocess is running
         self._ensure_subprocess()
+        # Marks the pickled snapshot sent below as executing inside the old
+        # venv, so a test's _running_in_old_venv read there is reliable
+        # regardless of what lance.__version__ happens to report (see the
+        # flag's docstring on UpgradeDowngradeTest). Reset right after on our
+        # own `obj` reference so a later bare call on the same object (the
+        # current build's own check_read/check_write in the upgrade/downgrade
+        # round trip) does not inherit it.
+        obj._running_in_old_venv = True
         try:
             # Send request: (obj, method_name, env_overrides)
             self._send_message((obj, method_name, env_overrides or {}))
@@ -477,6 +485,9 @@ class VenvExecutor:
             panic = self._last_panic()
             detail = panic or f"subprocess communication failed: {e}"
             raise RuntimeError(f"Lance {self.version} (exit={returncode}): {detail}")
+
+        finally:
+            obj._running_in_old_venv = False
 
     def cleanup(self):
         """Remove the virtual environment directory and terminate subprocess."""
