@@ -301,6 +301,10 @@ message DeletionFile {
  * Valid only in a fragment whose data files are Lance v2 files. A legacy v1
  * data file has no `column_indices` to locate the column by, so a writer on a
  * dataset that stores v1 files leaves every sequence inline.
+ *
+ * This is a stable table-format feature. A manifest containing any column
+ * marker must set the spilled row lineage feature flag (bit 11) in both the
+ * reader and writer feature words.
  */
 message RowLineageColumn {}
 
