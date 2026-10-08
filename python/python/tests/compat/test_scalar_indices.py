@@ -259,6 +259,91 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         assert table.num_rows >= 1
 
 
+@compat_test(min_version="0.30.0")
+class BTreeRowIdDomainIndex(UpgradeDowngradeTest):
+    """Test that a BTREE index on a dataset *without* stable row ids stays
+    usable -- not just readable -- by an older build, no matter which build
+    wrote it.
+
+    BTREE moved to storing physical row addresses (``_rowaddr``) instead of
+    row ids, bumping its on-disk format version to 1 (see
+    BTreeRowAddressDomainIndex above). But a row id and a row address are the
+    same value on a dataset that does not enable stable row ids, so the
+    current build keeps writing the old format (index_version 0) there --
+    on creation, and again on every rebuild during optimize -- specifically
+    so a user who never turns on stable row ids sees no
+    forward-compatibility impact from that migration.
+
+    Unlike BTreeIndex above, this asserts the index is genuinely *used*
+    (not answered via a full-scan fallback) in every direction: right after
+    the current build creates it, and after the current build has rebuilt
+    it with optimize_indices() -- the scenario that would have forced a
+    fallback if the rebuild had silently bumped the format version.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create a dataset without stable row ids and a BTREE index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "btree": pa.array(range(1000)),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
+        dataset.create_scalar_index("btree", "BTREE")
+
+    def _assert_queryable_and_indexed(self):
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="btree == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        explain = ds.scanner(filter="btree == 7").explain_plan()
+        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain, (
+            "a BTREE index on a dataset without stable row ids must stay "
+            "usable by every build, not fall back to a full scan"
+        )
+
+    def check_read(self):
+        """The index must be used, whichever build wrote it."""
+        self._assert_queryable_and_indexed()
+
+    def check_write(self):
+        """Insert a row and rebuild the index, then verify it is still
+        queryable -- and still actually used, including by an older build
+        reading what the current build just rebuilt."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "btree": pa.array([1000]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="btree == 7")
+        assert table.num_rows == 1
+        # `check_write` runs more than once across the upgrade/downgrade
+        # round trip, each time inserting another `btree == 1000` row, so
+        # this can't assert an exact count the way the `== 7` row (written
+        # once, in `create`) can.
+        table = ds.to_table(filter="btree == 1000")
+        assert table.num_rows >= 1
+        self._assert_queryable_and_indexed()
+
+
 @compat_test(min_version="0.22.0")
 class BitmapLabelListIndex(UpgradeDowngradeTest):
     """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0).
