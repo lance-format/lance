@@ -8835,7 +8835,10 @@ mod test {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_index::{
+        IndexType,
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+    };
     use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
 
@@ -14752,6 +14755,105 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[rstest]
+    #[case::range(
+        "NOT (colour = 'c41') OR (seq >= 0 AND seq < 2)",
+        vec![0, 1, 2, 4, 5, 7]
+    )]
+    #[case::equality("NOT (colour = 'c41') OR seq = 0", vec![0, 2, 4, 5, 7])]
+    #[case::inequality("colour <> 'c41' OR seq = 0", vec![0, 2, 4, 5, 7])]
+    #[case::not("NOT (colour = 'c41')", vec![2, 5, 7])]
+    #[tokio::test]
+    async fn test_not_or_zone_map(
+        #[case] filter: &str,
+        #[case] expected_ids: Vec<i32>,
+        #[values(None, Some(8))] limit: Option<i64>,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            (
+                "colour",
+                Utf8,
+                [
+                    None,
+                    Some("c41"),
+                    Some("c42"),
+                    None,
+                    Some("c41"),
+                    Some("c42"),
+                    None,
+                    Some("c42")
+                ]
+            ),
+            (
+                "seq",
+                Int32,
+                [
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(0),
+                    Some(1),
+                    None,
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        for (column, index_type, builtin) in [
+            ("colour", IndexType::Bitmap, BuiltinIndexType::Bitmap),
+            ("seq", IndexType::ZoneMap, BuiltinIndexType::ZoneMap),
+        ] {
+            dataset
+                .create_index(
+                    &[column],
+                    index_type,
+                    None,
+                    &ScalarIndexParams::for_builtin(builtin),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut full_scan = dataset.scan();
+        full_scan.use_scalar_index(false).filter(filter).unwrap();
+        full_scan.limit(limit, None).unwrap();
+        let full_batch = full_scan.try_into_batch().await.unwrap();
+        let full_ids = full_batch["id"].as_primitive::<Int32Type>().values();
+        assert_eq!(full_ids.as_ref(), expected_ids.as_slice());
+
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(filter).unwrap();
+        // Eight rows exceed the guaranteed matches, so the limit must fall back to
+        // checking candidates instead of reading only the lower bound.
+        indexed_scan.limit(limit, None).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        if filter.contains("seq") {
+            assert!(plan.contains("ZoneMap"), "{plan}");
+        }
+        let indexed_batch = indexed_scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            indexed_batch["id"].as_primitive::<Int32Type>().values(),
+            full_ids
+        );
     }
 
     #[tokio::test]

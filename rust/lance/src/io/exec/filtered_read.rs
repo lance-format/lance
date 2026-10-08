@@ -1091,7 +1091,9 @@ impl FilteredReadStream {
                         &index_result.lower,
                         None,
                     );
-                    fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
+                    // Candidates outside the lower bound still need a recheck if
+                    // the guaranteed matches cannot satisfy the requested limit.
+                    fragments_to_read.insert(fragment_id, to_read);
 
                     Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
                     scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
@@ -4228,6 +4230,47 @@ mod tests {
         assert_eq!(
             batch["value"].as_primitive::<UInt32Type>().values(),
             &[3, 13]
+        );
+    }
+
+    #[rstest]
+    #[case::no_limit(None, vec![3, 13, 23, 33])]
+    #[case::limit_fallback(Some(0..10), vec![3, 13, 23, 33])]
+    #[case::offset_fallback(Some(1..10), vec![13, 23, 33])]
+    #[case::limit_pushdown(Some(0..1), vec![3])]
+    #[tokio::test]
+    async fn test_at_least_index_preserves_candidates(
+        #[case] scan_range: Option<Range<u64>>,
+        #[case] expected_values: Vec<u32>,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        // Only row 3 is guaranteed by the index; matches in the other fragments
+        // require a recheck unless that one row satisfies the requested limit.
+        let index_input = index_result_input(
+            IndexExprResult::at_least(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([3]))),
+            dataset.fragments(),
+        );
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value % 10 = 3").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let mut options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap();
+        if let Some(scan_range) = scan_range {
+            options = options.with_scan_range_after_filter(scan_range).unwrap();
+        }
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(
+            batch["value"]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .as_ref(),
+            expected_values.as_slice()
         );
     }
 
