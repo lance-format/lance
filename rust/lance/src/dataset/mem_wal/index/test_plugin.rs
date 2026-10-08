@@ -11,6 +11,7 @@ use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 
 use super::fts::FtsQueryExpr;
@@ -103,6 +104,13 @@ impl MemIndexPlugin for Wrapped {
             Some(params) => Ok(params.clone()),
             None => self.inner.flush_params(spec),
         }
+    }
+    fn query_parser(
+        &self,
+        index_name: String,
+        index_details: Option<&prost_types::Any>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        self.inner.query_parser(index_name, index_details)
     }
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         self.inner.resolve(ctx).await

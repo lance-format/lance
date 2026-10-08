@@ -30,6 +30,17 @@ impl<T: AnyQuery> MemQuery for T {
     }
 }
 
+/// A Lance scalar query behind a trait object, as the expression pass hands it
+/// out.
+#[derive(Debug)]
+pub struct ScalarQuery<'a>(pub &'a dyn AnyQuery);
+
+impl MemQuery for ScalarQuery<'_> {
+    fn as_any(&self) -> &dyn Any {
+        self.0.as_any()
+    }
+}
+
 /// A set of positions in one memtable.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PositionSet(RoaringTreemap);
@@ -266,12 +277,24 @@ pub struct SearchContext {
     /// The highest position a reader may see. An index may hold rows past it
     /// and must not return them.
     pub max_visible: RowPosition,
+    /// How many matching rows are worth listing. An index that would list more
+    /// may decline with `Ok(None)`, and the caller reads every row.
+    pub match_budget: Option<u64>,
 }
 
 impl SearchContext {
-    /// A search over everything visible up to `max_visible`.
+    /// A search over everything visible up to `max_visible`, with no budget.
     pub fn new(max_visible: RowPosition) -> Self {
-        Self { max_visible }
+        Self {
+            max_visible,
+            match_budget: None,
+        }
+    }
+
+    /// The same search, declinable once it matches more than `budget` rows.
+    pub fn with_match_budget(mut self, budget: u64) -> Self {
+        self.match_budget = Some(budget);
+        self
     }
 }
 

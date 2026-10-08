@@ -1117,6 +1117,7 @@ async fn build_index_specs(
             columns: resolved.columns,
             plugin,
             params: resolved.params,
+            details: index_meta.index_details.clone(),
         };
 
         // Nobody named this one, so a table must not become unwritable for

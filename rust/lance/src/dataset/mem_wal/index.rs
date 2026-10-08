@@ -6,6 +6,7 @@
 
 pub mod arena_skiplist;
 mod btree;
+mod filter;
 mod fts;
 mod hnsw;
 mod pk;
@@ -35,6 +36,7 @@ use super::wal::WriterCursors;
 use pk::{OwnedPk, PkIndex};
 
 pub use btree::{BTreeMemIndex, BTreeMemIndexPlugin};
+pub use filter::{IndexedFilter, MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter};
 pub use fts::{FtsEntry, FtsMemIndex, FtsMemIndexPlugin, FtsParams, FtsQueryExpr, SearchOptions};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats, search_cross_column};
 pub use hnsw::{HnswMemIndex, HnswMemIndexPlugin, HnswParams};
@@ -44,8 +46,8 @@ pub use plugin::{
     MemIndexPlugin, MemIndexRegistry, MemIndexSpec, PrimaryKeyIndex, ResolveContext, ResolvedIndex,
 };
 pub use query::{
-    FtsMemQuery, MemMatches, MemQuery, MemSearchResult, PositionSet, RankedMatch, SearchContext,
-    VectorMemQuery,
+    FtsMemQuery, MemMatches, MemQuery, MemSearchResult, PositionSet, RankedMatch, ScalarQuery,
+    SearchContext, VectorMemQuery,
 };
 
 /// Row position in a memtable: the row's position across all its batches,
@@ -164,6 +166,8 @@ pub enum MemTableVisibility {
 pub struct IndexStore {
     /// Sorted by name, so the same query always reaches the same index.
     indexes: BTreeMap<String, Arc<dyn MemIndex>>,
+    /// How a filter expression reaches these indexes.
+    filter_catalog: Arc<MemIndexCatalog>,
     pk_index: Option<PkIndex>,
     /// Batches every index holds, as an exclusive count. Not a visibility
     /// bound: readers use [`Self::visible_count`].
@@ -253,6 +257,7 @@ impl IndexStore {
                 spec.build(schema, max_rows, max_batches)?,
             );
         }
+        store.filter_catalog = Arc::new(MemIndexCatalog::new(specs, schema));
         Ok(store)
     }
 
@@ -417,24 +422,34 @@ impl IndexStore {
         self.indexed_count.fetch_max(count, Ordering::AcqRel);
     }
 
+    /// How a filter expression reaches these indexes.
+    pub fn filter_catalog(&self) -> &MemIndexCatalog {
+        &self.filter_catalog
+    }
+
     /// The index named `name`.
     pub fn get_index(&self, name: &str) -> Option<&Arc<dyn MemIndex>> {
         self.indexes.get(name)
     }
 
-    /// The first index, by name, covering `column` that can answer `query`;
-    /// the memtable's own key index last.
-    pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
-        let owned_pk = match &self.pk_index {
+    /// The B-tree the memtable keeps over a single key column, when no user
+    /// index serves as the key index.
+    pub(crate) fn own_key_index(&self) -> Option<Arc<dyn MemIndex>> {
+        match &self.pk_index {
             Some(PkIndex::Owned(OwnedPk::Single(index))) => {
                 Some(index.clone() as Arc<dyn MemIndex>)
             }
             _ => None,
-        };
+        }
+    }
+
+    /// The first index, by name, covering `column` that can answer `query`;
+    /// the memtable's own key index last.
+    pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
         self.indexes
             .values()
             .cloned()
-            .chain(owned_pk)
+            .chain(self.own_key_index())
             .find(|index| {
                 index.columns().iter().any(|covered| covered == column) && index.can_answer(query)
             })

@@ -341,6 +341,7 @@ mod evolve {
             columns: resolved.columns,
             plugin: Arc::new(FtsMemIndexPlugin),
             params: resolved.params,
+            details: meta.index_details,
         }]
     }
 

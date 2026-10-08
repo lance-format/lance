@@ -22,6 +22,7 @@ use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
@@ -456,6 +457,18 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug + Any {
         Ok(ScalarIndexParams::default())
     }
 
+    /// The parser the on-disk index of this kind uses, so a filter expression
+    /// it claims reaches this index as the same query. `index_details` are the
+    /// base-table index's, absent for a memtable configured directly. `None`
+    /// for a kind no filter expression names.
+    fn query_parser(
+        &self,
+        _index_name: String,
+        _index_details: Option<&prost_types::Any>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        None
+    }
+
     /// Resolve this index against the base table: the columns it covers and
     /// what it needs to build one. Runs each time a writer opens or refreshes
     /// its index set; do any I/O here so [`create`](Self::create) need not.
@@ -567,6 +580,9 @@ pub struct MemIndexSpec {
     pub plugin: Arc<dyn MemIndexPlugin>,
     /// What [`MemIndexPlugin::resolve`] returned.
     pub params: Arc<dyn MemIndexParams>,
+    /// The base-table index's details message, which the query parser is built
+    /// from.
+    pub details: Option<Arc<prost_types::Any>>,
 }
 
 impl MemIndexSpec {
@@ -594,11 +610,12 @@ impl MemIndexSpec {
             columns: vec![column.into()],
             plugin,
             params,
+            details: None,
         }
     }
 
     /// Whether `other` describes the same index: name, columns, field ids,
-    /// plugin type, plugin version and settings.
+    /// plugin type, plugin version, settings and base-table details.
     pub fn same_index(&self, other: &Self) -> bool {
         self.name == other.name
             && self.columns == other.columns
@@ -608,6 +625,7 @@ impl MemIndexSpec {
             && self.plugin.details_message() == other.plugin.details_message()
             && self.plugin.version() == other.plugin.version()
             && self.params.same_as(other.params.as_ref())
+            && self.details == other.details
     }
 
     /// `params` as `P`, the type its plugin's own
