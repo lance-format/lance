@@ -21,6 +21,7 @@ on:
       - clippy.toml
       - deny.toml
       - ci/check_dependency_age.py
+      - ci/arrow_upgrade.py
 
 permissions:
   contents: read
@@ -116,6 +117,123 @@ jobs:
       # fetched. The script falls back to the network when that misses.
       - name: Check dependency age
         run: python3 ci/check_dependency_age.py
+
+  arrow-ordering-detect:
+    # Lance inherits its comparison semantics from Arrow, DataFusion and `half`.
+    # The ordering fixtures are excluded from the default test run (`test =
+    # false` in rust/lance-compat/Cargo.toml) and run only from the
+    # `arrow-ordering-compat` job below, which this small job gates: it fires
+    # when a PR changes one of those versions in Cargo.lock, or touches the
+    # fixtures, these jobs, the detector, or the Lance crates the fixtures
+    # exercise, so edits to the check itself are verified too.
+    name: Detect Arrow ordering-relevant changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+      base_sha: ${{ steps.detect.outputs.base_sha }}
+    env:
+      FIXTURE: rust/lance-compat/tests/arrow_ordering.rs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Detect dependency or fixture changes
+        id: detect
+        run: |
+          # The checkout is the PR's merge commit, whose first parent is the base
+          # branch as merged. The event payload's base SHA goes stale on a re-run
+          # after the base branch moved, so the parent is the reference used.
+          base_sha=$(git rev-parse HEAD^1 2>/dev/null || echo "${{ github.event.pull_request.base.sha }}")
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --depth=1 origin "$base_sha"
+          git show "$base_sha:Cargo.lock" > "$RUNNER_TEMP/base.Cargo.lock"
+          python3 ci/arrow_upgrade.py "$RUNNER_TEMP/base.Cargo.lock" Cargo.lock
+          # Changes to the check itself, or to the Lance crates it exercises,
+          # also run the fixtures so the check is never merged untested.
+          self_changed=$(git diff --name-only "$base_sha" HEAD -- \
+            rust/lance-compat ci/arrow_upgrade.py .github/workflows/rust.yml \
+            rust/arrow-scalar rust/arrow-stats)
+          if [ -n "$self_changed" ]; then
+            echo "fixtures or the paths they exercise changed:"
+            echo "$self_changed"
+          fi
+          if [ -n "$self_changed" ] || grep -q '^changed=true$' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  arrow-ordering-compat:
+    # The fixtures *from the base branch* run first, so an upgrade cannot pass
+    # by refreshing the expectations in the same PR; a reviewed change is
+    # admitted with the `arrow-ordering-reviewed` label, read live so a re-run
+    # after labelling sees it. The PR's own copy runs after.
+    name: Arrow ordering compatibility
+    needs: arrow-ordering-detect
+    if: needs.arrow-ordering-detect.outputs.run == 'true'
+    runs-on: "ubuntu-24.04-8x"
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      CC: clang
+      CXX: clang++
+      # No `-D warnings` here: this job builds with default features, under
+      # which feature-gated code warns as dead, and a dependency bump may
+      # deprecate an API the base fixtures use. The clippy job enforces
+      # warnings; this job's only question is whether the ordering changed.
+      BASE_SHA: ${{ needs.arrow-ordering-detect.outputs.base_sha }}
+      FIXTURE: rust/lance-compat/tests/arrow_ordering.rs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Run base-branch fixtures against the upgraded dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # The base branch's expectations are the contract under test.
+          if ! git cat-file -e "$BASE_SHA:$FIXTURE" 2>/dev/null; then
+            echo "::notice::No ordering fixtures on the base branch; only the PR's copy is checked."
+            exit 0
+          fi
+          git show "$BASE_SHA:$FIXTURE" > "$FIXTURE"
+          # Labels are read live rather than from the event payload so that a
+          # re-run after labelling admits the change.
+          reviewed=false
+          if gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | grep -qx 'arrow-ordering-reviewed'; then
+            reviewed=true
+          fi
+          # A compile failure means the upgrade renamed an API the fixtures use;
+          # that is a port, not an ordering finding, and is reported as such.
+          if ! cargo test --profile ci --locked -p lance-compat --test arrow_ordering --no-run; then
+            if [ "$reviewed" = "true" ]; then
+              echo "::warning::Base-branch fixtures do not compile against the upgraded dependencies; admitted by the arrow-ordering-reviewed label. Only the PR's copy is checked."
+              exit 0
+            fi
+            echo "::error::Base-branch fixtures do not compile against the upgraded dependencies, so the ordering contract could not be checked. Port the fixture file without changing expectations, review the release notes in the job summary, then apply the arrow-ordering-reviewed label."
+            exit 1
+          fi
+          if cargo test --profile ci --locked -p lance-compat --test arrow_ordering; then
+            exit 0
+          fi
+          if [ "$reviewed" = "true" ]; then
+            echo "::warning::Arrow ordering changed; admitted by the arrow-ordering-reviewed label."
+            exit 0
+          fi
+          echo "::error::Arrow ordering changed against the base-branch fixtures. Review the release notes in the job summary, record the affected Lance paths and any persisted-structure handling in the PR, then apply the arrow-ordering-reviewed label."
+          exit 1
+      - name: Run the PR's fixtures against the upgraded dependencies
+        run: |
+          git checkout -- "$FIXTURE"
+          cargo test --profile ci --locked -p lance-compat --test arrow_ordering
 
   linux-build:
     runs-on: "ubuntu-24.04-8x"

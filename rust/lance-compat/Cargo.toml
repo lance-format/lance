@@ -33,8 +33,10 @@ rstest = { workspace = true }
 tokio = { workspace = true }
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
-# Not part of the default test run; the clippy job lints it explicitly. Run
-# with `cargo test -p lance-compat --test arrow_ordering`.
+# Not part of the default test run: CI runs it from the `arrow-ordering-compat`
+# job when Cargo.lock changes an ordering-relevant crate or the fixtures
+# themselves change, and the clippy job lints it explicitly. Run by hand with
+# `cargo test -p lance-compat --test arrow_ordering`.
 [[test]]
 name = "arrow_ordering"
 test = false
