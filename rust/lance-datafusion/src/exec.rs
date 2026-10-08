@@ -22,7 +22,7 @@ use datafusion::{
         TaskContext,
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerBuilder,
-        memory_pool::FairSpillPool,
+        memory_pool::{FairSpillPool, MemoryLimit, MemoryPool},
         runtime_env::RuntimeEnvBuilder,
     },
     physical_plan::{
@@ -287,6 +287,13 @@ pub struct LanceExecutionOptions {
     pub target_partition: Option<usize>,
     pub execution_stats_callback: Option<ExecutionStatsCallback>,
     pub skip_logging: bool,
+    /// When set, executions use this pool instead of building one from
+    /// [`Self::mem_pool_size`], whether or not spilling is enabled.
+    ///
+    /// The caller owns the pool's sizing and how it is shared. For example, a
+    /// server can bound all of its concurrent queries by handing each one a
+    /// pool that draws from a single node-wide budget.
+    pub memory_pool: Option<Arc<dyn MemoryPool>>,
 }
 
 impl std::fmt::Debug for LanceExecutionOptions {
@@ -302,6 +309,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
                 "execution_stats_callback",
                 &self.execution_stats_callback.is_some(),
             )
+            .field("memory_pool", &self.memory_pool)
             .finish()
     }
 }
@@ -376,23 +384,37 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     if let Some(target_partition) = options.target_partition {
         session_config = session_config.with_target_partitions(target_partition);
     }
+    if let Some(memory_pool) = &options.memory_pool {
+        runtime_env_builder = runtime_env_builder.with_memory_pool(memory_pool.clone());
+    }
     if options.use_spilling() {
+        let pool_limit = match &options.memory_pool {
+            Some(memory_pool) => match memory_pool.memory_limit() {
+                MemoryLimit::Finite(limit) => Some(limit as u64),
+                MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+            },
+            None => Some(options.mem_pool_size()),
+        };
         // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
         // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
         // to leave room for input batches in small pools. This reservation comes
         // out of the same pool; it does not guarantee that every batch will fit.
-        let sort_spill_reservation_bytes =
-            (options.mem_pool_size() / 3).min(MAX_SORT_SPILL_RESERVATION_BYTES) as usize;
+        let sort_spill_reservation_bytes = pool_limit
+            .map_or(MAX_SORT_SPILL_RESERVATION_BYTES, |limit| {
+                (limit / 3).min(MAX_SORT_SPILL_RESERVATION_BYTES)
+            }) as usize;
         session_config =
             session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
-        runtime_env_builder = runtime_env_builder
-            .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(TrackConsumersPool::new(
-                FairSpillPool::new(options.mem_pool_size() as usize),
-                NonZero::try_from(16).unwrap(),
-            )));
+        runtime_env_builder = runtime_env_builder.with_disk_manager_builder(disk_manager_builder);
+        if options.memory_pool.is_none() {
+            runtime_env_builder =
+                runtime_env_builder.with_memory_pool(Arc::new(TrackConsumersPool::new(
+                    FairSpillPool::new(options.mem_pool_size() as usize),
+                    NonZero::try_from(16).unwrap(),
+                )));
+        }
     }
     // Without spilling, DataFusion's default UnboundedMemoryPool accepts all
     // reservations. This bypasses the configured pool limit, not actual RAM limits.
@@ -446,8 +468,11 @@ fn get_max_cache_size() -> usize {
 
 /// Reuses unbounded sessions, while giving each spilling caller a fresh bounded
 /// memory pool so concurrent sorts cannot consume each other's headroom.
+///
+/// Sessions for a caller-supplied [`LanceExecutionOptions::memory_pool`] are
+/// not cached, so every execution runs in the pool it was given.
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.use_spilling() {
+    if options.use_spilling() || options.memory_pool.is_some() {
         return new_session_context(options);
     }
 
@@ -1269,11 +1294,12 @@ impl ExecutionPlan for HardCapBatchSizeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, UnboundedMemoryPool,
+    };
 
     use arrow_array::{Int32Array, cast::AsArray, record_batch, types::Int32Type};
     use arrow_select::concat::concat_batches;
-    use datafusion::execution::memory_pool::MemoryLimit;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
     use futures::TryStreamExt;
@@ -1340,6 +1366,60 @@ mod tests {
         }
 
         assert_eq!(reservations.len(), 3);
+    }
+
+    #[rstest]
+    #[case::without_spilling(false)]
+    #[case::with_spilling(true)]
+    fn test_session_context_uses_supplied_memory_pool(#[case] use_spilling: bool) {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let options = LanceExecutionOptions {
+            use_spilling,
+            // Ignored in favor of the supplied pool.
+            mem_pool_size: Some(1024),
+            memory_pool: Some(memory_pool.clone()),
+            ..Default::default()
+        };
+        let cached_sessions = get_session_cache().lock().unwrap().len();
+
+        for _ in 0..2 {
+            let session_ctx = get_session_context(&options);
+            assert!(Arc::ptr_eq(
+                &session_ctx.runtime_env().memory_pool,
+                &memory_pool
+            ));
+        }
+        assert_eq!(get_session_cache().lock().unwrap().len(), cached_sessions);
+    }
+
+    #[rstest]
+    #[case::small_pool(Some(30 * 1024 * 1024), 10 * 1024 * 1024)]
+    #[case::large_pool(Some(1024 * 1024 * 1024), MAX_SORT_SPILL_RESERVATION_BYTES)]
+    #[case::unbounded_pool(None, MAX_SORT_SPILL_RESERVATION_BYTES)]
+    fn test_sort_spill_reservation_follows_supplied_pool(
+        #[case] pool_limit: Option<usize>,
+        #[case] expected_reservation: u64,
+    ) {
+        let memory_pool: Arc<dyn MemoryPool> = match pool_limit {
+            Some(limit) => Arc::new(GreedyMemoryPool::new(limit)),
+            None => Arc::new(UnboundedMemoryPool::default()),
+        };
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(1024),
+            memory_pool: Some(memory_pool),
+            ..Default::default()
+        };
+        let session_ctx = new_session_context(&options);
+        assert_eq!(
+            session_ctx
+                .copied_config()
+                .options()
+                .execution
+                .sort_spill_reservation_bytes,
+            expected_reservation as usize
+        );
     }
 
     #[test]

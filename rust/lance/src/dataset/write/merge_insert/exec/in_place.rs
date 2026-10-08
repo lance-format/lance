@@ -454,6 +454,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 current_version,
                 target_bases_info,
                 params.write_version(&dataset),
+                params.memory_pool(),
             )
             .await?;
 

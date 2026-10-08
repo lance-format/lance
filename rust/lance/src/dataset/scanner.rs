@@ -19,6 +19,7 @@ use async_recursion::async_recursion;
 use chrono::Utc;
 use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
@@ -1224,6 +1225,9 @@ pub struct Scanner {
     /// If set, this callback will be called after the scan with summary statistics
     scan_stats_callback: Option<ExecutionStatsCallback>,
 
+    /// If set, the scan executes in this DataFusion memory pool
+    memory_pool: Option<Arc<dyn MemoryPool>>,
+
     /// Whether the result returned by the scanner must be of the size of the batch_size.
     /// By default, it is false.
     /// Mainly, if the result is returned strictly according to the batch_size,
@@ -1683,6 +1687,7 @@ impl Scanner {
             use_scalar_index: true,
             include_deleted_rows: false,
             scan_stats_callback: None,
+            memory_pool: None,
             strict_batch_size: false,
             file_reader_options,
             aggregate: None,
@@ -1925,6 +1930,33 @@ impl Scanner {
     /// Set the callback to be called after the scan with summary statistics
     pub fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
         self.scan_stats_callback = Some(callback);
+        self
+    }
+
+    /// Execute the scan in the given DataFusion memory pool.
+    ///
+    /// By default each scan gets its own unbounded pool. Supply a pool to bound
+    /// the memory the scan's operators (for example sorts and aggregates)
+    /// reserve, or to share one budget across many concurrent scans. See
+    /// [`LanceExecutionOptions::memory_pool`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use datafusion::execution::memory_pool::GreedyMemoryPool;
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let memory_pool = Arc::new(GreedyMemoryPool::new(512 * 1024 * 1024));
+    /// let batch = dataset
+    ///     .scan()
+    ///     .memory_pool(memory_pool)
+    ///     .try_into_batch()
+    ///     .await?;
+    /// # let _ = batch;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_pool(&mut self, memory_pool: Arc<dyn MemoryPool>) -> &mut Self {
+        self.memory_pool = Some(memory_pool);
         self
     }
 
@@ -2893,11 +2925,7 @@ impl Scanner {
 
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
-                LanceExecutionOptions {
-                    batch_size: self.batch_size,
-                    execution_stats_callback: self.scan_stats_callback.clone(),
-                    ..Default::default()
-                },
+                self.execution_options(),
             )?))
         }
         .boxed()
@@ -2913,6 +2941,9 @@ impl Scanner {
         if options.execution_stats_callback.is_none() {
             options.execution_stats_callback = self.scan_stats_callback.clone();
         }
+        if options.memory_pool.is_none() {
+            options.memory_pool = self.memory_pool.clone();
+        }
 
         execute_plan(plan, options)
     }
@@ -2921,6 +2952,7 @@ impl Scanner {
         LanceExecutionOptions {
             batch_size: self.batch_size,
             execution_stats_callback: self.scan_stats_callback.clone(),
+            memory_pool: self.memory_pool.clone(),
             ..Default::default()
         }
     }
@@ -2944,7 +2976,13 @@ impl Scanner {
             scanner.aggregate(AggregateExpr::builder().count_star().build())?;
 
             let plan = scanner.create_plan().await?;
-            let mut stream = execute_plan(plan, LanceExecutionOptions::default())?;
+            let mut stream = execute_plan(
+                plan,
+                LanceExecutionOptions {
+                    memory_pool: self.memory_pool.clone(),
+                    ..Default::default()
+                },
+            )?;
 
             // A count plan will always return a single batch with a single row.
             if let Some(first_batch) = stream.next().await {
@@ -8343,6 +8381,7 @@ impl Scanner {
             plan,
             LanceExecutionOptions {
                 batch_size: self.batch_size,
+                memory_pool: self.memory_pool.clone(),
                 ..Default::default()
             },
         )
@@ -8376,6 +8415,7 @@ impl Scanner {
             plan,
             LanceExecutionOptions {
                 batch_size: self.batch_size,
+                memory_pool: self.memory_pool.clone(),
                 ..Default::default()
             },
         )
@@ -13350,6 +13390,41 @@ mod test {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scan_uses_supplied_memory_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let dataset = gen_batch()
+            .col("int", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        let sorted_scan = |memory_pool: Arc<dyn MemoryPool>| {
+            let mut scan = dataset.scan();
+            scan.order_by(Some(vec![ColumnOrdering::desc_nulls_first(
+                "int".to_string(),
+            )]))
+            .unwrap()
+            .memory_pool(memory_pool);
+            scan
+        };
+
+        let batch = sorted_scan(Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)))
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["int"].as_primitive::<Int32Type>(),
+            &Int32Array::from_iter_values((0..300).rev())
+        );
+
+        let err = sorted_scan(Arc::new(GreedyMemoryPool::new(1)))
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Resources exhausted"), "{err}");
     }
 
     #[rstest]
