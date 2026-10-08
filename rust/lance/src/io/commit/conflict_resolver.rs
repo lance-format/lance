@@ -59,7 +59,7 @@ pub struct TransactionRebase<'a> {
     /// The latest manifest's live fragments, loaded with `current_lineage`.
     current_live: Option<RoaringBitmap>,
     /// Deferred compactions, for a CreateIndex on an untagged table.
-    untagged_reuse: Option<UntaggedReuse>,
+    untagged_reuse: Option<Box<UntaggedReuse>>,
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
@@ -596,11 +596,11 @@ impl<'a> TransactionRebase<'a> {
                     .map(|group| sorted_ids(group.old_frags.iter().map(|f| f.id))),
             );
         }
-        self.untagged_reuse = Some(UntaggedReuse {
+        self.untagged_reuse = Some(Box::new(UntaggedReuse {
             deferred_groups,
             carried: HashMap::new(),
             schema: dataset.schema().clone(),
-        });
+        }));
         Ok(())
     }
 
