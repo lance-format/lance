@@ -1074,6 +1074,11 @@ pub(crate) struct IvfOpenContext {
     /// it opens (`Session::index_origin_latency`), `None` when it declares
     /// none; see [`IVFIndex::origin_latency_at_open`].
     pub(crate) origin_latency_hint: Option<OriginLatencyClass>,
+    /// Whether the session keeps the small columns of the IVF_RQ indexes it
+    /// opens resident (`Session::index_resident_columns`), `auto` unless it
+    /// sets one; `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides
+    /// it. See [`IVFIndex::resident_columns_at_open`].
+    pub(crate) resident_columns: ResidentColumnsSetting,
     /// The index's namespace of the index cache without a fragment reuse
     /// segment, where an IVF_RQ index with resident small columns charges
     /// and leases their store (see [`ResidentColumns::in_index_cache`]), so
@@ -1701,8 +1706,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
         let storage =
             IvfQuantizationStorage::try_new_with_remapper(storage_reader, frag_reuse_index).await?;
-        let resident_columns =
-            Self::resident_columns_at_open(&storage, context.file_cache.as_ref())?;
+        let resident_columns = Self::resident_columns_at_open(
+            &storage,
+            context.file_cache.as_ref(),
+            context.resident_columns,
+        )?;
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
@@ -1891,10 +1899,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// Whether an index keeps the small columns of `storage`'s file
     /// resident in `file_cache`, whatever its origin latency class: when the
     /// setting admits the store (see [`ResidentColumnsSetting::admits`]).
-    /// `off` keeps none and sizes nothing. `auto` keeps one only in a cache
-    /// with a pin budget, where the bytes the cache would charge for the
-    /// store fit its pinned cap; without a cache, only `on` keeps one, shared
-    /// and uncharged. A store that does not fit counts
+    /// The setting is `LANCE_RQ_RESIDENT_COLUMNS` when it is `on` or `off`,
+    /// and otherwise `session`, the opening session's
+    /// ([`ResidentColumnsSetting::resolve_with_session`]). `off` keeps none
+    /// and sizes nothing. `auto` keeps one only in a cache with a pin
+    /// budget, where the bytes the cache would charge for the store fit its
+    /// pinned cap; without a cache, only `on` keeps one, shared and
+    /// uncharged. A store that does not fit counts
     /// `resident_columns_oversize`, and one that fits a cache without a pin
     /// budget counts `resident_columns_unpinnable` under `auto`. Only IVF_RQ
     /// indexes read (and validate) `LANCE_RQ_RESIDENT_COLUMNS` and
@@ -1903,12 +1914,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     fn resident_columns_at_open(
         storage: &IvfQuantizationStorage<Q>,
         file_cache: Option<&LanceCache>,
+        session: ResidentColumnsSetting,
     ) -> Result<bool> {
         if Q::quantization_type() != QuantizationType::Rabit {
             return Ok(false);
         }
         resident_lifetime_setting()?;
-        let setting = resident_columns_setting()?;
+        let setting =
+            ResidentColumnsSetting::resolve_with_session(resident_columns_setting()?, session);
         if setting == ResidentColumnsSetting::Off {
             return Ok(false);
         }
@@ -3908,8 +3921,11 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     // Bind the store as an open does: the state holds none, so a state read
     // back from a persistent tier binds to the one the index cache holds or
     // the file's live indexes share, and any state pins nothing.
-    let resident =
-        IVFIndex::<S, Q>::resident_columns_at_open(&storage, context.file_cache.as_ref())?;
+    let resident = IVFIndex::<S, Q>::resident_columns_at_open(
+        &storage,
+        context.file_cache.as_ref(),
+        context.resident_columns,
+    )?;
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
@@ -11739,21 +11755,30 @@ mod tests {
 
         impl ResidentTestIndex {
             async fn open(uri: &str, backend: Arc<dyn CacheBackend>) -> Self {
-                Self::open_with_hint(uri, backend, Some(OriginLatencyClass::High)).await
+                Self::open_with(
+                    uri,
+                    backend,
+                    Some(OriginLatencyClass::High),
+                    ResidentColumnsSetting::Auto,
+                )
+                .await
             }
 
-            /// [`Self::open`] by a session that declares `hint` instead.
-            async fn open_with_hint(
+            /// [`Self::open`] by a session that declares `hint` and sets
+            /// `resident_columns` instead.
+            async fn open_with(
                 uri: &str,
                 backend: Arc<dyn CacheBackend>,
                 hint: Option<OriginLatencyClass>,
+                resident_columns: ResidentColumnsSetting,
             ) -> Self {
                 let session = Session::with_index_cache_backend(
                     backend,
                     LAZY_METADATA_CACHE_BYTES,
                     Arc::new(ObjectStoreRegistry::default()),
                 )
-                .with_index_origin_latency(hint);
+                .with_index_origin_latency(hint)
+                .with_index_resident_columns(resident_columns);
                 let dataset = open_with_session(uri, session).await;
                 let index = dataset.load_indices().await.unwrap()[0].clone();
                 let index_dir = dataset.indice_files_dir(&index).unwrap();
@@ -12098,6 +12123,7 @@ mod tests {
             for frag_reuse_uuid in [Uuid::new_v4(), Uuid::new_v4()] {
                 let context = IvfOpenContext {
                     origin_latency_hint: Some(OriginLatencyClass::High),
+                    resident_columns: ResidentColumnsSetting::Auto,
                     file_cache: Some(test.file_cache()),
                     resident_lease: None,
                 };
@@ -12152,7 +12178,8 @@ mod tests {
         /// A store that would take more than half of the index cache's
         /// largest admissible entry stays in the file under `auto`, which
         /// counts it, whatever the origin class the session declares, with
-        /// the same results as a resident store.
+        /// the same results as a resident store; a session that turns the
+        /// store off counts nothing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_oversize_store_resolves_off_under_auto() {
             const SMALL_RAM_BYTES: usize = 1024 * 1024;
@@ -12176,13 +12203,23 @@ mod tests {
                 Some(OriginLatencyClass::Low),
                 None,
             ] {
-                for (ram_bytes, resident) in
-                    [(SMALL_RAM_BYTES, false), (RESIDENT_TEST_RAM_BYTES, true)]
-                {
-                    let context = format!("hint={hint:?} resident={resident}");
-                    let test =
-                        ResidentTestIndex::open_with_hint(dir.as_str(), backend(ram_bytes), hint)
-                            .await;
+                for (ram_bytes, resident_columns) in [
+                    (SMALL_RAM_BYTES, ResidentColumnsSetting::Auto),
+                    (RESIDENT_TEST_RAM_BYTES, ResidentColumnsSetting::Auto),
+                    // A session that turns the store off sizes nothing, so
+                    // it counts nothing on the cache the store overflows.
+                    (SMALL_RAM_BYTES, ResidentColumnsSetting::Off),
+                ] {
+                    let resident = ram_bytes == RESIDENT_TEST_RAM_BYTES;
+                    let oversize = !resident && resident_columns == ResidentColumnsSetting::Auto;
+                    let context = format!("hint={hint:?} {resident_columns} ram={ram_bytes}");
+                    let test = ResidentTestIndex::open_with(
+                        dir.as_str(),
+                        backend(ram_bytes),
+                        hint,
+                        resident_columns,
+                    )
+                    .await;
                     layered_stats::snapshot_and_reset();
                     let index = test.open_index().await;
                     assert_eq!(
@@ -12197,7 +12234,7 @@ mod tests {
                     let stats = layered_stats::snapshot_and_reset();
                     assert_eq!(
                         stats.resident_columns_oversize,
-                        u64::from(!resident),
+                        u64::from(oversize),
                         "{context} {stats:?}"
                     );
                     assert_eq!(stats.resident_columns_unpinnable, 0, "{context} {stats:?}");
@@ -12223,7 +12260,8 @@ mod tests {
         /// the store, pinned while the index lives, with code-only entries.
         /// A Moka backend never pins, so there `auto` keeps the columns in
         /// the file, with full entries, and counts the open, with or without
-        /// capacity. Results do not depend on it.
+        /// capacity, while a session set to `on` keeps the store there,
+        /// unpinned. Results do not depend on it.
         #[rstest]
         #[case::native(false)]
         #[case::layered(true)]
@@ -12246,23 +12284,33 @@ mod tests {
                     Arc::new(ObjectStoreRegistry::default()),
                 )
             };
+            let moka_with_capacity = || {
+                moka(lance_core::cache::MokaCacheBackend::with_capacity(
+                    LAZY_LARGE_CACHE_BYTES,
+                ))
+            };
+            // The session, whether its index keeps the store, and whether the
+            // cache pins it.
             let sessions = [
-                ("quick", Session::default(), true),
-                (
-                    "moka",
-                    moka(lance_core::cache::MokaCacheBackend::with_capacity(
-                        LAZY_LARGE_CACHE_BYTES,
-                    )),
-                    false,
-                ),
+                ("quick", Session::default(), true, true),
+                ("moka", moka_with_capacity(), false, false),
                 (
                     "moka without capacity",
                     moka(lance_core::cache::MokaCacheBackend::no_cache()),
                     false,
+                    false,
+                ),
+                // `on` keeps a store the cache cannot pin, evictable while
+                // in use.
+                (
+                    "moka with on",
+                    moka_with_capacity().with_index_resident_columns(ResidentColumnsSetting::On),
+                    true,
+                    false,
                 ),
             ];
             let mut results = Vec::new();
-            for (label, session, resident) in sessions {
+            for (label, session, resident, pinned) in sessions {
                 let context = format!("layered={layered} {label}");
                 let dataset = open_with_session(dir.as_str(), session).await;
                 let uuid = dataset.load_indices().await.unwrap()[0].uuid;
@@ -12290,17 +12338,104 @@ mod tests {
                     .await
                     .unwrap();
                 results.push(result_bits(&result));
-                // The live index pins the store its search loaded.
-                let pinned = dataset.index_cache.pinned_stats();
+                // The live index pins the store its search loaded where the
+                // cache can.
+                let stats = dataset.index_cache.pinned_stats();
                 assert_eq!(
-                    pinned.pinned_entries,
-                    u64::from(resident),
-                    "{context} {pinned:?}"
+                    stats.pinned_entries,
+                    u64::from(pinned),
+                    "{context} {stats:?}"
                 );
             }
             assert!(!results[0].0.is_empty());
             for result in &results {
                 assert_eq!(result, &results[0]);
+            }
+        }
+
+        /// A session's residency setting reaches the IVF_RQ indexes it
+        /// opens, when they open and when they are reconstructed from the
+        /// cached state: `off` keeps the small columns in the file, with
+        /// full entries, and `auto`, the default, keeps them resident, with
+        /// code-only entries, in an index cache that pins the store. Results
+        /// do not depend on it. The environment's `on` or `off` overrides
+        /// every session, so the test checks the sessions only where it
+        /// sets none.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_session_resident_columns_reach_rq_index(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            if resident_columns_setting().unwrap() != ResidentColumnsSetting::Auto
+                || entry_columns_setting().unwrap() != EntryColumns::Codes
+            {
+                return;
+            }
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let queries = [
+                lazy_test_query(vectors.value(0), 10, 8),
+                lazy_test_query(vectors.value(777), 100, LAZY_PARTITIONS),
+            ];
+            let mut first_results = vec![None; queries.len()];
+            for (setting, resident) in [
+                (ResidentColumnsSetting::Off, false),
+                (ResidentColumnsSetting::Auto, true),
+            ] {
+                let session = Session::new(
+                    LAZY_LARGE_CACHE_BYTES,
+                    LAZY_METADATA_CACHE_BYTES,
+                    Arc::new(ObjectStoreRegistry::default()),
+                );
+                assert_eq!(
+                    session.index_resident_columns(),
+                    ResidentColumnsSetting::Auto
+                );
+                let session = session.with_index_resident_columns(setting);
+                let dataset = open_with_session(dir.as_str(), session).await;
+                let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+                let opened = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+                let state_key =
+                    crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
+                assert!(
+                    dataset.index_cache.get_with_key(&state_key).await.is_some(),
+                    "the reopen must reconstruct from the cached state"
+                );
+                let reconstructed = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                for (path, index) in [("open", &opened), ("reconstruct", &reconstructed)] {
+                    let context = format!("layered={layered} {setting} {path}");
+                    let ivf = lazy_index(index);
+                    assert_eq!(ivf.resident_columns_enabled(), resident, "{context}");
+                    let entry_columns = if resident {
+                        EntryColumns::Codes
+                    } else {
+                        EntryColumns::All
+                    };
+                    assert_eq!(ivf.entry_columns(), entry_columns, "{context}");
+                    for (position, query) in queries.iter().enumerate() {
+                        let context = format!("{context} query={position}");
+                        let result = search_global(index, query, Arc::new(NoFilter))
+                            .await
+                            .unwrap();
+                        let bits = result_bits(&result);
+                        assert!(!bits.0.is_empty(), "{context}");
+                        let first = first_results[position].get_or_insert_with(|| bits.clone());
+                        assert_eq!(&bits, first, "{context}");
+                    }
+                    let loaded = ivf.storage.resident_columns().loaded_bytes();
+                    let bytes = ivf.resident_columns_bytes();
+                    assert_eq!(loaded, resident.then_some(bytes), "{context}");
+                }
             }
         }
 

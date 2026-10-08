@@ -3056,6 +3056,7 @@ impl DatasetIndexInternalExt for Dataset {
         // or reconstruction below runs.
         let open_context = IvfOpenContext {
             origin_latency_hint: self.session.index_origin_latency(),
+            resident_columns: self.session.index_resident_columns(),
             file_cache: Some(file_cache),
             resident_lease,
         };

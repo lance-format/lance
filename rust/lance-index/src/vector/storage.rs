@@ -1081,8 +1081,10 @@ fn sign_bounds_from(value: Option<&str>) -> Result<SignBounds> {
 /// [`ResidentColumnsSetting::admits`]). The store is an entry of the index
 /// cache, charged in its budget and leased, so kept in RAM, while an index
 /// of the file is live (see [`ResidentColumns`]); [`resident_columns_bytes`]
-/// gives its size without I/O. Results are the same either way. Read once
-/// per process; resolved when an index opens.
+/// gives its size without I/O. Results are the same either way. `on` or
+/// `off` here overrides the setting of the session opening an index, which
+/// `auto` defers to (see [`ResidentColumnsSetting::resolve_with_session`]).
+/// Read once per process; resolved when an index opens.
 pub const RESIDENT_COLUMNS_ENV: &str = "LANCE_RQ_RESIDENT_COLUMNS";
 
 /// The size of an IVF_RQ storage file's resident store, known without
@@ -1127,6 +1129,17 @@ pub enum ResidentColumnsSetting {
 }
 
 impl ResidentColumnsSetting {
+    /// The setting an index opens with: `env`, the value of
+    /// [`RESIDENT_COLUMNS_ENV`], when it is `on` or `off`, and otherwise
+    /// `session`, what the opening session sets for the IVF_RQ indexes it
+    /// opens (`auto` unless it sets one).
+    pub fn resolve_with_session(env: Self, session: Self) -> Self {
+        match env {
+            Self::Auto => session,
+            Self::On | Self::Off => env,
+        }
+    }
+
     /// Whether an index keeps its small columns resident in a store of
     /// `store`'s size, charged in an index cache whose largest admissible
     /// entry is `max_entry_bytes` and that has a pin budget when
@@ -4468,6 +4481,30 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains(RESIDENT_COLUMNS_ENV), "{error}");
             assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    /// The environment's `on` or `off` wins over every session setting; its
+    /// `auto` defers to the session's.
+    #[test]
+    fn resident_columns_resolve_with_session() {
+        use ResidentColumnsSetting::{Auto, Off, On};
+        for (env, session, expected) in [
+            (Auto, Auto, Auto),
+            (Auto, On, On),
+            (Auto, Off, Off),
+            (On, Auto, On),
+            (On, On, On),
+            (On, Off, On),
+            (Off, Auto, Off),
+            (Off, On, Off),
+            (Off, Off, Off),
+        ] {
+            assert_eq!(
+                ResidentColumnsSetting::resolve_with_session(env, session),
+                expected,
+                "env={env} session={session}"
+            );
         }
     }
 
