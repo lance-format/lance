@@ -1485,8 +1485,8 @@ mod tests {
     /// A deduplicated filtered read answered from the filter indexes returns
     /// exactly what reading every row returns: across updates that move a key
     /// in and out of the filter, deletes, rows indexed but not yet visible, and
-    /// single and composite keys — whether the matches are checked one by one
-    /// or are too many and every row is read.
+    /// integer, string and composite keys — whether the matches are checked one
+    /// by one or are too many and every row is read.
     #[tokio::test]
     async fn dedup_from_indexes_answers_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -1515,10 +1515,16 @@ mod tests {
             (seed >> 33) % bound
         };
         let (mut checked_reads, mut full_reads) = (0, 0);
-        for round in 0..100 {
-            let composite = round % 2 == 1;
+        for round in 0..150 {
+            let composite = round % 3 == 1;
+            let string_key = round % 3 == 2;
+            let key_type = if string_key {
+                DataType::Utf8
+            } else {
+                DataType::Int32
+            };
             let schema = Arc::new(Schema::new(vec![
-                Field::new("a", DataType::Int32, false),
+                Field::new("a", key_type, false),
                 Field::new("b", DataType::Int32, false),
                 Field::new("colour", DataType::Utf8, true),
                 Field::new(TOMBSTONE, DataType::Boolean, false),
@@ -1558,7 +1564,13 @@ mod tests {
                 let batch = RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Int32Array::from(a)),
+                        if string_key {
+                            Arc::new(StringArray::from_iter_values(
+                                a.iter().map(|key| format!("key{key:03}")),
+                            )) as arrow_array::ArrayRef
+                        } else {
+                            Arc::new(Int32Array::from(a)) as arrow_array::ArrayRef
+                        },
                         Arc::new(Int32Array::from(b)),
                         Arc::new(StringArray::from(colour)),
                         Arc::new(BooleanArray::from(tombstone)),
@@ -1589,18 +1601,17 @@ mod tests {
                     let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
                         .await
                         .unwrap();
-                    let mut rows: Vec<(u64, i32, i32)> = Vec::new();
+                    let mut rows: Vec<(u64, String, i32)> = Vec::new();
                     for batch in &batches {
                         let column = |name: &str| batch.column_by_name(name).unwrap().clone();
                         let address = column("_rowaddr");
                         let address = address.as_primitive::<arrow_array::types::UInt64Type>();
-                        let (a, b) = (column("a"), column("b"));
-                        let (a, b) = (
-                            a.as_primitive::<arrow_array::types::Int32Type>(),
-                            b.as_primitive::<arrow_array::types::Int32Type>(),
-                        );
+                        let a = arrow_cast::cast(&column("a"), &DataType::Utf8).unwrap();
+                        let a = a.as_string::<i32>();
+                        let b = column("b");
+                        let b = b.as_primitive::<arrow_array::types::Int32Type>();
                         for row in 0..batch.num_rows() {
-                            rows.push((address.value(row), a.value(row), b.value(row)));
+                            rows.push((address.value(row), a.value(row).to_string(), b.value(row)));
                         }
                     }
                     rows.sort_unstable();
