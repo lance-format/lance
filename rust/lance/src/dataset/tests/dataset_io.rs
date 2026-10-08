@@ -1424,6 +1424,7 @@ async fn test_write_manifest(
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1981,6 +1982,9 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
     )
     .await
     .unwrap();
+
+    assert!(dataset.manifest.base_paths.is_empty());
+    assert!(!dataset.manifest.has_managed_blobs());
 
     let clone = dataset
         .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
@@ -3983,6 +3987,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,

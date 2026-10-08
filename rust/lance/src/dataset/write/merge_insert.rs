@@ -149,6 +149,20 @@ mod assign_action;
 mod exec;
 mod logical_plan;
 
+/// Check a merge source against the target schema. As on append, a legacy
+/// blob input matches a Blob v2 target column; the writer converts it.
+fn check_source_schema(
+    source: &lance_core::datatypes::Schema,
+    target: &lance_core::datatypes::Schema,
+    options: &SchemaCompareOptions,
+) -> Result<()> {
+    source.check_compatible(target, options).or_else(|err| {
+        let source = super::promote_legacy_blob_schema(source)?;
+        let target = super::promote_legacy_blob_schema(target)?;
+        source.check_compatible(&target, options).map_err(|_| err)
+    })
+}
+
 /// Build a source schema in target field order while preserving the source's
 /// logical leaf types. The latter matters for extension columns such as Arrow
 /// JSON, whose write input is Utf8 while the dataset's physical type is binary.
@@ -1262,18 +1276,14 @@ impl MergeInsertJob {
         options.ignore_field_order = true;
 
         // Try full schema match first.
-        if lance_schema
-            .check_compatible(target_schema, &options)
-            .is_ok()
-        {
+        if check_source_schema(&lance_schema, target_schema, &options).is_ok() {
             return Ok(SchemaComparison::FullCompatible);
         }
 
         // If full match fails, try subschema match.
         options.allow_subschema = true;
 
-        lance_schema
-            .check_compatible(target_schema, &options)
+        check_source_schema(&lance_schema, target_schema, &options)
             .map(|_| SchemaComparison::Subschema)
     }
 
@@ -1793,17 +1803,9 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let mut writer = versions::open_writer(
-                        write_version,
-                        &dataset.object_store,
-                        &write_schema,
-                        &dataset.base,
-                        super::WriterOptions {
-                            add_data_dir: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                    let mut writer =
+                        versions::open_update_writer(write_version, &dataset, &write_schema, false)
+                            .await?;
 
                     // We need to remove rowaddr before writing.
                     batches
@@ -2327,6 +2329,16 @@ impl MergeInsertJob {
         }
     }
 
+    /// Whether the source provides a dataset column with a blob anywhere in it.
+    fn source_carries_blob(&self, source_schema: &Schema) -> bool {
+        self.dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| source_schema.column_with_name(&field.name).is_some())
+            .any(subtree_has_blob)
+    }
+
     /// Resolves the caller's [`MergeInsertWriteMode`] against this operation.
     ///
     /// [`WriteSink::RewriteColumns`] only ever replaces column data within a
@@ -2394,14 +2406,7 @@ impl MergeInsertJob {
         // the top-level fields it carries and then descends: a blob nested
         // anywhere under one of them (struct member, list item, map value) is
         // still patched by writing that whole top-level column.
-        if self
-            .dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| source_schema.column_with_name(&field.name).is_some())
-            .any(subtree_has_blob)
-        {
+        if self.source_carries_blob(source_schema) {
             blockers.push("the source carries a blob column, whose stored form differs from the one it provides");
         }
 
@@ -2567,11 +2572,7 @@ impl MergeInsertJob {
 
         // Execute the plan
         // Assert that we have exactly one partition since we're designed for single-partition execution
-        let partition_count = match plan.properties().output_partitioning() {
-            datafusion_physical_expr::Partitioning::RoundRobinBatch(n) => *n,
-            datafusion_physical_expr::Partitioning::Hash(_, n) => *n,
-            datafusion_physical_expr::Partitioning::UnknownPartitioning(n) => *n,
-        };
+        let partition_count = plan.properties().output_partitioning().partition_count();
 
         if partition_count != 1 {
             return Err(Error::invalid_input(format!(
@@ -2655,8 +2656,9 @@ impl MergeInsertJob {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
-        let is_full_schema = full_schema.compare_with_options(
+        let is_full_schema = check_source_schema(
             &lance_schema,
+            full_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
@@ -2665,16 +2667,21 @@ impl MergeInsertJob {
                 ignore_field_order: true,
                 ..Default::default()
             },
-        );
+        )
+        .is_ok();
 
         // Partial-schema upsert: every source field must exist in the target
-        // and have a compatible data type. Missing target columns will be
+        // and have a compatible data type (legacy blob input matches Blob v2,
+        // as in `check_source_schema`). Missing target columns will be
         // filled from the target side of the join in `create_plan`.
         let is_subset_schema = !is_full_schema
             && lance_schema.fields.iter().all(|sf| {
                 full_schema
                     .field(&sf.name)
-                    .map(|tf| tf.data_type() == sf.data_type())
+                    .map(|tf| {
+                        tf.data_type() == sf.data_type()
+                            || (tf.is_blob_v2() && sf.is_blob() && !sf.is_blob_v2())
+                    })
                     .unwrap_or(false)
             });
 
@@ -2715,8 +2722,10 @@ impl MergeInsertJob {
         // probe: the sink decides how many bytes are written, the probe only how
         // the matched rows are found. Merges that write nothing (no matched
         // update) or write whole rows on both paths (a full-schema source) are
-        // unaffected, so they keep the index.
-        let write_mode_needs_v2 = self.params.write_mode == MergeInsertWriteMode::RewriteRows
+        // unaffected, so they keep the index. A source carrying a blob column
+        // needs whole rows too: patching cannot write blobs (`select_write_sink`).
+        let write_mode_needs_v2 = (self.params.write_mode == MergeInsertWriteMode::RewriteRows
+            || self.source_carries_blob(source_schema))
             && is_subset_schema
             && matches!(
                 self.params.when_matched,
@@ -2805,8 +2814,9 @@ impl MergeInsertJob {
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
-        let is_full_schema = full_schema.compare_with_options(
+        let is_full_schema = check_source_schema(
             &lance_schema,
+            full_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
@@ -2816,7 +2826,8 @@ impl MergeInsertJob {
                 ignore_field_order: true,
                 ..Default::default()
             },
-        );
+        )
+        .is_ok();
         let source = if is_full_schema {
             let target_schema = Schema::from(full_schema);
             let canonical_schema = Arc::new(canonical_source_schema(
@@ -15196,8 +15207,20 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
+    /// A legacy blob source merges into a 2.1 table, and into a 2.2 table whose
+    /// column is Blob v2. Partial + indexed patches the blob column in place,
+    /// which fails for Blob v2 sources too, so it is not covered here.
+    #[rstest::rstest]
+    #[case::full(false, false)]
+    #[case::full_indexed(true, false)]
+    #[case::partial(false, true)]
     #[tokio::test]
-    async fn test_merge_insert_with_blob_v1_source_provides_blob() {
+    async fn test_merge_insert_with_blob_v1_source_provides_blob(
+        #[case] indexed: bool,
+        #[case] partial: bool,
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+        #[values(false, true)] delete_unmatched: bool,
+    ) {
         use arrow_array::LargeBinaryArray;
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::BLOB_META_KEY;
@@ -15222,57 +15245,84 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             )
             .unwrap()
         };
-        let dataset = Arc::new(
-            Dataset::write(
-                RecordBatchIterator::new(
-                    vec![Ok(make_batch(
-                        vec![Some(b"foo"), Some(b"bar")],
-                        vec![0, 1],
-                        vec![10, 20],
-                    ))],
-                    schema.clone(),
-                ),
-                &test_dir,
-                Some(WriteParams {
-                    data_storage_version: Some(LanceFileVersion::V2_1),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap(),
-        );
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(make_batch(
+                    vec![Some(b"foo"), Some(b"bar")],
+                    vec![0, 1],
+                    vec![10, 20],
+                ))],
+                schema.clone(),
+            ),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let mut batch = make_batch(vec![Some(b"baz"), Some(b"qux")], vec![1, 2], vec![200, 300]);
+        if partial {
+            batch = batch.project(&[0, 1]).unwrap();
+        }
         let source = Box::new(RecordBatchIterator::new(
-            vec![Ok(make_batch(
-                vec![Some(b"baz"), Some(b"qux")],
-                vec![1, 2],
-                vec![200, 300],
-            ))],
-            schema,
+            vec![Ok(batch.clone())],
+            batch.schema(),
         ));
 
-        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
-            .unwrap()
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
             .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        if delete_unmatched {
+            builder.when_not_matched_by_source(WhenNotMatchedBySource::Delete);
+        }
+        let (new_dataset, _) = builder
             .try_build()
-            .unwrap();
-        let (new_dataset, _) = job.execute_reader(source).await.unwrap();
-        let blobs = new_dataset
-            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .unwrap()
+            .execute_reader(source)
             .await
             .unwrap();
-        assert_eq!(
-            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"foo"
-        );
-        assert_eq!(
-            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"baz"
-        );
-        assert_eq!(
-            blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"qux"
-        );
+
+        let ids = new_dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = ids["id"]
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .values();
+        let indices: Vec<u64> = (0..ids.len() as u64).collect();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for (id, blob) in ids.iter().zip(blobs) {
+            actual.push((*id, blob.unwrap().read().await.unwrap().to_vec()));
+        }
+        actual.sort();
+        let mut expected = vec![(1, b"baz".to_vec()), (2, b"qux".to_vec())];
+        if !delete_unmatched {
+            expected.insert(0, (0, b"foo".to_vec()));
+        }
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -15347,6 +15397,112 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    /// A partial-schema source carrying a Blob v2 column updates and inserts
+    /// whether or not the join key has a scalar index.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_partial_blob_v2_source(#[values(false, true)] indexed: bool) {
+        use crate::{BlobArrayBuilder, blob_field};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blobs", true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let make_batch = |blob_values: &[&[u8]], ids: Vec<i64>| {
+            let mut blobs = BlobArrayBuilder::new(blob_values.len());
+            for value in blob_values {
+                blobs.push_bytes(value).unwrap();
+            }
+            let others = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    blobs.finish().unwrap(),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(others)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(make_batch(&[b"foo", b"bar"], vec![0, 1]))],
+                schema.clone(),
+            ),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let source = make_batch(&[b"baz", b"qux"], vec![1, 2])
+            .project(&[0, 1])
+            .unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        ));
+
+        let (new_dataset, _) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(source)
+                .await
+                .unwrap();
+
+        let batch = new_dataset
+            .scan()
+            .project(&["id", "other"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let others = batch["other"].as_primitive::<arrow_array::types::Int64Type>();
+        let mut actual = Vec::new();
+        for (row, blob) in blobs.into_iter().enumerate() {
+            actual.push((
+                ids.value(row),
+                others.is_valid(row).then(|| others.value(row)),
+                blob.unwrap().read().await.unwrap().to_vec(),
+            ));
+        }
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                (0, Some(0), b"foo".to_vec()),
+                (1, Some(10), b"baz".to_vec()),
+                (2, None, b"qux".to_vec()),
+            ]
         );
     }
 

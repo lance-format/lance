@@ -90,6 +90,9 @@ pub static BLOB_V2_LOGICAL_TYPE: LazyLock<DataType> =
 /// - [`BlobKind::Packed`] carries `blob_id`, `position`, and `blob_size`.
 /// - [`BlobKind::Dedicated`] carries `blob_id` and `blob_size`; its stored
 ///   `position` is zero.
+/// - [`BlobKind::Managed`] carries `uri`, `position`, and `blob_size`, with
+///   a null `blob_id` for the writer's table base. [`BlobKind::ManagedWithBase`]
+///   additionally carries an exact registered `blob_id`.
 /// - [`BlobKind::External`] carries `uri`, optional `blob_id`, `position`, and
 ///   `blob_size`. A zero `blob_size` is resolved to the complete external object
 ///   length when read.
@@ -123,6 +126,9 @@ pub static BLOB_V2_PREPARED_TYPE: LazyLock<DataType> =
 ///   `position` and `size` locate a range within it.
 /// - [`BlobKind::Dedicated`]: `blob_id` identifies a dedicated raw blob file,
 ///   `position` is zero, and `size` is the complete file length.
+/// - [`BlobKind::Managed`]: `blob_uri` is relative to the data file's table base;
+///   `blob_id` is unused (zero). [`BlobKind::ManagedWithBase`] instead selects an
+///   exact registered base using `blob_id`. Both store a known byte range.
 /// - [`BlobKind::External`]: `blob_uri` and `blob_id` identify the object, while
 ///   `position` and `size` select a range. A zero `size` is resolved to the
 ///   object's complete length when read.
@@ -611,6 +617,18 @@ pub enum BlobKind {
     /// External blobs can have a position and a size. If the position is not set,
     /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
+    /// A Lance-owned immutable object, independent of the descriptor's data file.
+    /// `blob_uri` is relative to the data file's table base; `blob_id` is unused.
+    /// A local table base moves with the dataset, including its Managed objects.
+    /// `position`/`size` select a known range, and
+    /// zero size is an empty value rather than a request to discover its length.
+    /// Tables containing this kind require the Managed Blob reader and writer feature flags.
+    Managed = 4,
+    /// A Managed object relative to an explicitly registered table base.
+    /// `blob_id` is the exact base ID, including zero and `u32::MAX`.
+    /// This wire variant preserves the non-nullable descriptor layout while
+    /// distinguishing an explicit base from the implicit table base.
+    ManagedWithBase = 5,
 }
 
 impl TryFrom<u8> for BlobKind {
@@ -622,6 +640,8 @@ impl TryFrom<u8> for BlobKind {
             1 => Ok(Self::Packed),
             2 => Ok(Self::Dedicated),
             3 => Ok(Self::External),
+            4 => Ok(Self::Managed),
+            5 => Ok(Self::ManagedWithBase),
             other => Err(Error::invalid_input_source(
                 format!("Unknown blob kind {other:?}").into(),
             )),

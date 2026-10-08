@@ -14,6 +14,7 @@
 package org.lance;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
 
 import java.nio.ByteBuffer;
 import java.util.HashMap;
@@ -24,6 +25,7 @@ import java.util.Optional;
 public class ReadOptions {
 
   private final Optional<Long> version;
+  private final Optional<Ref> ref;
   private final Optional<Integer> blockSize;
   private final long indexCacheSizeBytes;
   private final long metadataCacheSizeBytes;
@@ -34,6 +36,7 @@ public class ReadOptions {
 
   private ReadOptions(Builder builder) {
     this.version = builder.version;
+    this.ref = builder.ref;
     this.blockSize = builder.blockSize;
     this.indexCacheSizeBytes = builder.indexCacheSizeBytes;
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
@@ -45,6 +48,15 @@ public class ReadOptions {
 
   public Optional<Long> getVersion() {
     return version;
+  }
+
+  /**
+   * Get the reference (a version, a branch or a tag) the dataset is opened at.
+   *
+   * @return the reference, or empty if none was specified
+   */
+  public Optional<Ref> getRef() {
+    return ref;
   }
 
   public Optional<Integer> getBlockSize() {
@@ -84,6 +96,7 @@ public class ReadOptions {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("version", version.orElse(null))
+        .add("ref", ref.orElse(null))
         .add("blockSize", blockSize.orElse(null))
         .add("indexCacheSizeBytes", indexCacheSizeBytes)
         .add("metadataCacheSizeBytes", metadataCacheSizeBytes)
@@ -97,6 +110,7 @@ public class ReadOptions {
   public static class Builder {
 
     private Optional<Long> version = Optional.empty();
+    private Optional<Ref> ref = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
     private long indexCacheSizeBytes = 6L * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
     private long metadataCacheSizeBytes = 1024L * 1024 * 1024; // Default to 1 GiB like Rust
@@ -106,13 +120,55 @@ public class ReadOptions {
     private Optional<Session> session = Optional.empty();
 
     /**
-     * Set the version of the dataset to read. If not set, read from latest version.
+     * Set the version of the dataset to read. If neither a version nor a {@link #setRef(Ref) ref}
+     * is set, read from latest version.
+     *
+     * <p>The version is looked up on the branch the dataset URI points at. Use {@link #setRef(Ref)}
+     * to open a version on another branch. Cannot be combined with {@link #setRef(Ref)}.
      *
      * @param version the version of the dataset
      * @return this builder
      */
     public Builder setVersion(long version) {
       this.version = Optional.of(version);
+      return this;
+    }
+
+    /**
+     * Set the reference to open the dataset at. It accepts the same references as {@link
+     * Dataset#checkout(Ref)}:
+     *
+     * <ul>
+     *   <li>{@link Ref#ofMain(long)}: a version on the main branch, when the URI is the dataset
+     *       root.
+     *   <li>{@link Ref#ofBranch(String)}: the latest version of a branch.
+     *   <li>{@link Ref#ofBranch(String, long)}: a version on a branch.
+     *   <li>{@link Ref#ofTag(String)}: the version a tag points at, on the branch that version
+     *       belongs to.
+     * </ul>
+     *
+     * <p>Open the dataset root: references to the default branch ({@link Ref#ofMain()}, {@link
+     * Ref#ofMain(long)}, and {@code "main"} in {@link Ref#ofBranch(String)}) are resolved on the
+     * chain the URI points at, like {@link #setVersion(long)}. From a branch directory they read
+     * that branch, while {@link Dataset#checkout(Ref)} reads the default branch.
+     *
+     * <pre>{@code
+     * Dataset dev =
+     *     Dataset.open()
+     *         .allocator(allocator)
+     *         .uri("s3://bucket/table.lance")
+     *         .readOptions(new ReadOptions.Builder().setRef(Ref.ofBranch("dev", 2)).build())
+     *         .build();
+     * }</pre>
+     *
+     * <p>Cannot be combined with {@link #setVersion(long)} or {@link
+     * #setSerializedManifest(ByteBuffer)}.
+     *
+     * @param ref the reference to open
+     * @return this builder
+     */
+    public Builder setRef(Ref ref) {
+      this.ref = Optional.of(Preconditions.checkNotNull(ref, "ref must not be null"));
       return this;
     }
 
@@ -221,7 +277,7 @@ public class ReadOptions {
 
     /**
      * Use a serialized manifest instead of loading it from the object store. This is common when
-     * transferring a dataset across IPC boundaries.
+     * transferring a dataset across IPC boundaries. Cannot be combined with {@link #setRef(Ref)}.
      *
      * @param serializedManifest the serialized manifest as a ByteBuffer
      * @return this builder
@@ -250,6 +306,20 @@ public class ReadOptions {
     }
 
     public ReadOptions build() {
+      if (version.isPresent() && ref.isPresent()) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Cannot set both version (%d) and ref (%s); use Ref.ofMain(version) or"
+                    + " Ref.ofBranch(branch, version) to open a version by reference",
+                version.get(), ref.get()));
+      }
+      if (serializedManifest.isPresent() && ref.isPresent()) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Cannot set both a serialized manifest and ref (%s); the manifest already"
+                    + " determines the version to open",
+                ref.get()));
+      }
       return new ReadOptions(this);
     }
   }

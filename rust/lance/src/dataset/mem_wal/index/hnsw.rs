@@ -485,6 +485,11 @@ mod tests {
                 flat.push((id as f32 * 0.01) + (d as f32 * 0.001));
             }
         }
+        batch_of(ids, flat, dim)
+    }
+
+    /// `ids` with their vectors, `dim` values each, laid out row after row.
+    fn batch_of(ids: Vec<i32>, flat: Vec<f32>, dim: usize) -> RecordBatch {
         let inner = Float32Array::from(flat);
         let fsl = FixedSizeListArray::try_new_from_values(inner, dim as i32).unwrap();
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -582,6 +587,31 @@ mod tests {
             best_dist
         );
         assert_eq!(best_pos, 5);
+    }
+
+    /// A dot index ranks the larger product first and reports `1 - dot`, the
+    /// distance the base table's dot index reports.
+    #[test]
+    fn test_dot_index_ranks_the_larger_product_first() {
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::Dot,
+            HnswBuildParams::default(),
+            2,
+            64,
+        );
+        let batch = batch_of(vec![0, 1], vec![1.0, 1.0, 1.0, 10.0, 10.0, 10.0], 3);
+        index.insert(&batch, 0).unwrap();
+
+        let query =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 1.0, 1.0]), 3)
+                .unwrap();
+        // Products 3 and 30.
+        assert_eq!(
+            index.search(&query, 2, None, u64::MAX).unwrap(),
+            vec![(-29.0, 1), (-2.0, 0)]
+        );
     }
 
     #[test]

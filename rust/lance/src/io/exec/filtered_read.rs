@@ -16,6 +16,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -25,6 +26,7 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
@@ -1987,6 +1989,36 @@ impl FilteredReadOptions {
         self
     }
 
+    /// [`Self::with_projection`], keeping the filters planned by
+    /// [`Self::with_physical_filters`] (and their session bindings) rebound to
+    /// the new projection.
+    pub(crate) fn with_projection_keeping_filters(
+        mut self,
+        projection: Projection,
+    ) -> Result<Self> {
+        self.projection = projection;
+        for (filter, physical_filter) in &mut self.physical_filters {
+            let projection = self
+                .projection
+                .clone()
+                .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
+            let schema = public_blob_v2_binary_projection_schema(&projection);
+            *physical_filter = physical_filter
+                .clone()
+                .transform(|expr| {
+                    let Some(column) = expr.downcast_ref::<Column>() else {
+                        return Ok(Transformed::no(expr));
+                    };
+                    let index = schema.index_of(column.name())?;
+                    Ok(Transformed::yes(
+                        Arc::new(Column::new(column.name(), index)) as Arc<dyn PhysicalExpr>,
+                    ))
+                })?
+                .data;
+        }
+        Ok(self)
+    }
+
     /// Specify the size of the I/O buffer (in bytes) to use for the scan
     ///
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
@@ -2732,6 +2764,20 @@ impl FilteredReadExec {
         }
     }
 
+    /// This read with `projection`, keeping its precomputed plan and
+    /// session-planned filters.
+    pub(crate) fn with_projection(&self, projection: Projection) -> Result<Self> {
+        let options = self
+            .options
+            .clone()
+            .with_projection_keeping_filters(projection)?;
+        let read = Self::try_new(self.dataset.clone(), options, self.index_input().cloned())?;
+        if let Some(plan) = self.plan.get() {
+            let _ = read.plan.set(plan.clone());
+        }
+        Ok(read)
+    }
+
     /// Return the pre-computed plan if one exists, without triggering initialization.
     pub fn plan(&self) -> Option<FilteredReadPlan> {
         self.plan.get().map(|p| p.to_external_plan())
@@ -2769,6 +2815,15 @@ impl FilteredReadExec {
             self.schema(),
             lazy_stream,
         )))
+    }
+
+    fn retained_physical_row_count(&self, fragments: &[Fragment]) -> Option<u64> {
+        self.dataset.manifest().writer_version.as_ref()?;
+        fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows)
+            .sum::<Option<usize>>()
+            .map(|physical_rows| physical_rows as u64)
     }
 }
 
@@ -3353,13 +3408,24 @@ impl ExecutionPlan for FilteredReadExec {
             .clone()
             .unwrap_or_else(|| self.dataset.fragments().clone());
 
-        if fragments.iter().any(|f| f.num_rows().is_none()) {
-            return Err(DataFusionError::Internal(
-                "Fragments are missing row count stats".to_string(),
-            ));
-        }
-
-        let total_rows: u64 = fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum();
+        let total_rows = if self.options.with_deleted_rows {
+            if self.options.scan_range_before_filter.is_some()
+                || self.options.scan_range_after_filter.is_some()
+            {
+                return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
+            }
+            let Some(total_rows) = self.retained_physical_row_count(fragments.as_ref()) else {
+                return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
+            };
+            total_rows
+        } else {
+            if fragments.iter().any(|f| f.num_rows().is_none()) {
+                return Err(DataFusionError::Internal(
+                    "Fragments are missing row count stats".to_string(),
+                ));
+            }
+            fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum()
+        };
 
         let Some(filter) = self.options.full_filter.as_ref() else {
             // If there is no filter, we just return the total number of rows (sans any before-filter range)
@@ -4709,6 +4775,10 @@ mod tests {
             .unwrap()
             .with_projection(fixture.dataset.empty_projection().with_row_id());
         let plan = fixture.make_plan(options).await;
+        assert_eq!(
+            plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Exact(300)
+        );
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let num_rows = stream
             .map_ok(|batch| batch.num_rows())
@@ -4716,6 +4786,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(num_rows, 300);
+        let mut scanner = fixture.dataset.scan();
+        scanner.with_row_id().include_deleted_rows();
+        assert_eq!(scanner.count_rows().await.unwrap(), 300);
+
+        let filter = fixture.filter_plan("not_indexed >= 250", false).await;
+        let options = base_options
+            .with_deleted_rows()
+            .unwrap()
+            .with_filter_plan(filter);
+        let plan = fixture.make_plan(options.clone()).await;
+        assert_eq!(
+            plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(300)
+        );
+        fixture.test_plan(options, &u32s(vec![250..400])).await;
     }
 
     /// A stale (not rebuilt after a delete) index hit drops on the live view

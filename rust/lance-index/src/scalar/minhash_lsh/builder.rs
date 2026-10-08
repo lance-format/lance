@@ -5,6 +5,7 @@
 //! `signatures.lance`, and sorting the (band key, doc id) records into
 //! `bands.lance` with an external sort that spills to local temporary files.
 
+use crate::scalar::RowAddrTranslatorRef;
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
@@ -79,8 +80,8 @@ pub(super) enum RowIdTransform<'a> {
     Keep,
     /// Keep only the rows the filter selects.
     Filter(&'a OldIndexDataFilter),
-    /// Rewrite row ids through the mapping, dropping rows it deletes.
-    Remap(&'a RowAddrRemap),
+    /// Rewrite row ids through the translator, dropping rows it deletes.
+    Remap(RowAddrTranslatorRef<'a>),
 }
 
 impl RowIdTransform<'_> {
@@ -88,12 +89,13 @@ impl RowIdTransform<'_> {
     ///
     /// Stored row ids predate any deferred compaction the segment was opened
     /// with, so `frag_reuse_index` first brings them into the current address
-    /// space, which is the space the filter or mapping is expressed in.
-    fn apply(
+    /// space, which is the space the filter or mapping is expressed in. A
+    /// remap translates one batch at a time through the translator.
+    async fn apply(
         &self,
         row_ids: &UInt64Array,
         frag_reuse_index: Option<&dyn RowIdRemapper>,
-    ) -> Vec<Option<u64>> {
+    ) -> Result<Vec<Option<u64>>> {
         let mut row_ids: Vec<Option<u64>> = row_ids
             .values()
             .iter()
@@ -112,9 +114,13 @@ impl RowIdTransform<'_> {
                     }
                 }
             }
-            Self::Remap(mapping) => mapping.remap_in_place(&mut row_ids),
+            Self::Remap(translator) => {
+                let current: Vec<u64> = row_ids.iter().flatten().copied().collect();
+                let resolved = translator.resolve(current).await?;
+                resolved.remap_in_place(&mut row_ids);
+            }
         }
-        row_ids
+        Ok(row_ids)
     }
 }
 
@@ -145,15 +151,13 @@ impl SignatureSource<'_> {
         let stream = batches
             .map(move |batch| {
                 let generator = generator.clone();
-                // Row id filtering needs the transform, which cannot move into
-                // the CPU task, so it runs here; band keys are computed there.
-                let prepared = batch.and_then(|batch| {
-                    let (row_ids, _) = signature_columns(&batch, num_hashes)?;
-                    let kept = transform.apply(row_ids, frag_reuse_index);
-                    Ok((batch, kept))
-                });
                 async move {
-                    let (batch, kept) = prepared?;
+                    let batch = batch?;
+                    // Row id filtering needs the transform, which cannot move
+                    // into the CPU task, so it runs here, one batch at a time;
+                    // band keys are computed there.
+                    let (row_ids, _) = signature_columns(&batch, num_hashes)?;
+                    let kept = transform.apply(row_ids, frag_reuse_index).await?;
                     spawn_cpu(move || resign_batch(generator, batch, kept)).await
                 }
             })

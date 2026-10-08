@@ -36,7 +36,7 @@ use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::generation_read::GenerationRead;
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
@@ -116,6 +116,18 @@ pub struct LsmPointLookupPlanner {
     /// generation's columns to the table's. Defaults to `base_schema`, which
     /// carries them when the caller built it from a Lance schema.
     identity_schema: SchemaRef,
+    /// Whether every in-memory memtable uses the table's current schema. The
+    /// fast paths read columns by the table's names, so if any memtable was
+    /// created before a schema change, lookups take the slower plan path.
+    in_memory_matches_table: bool,
+}
+
+/// Whether every in-memory memtable `collector` holds matches `table_schema`.
+fn in_memory_matches_table(collector: &LsmDataSourceCollector, table_schema: &Schema) -> bool {
+    collector
+        .in_memory_refs_newest_first()
+        .iter()
+        .all(|m| memtable_matches_table(&m.schema, table_schema))
 }
 
 impl LsmPointLookupPlanner {
@@ -132,6 +144,7 @@ impl LsmPointLookupPlanner {
         base_schema: SchemaRef,
     ) -> Result<Self> {
         let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false)?;
+        let in_memory_matches_table = in_memory_matches_table(&collector, &base_schema);
         Ok(Self {
             collector,
             pk_columns,
@@ -145,11 +158,13 @@ impl LsmPointLookupPlanner {
             task_ctx: SessionContext::new().task_ctx(),
             visibility: MemTableVisibility::Published,
             identity_schema: base_schema,
+            in_memory_matches_table,
         })
     }
 
     /// Supply the table's field ids, when `base_schema` was built without them.
     pub fn with_identity_schema(mut self, identity_schema: SchemaRef) -> Self {
+        self.in_memory_matches_table = in_memory_matches_table(&self.collector, &identity_schema);
         self.identity_schema = identity_schema;
         self
     }
@@ -396,7 +411,8 @@ impl LsmPointLookupPlanner {
         // requirement avoids the `OrderableScalarValue` panic on comparing
         // mismatched variants — the plan path coerces, so a coercible-but-
         // different literal (e.g. `Int64` for an `Int32` PK) falls back.
-        let fast_eligible = pk_values.len() == 1
+        let fast_eligible = self.in_memory_matches_table
+            && pk_values.len() == 1
             && self.pk_columns.len() == 1
             && self
                 .base_schema
@@ -521,7 +537,8 @@ impl LsmPointLookupPlanner {
             .first()
             .and_then(|c| self.base_schema.field_with_name(c).ok())
             .map(|f| f.data_type().clone());
-        let fast_eligible = self.pk_columns.len() == 1
+        let fast_eligible = self.in_memory_matches_table
+            && self.pk_columns.len() == 1
             && !target.fields().iter().any(|f| is_system_column(f.name()))
             && pk_type
                 .as_ref()
@@ -757,8 +774,33 @@ impl LsmPointLookupPlanner {
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.filter_expr(filter.clone());
+                // A memtable created before a schema change still uses the old
+                // column names, so read it like a flushed generation of that age.
+                let generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                match &generation {
+                    None => {
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                        scanner.filter_expr(filter.clone());
+                    }
+                    Some(generation) => {
+                        let stored_filter = generation.to_stored(filter).ok_or_else(|| {
+                            lance_core::Error::internal(format!(
+                                "point lookup: `{filter}` names a column memtable {} does not store",
+                                source.generation()
+                            ))
+                        })?;
+                        scanner.project(&generation.stored_projection())?;
+                        scanner.filter_expr(stored_filter);
+                    }
+                }
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
                 // insert order) so we can pick the most recently inserted
                 // duplicate below. Without this, a `FilterExec → LIMIT 1`
@@ -766,6 +808,11 @@ impl LsmPointLookupPlanner {
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
                 let raw = Box::pin(scanner.create_plan()).await?;
+                // `_rowid` is not a table column; it passes through unchanged.
+                let raw = match &generation {
+                    None => raw,
+                    Some(generation) => generation.reconcile(raw)?,
+                };
                 // The filter already restricts to the exact PK value, so the
                 // scan yields that key's insert history. Within the active
                 // memtable larger `_rowid` = newer insert, so sorting `_rowid`
@@ -2650,5 +2697,94 @@ mod tests {
         let batch = planner.lookup_many(&keys, None).await.unwrap();
         assert_eq!(batch.num_rows(), 2, "the tombstoned key is omitted");
         assert_eq!(sorted_ids(&batch), vec![1, 3]);
+    }
+
+    /// A lookup projecting a nested field still finds the row after an
+    /// unrelated column is added.
+    #[tokio::test]
+    async fn a_nested_point_lookup_survives_an_unrelated_column_add() {
+        let stored_schema = create_nested_schema();
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let active = active_memtable_ref(
+                &stored_schema,
+                &[create_nested_batch(&stored_schema, &[1])],
+                1,
+            );
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        crate::dataset::mem_wal::scanner::collector::InMemoryMemTables {
+                            active,
+                            frozen: vec![],
+                        },
+                    );
+            let planner =
+                LsmPointLookupPlanner::new(collector, vec!["id".to_string()], table_schema)
+                    .unwrap();
+            let row = planner
+                .lookup(
+                    &[ScalarValue::Int32(Some(1))],
+                    Some(&["meta.a".to_string()]),
+                )
+                .await
+                .expect("an unrelated added column must preserve a nested point lookup")
+                .expect("the row is still present");
+            assert_eq!(meta_children(&row), vec!["a"]);
+            assert_eq!(id_at(&row), 1);
+            let meta = row.column_by_name("meta").unwrap().as_struct();
+            assert_eq!(
+                meta.column_by_name("a")
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0),
+                10,
+            );
+        }
+    }
+
+    /// Struct children selected out of declaration order come back in the
+    /// selected order, so no child gets another child's values.
+    #[tokio::test]
+    async fn a_nested_projection_keeps_selection_order() {
+        let stored_schema = create_nested_schema();
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let active = active_memtable_ref(
+                &stored_schema,
+                &[create_nested_batch(&stored_schema, &[1])],
+                1,
+            );
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        crate::dataset::mem_wal::scanner::collector::InMemoryMemTables {
+                            active,
+                            frozen: vec![],
+                        },
+                    );
+            let planner =
+                LsmPointLookupPlanner::new(collector, vec!["id".to_string()], table_schema)
+                    .unwrap();
+            let row = planner
+                .lookup(
+                    &[ScalarValue::Int32(Some(1))],
+                    Some(&["meta.b".to_string(), "meta.a".to_string()]),
+                )
+                .await
+                .expect("a reversed nested selection still resolves")
+                .expect("the row is still present");
+            assert_eq!(
+                meta_children(&row),
+                vec!["b", "a"],
+                "the output follows the selection, not the declaration"
+            );
+        }
     }
 }

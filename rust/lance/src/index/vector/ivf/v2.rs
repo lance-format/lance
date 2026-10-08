@@ -4,6 +4,7 @@
 //! IVF - Inverted File index.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -2931,6 +2932,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     }
 
     async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
+    }
+
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::index(
             "Remapping IVF in this way not supported".to_string(),
         ))
@@ -6334,12 +6342,13 @@ mod tests {
     }
 
     async fn test_delete_all_rows(params: VectorIndexParams) {
+        // Boxed for CI clippy `large_futures`: each typed delete-all future grew past 16 KiB.
         match params.metric_type {
             DistanceType::Hamming => {
-                test_delete_all_rows_impl::<UInt8Type>(params, 0..4).await;
+                Box::pin(test_delete_all_rows_impl::<UInt8Type>(params, 0..4)).await;
             }
             _ => {
-                test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0).await;
+                Box::pin(test_delete_all_rows_impl::<Float32Type>(params, 0.0..1.0)).await;
             }
         }
     }
@@ -6424,13 +6433,15 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist, recall_requirement).await;
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6493,7 +6504,8 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_pq_delete_all_rows_lifecycle() {
         let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
-        test_delete_all_rows(params).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params)).await;
     }
 
     #[rstest]
@@ -6518,7 +6530,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let params = VectorIndexParams::with_ivf_sq_params(distance_type, ivf_params, sq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6559,7 +6572,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let rq_params = RQBuildParams::with_rotation_type(5, rotation_type);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6675,7 +6689,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -6701,12 +6716,14 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_delete_all_rows(params.clone()).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
         test_remap(params, nlist, recall_requirement).await;
     }
 
@@ -6824,6 +6841,147 @@ mod tests {
     // the on-disk names, which are part of the index file contract.
     const HNSW_VECTOR_ID_COL: &str = "__vector_id";
     const HNSW_NEIGHBORS_COL: &str = "__neighbors";
+
+    /// Store wrapper that holds every read open for a measurable window and
+    /// records how many were in flight at once. Instantaneous reads never
+    /// overlap, so a delay is what makes concurrency observable at all.
+    #[derive(Debug)]
+    struct ConcurrencyProbeStore {
+        target: Arc<dyn object_store::ObjectStore>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for ConcurrencyProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ConcurrencyProbeStore({})", self.target)
+        }
+    }
+
+    impl ConcurrencyProbeStore {
+        async fn enter(&self) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for ConcurrencyProbeStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.target.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.target.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.enter().await;
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &object_store::path::Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.enter().await;
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Opening the storage reads the IVF protobuf and the quantizer buffer,
+    /// two independent global buffers whose positions both come from the schema
+    /// metadata. Reading them one after the other costs an extra round trip on
+    /// every cold open, so pin that they go out together: with the reads
+    /// serialized this sees one in flight at a time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>("memory://", 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(16),
+            PQBuildParams::new(4, 8),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut probed = dataset.object_store.as_ref().clone();
+        probed.inner = Arc::new(ConcurrencyProbeStore {
+            target: probed.inner.clone(),
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+        });
+        let probed = Arc::new(probed);
+        let scheduler = ScanScheduler::new(probed, SchedulerConfig::default_for_testing());
+        let reader = open_rq_aux_reader(&dataset, scheduler, &indices[0].uuid.to_string()).await;
+        max_in_flight.store(0, Ordering::SeqCst);
+        let _storage = lance_index::vector::storage::IvfQuantizationStorage::<
+            lance_index::vector::pq::ProductQuantizer,
+        >::try_new(reader, None)
+        .await
+        .unwrap();
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            2,
+            "both global buffer reads should be in flight at once"
+        );
+    }
 
     async fn build_ivf_hnsw_sq(test_uri: &str, nlist: usize) -> Dataset {
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
@@ -7335,21 +7493,23 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        test_index(
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(
             v1_params,
             nlist,
             recall_requirement,
             Some((dataset.clone(), vectors.clone())),
-        )
+        ))
         .await;
         dataset.checkout_latest().await.unwrap();
         // retest with v3 params on the same dataset
-        test_index(
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(
             v3_params,
             nlist,
             recall_requirement,
             Some((dataset.clone(), vectors)),
-        )
+        ))
         .await;
 
         dataset.checkout_latest().await.unwrap();

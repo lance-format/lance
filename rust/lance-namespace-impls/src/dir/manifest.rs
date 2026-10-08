@@ -101,6 +101,17 @@ static BASE_OBJECTS_VALUE_FIELD: LazyLock<Field> = LazyLock::new(|| {
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
 const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
+// Dataset config keys of Lance's automatic old-version cleanup policy. Lance
+// releases before 7.0 wrote this policy into every new dataset by default, so
+// directory manifests created by those releases still carry it.
+const AUTO_CLEANUP_CONFIG_PREFIX: &str = "lance.auto_cleanup.";
+
+fn has_auto_cleanup_config(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .keys()
+        .any(|key| key.starts_with(AUTO_CLEANUP_CONFIG_PREFIX))
+}
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,23 +608,20 @@ pub struct NamespaceInfo {
 /// A wrapper around a Dataset that provides concurrent access.
 ///
 /// This can be cloned cheaply. It supports concurrent reads or exclusive writes.
-/// The manifest dataset uses contiguous attached versions and this module never
-/// runs old-version cleanup on it, allowing reads to check only the immediate
-/// successor manifest before deciding whether a reload is needed.
+///
+/// Manifest rewrites never run old-version cleanup or add an auto-cleanup
+/// policy. Policy-free manifests therefore keep contiguous attached versions,
+/// so reloads only need to probe the immediate successor manifest. A manifest
+/// created by an older Lance release can still carry an auto-cleanup policy,
+/// and older writers act on it by removing old versions, which leaves gaps
+/// after the held version. While that version carries the policy, reloads
+/// resolve the latest version instead.
 #[derive(Debug, Clone)]
 pub struct DatasetConsistencyWrapper(Arc<RwLock<Dataset>>);
 
 impl DatasetConsistencyWrapper {
     /// Create a new wrapper with the given dataset.
     pub fn new(dataset: Dataset) -> Self {
-        debug_assert!(
-            !dataset
-                .manifest()
-                .config
-                .keys()
-                .any(|key| key.starts_with("lance.auto_cleanup.")),
-            "the directory manifest dataset must not enable old-version cleanup"
-        );
         Self(Arc::new(RwLock::new(dataset)))
     }
 
@@ -679,25 +687,17 @@ impl DatasetConsistencyWrapper {
             dataset_uri,
             current_version
         );
-        // The directory manifest table uses contiguous attached versions and
-        // does not run old-version cleanup, so the immediate successor probe is
-        // enough to detect changes without resolving or loading the latest
-        // manifest on every namespace read.
-        let has_successor_version = read_guard.has_successor_version().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to check dataset staleness: {:?}", e),
-            })
-        })?;
+        let has_newer_version = Self::has_newer_version(&read_guard).await?;
         log::debug!(
-            "Reload checked successor_version_exists={} for uri={}, current_version={}",
-            has_successor_version,
+            "Reload checked has_newer_version={} for uri={}, current_version={}",
+            has_newer_version,
             dataset_uri,
             current_version
         );
         drop(read_guard);
 
         // If already up-to-date, return early
-        if !has_successor_version {
+        if !has_newer_version {
             log::debug!("Already up-to-date for uri={}", dataset_uri);
             return Ok(());
         }
@@ -719,13 +719,7 @@ impl DatasetConsistencyWrapper {
             current_version
         );
 
-        let has_successor_version = dataset.has_successor_version().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to check dataset staleness: {:?}", e),
-            })
-        })?;
-
-        if has_successor_version {
+        if Self::has_newer_version(dataset).await? {
             dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
@@ -734,6 +728,25 @@ impl DatasetConsistencyWrapper {
         }
 
         Ok(())
+    }
+
+    /// Return whether a version newer than the held one has been committed.
+    ///
+    /// Probing the immediate successor avoids resolving the latest manifest on
+    /// every namespace read, but misses newer versions once cleanup has removed
+    /// the successor. A held version with an auto-cleanup policy can have such
+    /// gaps after it, so it resolves the latest version instead.
+    async fn has_newer_version(dataset: &Dataset) -> Result<bool> {
+        let has_newer_version = if has_auto_cleanup_config(dataset.manifest()) {
+            dataset.is_stale().await
+        } else {
+            dataset.has_successor_version().await
+        };
+        has_newer_version.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to check dataset staleness: {:?}", e),
+            })
+        })
     }
 }
 
@@ -1340,7 +1353,13 @@ impl ManifestNamespace {
             })
             .collect::<Vec<_>>();
         fragments.sort_by_key(|fragment| fragment.id);
-        Manifest::new_from_previous(previous, schema, Arc::new(fragments))
+        let mut manifest = Manifest::new_from_previous(previous, schema, Arc::new(fragments));
+        // Drop a legacy auto-cleanup policy so later commits, including those of
+        // older writers that inherit this config, stop removing old versions.
+        manifest
+            .config
+            .retain(|key, _| !key.starts_with(AUTO_CLEANUP_CONFIG_PREFIX));
+        manifest
     }
 
     async fn build_manifest_indices(
@@ -1876,6 +1895,8 @@ impl ManifestNamespace {
             .map_err(CommitError::from)?;
         let base_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
         let naming_scheme = dataset.manifest_location().naming_scheme;
+        let inline_transaction =
+            lance_table::format::Transaction::try_from(&transaction).map_err(CommitError::from)?;
         commit_handler
             .commit(
                 manifest,
@@ -1884,7 +1905,7 @@ impl ManifestNamespace {
                 &object_store,
                 write_manifest_file_to_path,
                 naming_scheme,
-                Some((&transaction).into()),
+                Some(inline_transaction),
             )
             .await
             .map(|_location| ())
@@ -3863,16 +3884,18 @@ impl LanceNamespace for ManifestNamespace {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation, DeleteObjectMutation,
-        LANCE_DATA_DIR, LANCE_INDICES_DIR, MANIFEST_TABLE_NAME, ManifestBatchBuilder,
-        ManifestEntry, ManifestIndexAccumulator, ManifestNamespace, ManifestOutputRow,
-        ManifestRowValue, ManifestStreamMutation, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME,
-        ObjectType,
+        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation,
+        DatasetConsistencyWrapper, DeleteObjectMutation, LANCE_DATA_DIR, LANCE_INDICES_DIR,
+        MANIFEST_TABLE_NAME, ManifestBatchBuilder, ManifestEntry, ManifestIndexAccumulator,
+        ManifestNamespace, ManifestOutputRow, ManifestRowValue, ManifestStreamMutation,
+        OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME, ObjectType, has_auto_cleanup_config,
     };
-    use crate::DirectoryNamespaceBuilder;
+    use crate::{DirectoryNamespace, DirectoryNamespaceBuilder};
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use futures::StreamExt;
+    use lance::dataset::builder::DatasetBuilder;
+    use lance::dataset::cleanup::CleanupPolicyBuilder;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
@@ -4261,6 +4284,142 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect()
+    }
+
+    async fn create_manifest_only_table(ns: &DirectoryNamespace, name: &str) {
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec![name.to_string()]);
+        ns.create_table(create_request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+    }
+
+    fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempStdDir> {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data")
+            .join(table_path);
+        let temp_dir = TempStdDir::default();
+        let mut directories = vec![(source, temp_dir.to_path_buf())];
+        while let Some((source, destination)) = directories.pop() {
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                let target = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    directories.push((entry.path(), target));
+                } else {
+                    std::fs::copy(entry.path(), target)?;
+                }
+            }
+        }
+        Ok(temp_dir)
+    }
+
+    #[derive(Debug)]
+    enum ManifestAccess {
+        Get,
+        GetRefreshed,
+        GetMut,
+    }
+
+    /// Readers and writers holding a manifest created by a released old writer
+    /// must observe newer commits after cleanup removes the immediate successor.
+    #[rstest]
+    #[case::get(ManifestAccess::Get)]
+    #[case::get_refreshed(ManifestAccess::GetRefreshed)]
+    #[case::get_mut(ManifestAccess::GetMut)]
+    #[tokio::test]
+    async fn test_legacy_auto_cleanup_manifest_reload_skips_removed_versions(
+        #[case] access: ManifestAccess,
+    ) {
+        let temp_dir = copy_test_data_to_tmp("v6.0.1/dir_manifest/namespace").unwrap();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_uri = format!("{}/{}", temp_path, MANIFEST_TABLE_NAME);
+        // Directory listing would surface tables the manifest misses, so the
+        // namespaces read only the manifest.
+        let build_namespace = || {
+            DirectoryNamespaceBuilder::new(temp_path)
+                .manifest_enabled(true)
+                .dir_listing_enabled(false)
+                .build()
+        };
+
+        let manifest_ds = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        assert!(has_auto_cleanup_config(manifest_ds.manifest()));
+        assert_eq!(
+            manifest_ds.manifest().config["lance.auto_cleanup.interval"],
+            "20"
+        );
+        assert_eq!(
+            manifest_ds.manifest().config["lance.auto_cleanup.older_than"],
+            "14days"
+        );
+        let legacy_version = manifest_ds.version().version;
+        let wrapper = DatasetConsistencyWrapper::new(manifest_ds);
+        let reader = build_namespace().await.unwrap();
+        let writer = build_namespace().await.unwrap();
+        create_manifest_only_table(&writer, "t2").await;
+        create_manifest_only_table(&writer, "t3").await;
+
+        let latest = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        let latest_version = latest.version().version;
+        assert_eq!(latest_version, legacy_version + 2);
+        assert!(!has_auto_cleanup_config(latest.manifest()));
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&latest, 1)
+            .await
+            .unwrap()
+            .delete_unverified(true)
+            .build();
+        latest.cleanup_with_policy(policy).await.unwrap();
+        let error = latest
+            .checkout_version(legacy_version + 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::DatasetNotFound { .. }),
+            "unexpected missing-version error: {error:?}"
+        );
+        assert!(error.to_string().contains("not found"));
+
+        let reloaded_version = match access {
+            ManifestAccess::Get => wrapper.get().await.unwrap().version().version,
+            ManifestAccess::GetRefreshed => {
+                wrapper.get_refreshed().await.unwrap().version().version
+            }
+            ManifestAccess::GetMut => wrapper.get_mut().await.unwrap().version().version,
+        };
+        assert_eq!(reloaded_version, latest_version);
+        assert!(!has_auto_cleanup_config(
+            wrapper.get().await.unwrap().manifest()
+        ));
+
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let mut tables = reader
+            .list_tables(list_request.clone())
+            .await
+            .unwrap()
+            .tables;
+        tables.sort();
+        assert_eq!(tables, vec!["t1", "t2", "t3"]);
+
+        // Once refreshed to a policy-free version, the successor fast path must
+        // still observe subsequent writes.
+        create_manifest_only_table(&writer, "t4").await;
+        assert_eq!(
+            wrapper.get().await.unwrap().version().version,
+            latest_version + 1
+        );
+        let mut tables = reader.list_tables(list_request).await.unwrap().tables;
+        tables.sort();
+        assert_eq!(tables, vec!["t1", "t2", "t3", "t4"]);
     }
 
     #[tokio::test]

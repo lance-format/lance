@@ -48,7 +48,7 @@ pub fn wants_row_address(projection: Option<&[String]>) -> bool {
 }
 
 /// Auto-managed by the planner; must never reach `scanner.project()`.
-fn is_auto_managed(col: &str) -> bool {
+pub(super) fn is_auto_managed(col: &str) -> bool {
     col == DISTANCE_COLUMN || is_system_column(col)
 }
 
@@ -69,6 +69,21 @@ pub(super) fn resolve_data_fields(
     }
     let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
     let projected = lance_schema.project(data_names)?;
+    let arrow_schema = Schema::from(&projected);
+    Ok(arrow_schema.fields().iter().cloned().collect())
+}
+
+/// [`resolve_data_fields`], but skips names the schema does not have instead
+/// of failing.
+pub(super) fn resolve_data_fields_or_drop(
+    data_names: &[String],
+    base_schema: &SchemaRef,
+) -> Result<Vec<Arc<Field>>> {
+    if data_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
+    let projected = lance_schema.project_or_drop(data_names)?;
     let arrow_schema = Schema::from(&projected);
     Ok(arrow_schema.fields().iter().cloned().collect())
 }

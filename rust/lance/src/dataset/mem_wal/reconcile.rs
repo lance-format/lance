@@ -659,7 +659,7 @@ mod relabel_tests {
             ArrowField::new(
                 "entries",
                 DataType::Struct(Fields::from(vec![
-                    stamped("key", DataType::Int64, 2),
+                    stamped("key", DataType::Int64, 2).with_nullable(false),
                     stamped(value, DataType::Int64, 3),
                 ])),
                 false,
@@ -669,7 +669,7 @@ mod relabel_tests {
         let values = Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef;
         let entries = StructArray::new(
             Fields::from(vec![
-                stamped("key", DataType::Int64, 2),
+                stamped("key", DataType::Int64, 2).with_nullable(false),
                 stamped("old", DataType::Int64, 3),
             ]),
             vec![keys, values],

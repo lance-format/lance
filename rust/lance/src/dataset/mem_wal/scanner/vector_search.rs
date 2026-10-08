@@ -28,7 +28,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_id,
@@ -436,12 +436,11 @@ impl LsmVectorSearchPlanner {
 
         // No cross-source dedup needed (see struct doc): SortExec(per partition)
         // + SortPreservingMerge does the p-way distance-ordered top-k merge.
-        #[allow(deprecated)]
         // The downstream `SortPreservingMergeExec` already spawns one driver
         // task per input partition (one per union arm) via `spawn_buffered`, so
         // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
         // task without an extra repartition.
-        let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
+        let merged = UnionExec::try_new(knn_plans)?;
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(
@@ -651,11 +650,7 @@ impl LsmVectorSearchPlanner {
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -667,20 +662,61 @@ impl LsmVectorSearchPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-                // Supply PKs so the memtable scanner can choose HNSW for
-                // append-only data and exact newest-before-top-k search when
-                // PK rewrites or filters make stale suppression necessary.
-                scanner.with_pk_columns(self.pk_columns.clone());
                 // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                if let Some(ref filter) = self.filter {
+
+                // A memtable created before a schema change uses old column names.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let vector_column = match &generation {
+                    Some(generation) => match generation.stored_name(&self.vector_column) {
+                        Some(stored) => stored.to_string(),
+                        // Created before the searched column existed: no candidates.
+                        None => return self.empty_plan(projection),
+                    },
+                    None => self.vector_column.clone(),
+                };
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(self.filter.as_ref()),
+                    None => (self.filter.clone(), None),
+                };
+
+                // Supply PKs so the memtable scanner can choose HNSW for
+                // append-only data and exact newest-before-top-k search when
+                // PK rewrites or filters make stale suppression necessary.
+                match &generation {
+                    Some(generation) => {
+                        scanner.with_pk_columns(generation.stored_pk_columns()?);
+                        scanner.project(&generation.stored_projection())?;
+                    }
+                    None => {
+                        scanner.with_pk_columns(self.pk_columns.clone());
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
+                }
+                if let Some(stored) = stored_filter {
                     // Routed to filtered brute-force (see `plan_vector_search`):
                     // the predicate masks rows before the memtable top-k cut.
-                    scanner.filter_expr(filter.clone());
+                    scanner.filter_expr(stored);
                 }
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+                // A filter applied after the scan would run after the top-k cut,
+                // so search every row exactly and let the filter cut instead.
+                let k = match above {
+                    None => k,
+                    Some(_) => {
+                        scanner.use_index(false);
+                        batch_store.total_rows().max(1)
+                    }
+                };
+                scanner.nearest(&vector_column, query_vector, k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
                     scanner.minimum_nprobes(minimum_nprobes);
@@ -692,7 +728,11 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                scanner.create_plan().await
+                let plan = Box::pin(scanner.create_plan()).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(plan, &above),
+                    None => Ok(plan),
+                }
             }
         }
     }

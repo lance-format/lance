@@ -1255,6 +1255,9 @@ pub enum TriggerMemTableFlush {
     Flush {
         /// The frozen memtable to flush.
         memtable: Arc<MemTable>,
+        /// The indexes the memtable was built with. Not read from the writer,
+        /// whose set changes with the schema while this memtable keeps the old one.
+        index_configs: Arc<[MemIndexConfig]>,
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
@@ -1263,10 +1266,15 @@ pub enum TriggerMemTableFlush {
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flush { memtable, done } => f
+            Self::Flush {
+                memtable,
+                index_configs,
+                done,
+            } => f
                 .debug_struct("TriggerMemTableFlush::Flush")
                 .field("memtable_gen", &memtable.generation())
                 .field("memtable_rows", &memtable.row_count())
+                .field("index_count", &index_configs.len())
                 .field("has_done", &done.is_some())
                 .finish(),
         }
@@ -1783,7 +1791,7 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1880,7 +1888,7 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
