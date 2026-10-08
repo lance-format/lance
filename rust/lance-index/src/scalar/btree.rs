@@ -96,6 +96,16 @@ const BATCH_SIZE_META_KEY: &str = "batch_size";
 const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
 const PAGE_NUM_PER_RANGE_PARTITION_META_KEY: &str = "page_num_per_range_partition";
+/// BTree index format version 0: the `ids` column stores row ids (`_rowid`).
+///
+/// A row id and a row address are the same value on a dataset that does not
+/// use stable row ids, so a freshly built index is still labeled this
+/// version there even though training always scans addresses -- see
+/// `build_scalar_index`'s BTree-specific override of the trained version.
+/// That keeps a user who never turns on stable row ids from seeing any
+/// forward-compatibility impact from the row-address-domain migration: old
+/// builds already understand this version.
+pub const BTREE_ROW_ID_DOMAIN_VERSION: u32 = 0;
 /// BTree index format version 1: the `ids` column stores physical row
 /// addresses (`_rowaddr`).
 ///
@@ -2252,6 +2262,13 @@ impl BTreeIndex {
                     first.data_type, segment.data_type
                 )));
             }
+            if segment.results_are_row_addresses != first.results_are_row_addresses {
+                return Err(Error::index(
+                    "cannot merge BTree segments that disagree on whether they store row \
+                     ids or row addresses -- rebuild them into one segment first"
+                        .to_string(),
+                ));
+            }
         }
 
         let new_schema = new_data.schema();
@@ -2314,7 +2331,16 @@ impl BTreeIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
-            index_version: BTREE_INDEX_VERSION,
+            // Preserve the source segments' own domain (checked above to
+            // agree) rather than the latest version this build can write:
+            // merging row-id-domain segments (valid on a dataset without
+            // stable row ids) must not silently flip the result to
+            // address-domain.
+            index_version: if first.results_are_row_addresses {
+                BTREE_ROW_ADDR_DOMAIN_VERSION
+            } else {
+                BTREE_ROW_ID_DOMAIN_VERSION
+            },
             files,
         })
     }
@@ -2606,7 +2632,16 @@ impl BTreeIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
-            index_version: BTREE_INDEX_VERSION,
+            // Preserve this segment's own domain rather than the latest
+            // version this build can write: remapping a row-id-domain
+            // segment (valid on a dataset without stable row ids, where a
+            // row id already is a row address) must not silently flip it to
+            // address-domain.
+            index_version: if self.results_are_row_addresses {
+                BTREE_ROW_ADDR_DOMAIN_VERSION
+            } else {
+                BTREE_ROW_ID_DOMAIN_VERSION
+            },
             files: remapped_files,
         })
     }
