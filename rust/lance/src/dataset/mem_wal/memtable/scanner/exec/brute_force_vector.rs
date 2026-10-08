@@ -467,7 +467,7 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 
