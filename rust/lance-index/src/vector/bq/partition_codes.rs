@@ -5,9 +5,10 @@
 //!
 //! A native IVF_RQ index with a flat sub-index whose small columns are
 //! resident caches a partition as its code columns alone
-//! (`EntryColumns::Codes`): every read attaches copies of the resident rows
-//! and builds the storage, so the cache holds no second copy of the row ids
-//! and factors the store already keeps. The codes are kept packed and
+//! (`EntryColumns::Codes`): every read attaches views of the resident rows
+//! (copies under `LANCE_RQ_RESIDENT_ATTACH=copy`) and builds the storage for
+//! that read alone, so the cache holds no second copy of the row ids and
+//! factors the store already keeps. The codes are kept packed and
 //! blocked (see `normalize_entry_codes`), and persisted as a raw fixed-width
 //! body (see [`super::raw_body`]):
 //!
