@@ -367,7 +367,7 @@ impl CacheCodecImpl for BitmapIndexState {
     /// ARROW_IPC : one or more (keys: <value_type>, offsets: UInt64) batches
     /// ```
     /// Batches are in key order and each holds at most
-    /// [`MAX_STATE_LOOKUP_BATCH_BYTES`] of keys, except that a single larger
+    /// `MAX_STATE_LOOKUP_BATCH_BYTES` of keys, except that a single larger
     /// key takes a batch of its own. The value type is recovered from the IPC
     /// section schema.
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
