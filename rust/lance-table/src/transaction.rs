@@ -53,8 +53,9 @@ pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,
 };
 pub use validate::{
-    canonicalize_stable_field_ids, resolve_arrow_field_ids, validate_detached_stable_field_ids,
-    validate_operation, validate_stable_field_id_transition,
+    canonicalize_non_reusable_field_ids, resolve_arrow_field_ids,
+    validate_detached_non_reusable_field_ids, validate_non_reusable_field_id_transition,
+    validate_operation,
 };
 
 use crate::format::{IndexMetadata, Manifest};

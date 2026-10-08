@@ -60,7 +60,7 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
-use lance_table::transaction::validate_stable_field_id_transition;
+use lance_table::transaction::validate_non_reusable_field_id_transition;
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
@@ -2066,7 +2066,7 @@ impl ManifestNamespace {
                 schema.clone(),
                 fragments,
             );
-            if let Err(err) = validate_stable_field_id_transition(
+            if let Err(err) = validate_non_reusable_field_id_transition(
                 dataset.manifest(),
                 &manifest,
                 &transaction.operation,

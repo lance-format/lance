@@ -45,8 +45,9 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
-    FragReuseUpdate, PreparedIndices, canonicalize_stable_field_ids, has_writer_placed_lineage,
-    validate_detached_stable_field_ids, validate_operation, validate_stable_field_id_transition,
+    FragReuseUpdate, PreparedIndices, canonicalize_non_reusable_field_ids,
+    has_writer_placed_lineage, validate_detached_non_reusable_field_ids,
+    validate_non_reusable_field_id_transition, validate_operation,
 };
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
@@ -436,7 +437,7 @@ async fn do_commit_new_dataset(
     session: Arc<Session>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    canonicalize_stable_field_ids(None, &mut transaction.operation, None)?;
+    canonicalize_non_reusable_field_ids(None, &mut transaction.operation, None)?;
     let transaction = &transaction;
     validate_operation(None, &transaction.operation)?;
     let pb_transaction = pb::Transaction::try_from(transaction)?;
@@ -630,7 +631,7 @@ async fn do_commit_new_dataset(
         (manifest, indices)
     };
 
-    if !manifest.uses_stable_field_ids() {
+    if !manifest.uses_non_reusable_field_ids() {
         fix_schema(&mut manifest)?;
     }
 
@@ -898,9 +899,9 @@ pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
         return Ok(());
     }
 
-    if manifest.uses_stable_field_ids() {
+    if manifest.uses_non_reusable_field_ids() {
         return Err(Error::invalid_input(
-            "Cannot repair duplicate field IDs after stable field identity is activated; repair would change an existing identity",
+            "Cannot repair duplicate field IDs after non-reusable field identity is activated; repair would change an existing identity",
         ));
     }
 
@@ -1289,9 +1290,9 @@ pub(crate) async fn do_commit_detached_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
     let mut transaction = transaction.clone();
-    canonicalize_stable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
+    canonicalize_non_reusable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
-    validate_detached_stable_field_ids(&dataset.manifest, &transaction.operation)?;
+    validate_detached_non_reusable_field_ids(&dataset.manifest, &transaction.operation)?;
     validate_operation(Some(&dataset.manifest), &transaction.operation)?;
     // Detached commits skip the rebase pipeline, so a rewrite's transition
     // intent would never be assembled or validated (a dummy intent plus a
@@ -1375,7 +1376,11 @@ pub(crate) async fn do_commit_detached_transaction(
         // Validate before the fragment-id check to preserve legacy migration
         // diagnostics. Finalization repeats this at the manifest write boundary.
         fix_schema(&mut manifest)?;
-        validate_stable_field_id_transition(&dataset.manifest, &manifest, &transaction.operation)?;
+        validate_non_reusable_field_id_transition(
+            &dataset.manifest,
+            &manifest,
+            &transaction.operation,
+        )?;
         crate::dataset::versions::check_manifest_storage_version_for_commit(&mut manifest)?;
         check_fragment_ids(&manifest)?;
         // Runs after the coverage derivation and can replace a fragment bitmap
@@ -1777,12 +1782,13 @@ pub(crate) async fn commit_transaction(
         let attempt_start = Instant::now();
         let retry_start = *retry_start.get_or_insert(attempt_start);
 
-        // Preserve identities from the read version, but allocate new IDs above
-        // the latest high-water mark. Each attempt remaps its own copy of the
+        // Merge preserves fields from the read version; Overwrite replaces all
+        // fields. Allocate new IDs above the latest high-water mark.
+        // Each attempt remaps its own copy of the
         // staged files, so a retry never mistakes a provisional ID for a field
         // introduced by a concurrent commit.
         let mut attempt_transaction = transaction.clone();
-        canonicalize_stable_field_ids(
+        canonicalize_non_reusable_field_ids(
             Some(&dataset.manifest),
             &mut attempt_transaction.operation,
             Some(read_version_dataset.schema()),
@@ -1861,7 +1867,7 @@ pub(crate) async fn commit_transaction(
         migrate_manifest(&dataset, &mut manifest, recompute_stats).await?;
 
         fix_schema(&mut manifest)?;
-        validate_stable_field_id_transition(
+        validate_non_reusable_field_id_transition(
             &dataset.manifest,
             &manifest,
             &attempt_transaction.operation,
@@ -2321,7 +2327,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset.migrate_to_stable_field_ids().await.unwrap();
+        dataset.migrate_to_non_reusable_field_ids().await.unwrap();
 
         let mut foreign_manifest = dataset.manifest.as_ref().clone();
         foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);
@@ -2370,7 +2376,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dataset.migrate_to_stable_field_ids().await.unwrap();
+        dataset.migrate_to_non_reusable_field_ids().await.unwrap();
 
         let mut foreign_manifest = dataset.manifest.as_ref().clone();
         foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);
@@ -2395,8 +2401,8 @@ mod tests {
             metadata: HashMap::new(),
         };
         let mut expected_schema = raw_schema.clone();
-        expected_schema.fields[0].id = 0;
-        expected_schema.fields[1].id = 2;
+        expected_schema.fields[0].id = if overwrite { 2 } else { 0 };
+        expected_schema.fields[1].id = if overwrite { 3 } else { 2 };
         let mut operation = if overwrite {
             Operation::Overwrite {
                 fragments: vec![merged_fragment],
@@ -2420,14 +2426,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(committed.schema(), &expected_schema);
-        assert_eq!(committed.manifest.max_allocated_field_id, Some(2));
+        assert_eq!(
+            committed.manifest.max_allocated_field_id,
+            Some(if overwrite { 3 } else { 2 })
+        );
         assert_eq!(
             committed.manifest.fragments[0].files[0].fields.as_ref(),
-            &[0]
+            &[expected_schema.fields[0].id]
         );
         assert_eq!(
             committed.manifest.fragments[0].files[1].fields.as_ref(),
-            &[2]
+            &[expected_schema.fields[1].id]
         );
     }
 
@@ -3159,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_schema_does_not_reassign_stable_field_identity() {
+    fn test_fix_schema_does_not_reassign_non_reusable_field_identity() {
         let mut field =
             Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
         field.id = 0;
@@ -3178,11 +3187,14 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        manifest.activate_stable_field_ids();
+        manifest.activate_non_reusable_field_ids();
 
         let err = fix_schema(&mut manifest).unwrap_err();
 
-        assert!(err.to_string().contains("stable field identity"), "{err}");
+        assert!(
+            err.to_string().contains("non-reusable field identity"),
+            "{err}"
+        );
         assert_eq!(manifest.schema.field("a").unwrap().id, 0);
     }
 

@@ -1545,9 +1545,9 @@ fn convert_arrow_schema(
         })?
     };
 
-    let Some(manifest) = manifest
-        .filter(|manifest| !manifest.uses_stable_field_ids() && operation_name != "Overwrite")
-    else {
+    let Some(manifest) = manifest.filter(|manifest| {
+        !manifest.uses_non_reusable_field_ids() && operation_name != "Overwrite"
+    }) else {
         return Ok(ConvertedSchema {
             schema: original_schema,
             field_id_remap: HashMap::new(),
@@ -2494,7 +2494,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_java_schema_conversion_preserves_unassigned_ids() {
+    fn non_reusable_java_schema_conversion_preserves_unassigned_ids() {
         let mut base = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
         base.id = 0;
         let base_schema = LanceSchema {
@@ -2510,7 +2510,7 @@ mod tests {
             Default::default(),
             HashMap::new(),
         );
-        manifest.activate_stable_field_ids();
+        manifest.activate_non_reusable_field_ids();
 
         let ConvertedSchema {
             schema,
@@ -2523,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_java_project_preserves_explicit_ids_and_metadata() {
+    fn non_reusable_java_project_preserves_explicit_ids_and_metadata() {
         let base_schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
             "a",
             ArrowDataType::Int32,
@@ -2543,7 +2543,7 @@ mod tests {
             Default::default(),
             HashMap::new(),
         );
-        manifest.activate_stable_field_ids();
+        manifest.activate_non_reusable_field_ids();
         let converted = convert_arrow_schema(&arrow_schema, Some(&manifest), "Project").unwrap();
         assert_eq!(converted.schema.field("renamed").unwrap().id, 0);
         assert_eq!(converted.schema.metadata, metadata);

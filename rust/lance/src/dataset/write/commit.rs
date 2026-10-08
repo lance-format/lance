@@ -53,8 +53,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
-    /// Whether this commit atomically activates stable field IDs.
-    activate_stable_field_ids: bool,
+    /// Whether this commit atomically activates non-reusable field IDs.
+    activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
 }
@@ -81,7 +81,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
-            activate_stable_field_ids: false,
+            activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
         }
     }
@@ -282,8 +282,8 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    pub(crate) fn with_stable_field_id_migration_activation(mut self) -> Self {
-        self.activate_stable_field_ids = true;
+    pub(crate) fn with_non_reusable_field_id_migration_activation(mut self) -> Self {
+        self.activate_non_reusable_field_ids = true;
         self
     }
 
@@ -453,7 +453,7 @@ impl<'a> CommitBuilder<'a> {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
-            activate_stable_field_ids: self.activate_stable_field_ids,
+            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             ..Default::default()
         };
 
@@ -692,7 +692,7 @@ mod tests {
             .execute(vec![batch.clone()])
             .await
             .unwrap();
-        dataset.migrate_to_stable_field_ids().await.unwrap();
+        dataset.migrate_to_non_reusable_field_ids().await.unwrap();
         let mut raw_schema = dataset.schema().clone();
         for field in &mut raw_schema.fields {
             field.id += 10;

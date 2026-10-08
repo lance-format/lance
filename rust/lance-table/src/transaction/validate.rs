@@ -19,7 +19,8 @@ type DataFileIdentity = (Option<u32>, String);
 
 /// Resolve an Arrow-derived operation against the dataset it was read from.
 ///
-/// Overwrite and Merge match fields by name and type, not positional Arrow IDs.
+/// Overwrite assigns new IDs to every field. Merge matches fields by name and
+/// type, not positional Arrow IDs.
 /// Project may use explicit IDs for renames; its conversion must leave missing
 /// IDs unassigned. New file mappings follow the resolved schema; retained files
 /// are unchanged. Call this at the conversion boundary, before committing the
@@ -36,7 +37,7 @@ pub fn resolve_arrow_field_ids(
     manifest: Option<&Manifest>,
     operation: &mut Operation,
 ) -> Result<()> {
-    if manifest.is_some_and(|manifest| !manifest.uses_stable_field_ids()) {
+    if manifest.is_some_and(|manifest| !manifest.uses_non_reusable_field_ids()) {
         match operation {
             Operation::Overwrite { schema, .. }
             | Operation::Project { schema, .. }
@@ -75,7 +76,8 @@ pub fn resolve_arrow_field_ids(
                 .flat_map(|fragment| fragment.referenced_lance_files())
                 .map(|file| (file.base_id, file.path.clone()))
                 .collect();
-            let field_id_remap = canonicalize_schema(Some(manifest), schema, None, true)?;
+            let field_id_remap =
+                canonicalize_schema(Some(manifest), schema, Some(&manifest.schema), true)?;
             resolve_fragment_field_ids(fragments, &field_id_remap, &retained_files, schema)?;
         }
         _ => {}
@@ -85,33 +87,32 @@ pub fn resolve_arrow_field_ids(
 
 /// Assign IDs and update new file mappings before committing a Lance operation.
 ///
-/// `manifest` is the latest version. On a retry, `read_schema` identifies which
-/// input IDs referred to existing fields when the transaction was prepared;
-/// `None` uses the manifest's schema. New fields are allocated above the latest
-/// high-water mark, without binding their provisional IDs to fields introduced
+/// `manifest` is the latest version. Overwrite assigns new IDs to every field.
+/// For Merge, `read_schema` identifies existing fields when the transaction was
+/// prepared; `None` uses the manifest's schema. New fields are allocated above
+/// the latest high-water mark, without binding their provisional IDs to fields introduced
 /// by a concurrent commit. Arrow inputs must first use [`resolve_arrow_field_ids`].
 ///
 /// ```no_run
-/// # use lance_table::{format::Manifest, transaction::{Operation, canonicalize_stable_field_ids}};
+/// # use lance_table::{format::Manifest, transaction::{Operation, canonicalize_non_reusable_field_ids}};
 /// # fn commit(read: &Manifest, latest: &Manifest, operation: &mut Operation) -> lance_core::Result<()> {
-/// canonicalize_stable_field_ids(Some(latest), operation, Some(&read.schema))?;
+/// canonicalize_non_reusable_field_ids(Some(latest), operation, Some(&read.schema))?;
 /// # Ok(())
 /// # }
 /// ```
-pub fn canonicalize_stable_field_ids(
+pub fn canonicalize_non_reusable_field_ids(
     manifest: Option<&Manifest>,
     operation: &mut Operation,
     read_schema: Option<&Schema>,
 ) -> Result<()> {
-    if manifest.is_some_and(|manifest| !manifest.uses_stable_field_ids()) {
+    if manifest.is_some_and(|manifest| !manifest.uses_non_reusable_field_ids()) {
         return Ok(());
     }
     match operation {
         Operation::Overwrite {
             schema, fragments, ..
         } => {
-            let identity_schema = read_schema.or_else(|| manifest.map(|manifest| &manifest.schema));
-            let remap = canonicalize_schema(manifest, schema, identity_schema, false)?;
+            let remap = canonicalize_schema(manifest, schema, None, false)?;
             remap_fragment_field_ids(fragments, &remap, &HashSet::new());
         }
         Operation::Merge {
@@ -213,7 +214,7 @@ fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> 
 fn canonicalize_schema(
     manifest: Option<&Manifest>,
     schema: &mut Schema,
-    identity_schema: Option<&Schema>,
+    matching_schema: Option<&Schema>,
     remap_raw_source_ids: bool,
 ) -> Result<HashMap<i32, i32>> {
     let mut original = schema.clone();
@@ -222,13 +223,13 @@ fn canonicalize_schema(
     }
 
     let max_existing_id = manifest.map(Manifest::max_field_id);
-    if manifest.is_none() {
-        schema.try_reassign_field_ids(max_existing_id)?;
-    } else if let Some(manifest) = manifest {
+    if let Some(matching_schema) = matching_schema {
         for field in &mut schema.fields {
-            canonicalize_field(field, -1, &manifest.schema, None, identity_schema);
+            canonicalize_field(field, -1, matching_schema, None, None);
         }
         schema.try_set_field_id(max_existing_id)?;
+    } else {
+        schema.try_reassign_field_ids(max_existing_id)?;
     }
     schema.validate()?;
     schema.verify_primary_key()?;
@@ -455,18 +456,18 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         _ => Ok(()),
     };
     result?;
-    validate_stable_field_id_operation(manifest, operation)
+    validate_non_reusable_field_id_operation(manifest, operation)
 }
 
-/// Validate stable-field-ID invariants that are independent of one operation.
-fn validate_stable_field_id_manifest(manifest: &Manifest) -> Result<()> {
+/// Validate non-reusable-field-ID invariants that are independent of one operation.
+fn validate_non_reusable_field_id_manifest(manifest: &Manifest) -> Result<()> {
     let Some(max_allocated_field_id) = manifest.max_allocated_field_id else {
         return Ok(());
     };
     let max_referenced_field_id = manifest.max_referenced_field_id();
     if max_allocated_field_id < max_referenced_field_id {
         return Err(Error::invalid_input(format!(
-            "Stable field-ID high-water mark {} is below referenced field ID {}",
+            "Non-reusable field-ID high-water mark {} is below referenced field ID {}",
             max_allocated_field_id, max_referenced_field_id
         )));
     }
@@ -480,7 +481,7 @@ fn validate_stable_field_id_manifest(manifest: &Manifest) -> Result<()> {
 /// high-water mark are legal only when the canonical successor schema contains
 /// that newly allocated identity. Overwrite has no retained physical state, so
 /// every non-negative reference must belong to its replacement schema.
-pub fn validate_stable_field_id_transition(
+pub fn validate_non_reusable_field_id_transition(
     parent: &Manifest,
     successor: &Manifest,
     operation: &Operation,
@@ -490,12 +491,12 @@ pub fn validate_stable_field_id_transition(
     };
     let Some(successor_max_field_id) = successor.max_allocated_field_id else {
         return Err(Error::invalid_input(
-            "Stable field-ID activation marker is missing from the successor manifest",
+            "Non-reusable field-ID activation marker is missing from the successor manifest",
         ));
     };
     if successor_max_field_id < parent_max_field_id {
         return Err(Error::invalid_input(format!(
-            "Stable field-ID high-water mark decreases from {parent_max_field_id} to {successor_max_field_id}"
+            "Non-reusable field-ID high-water mark decreases from {parent_max_field_id} to {successor_max_field_id}"
         )));
     }
     let successor_schema_ids = successor
@@ -507,10 +508,10 @@ pub fn validate_stable_field_id_transition(
     if !matches!(operation, Operation::Restore { .. }) {
         validate_new_field_ids(
             parent,
-            successor
-                .schema
-                .fields_pre_order()
-                .filter(|field| parent.schema.field_by_id(field.id).is_none()),
+            successor.schema.fields_pre_order().filter(|field| {
+                matches!(operation, Operation::Overwrite { .. })
+                    || parent.schema.field_by_id(field.id).is_none()
+            }),
         )?;
     }
 
@@ -546,7 +547,7 @@ fn validate_new_field_ids<'a>(
     for field in new_fields {
         if field.id <= max_allocated_field_id {
             return Err(Error::invalid_input(format!(
-                "New field '{}' has ID {}, but stable field IDs must be greater than the high-water mark {}",
+                "New field '{}' has ID {}, but non-reusable field IDs must be greater than the high-water mark {}",
                 field.name, field.id, max_allocated_field_id
             )));
         }
@@ -554,11 +555,14 @@ fn validate_new_field_ids<'a>(
     Ok(())
 }
 
-fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation) -> Result<()> {
-    if !manifest.uses_stable_field_ids() {
+fn validate_non_reusable_field_id_operation(
+    manifest: &Manifest,
+    operation: &Operation,
+) -> Result<()> {
+    if !manifest.uses_non_reusable_field_ids() {
         return Ok(());
     }
-    validate_stable_field_id_manifest(manifest)?;
+    validate_non_reusable_field_id_manifest(manifest)?;
 
     let (Operation::Overwrite { schema, .. }
     | Operation::Merge { schema, .. }
@@ -568,13 +572,17 @@ fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation
     };
     schema.validate()?;
 
+    if matches!(operation, Operation::Overwrite { .. }) {
+        return validate_new_field_ids(manifest, schema.fields_pre_order());
+    }
+
     for field in schema.fields_pre_order() {
         let Some(prior_field) = manifest.schema.field_by_id(field.id) else {
             continue;
         };
         if field.parent_id != prior_field.parent_id {
             return Err(Error::invalid_input(format!(
-                "Field ID {} moves from parent {} to parent {}; stable field identity cannot move between parents",
+                "Field ID {} moves from parent {} to parent {}; non-reusable field identity cannot move between parents",
                 field.id, prior_field.parent_id, field.parent_id
             )));
         }
@@ -594,12 +602,12 @@ fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation
     )
 }
 
-/// Reject detached schema changes once stable field identity is active.
-pub fn validate_detached_stable_field_ids(
+/// Reject detached schema changes once non-reusable field identity is active.
+pub fn validate_detached_non_reusable_field_ids(
     manifest: &Manifest,
     operation: &Operation,
 ) -> Result<()> {
-    if !manifest.uses_stable_field_ids() {
+    if !manifest.uses_non_reusable_field_ids() {
         return Ok(());
     }
     match operation {
@@ -608,7 +616,7 @@ pub fn validate_detached_stable_field_ids(
         | Operation::Project { .. }
         | Operation::Overwrite { .. }
         | Operation::Restore { .. } => Err(Error::invalid_input(
-            "Detached commits cannot change schema after stable field IDs are activated",
+            "Detached commits cannot change schema after non-reusable field IDs are activated",
         )),
         _ => Ok(()),
     }
@@ -1103,12 +1111,12 @@ mod tests {
     fn activated_manifest() -> Manifest {
         let schema = one_field_schema();
         let mut manifest = manifest_with_file_fields(schema, vec![0]);
-        manifest.activate_stable_field_ids();
+        manifest.activate_non_reusable_field_ids();
         manifest
     }
 
     #[test]
-    fn stable_field_ids_allow_reserved_ids_above_high_water_mark() {
+    fn non_reusable_field_ids_allow_reserved_ids_above_high_water_mark() {
         let mut manifest = activated_manifest();
         manifest.max_allocated_field_id = Some(5);
         let mut schema = manifest.schema.clone();
@@ -1144,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_ids_require_fresh_identity_for_type_replacement() {
+    fn non_reusable_field_ids_require_fresh_identity_for_type_replacement() {
         let manifest = activated_manifest();
         let mut schema = manifest.schema.clone();
         schema.fields[0].logical_type = LogicalType::try_from(&DataType::Float32).unwrap();
@@ -1159,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_ids_allow_overwrite_to_preserve_compatible_identity() {
+    fn non_reusable_field_ids_reject_overwrite_with_existing_ids() {
         let manifest = activated_manifest();
         let schema = manifest.schema.clone();
         let operation = Operation::Overwrite {
@@ -1169,7 +1177,17 @@ mod tests {
             initial_bases: None,
         };
 
-        validate_operation(Some(&manifest), &operation).unwrap();
+        for err in [
+            validate_operation(Some(&manifest), &operation).unwrap_err(),
+            validate_non_reusable_field_id_transition(&manifest, &manifest, &operation)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(
+                err.to_string()
+                    .contains("greater than the high-water mark 0")
+            );
+        }
     }
 
     #[test]
@@ -1184,7 +1202,7 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, None).unwrap();
+        canonicalize_non_reusable_field_ids(Some(&manifest), &mut operation, None).unwrap();
 
         let Operation::Overwrite {
             schema, fragments, ..
@@ -1192,8 +1210,34 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(schema.fields[0].id, 0);
-        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+        assert_eq!(schema.fields[0].id, 1);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
+    }
+
+    #[rstest::rstest]
+    #[case::last_id(i32::MAX - 1)]
+    #[case::exhausted(i32::MAX)]
+    fn overwrite_cannot_keep_existing_ids_to_avoid_exhaustion(#[case] max_id: i32) {
+        let mut manifest = activated_manifest();
+        manifest.max_allocated_field_id = Some(max_id);
+        let mut operation = Operation::Overwrite {
+            schema: manifest.schema.clone(),
+            fragments: vec![],
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+        let result = canonicalize_non_reusable_field_ids(Some(&manifest), &mut operation, None);
+        if max_id == i32::MAX {
+            let err = result.unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("IDs are exhausted"));
+        } else {
+            result.unwrap();
+            let Operation::Overwrite { schema, .. } = operation else {
+                unreachable!();
+            };
+            assert_eq!(schema.fields[0].id, i32::MAX);
+        }
     }
 
     #[test]
@@ -1216,16 +1260,13 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(schema.fields[0].id, 0);
-        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+        assert_eq!(schema.fields[0].id, 1);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
     }
 
     #[rstest::rstest]
-    #[case::concurrent_add(false, vec![0, 2])]
-    #[case::concurrent_replace(true, vec![2, 3])]
-    fn canonicalize_overwrite_retry_preserves_only_live_read_identities(
-        #[case] replace: bool,
-        #[case] expected_ids: Vec<i32>,
+    fn canonicalize_overwrite_retry_assigns_all_ids_above_latest_mark(
+        #[values(false, true)] replace: bool,
     ) {
         let read = activated_manifest();
         let mut staged = read.schema.clone();
@@ -1240,7 +1281,7 @@ mod tests {
         latest_schema.fields.push(new_field);
         let latest_ids = latest_schema.field_ids().into_iter().collect();
         let mut latest = manifest_with_file_fields(latest_schema, latest_ids);
-        latest.activate_stable_field_ids();
+        latest.activate_non_reusable_field_ids();
         let mut operation = Operation::Overwrite {
             schema: staged,
             fragments: vec![fragment_with_file_fields(0, "new.lance", vec![0, 1])],
@@ -1248,7 +1289,8 @@ mod tests {
             initial_bases: None,
         };
 
-        canonicalize_stable_field_ids(Some(&latest), &mut operation, Some(&read.schema)).unwrap();
+        canonicalize_non_reusable_field_ids(Some(&latest), &mut operation, Some(&read.schema))
+            .unwrap();
         validate_operation(Some(&latest), &operation).unwrap();
 
         let Operation::Overwrite {
@@ -1263,21 +1305,21 @@ mod tests {
                 .iter()
                 .map(|field| field.id)
                 .collect::<Vec<_>>(),
-            expected_ids
+            vec![2, 3]
         );
-        assert_eq!(fragments[0].files[0].fields.as_ref(), expected_ids);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[2, 3]);
         assert_eq!(schema.fields[1].name, "new_column");
     }
 
     #[test]
-    fn canonicalize_raw_arrow_overwrite_matches_reordered_fields_by_name() {
+    fn canonicalize_raw_arrow_overwrite_assigns_new_ids_in_schema_order() {
         let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, true),
             ArrowField::new("b", DataType::Int32, true),
         ]))
         .unwrap();
         let mut manifest = manifest_with_file_fields(schema, vec![0, 1]);
-        manifest.activate_stable_field_ids();
+        manifest.activate_non_reusable_field_ids();
         let mut raw_schema = LanceSchema::try_from(&ArrowSchema::new(vec![
             ArrowField::new("b", DataType::Int32, true),
             ArrowField::new("a", DataType::Int32, true),
@@ -1298,8 +1340,8 @@ mod tests {
         let Operation::Overwrite { schema, .. } = operation else {
             unreachable!();
         };
-        assert_eq!(schema.field("b").unwrap().id, 1);
-        assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.field("b").unwrap().id, 2);
+        assert_eq!(schema.field("a").unwrap().id, 3);
         assert_eq!(schema.metadata.get("source").unwrap(), "user metadata");
     }
 
@@ -1474,7 +1516,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, None).unwrap();
+        canonicalize_non_reusable_field_ids(Some(&manifest), &mut operation, None).unwrap();
 
         let Operation::Merge {
             schema, fragments, ..
@@ -1511,7 +1553,7 @@ mod tests {
             preserves_nullability: true,
         };
 
-        canonicalize_stable_field_ids(Some(&manifest), &mut operation, None).unwrap();
+        canonicalize_non_reusable_field_ids(Some(&manifest), &mut operation, None).unwrap();
 
         let Operation::Merge {
             schema, fragments, ..
@@ -1554,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_id_manifest_rejects_high_water_mark_below_overlay_reference() {
+    fn non_reusable_field_id_manifest_rejects_high_water_mark_below_overlay_reference() {
         let mut manifest = activated_manifest();
         Arc::make_mut(&mut manifest.fragments)[0]
             .overlays
@@ -1564,7 +1606,7 @@ mod tests {
                 committed_version: 1,
             });
 
-        let err = validate_stable_field_id_manifest(&manifest).unwrap_err();
+        let err = validate_non_reusable_field_id_manifest(&manifest).unwrap_err();
 
         assert!(
             err.to_string().contains("below referenced field ID 7"),
@@ -1573,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_id_transition_rejects_file_only_allocator_advance() {
+    fn non_reusable_field_id_transition_rejects_file_only_allocator_advance() {
         let manifest = activated_manifest();
         let mut successor = Manifest::new_from_previous(
             &manifest,
@@ -1588,8 +1630,8 @@ mod tests {
             field_metadata_updates: HashMap::new(),
         };
 
-        let err =
-            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+        let err = validate_non_reusable_field_id_transition(&manifest, &successor, &operation)
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("canonical successor schema"),
@@ -1598,7 +1640,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_id_transition_rejects_decreasing_high_water_mark() {
+    fn non_reusable_field_id_transition_rejects_decreasing_high_water_mark() {
         let manifest = activated_manifest();
         let mut successor = Manifest::new_from_previous(
             &manifest,
@@ -1613,8 +1655,8 @@ mod tests {
             field_metadata_updates: HashMap::new(),
         };
 
-        let err =
-            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+        let err = validate_non_reusable_field_id_transition(&manifest, &successor, &operation)
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("high-water mark decreases"),
@@ -1623,14 +1665,14 @@ mod tests {
     }
 
     #[test]
-    fn detached_stable_field_ids_allow_data_only_merge_and_reject_schema_change() {
+    fn detached_non_reusable_field_ids_allow_data_only_merge_and_reject_schema_change() {
         let manifest = activated_manifest();
         let data_only = Operation::Merge {
             fragments: manifest.fragments.as_ref().clone(),
             schema: manifest.schema.clone(),
             preserves_nullability: true,
         };
-        validate_detached_stable_field_ids(&manifest, &data_only).unwrap();
+        validate_detached_non_reusable_field_ids(&manifest, &data_only).unwrap();
 
         let mut changed_schema = manifest.schema.clone();
         changed_schema.fields[0].name = "renamed".to_string();
@@ -1638,7 +1680,7 @@ mod tests {
             schema: changed_schema,
             preserves_nullability: true,
         };
-        let err = validate_detached_stable_field_ids(&manifest, &schema_change).unwrap_err();
+        let err = validate_detached_non_reusable_field_ids(&manifest, &schema_change).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Detached commits cannot change schema"),

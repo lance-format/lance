@@ -1924,7 +1924,7 @@ pub(super) fn prepare_write_schema(
         projected
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Overwrite)
-        && dataset.manifest.uses_stable_field_ids()
+        && dataset.manifest.uses_non_reusable_field_ids()
     {
         // Uncommitted fragment APIs return files without the schema used to
         // write them, so their mappings must already use commit-time IDs.
@@ -1940,7 +1940,7 @@ pub(super) fn prepare_write_schema(
             Operation::Overwrite { schema, .. } => schema,
             _ => {
                 return Err(Error::internal(
-                    "Stable field-ID canonicalization changed an Overwrite operation",
+                    "Non-reusable field-ID canonicalization changed an Overwrite operation",
                 ));
             }
         }

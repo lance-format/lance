@@ -28,7 +28,7 @@ A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
 a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
 
-`max_allocated_field_id` is optional. If a manifest sets it, the dataset uses stable field IDs from
+`max_allocated_field_id` is optional. If a manifest sets it, the dataset uses non-reusable field IDs from
 that version onward. See [Field IDs](schema.md#field-ids).
 
 The field is a high-water mark. It starts at the largest field ID that the activation manifest
@@ -37,6 +37,7 @@ references. It then records the largest ID assigned after activation. When a man
 - Every field ID of 0 or greater in the manifest schema, a `DataFile.fields` mapping, or an overlay
   mapping must be less than or equal to `max_allocated_field_id`.
 - A writer must not lower `max_allocated_field_id` from the value in the previous manifest.
+- A writer must not assign a previously allocated field ID to another field.
 - A writer that adds fields must assign IDs greater than the previous `max_allocated_field_id` and
   set the new high-water mark to at least the largest ID it assigned. The writer must fail if an
   assigned ID does not fit in an `int32`.

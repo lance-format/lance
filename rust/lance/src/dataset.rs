@@ -152,7 +152,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
     apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    validate_paired_feature_flags, validate_stable_field_id_flags,
+    validate_non_reusable_field_id_flags, validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -3312,12 +3312,12 @@ impl Dataset {
     /// ```
     /// # use lance::{Dataset, Result};
     /// # async fn activate(dataset: &mut Dataset) -> Result<()> {
-    /// dataset.migrate_to_stable_field_ids().await?;
+    /// dataset.migrate_to_non_reusable_field_ids().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn migrate_to_stable_field_ids(&mut self) -> Result<()> {
-        if self.manifest.uses_stable_field_ids() {
+    pub async fn migrate_to_non_reusable_field_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_non_reusable_field_ids() {
             return Ok(());
         }
 
@@ -3334,7 +3334,7 @@ impl Dataset {
         );
         let new_ds = CommitBuilder::new(Arc::new(self.clone()))
             .with_max_retries(0)
-            .with_stable_field_id_migration_activation()
+            .with_non_reusable_field_id_migration_activation()
             .execute(transaction)
             .await?;
         *self = new_ds;
@@ -4246,8 +4246,8 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
-    /// Whether this commit activates stable field IDs.
-    activate_stable_field_ids: bool,
+    /// Whether this commit activates non-reusable field IDs.
+    activate_non_reusable_field_ids: bool,
     /// This commit is a tagged fragment-reuse-index trim derived by
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
@@ -4264,7 +4264,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
-            activate_stable_field_ids: false,
+            activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
         }
     }
@@ -4307,7 +4307,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
-            activate_stable_field_ids: self.activate_stable_field_ids,
+            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             spilled_row_lineage: Default::default(),
         }
     }
@@ -4404,7 +4404,7 @@ pub(crate) async fn write_manifest_file(
         indices.as_deref().unwrap_or_default(),
     )?;
 
-    validate_stable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
+    validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));

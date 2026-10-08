@@ -227,11 +227,11 @@ Note: A `parent_id` of -1 indicates a top-level field. For nested fields, `paren
 - If the manifest does not set the field, the dataset uses the legacy behavior. A writer may choose
   the next ID from fields the current version still references. It may therefore reuse the ID of a
   dropped field.
-- If the manifest sets the field, the dataset uses stable field IDs. A writer assigns each new field
+- If the manifest sets the field, the dataset uses non-reusable field IDs. A writer assigns each new field
   an ID greater than `max_allocated_field_id`. It does not reuse an ID dropped or replaced after
   activation.
 
-For stable field IDs, a caller cannot choose the ID of a new field. An Arrow schema may carry
+For non-reusable field IDs, a caller cannot choose the ID of a new field. An Arrow schema may carry
 field-ID metadata, but the writer discards that metadata for new fields and assigns the IDs. The IDs
 do not have to be consecutive, which leaves room for a future reservation mechanism.
 
@@ -239,12 +239,12 @@ The first manifest that sets `max_allocated_field_id` initializes it to the larg
 or greater in the manifest schema, base data files, and overlay files. Earlier versions keep the
 legacy behavior. Activation cannot recover an ID that an earlier version dropped or reused.
 
-`max_allocated_field_id` stores the allocator state. `FLAG_STABLE_FIELD_IDS` tells writers that they
-must honor that state. A legacy manifest sets neither value. A stable manifest sets both. A manifest
-that sets only one is invalid. The reader flag for stable field IDs must remain unset because the
+`max_allocated_field_id` stores the allocator state. `FLAG_NON_REUSABLE_FIELD_IDS` tells writers that they
+must honor that state. A legacy manifest sets neither value. An activated manifest sets both. A manifest
+that sets only one is invalid. The reader flag for non-reusable field IDs must remain unset because the
 feature does not change read behavior.
 
-A dataset changes to stable field IDs only through an explicit migration commit. Before activation,
+A dataset changes to non-reusable field IDs only through an explicit migration commit. Before activation,
 operators must ensure that all clients that can write to the dataset enforce writer feature flags,
 rejecting writes when they do not support a required flag. Clients that ignore these flags must no
 longer write to the dataset: they may discard the high-water mark and allow field IDs to be reused.
@@ -258,13 +258,14 @@ from reusing IDs, but does not resolve this existing conflict. Reading old versi
 
 ### Field ID Properties
 
-- **Stable**: A field keeps the same ID for as long as the field exists.
+- **Preserved**: A field keeps the same ID for as long as the field exists.
 - **Unique**: No two fields in one dataset version have the same ID.
 - **Sparse**: The field IDs in one version do not have to be consecutive.
 
 When `max_allocated_field_id` is set, two more properties apply:
 
-- **Not reused**: After activation, no later version uses the ID of a dropped or replaced field.
+- **Not reassigned**: After activation, a writer must not assign a field's ID to another field,
+  even after the original field is dropped or replaced.
 - **Increasing**: Every new ID is greater than the activation high-water mark and every ID assigned
   after activation.
 
@@ -348,8 +349,9 @@ Field IDs enable efficient schema evolution:
 - **Metadata or Nullability Change**: Preserve the field ID
 - **Type Replacement**: A cast creates a replacement field with a new ID and retires the old
   identity. This keeps one logical type bound to an ID in every version that references it
-- **Overwrite**: Preserve compatible logical identities; allocate new IDs for added fields and type
-  replacements
+- **Overwrite**: When `max_allocated_field_id` is set, replace all fields and assign every field,
+  including nested fields, a new ID above the previous high-water mark. This applies even when
+  names and types are unchanged. References to old field IDs do not identify the replacement fields
 
 The use of field IDs ensures that data files can be correctly interpreted even as the schema changes over time.
 

@@ -77,7 +77,7 @@ pub struct Manifest {
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
 
-    /// The highest field ID allocated since stable field identity was activated.
+    /// The highest field ID allocated since non-reusable field identity was activated.
     /// `None` means the dataset still uses the legacy live-reference allocator.
     pub max_allocated_field_id: Option<i32>,
 
@@ -501,13 +501,13 @@ impl Manifest {
         schema_max_id.max(fragment_max_id)
     }
 
-    /// Whether the stable-field-ID allocation contract is active.
-    pub fn uses_stable_field_ids(&self) -> bool {
+    /// Whether the non-reusable-field-ID allocation contract is active.
+    pub fn uses_non_reusable_field_ids(&self) -> bool {
         self.max_allocated_field_id.is_some()
     }
 
-    /// Activate stable field IDs at the maximum ID visible in this snapshot.
-    pub fn activate_stable_field_ids(&mut self) {
+    /// Activate non-reusable field IDs at the maximum ID visible in this snapshot.
+    pub fn activate_non_reusable_field_ids(&mut self) {
         if self.max_allocated_field_id.is_none() {
             self.max_allocated_field_id = Some(self.max_referenced_field_id());
         }
@@ -806,8 +806,8 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
-    /// Whether this commit atomically activates stable field IDs.
-    pub activate_stable_field_ids: bool,
+    /// Whether this commit atomically activates non-reusable field IDs.
+    pub activate_non_reusable_field_ids: bool,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
@@ -1247,7 +1247,7 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{FLAG_STABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
@@ -1747,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_id_high_water_mark_survives_dropped_references_and_round_trip() {
+    fn non_reusable_field_id_high_water_mark_survives_dropped_references_and_round_trip() {
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("a", arrow_schema::DataType::Int64, false),
             ArrowField::new("b", arrow_schema::DataType::Int64, false),
@@ -1768,8 +1768,8 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        manifest.activate_stable_field_ids();
-        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        manifest.activate_non_reusable_field_ids();
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
         assert_eq!(manifest.max_allocated_field_id, Some(1));
 
         manifest.schema.fields.pop();
@@ -1793,8 +1793,14 @@ mod tests {
             recovered.fragments[0].files[0].column_indices.as_ref(),
             &[0, 1]
         );
-        assert_eq!(recovered.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        assert_ne!(recovered.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(
+            recovered.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_ne!(
+            recovered.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
 
         recovered.schema.fields.push(
             Field::try_from(ArrowField::new("c", arrow_schema::DataType::Int64, false)).unwrap(),
@@ -1810,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn shallow_clone_preserves_stable_field_id_allocation_state() {
+    fn shallow_clone_preserves_non_reusable_field_id_allocation_state() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "a",
             arrow_schema::DataType::Int64,
@@ -1824,7 +1830,7 @@ mod tests {
             HashMap::new(),
         );
         manifest.max_allocated_field_id = Some(41);
-        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
 
         let cloned = manifest.shallow_clone(
             Some("parent".to_string()),
@@ -1835,8 +1841,8 @@ mod tests {
         );
 
         assert_eq!(cloned.max_allocated_field_id, Some(41));
-        assert_eq!(cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(cloned.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
+        assert_ne!(cloned.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
     }
 
     #[test]

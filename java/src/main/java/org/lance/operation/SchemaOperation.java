@@ -31,9 +31,10 @@ import java.util.Objects;
  *   <li>Otherwise, allocate based on the max field id of the dataset.
  * </ol>
  *
- * <p>Datasets use stable field IDs only after explicit migration. On those datasets, compatible
- * existing fields keep their identities, while new IDs are assigned by the dataset allocator and
- * field mappings in fragments committed by the same operation are remapped to the canonical IDs.
+ * <p>Datasets use non-reusable field IDs only after explicit migration. On those datasets,
+ * Overwrite assigns new IDs to every field, even if names and types are unchanged. Other operations
+ * preserve existing field IDs unless they replace the field. New IDs are assigned by the dataset
+ * allocator, and field mappings in newly written fragments are updated to match.
  */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;

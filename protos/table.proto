@@ -278,13 +278,15 @@ message Manifest {
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
 
-  /* The stable field-ID allocator high-water mark.
+  /* The non-reusable field-ID allocator high-water mark.
    *
    * The first manifest that sets this field initializes it to the largest
    * field ID the manifest references. Later writers assign new IDs above it.
    * A dropped ID remains covered by this value and must not be reused.
+   * An overwrite assigns every field a new ID above the previous high-water
+   * mark, even when field names and types are unchanged.
    *
-   * This field and FLAG_STABLE_FIELD_IDS in writer_feature_flags must either
+   * This field and FLAG_NON_REUSABLE_FIELD_IDS in writer_feature_flags must either
    * both be set or both be absent. A mismatch is invalid.
    */
   optional int32 max_allocated_field_id = 24;
