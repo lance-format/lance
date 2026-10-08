@@ -136,13 +136,9 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                             right: Box::new(coerce_expr(right, &left_type)?),
                         }))
                     }
-                    // Expressions that reference columns have their own type context. Resolving
-                    // them recursively prevents their literals from inheriting the outer type.
-                    Expr::BinaryExpr(_) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: left.clone(),
-                        op: *op,
-                        right: Box::new(resolve_expr(right, schema)?),
-                    })),
+                    // Let DataFusion coerce other expressions. Recursively resolving them
+                    // can narrow literals to an inner column's type before arithmetic promotes
+                    // its operands, for example the 0.5 in `float_col = int_col + 0.5`.
                     _ => Ok(expr.clone()),
                 }
             } else if let Some(right_type) = resolve_column_type(right.as_ref(), schema) {

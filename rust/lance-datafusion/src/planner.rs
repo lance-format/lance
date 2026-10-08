@@ -1272,13 +1272,14 @@ mod tests {
     ) {
         let batch = arrow_array::record_batch!(
             ("flag", Boolean, [true, false, true]),
-            ("id", Int64, [1, 0, -1]),
-            ("x", Float64, [0.5, 2.0, 1.0])
+            ("id", Int32, [1, 0, -1]),
+            ("x", Float32, [0.5, 2.0, 1.0])
         )
         .unwrap();
         let planner = Planner::new(batch.schema());
 
         let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
 
@@ -1309,6 +1310,34 @@ mod tests {
         assert_eq!(
             predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::float_literal("f = n + 0.5")]
+    #[case::float_literal_on_left("f = 0.5 + n")]
+    #[case::float_expression_on_left("n + 0.5 = f")]
+    #[case::wide_integer_literal("wide = small + 128")]
+    #[case::wide_integer_literal_on_left("wide = 128 + small")]
+    #[case::integer_expression_on_left("small + 128 = wide")]
+    fn test_parse_comparison_to_mixed_type_expression(#[case] filter: &str) {
+        let batch = arrow_array::record_batch!(
+            ("f", Float64, [Some(1.5), Some(1.5), None, Some(1.5)]),
+            ("n", Int64, [Some(1), Some(2), Some(1), None]),
+            ("wide", Int64, [Some(129), Some(129), Some(129), None]),
+            ("small", Int8, [Some(1), Some(2), None, Some(1)])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(vec![Some(true), Some(false), None, None])
         );
     }
 
