@@ -13838,12 +13838,21 @@ mod tests {
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
     }
 
-    /// Runs `change` against the dataset the first time an index commit is
-    /// attempted, so that attempt loses the race and retries.
+    #[derive(Clone, Copy, Debug, Default)]
+    enum RacingChange {
+        #[default]
+        UpdateInPlace,
+        FoldOverlay,
+        /// Updates in place, then cleans up the compaction's version.
+        UpdateAndCleanUpCompaction,
+    }
+
+    /// Makes a change the first time an index commit is attempted, so that
+    /// attempt loses the race and retries.
     #[derive(Debug, Default)]
     struct ChangeBeforeIndexCommit {
         pending: std::sync::Mutex<Option<Dataset>>,
-        fold_overlay: bool,
+        change: RacingChange,
         attempts: std::sync::atomic::AtomicUsize,
     }
 
@@ -13868,21 +13877,36 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let pending = self.pending.lock().unwrap().take();
                 if let Some(mut dataset) = pending {
-                    if self.fold_overlay {
-                        let fragment_id = dataset.fragments()[0].id;
-                        dataset = commit_overlay(
-                            dataset,
-                            fragment_id,
-                            &[1],
-                            OverlayCoverage::dense(bitmap([0])),
-                            vec![i32_array([Some(999)])],
-                        )
-                        .await;
-                        compact_files(&mut dataset, compact_into_one(true), None)
-                            .await
-                            .unwrap();
-                    } else {
-                        update_val_in_place(dataset).await;
+                    let compaction = dataset.manifest.version;
+                    let uri = dataset.uri.clone();
+                    match self.change {
+                        RacingChange::FoldOverlay => {
+                            let fragment_id = dataset.fragments()[0].id;
+                            dataset = commit_overlay(
+                                dataset,
+                                fragment_id,
+                                &[1],
+                                OverlayCoverage::dense(bitmap([0])),
+                                vec![i32_array([Some(999)])],
+                            )
+                            .await;
+                            compact_files(&mut dataset, compact_into_one(true), None)
+                                .await
+                                .unwrap();
+                        }
+                        RacingChange::UpdateInPlace => update_val_in_place(dataset).await,
+                        RacingChange::UpdateAndCleanUpCompaction => {
+                            update_val_in_place(dataset).await;
+                            let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+                                .versions(vec![compaction])
+                                .unwrap()
+                                .build();
+                            open_in_new_session(&uri)
+                                .await
+                                .cleanup_with_policy(policy)
+                                .await
+                                .unwrap();
+                        }
                     }
                 }
             }
@@ -13900,31 +13924,77 @@ mod tests {
         }
     }
 
-    /// A change that makes an index commit retry is checked against the
-    /// rewrites the first attempt already let through.
-    #[rstest]
-    #[case::in_place_update(false)]
-    #[case::folded_overlay(true)]
-    #[tokio::test]
-    async fn test_reindex_retry_rechecks_rewrites_seen_before(#[case] fold_overlay: bool) {
-        let dir = TempStrDir::default();
-        let mut dataset = indexed_three_column_dataset(dir.as_str()).await;
+    /// An index builder in another process whose first commit attempt races
+    /// `change`, made after a deferred compaction.
+    async fn racing_index_builder(
+        uri: &str,
+        change: RacingChange,
+    ) -> (Dataset, Arc<ChangeBeforeIndexCommit>) {
+        let mut dataset = indexed_three_column_dataset(uri).await;
         let race = Arc::new(ChangeBeforeIndexCommit {
-            fold_overlay,
+            change,
             ..Default::default()
         });
-        let mut builder = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+        let builder = crate::dataset::builder::DatasetBuilder::from_uri(uri)
             .with_session(Arc::new(crate::session::Session::default()))
             .with_commit_handler(race.clone())
             .load()
+            .await
+            .unwrap();
+        // Keeps the build's version through the cleanup below.
+        dataset
+            .tags()
+            .create("index-build", dataset.manifest.version)
             .await
             .unwrap();
         compact_files(&mut dataset, compact_into_one(false), None)
             .await
             .unwrap();
         *race.pending.lock().unwrap() = Some(dataset);
+        (builder, race)
+    }
+
+    /// A change that makes an index commit retry is checked against the
+    /// rewrites the first attempt already let through.
+    #[rstest]
+    #[case::in_place_update(RacingChange::UpdateInPlace)]
+    #[case::folded_overlay(RacingChange::FoldOverlay)]
+    #[tokio::test]
+    async fn test_reindex_retry_rechecks_rewrites_seen_before(#[case] change: RacingChange) {
+        let dir = TempStrDir::default();
+        let (mut builder, race) = racing_index_builder(dir.as_str(), change).await;
 
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
         assert_eq!(race.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A retry that cannot see a compaction it relies on, because cleanup
+    /// removed that version, refuses to commit.
+    #[tokio::test]
+    async fn test_reindex_retry_refuses_a_cleaned_up_compaction() {
+        let dir = TempStrDir::default();
+        let (mut builder, _) =
+            racing_index_builder(dir.as_str(), RacingChange::UpdateAndCleanUpCompaction).await;
+
+        assert_retryable_conflict(
+            builder
+                .create_index(
+                    &["val"],
+                    IndexType::Scalar,
+                    Some("val_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .map(|_| ()),
+        );
+        let latest = open_in_new_session(dir.as_str()).await;
+        assert!(
+            latest
+                .load_index_by_name("val_idx")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

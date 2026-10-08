@@ -1747,6 +1747,22 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
+            if replay_from_read_version && rebase.relies_on_untagged_reuse() {
+                let complete = other_transactions
+                    .iter()
+                    .map(|(version, _)| *version)
+                    .eq(read_version + 1..=dataset.manifest.version);
+                if !complete {
+                    return Err(Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        format!(
+                            "versions since {read_version} were cleaned up, so this index cannot \
+                             be carried through deferred compactions; rebuild it"
+                        )
+                        .into(),
+                    ));
+                }
+            }
 
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;

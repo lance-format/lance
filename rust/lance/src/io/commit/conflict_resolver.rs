@@ -604,6 +604,14 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
+    /// Whether this CreateIndex may be let past deferred compactions on an
+    /// untagged table, which needs every version since its read version.
+    pub(crate) fn relies_on_untagged_reuse(&self) -> bool {
+        self.untagged_reuse
+            .as_ref()
+            .is_some_and(|reuse| !reuse.deferred_groups.is_empty())
+    }
+
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
         // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
