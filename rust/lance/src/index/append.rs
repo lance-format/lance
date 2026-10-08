@@ -577,11 +577,34 @@ async fn merge_scalar_indices<'a>(
         ));
     }
 
-    let selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
+    let mut selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
 
     // No new data + ≤1 old selected = rewriting one segment to itself.
     if unindexed.is_empty() && selected_old_indices.len() <= 1 {
         return Ok(None);
+    }
+
+    // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
+    // segments (plus any deletion-affected one); with `num_indices_to_merge: Some(0)`
+    // (append mode) it selects none at all. A row-id-domain BTree segment left
+    // outside that selection would otherwise survive untouched beside the
+    // freshly built address-domain segment this call is about to create.
+    // `LogicalScalarIndex` takes the whole named index's result domain from its
+    // first segment alone, so that mix makes every match the new segment finds
+    // look like a row id needing resolution, and matching rows silently vanish
+    // when that resolution misses. Fold every such segment into this rebuild,
+    // regardless of which ones the trailing-window heuristic already picked,
+    // so the named index never ends up straddling both domains.
+    if index_type == IndexType::BTree && dataset.manifest.uses_stable_row_ids() {
+        for idx in old_indices {
+            if !idx.results_are_row_addrs()
+                && !selected_old_indices
+                    .iter()
+                    .any(|selected| selected.uuid == idx.uuid)
+            {
+                selected_old_indices.push(idx);
+            }
+        }
     }
 
     // For the delta case (`selected` empty) the reference is purely
@@ -3851,6 +3874,131 @@ mod tests {
         }
     }
 
+    /// A stray row-id-domain segment left beside a freshly built address-domain
+    /// one is not just imprecise, it is wrong: `LogicalScalarIndex` takes the
+    /// whole named index's result domain from its first segment alone, so the
+    /// new segment's real addresses get treated as row ids wherever they land
+    /// outside the old segment's row-id numbering, and those rows vanish from
+    /// every query. `select_segments_to_merge` selects nothing in append mode
+    /// (`num_indices_to_merge: Some(0)`), so without folding every remaining
+    /// legacy segment into the rebuild regardless of what it selected, this is
+    /// exactly what append-mode optimize would do under stable row ids.
+    #[tokio::test]
+    async fn test_optimize_btree_append_rebuilds_stray_legacy_segment_with_stable_row_ids() {
+        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("id = '{}'", id))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let make_batch = |start: i32, end: i32| {
+            let ids = StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
+        };
+
+        // One fragment, one BTree segment, built under stable row ids so row
+        // ids and row addresses are already two independent numbering schemes.
+        let reader = RecordBatchIterator::new(vec![Ok(make_batch(0, 64))], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let original_fragment_id = dataset.get_fragments()[0].id() as u32;
+        let segment = crate::index::create::CreateIndexBuilder::new(
+            &mut dataset,
+            &["id"],
+            IndexType::BTree,
+            &params,
+        )
+        .name("id_idx".into())
+        .fragments(vec![original_fragment_id])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        assert!(
+            segment.results_are_row_addrs(),
+            "a segment built by the current code is always address-domain"
+        );
+
+        // Relabel it as a pre-migration (row-id-domain) segment: index_version
+        // is exactly how `results_are_row_addrs` tells the two apart, and real
+        // legacy segments on disk differ from a fresh one only in that label
+        // (`BTreeIndexPlugin::load_index` derives domain purely from the
+        // version its caller passes in, never from the file itself).
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("id_idx", "id", vec![legacy_segment])
+            .await
+            .unwrap();
+
+        // Append a second fragment and leave it unindexed, then optimize in
+        // append mode -- the scenario that selects zero old segments to merge.
+        let appended = RecordBatchIterator::new(vec![Ok(make_batch(64, 128))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        // The stray legacy segment must not survive append-mode optimize: it
+        // has to be folded into one consolidated, address-domain segment
+        // rather than left beside the new delta.
+        let committed = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "the legacy segment must be rebuilt together with the new data, \
+             not left beside it: {committed:?}"
+        );
+        assert!(
+            committed[0].results_are_row_addrs(),
+            "the rebuilt segment must be address-domain"
+        );
+
+        // Rows from both the original and the newly appended fragment must be
+        // findable -- in particular rows only the new segment's data covers,
+        // which a stray legacy segment reporting the wrong domain would drop.
+        for id in ["song-10", "song-100", "song-127"] {
+            assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
+        }
+    }
+
     #[tokio::test]
     async fn test_optimize_bitmap_index_append() {
         let test_dir = TempStrDir::default();
@@ -4904,12 +5052,6 @@ mod tests {
     /// silently reintroduce the stale entries this fix removes. Simulate an
     /// unreadable deletion vector by deleting the file the manifest still
     /// references, then assert optimize errors instead of succeeding.
-    ///
-    /// Bitmap rather than BTree: this guarantee comes from
-    /// `build_stable_row_id_filter`, which only the row-id-domain merge path
-    /// (still used by Bitmap) goes through. BTree is always address-domain
-    /// now and merges through the coarse `Fragments` filter instead, which
-    /// never reads a deletion vector, so it cannot surface this error.
     #[tokio::test]
     async fn test_optimize_errors_when_deletion_vector_unreadable() {
         use crate::dataset::UpdateBuilder;
