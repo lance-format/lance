@@ -62,7 +62,7 @@ pub use codec::{
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 pub use moka::MokaCacheBackend;
-pub use quick::{QuickCacheBackend, recommended_cache_shards};
+pub use quick::{QuickCacheBackend, QuickCacheShardPolicy, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 
 use std::any::TypeId;
@@ -335,6 +335,11 @@ impl LanceCache {
         self.state.backend.size_bytes().await
     }
 
+    /// Weighted capacity in bytes, if the backend reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.state.backend.capacity_bytes()
+    }
+
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
@@ -583,6 +588,12 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
         }
+    }
+
+    /// Weighted capacity in bytes, if the cache is alive and its backend
+    /// reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.upgrade()?.capacity_bytes()
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>

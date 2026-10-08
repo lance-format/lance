@@ -50,8 +50,10 @@ fn run_bench<T: ArrowFloatType>(
             b.iter(|| {
                 black_box(
                     target
-                        .chunks_exact(DIMENSION)
-                        .map(auto_vec_impl)
+                        .as_chunks::<DIMENSION>()
+                        .0
+                        .iter()
+                        .map(|v| auto_vec_impl(v))
                         .collect::<Vec<_>>(),
                 );
             });
@@ -65,8 +67,10 @@ fn run_bench<T: ArrowFloatType>(
                 b.iter(|| {
                     black_box(
                         target
-                            .chunks_exact(DIMENSION)
-                            .map(simd_impl)
+                            .as_chunks::<DIMENSION>()
+                            .0
+                            .iter()
+                            .map(|v| simd_impl(v))
                             .collect::<Vec<_>>(),
                     );
                 });

@@ -16,7 +16,9 @@ use lance::dataset::{
     WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
+use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::CompactedSsTable;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -55,6 +57,7 @@ fn inner_merge_insert<'local>(
     let use_index = extract_use_index(env, &jparam)?;
     let write_mode = extract_write_mode(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
+    let data_storage_version = extract_data_storage_version(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -65,7 +68,11 @@ fn inner_merge_insert<'local>(
             when_not_matched_by_source_delete_expr,
         )?;
 
-        let merge_insert_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
+        let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?;
+        if let Some(version) = data_storage_version {
+            builder.data_storage_version(LanceFileVersion::from_str(&version)?);
+        }
+        let merge_insert_job = builder
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
             .when_not_matched_by_source(when_not_matched_by_source)
@@ -242,6 +249,21 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
 fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<bool> {
     let use_index = env.call_method(jparam, "useIndex", "()Z", &[])?.z()?;
     Ok(use_index)
+}
+
+fn extract_data_storage_version<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<Option<String>> {
+    let version = env
+        .call_method(
+            jparam,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    env.get_string_opt(&version)
 }
 
 fn extract_write_mode<'local>(

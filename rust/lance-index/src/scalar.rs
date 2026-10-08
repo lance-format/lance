@@ -24,6 +24,11 @@ use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;
+pub use lance_index_core::remapping::{
+    BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, LEGACY_TRAFFIC_ONLY,
+    RemapUnavailable, RowAddrTranslator, RowAddrTranslatorRef, check_batch_remapping_entry,
+    materialize_remap,
+};
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
     LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
@@ -39,8 +44,11 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+pub mod minhash_lsh;
 pub mod ngram;
 pub mod registry;
+#[cfg(test)]
+mod remap_compat_tests;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;

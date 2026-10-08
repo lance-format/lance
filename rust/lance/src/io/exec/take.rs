@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::projection::ProjectionMapping;
 use futures::FutureExt;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -75,6 +76,9 @@ struct TakeStream {
     /// must be materialized after take.
     read_fields: Arc<Schema>,
     materialize_blob_v2_binary: bool,
+    /// Scanner-level byte budget for output batches. Applied after blob v2
+    /// payloads are materialized so that the final batch size is capped.
+    batch_size_bytes: Option<u64>,
     /// The output schema, needed for us to merge the new columns
     /// into the input data in the correct order
     output_schema: SchemaRef,
@@ -96,6 +100,7 @@ impl TakeStream {
         scan_scheduler: Arc<ScanScheduler>,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
+        batch_size_bytes: Option<u64>,
     ) -> Self {
         let materialize_blob_v2_binary =
             crate::dataset::blob::schema_has_blob_v2_binary_view(fields_to_take.as_ref());
@@ -111,6 +116,7 @@ impl TakeStream {
             fields_to_take,
             read_fields,
             materialize_blob_v2_binary,
+            batch_size_bytes,
             output_schema,
             readers_cache: Arc::new(Mutex::new(HashMap::new())),
             scan_scheduler,
@@ -239,7 +245,7 @@ impl TakeStream {
         self: Arc<Self>,
         batch: RecordBatch,
         batch_number: u32,
-    ) -> DataFusionResult<RecordBatch> {
+    ) -> DataFusionResult<Vec<RecordBatch>> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let (row_addrs_arr, validity_mask) = self.get_row_addrs(&batch).await?;
 
@@ -354,7 +360,7 @@ impl TakeStream {
         let batches = futures.try_collect::<Vec<_>>().await?;
 
         if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+            return Ok(vec![RecordBatch::new_empty(self.output_schema.clone())]);
         }
 
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
@@ -399,7 +405,15 @@ impl TakeStream {
             .await?;
         }
 
-        Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+        let merged = batch.merge_with_schema(&new_data, self.output_schema.as_ref())?;
+        if let Some(budget) = self.batch_size_bytes {
+            Ok(crate::dataset::blob::split_batch_by_bytes(
+                merged,
+                (budget * 2) as usize,
+            )?)
+        } else {
+            Ok(vec![merged])
+        }
     }
 
     fn apply<S: Stream<Item = Result<RecordBatch>> + Send + 'static>(
@@ -423,6 +437,8 @@ impl TakeStream {
             .boxed();
         batches
             .try_buffered(get_num_compute_intensive_cpus())
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
             .map(move |result| {
                 if result.is_ok() {
                     result_metrics.batches_processed.add(1);
@@ -459,6 +475,12 @@ pub struct TakeExec {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    /// Scanner-level byte budget for output batches.
+    batch_size_bytes: Option<u64>,
+    /// Whether the input columns lead the output unchanged. A take that adds
+    /// fields to an input struct changes that column, so orderings on it do
+    /// not carry across.
+    has_unchanged_input: bool,
 }
 
 impl DisplayAs for TakeExec {
@@ -507,6 +529,16 @@ impl TakeExec {
         input: Arc<dyn ExecutionPlan>,
         projection: Projection,
     ) -> Result<Option<Self>> {
+        Self::try_new_with_batch_size(dataset, input, projection, None)
+    }
+
+    /// Create a [`TakeExec`] node with an explicit byte budget for output batches.
+    pub fn try_new_with_batch_size(
+        dataset: Arc<Dataset>,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Projection,
+        batch_size_bytes: Option<u64>,
+    ) -> Result<Option<Self>> {
         let original_projection = projection.clone();
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
@@ -537,12 +569,23 @@ impl TakeExec {
             &output_schema,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
+        let has_unchanged_input = input
+            .schema()
+            .fields()
+            .iter()
+            .zip(output_arrow.fields())
+            .all(|(input_field, output_field)| input_field == output_field);
+        let eq_properties = if has_unchanged_input {
+            Self::output_equivalences(&input, &output_arrow)?
+        } else {
+            EquivalenceProperties::new(output_arrow.clone())
+        };
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
+                .with_eq_properties(eq_properties),
         );
 
         Ok(Some(Self {
@@ -553,7 +596,24 @@ impl TakeExec {
             output_schema: output_arrow,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            batch_size_bytes,
+            has_unchanged_input,
         }))
+    }
+
+    /// The input's orderings and equivalences on `output`, whose leading
+    /// columns are the input's. Rows keep their input order.
+    fn output_equivalences(
+        input: &Arc<dyn ExecutionPlan>,
+        output: &SchemaRef,
+    ) -> Result<EquivalenceProperties> {
+        let input_schema = input.schema();
+        let indices = (0..input_schema.fields().len()).collect::<Vec<_>>();
+        let mapping = ProjectionMapping::from_indices(&indices, &input_schema)?;
+        Ok(input
+            .properties()
+            .eq_properties
+            .project(&mapping, output.clone()))
     }
 
     /// The output of a take operation will be all columns from the input schema followed
@@ -628,6 +688,12 @@ impl ExecutionPlan for TakeExec {
         vec![&self.input]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Rows keep their order, but a changed input column must not let a
+        // sort above be pushed below the take.
+        vec![self.has_unchanged_input]
+    }
+
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         // This is an I/O bound operation and wouldn't really benefit from partitioning
         //
@@ -649,7 +715,12 @@ impl ExecutionPlan for TakeExec {
 
         let projection = self.output_projection.clone();
 
-        let plan = Self::try_new(self.dataset.clone(), children[0].clone(), projection)?;
+        let plan = Self::try_new_with_batch_size(
+            self.dataset.clone(),
+            children[0].clone(),
+            projection,
+            self.batch_size_bytes,
+        )?;
 
         if let Some(plan) = plan {
             Ok(Arc::new(plan))
@@ -669,6 +740,7 @@ impl ExecutionPlan for TakeExec {
         let schema_to_take = self.schema_to_take.clone();
         let output_schema = self.output_schema.clone();
         let metrics = self.metrics.clone();
+        let batch_size_bytes = self.batch_size_bytes;
 
         // ScanScheduler::new launches the I/O scheduler in the background.
         // We aren't allowed to do work in `execute` and so we defer creation of the
@@ -686,6 +758,7 @@ impl ExecutionPlan for TakeExec {
                 scan_scheduler,
                 &metrics,
                 partition,
+                batch_size_bytes,
             ));
             take_stream.apply(input_stream)
         });

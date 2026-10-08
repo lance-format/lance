@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
@@ -17,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -170,6 +171,11 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Whether this table requires independently addressed Managed Blob support.
+    pub fn has_managed_blobs(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -384,6 +390,36 @@ impl Manifest {
                 "Field with id {} does not exist for replace_field_metadata",
                 field_id
             )))
+        }
+    }
+
+    /// Copy inline row ids out of the manifest buffer they were decoded from
+    /// when they are a small share of it.
+    ///
+    /// Inline row ids decoded from a `Bytes` buffer are slices of that buffer
+    /// (see [`InlineRowIds`]), and a slice keeps the whole allocation alive.
+    /// That is the right trade when the row ids are most of the manifest, as
+    /// they are for a compacted stable-row-id table, but a manifest whose row
+    /// ids are a few percent of its bytes would pin the rest for nothing.
+    /// `buffer_len` is the size of the decoded buffer.
+    pub fn detach_sparse_inline_row_ids(&mut self, buffer_len: usize) {
+        let inline_bytes: usize = self
+            .fragments
+            .iter()
+            .filter_map(|fragment| match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(data)) => Some(data.len()),
+                _ => None,
+            })
+            .sum();
+        // Keep the slices while the row ids are at least a quarter of the buffer.
+        if inline_bytes == 0 || inline_bytes.saturating_mul(4) >= buffer_len {
+            return;
+        }
+        for fragment in Arc::make_mut(&mut self.fragments) {
+            if let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta {
+                let copied = InlineRowIds::from(Bytes::copy_from_slice(data));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(copied));
+            }
         }
     }
 
@@ -611,6 +647,25 @@ pub struct BasePath {
 }
 
 impl BasePath {
+    /// Choose an unused exact base ID without reserving zero or overflowing at
+    /// `u32::MAX`. The caller must publish the binding with its references and
+    /// reject a concurrent attempt to bind the chosen ID to another location.
+    pub fn unused_id(bases: impl IntoIterator<Item = u32>) -> Result<u32> {
+        let mut ids = bases.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut candidate = 0u32;
+        for id in ids {
+            if id != candidate {
+                break;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("All u32 base IDs are already registered"))?;
+        }
+        Ok(candidate)
+    }
+
     /// Create a new BasePath
     ///
     /// # Arguments
@@ -719,6 +774,13 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
+    /// Row lineage sequences of the current manifest's fragments that live
+    /// outside the manifest, read ahead of the build. An update that rewrites
+    /// rows needs the existing row ids and created-at versions to carry each
+    /// row's lineage over, and a partial column rewrite needs the existing
+    /// last-updated-at versions; the build cannot read a data file itself. Only
+    /// consulted for fragments whose sequences are spilled.
+    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1002,7 +1064,10 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
-            transaction_section: p.transaction_section.map(|i| i as usize),
+            transaction_section: p
+                .transaction_section
+                .or(p.transaction_section_deprecated)
+                .map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -1050,6 +1115,7 @@ impl From<&Manifest> for pb::Manifest {
                     build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragment_tree: None,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1080,6 +1146,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            transaction_section_deprecated: None,
         }
     }
 }
@@ -1151,7 +1218,7 @@ mod tests {
 
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
 
@@ -1290,6 +1357,41 @@ mod tests {
                 .to_string()
                 .contains("All data files must have the same version")
         );
+    }
+
+    #[test]
+    fn test_detach_sparse_inline_row_ids_copies_only_small_shares() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]);
+        // Two 10 byte row id sequences sliced out of one buffer.
+        let buffer = Bytes::from(vec![7u8; 64]);
+        let fragments = [0..10, 20..30].into_iter().enumerate().map(|(id, range)| {
+            let mut fragment = Fragment::new(id as u64);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(InlineRowIds::from(buffer.slice(range))));
+            fragment
+        });
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(fragments.collect()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let ptr = |manifest: &Manifest, i: usize| match &manifest.fragments[i].row_id_meta {
+            Some(RowIdMeta::Inline(data)) => data.bytes().as_ptr(),
+            _ => unreachable!(),
+        };
+        let in_buffer = |p: *const u8| buffer.as_ptr_range().contains(&p);
+
+        // 20 of 80 bytes is a quarter: the slices stay.
+        manifest.detach_sparse_inline_row_ids(80);
+        assert!(in_buffer(ptr(&manifest, 0)) && in_buffer(ptr(&manifest, 1)));
+
+        // 20 of 81 bytes is below a quarter: copied out, contents intact.
+        manifest.detach_sparse_inline_row_ids(81);
+        assert!(!in_buffer(ptr(&manifest, 0)) && !in_buffer(ptr(&manifest, 1)));
+        let Some(RowIdMeta::Inline(copied)) = &manifest.fragments[1].row_id_meta else {
+            unreachable!()
+        };
+        assert_eq!(&**copied, &buffer[20..30]);
     }
 
     #[test]
@@ -1638,6 +1740,36 @@ mod tests {
         config.remove("other-key");
         manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
+    }
+
+    #[rstest::rstest]
+    #[case::only_current(Some(22), None, Some(22))]
+    #[case::only_deprecated(None, Some(21), Some(21))]
+    #[case::current_wins_over_deprecated(Some(22), Some(21), Some(22))]
+    #[case::neither(None, None, None)]
+    fn test_transaction_section_field_precedence(
+        #[case] current: Option<u64>,
+        #[case] deprecated: Option<u64>,
+        #[case] expected: Option<usize>,
+    ) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int64, false)]);
+        let manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let mut pb_manifest = pb::Manifest::from(&manifest);
+        pb_manifest.transaction_section = current;
+        pb_manifest.transaction_section_deprecated = deprecated;
+
+        let manifest = Manifest::try_from(pb_manifest).unwrap();
+        assert_eq!(manifest.transaction_section, expected);
+
+        // Whatever was read, only the current field is ever written back.
+        let pb_manifest = pb::Manifest::from(&manifest);
+        assert_eq!(pb_manifest.transaction_section, expected.map(|p| p as u64));
+        assert_eq!(pb_manifest.transaction_section_deprecated, None);
     }
 
     #[test]

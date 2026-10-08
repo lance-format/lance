@@ -40,6 +40,66 @@ print(ds.count_rows())  # Output: 2
 `lance.write_dataset` supports writing `pyarrow.Table`, `pandas.DataFrame`,
 `pyarrow.dataset.Dataset`, and `Iterator[pyarrow.RecordBatch]`.
 
+## Choosing a data file version
+
+`data_storage_version` selects the format of newly written data files. For an
+existing V2 dataset, an operation can select `"2.0"`, `"2.1"`, `"2.2"`, or `"2.3"`
+without rewriting the other files. The dataset's `data_storage_version` property
+is the default for writes that omit a target, not a summary of its existing
+files. Create and overwrite establish this default; append, update, merge-insert,
+and compaction do not change it. V1 and V2 cannot be mixed.
+
+```python
+import lance
+import pyarrow as pa
+
+data = pa.table({"id": [1, 2], "value": [10, 20]})
+ds = lance.write_dataset(data, "./versions.lance", data_storage_version="2.1")
+ds.update({"value": "value + 1"}, data_storage_version="2.2")
+assert ds.data_storage_version == "2.1"
+
+ds.merge_insert("id").when_not_matched_insert_all().data_storage_version("2.2").execute(
+    pa.table({"id": [3], "value": [30]})
+)
+ds.optimize.compact_files(data_storage_version="2.2")
+```
+
+The `"stable"` and `"next"` selectors resolve according to the engine release.
+Use exact versions when the output identity must be independent of that release.
+V2.3 is currently unstable: files written by one unstable revision may not be
+readable by a later revision. Use it only for experimentation.
+Compaction plans fix the target before distributing tasks, including when the
+target comes from the dataset default. The target survives Python pickle and
+Java serialization; workers do not reinterpret it using their own release defaults.
+
+Java update, merge-insert, and compaction options use
+`withDataStorageVersion(DataStorageVersion.V2_2)`. The shared `DataStorageVersion`
+enum also provides `STABLE` and `NEXT` selectors.
+
+Compaction can convert selected fragments to another supported V2 version.
+Binary copy requires every selected file to match the output version, as well
+as the usual eligibility checks. In particular, overlays need reencoding to
+preserve updated values. `try_binary_copy` falls back to reencoding when inputs
+are ineligible; `force_binary_copy` rejects them. A version mismatch error includes
+the target version, actual version, and file path. A persistent compaction target
+can be set through `lance.compaction.data_storage_version` in the table config;
+an explicit operation target takes precedence.
+
+### Upgrading clients before mixed-version writes
+
+Before writing files that differ from the dataset default, upgrade every reader
+and writer to a mixed-version-aware release. Drain, restart, or fence writers
+that opened the dataset using an older release. The commit automatically sets
+the paired mixed-version reader/writer feature flags when needed; there is no
+separate activation API. These flags remain set even if compaction later makes
+the files homogeneous again.
+
+Older clients that do not recognize the flags reject the resulting snapshots.
+The flags cannot retroactively fence an older writer that already read a prior
+manifest. Historical homogeneous datasets remain readable by clients that
+support their file versions; see [table versioning](../format/table/versioning.md)
+for the feature flag contract.
+
 ## Adding Rows
 
 To insert data into your dataset, you can use either `LanceDataset.insert`

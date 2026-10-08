@@ -35,6 +35,11 @@ pub struct f32x8(float32x4x2_t);
 #[derive(Clone, Copy)]
 pub struct f32x8(v8f32);
 
+#[allow(non_camel_case_types)]
+#[cfg(simd_fallback)]
+#[derive(Clone, Copy)]
+pub struct f32x8([f32; 8]);
+
 impl std::fmt::Debug for f32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut arr = [0.0_f32; 8];
@@ -119,6 +124,10 @@ impl f32x8 {
             ];
             Self::load_unaligned(values.as_ptr())
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(indices.map(|i| slice[i as usize]))
+        }
     }
 }
 
@@ -182,6 +191,10 @@ impl SIMD<f32, 8> for f32x8 {
         unsafe {
             Self(transmute(lasx_xvreplgr2vr_w(transmute(val))))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self([val; 8])
+        }
     }
 
     fn zeros() -> Self {
@@ -194,6 +207,10 @@ impl SIMD<f32, 8> for f32x8 {
             Self::splat(0.0)
         }
         #[cfg(target_arch = "loongarch64")]
+        {
+            Self::splat(0.0)
+        }
+        #[cfg(simd_fallback)]
         {
             Self::splat(0.0)
         }
@@ -213,6 +230,10 @@ impl SIMD<f32, 8> for f32x8 {
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self::load_unaligned(ptr) }
+        }
     }
 
     #[inline]
@@ -229,6 +250,10 @@ impl SIMD<f32, 8> for f32x8 {
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self(std::ptr::read_unaligned(ptr as *const [f32; 8])) }
+        }
     }
 
     unsafe fn store(&self, ptr: *mut f32) {
@@ -244,6 +269,10 @@ impl SIMD<f32, 8> for f32x8 {
         unsafe {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr));
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { self.store_unaligned(ptr) }
+        }
     }
 
     unsafe fn store_unaligned(&self, ptr: *mut f32) {
@@ -258,6 +287,10 @@ impl SIMD<f32, 8> for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr));
+        }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { std::ptr::write_unaligned(ptr as *mut [f32; 8], self.0) }
         }
     }
 
@@ -286,6 +319,10 @@ impl SIMD<f32, 8> for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         {
             self.as_array().iter().sum()
+        }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().sum()
         }
     }
 
@@ -321,6 +358,10 @@ impl SIMD<f32, 8> for f32x8 {
             let m2 = lasx_xvfmin_s(transmute(m1), transmute(m2));
             transmute(lasx_xvpickve2gr_w::<0>(transmute(m2)))
         }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().copied().fold(f32::INFINITY, f32::min)
+        }
     }
 
     fn min(&self, rhs: &Self) -> Self {
@@ -338,6 +379,10 @@ impl SIMD<f32, 8> for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             Self(lasx_xvfmin_s(self.0, rhs.0))
+        }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].min(rhs.0[i])))
         }
     }
 
@@ -372,6 +417,12 @@ impl SIMD<f32, 8> for f32x8 {
                 }
             }
         }
+        #[cfg(simd_fallback)]
+        {
+            if let Some(i) = self.0.iter().position(|&v| v == val) {
+                return Some(i as i32);
+            }
+        }
         None
     }
 }
@@ -390,6 +441,12 @@ impl FloatSimd<f32, 8> for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             self.0 = lasx_xvfmadd_s(a.0, b.0, self.0);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] = a.0[i].mul_add(b.0[i], self.0[i]);
+            }
         }
     }
 }
@@ -414,6 +471,10 @@ impl Add for f32x8 {
         unsafe {
             Self(lasx_xvfadd_s(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i] + rhs.0[i]))
+        }
     }
 }
 
@@ -432,6 +493,12 @@ impl AddAssign for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             self.0 = lasx_xvfadd_s(self.0, rhs.0);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] += rhs.0[i];
+            }
         }
     }
 }
@@ -456,6 +523,10 @@ impl Sub for f32x8 {
         unsafe {
             Self(lasx_xvfsub_s(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i] - rhs.0[i]))
+        }
     }
 }
 
@@ -474,6 +545,12 @@ impl SubAssign for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             self.0 = lasx_xvfsub_s(self.0, rhs.0);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] -= rhs.0[i];
+            }
         }
     }
 }
@@ -497,6 +574,10 @@ impl Mul for f32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             Self(lasx_xvfmul_s(self.0, rhs.0))
+        }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i] * rhs.0[i]))
         }
     }
 }
@@ -525,6 +606,11 @@ pub struct f32x16(float32x4x4_t);
 #[cfg(target_arch = "loongarch64")]
 #[derive(Clone, Copy)]
 pub struct f32x16(v8f32, v8f32);
+
+#[allow(non_camel_case_types)]
+#[cfg(simd_fallback)]
+#[derive(Clone, Copy)]
+pub struct f32x16([f32; 16]);
 
 impl std::fmt::Debug for f32x16 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -581,6 +667,10 @@ impl SIMD<f32, 16> for f32x16 {
                 transmute(lasx_xvreplgr2vr_w(transmute(val))),
             )
         }
+        #[cfg(simd_fallback)]
+        {
+            Self([val; 16])
+        }
     }
 
     #[inline]
@@ -594,6 +684,10 @@ impl SIMD<f32, 16> for f32x16 {
             Self::splat(0.0)
         }
         #[cfg(target_arch = "loongarch64")]
+        {
+            Self::splat(0.0)
+        }
+        #[cfg(simd_fallback)]
         {
             Self::splat(0.0)
         }
@@ -616,6 +710,10 @@ impl SIMD<f32, 16> for f32x16 {
                 transmute(lasx_xvld::<32>(transmute(ptr))),
             )
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self::load_unaligned(ptr) }
+        }
     }
 
     #[inline]
@@ -635,6 +733,10 @@ impl SIMD<f32, 16> for f32x16 {
                 transmute(lasx_xvld::<32>(transmute(ptr))),
             )
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self(std::ptr::read_unaligned(ptr as *const [f32; 16])) }
+        }
     }
 
     #[inline]
@@ -653,6 +755,10 @@ impl SIMD<f32, 16> for f32x16 {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr));
             lasx_xvst::<32>(transmute(self.1), transmute(ptr));
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { self.store_unaligned(ptr) }
+        }
     }
 
     #[inline]
@@ -670,6 +776,10 @@ impl SIMD<f32, 16> for f32x16 {
         {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr));
             lasx_xvst::<32>(transmute(self.1), transmute(ptr));
+        }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { std::ptr::write_unaligned(ptr as *mut [f32; 16], self.0) }
         }
     }
 
@@ -700,6 +810,10 @@ impl SIMD<f32, 16> for f32x16 {
         #[cfg(target_arch = "loongarch64")]
         {
             self.as_array().iter().sum()
+        }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().sum()
         }
     }
 
@@ -735,6 +849,10 @@ impl SIMD<f32, 16> for f32x16 {
             let m1 = lasx_xvfmin_s(transmute(m1), transmute(m2));
             transmute(lasx_xvpickve2gr_w::<0>(transmute(m1)))
         }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().copied().fold(f32::INFINITY, f32::min)
+        }
     }
 
     #[inline]
@@ -755,6 +873,10 @@ impl SIMD<f32, 16> for f32x16 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             Self(lasx_xvfmin_s(self.0, rhs.0), lasx_xvfmin_s(self.1, rhs.1))
+        }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].min(rhs.0[i])))
         }
     }
 
@@ -802,6 +924,10 @@ impl SIMD<f32, 16> for f32x16 {
             }
             None
         }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().position(|&v| v == val).map(|i| i as i32)
+        }
     }
 }
 
@@ -824,6 +950,12 @@ impl FloatSimd<f32, 16> for f32x16 {
         unsafe {
             self.0 = lasx_xvfmadd_s(a.0, b.0, self.0);
             self.1 = lasx_xvfmadd_s(a.1, b.1, self.1);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..16 {
+                self.0[i] = a.0[i].mul_add(b.0[i], self.0[i]);
+            }
         }
     }
 }
@@ -850,6 +982,10 @@ impl Add for f32x16 {
         unsafe {
             Self(lasx_xvfadd_s(self.0, rhs.0), lasx_xvfadd_s(self.1, rhs.1))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i] + rhs.0[i]))
+        }
     }
 }
 
@@ -872,6 +1008,12 @@ impl AddAssign for f32x16 {
         unsafe {
             self.0 = lasx_xvfadd_s(self.0, rhs.0);
             self.1 = lasx_xvfadd_s(self.1, rhs.1);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..16 {
+                self.0[i] += rhs.0[i];
+            }
         }
     }
 }
@@ -898,6 +1040,10 @@ impl Mul for f32x16 {
         unsafe {
             Self(lasx_xvfmul_s(self.0, rhs.0), lasx_xvfmul_s(self.1, rhs.1))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i] * rhs.0[i]))
+        }
     }
 }
 
@@ -923,6 +1069,10 @@ impl Sub for f32x16 {
         unsafe {
             Self(lasx_xvfsub_s(self.0, rhs.0), lasx_xvfsub_s(self.1, rhs.1))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i] - rhs.0[i]))
+        }
     }
 }
 
@@ -945,6 +1095,12 @@ impl SubAssign for f32x16 {
         unsafe {
             self.0 = lasx_xvfsub_s(self.0, rhs.0);
             self.1 = lasx_xvfsub_s(self.1, rhs.1);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..16 {
+                self.0[i] -= rhs.0[i];
+            }
         }
     }
 }

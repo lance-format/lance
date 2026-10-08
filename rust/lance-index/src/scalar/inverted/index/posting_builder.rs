@@ -1,27 +1,142 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use smallvec::SmallVec;
+
+use super::super::encoding::{decode_full_posting_block, decode_varint_u32};
 use super::*;
 
+/// Inline capacity, in encoded bytes, of a posting list's unflushed tail.
+///
+/// Most distinct tokens of a real corpus occur in only a few documents, and
+/// 16 bytes hold their first three or four varint-encoded postings, so those
+/// tokens never allocate a tail buffer.
+const INLINE_TAIL_BYTES: usize = 16;
+
+/// Builds the posting list of one token during indexing.
+///
+/// A partition holds one builder per distinct token and real corpora reach
+/// tens of millions of distinct tokens, so the size of this struct and the
+/// allocations every token pays dominate index-build memory. Postings that
+/// have not filled a block yet are kept as a varint byte stream that starts
+/// inline, and the state that only lists with full blocks or positions need
+/// lives behind one lazily allocated box.
 #[derive(Debug)]
 pub struct PostingListBuilder {
+    // Varint pairs of (doc id delta, frequency) for the postings that have not
+    // filled a block yet. Deltas wrap, so any doc id order round-trips.
+    pub(super) tail: SmallVec<[u8; INLINE_TAIL_BYTES]>,
+    pub(super) overflow: Option<Box<PostingListOverflow>>,
+    // Base of the next doc id delta: the last doc id in `tail`, or 0 while
+    // `tail` is empty.
+    pub(super) last_tail_doc_id: u32,
+    // A tail that reaches `block_size` postings is flushed right away, so the
+    // count stays below 256.
+    pub(super) tail_len: u8,
     pub(super) with_positions: bool,
     pub(super) posting_tail_codec: PostingTailCodec,
-    pub(super) encoded_blocks: Option<Box<EncodedBlocks>>,
-    pub(super) encoded_position_blocks: Option<Box<EncodedPositionBlocks>>,
-    pub(super) tail_entries: Vec<RawDocInfo>,
+    pub(super) block_size_log2: u8,
+}
+
+// There is one builder per distinct token of a partition; keep it small.
+const _: () = assert!(std::mem::size_of::<PostingListBuilder>() <= 40);
+
+/// Builder state that only posting lists with full blocks or positions need.
+#[derive(Debug, Default)]
+pub(super) struct PostingListOverflow {
+    // Positions of the postings in `tail` and of the open document; only
+    // lists with positions use them.
     pub(super) tail_positions: PositionBlockBuilder,
-    pub(super) open_doc_id: Option<u32>,
-    pub(super) open_doc_frequency: u32,
-    pub(super) open_doc_last_position: Option<u32>,
-    pub(super) block_size: usize,
-    pub(super) memory_size_bytes: u32,
-    pub(super) len: u32,
+    pub(super) open_doc: Option<OpenDoc>,
+    // Every token of a positional build allocates this box on its first
+    // posting, but most tokens never fill a block, so block storage is boxed
+    // separately.
+    pub(super) full_blocks: Option<Box<FullBlocks>>,
+}
+
+// Every distinct token of a positional build allocates one; keep it small.
+const _: () = assert!(std::mem::size_of::<PostingListOverflow>() <= 80);
+
+/// The encoded full blocks of a posting list that reached `block_size`
+/// postings.
+#[derive(Debug, Default)]
+pub(super) struct FullBlocks {
+    pub(super) encoded_blocks: EncodedBlocks,
+    pub(super) encoded_position_blocks: EncodedPositionBlocks,
+}
+
+/// A document whose positions are still streaming in through
+/// [`PostingListBuilder::add_occurrence`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OpenDoc {
+    doc_id: u32,
+    frequency: u32,
+    last_position: u32,
+}
+
+/// Decodes `remaining` (doc id, frequency) pairs from a builder tail.
+struct TailEntries<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    doc_id: u32,
+    remaining: usize,
+}
+
+impl<'a> TailEntries<'a> {
+    fn new(bytes: &'a [u8], len: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            doc_id: 0,
+            remaining: len,
+        }
+    }
+}
+
+impl Iterator for TailEntries<'_> {
+    type Item = (u32, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let delta = decode_varint_u32(self.bytes, &mut self.offset)
+            .expect("posting list tail is encoded by the builder");
+        let frequency = decode_varint_u32(self.bytes, &mut self.offset)
+            .expect("posting list tail is encoded by the builder");
+        self.doc_id = self.doc_id.wrapping_add(delta);
+        Some((self.doc_id, frequency))
+    }
+}
+
+fn push_varint(dst: &mut SmallVec<[u8; INLINE_TAIL_BYTES]>, mut value: u32) {
+    while value >= 0x80 {
+        dst.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    dst.push(value as u8);
 }
 
 impl PostingListBuilder {
+    /// Heap bytes owned by this builder, excluding the builder struct itself.
     pub fn size(&self) -> u64 {
-        self.memory_size_bytes as u64
+        let tail_size = if self.tail.spilled() {
+            self.tail.capacity()
+        } else {
+            0
+        };
+        let overflow_size = self.overflow.as_deref().map_or(0, |overflow| {
+            let full_blocks_size = overflow.full_blocks.as_deref().map_or(0, |full_blocks| {
+                std::mem::size_of::<FullBlocks>()
+                    + full_blocks.encoded_blocks.size()
+                    + full_blocks.encoded_position_blocks.size()
+            });
+            std::mem::size_of::<PostingListOverflow>()
+                + overflow.tail_positions.size()
+                + full_blocks_size
+        });
+        (tail_size + overflow_size) as u64
     }
 
     pub fn has_positions(&self) -> bool {
@@ -62,66 +177,85 @@ impl PostingListBuilder {
     ) -> Self {
         validate_block_size(block_size).expect("invalid posting list block size");
         Self {
+            tail: SmallVec::new(),
+            overflow: None,
+            last_tail_doc_id: 0,
+            tail_len: 0,
             with_positions: with_position,
             posting_tail_codec,
-            encoded_blocks: None,
-            encoded_position_blocks: None,
-            tail_entries: Vec::new(),
-            tail_positions: PositionBlockBuilder::default(),
-            open_doc_id: None,
-            open_doc_frequency: 0,
-            open_doc_last_position: None,
-            block_size,
-            len: 0,
-            memory_size_bytes: 0,
+            block_size_log2: block_size.trailing_zeros() as u8,
         }
     }
 
+    fn block_size(&self) -> usize {
+        1 << self.block_size_log2
+    }
+
     pub fn len(&self) -> usize {
-        self.len as usize
+        let tail_len = usize::from(self.tail_len);
+        match self.overflow.as_deref() {
+            Some(overflow) => {
+                let num_full_blocks = overflow
+                    .full_blocks
+                    .as_deref()
+                    .map_or(0, |full_blocks| full_blocks.encoded_blocks.len());
+                num_full_blocks * self.block_size()
+                    + tail_len
+                    + usize::from(overflow.open_doc.is_some())
+            }
+            None => tail_len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     pub fn iter(&self) -> std::vec::IntoIter<(u32, u32, Option<Vec<u32>>)> {
         self.collect_entries().into_iter()
     }
 
+    fn tail_entries(&self) -> TailEntries<'_> {
+        TailEntries::new(&self.tail, usize::from(self.tail_len))
+    }
+
+    fn open_doc(&self) -> Option<OpenDoc> {
+        self.overflow
+            .as_deref()
+            .and_then(|overflow| overflow.open_doc)
+    }
+
+    fn overflow_mut(&mut self) -> &mut PostingListOverflow {
+        self.overflow.get_or_insert_with(Box::default)
+    }
+
     pub fn for_each_entry<E>(
         &self,
         mut visit: impl FnMut(u32, u32, Option<Vec<u32>>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
-        let mut doc_ids = Vec::with_capacity(self.block_size);
-        let mut frequencies = Vec::with_capacity(self.block_size);
+        let block_size = self.block_size();
         let mut decoded_positions = Vec::new();
-        let mut position_block_index = 0usize;
 
-        if let Some(encoded_blocks) = self.encoded_blocks.as_deref() {
-            for block in encoded_blocks.iter() {
+        if let Some(full_blocks) = self
+            .overflow
+            .as_deref()
+            .and_then(|overflow| overflow.full_blocks.as_deref())
+        {
+            let mut doc_ids = Vec::with_capacity(block_size);
+            let mut frequencies = Vec::with_capacity(block_size);
+            for (block_index, block) in full_blocks.encoded_blocks.iter().enumerate() {
                 doc_ids.clear();
                 frequencies.clear();
-                super::super::encoding::decode_full_posting_block(
-                    block,
-                    &mut doc_ids,
-                    &mut frequencies,
-                    self.block_size,
-                );
+                decode_full_posting_block(block, &mut doc_ids, &mut frequencies, block_size);
                 decoded_positions.clear();
                 if self.with_positions {
-                    let position_blocks = self
-                        .encoded_position_blocks
-                        .as_deref()
-                        .expect("positions must exist for posting list");
                     super::super::encoding::decode_position_stream_block(
-                        position_blocks.block(position_block_index),
+                        full_blocks.encoded_position_blocks.block(block_index),
                         &frequencies,
                         PositionStreamCodec::PackedDelta,
                         &mut decoded_positions,
                     )
                     .expect("position stream decoding should succeed");
-                    position_block_index += 1;
                 }
                 let mut offset = 0usize;
                 for (doc_id, frequency) in doc_ids.iter().copied().zip(frequencies.iter().copied())
@@ -137,26 +271,28 @@ impl PostingListBuilder {
             }
         }
 
-        let mut decoded_tail_positions = Vec::new();
-        if self.with_positions && !self.tail_entries.is_empty() {
+        decoded_positions.clear();
+        if self.with_positions && self.tail_len > 0 {
             let tail_frequencies = self
-                .tail_entries
-                .iter()
-                .map(|entry| entry.frequency)
+                .tail_entries()
+                .map(|(_, frequency)| frequency)
                 .collect::<Vec<_>>();
-            self.tail_positions
-                .decode_into(tail_frequencies.as_slice(), &mut decoded_tail_positions)
+            self.overflow
+                .as_deref()
+                .expect("positions must exist for posting list")
+                .tail_positions
+                .decode_into(tail_frequencies.as_slice(), &mut decoded_positions)
                 .expect("tail position stream decoding should succeed");
         }
         let mut tail_offset = 0usize;
-        for entry in &self.tail_entries {
+        for (doc_id, frequency) in self.tail_entries() {
             let positions = self.with_positions.then(|| {
-                let end = tail_offset + entry.frequency as usize;
-                let doc_positions = decoded_tail_positions[tail_offset..end].to_vec();
+                let end = tail_offset + frequency as usize;
+                let doc_positions = decoded_positions[tail_offset..end].to_vec();
                 tail_offset = end;
                 doc_positions
             });
-            visit(entry.doc_id, entry.frequency, positions)?;
+            visit(doc_id, frequency, positions)?;
         }
 
         Ok(())
@@ -164,33 +300,19 @@ impl PostingListBuilder {
 
     pub fn add(&mut self, doc_id: u32, term_positions: PositionRecorder) {
         debug_assert!(
-            self.open_doc_id.is_none(),
+            self.open_doc().is_none(),
             "cannot add closed doc while a positions doc is still open"
         );
-        let tail_entries_capacity_before = self.tail_entries.capacity();
-        self.tail_entries
-            .push(RawDocInfo::new(doc_id, term_positions.len()));
-        let tail_entries_capacity_after = self.tail_entries.capacity();
-        if tail_entries_capacity_after > tail_entries_capacity_before {
-            self.add_memory_bytes(
-                (tail_entries_capacity_after - tail_entries_capacity_before)
-                    * std::mem::size_of::<RawDocInfo>(),
-            );
-        }
+        let frequency = term_positions.len();
         if let PositionRecorder::Position(positions_in_doc) = term_positions {
             debug_assert!(self.with_positions);
-            let old_size = self.tail_positions.size();
-            self.tail_positions
+            self.overflow_mut()
+                .tail_positions
                 .append_doc_positions(positions_in_doc.as_slice())
                 .expect("position stream encoding should succeed");
-            self.adjust_tail_positions_size(old_size);
         }
-        self.len += 1;
-
-        if self.tail_entries.len() == self.block_size {
-            self.flush_tail_block()
-                .expect("posting list block compression should succeed");
-        }
+        self.push_tail_entry(doc_id, frequency)
+            .expect("posting list block compression should succeed");
     }
 
     pub fn add_occurrence(&mut self, doc_id: u32, position: u32) -> Result<bool> {
@@ -200,28 +322,27 @@ impl PostingListBuilder {
             ));
         }
 
-        match self.open_doc_id {
-            Some(open_doc_id) if open_doc_id == doc_id => {
-                let old_size = self.tail_positions.size();
-                self.tail_positions
-                    .append_position(position, self.open_doc_last_position)?;
-                self.adjust_tail_positions_size(old_size);
-                self.open_doc_frequency += 1;
-                self.open_doc_last_position = Some(position);
+        let overflow = self.overflow_mut();
+        match overflow.open_doc.as_mut() {
+            Some(open_doc) if open_doc.doc_id == doc_id => {
+                overflow
+                    .tail_positions
+                    .append_position(position, Some(open_doc.last_position))?;
+                open_doc.frequency += 1;
+                open_doc.last_position = position;
                 Ok(false)
             }
-            Some(open_doc_id) => Err(Error::index(format!(
+            Some(open_doc) => Err(Error::index(format!(
                 "posting list received doc {} before finishing open doc {}",
-                doc_id, open_doc_id
+                doc_id, open_doc.doc_id
             ))),
             None => {
-                let old_size = self.tail_positions.size();
-                self.tail_positions.append_position(position, None)?;
-                self.adjust_tail_positions_size(old_size);
-                self.open_doc_id = Some(doc_id);
-                self.open_doc_frequency = 1;
-                self.open_doc_last_position = Some(position);
-                self.len += 1;
+                overflow.tail_positions.append_position(position, None)?;
+                overflow.open_doc = Some(OpenDoc {
+                    doc_id,
+                    frequency: 1,
+                    last_position: position,
+                });
                 Ok(true)
             }
         }
@@ -231,32 +352,65 @@ impl PostingListBuilder {
         if !self.with_positions {
             return Ok(());
         }
-        match self.open_doc_id {
-            Some(open_doc_id) if open_doc_id == doc_id => {
-                let tail_entries_capacity_before = self.tail_entries.capacity();
-                self.tail_entries
-                    .push(RawDocInfo::new(doc_id, self.open_doc_frequency));
-                let tail_entries_capacity_after = self.tail_entries.capacity();
-                if tail_entries_capacity_after > tail_entries_capacity_before {
-                    self.add_memory_bytes(
-                        (tail_entries_capacity_after - tail_entries_capacity_before)
-                            * std::mem::size_of::<RawDocInfo>(),
-                    );
-                }
-                self.open_doc_id = None;
-                self.open_doc_frequency = 0;
-                self.open_doc_last_position = None;
-                if self.tail_entries.len() == self.block_size {
-                    self.flush_tail_block()?;
-                }
-                Ok(())
+        let Some(overflow) = self.overflow.as_deref_mut() else {
+            return Ok(());
+        };
+        match overflow.open_doc {
+            Some(open_doc) if open_doc.doc_id == doc_id => {
+                overflow.open_doc = None;
+                self.push_tail_entry(doc_id, open_doc.frequency)
             }
-            Some(open_doc_id) => Err(Error::index(format!(
+            Some(open_doc) => Err(Error::index(format!(
                 "attempted to finish doc {} while doc {} is still open",
-                doc_id, open_doc_id
+                doc_id, open_doc.doc_id
             ))),
             None => Ok(()),
         }
+    }
+
+    fn push_tail_entry(&mut self, doc_id: u32, frequency: u32) -> Result<()> {
+        push_varint(&mut self.tail, doc_id.wrapping_sub(self.last_tail_doc_id));
+        push_varint(&mut self.tail, frequency);
+        self.last_tail_doc_id = doc_id;
+        let tail_len = usize::from(self.tail_len) + 1;
+        if tail_len == self.block_size() {
+            self.flush_tail_block()
+        } else {
+            self.tail_len = tail_len as u8;
+            Ok(())
+        }
+    }
+
+    /// Encodes the full tail, which holds exactly `block_size` postings, as a
+    /// block.
+    fn flush_tail_block(&mut self) -> Result<()> {
+        let block_size = self.block_size();
+        let mut doc_ids = Vec::with_capacity(block_size);
+        let mut frequencies = Vec::with_capacity(block_size);
+        for (doc_id, frequency) in TailEntries::new(&self.tail, block_size) {
+            doc_ids.push(doc_id);
+            frequencies.push(frequency);
+        }
+        let with_positions = self.with_positions;
+        let overflow = self.overflow_mut();
+        debug_assert!(
+            overflow.open_doc.is_none(),
+            "cannot flush a posting block while a document is still open"
+        );
+        let full_blocks = overflow.full_blocks.get_or_insert_with(Box::default);
+        full_blocks
+            .encoded_blocks
+            .push_full_block(&doc_ids, &frequencies)?;
+        if with_positions {
+            let tail_position_block = std::mem::take(&mut overflow.tail_positions).finish();
+            full_blocks
+                .encoded_position_blocks
+                .push_encoded_block(tail_position_block.as_slice());
+        }
+        self.tail.clear();
+        self.tail_len = 0;
+        self.last_tail_doc_id = 0;
+        Ok(())
     }
 
     fn collect_entries(&self) -> Vec<(u32, u32, Option<Vec<u32>>)> {
@@ -269,111 +423,29 @@ impl PostingListBuilder {
         entries
     }
 
-    fn encoded_blocks_mut(&mut self) -> &mut EncodedBlocks {
-        if self.encoded_blocks.is_none() {
-            self.encoded_blocks = Some(Box::default());
-            self.add_memory_bytes(std::mem::size_of::<EncodedBlocks>());
+    fn into_parts(self) -> PostingListParts {
+        debug_assert!(self.open_doc().is_none());
+        let length = self.len();
+        let block_size = self.block_size();
+        let (tail_doc_ids, tail_frequencies) = self.tail_entries().unzip();
+        let overflow = self.overflow.map(|overflow| *overflow).unwrap_or_default();
+        let full_blocks = overflow
+            .full_blocks
+            .map(|full_blocks| *full_blocks)
+            .unwrap_or_default();
+        PostingListParts {
+            with_positions: self.with_positions,
+            posting_tail_codec: self.posting_tail_codec,
+            block_size,
+            length,
+            encoded_blocks: full_blocks.encoded_blocks,
+            encoded_position_blocks: full_blocks.encoded_position_blocks,
+            tail_doc_ids,
+            tail_frequencies,
+            tail_position_block: self
+                .with_positions
+                .then(|| overflow.tail_positions.finish()),
         }
-        self.encoded_blocks
-            .as_deref_mut()
-            .expect("encoded blocks must exist")
-    }
-
-    fn encoded_position_blocks_mut(&mut self) -> &mut EncodedPositionBlocks {
-        if self.encoded_position_blocks.is_none() {
-            self.encoded_position_blocks = Some(Box::default());
-            self.add_memory_bytes(std::mem::size_of::<EncodedPositionBlocks>());
-        }
-        self.encoded_position_blocks
-            .as_deref_mut()
-            .expect("encoded position blocks must exist")
-    }
-
-    fn flush_tail_block(&mut self) -> Result<()> {
-        if self.tail_entries.is_empty() {
-            return Ok(());
-        }
-        debug_assert!(
-            self.open_doc_id.is_none(),
-            "cannot flush a posting block while a document is still open"
-        );
-        debug_assert_eq!(self.tail_entries.len(), self.block_size);
-        let doc_ids = self
-            .tail_entries
-            .iter()
-            .map(|entry| entry.doc_id)
-            .collect::<Vec<_>>();
-        let frequencies = self
-            .tail_entries
-            .iter()
-            .map(|entry| entry.frequency)
-            .collect::<Vec<_>>();
-        let encoded_blocks_size_before = self
-            .encoded_blocks
-            .as_ref()
-            .map(|encoded_blocks| encoded_blocks.size())
-            .unwrap_or(0usize);
-        self.encoded_blocks_mut()
-            .push_full_block(&doc_ids, &frequencies)?;
-        let encoded_blocks_size_after = self
-            .encoded_blocks
-            .as_ref()
-            .map(|encoded_blocks| encoded_blocks.size())
-            .unwrap_or(0usize);
-        if encoded_blocks_size_after > encoded_blocks_size_before {
-            self.add_memory_bytes(encoded_blocks_size_after - encoded_blocks_size_before);
-        }
-        if self.with_positions {
-            let encoded_positions_size_before = self
-                .encoded_position_blocks
-                .as_ref()
-                .map(|encoded| encoded.size())
-                .unwrap_or(0usize);
-            let released_tail_positions_bytes = self.tail_positions.size();
-            let tail_position_block = std::mem::take(&mut self.tail_positions).finish();
-            self.encoded_position_blocks_mut()
-                .push_encoded_block(tail_position_block.as_slice());
-            let encoded_positions_size_after = self
-                .encoded_position_blocks
-                .as_ref()
-                .map(|encoded| encoded.size())
-                .unwrap_or(0usize);
-            if released_tail_positions_bytes > 0 {
-                self.subtract_memory_bytes(released_tail_positions_bytes);
-            }
-            if encoded_positions_size_after > encoded_positions_size_before {
-                self.add_memory_bytes(encoded_positions_size_after - encoded_positions_size_before);
-            }
-        }
-        self.tail_entries.clear();
-        Ok(())
-    }
-
-    fn adjust_tail_positions_size(&mut self, old_size: usize) {
-        let new_size = self.tail_positions.size();
-        if new_size > old_size {
-            self.add_memory_bytes(new_size - old_size);
-        } else if old_size > new_size {
-            self.subtract_memory_bytes(old_size - new_size);
-        }
-    }
-
-    fn add_memory_bytes(&mut self, bytes: usize) {
-        self.memory_size_bytes = self
-            .memory_size_bytes
-            .checked_add(
-                u32::try_from(bytes).expect("posting list memory size delta overflowed u32"),
-            )
-            .expect("posting list memory size overflowed u32");
-    }
-
-    fn subtract_memory_bytes(&mut self, bytes: usize) {
-        self.memory_size_bytes = self
-            .memory_size_bytes
-            .checked_sub(
-                u32::try_from(bytes).expect("posting list memory size delta overflowed u32"),
-            )
-            .expect("posting list memory size underflowed u32");
     }
 
     fn build_position_columns(
@@ -409,14 +481,13 @@ impl PostingListBuilder {
     }
 
     fn build_batch(
-        self,
+        length: usize,
         compressed: LargeBinaryArray,
         impacts: Option<ImpactSkipData>,
         max_score: f32,
         schema: SchemaRef,
         positions: Option<CompressedPositionStorage>,
     ) -> Result<RecordBatch> {
-        let length = self.len();
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -485,37 +556,8 @@ impl PostingListBuilder {
             } else {
                 None
             };
-        let Self {
-            with_positions,
-            posting_tail_codec,
-            encoded_blocks,
-            encoded_position_blocks,
-            tail_entries,
-            tail_positions,
-            open_doc_id,
-            open_doc_frequency,
-            open_doc_last_position,
-            block_size,
-            len,
-            ..
-        } = self;
-        debug_assert!(open_doc_id.is_none());
-        debug_assert_eq!(open_doc_frequency, 0);
-        debug_assert!(open_doc_last_position.is_none());
-        let parts = PostingListParts {
-            with_positions,
-            posting_tail_codec,
-            block_size,
-            length: len as usize,
-            encoded_blocks: encoded_blocks
-                .map(|encoded_blocks| *encoded_blocks)
-                .unwrap_or_default(),
-            encoded_position_blocks: encoded_position_blocks
-                .map(|encoded_positions| *encoded_positions)
-                .unwrap_or_default(),
-            tail_entries: tail_entries.as_slice(),
-            tail_position_block: with_positions.then(|| tail_positions.finish()),
-        };
+        let parts = self.into_parts();
+        let length = parts.length as u32;
         let (compressed, shared_positions, max_score, impacts) =
             Self::build_compressed_with_scores_from_parts(parts, docs)?;
         let positions = match legacy_positions {
@@ -526,24 +568,13 @@ impl PostingListBuilder {
             compressed,
             Some(&impacts),
             max_score,
-            len,
+            length,
             positions.as_ref(),
         )
     }
 
-    fn extend_tail_components(
-        tail_entries: &[RawDocInfo],
-        doc_ids: &mut Vec<u32>,
-        frequencies: &mut Vec<u32>,
-    ) {
-        doc_ids.clear();
-        frequencies.clear();
-        doc_ids.extend(tail_entries.iter().map(|entry| entry.doc_id));
-        frequencies.extend(tail_entries.iter().map(|entry| entry.frequency));
-    }
-
     fn build_compressed_with_scores_from_parts(
-        parts: PostingListParts<'_>,
+        parts: PostingListParts,
         docs: &DocSet,
     ) -> Result<(
         LargeBinaryArray,
@@ -558,7 +589,8 @@ impl PostingListBuilder {
             block_size,
             mut encoded_blocks,
             mut encoded_position_blocks,
-            tail_entries,
+            tail_doc_ids,
+            tail_frequencies,
             tail_position_block,
         } = parts;
         let avgdl = docs.average_length();
@@ -574,12 +606,7 @@ impl PostingListBuilder {
             let block = encoded_blocks.block(index);
             doc_ids.clear();
             frequencies.clear();
-            super::super::encoding::decode_full_posting_block(
-                block,
-                &mut doc_ids,
-                &mut frequencies,
-                block_size,
-            );
+            decode_full_posting_block(block, &mut doc_ids, &mut frequencies, block_size);
             let block_score = compute_block_score_and_impact_block(
                 docs,
                 avgdl,
@@ -595,21 +622,20 @@ impl PostingListBuilder {
             }
         }
 
-        if !tail_entries.is_empty() {
-            Self::extend_tail_components(tail_entries, &mut doc_ids, &mut frequencies);
+        if !tail_doc_ids.is_empty() {
             let block_score = compute_block_score_and_impact_block(
                 docs,
                 avgdl,
                 idf_scale,
-                doc_ids.iter().copied(),
-                frequencies.iter().copied(),
+                tail_doc_ids.iter().copied(),
+                tail_frequencies.iter().copied(),
                 &mut impact_block,
             );
             impact_builder.append_block(impact_block.as_slice())?;
             max_score = max_score.max(block_score);
             encoded_blocks.append_remainder_block_with_codec(
-                doc_ids.as_slice(),
-                frequencies.as_slice(),
+                tail_doc_ids.as_slice(),
+                tail_frequencies.as_slice(),
                 posting_tail_codec,
                 block_size,
             )?;
@@ -634,22 +660,24 @@ impl PostingListBuilder {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_compressed_with_block_scores_from_parts(
-        with_positions: bool,
-        posting_tail_codec: PostingTailCodec,
-        block_size: usize,
-        mut encoded_blocks: EncodedBlocks,
-        mut encoded_position_blocks: EncodedPositionBlocks,
-        tail_entries: &[RawDocInfo],
-        tail_position_block: Option<Vec<u8>>,
+        parts: PostingListParts,
         mut block_max_scores: impl Iterator<Item = f32>,
     ) -> Result<(LargeBinaryArray, Option<SharedPositionStream>, f32)> {
+        let PostingListParts {
+            with_positions,
+            posting_tail_codec,
+            block_size,
+            mut encoded_blocks,
+            mut encoded_position_blocks,
+            tail_doc_ids,
+            tail_frequencies,
+            tail_position_block,
+            ..
+        } = parts;
         let has_score_prefix =
             super::super::encoding::posting_block_score_prefix_len(block_size) > 0;
         let mut max_score = f32::MIN;
-        let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
-        let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
 
         for index in 0..encoded_blocks.len() {
             let block_score = block_max_scores
@@ -661,15 +689,14 @@ impl PostingListBuilder {
             }
         }
 
-        if !tail_entries.is_empty() {
+        if !tail_doc_ids.is_empty() {
             let block_score = block_max_scores
                 .next()
                 .ok_or_else(|| Error::index("missing tail block max score".to_owned()))?;
             max_score = max_score.max(block_score);
-            Self::extend_tail_components(tail_entries, &mut doc_ids, &mut frequencies);
             encoded_blocks.append_remainder_block_with_codec(
-                doc_ids.as_slice(),
-                frequencies.as_slice(),
+                tail_doc_ids.as_slice(),
+                tail_frequencies.as_slice(),
                 posting_tail_codec,
                 block_size,
             )?;
@@ -695,12 +722,12 @@ impl PostingListBuilder {
     pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
             self.posting_tail_codec,
-            self.block_size,
+            self.block_size(),
         )?;
         let schema = inverted_list_schema_for_version_with_block_size_and_impacts(
             self.has_positions(),
             format_version,
-            self.block_size,
+            self.block_size(),
             false,
         );
         let legacy_positions =
@@ -709,57 +736,18 @@ impl PostingListBuilder {
             } else {
                 None
             };
-        let Self {
-            with_positions,
-            posting_tail_codec,
-            encoded_blocks,
-            encoded_position_blocks,
-            tail_entries,
-            tail_positions,
-            open_doc_id,
-            open_doc_frequency,
-            open_doc_last_position,
-            block_size,
-            len,
-            ..
-        } = self;
-        debug_assert!(open_doc_id.is_none());
-        debug_assert_eq!(open_doc_frequency, 0);
-        debug_assert!(open_doc_last_position.is_none());
+        let parts = self.into_parts();
+        let length = parts.length;
         let (compressed, shared_positions, max_score) =
             Self::build_compressed_with_block_scores_from_parts(
-                with_positions,
-                posting_tail_codec,
-                block_size,
-                encoded_blocks
-                    .map(|encoded_blocks| *encoded_blocks)
-                    .unwrap_or_default(),
-                encoded_position_blocks
-                    .map(|encoded_positions| *encoded_positions)
-                    .unwrap_or_default(),
-                tail_entries.as_slice(),
-                with_positions.then(|| tail_positions.finish()),
+                parts,
                 block_max_scores.into_iter(),
             )?;
-        let builder = Self {
-            with_positions,
-            posting_tail_codec,
-            encoded_blocks: None,
-            encoded_position_blocks: None,
-            tail_entries: Vec::new(),
-            tail_positions: PositionBlockBuilder::default(),
-            open_doc_id: None,
-            open_doc_frequency: 0,
-            open_doc_last_position: None,
-            block_size,
-            memory_size_bytes: 0,
-            len,
-        };
         let positions = match legacy_positions {
             Some(positions) => Some(CompressedPositionStorage::LegacyPerDoc(positions)),
             None => shared_positions.map(CompressedPositionStorage::SharedStream),
         };
-        builder.build_batch(compressed, None, max_score, schema, positions)
+        Self::build_batch(length, compressed, None, max_score, schema, positions)
     }
 
     pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
@@ -770,58 +758,22 @@ impl PostingListBuilder {
             } else {
                 None
             };
-        let Self {
-            with_positions,
-            posting_tail_codec,
-            encoded_blocks,
-            encoded_position_blocks,
-            tail_entries,
-            tail_positions,
-            open_doc_id,
-            open_doc_frequency,
-            open_doc_last_position,
-            block_size,
-            len,
-            ..
-        } = self;
-        debug_assert!(open_doc_id.is_none());
-        debug_assert_eq!(open_doc_frequency, 0);
-        debug_assert!(open_doc_last_position.is_none());
-        let parts = PostingListParts {
-            with_positions,
-            posting_tail_codec,
-            block_size,
-            length: len as usize,
-            encoded_blocks: encoded_blocks
-                .map(|encoded_blocks| *encoded_blocks)
-                .unwrap_or_default(),
-            encoded_position_blocks: encoded_position_blocks
-                .map(|encoded_positions| *encoded_positions)
-                .unwrap_or_default(),
-            tail_entries: tail_entries.as_slice(),
-            tail_position_block: with_positions.then(|| tail_positions.finish()),
-        };
+        let parts = self.into_parts();
+        let length = parts.length;
         let (compressed, shared_positions, max_score, impacts) =
             Self::build_compressed_with_scores_from_parts(parts, docs)?;
-        let builder = Self {
-            with_positions,
-            posting_tail_codec,
-            encoded_blocks: None,
-            encoded_position_blocks: None,
-            tail_entries: Vec::new(),
-            tail_positions: PositionBlockBuilder::default(),
-            open_doc_id: None,
-            open_doc_frequency: 0,
-            open_doc_last_position: None,
-            block_size,
-            memory_size_bytes: 0,
-            len,
-        };
         let positions = match legacy_positions {
             Some(positions) => Some(CompressedPositionStorage::LegacyPerDoc(positions)),
             None => shared_positions.map(CompressedPositionStorage::SharedStream),
         };
-        builder.build_batch(compressed, Some(impacts), max_score, schema, positions)
+        Self::build_batch(
+            length,
+            compressed,
+            Some(impacts),
+            max_score,
+            schema,
+            positions,
+        )
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
@@ -829,7 +781,7 @@ impl PostingListBuilder {
         let mut new_builder = Self::new_with_posting_tail_codec_and_block_size(
             self.has_positions(),
             self.posting_tail_codec,
-            self.block_size,
+            self.block_size(),
         );
         for (doc_id, freq, positions) in self.iter() {
             while cursor < removed.len() && removed[cursor] < doc_id {

@@ -33,7 +33,7 @@ use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::Float32Array;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
 };
@@ -68,6 +68,7 @@ use lance_file::{
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::NoFilter;
+use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
@@ -127,7 +128,9 @@ use serde_json::json;
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
+    future::Future,
     ops::Range,
+    pin::Pin,
     sync::{Arc, OnceLock},
 };
 use tokio::sync::mpsc;
@@ -499,7 +502,7 @@ fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
     }
 }
 
-fn validate_vector_query_compatibility(
+pub(crate) fn validate_vector_query_compatibility(
     indices: &[Arc<dyn VectorIndex>],
     operation: &str,
 ) -> Result<()> {
@@ -1558,6 +1561,13 @@ impl VectorIndex for IVFIndex {
         ))
     }
 
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize: see `remap`.
+        Err(Error::index(
+            "Remapping IVF in this way not supported".to_string(),
+        ))
+    }
+
     fn ivf_model(&self) -> &IvfModel {
         &self.ivf
     }
@@ -2021,13 +2031,13 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap(mapping).await?;
+        page.remap_streaming(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2066,12 +2076,33 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
     Ok(tasks)
 }
 
+/// Runs one specialized builder's remap on the heap.
+///
+/// The eager compaction remap runs under Python's `block_on` on the calling
+/// thread, and in CI (dev-profile wheel, opt-level 0) it overflowed the
+/// Windows main-thread stack. `remap_index_file_v3` dispatches over an 11-arm
+/// match whose arms each await a different monomorphization of
+/// `IvfIndexBuilder::remap_streaming`; without the box the outer future embeds
+/// every specialized builder future, and at opt-level 0 each arm's future is
+/// also materialized as a separate stack temporary while it is polled. Boxing
+/// per arm, in the concrete `Pin<Box<impl Future>>` form (a `dyn Future`
+/// trait object would put a `dyn Send` obligation in front of the solver, see
+/// `DatasetIndexRemapper::remap_indices`), leaves one pointer per arm
+/// on the caller's stack. The builder moves into the heap future too, so the
+/// dispatching future does not hold a builder across the await either.
+fn remap_boxed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+    mut builder: IvfIndexBuilder<S, Q>,
+    mapping: &RowAddrTranslator,
+) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>> {
+    Box::pin(async move { builder.remap_streaming(mapping).await })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn remap_index_file_v3(
     dataset: &Dataset,
     new_uuid: &Uuid,
     index: Arc<dyn VectorIndex>,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     column: String,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
@@ -2080,17 +2111,21 @@ pub(crate) async fn remap_index_file_v3(
     match index.sub_index_type() {
         (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
+                remap_boxed(
+                    IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                        dataset, column, index_dir, index,
+                    )?,
+                    mapping,
+                )
                 .await
             }
             DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
+                remap_boxed(
+                    IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                        dataset, column, index_dir, index,
+                    )?,
+                    mapping,
+                )
                 .await
             }
             _ => Err(Error::index(format!(
@@ -2099,65 +2134,85 @@ pub(crate) async fn remap_index_file_v3(
             ))),
         },
         (SubIndexType::Flat, QuantizationType::Product) => {
-            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Flat, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Flat, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
-            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
-                .remap(mapping)
-                .await
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
+            .await
         }
         (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => {
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
 
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Rabit) => {
-            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
-                dataset, column, index_dir, index,
-            )?
-            .remap(mapping)
+            remap_boxed(
+                IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
+                    dataset, column, index_dir, index,
+                )?,
+                mapping,
+            )
             .await
         }
     }
@@ -2170,7 +2225,7 @@ pub(crate) async fn remap_index_file(
     new_uuid: &Uuid,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
@@ -3733,6 +3788,58 @@ fn update_refined_centroids(
     f32_fsl_from_values(next, dimension)
 }
 
+/// The streaming trainers accumulate and re-dispatch in f32, so training
+/// chunks must arrive as Float32. `convert_to_floating_point` cannot do this
+/// on its own: it returns f16 and f64 inputs unchanged, and the trainers'
+/// f32-only kernels hit those as a downcast panic.
+fn cast_training_data_to_f32(training_data: FixedSizeListArray) -> Result<FixedSizeListArray> {
+    let value_type = training_data.value_type();
+    match value_type {
+        DataType::Float32 => Ok(training_data),
+        DataType::Float16 | DataType::Float64 | DataType::Int8 => {
+            let (field, dimension, values, nulls) = training_data.into_parts();
+            let values = arrow::compute::cast(&values, &DataType::Float32)?;
+            let field = Arc::new(field.as_ref().clone().with_data_type(DataType::Float32));
+            let cast = FixedSizeListArray::try_new(field, dimension, values, nulls)?;
+            if value_type == DataType::Float64 {
+                return drop_rows_that_saturated(cast);
+            }
+            Ok(cast)
+        }
+        value_type => Err(Error::invalid_input(format!(
+            "streaming IVF training supports f16/f32/f64 and i8 vector columns, got {value_type}"
+        ))),
+    }
+}
+
+/// An f64 above `f32::MAX` saturates to an infinity instead of failing the
+/// cast, and the samplers filter for finite values before the cast runs, so the
+/// invariant has to be re-established here or the trainers accumulate
+/// infinities into their centroids.
+///
+/// This drops exactly the rows the narrowing broke, so null rows pass through
+/// as they do for every other value type.
+fn drop_rows_that_saturated(cast: FixedSizeListArray) -> Result<FixedSizeListArray> {
+    let values = cast.values().as_primitive::<Float32Type>().values();
+    if values.iter().all(|value| value.is_finite()) {
+        return Ok(cast);
+    }
+    let dimension = cast.value_length() as usize;
+    let keep = BooleanArray::from_iter(
+        values
+            .chunks(dimension)
+            .map(|row| Some(row.iter().all(|value| value.is_finite()))),
+    );
+    let kept = keep.true_count();
+    warn!(
+        "Dropped {} of {} streaming IVF training rows: their f64 values exceed the f32 range the trainers use",
+        cast.len() - kept,
+        cast.len()
+    );
+    let filtered = arrow::compute::filter(&cast, &keep)?;
+    Ok(filtered.as_fixed_size_list().clone())
+}
+
 async fn refine_streaming_f32_kmeans_with_sampler(
     sampler: &FixedIvfTrainingSampler<'_>,
     metric_type: MetricType,
@@ -3753,17 +3860,13 @@ async fn refine_streaming_f32_kmeans_with_sampler(
             let ranges = sample_ranges.chunk(row_offset, streaming_sample_size.max(1));
             row_offset += ranges.iter().map(range_len).sum::<usize>();
             let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
-            let training_data = if training_data.value_type() == DataType::Float32 {
-                training_data
-            } else {
-                training_data.convert_to_floating_point()?
-            };
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming IVF refinement currently supports L2/Cosine training, got {}",
                     metric_type
                 )));
             }
+            let training_data = cast_training_data_to_f32(training_data)?;
             loss += accumulate_refine_assignments(
                 &training_data,
                 &centroids,
@@ -3815,17 +3918,13 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                 fragment_ids,
             )
             .await?;
-            let training_data = if training_data.value_type() == DataType::Float32 {
-                training_data
-            } else {
-                training_data.convert_to_floating_point()?
-            };
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming IVF refinement currently supports L2/Cosine training, got {}",
                     metric_type
                 )));
             }
+            let training_data = cast_training_data_to_f32(training_data)?;
             loss += accumulate_refine_assignments(
                 &training_data,
                 &centroids,
@@ -4609,17 +4708,13 @@ async fn train_streaming_coreset_ivf_model(
                 )
                 .await?
             };
-            let training_data = if training_data.value_type() == DataType::Float32 {
-                training_data
-            } else {
-                training_data.convert_to_floating_point()?
-            };
             if mt != DistanceType::L2 {
                 return Err(Error::invalid_input(format!(
                     "streaming coreset IVF currently supports L2/Cosine training, got {}",
                     metric_type
                 )));
             }
+            let training_data = cast_training_data_to_f32(training_data)?;
             if training_data.len() < num_partitions {
                 return Err(Error::index(format!(
                     "Not enough training vectors for streaming coreset IVF. Requires at least {} rows but sampled {} rows",
@@ -4956,6 +5051,7 @@ async fn train_ivf_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
 
     use std::collections::HashSet;
     use std::iter::repeat_n;
@@ -4965,8 +5061,8 @@ mod tests {
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
-        FixedSizeListArray, Float16Array, Float32Array, RecordBatch, RecordBatchIterator,
-        RecordBatchReader, UInt64Array, make_array,
+        FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, RecordBatch,
+        RecordBatchIterator, RecordBatchReader, UInt16Array, UInt64Array, make_array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, Schema};
@@ -4978,6 +5074,7 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::VECTOR_INDEX_VERSION;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::progress::noop_progress;
     use lance_index::scalar::OldIndexDataFilter;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
@@ -5752,7 +5849,7 @@ mod tests {
             &new_uuid,
             dataset_mut.version().version,
             ivf_index,
-            &RowAddrRemap::direct(mapping),
+            &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],
@@ -6466,6 +6563,211 @@ mod tests {
         );
     }
 
+    /// f16 and f64 columns used to survive the streaming trainer's dtype
+    /// normalization unchanged (`convert_to_floating_point` only converts
+    /// integer types) and then hit the unconditional Float32 downcast in the
+    /// coreset path, panicking the build instead of training.
+    ///
+    /// The two cases also take different routes into the trainer: a
+    /// non-nullable column gets the fixed-range sampler, a nullable one the
+    /// resampling path, and each has its own normalization site.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_ivf_training_float16() {
+        let values = generate_random_array_with_seed::<Float16Type>(2048 * 8, [22; 32]);
+        streaming_coreset_training_completes(values, 8, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_ivf_training_float64_nullable() {
+        let values = generate_random_array_with_seed::<Float64Type>(2048 * 8, [22; 32]);
+        streaming_coreset_training_completes(values, 8, true).await;
+    }
+
+    async fn streaming_coreset_training_completes<T: arrow_array::Array + 'static>(
+        values: T,
+        dimension: usize,
+        nullable: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let fsl = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            fsl.data_type().clone(),
+            nullable,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(4);
+        params.streaming_refine_passes = 1;
+        params.max_iters = 2;
+
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            dimension,
+            MetricType::L2,
+            &params,
+            None,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ivf_model.num_partitions(), 257);
+        assert_eq!(ivf_model.dimension(), dimension);
+        let centroids = ivf_model.centroids_array().expect("trained model");
+        assert_eq!(centroids.value_type(), DataType::Float32);
+        let centroid_values = centroids.values().as_primitive::<Float32Type>();
+        // The generator draws from [0, 1), and a centroid is a weighted mean of
+        // training rows, so anything outside that range means the cast produced
+        // the wrong values rather than the wrong type.
+        assert!(
+            centroid_values
+                .values()
+                .iter()
+                .all(|v| (0.0..=1.0).contains(v)),
+            "centroid outside the training range: {:?}",
+            centroid_values
+                .values()
+                .iter()
+                .find(|v| !(0.0..=1.0).contains(*v)),
+        );
+    }
+
+    /// Read the f32 values of a training chunk row by row.
+    fn f32_rows(array: &FixedSizeListArray) -> Vec<Vec<f32>> {
+        let dimension = array.value_length() as usize;
+        let values = array.values().as_primitive::<Float32Type>().values();
+        values
+            .chunks(dimension)
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>()
+    }
+
+    /// `cast_training_data_to_f32` is the only place the streaming trainers
+    /// normalize dtypes, so it has to keep the values, the row boundaries and
+    /// the nulls intact for every type it accepts, and reject the rest with an
+    /// error rather than let a downstream downcast panic.
+    #[test]
+    fn test_cast_training_data_to_f32_converts_supported_types() {
+        let expected = vec![vec![1.0f32, 2.0], vec![3.0, 4.0]];
+
+        let f32_input = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0f32, 2.0, 3.0, 4.0]),
+            2,
+        )
+        .unwrap();
+        let out = cast_training_data_to_f32(f32_input).unwrap();
+        assert_eq!(f32_rows(&out), expected, "Float32 must pass through");
+
+        let f16_input = FixedSizeListArray::try_new_from_values(
+            Float16Array::from(vec![
+                f16::from_f32(1.0),
+                f16::from_f32(2.0),
+                f16::from_f32(3.0),
+                f16::from_f32(4.0),
+            ]),
+            2,
+        )
+        .unwrap();
+        let out = cast_training_data_to_f32(f16_input).unwrap();
+        assert_eq!(f32_rows(&out), expected, "Float16 must widen exactly");
+        assert_eq!(out.value_type(), DataType::Float32);
+
+        let f64_input = FixedSizeListArray::try_new_from_values(
+            Float64Array::from(vec![1.0f64, 2.0, 3.0, 4.0]),
+            2,
+        )
+        .unwrap();
+        let out = cast_training_data_to_f32(f64_input).unwrap();
+        assert_eq!(f32_rows(&out), expected, "Float64 must narrow exactly");
+
+        let i8_input =
+            FixedSizeListArray::try_new_from_values(Int8Array::from(vec![1i8, 2, 3, 4]), 2)
+                .unwrap();
+        let out = cast_training_data_to_f32(i8_input).unwrap();
+        assert_eq!(f32_rows(&out), expected, "Int8 must convert");
+    }
+
+    /// The samplers hand over sliced chunks, so the cast has to follow the
+    /// slice rather than the whole underlying buffer.
+    #[test]
+    fn test_cast_training_data_to_f32_follows_a_slice() {
+        let input = FixedSizeListArray::try_new_from_values(
+            Float64Array::from(vec![10.0f64, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0]),
+            2,
+        )
+        .unwrap();
+        let out = cast_training_data_to_f32(input.slice(1, 2)).unwrap();
+        assert_eq!(
+            f32_rows(&out),
+            vec![vec![20.0f32, 21.0], vec![30.0, 31.0]],
+            "a sliced chunk must map to the rows it points at"
+        );
+    }
+
+    #[test]
+    fn test_cast_training_data_to_f32_keeps_nulls() {
+        let values = Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::ZERO,
+            f16::ZERO,
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ]);
+        let field = Arc::new(Field::new("item", DataType::Float16, false));
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let input = FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(nulls)).unwrap();
+        let out = cast_training_data_to_f32(input).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.null_count(), 1, "the null row must survive the cast");
+        assert!(out.is_null(1), "the null must stay on the same row");
+    }
+
+    /// An f64 above `f32::MAX` saturates to an infinity instead of failing the
+    /// cast, so the samplers' finite filter no longer covers what the trainers
+    /// get and the cast has to drop those rows itself. A null row is not one of
+    /// them, so it stays.
+    #[test]
+    fn test_cast_training_data_to_f32_drops_rows_that_overflow_f32() {
+        let values = Float64Array::from(vec![1.0f64, 2.0, 1e39, 4.0, 0.0, 0.0, 5.0, 6.0]);
+        let field = Arc::new(Field::new("item", DataType::Float64, false));
+        let nulls = NullBuffer::from(vec![true, true, false, true]);
+        let input = FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(nulls)).unwrap();
+        let out = cast_training_data_to_f32(input).unwrap();
+        assert_eq!(
+            f32_rows(&out),
+            vec![vec![1.0f32, 2.0], vec![0.0, 0.0], vec![5.0, 6.0]],
+            "the row that saturated to an infinity must be dropped, the null row must not"
+        );
+        assert_eq!(out.null_count(), 1, "the null row must survive the filter");
+        assert!(
+            out.is_null(1),
+            "the null must land on the row it started on"
+        );
+    }
+
+    #[test]
+    fn test_cast_training_data_to_f32_rejects_unsupported_types() {
+        let input =
+            FixedSizeListArray::try_new_from_values(UInt16Array::from(vec![1u16, 2, 3, 4]), 2)
+                .unwrap();
+        let error = cast_training_data_to_f32(input).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("UInt16"),
+            "the error must name the rejected type: {error}"
+        );
+    }
+
     #[test]
     fn test_fixed_training_ranges_are_sorted_and_bounded() {
         let ranges = generate_fixed_training_ranges(10_000, 1_234, 1_024, 16);
@@ -6694,6 +6996,64 @@ mod tests {
                 ),
                 Field::new("_distance", DataType::Float32, true)
             ]))
+        );
+    }
+
+    /// A codebook whose sub-vector width disagrees with the column used to be
+    /// accepted: the PQ transform derives the width from the column, so an
+    /// oversized codebook had its sub-vector boundaries read at the wrong
+    /// offsets and produced a searchable but wrong index, with no error.
+    ///
+    /// The two index file versions reach the codebook through different
+    /// writers, so both are covered.
+    #[rstest]
+    #[case::v3(IndexFileVersion::V3)]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[tokio::test]
+    async fn test_create_ivf_pq_rejects_mismatched_codebook(#[case] version: IndexFileVersion) {
+        const DIM: usize = 32;
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let arr = generate_random_array_with_seed::<Float32Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // Twice the required 256 * DIM. Divisible by the column dimension, so
+        // nothing downstream complains on its own.
+        let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
+            256 * DIM * 2,
+            [22; 32],
+        ));
+        let mut params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            fast_ivf_params(2),
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        params.version = version;
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("a codebook that does not match the column must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&(256 * DIM * 2).to_string())
+                && message.contains(&(256 * DIM).to_string()),
+            "the error must give the supplied and the required size: {message}"
         );
     }
 

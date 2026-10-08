@@ -23,6 +23,64 @@ pub const BATCH_SIZE: u64 = 10_000;
 /// Number of batches in the dataset
 pub const NUM_BATCHES: u64 = TOTAL_ROWS / BATCH_SIZE;
 
+/// Number of fragments the many-fragment dataset is spread over
+#[allow(dead_code)] // only the btree bench uses the many-fragment dataset
+pub const NUM_FRAGMENTS: u64 = 1_000;
+
+/// Total rows of the many-fragment dataset. Defaults to [`TOTAL_ROWS`]; set
+/// `LANCE_BTREE_BENCH_MANY_FRAG_ROWS` to scale it (e.g. down for a quick run,
+/// up to make every range query touch thousands of pages).
+#[allow(dead_code)] // only the btree bench uses the many-fragment dataset
+pub fn many_fragment_total_rows() -> u64 {
+    std::env::var("LANCE_BTREE_BENCH_MANY_FRAG_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TOTAL_ROWS)
+}
+
+/// Row address of the `i`-th value of the many-fragment dataset: consecutive
+/// values round-robin across fragments, so every btree page (rows sorted by
+/// value) spans all [`NUM_FRAGMENTS`] fragments.
+#[allow(dead_code)] // only the btree bench uses the many-fragment dataset
+pub fn many_fragment_row_addr(i: u64) -> u64 {
+    ((i % NUM_FRAGMENTS) << 32) | (i / NUM_FRAGMENTS)
+}
+
+/// Generate a stream of int64 data with unique sequential values whose row
+/// ids are fragment-style addresses interleaved across [`NUM_FRAGMENTS`]
+/// fragments (see [`many_fragment_row_addr`]).
+#[allow(dead_code)] // only the btree bench uses the many-fragment dataset
+pub fn generate_int_many_fragment_stream() -> SendableRecordBatchStream {
+    let total_rows = many_fragment_total_rows();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("_rowid", DataType::UInt64, false),
+    ]));
+
+    let mut batches = Vec::new();
+    let mut current_row = 0u64;
+    while current_row < total_rows {
+        let batch_end = (current_row + BATCH_SIZE).min(total_rows);
+        let values: Vec<i64> = (current_row..batch_end).map(|i| i as i64).collect();
+        let row_ids: Vec<u64> = (current_row..batch_end)
+            .map(many_fragment_row_addr)
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+        batches.push(Ok(batch));
+        current_row = batch_end;
+    }
+
+    let stream = futures::stream::iter(batches);
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+}
+
 /// Generate a stream of int64 data with unique values (sequential)
 pub fn generate_int_unique_stream() -> SendableRecordBatchStream {
     gen_batch()

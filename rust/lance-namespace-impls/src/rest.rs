@@ -3,12 +3,16 @@
 
 //! REST implementation of Lance Namespace
 
+mod tls;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::OpsMetrics;
 use crate::merge_insert_on_columns;
+use tls::{ReloadableClient, TlsConfig};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -59,15 +63,18 @@ use lance_namespace::error::NamespaceError;
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
-/// This client wraps a single `reqwest::Client` and applies dynamic headers
-/// to each request without recreating the client. This is more efficient than
-/// creating a new client per request when using a `DynamicContextProvider`.
+/// This client applies dynamic headers to each request without recreating the
+/// client. This is more efficient than creating a new client per request when
+/// using a `DynamicContextProvider`.
 ///
 /// The design follows lancedb's `RestfulLanceDbClient` pattern where headers
 /// are applied to the built request using `headers_mut()` before execution.
+///
+/// The underlying `reqwest::Client` is only recreated when the TLS material it
+/// presents is rotated on disk, see [`ReloadableClient`].
 #[derive(Clone)]
 struct RestClient {
-    client: reqwest::Client,
+    client: Arc<ReloadableClient>,
     base_path: String,
     base_headers: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
@@ -133,7 +140,7 @@ impl RestClient {
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
         self.apply_headers(&mut request, operation, object_id);
-        self.client.execute(request).await
+        self.client().execute(request).await
     }
 
     /// Get the base path URL
@@ -141,9 +148,12 @@ impl RestClient {
         &self.base_path
     }
 
-    /// Get a reference to the underlying reqwest client
-    fn client(&self) -> &reqwest::Client {
-        &self.client
+    /// Get the reqwest client to use for the next request.
+    ///
+    /// Returned by value because the client is replaced when the TLS material it presents
+    /// is rotated on disk. Cloning it is cheap: `reqwest::Client` is a handle around an `Arc`.
+    fn client(&self) -> reqwest::Client {
+        self.client.current()
     }
 }
 
@@ -174,6 +184,8 @@ pub struct RestNamespaceBuilder {
     key_file: Option<String>,
     ssl_ca_cert: Option<String>,
     assert_hostname: bool,
+    /// How often the TLS files are checked for rotation, in seconds. 0 disables reloading.
+    reload_interval_seconds: u64,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, tracks operation metrics. Default: false.
     ops_metrics_enabled: bool,
@@ -189,6 +201,7 @@ impl std::fmt::Debug for RestNamespaceBuilder {
             .field("key_file", &self.key_file)
             .field("ssl_ca_cert", &self.ssl_ca_cert)
             .field("assert_hostname", &self.assert_hostname)
+            .field("reload_interval_seconds", &self.reload_interval_seconds)
             .field(
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
@@ -201,6 +214,12 @@ impl std::fmt::Debug for RestNamespaceBuilder {
 impl RestNamespaceBuilder {
     /// Default delimiter for object identifiers
     const DEFAULT_DELIMITER: &'static str = "$";
+
+    /// Default interval between two checks for rotated TLS material, in seconds.
+    ///
+    /// Certificate agents typically re-mint short-lived certificates hours before they expire,
+    /// so a few minutes of staleness is harmless while keeping the cost of the check negligible.
+    const DEFAULT_RELOAD_INTERVAL_SECONDS: u64 = 300;
 
     /// Create a new RestNamespaceBuilder with the specified URI.
     ///
@@ -216,6 +235,7 @@ impl RestNamespaceBuilder {
             key_file: None,
             ssl_ca_cert: None,
             assert_hostname: true,
+            reload_interval_seconds: Self::DEFAULT_RELOAD_INTERVAL_SECONDS,
             context_provider: None,
             ops_metrics_enabled: false,
         }
@@ -232,6 +252,8 @@ impl RestNamespaceBuilder {
     /// - `tls.key_file`: Path to client private key file (optional)
     /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
     /// - `tls.assert_hostname`: Whether to verify hostname (optional, defaults to true)
+    /// - `tls.reload_interval_seconds`: How often the TLS files above are checked for rotation
+    ///   (optional, defaults to 300, `0` disables reloading)
     ///
     /// # Arguments
     ///
@@ -294,6 +316,17 @@ impl RestNamespaceBuilder {
             .get("tls.assert_hostname")
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
+        let reload_interval_seconds = match properties.get("tls.reload_interval_seconds") {
+            Some(value) => value.parse::<u64>().map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid value '{value}' for property 'tls.reload_interval_seconds', \
+                         expected a number of seconds: {e}"
+                    ),
+                })
+            })?,
+            None => Self::DEFAULT_RELOAD_INTERVAL_SECONDS,
+        };
 
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
@@ -309,6 +342,7 @@ impl RestNamespaceBuilder {
             key_file,
             ssl_ca_cert,
             assert_hostname,
+            reload_interval_seconds,
             context_provider: None,
             ops_metrics_enabled,
         })
@@ -382,6 +416,23 @@ impl RestNamespaceBuilder {
     /// * `assert_hostname` - Whether to verify hostname
     pub fn assert_hostname(mut self, assert_hostname: bool) -> Self {
         self.assert_hostname = assert_hostname;
+        self
+    }
+
+    /// Set how often the TLS files are checked for rotation.
+    ///
+    /// Client certificates are commonly short-lived and re-minted onto the same paths while the
+    /// process runs. Once the interval has elapsed, the next request re-reads the configured
+    /// certificate, key and CA files, and rebuilds the HTTP client if their content changed.
+    /// Unchanged content leaves the client, and therefore its connection pool, untouched.
+    ///
+    /// Defaults to 300 seconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `reload_interval_seconds` - Interval between checks in seconds, `0` to never reload
+    pub fn reload_interval_seconds(mut self, reload_interval_seconds: u64) -> Self {
+        self.reload_interval_seconds = reload_interval_seconds;
         self
     }
 
@@ -494,35 +545,18 @@ impl std::fmt::Display for RestNamespace {
 impl RestNamespace {
     /// Create a new REST namespace from builder
     pub(crate) fn from_builder(builder: RestNamespaceBuilder) -> Self {
-        // Build reqwest client WITHOUT default headers - we'll apply headers per-request
-        let mut client_builder = reqwest::Client::builder();
-
-        // Configure mTLS if certificate and key files are provided
-        if let (Some(cert_file), Some(key_file)) = (&builder.cert_file, &builder.key_file)
-            && let (Ok(cert), Ok(key)) = (std::fs::read(cert_file), std::fs::read(key_file))
-            && let Ok(identity) = reqwest::Identity::from_pem(&[&cert[..], &key[..]].concat())
-        {
-            client_builder = client_builder.identity(identity);
-        }
-
-        // Load CA certificate for server verification
-        if let Some(ca_cert_file) = &builder.ssl_ca_cert
-            && let Ok(ca_cert) = std::fs::read(ca_cert_file)
-            && let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_cert)
-        {
-            client_builder = client_builder.add_root_certificate(ca_cert);
-        }
-
-        // Configure hostname verification
-        client_builder = client_builder.danger_accept_invalid_hostnames(!builder.assert_hostname);
-
-        let client = client_builder
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let tls = TlsConfig {
+            cert_file: builder.cert_file,
+            key_file: builder.key_file,
+            ssl_ca_cert: builder.ssl_ca_cert,
+            assert_hostname: builder.assert_hostname,
+        };
+        let reload_interval = (builder.reload_interval_seconds > 0)
+            .then(|| Duration::from_secs(builder.reload_interval_seconds));
 
         // Create the RestClient that handles per-request header injection
         let rest_client = RestClient {
-            client,
+            client: Arc::new(ReloadableClient::new(tls, reload_interval)),
             base_path: builder.uri,
             base_headers: builder.headers,
             context_provider: builder.context_provider,
@@ -1748,6 +1782,75 @@ mod tests {
         assert_eq!(builder.key_file, Some("/path/to/key.pem".to_string()));
         assert_eq!(builder.ssl_ca_cert, Some("/path/to/ca.pem".to_string()));
         assert!(builder.assert_hostname);
+        assert_eq!(
+            builder.reload_interval_seconds,
+            RestNamespaceBuilder::DEFAULT_RELOAD_INTERVAL_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_tls_reload_interval_parsing() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert("tls.reload_interval_seconds".to_string(), "60".to_string());
+
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert_eq!(builder.reload_interval_seconds, 60);
+    }
+
+    #[test]
+    fn test_tls_reload_disabled_by_zero_interval() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert("tls.reload_interval_seconds".to_string(), "0".to_string());
+
+        let builder = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder");
+        assert_eq!(builder.reload_interval_seconds, 0);
+    }
+
+    #[test]
+    fn test_tls_reload_interval_reaches_the_client() {
+        let namespace = RestNamespaceBuilder::new("https://api.example.com")
+            .cert_file("/path/to/cert.pem")
+            .key_file("/path/to/key.pem")
+            .build();
+        assert_eq!(
+            namespace.rest_client.client.reload_interval(),
+            Some(Duration::from_secs(
+                RestNamespaceBuilder::DEFAULT_RELOAD_INTERVAL_SECONDS
+            ))
+        );
+
+        let namespace = RestNamespaceBuilder::new("https://api.example.com")
+            .cert_file("/path/to/cert.pem")
+            .key_file("/path/to/key.pem")
+            .reload_interval_seconds(0)
+            .build();
+        assert_eq!(
+            namespace.rest_client.client.reload_interval(),
+            None,
+            "an interval of 0 should disable reloading"
+        );
+    }
+
+    #[test]
+    fn test_tls_reload_interval_rejects_invalid_value() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert(
+            "tls.reload_interval_seconds".to_string(),
+            "5 minutes".to_string(),
+        );
+
+        let error = RestNamespaceBuilder::from_properties(properties)
+            .expect_err("an unparsable interval should be rejected")
+            .to_string();
+        assert!(
+            error.contains("tls.reload_interval_seconds") && error.contains("5 minutes"),
+            "the error should name the property and its value: {error}"
+        );
     }
 
     #[test]

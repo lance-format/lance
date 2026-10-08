@@ -396,6 +396,18 @@ impl ObjectStoreParams {
             .and_then(|a| a.initial_storage_options())
     }
 
+    /// The block size to use: the explicit `block_size` parameter, else the
+    /// `block_size` storage option, else `None` for the store's default.
+    pub fn resolved_block_size(&self) -> Result<Option<usize>> {
+        if self.block_size.is_some() {
+            return Ok(self.block_size);
+        }
+        match self.storage_options() {
+            Some(options) => StorageOptions(options.clone()).block_size(),
+            None => Ok(None),
+        }
+    }
+
     /// Resolve these params for a single base path scope.
     ///
     /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
@@ -656,7 +668,11 @@ impl ObjectStore {
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
 
             let mut io_tracker = IOTracker::default();
-            meter_store(&mut inner, &mut io_tracker, &store_prefix);
+            meter_store(
+                &mut inner,
+                &mut io_tracker,
+                &metrics_base(&store_prefix, path),
+            );
 
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
@@ -669,7 +685,7 @@ impl ObjectStore {
                 inner: tracked_store,
                 local_dir_operations: None,
                 scheme: path.scheme().to_string(),
-                block_size: params.block_size.unwrap_or(64 * 1024),
+                block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
@@ -1585,19 +1601,38 @@ impl ObjectStore {
         result
     }
 
+    /// Delete every location in the stream, up to `io_parallelism` at a time.
+    ///
+    /// Deleting serially costs a round trip per object — ~30/s against a cloud store,
+    /// which is days for a table with millions of unreferenced files.
+    ///
+    /// `ObjectStore::delete_stream` would also batch (S3: 1000 keys per request) but
+    /// needs a `'static` stream of `object_store::Result`; callers pass a borrowed
+    /// stream of `lance_core::Result`. Using it means changing this signature.
+    ///
+    /// Order is not preserved; no caller may depend on it.
+    ///
+    /// A location that is already gone counts as removed. Callers list first and
+    /// delete after, so a concurrent writer or a second cleanup can remove a path in
+    /// between; failing there would abandon an entire sweep over one absent object.
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
     ) -> BoxStream<'a, Result<Path>> {
         let store = Arc::clone(&self.inner);
         locations
-            .and_then(move |location| {
+            .map(move |location| {
                 let store = Arc::clone(&store);
                 async move {
-                    store.delete(&location).await?;
-                    Ok(location)
+                    let location = location?;
+                    match store.delete(&location).await {
+                        Ok(()) => Ok(location),
+                        Err(object_store::Error::NotFound { .. }) => Ok(location),
+                        Err(error) => Err(error.into()),
+                    }
                 }
             })
+            .buffer_unordered(self.io_parallelism())
             .boxed()
     }
 
@@ -1681,6 +1716,24 @@ impl StorageOptions {
         self.0.iter().any(|(key, value)| {
             key.to_ascii_lowercase().contains("allow_http") & str_is_truthy(value)
         })
+    }
+
+    /// Byte gap below which the I/O scheduler merges two reads of one file
+    /// into a single request, overriding the store's default.
+    pub fn block_size(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("block_size"))
+        else {
+            return Ok(None);
+        };
+        let block_size = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option block_size must be a number of bytes, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(block_size))
     }
 
     /// Number of times to retry a download that fails
@@ -1790,7 +1843,11 @@ impl ObjectStore {
             }
         };
         let mut io_tracker = IOTracker::default();
-        meter_store(&mut store, &mut io_tracker, &store_prefix);
+        meter_store(
+            &mut store,
+            &mut io_tracker,
+            &metrics_base(&store_prefix, &location),
+        );
 
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
@@ -1827,18 +1884,26 @@ impl ObjectStore {
 /// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
 /// through here, or through nothing at all.
 #[cfg(feature = "metrics")]
-fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, base: &str) {
     use crate::object_store::metrics::ObjectStoreMetricsExt;
-    io_tracker.set_metrics_base(store_prefix);
-    *inner = inner.clone().metered(store_prefix.to_owned());
+    io_tracker.set_metrics_base(base);
+    *inner = inner.clone().metered(base.to_owned());
 }
 
 #[cfg(not(feature = "metrics"))]
-fn meter_store(
-    _inner: &mut Arc<dyn OSObjectStore>,
-    _io_tracker: &mut IOTracker,
-    _store_prefix: &str,
-) {
+fn meter_store(_inner: &mut Arc<dyn OSObjectStore>, _io_tracker: &mut IOTracker, _base: &str) {}
+
+/// The `base` metrics label for a store opened at `location`; see
+/// [`metrics::metrics_base`]. Without the `metrics` feature the label is unused
+/// and the prefix keeps the registry cache keyed per bucket as before.
+#[cfg(feature = "metrics")]
+pub(crate) fn metrics_base(store_prefix: &str, location: &Url) -> String {
+    metrics::metrics_base(metrics::base_label_mode(), store_prefix, location)
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn metrics_base(store_prefix: &str, _location: &Url) -> String {
+    store_prefix.to_owned()
 }
 
 fn infer_block_size(scheme: &str) -> usize {
@@ -2057,6 +2122,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.block_size, 1024);
+
+        // The storage option applies when no parameter is given...
+        let mut options_with_block_size = storage_options.unwrap_or_default();
+        options_with_block_size.insert(String::from("block_size"), String::from("2048"));
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(
+            options_with_block_size,
+        ));
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor.clone()),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 2048);
+
+        // ...and the explicit parameter wins over it.
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_block_size_option_rejects_invalid_values() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+            [(String::from("block_size"), String::from("64KiB"))],
+        )));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        };
+        let error =
+            ObjectStore::from_uri_and_params(registry, "memory:///bucket/foo.lance", &params)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("block_size"), "{error}");
     }
 
     #[rstest]
@@ -2655,6 +2769,19 @@ mod tests {
         part_count: AtomicUsize,
         abort_count: AtomicUsize,
         native_copy_count: AtomicUsize,
+        delete_stream_count: AtomicUsize,
+        delete_in_flight: AtomicUsize,
+        /// High-water mark of concurrent deletions; 1 means serial.
+        delete_max_in_flight: AtomicUsize,
+    }
+
+    /// Decrements the in-flight count when its stream is dropped.
+    struct InFlightGuard(Arc<MultipartObservations>);
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.delete_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[derive(Debug)]
@@ -2748,7 +2875,28 @@ mod tests {
             &self,
             locations: BoxStream<'static, OSResult<Path>>,
         ) -> BoxStream<'static, OSResult<Path>> {
-            self.inner.delete_stream(locations)
+            let observations = self.observations.clone();
+            observations
+                .delete_stream_count
+                .fetch_add(1, Ordering::SeqCst);
+            let in_flight = observations.delete_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            observations
+                .delete_max_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            let guard = InFlightGuard(observations);
+            let inner = self.inner.delete_stream(locations);
+            // An in-memory delete resolves on first poll, so overlap is only
+            // observable if the deletion yields.
+            async move {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                inner.map(move |result| {
+                    let _ = &guard;
+                    result
+                })
+            }
+            .flatten_stream()
+            .boxed()
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -2881,6 +3029,87 @@ mod tests {
         assert_eq!(
             store.read_one_all(&destination).await.unwrap().as_ref(),
             contents
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_removes_every_path() {
+        let store = ObjectStore::memory();
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut reported = store
+            .remove_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Concurrent deletion does not preserve order.
+        reported.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        for path in &paths {
+            assert!(!store.exists(path).await.unwrap(), "{path} still present");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_tolerates_already_deleted() {
+        // Callers list first and delete after, so a path can disappear in between.
+        // Failing there abandons the whole sweep over one absent object.
+        let store = ObjectStore::memory();
+        let present = Path::from("present");
+        let absent = Path::from("never-written");
+        store.put(&present, b"x").await.unwrap();
+
+        let to_remove =
+            futures::stream::iter(vec![Ok(absent.clone()), Ok(present.clone())]).boxed();
+        let mut removed = store
+            .remove_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("an already-absent path must not fail the stream");
+
+        removed.sort_unstable();
+        let mut expected = vec![absent, present.clone()];
+        expected.sort_unstable();
+        assert_eq!(removed, expected);
+        assert!(!store.exists(&present).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_deletes_concurrently() {
+        // Serial deletion is a round trip per object; the high-water mark is 1
+        // exactly when that regression happens.
+        let observations = Arc::new(MultipartObservations::default());
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(ObservedMultipartStore {
+            inner: InMemory::new(),
+            observations: observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let removed = store
+            .remove_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(removed.len(), paths.len());
+        assert!(
+            observations.delete_max_in_flight.load(Ordering::SeqCst) > 1,
+            "deletions ran one at a time; remove_stream must overlap them"
         );
     }
 

@@ -6,6 +6,7 @@ use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
+use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -15,7 +16,6 @@ use super::scanner::get_default_batch_size;
 use super::versions;
 use super::write::{GenericWriter, cleanup_data_fragments};
 use crate::dataset::FileFragment;
-use crate::dataset::utils::SchemaAdapter;
 
 /// Update or insert a new column.
 ///
@@ -44,10 +44,9 @@ pub struct Updater {
     /// The schema the new files will be written in. This only contains new columns.
     write_schema: Option<Schema>,
 
-    /// The adapter to convert the logical data to physical data.
-    schema_adapter: Option<SchemaAdapter>,
-
     allow_external_blob_outside_bases: bool,
+
+    write_version: ConcreteFileVersion,
 
     finished: bool,
 
@@ -68,20 +67,35 @@ impl Updater {
         deletion_vector: DeletionVector,
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
+        write_version: ConcreteFileVersion,
     ) -> Result<Self> {
+        if batch_size == Some(0) {
+            return Err(Error::invalid_input(format!(
+                "batch_size must be greater than zero, got 0 for fragment {}",
+                fragment.id()
+            )));
+        }
         let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
             (Some(write_schema), Some(final_schema))
         } else {
             (None, None)
         };
 
-        let storage_version = fragment
-            .dataset()
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
+        let source_version = fragment
+            .metadata()
+            .referenced_lance_files()
+            .next()
+            .map(|file| file.file_version())
+            .transpose()?
+            .unwrap_or_else(|| {
+                fragment
+                    .dataset()
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_format()
+            });
         let legacy_batch_size =
-            versions::row_group_size_for_rewrite(storage_version, &fragment).await?;
+            versions::row_group_size_for_rewrite(source_version, &fragment).await?;
 
         let batch_size = match (&legacy_batch_size, batch_size) {
             // If this is a v1 dataset we must use the row group size of the file
@@ -103,8 +117,8 @@ impl Updater {
             final_schema,
             // The schema adapter needs the data schema, not the logical schema, so it can't be
             // created until after the first batch is read.
-            schema_adapter: None,
             allow_external_blob_outside_bases: false,
+            write_version,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
         })
@@ -171,14 +185,8 @@ impl Updater {
     ///
     /// Internal use only.
     async fn new_writer(&mut self, schema: Schema) -> Result<Box<dyn GenericWriter>> {
-        let data_storage_version = self
-            .dataset()
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
-
         versions::open_update_writer(
-            data_storage_version,
+            self.write_version,
             self.dataset(),
             &schema,
             self.allow_external_blob_outside_bases,
@@ -232,15 +240,6 @@ impl Updater {
             );
         }
 
-        let schema_adapter = if let Some(schema_adapter) = self.schema_adapter.as_ref() {
-            schema_adapter
-        } else {
-            self.schema_adapter = Some(SchemaAdapter::new(batch.schema()));
-            self.schema_adapter.as_ref().unwrap()
-        };
-
-        let batch = schema_adapter.to_physical_batch(batch)?;
-
         let writer = self.writer.as_mut().unwrap();
 
         writer.write(&[batch]).await?;
@@ -272,11 +271,6 @@ impl Updater {
         }
 
         let mut fragment = Fragment::new(self.fragment.id() as u64);
-        let storage_version = self
-            .dataset()
-            .manifest()
-            .data_storage_format
-            .lance_file_format();
         // cleanup_data_fragments only needs path/base_id to remove the unfinished
         // data file and any blob sidecars. Build a minimal synthetic fragment so
         // we can reuse the shared cleanup path without fabricating full metadata.
@@ -284,7 +278,7 @@ impl Updater {
             path,
             vec![],
             vec![],
-            storage_version,
+            self.write_version,
             None,
             base_id,
         ));
