@@ -11,11 +11,13 @@
 //! or new rows in the window between commit and next memtable rotation), this
 //! exec keeps KNN correct by computing exact distances row-by-row.
 
+use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
@@ -27,15 +29,19 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, Result};
+use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_linalg::distance::DistanceType;
 
 use super::super::builder::VectorQuery;
 use super::newest_pk_positions;
 use super::vector::DISTANCE_COLUMN;
+use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
-use crate::dataset::mem_wal::write::BatchStore;
+use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
+use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
 /// indexed path defers to the index's own metric, but with no index there is
@@ -43,8 +49,34 @@ use crate::dataset::mem_wal::write::BatchStore;
 /// SSTable/base arms use when re-ranking unindexed candidates.
 const DEFAULT_DISTANCE_TYPE: DistanceType = DistanceType::L2;
 
+/// Past `1 / NEWEST_SEEK_SHARE` of the visible rows, checking each candidate's
+/// key with a seek costs more than one pass hashing every visible key. The
+/// same crossover the filter indexes' newest-only reads use.
+const NEWEST_SEEK_SHARE: u64 = 8;
+
+/// The part of the prefilter the memtable's filter indexes answer.
+#[derive(Debug, Clone)]
+struct IndexFilter {
+    /// The index searches the filter was split into.
+    expr: ScalarIndexExpr,
+    /// Whether those searches are the whole filter. When some condition had no
+    /// index, an exact index answer is still only a superset.
+    covers_filter: bool,
+}
+
+/// How a search keeps only each primary key's newest visible version.
+enum Newest {
+    /// Every row is its key's newest version, or there is no key.
+    Any,
+    /// The newest versions' positions, from a pass over every visible key.
+    Among(HashSet<u64>),
+    /// A seek in the key index per row.
+    Seek,
+}
+
 /// Brute-force KNN over an active memtable without an HNSW. Produces the same
 /// output schema as [`super::VectorIndexExec`].
+#[derive(Clone)]
 pub struct MemTableBruteForceVectorExec {
     batch_store: Arc<BatchStore>,
     query: VectorQuery,
@@ -62,6 +94,12 @@ pub struct MemTableBruteForceVectorExec {
     /// eligible for top-k. With a filter, this evaluates the predicate against
     /// the current PK version instead of falling back to a stale older version.
     pk_columns: Option<Vec<String>>,
+    /// The memtable's indexes: the primary-key index tells whether any key was
+    /// rewritten and which version is newest, and the filter indexes narrow the
+    /// rows the prefilter is applied to.
+    indexes: Option<Arc<IndexStore>>,
+    /// The prefilter as searches in `indexes`, when they answer some of it.
+    index_filter: Option<IndexFilter>,
 }
 
 impl Debug for MemTableBruteForceVectorExec {
@@ -116,6 +154,8 @@ impl MemTableBruteForceVectorExec {
             with_row_id,
             filter: None,
             pk_columns: None,
+            indexes: None,
+            index_filter: None,
         })
     }
 
@@ -130,6 +170,25 @@ impl MemTableBruteForceVectorExec {
     /// of each PK (see `pk_columns`).
     pub fn with_pk_columns(mut self, pk_columns: Option<Vec<String>>) -> Self {
         self.pk_columns = pk_columns.filter(|columns| !columns.is_empty());
+        self
+    }
+
+    /// Provide the memtable's indexes, so a search skips the newest-version
+    /// pass when no key was ever rewritten.
+    pub fn with_indexes(mut self, indexes: Arc<IndexStore>) -> Self {
+        self.indexes = Some(indexes);
+        self
+    }
+
+    /// Narrow the prefilter's rows with searches in the filter indexes:
+    /// `expr` is what they answer of it, and `covers_filter` whether that is
+    /// the whole filter. Needs [`Self::with_indexes`]; the filter itself is
+    /// still applied to every candidate the indexes did not settle.
+    pub fn with_index_filter(mut self, expr: ScalarIndexExpr, covers_filter: bool) -> Self {
+        self.index_filter = Some(IndexFilter {
+            expr,
+            covers_filter,
+        });
         self
     }
 
@@ -197,10 +256,121 @@ impl MemTableBruteForceVectorExec {
         Ok(self.query.query_vector.clone())
     }
 
-    /// Compute `(distance, row_position)` for every visible row, then top-k by
-    /// distance ascending. Rows where the vector column is null or where the
-    /// computed distance is non-finite are skipped — same convention as the
-    /// HNSW search (which filters on `result.distance.is_finite()`).
+    /// The filter indexes' candidates for the prefilter, ascending, or `None`
+    /// when every visible row is one; and whether those candidates are exactly
+    /// the rows the filter keeps, so it need not be applied to them.
+    fn index_candidates(&self, max_readable_row: u64) -> (Option<Vec<u64>>, bool) {
+        let (Some(indexes), Some(index_filter)) = (&self.indexes, &self.index_filter) else {
+            return (None, false);
+        };
+        let ctx = SearchContext::new(max_readable_row);
+        match evaluate_index_filter(&index_filter.expr, indexes, &ctx) {
+            Ok(result) => {
+                let settled = result.is_exact() && index_filter.covers_filter;
+                if result.at_most.len() == max_readable_row + 1 {
+                    (None, settled)
+                } else {
+                    (Some(result.at_most.into()), settled)
+                }
+            }
+            // A failing index must not answer "no rows": every row is a
+            // candidate and the filter decides.
+            Err(error) => {
+                log::warn!(
+                    "a memtable index failed to search {}; filtering every row instead: {error}",
+                    index_filter.expr
+                );
+                (None, false)
+            }
+        }
+    }
+
+    /// How to keep each primary key's newest visible version, given how many
+    /// rows passed the prefilter: not at all when no key was ever rewritten, a
+    /// seek in the key index per row when few passed, and otherwise a pass over
+    /// every visible key.
+    fn newest_rule(&self, max_readable_row: u64, passed: u64) -> Result<Newest> {
+        let Some(pk_columns) = &self.pk_columns else {
+            return Ok(Newest::Any);
+        };
+        if let Some(indexes) = &self.indexes
+            && indexes.has_pk_index()
+        {
+            // Read at execution, not planning: the flag is set before a rewrite
+            // becomes visible and is never cleared, so a later read can only
+            // err toward checking.
+            if !indexes.pk_has_overrides() {
+                return Ok(Newest::Any);
+            }
+            if passed <= (max_readable_row + 1) / NEWEST_SEEK_SHARE {
+                return Ok(Newest::Seek);
+            }
+        }
+        newest_pk_positions(
+            &self.batch_store,
+            pk_columns,
+            self.readable_count,
+            max_readable_row,
+        )
+        .map(Newest::Among)
+        .map_err(|e| Error::invalid_input(e.to_string()))
+    }
+
+    /// The visible rows the filter indexes leave and the prefilter keeps, per
+    /// stored batch: the batch's first row position, the batch, and the kept
+    /// rows' offsets in it. Rows are tracked by offset rather than copied out,
+    /// so a broad answer costs no more than reading every row.
+    fn prefiltered_rows(&self, max_readable_row: u64) -> Result<Vec<(u64, RecordBatch, Vec<u32>)>> {
+        let (index_candidates, settled) = self.index_candidates(max_readable_row);
+        let mut current_row: u64 = 0;
+        let mut next_candidate = 0usize;
+        let mut passed = Vec::new();
+        for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
+            let n = stored_batch.num_rows;
+            let start = current_row;
+            current_row += n as u64;
+            if n == 0 || batch_position >= self.readable_count || start > max_readable_row {
+                continue;
+            }
+            let end = current_row.min(max_readable_row + 1);
+
+            let mut rows: Vec<u32> = match &index_candidates {
+                Some(positions) => {
+                    let first = next_candidate;
+                    while next_candidate < positions.len() && positions[next_candidate] < end {
+                        next_candidate += 1;
+                    }
+                    positions[first..next_candidate]
+                        .iter()
+                        .map(|&pos| (pos - start) as u32)
+                        .collect()
+                }
+                None => (0..(end - start) as u32).collect(),
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let scan_batch = scan_record_batch(&stored_batch.data)?;
+
+            // Prefilter: drop rows that fail the predicate before they reach the
+            // top-k heap (a NULL predicate result excludes the row, matching SQL).
+            if !settled && let Some(mask) = self.filter_mask(&scan_batch)? {
+                rows.retain(|&row| mask.is_valid(row as usize) && mask.value(row as usize));
+            }
+            if !rows.is_empty() {
+                passed.push((start, scan_batch, rows));
+            }
+        }
+        Ok(passed)
+    }
+
+    /// Compute `(distance, row_position)` for every visible row that passes the
+    /// prefilter and is its key's newest version, then top-k by distance
+    /// ascending. Distances are computed over whole batches, since copying a
+    /// vector out costs far more than its distance. Rows where
+    /// the vector column is null or where the computed distance is non-finite
+    /// are skipped — same convention as the HNSW search (which filters on
+    /// `result.distance.is_finite()`).
     fn compute_topk(&self) -> Result<Vec<(f32, u64)>> {
         if self.query.k == 0 {
             return Ok(Vec::new());
@@ -213,41 +383,48 @@ impl MemTableBruteForceVectorExec {
         let distance_type = self.query.distance_type.unwrap_or(DEFAULT_DISTANCE_TYPE);
         let batch_func = distance_type.arrow_batch_func();
 
+        let passed = self.prefiltered_rows(max_readable_row)?;
         // When PK columns are configured, only the newest version of each PK is
         // eligible. This keeps top-k slots from being consumed by superseded
         // rows and makes filtered search evaluate the predicate against the
         // current version of the PK.
-        let newest_positions = if let Some(pk_columns) = &self.pk_columns {
-            Some(
-                newest_pk_positions(
-                    &self.batch_store,
-                    pk_columns,
-                    self.readable_count,
-                    max_readable_row,
-                )
-                .map_err(|e| Error::invalid_input(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let passed_rows = passed.iter().map(|(_, _, rows)| rows.len() as u64).sum();
+        let newest = self.newest_rule(max_readable_row, passed_rows)?;
 
-        // Walk batches in append order. `current_row` is the global row offset
-        // of the *next* row about to be visited; rows past `max_readable_row`
-        // are dropped before they reach the heap.
-        let mut current_row: u64 = 0;
         let mut candidates: Vec<(f32, u64)> = Vec::new();
-
-        for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
-            let n = stored_batch.num_rows;
-            if n == 0 {
+        for (start, scan_batch, mut rows) in passed {
+            // Skip superseded versions: only the newest version of each PK is
+            // eligible, so a newer non-matching version excludes the PK.
+            match &newest {
+                Newest::Any => {}
+                Newest::Among(positions) => {
+                    rows.retain(|&row| positions.contains(&(start + row as u64)));
+                }
+                Newest::Seek => {
+                    let (Some(indexes), Some(pk_columns)) = (&self.indexes, &self.pk_columns)
+                    else {
+                        unreachable!("a seek is chosen only with a key index and key columns");
+                    };
+                    let pk_indices = resolve_pk_indices(&scan_batch, pk_columns)?;
+                    let mut kept = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let values = pk_indices
+                            .iter()
+                            .map(|&column| {
+                                ScalarValue::try_from_array(scan_batch.column(column), row as usize)
+                            })
+                            .collect::<DataFusionResult<Vec<_>>>()?;
+                        if indexes.pk_is_newest(&values, start + row as u64, max_readable_row) {
+                            kept.push(row);
+                        }
+                    }
+                    rows = kept;
+                }
+            }
+            if rows.is_empty() {
                 continue;
             }
-            if batch_position >= self.readable_count {
-                current_row += n as u64;
-                continue;
-            }
 
-            let scan_batch = scan_record_batch(&stored_batch.data)?;
             let column = scan_batch.column_by_name(column_name).ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Vector column '{}' not found in memtable schema",
@@ -269,38 +446,16 @@ impl MemTableBruteForceVectorExec {
                 ))
             })?;
 
-            // Prefilter: drop rows that fail the predicate before they reach the
-            // top-k heap (a NULL predicate result excludes the row, matching SQL).
-            let filter_mask = self.filter_mask(&scan_batch)?;
-
-            for row in 0..n {
-                let pos = current_row + row as u64;
-                if pos > max_readable_row {
-                    break;
-                }
-                // Skip superseded versions: only the newest version of each PK is
-                // eligible, so a newer non-matching version excludes the PK.
-                if let Some(ref newest) = newest_positions
-                    && !newest.contains(&pos)
-                {
+            for row in rows {
+                if distances.is_null(row as usize) {
                     continue;
                 }
-                if let Some(ref mask) = filter_mask
-                    && (!mask.is_valid(row) || !mask.value(row))
-                {
-                    continue;
-                }
-                if distances.is_null(row) {
-                    continue;
-                }
-                let dist = distances.value(row);
+                let dist = distances.value(row as usize);
                 if !dist.is_finite() {
                     continue;
                 }
-                candidates.push((dist, pos));
+                candidates.push((dist, start + row as u64));
             }
-
-            current_row += n as u64;
         }
 
         // `partial_cmp` defaults Equal on NaN; we filtered non-finite above so
@@ -452,14 +607,21 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let results = self
-            .compute_topk()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-        let batches = self.materialize_rows(&results)?;
-        let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
+        // Ranking reads every candidate row, so it runs on the CPU pool from
+        // inside the stream rather than on the caller's thread in `execute`.
+        let exec = self.clone();
+        let batches = stream::once(spawn_cpu(move || {
+            let results = exec
+                .compute_topk()
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            exec.materialize_rows(&results)
+        }))
+        .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
+        .try_flatten()
+        .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.output_schema.clone(),
-            stream,
+            batches,
         )))
     }
 

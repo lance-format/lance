@@ -1318,18 +1318,29 @@ impl MemTableScanner {
                 self.with_row_id,
             )?)
         } else {
-            Arc::new(
-                MemTableBruteForceVectorExec::new(
-                    self.batch_store.clone(),
-                    query.clone(),
-                    max_readable,
-                    projection_indices,
-                    base_schema,
-                    self.with_row_id,
-                )?
-                .with_filter(filter_predicate)
-                .with_pk_columns(self.pk_columns.clone()),
-            )
+            let mut exec = MemTableBruteForceVectorExec::new(
+                self.batch_store.clone(),
+                query.clone(),
+                max_readable,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?
+            .with_filter(filter_predicate)
+            .with_pk_columns(self.pk_columns.clone())
+            .with_indexes(self.indexes.clone());
+            // Rank only the rows the filter indexes leave, as a filtered scan
+            // reads only them: the same split of the filter into index
+            // searches and a leftover.
+            if self.use_index
+                && let Some(filter) = &self.filter
+            {
+                let optimized = Planner::new(self.schema.clone()).optimize_expr(filter.clone())?;
+                if let Some(indexed) = plan_filter(&optimized, self.indexes.filter_catalog())? {
+                    exec = exec.with_index_filter(indexed.searches, indexed.is_whole_filter);
+                }
+            }
+            Arc::new(exec)
         };
         self.apply_post_index_ops(exec).await
     }
