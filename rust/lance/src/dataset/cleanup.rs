@@ -934,6 +934,12 @@ impl<'a> CleanupTask<'a> {
             .map(|uuid| indices_dir.clone().join(uuid.as_str()))
             .collect::<HashSet<_>>();
         let index_dirs_to_remove = Mutex::new(HashSet::new());
+        // Blob v2 sidecars live in `data/<data_file_key>/` directories. Once
+        // cleanup deletes the last file in one, the now-empty directory must be
+        // pruned too, mirroring `_indices/<uuid>/` (#9744). Only local
+        // filesystems have directories, so this reuses `removes_empty_dirs`.
+        let data_dir = self.dataset.data_dir();
+        let data_dirs_to_remove = Mutex::new(HashSet::new());
         // Versions whose manifest could not be deleted. Their store records must
         // survive with them: a record outliving its manifest is retired by the next
         // cleanup, but a manifest outliving its record is a lost version.
@@ -1067,6 +1073,21 @@ impl<'a> CleanupTask<'a> {
                     parent = dir_path.parent();
                 }
             }
+            if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Data) {
+                // Collect the sidecar directory of a deleted `.blob` / `.tmp*`
+                // file so it can be pruned once empty. A `.lance` file sits
+                // directly under `data/`, so its parent is `data_dir` and the
+                // loop below skips it; only real sidecar subdirs are collected.
+                let mut parent = file.path.parent();
+                let mut data_dirs = data_dirs_to_remove.lock().unwrap();
+                while let Some(dir_path) = parent {
+                    if dir_path == data_dir || !dir_path.prefix_matches(&data_dir) {
+                        break;
+                    }
+                    data_dirs.insert(dir_path.clone());
+                    parent = dir_path.parent();
+                }
+            }
             Ok(file)
         });
 
@@ -1160,6 +1181,29 @@ impl<'a> CleanupTask<'a> {
                     "Failed to remove empty index directories"
                 );
             }
+
+            // Prune blob v2 sidecar directories emptied by this run (or aged out
+            // from an earlier one), mirroring the `_indices/` pruning above. A
+            // sidecar that still holds a referenced `.blob` file is file-bearing
+            // and is skipped by `remove_empty_dirs`, so no retain set is needed.
+            if removes_empty_dirs
+                && let Err(error) = self
+                    .dataset
+                    .object_store
+                    .remove_empty_dirs(
+                        data_dir.clone(),
+                        HashSet::new(),
+                        data_dirs_to_remove.into_inner().unwrap(),
+                        (!self.policy.delete_unverified).then_some(verification_threshold),
+                    )
+                    .await
+            {
+                warn!(
+                    path = data_dir.as_ref(),
+                    error = %error,
+                    "Failed to remove empty data directories"
+                );
+            }
         } else {
             // Nothing is deleted, so the stats describe what would be removed.
             all_files_to_remove
@@ -1221,6 +1265,25 @@ impl<'a> CleanupTask<'a> {
                     true,
                     size_bytes,
                 ));
+            }
+        }
+        if relative_path.as_ref().starts_with("data/")
+            && relative_path
+                .filename()
+                .is_some_and(|name| name.starts_with(".tmp"))
+        {
+            // A `.tmp*` file in the data directory is a tempfile a local writer
+            // left behind when it was killed before renaming it into place
+            // (`ObjectStore::create` writes to a tempfile in the destination
+            // directory). Nothing references it, so it is unverified debris just
+            // like `_versions/.tmp*` and is reclaimed under the same age /
+            // `delete_unverified` gate. This covers both `data/.tmp*` and a blob
+            // v2 sidecar's `data/<key>/.tmp*`; removing the latter also lets its
+            // sidecar directory become empty so it can be pruned (#9743).
+            if maybe_in_progress {
+                return Ok(None);
+            } else {
+                return Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes));
             }
         }
         if relative_path.as_ref().starts_with("_fri") {
@@ -2427,6 +2490,24 @@ mod tests {
                 .join(uuid.to_string())
         }
 
+        fn local_data_dir(&self) -> std::path::PathBuf {
+            std::path::Path::new(self.tmpdir.as_str())
+                .join("my_db")
+                .join(crate::dataset::DATA_DIR)
+        }
+
+        /// Subdirectories directly under `data/`, i.e. the blob v2 sidecar dirs.
+        fn data_sidecar_dirs(&self) -> Vec<std::path::PathBuf> {
+            let data_dir = self.local_data_dir();
+            let Ok(entries) = std::fs::read_dir(&data_dir) else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.is_dir())
+                .collect()
+        }
+
         fn os_params(&self) -> ObjectStoreParams {
             ObjectStoreParams {
                 object_store_wrapper: Some(self.mock_store.clone()),
@@ -3329,6 +3410,110 @@ mod tests {
             .unwrap();
 
         assert_eq!(fixture.count_blob_files().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_emptied_blob_v2_sidecar_directories() {
+        // Regression test for #9744: once cleanup deletes the last `.blob` in a
+        // `data/<key>/` sidecar, the now-empty directory must be pruned too, as
+        // `_indices/<uuid>/` already is. Directories only exist on local stores.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // An orphaned blob v2 sidecar: `data/<key>/<id>.blob` whose parent
+        // `data/<key>.lance` is not referenced by any manifest, so the sidecar
+        // file (and then its emptied directory) must both be reclaimed.
+        let data_dir = fixture.local_data_dir();
+        let sidecar = data_dir.join("01101001010010001001100042001047c1b3224a4afc3eec3a");
+        std::fs::create_dir_all(&sidecar).unwrap();
+        let blob_file = sidecar.join(format!("1{}.blob", "0".repeat(31)));
+        std::fs::write(&blob_file, b"x").unwrap();
+
+        // Age it past the unverified threshold so it is reclaimed.
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now + TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        // The orphaned `.blob` AND its now-empty sidecar directory are both gone.
+        assert!(!blob_file.exists());
+        assert_eq!(fixture.data_sidecar_dirs().len(), 0);
+        // The referenced data file is untouched.
+        assert_gt!(fixture.count_files().await.unwrap().num_data_files, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_aged_temp_files_in_data_dir() {
+        // Regression test for #9743: a `.tmp*` file a killed local writer leaves
+        // in `data/` (or in a blob v2 sidecar dir) is unreferenced debris, just
+        // like `_versions/.tmp*`, and must be reclaimed once it ages past the
+        // unverified threshold.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let data_dir = fixture.local_data_dir();
+        let sidecar = data_dir.join("01101001010010001001100042001047c1b3224a4afc3eec3a");
+        std::fs::create_dir_all(&sidecar).unwrap();
+        let top_level_tmp = data_dir.join(".tmpAb3Xz9");
+        let sidecar_tmp = sidecar.join(".tmpCd1Yz8");
+        std::fs::write(&top_level_tmp, b"x").unwrap();
+        std::fs::write(&sidecar_tmp, b"x").unwrap();
+
+        // Age the temp files past the 7-day unverified threshold.
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now + TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+
+        assert!(!top_level_tmp.exists());
+        assert!(!sidecar_tmp.exists());
+        // The sidecar held only the temp file, so it is pruned as empty (#9744).
+        assert!(!sidecar.exists());
+        // Referenced data files are untouched.
+        assert_gt!(fixture.count_files().await.unwrap().num_data_files, 0);
+    }
+
+    #[rstest]
+    #[case::default_policy(false, true)]
+    #[case::delete_unverified(true, false)]
+    #[tokio::test]
+    async fn cleanup_applies_unverified_policy_to_fresh_temp_file_in_data_dir(
+        #[case] delete_unverified: bool,
+        #[case] should_preserve: bool,
+    ) {
+        // A fresh `.tmp*` file may belong to an in-progress write, so it survives
+        // unless the caller verifies no writes are in flight (#9743).
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now);
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let tmp = fixture.local_data_dir().join(".tmpAb3Xz9");
+        std::fs::write(&tmp, b"x").unwrap();
+
+        fixture
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tmp.exists(), should_preserve);
     }
 
     #[tokio::test]
