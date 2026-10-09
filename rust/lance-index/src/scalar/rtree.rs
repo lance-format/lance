@@ -488,24 +488,6 @@ impl RTreeIndex {
             batches,
         )))
     }
-
-    async fn combine_old_new(
-        self,
-        new_input: SendableRecordBatchStream,
-    ) -> Result<SendableRecordBatchStream> {
-        let old_input = self.into_data_stream().await?;
-        debug_assert_eq!(
-            old_input.schema().flattened_fields().len(),
-            new_input.schema().flattened_fields().len()
-        );
-
-        let merged = futures::stream::select(old_input, new_input);
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
-            merged,
-        )))
-    }
 }
 
 fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
@@ -826,10 +808,23 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
-        let combined_bbox_data = self.clone().combine_old_new(bbox_data).await?;
+        let mut old_data = self.clone().into_data_stream().await?;
+        if let Some(remapper) = self.frag_reuse_index.clone() {
+            old_data = remap_rtree_data(old_data, remapper);
+        } else if let Some(remapper) = self.batch_remapper.clone() {
+            old_data = remap_rtree_data_async(old_data, remapper);
+        }
+        // The filter refers to the current row-ID domain, after remapping old entries.
+        if let Some(filter) = &old_data_filter {
+            old_data = filter_rtree_data(old_data, filter.clone());
+        }
+        let combined_bbox_data = Box::pin(RecordBatchStreamAdapter::new(
+            BBOX_ROWID_SCHEMA.clone(),
+            stream::select(old_data, bbox_data),
+        ));
         let tmpdir = Arc::new(TempDir::default());
         let spill_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -843,7 +838,15 @@ impl ScalarIndex for RTreeIndex {
         )
         .await?;
 
-        let null_map = self.search_null(&NoOpMetricsCollector).await?;
+        let mut null_map = self.search_null(&NoOpMetricsCollector).await?;
+        if let Some(remapper) = &self.frag_reuse_index {
+            null_map = remapper.remap_row_addrs_tree_map(&null_map);
+        } else if let Some(remapper) = &self.batch_remapper {
+            null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
+        }
+        if let Some(filter) = &old_data_filter {
+            filter.retain_old_rows(&mut null_map);
+        }
         stats.null_map |= &null_map;
 
         let files = RTreeIndexPlugin::train_rtree_index(
@@ -1745,6 +1748,172 @@ mod tests {
             .unwrap();
         assert_eq!(updated.metadata.num_items, 0);
         assert_eq!(updated.metadata.num_pages, 0);
+    }
+
+    #[derive(Debug)]
+    struct UpdateRemapper;
+
+    #[async_trait]
+    impl BatchRowIdRemapper for UpdateRemapper {
+        async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+            Ok(row_ids
+                .iter()
+                .map(|id| {
+                    Some(RowAddress::new_from_parts(2 + (*id / 2) as u32, (*id % 2) as u32).into())
+                })
+                .collect())
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::row_ids("rows")]
+    #[case::fragments("fragments")]
+    #[case::empty_row_ids("empty_rows")]
+    #[case::empty_fragments("empty_fragments")]
+    #[case::unfiltered("none")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_update_filters_old_rows(
+        #[case] filter_kind: &str,
+        #[values("mixed", "empty", "all_null")] new_input: &str,
+        #[values("none", "sync", "async")] remapping: &str,
+    ) {
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut builder = PointBuilder::new(point_type.clone());
+        builder.push_null();
+        builder.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+        builder.push_null();
+        builder.push_point(Some(&geo_types::point!(x: 3.0, y: 3.0)));
+        let (index, _store, _tmpdir) = train_index(&builder.finish(), Some(4)).await;
+        let mut index = index.as_ref().clone();
+        let old_ids: Vec<u64> = (0..4)
+            .map(|id| {
+                if remapping == "none" {
+                    id
+                } else {
+                    RowAddress::new_from_parts(2 + (id / 2) as u32, (id % 2) as u32).into()
+                }
+            })
+            .collect();
+        match remapping {
+            "sync" => {
+                index.frag_reuse_index = Some(Arc::new(FragReuseIndexHandle(Arc::new(
+                    FragReuseIndex::new(
+                        uuid::Uuid::new_v4(),
+                        vec![(0..4).zip(old_ids.iter().copied().map(Some)).collect()],
+                        FragReuseIndexDetails { versions: vec![] },
+                    ),
+                ))));
+            }
+            "async" => index.batch_remapper = Some(Arc::new(UpdateRemapper)),
+            _ => {}
+        }
+        let retained_ids = old_ids[2..].iter().copied().collect::<RowAddrTreeMap>();
+        let filter = match filter_kind {
+            "rows" => Some(OldIndexDataFilter::RowIds(retained_ids)),
+            "empty_rows" => Some(OldIndexDataFilter::RowIds(RowAddrTreeMap::new())),
+            "fragments" | "empty_fragments" => Some(OldIndexDataFilter::Fragments {
+                to_keep: if filter_kind == "fragments" && remapping != "none" {
+                    RoaringBitmap::from_iter([3])
+                } else {
+                    RoaringBitmap::new()
+                },
+                to_remove: RoaringBitmap::from_iter([0, 2]),
+            }),
+            _ => None,
+        };
+        let mut new_builder = PointBuilder::new(point_type);
+        if new_input != "empty" {
+            if new_input == "mixed" {
+                new_builder.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
+            } else {
+                new_builder.push_null();
+            }
+            new_builder.push_null();
+        }
+        // Both replacements reuse excluded old IDs. The old-data filter must not
+        // remove the new point or the new NULL at those IDs.
+        let new_ids = if new_input == "empty" {
+            vec![]
+        } else {
+            old_ids[..2].to_vec()
+        };
+        let new_stream = convert_bbox_rowid_batch_stream(
+            &new_builder.finish(),
+            Arc::new(UInt64Array::from(new_ids)),
+        );
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        index
+            .update(new_stream, dest_store.as_ref(), filter)
+            .await
+            .unwrap();
+        let updated = RTreeIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let mut expected_nulls = RowAddrTreeMap::new();
+        let mut expected_points = RowAddrTreeMap::new();
+        if filter_kind == "none" {
+            expected_nulls.insert(old_ids[0]);
+            expected_points.insert(old_ids[1]);
+        }
+        if filter_kind == "none"
+            || filter_kind == "rows"
+            || (filter_kind == "fragments" && remapping != "none")
+        {
+            expected_nulls.insert(old_ids[2]);
+            expected_points.insert(old_ids[3]);
+        }
+        if new_input != "empty" {
+            expected_nulls.insert(old_ids[1]);
+            if new_input == "all_null" {
+                expected_nulls.insert(old_ids[0]);
+            } else {
+                expected_points.insert(old_ids[0]);
+            }
+        }
+        let null_result = updated
+            .search(&GeoQuery::IsNull, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(nulls) = null_result else {
+            panic!("NULL search must be exact")
+        };
+        assert_eq!(
+            nulls,
+            NullableRowAddrSet::new(expected_nulls, RowAddrTreeMap::new())
+        );
+        let bounds = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 0.0, y: 0.0 },
+            coord! { x: 11.0, y: 11.0 },
+        ));
+        assert_eq!(
+            updated
+                .search_bbox(bounds, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_points
+        );
+        let obsolete_bounds = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 0.5, y: 0.5 },
+            coord! { x: 1.5, y: 1.5 },
+        ));
+        let mut expected_obsolete = RowAddrTreeMap::new();
+        if filter_kind == "none" {
+            expected_obsolete.insert(old_ids[1]);
+        }
+        assert_eq!(
+            updated
+                .search_bbox(obsolete_bounds, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_obsolete
+        );
     }
 
     #[tokio::test]
