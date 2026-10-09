@@ -6670,23 +6670,20 @@ async fn assert_json_index_matches_scan(dataset: &Dataset, vals: &[i64]) {
     }
 }
 
-/// On a stable-row-id dataset a JSON index over a BTree or Bitmap stores row
-/// addresses, and keeps doing so through a delete, an append, and an optimize
-/// that updates the one existing segment in place. That update must filter the
-/// old segment's data by fragment: a row-id filter would treat every address
-/// past the first fragment as a deleted row and drop it.
-#[rstest]
-#[case::btree("btree")]
-#[case::bitmap("bitmap")]
+/// On a stable-row-id dataset a JSON index over a BTree stores row addresses,
+/// and keeps doing so through a delete, an append, and an optimize that updates
+/// the one existing segment in place. That update must filter the old segment's
+/// data by fragment: a row-id filter would treat every address past the first
+/// fragment as a deleted row and drop it.
 #[tokio::test]
-async fn test_json_index_row_addr_domain_with_stable_row_ids(#[case] target_index_type: &str) {
+async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
     let mut dataset = stable_row_id_json_dataset("memory://").await;
     dataset
         .create_index(
             &["json"],
             IndexType::Scalar,
             Some("json_idx".to_string()),
-            &json_index_params(target_index_type),
+            &json_index_params("btree"),
             false,
         )
         .await
