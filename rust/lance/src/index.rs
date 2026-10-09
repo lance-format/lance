@@ -157,9 +157,11 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
 /// merge owns the whole caller-defined group, so remap its union and use that
 /// representable group coverage while materializing every source.
 ///
-/// Returns the fragments the remap added, or `None` when nothing was remapped.
-/// Coverage only moves with the row addresses the reuse index maps; elsewhere it
-/// shrinks, and those rows fall back to a flat scan.
+/// Returns the fragments the remap added beyond the segments' own coverage (on
+/// a tagged history, beyond their provenance), or `None` when the coverage was
+/// left as staged. Coverage only moves with the row addresses the reuse index
+/// maps, and never onto a fragment whose indexed data changed since the
+/// segments were built; those rows fall back to a flat scan.
 async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     index_name: &str,
@@ -252,16 +254,16 @@ async fn remap_merged_segment_coverage(
 
     // Coverage may follow rows through a compaction only if nothing else changed
     // the indexed fields on the way, and the manifests to check that still exist.
-    if indexed_data_moved_on(dataset, &frag_reuse_index, segments).await? {
+    let Some(stale) = stale_fragments(dataset, &frag_reuse_index, segments).await? else {
         tracing::warn!(
             index_name,
             staged_fragments = staged_coverage.len(),
-            "Merging index segments whose indexed data has been rewritten since they were \
-             built, or whose history has been cleaned up: the merged index will not cover \
-             those rows, which fall back to a flat scan. Rebuild the index to cover them."
+            "Merging index segments whose build version has been cleaned up: the merged \
+             index will not cover their rows, which fall back to a flat scan. Rebuild the \
+             index to cover them."
         );
         return Ok(None);
-    }
+    };
 
     let mut merged_coverage = staged_coverage.clone();
     frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
@@ -296,6 +298,17 @@ async fn remap_merged_segment_coverage(
             "Merged index covers no rows: its segments together cover only part of a \
              rewrite group, so the fragments that group produced hold rows no segment \
              indexed. The remapper reports the group; this is the effect on the merge."
+        );
+    }
+
+    if !stale.is_disjoint(&merged_coverage) {
+        merged_coverage -= &stale;
+        tracing::warn!(
+            index_name,
+            stale_fragments = stale.len(),
+            "Merged index will not cover fragments whose indexed data changed since the \
+             segments were built, or whose history has been cleaned up: those rows fall back \
+             to a flat scan. Rebuild the index to cover them."
         );
     }
 
@@ -472,8 +485,8 @@ impl<'a> History<'a> {
             .await
             .map_err(|error| {
                 Error::io(format!(
-                    "CreateIndex: cannot read dataset version {version} to prove merged index \
-                 coverage: {error}"
+                    "merge_existing_index_segments: cannot read dataset version {version} to \
+                     check merged index coverage: {error}"
                 ))
             })?;
         let snapshot = Arc::new(Snapshot::new(dataset));
@@ -482,8 +495,10 @@ impl<'a> History<'a> {
     }
 
     /// The version that committed the compaction the reuse index records at
-    /// `recorded` (always `recorded + 1`), or `None` unless that commit is a
-    /// rewrite that produced `produced`.
+    /// `recorded`, or `None` unless that commit is a rewrite that produced
+    /// `produced`. The commit is `recorded + 1` because conflict resolution
+    /// restamps the record on every attempt; a record that was not restamped
+    /// fails the check and costs only coverage.
     async fn rewrite_commit(
         &self,
         recorded: u64,
@@ -591,7 +606,8 @@ async fn initial_records(
     segments: &[IndexMetadata],
 ) -> Result<Option<HashMap<u32, u64>>> {
     let mut by_version = segments.iter().collect::<Vec<_>>();
-    // Oldest first: a fragment two segments cover is checked against the older.
+    // Oldest first: a source of a fragment a later segment covers may also be
+    // covered by an older segment, and is checked against the older one.
     by_version.sort_by_key(|segment| segment.dataset_version);
 
     let mut following = HashMap::new();
@@ -628,24 +644,31 @@ async fn initial_records(
     Ok(Some(following))
 }
 
-/// Whether the indexed data changed since the segments were built, following
-/// each fragment through the compactions that rewrote it. Each compaction's
-/// inputs, and the final fragments, must match their recorded version
-/// ([`indexed_data_differs`]). A cleaned-up manifest counts as changed.
-async fn indexed_data_moved_on(
+/// The current fragments holding rows the segments indexed whose indexed data
+/// has changed since, following each covered fragment through the compactions
+/// that rewrote it. A compaction's inputs and the final fragments must each
+/// match the version their entries describe ([`indexed_data_differs`]); a
+/// compaction whose manifests were cleaned up counts as changed, and a changed
+/// input makes every fragment its group produced stale. `None` when the
+/// segments' own versions are gone, so nothing can be followed.
+async fn stale_fragments(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
-) -> Result<bool> {
+) -> Result<Option<RoaringBitmap>> {
     let mut indexed = HashSet::new();
     for segment in segments {
         indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
     }
     let mut history = History::new(dataset).await?;
-    let Some(mut following) = initial_records(&mut history, frag_reuse_index, segments).await?
-    else {
-        return Ok(true);
+    let Some(records) = initial_records(&mut history, frag_reuse_index, segments).await? else {
+        return Ok(None);
     };
+    // Each followed fragment's version, or `None` once its data is known stale.
+    let mut following: HashMap<u32, Option<u64>> = records
+        .into_iter()
+        .map(|(fragment, version)| (fragment, Some(version)))
+        .collect();
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
     versions.sort_by_key(|version| version.dataset_version);
@@ -664,59 +687,65 @@ async fn indexed_data_moved_on(
         if ours.is_empty() {
             continue;
         }
-        let Some(before_commit) = history.at(version.dataset_version).await? else {
-            return Ok(true);
-        };
-        for group in &ours {
-            for old in &group.old_frags {
-                let old = old.id as u32;
-                let Some(&recorded) = following.get(&old) else {
-                    continue;
-                };
-                let Some(against) = history.at(recorded).await? else {
-                    return Ok(true);
-                };
-                if indexed_data_differs(&against, &before_commit, old, &indexed).await? {
-                    return Ok(true);
-                }
-            }
-        }
-
+        let before_commit = history.at(version.dataset_version).await?;
         let produced = ours
             .iter()
             .flat_map(|group| group.new_frags.iter())
             .map(|fragment| fragment.id as u32);
-        let Some(committed) = history
-            .rewrite_commit(version.dataset_version, produced)
-            .await?
-        else {
-            return Ok(true);
+        let committed = match before_commit {
+            Some(_) => {
+                history
+                    .rewrite_commit(version.dataset_version, produced)
+                    .await?
+            }
+            None => None,
         };
-        // Only this compaction's groups advance.
         for group in ours {
+            let mut stale = committed.is_none();
             for old in &group.old_frags {
-                following.remove(&(old.id as u32));
+                let old = old.id as u32;
+                let (Some(recorded), Some(before_commit)) =
+                    (following.remove(&old), &before_commit)
+                else {
+                    continue;
+                };
+                stale |= match recorded {
+                    None => true,
+                    Some(recorded) => match history.at(recorded).await? {
+                        None => true,
+                        Some(against) => {
+                            indexed_data_differs(&against, before_commit, old, &indexed).await?
+                        }
+                    },
+                };
             }
             for new in &group.new_frags {
-                following.insert(new.id as u32, committed);
+                following.insert(new.id as u32, committed.filter(|_| !stale));
             }
         }
     }
 
     let current = history.current();
+    let mut stale = RoaringBitmap::new();
     for (fragment, recorded) in following {
         // A fragment no longer in the manifest is dropped from coverage anyway.
         if current.fragment(fragment).is_none() {
             continue;
         }
-        let Some(against) = history.at(recorded).await? else {
-            return Ok(true);
+        let differs = match recorded {
+            None => true,
+            Some(recorded) => match history.at(recorded).await? {
+                None => true,
+                Some(against) => {
+                    indexed_data_differs(&against, &current, fragment, &indexed).await?
+                }
+            },
         };
-        if indexed_data_differs(&against, &current, fragment, &indexed).await? {
-            return Ok(true);
+        if differs {
+            stale.insert(fragment);
         }
     }
-    Ok(false)
+    Ok(Some(stale))
 }
 
 /// Resolve the field ids a segment's staleness check must consider: the subtree of
@@ -738,8 +767,10 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
     Ok(indexed_field_ids)
 }
 
-/// `historically_missing_exempt`: fragments compaction created after the
-/// segments were built, so their absence from a segment's history is expected.
+/// Drops from each segment's coverage the fragments whose indexed data changed
+/// since it was built. `historically_missing_exempt` names fragments compaction
+/// created after the segments were built, whose absence from a segment's
+/// history is expected rather than stale.
 async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
