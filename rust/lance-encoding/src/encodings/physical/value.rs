@@ -9,7 +9,8 @@ use crate::compression::{
     require_block_payload,
 };
 use crate::data::{
-    BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
+    AllNullDataBlock, BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+    NullableDataBlock,
 };
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
@@ -322,17 +323,18 @@ impl ValueEncoder {
     fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> CompressiveEncoding {
         let mut inner = fsl.child.as_ref();
         let mut has_validity = false;
-        inner = match inner {
-            DataBlock::Nullable(nullable) => {
-                has_validity = true;
-                nullable.data.as_ref()
-            }
-            DataBlock::AllNull(_) => {
-                return ProtobufUtils21::constant(None);
-            }
-            _ => inner,
-        };
+        if let DataBlock::Nullable(nullable) = inner {
+            has_validity = true;
+            inner = nullable.data.as_ref();
+        }
         let inner_encoding = match inner {
+            // All inner values are null.  Reserve validity bits (has_validity=true) so that
+            // the decoder knows one validity byte per cum_dim items is stored per row.
+            // constant(None) signals that every stored item decodes to null.
+            DataBlock::AllNull(_) => {
+                has_validity = true;
+                ProtobufUtils21::constant(None)
+            }
             DataBlock::FixedWidth(fixed_width) => {
                 ProtobufUtils21::flat(fixed_width.bits_per_value, None)
             }
@@ -411,6 +413,19 @@ impl ValueEncoder {
                     break;
                 }
                 DataBlock::AllNull(_) => {
+                    // All inner values are null.  Add all-zero validity bits so that
+                    // bytes_per_row > 0 and the FullZip layout doesn't write bits_per_value=0,
+                    // which would crash the reader when there are also no ctrl-word bytes.
+                    bytes_per_row += cum_dim.div_ceil(8) as usize;
+                    validity_iters.push(PerValueFslValidityIter {
+                        buffer: LanceBuffer::from(vec![
+                            0u8;
+                            cum_dim.div_ceil(8) as usize
+                                * num_values as usize
+                        ]),
+                        bits_per_row: cum_dim as usize,
+                        offset: 0,
+                    });
                     data_bytes_per_row = 0;
                     data_buffer = LanceBuffer::empty();
                     break;
@@ -528,7 +543,7 @@ impl ValueDecompressor {
         }
     }
 
-    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Self {
+    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Result<Self> {
         let mut layers = Vec::new();
         let mut cum_dim = 1;
         let mut bytes_per_value = 0;
@@ -541,28 +556,45 @@ impl ValueDecompressor {
             if description.has_validity {
                 bytes_per_value += cum_dim.div_ceil(8);
             }
-            match description
+            let encoding = description
                 .values
                 .as_ref()
-                .unwrap()
+                .ok_or_else(|| Error::invalid_input("FSL encoding missing inner values field"))?
                 .compression
                 .as_ref()
-                .unwrap()
-            {
+                .ok_or_else(|| {
+                    Error::invalid_input("FSL encoding missing inner compression field")
+                })?;
+            match encoding {
                 Compression::FixedSizeList(inner) => {
                     description = inner;
                 }
                 Compression::Flat(flat) => {
                     let mut bits_per_value = bytes_per_value * 8;
                     bits_per_value += flat.bits_per_value * cum_dim;
-                    return Self {
+                    return Ok(Self {
                         bits_per_item: flat.bits_per_value,
                         bits_per_value,
                         items_per_value: cum_dim,
                         layers,
-                    };
+                    });
                 }
-                _ => unreachable!(),
+                // All inner values are null: only validity bytes are stored per row.
+                // bits_per_item=0 signals unzip_decompress to emit AllNull for the values.
+                Compression::Constant(_) => {
+                    return Ok(Self {
+                        bits_per_item: 0,
+                        bits_per_value: bytes_per_value * 8,
+                        items_per_value: cum_dim,
+                        layers,
+                    });
+                }
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "Unexpected inner encoding type in FSL descriptor: {:?}",
+                        encoding
+                    )));
+                }
             }
         }
     }
@@ -707,12 +739,23 @@ impl ValueDecompressor {
         }
 
         // Finally, restore the structure
-        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bits_per_item,
-            num_values: num_items as u64,
-            data: LanceBuffer::from(data_buffer),
-            block_info: BlockInfo::new(),
-        });
+        //
+        // bits_per_item=0 means the terminal encoding is constant-null (all inner values
+        // are null and only validity bits were stored).  Use AllNull so that into_arrow
+        // produces a properly typed all-null array without a zero-width data buffer.
+        let mut block = if self.bits_per_item == 0 {
+            debug_assert!(data_buffer.is_empty());
+            DataBlock::AllNull(AllNullDataBlock {
+                num_values: num_items as u64,
+            })
+        } else {
+            DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: self.bits_per_item,
+                num_values: num_items as u64,
+                data: LanceBuffer::from(data_buffer),
+                block_info: BlockInfo::new(),
+            })
+        };
 
         let mut validity_bufs = buffer_builders
             .into_iter()
@@ -1032,7 +1075,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let decompressed =
             MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
@@ -1120,7 +1163,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let num_values = data.num_values;
         assert_eq!(
@@ -1152,6 +1195,23 @@ mod tests {
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    // Regression: nullable_per_value_fsl wrote bits_per_value=0 when the child block was
+    // AllNull but the FSL had no outer null buffer (no ctrl-word bytes), making
+    // total_bytes_per_value=0 and crashing the reader with "per-row byte width must be > 0".
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_nullable_child_all_null_no_outer_nulls() {
+        // FSL<nullable Float32, dim=4>, 2 outer rows, no outer null buffer, all 8 child
+        // Float32 values are null.  DataBlock::from_arrays returns AllNull for the child,
+        // which routes into nullable_per_value_fsl.  Without this fix the encoder writes
+        // bits_per_value=0 and the decoder errors on read.
+        let items = new_null_array(&DataType::Float32, 8);
+        let items_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl = FixedSizeListArray::new(items_field, 4, items, None);
+
+        let test_cases = TestCases::default().with_structural_encodings();
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1205,7 +1265,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let decompressed =
             MiniBlockDecompressor::decompress(&decompressor, data.data, data.num_values).unwrap();
@@ -1235,7 +1295,7 @@ mod tests {
             panic!()
         };
 
-        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
 
         let PerValueDataBlock::Fixed(data) = data else {
             panic!()

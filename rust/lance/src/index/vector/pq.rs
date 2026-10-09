@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
+use lance_index::scalar::RowAddrTranslatorRef;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -27,7 +29,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{ProductQuantizationStorage, transpose};
@@ -72,7 +74,7 @@ pub struct PQIndex {
     /// Metric type.
     metric_type: MetricType,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 }
 
 async fn read_legacy_index_values(
@@ -150,7 +152,7 @@ impl PQIndex {
     pub(crate) fn new(
         pq: ProductQuantizer,
         metric_type: MetricType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Self {
         Self {
             code: None,
@@ -249,6 +251,48 @@ impl Index for PQIndex {
                 "PQIndex::calculate_included_frags: PQ is not initialized".to_string(),
             ))
         }
+    }
+}
+
+impl PQIndex {
+    /// The one remap implementation behind the legacy `remap` and
+    /// `remap_streaming`: this page's addresses are the unit of translation.
+    async fn remap_with(&mut self, mapping: RowAddrTranslatorRef<'_>) -> Result<()> {
+        let num_vectors = self.row_ids.as_ref().unwrap().len();
+        // One page's addresses are the unit of translation.
+        let mapping = mapping
+            .resolve(self.row_ids.as_ref().unwrap().values().iter().copied())
+            .await?;
+        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let transposed_codes = self.code.as_ref().unwrap();
+        let remapped = row_ids
+            .enumerate()
+            .filter_map(|(vec_idx, old_row_id)| {
+                let new_row_id = mapping.get(*old_row_id);
+                // If the row id is not in the mapping then this row is not remapped and we keep as is
+                let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
+                new_row_id.map(|new_row_id| {
+                    (
+                        new_row_id,
+                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
+            remapped.iter().map(|(row_id, _)| *row_id),
+        )));
+
+        let pq_codes =
+            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
+        let transposed_codes = transpose(
+            &pq_codes,
+            self.row_ids.as_ref().unwrap().len(),
+            self.pq.num_sub_vectors,
+        );
+        self.code = Some(Arc::new(transposed_codes));
+        Ok(())
     }
 }
 
@@ -459,42 +503,19 @@ impl VectorIndex for PQIndex {
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
-        todo!("this method is for only IVF_HNSW_* index");
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+        match self.row_ids.as_ref() {
+            Some(row_ids) => Box::new(row_ids.values().iter()),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
     async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
-        let num_vectors = self.row_ids.as_ref().unwrap().len();
-        let row_ids = self.row_ids.as_ref().unwrap().values().iter();
-        let transposed_codes = self.code.as_ref().unwrap();
-        let remapped = row_ids
-            .enumerate()
-            .filter_map(|(vec_idx, old_row_id)| {
-                let new_row_id = mapping.get(*old_row_id);
-                // If the row id is not in the mapping then this row is not remapped and we keep as is
-                let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
-                new_row_id.map(|new_row_id| {
-                    (
-                        new_row_id,
-                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        self.remap_with(mapping.into()).await
+    }
 
-        self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
-            remapped.iter().map(|(row_id, _)| *row_id),
-        )));
-
-        let pq_codes =
-            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
-        let transposed_codes = transpose(
-            &pq_codes,
-            self.row_ids.as_ref().unwrap().len(),
-            self.pq.num_sub_vectors,
-        );
-        self.code = Some(Arc::new(transposed_codes));
-        Ok(())
+    async fn remap_streaming(&mut self, translator: &RowAddrTranslator) -> Result<()> {
+        self.remap_with(translator.as_ref()).await
     }
 
     fn ivf_model(&self) -> &IvfModel {
@@ -548,9 +569,13 @@ pub async fn build_pq_model_in_fragments(
     ivf: Option<&IvfModel>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<ProductQuantizer> {
-    let num_codes = 2_usize.pow(params.num_bits as u32);
-
     if let Some(codebook) = &params.codebook {
+        lance_index::vector::pq::validate_supplied_codebook(
+            codebook.len(),
+            dim,
+            params.num_sub_vectors,
+            params.num_bits,
+        )?;
         let dt = if metric_type == MetricType::Cosine {
             info!("Normalize training data for PQ training: Cosine");
             MetricType::L2
@@ -579,8 +604,10 @@ pub async fn build_pq_model_in_fragments(
         "Start to train PQ code: PQ{}, bits={}",
         params.num_sub_vectors, params.num_bits
     );
-    let expected_sample_size =
-        lance_index::vector::pq::num_centroids(params.num_bits as u32) * params.sample_rate;
+    // 2^num_bits panics on an unrepresentable num_bits, so it stays below the
+    // supplied-codebook branch, which rejects that input instead.
+    let num_codes = lance_index::vector::pq::num_centroids(params.num_bits as u32);
+    let expected_sample_size = num_codes * params.sample_rate;
     info!(
         "Loading training data for PQ. Sample size: {}",
         expected_sample_size
@@ -897,6 +924,41 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::Unprocessable { .. }));
+    }
+
+    /// The supplied codebook is checked before 2^num_bits is derived, so a
+    /// num_bits that does not fit reports the input rather than overflowing.
+    #[tokio::test]
+    async fn test_build_pq_model_rejects_unrepresentable_num_bits() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = 16;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        )]));
+
+        let vectors = generate_random_array_with_seed::<Float32Type>(dim * 10, [11u8; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
+            dim, [12u8; 32],
+        ));
+        let params = PQBuildParams::with_codebook(4, usize::BITS as usize, codebook);
+        let err = build_pq_model(&dataset, "vector", dim, MetricType::L2, &params, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(err.to_string().contains("not representable"), "got {err}");
     }
 
     struct TestPreFilter {

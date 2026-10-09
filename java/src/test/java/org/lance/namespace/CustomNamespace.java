@@ -29,6 +29,7 @@ import org.lance.namespace.model.BatchCreateTableVersionsResponse;
 import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CountTableRowsResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateNamespaceResponse;
 import org.lance.namespace.model.CreateTableIndexRequest;
@@ -84,7 +85,9 @@ import org.lance.namespace.model.ListTablesResponse;
 import org.lance.namespace.model.MergeInsertIntoTableRequest;
 import org.lance.namespace.model.MergeInsertIntoTableResponse;
 import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.NamespaceExistsResponse;
 import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableResponse;
 import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.RenameTableRequest;
@@ -92,6 +95,7 @@ import org.lance.namespace.model.RenameTableResponse;
 import org.lance.namespace.model.RestoreTableRequest;
 import org.lance.namespace.model.RestoreTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
+import org.lance.namespace.model.TableExistsResponse;
 import org.lance.namespace.model.UpdateTableRequest;
 import org.lance.namespace.model.UpdateTableResponse;
 import org.lance.namespace.model.UpdateTableSchemaMetadataRequest;
@@ -174,8 +178,8 @@ public class CustomNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void namespaceExists(NamespaceExistsRequest request) {
-    inner.namespaceExists(request);
+  public NamespaceExistsResponse namespaceExists(NamespaceExistsRequest request) {
+    return inner.namespaceExists(request);
   }
 
   // Table operations
@@ -196,8 +200,8 @@ public class CustomNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void tableExists(TableExistsRequest request) {
-    inner.tableExists(request);
+  public TableExistsResponse tableExists(TableExistsRequest request) {
+    return inner.tableExists(request);
   }
 
   @Override
@@ -211,7 +215,7 @@ public class CustomNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public Long countTableRows(CountTableRowsRequest request) {
+  public CountTableRowsResponse countTableRows(CountTableRowsRequest request) {
     return inner.countTableRows(request);
   }
 
@@ -250,7 +254,7 @@ public class CustomNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public byte[] queryTable(QueryTableRequest request) {
+  public QueryTableResponse queryTable(QueryTableRequest request) {
     return inner.queryTable(request);
   }
 

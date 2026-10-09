@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tracing::instrument;
 use uuid::Uuid;
 
+use super::MemTableDataTarget;
 use super::manifest::ShardManifestStore;
 use super::util::{
     WatchableOnceCell, parse_bit_reversed_filename, shard_wal_path, wal_entry_filename,
@@ -40,6 +41,26 @@ use super::memtable::batch_store::{BatchStore, StoredBatch};
 
 /// Key for storing writer epoch in Arrow IPC file schema metadata.
 pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
+/// The memtable generation an entry's batches belong to. Absent in WAL-only
+/// mode.
+pub const GENERATION_KEY: &str = "generation";
+
+/// Metadata keys a WAL entry carries about itself rather than about its batches.
+const RESERVED_ENTRY_KEYS: &[&str] = &[
+    WRITER_EPOCH_KEY,
+    GENERATION_KEY,
+    FENCE_SENTINEL_KEY,
+    TARGET_GENERATION_KEY,
+    TARGET_GENERATION_DIR_KEY,
+    TARGET_DATA_FILE_KEY,
+    TARGET_CREATOR_EPOCH_KEY,
+    TARGET_BATCH_CAPACITY_KEY,
+];
+const TARGET_GENERATION_KEY: &str = "mem_wal_target_generation";
+const TARGET_GENERATION_DIR_KEY: &str = "mem_wal_target_generation_dir";
+const TARGET_DATA_FILE_KEY: &str = "mem_wal_target_data_file";
+const TARGET_CREATOR_EPOCH_KEY: &str = "mem_wal_target_creator_epoch";
+const TARGET_BATCH_CAPACITY_KEY: &str = "mem_wal_target_batch_capacity";
 
 /// Marks a WAL entry as a data-less fence sentinel (observability only;
 /// replay skips sentinels via their empty batch list).
@@ -238,29 +259,47 @@ impl BatchDurableWatcher {
         }
     }
 
-    /// Whether the write is readable yet.
-    fn is_visible(&self) -> bool {
+    /// Whether the write's batches are indexed — the weaker half of
+    /// [`Self::is_visible`], with the append possibly still outstanding.
+    fn is_indexed(&self) -> bool {
         // WAL-only mode has no indexes, so there is nothing to index-wait on.
         let indexed = match &self.indexes {
             Some(indexes) => indexes.indexed_count(),
             None => self.target_indexed,
         };
-        if indexed < self.target_indexed {
-            return false;
-        }
-        !self.cursors.durable_write() || self.cursors.durable() >= self.target_durable
+        indexed >= self.target_indexed
+    }
+
+    /// Whether the write is readable yet.
+    fn is_visible(&self) -> bool {
+        self.is_indexed()
+            && (!self.cursors.durable_write() || self.cursors.durable() >= self.target_durable)
     }
 
     /// Wait until the write is visible, or until the writer poisons — in which
     /// case no cursor will ever reach the target, so surface the typed error
     /// rather than blocking forever.
     pub async fn wait(&mut self) -> Result<()> {
+        self.wait_until(Self::is_visible).await
+    }
+
+    /// Wait until the write is indexed, leaving durability outstanding. Pairs
+    /// with [`MemTableVisibility::Indexed`](crate::dataset::mem_wal::MemTableVisibility::Indexed)
+    /// on the read side.
+    ///
+    /// Not an acknowledgement: a caller promising durability must still await
+    /// [`Self::wait`].
+    pub async fn wait_indexed(&mut self) -> Result<()> {
+        self.wait_until(Self::is_indexed).await
+    }
+
+    async fn wait_until(&mut self, reached: fn(&Self) -> bool) -> Result<()> {
         loop {
             // Mark the current version seen *before* testing, so a wake-up landing
             // between the test and `changed()` below is not lost.
             self.rx.borrow_and_update();
             self.cursors.check_poisoned()?;
-            if self.is_visible() {
+            if reached(self) {
                 return Ok(());
             }
             self.rx
@@ -854,7 +893,14 @@ impl WalFlusher {
             stored_batches.iter().map(|s| s.data.clone()).collect();
 
         let start = Instant::now();
-        let append_result = self.wal_appender.append(record_batches).await?;
+        let append_result = self
+            .wal_appender
+            .append_for_target(
+                record_batches,
+                batch_store.target(),
+                Some(batch_store.generation()),
+            )
+            .await?;
         let wal_io_duration = start.elapsed();
 
         // Advance the writer-global durability cursor and wake waiters. The range
@@ -986,7 +1032,6 @@ impl WalEntryData {
             .get(WRITER_EPOCH_KEY)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-
         // Read all batches
         let mut batches = Vec::new();
         for batch_result in reader {
@@ -1071,6 +1116,9 @@ pub struct WalReadEntry {
     /// Writer epoch recorded in the WAL entry's IPC schema metadata.
     /// Replay logic uses this to fence-check against the current epoch.
     pub writer_epoch: u64,
+    pub(crate) target: Option<MemTableDataTarget>,
+    /// Generation the batches belong to, when the entry records one.
+    pub(crate) generation: Option<u64>,
     pub batches: Vec<RecordBatch>,
 }
 
@@ -1195,8 +1243,22 @@ impl WalAppender {
 
     /// Append batches as one durable WAL entry.
     pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
+        self.append_for_target(batches, None, None).await
+    }
+
+    pub(crate) async fn append_for_target(
+        &self,
+        batches: Vec<RecordBatch>,
+        target: Option<&MemTableDataTarget>,
+        generation: Option<u64>,
+    ) -> Result<WalAppendResult> {
         validate_appender_batches(&batches)?;
-        let wal_data = Bytes::from(serialize_appender_batches(&batches, self.writer_epoch)?);
+        let wal_data = Bytes::from(serialize_appender_batches(
+            &batches,
+            self.writer_epoch,
+            target,
+            generation,
+        )?);
         let wal_bytes = wal_data.len();
         let num_batches = batches.len();
         let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1419,7 +1481,12 @@ impl WalTailer {
                 path, self.shard_id, e
             ))
         })?;
-        let (writer_epoch, batches) = deserialize_appender_batches(bytes)?;
+        let DecodedEntry {
+            writer_epoch,
+            target,
+            generation,
+            batches,
+        } = deserialize_appender_batches(bytes)?;
 
         self.highest_read
             .fetch_max(entry_position, Ordering::Relaxed);
@@ -1428,6 +1495,8 @@ impl WalTailer {
             shard_id: self.shard_id,
             entry_position,
             writer_epoch,
+            target,
+            generation,
             batches,
         }))
     }
@@ -1496,10 +1565,44 @@ fn validate_appender_batches(batches: &[RecordBatch]) -> Result<()> {
     Ok(())
 }
 
-fn serialize_appender_batches(batches: &[RecordBatch], writer_epoch: u64) -> Result<Vec<u8>> {
+fn serialize_appender_batches(
+    batches: &[RecordBatch],
+    writer_epoch: u64,
+    target: Option<&MemTableDataTarget>,
+    generation: Option<u64>,
+) -> Result<Vec<u8>> {
     let schema = batches[0].schema();
     let mut metadata = schema.metadata().clone();
+    // Only the writer sets these keys. Drop any the caller's schema carries.
+    for reserved in RESERVED_ENTRY_KEYS {
+        metadata.remove(*reserved);
+    }
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
+    if let Some(generation) = generation {
+        metadata.insert(GENERATION_KEY.to_string(), generation.to_string());
+    }
+    if let Some(target) = target {
+        metadata.insert(
+            TARGET_GENERATION_KEY.to_string(),
+            target.generation.to_string(),
+        );
+        metadata.insert(
+            TARGET_GENERATION_DIR_KEY.to_string(),
+            target.generation_dir.clone(),
+        );
+        metadata.insert(
+            TARGET_DATA_FILE_KEY.to_string(),
+            target.data_file_name.clone(),
+        );
+        metadata.insert(
+            TARGET_CREATOR_EPOCH_KEY.to_string(),
+            target.creator_epoch.to_string(),
+        );
+        metadata.insert(
+            TARGET_BATCH_CAPACITY_KEY.to_string(),
+            target.batch_capacity.to_string(),
+        );
+    }
     let ipc_schema = Arc::new(ArrowSchema::new_with_metadata(
         schema.fields().to_vec(),
         metadata,
@@ -1542,7 +1645,14 @@ fn serialize_fence_sentinel(writer_epoch: u64) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-fn deserialize_appender_batches(bytes: Bytes) -> Result<(u64, Vec<RecordBatch>)> {
+struct DecodedEntry {
+    writer_epoch: u64,
+    target: Option<MemTableDataTarget>,
+    generation: Option<u64>,
+    batches: Vec<RecordBatch>,
+}
+
+fn deserialize_appender_batches(bytes: Bytes) -> Result<DecodedEntry> {
     let cursor = Cursor::new(bytes);
     let reader = StreamReader::try_new(cursor, None)
         .map_err(|e| Error::io(format!("failed to open WAL IPC stream reader: {}", e)))?;
@@ -1558,8 +1668,27 @@ fn deserialize_appender_batches(bytes: Bytes) -> Result<(u64, Vec<RecordBatch>)>
                 WRITER_EPOCH_KEY, e
             ))
         })?;
+    let target = target_from_metadata(schema.metadata())?;
+    let generation = schema
+        .metadata()
+        .get(GENERATION_KEY)
+        .map(|value| {
+            value.parse::<u64>().map_err(|e| {
+                Error::io(format!(
+                    "WAL entry has malformed {} metadata: {}",
+                    GENERATION_KEY, e
+                ))
+            })
+        })
+        .transpose()?;
     let mut clean_metadata = schema.metadata().clone();
     clean_metadata.remove(WRITER_EPOCH_KEY);
+    clean_metadata.remove(GENERATION_KEY);
+    clean_metadata.remove(TARGET_GENERATION_KEY);
+    clean_metadata.remove(TARGET_GENERATION_DIR_KEY);
+    clean_metadata.remove(TARGET_DATA_FILE_KEY);
+    clean_metadata.remove(TARGET_CREATOR_EPOCH_KEY);
+    clean_metadata.remove(TARGET_BATCH_CAPACITY_KEY);
     let logical_schema = Arc::new(ArrowSchema::new_with_metadata(
         schema.fields().to_vec(),
         clean_metadata,
@@ -1572,7 +1701,53 @@ fn deserialize_appender_batches(bytes: Bytes) -> Result<(u64, Vec<RecordBatch>)>
             .map_err(|e| Error::io(format!("failed to strip WAL metadata: {}", e)))?;
         batches.push(clean);
     }
-    Ok((writer_epoch, batches))
+    Ok(DecodedEntry {
+        writer_epoch,
+        target,
+        generation,
+        batches,
+    })
+}
+
+fn target_from_metadata(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Result<Option<MemTableDataTarget>> {
+    let values = [
+        metadata.get(TARGET_GENERATION_KEY),
+        metadata.get(TARGET_GENERATION_DIR_KEY),
+        metadata.get(TARGET_DATA_FILE_KEY),
+        metadata.get(TARGET_CREATOR_EPOCH_KEY),
+        metadata.get(TARGET_BATCH_CAPACITY_KEY),
+    ];
+    if values.iter().all(|value| value.is_none()) {
+        return Ok(None);
+    }
+    if values.iter().any(|value| value.is_none()) {
+        return Err(Error::io(
+            "WAL entry has incomplete MemTable target metadata".to_string(),
+        ));
+    }
+    let generation = values[0]
+        .expect("checked above")
+        .parse::<u64>()
+        .map_err(|error| Error::io(format!("invalid WAL target generation: {error}")))?;
+    let creator_epoch = values[3]
+        .expect("checked above")
+        .parse::<u64>()
+        .map_err(|error| Error::io(format!("invalid WAL target creator epoch: {error}")))?;
+    let batch_capacity = values[4]
+        .expect("checked above")
+        .parse::<usize>()
+        .map_err(|error| Error::io(format!("invalid WAL target batch capacity: {error}")))?;
+    let target = MemTableDataTarget {
+        generation,
+        generation_dir: values[1].expect("checked above").clone(),
+        data_file_name: values[2].expect("checked above").clone(),
+        creator_epoch,
+        batch_capacity,
+    };
+    target.validate()?;
+    Ok(Some(target))
 }
 
 enum AtomicPutError {
@@ -1690,6 +1865,7 @@ async fn scan_first_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::MemTableVisibility;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -2500,6 +2676,72 @@ mod tests {
         );
     }
 
+    /// `wait_indexed` clears on the index apply alone; `wait` still needs the
+    /// append.
+    #[tokio::test]
+    async fn test_wait_indexed_clears_before_durable() {
+        let cursors = Arc::new(WriterCursors::new(true));
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 1)).unwrap();
+
+        let mut idx = IndexStore::new();
+        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        idx.set_durability(Arc::clone(&cursors), 0);
+        let indexes = Arc::new(idx);
+
+        apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Indexed but not durable: the two bounds diverge.
+        assert_eq!(indexes.indexed_count(), 1);
+        assert_eq!(indexes.visible_count(), 0);
+        assert_eq!(indexes.prefix_count(MemTableVisibility::Published), 0);
+        assert_eq!(indexes.prefix_count(MemTableVisibility::Indexed), 1);
+
+        let mut watcher =
+            BatchDurableWatcher::new(Arc::clone(&cursors), Some(indexes.clone()), 1, 1);
+        watcher
+            .wait_indexed()
+            .await
+            .expect("the index apply has landed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), watcher.wait())
+                .await
+                .is_err(),
+            "durability is still outstanding, so `wait` must not return"
+        );
+
+        // The append lands: now both clear.
+        cursors.advance_durable(1);
+        watcher.wait().await.expect("the append has landed");
+        assert_eq!(indexes.visible_count(), 1);
+    }
+
+    /// A poisoned writer wakes an index waiter with the typed error: its rows
+    /// may be indexed, but they are never going to exist.
+    #[tokio::test]
+    async fn test_wait_indexed_surfaces_a_poisoned_writer() {
+        let cursors = Arc::new(WriterCursors::new(true));
+        let mut watcher = BatchDurableWatcher::new(Arc::clone(&cursors), None, 1, 1);
+
+        cursors.mark_terminal_failure(&Error::io("the WAL PUT failed"));
+
+        watcher
+            .wait_indexed()
+            .await
+            .expect_err("a poisoned writer must not hand back a clean index wait");
+    }
+
     /// An index-apply failure poisons the writer.
     ///
     /// A partial apply cannot be rolled back — `insert_batches` joins every index
@@ -2629,5 +2871,37 @@ mod tests {
             cursors.check_poisoned().unwrap_err().fence_reason(),
             Some(FenceReason::PersistenceFailure)
         );
+    }
+
+    /// Reserved keys in the caller's schema metadata are ignored; only the
+    /// writer sets them.
+    #[test]
+    fn an_entry_takes_its_generation_from_the_writer_not_the_batch() {
+        // Built from the list so newly reserved keys are covered too.
+        let forged: std::collections::HashMap<String, String> = RESERVED_ENTRY_KEYS
+            .iter()
+            .map(|key| (key.to_string(), "0".to_string()))
+            .collect();
+        let schema = Arc::new(Schema::new_with_metadata(
+            create_test_schema().fields().to_vec(),
+            forged,
+        ));
+        let batch = create_test_batch(&schema, 1);
+
+        let bytes =
+            serialize_appender_batches(std::slice::from_ref(&batch), 7, None, None).unwrap();
+        let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
+        assert_eq!(decoded.generation, None, "the batch cannot supply one");
+        assert_eq!(decoded.writer_epoch, 7, "nor speak for the writer's epoch");
+        assert_eq!(decoded.target, None, "nor hand it a blob payload directory");
+        assert_eq!(
+            decoded.batches.len(),
+            1,
+            "nor pass itself off as a fence sentinel, which carries no batches"
+        );
+
+        let bytes = serialize_appender_batches(&[batch], 7, None, Some(4)).unwrap();
+        let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
+        assert_eq!(decoded.generation, Some(4));
     }
 }

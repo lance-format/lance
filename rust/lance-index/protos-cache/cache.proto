@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// Protobuf headers for serialized index cache entries.
-//
-// These messages describe the *cache* serialization format, not the on-disk
-// Lance format spec, so they live with the library (lance-index) rather than in
-// the top-level `protos/` spec folder.
-//
-// Field numbers and enum values are append-only across all messages here: never
-// renumber or reuse them. A change the proto cannot express transparently
-// (adding/removing/reordering the IPC/raw sections that follow a header) must
-// bump the relevant codec's `CURRENT_VERSION` instead.
+/* Protobuf headers for serialized index cache entries.
+ *
+ * These messages describe the *cache* serialization format, not the on-disk
+ * Lance format spec, so they live with the library (lance-index) rather than in
+ * the top-level `protos/` spec folder.
+ *
+ * Field numbers and enum values are append-only across all messages here: never
+ * renumber or reuse them. A change the proto cannot express transparently
+ * (adding/removing/reordering the IPC/raw sections that follow a header) must
+ * bump the relevant codec's `CURRENT_VERSION` instead.
+ */
 
 syntax = "proto3";
 
 package lance.index.cache;
 
-// ---------------------------------------------------------------------------
-// Full-text search (FTS) posting lists
-// ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+ * Full-text search (FTS) posting lists
+ * ---------------------------------------------------------------------------
+ */
 
 // Header for a serialized `CompressedPostingList` cache entry.
 message CompressedPostingHeader {
@@ -28,38 +30,43 @@ message CompressedPostingHeader {
   PositionStorage position_storage = 4;
   // Only meaningful when position_storage == POSITION_STORAGE_SHARED.
   PositionStreamCodec position_stream_codec = 5;
-  // Number of documents in each compressed posting block. Older cache entries
-  // omit this field and decode as the legacy 128-doc block size.
+  /* Number of documents in each compressed posting block. Older cache entries
+   * omit this field and decode as the legacy 128-doc block size.
+   */
   uint32 block_size = 6;
   // Whether an impact IPC section follows the posting/position sections.
   bool has_impacts = 7;
 }
 
-// Header for a serialized `PlainPostingList` cache entry. Followed by an Arrow
-// IPC section of (row_ids: UInt64, frequencies: Float32), then — when
-// position_storage == POSITION_STORAGE_LEGACY — an IPC section of the per-doc
-// position list. Plain postings never carry a shared position stream.
+/* Header for a serialized `PlainPostingList` cache entry. Followed by an Arrow
+ * IPC section of (row_ids: UInt64, frequencies: Float32), then — when
+ * position_storage == POSITION_STORAGE_LEGACY — an IPC section of the per-doc
+ * position list. Plain postings never carry a shared position stream.
+ */
 message PlainPostingHeader {
-  // Absent when the posting has no precomputed block-max score (the in-memory
-  // `max_score` is `None`); present otherwise.
+  /* Absent when the posting has no precomputed block-max score (the in-memory
+   * `max_score` is `None`); present otherwise.
+   */
   optional float max_score = 1;
   // POSITION_STORAGE_NONE or POSITION_STORAGE_LEGACY only.
   PositionStorage position_storage = 2;
 }
 
-// Header for a serialized standalone `Positions` cache entry. Followed by the
-// position sections framed per `position_storage`, which is never
-// POSITION_STORAGE_NONE for a standalone entry.
+/* Header for a serialized standalone `Positions` cache entry. Followed by the
+ * position sections framed per `position_storage`, which is never
+ * POSITION_STORAGE_NONE for a standalone entry.
+ */
 message PositionsHeader {
   PositionStorage position_storage = 1;
   // Only meaningful when position_storage == POSITION_STORAGE_SHARED.
   PositionStreamCodec position_stream_codec = 2;
 }
 
-// Header for a serialized `PostingListGroup`: a member count followed by that
-// many `PostingList` bodies written inline. Each member body is
-// self-delimiting, so members need no length prefixes, and writing them inline
-// keeps their Arrow IPC sections 64-byte aligned within the group entry.
+/* Header for a serialized `PostingListGroup`: a member count followed by that
+ * many `PostingList` bodies written inline. Each member body is
+ * self-delimiting, so members need no length prefixes, and writing them inline
+ * keeps their Arrow IPC sections 64-byte aligned within the group entry.
+ */
 message PostingListGroupHeader {
   uint32 count = 1;
 }
@@ -76,34 +83,40 @@ enum PositionStreamCodec {
   POSITION_STREAM_CODEC_PACKED_DELTA = 1;
 }
 
-// Which (if any) positions accompany the posting list, and how they are framed
-// in the sections after the header.
+/* Which (if any) positions accompany the posting list, and how they are framed
+ * in the sections after the header.
+ */
 enum PositionStorage {
   POSITION_STORAGE_NONE = 0;
   // Legacy per-doc positions as a single Arrow IPC section.
   POSITION_STORAGE_LEGACY = 1;
-  // Shared stream: an Arrow IPC section of block offsets, then a raw blob of
-  // the (codec-encoded) position bytes.
+  /* Shared stream: an Arrow IPC section of block offsets, then a raw blob of
+   * the (codec-encoded) position bytes.
+   */
   POSITION_STORAGE_SHARED = 2;
 }
 
-// ---------------------------------------------------------------------------
-// Scalar indices
-// ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+ * Scalar indices
+ * ---------------------------------------------------------------------------
+ */
 
-// Header for a serialized `BTreeIndexState` cache entry, followed by a single
-// Arrow IPC section holding the page-lookup batch.
+/* Header for a serialized `BTreeIndexState` cache entry, followed by a single
+ * Arrow IPC section holding the page-lookup batch.
+ */
 message BTreeIndexHeader {
   uint64 batch_size = 1;
-  // Whether an explicit page-range -> file mapping is present. Distinguishes a
-  // non-range-partitioned index (false) from a range-partitioned one whose map
-  // happens to be empty (true with no entries).
+  /* Whether an explicit page-range -> file mapping is present. Distinguishes a
+   * non-range-partitioned index (false) from a range-partitioned one whose map
+   * happens to be empty (true with no entries).
+   */
   bool has_ranges_to_files = 2;
   repeated RangeToFile ranges_to_files = 3;
 }
 
-// One entry of a `BTreeIndexState` page-range -> file mapping. The range is
-// inclusive on both ends (a `RangeInclusive<u32>`).
+/* One entry of a `BTreeIndexState` page-range -> file mapping. The range is
+ * inclusive on both ends (a `RangeInclusive<u32>`).
+ */
 message RangeToFile {
   uint32 start = 1;
   uint32 end = 2;
@@ -111,15 +124,17 @@ message RangeToFile {
   string path = 4;
 }
 
-// ---------------------------------------------------------------------------
-// Vector indices (IVF partitions)
-// ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+ * Vector indices (IVF partitions)
+ * ---------------------------------------------------------------------------
+ */
 
-// Headers for serialized IVF partition cache entries (`PartitionEntry<S, Q>`).
-//
-// Each header is followed by 64-byte-aligned Arrow IPC sections in a fixed,
-// version-keyed order (sub-index, then any quantizer-specific arrays, then the
-// quantizer storage batches).
+/* Headers for serialized IVF partition cache entries (`PartitionEntry<S, Q>`).
+ *
+ * Each header is followed by 64-byte-aligned Arrow IPC sections in a fixed,
+ * version-keyed order (sub-index, then any quantizer-specific arrays, then the
+ * quantizer storage batches).
+ */
 
 // Distance metric a quantizer's storage was built for.
 enum DistanceType {
@@ -165,9 +180,10 @@ message SqPartitionHeader {
   double bounds_end = 5;
 }
 
-// Header for a serialized IVF index state (`IvfIndexState<Q>`), followed by
-// three raw blobs: the IVF model protobuf, the quantizer's extra-metadata
-// buffer (may be empty), and the auxiliary IVF model protobuf.
+/* Header for a serialized IVF index state (`IvfIndexState<Q>`), followed by
+ * three raw blobs: the IVF model protobuf, the quantizer's extra-metadata
+ * buffer (may be empty), and the auxiliary IVF model protobuf.
+ */
 message IvfStateHeader {
   reserved 8;
   reserved "cache_key_prefix";
@@ -178,23 +194,26 @@ message IvfStateHeader {
   repeated string sub_index_metadata = 4;
   string sub_index_type = 5;
   string quantization_type = 6;
-  // Per-quantizer `Q::Metadata` as JSON. Kept as a string because the metadata
-  // type is generic over the quantizer; the proto envelope still provides
-  // additive evolution for the surrounding fields.
+  /* Per-quantizer `Q::Metadata` as JSON. Kept as a string because the metadata
+   * type is generic over the quantizer; the proto envelope still provides
+   * additive evolution for the surrounding fields.
+   */
   string quantizer_metadata_json = 7;
   uint64 index_file_size = 9;
   uint64 aux_file_size = 10;
 }
 
-// RabitQ quantizer. Sections: sub-index IPC, rotate-matrix IPC (Matrix rotation
-// only), storage IPC.
+/* RabitQ quantizer. Sections: sub-index IPC, rotate-matrix IPC (Matrix rotation
+ * only), storage IPC.
+ */
 message RabitPartitionHeader {
   DistanceType distance_type = 1;
   uint32 num_bits = 2;
   uint32 code_dim = 3;
   RotationType rotation_type = 4;
-  // Fast-rotation sign vector; present only when rotation_type ==
-  // ROTATION_TYPE_FAST (the Matrix case stores its rotation as an IPC section).
+  /* Fast-rotation sign vector; present only when rotation_type ==
+   * ROTATION_TYPE_FAST (the Matrix case stores its rotation as an IPC section).
+   */
   optional bytes fast_rotation_signs = 5;
   // Estimator the RabitQ storage uses at query time (residual vs raw query).
   RabitQueryEstimator query_estimator = 6;

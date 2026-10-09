@@ -76,6 +76,7 @@ impl Writer {
     }
 
     fn initialize(&mut self, schema: Schema) -> Result<()> {
+        self.encoding.validate_options()?;
         let encoding_options = self.encoding.encoding_options(&schema);
         schema.validate()?;
         let strategy = encoding_strategy(self.compression.clone());
@@ -122,7 +123,7 @@ impl Writer {
     }
 
     /// Append a buffer whose page or column metadata is supplied externally.
-    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         self.sink.write_external_buffer(bytes).await
     }
 
@@ -132,7 +133,7 @@ impl Writer {
     }
 
     /// Prepare the writer for encoded column data produced externally.
-    pub(crate) fn initialize_with_external_metadata(
+    pub fn initialize_with_external_metadata(
         &mut self,
         schema: Schema,
         column_metadata: Vec<pbfile::ColumnMetadata>,

@@ -20,6 +20,7 @@
 //!   - Row IDs and doc_start_positions in metadata
 //!   - File metadata: c_table, huffman_codes, tree topology
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +34,9 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
+use lance_index_core::remapping::RowAddrTranslator;
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
@@ -551,8 +552,10 @@ impl LazyRankBitVec {
     }
 
     fn decode_words(raw: &[u8]) -> Vec<u64> {
-        raw.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect()
     }
 
@@ -1078,8 +1081,10 @@ impl FMIndex {
     }
 
     fn deserialize_c_table(data: &[u8]) -> Vec<usize> {
-        data.chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as usize)
+        data.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c) as usize)
             .collect()
     }
 
@@ -1383,8 +1388,8 @@ impl LazyFMIndex {
             .unwrap();
         for i in 0..sa_batch.num_rows() {
             let raw = words_col.value(i);
-            for chunk in raw.chunks_exact(8) {
-                sa_samples.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in raw.as_chunks::<8>().0 {
+                sa_samples.push(u64::from_le_bytes(*chunk));
             }
         }
         sa_samples.truncate(sa_samples_len);
@@ -1470,8 +1475,10 @@ impl FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("missing row_ids"))?;
         let row_ids_bytes = hex_decode(row_ids_hex)?;
         let row_ids: Vec<u64> = row_ids_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let doc_starts_hex = md
@@ -1479,8 +1486,10 @@ impl FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("missing doc_start_positions"))?;
         let doc_starts_bytes = hex_decode(doc_starts_hex)?;
         let doc_start_positions: Vec<u64> = doc_starts_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let fm = Box::pin(LazyFMIndex::from_reader(
@@ -1642,10 +1651,23 @@ impl ScalarIndex for FMIndexScalarIndex {
             )),
         }
     }
+
+    fn results_are_row_addresses(&self) -> bool {
+        true
+    }
+
     fn can_remap(&self) -> bool {
         false
     }
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+        Err(Error::not_supported("Fm does not support remap"))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _: &RowAddrTranslator,
+        _: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(
@@ -2316,6 +2338,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
+        _index_version: u32,
         fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -2826,7 +2849,13 @@ mod tests {
             .unwrap();
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -3255,7 +3284,13 @@ mod tests {
         assert_eq!(created.files[1].path, fmindex_partition_path(1));
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
         let r = index

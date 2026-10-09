@@ -19,6 +19,7 @@ import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 
@@ -38,7 +39,10 @@ public class LanceFileWriter implements AutoCloseable {
   private DictionaryProvider dictionaryProvider;
 
   private static native LanceFileWriter openNative(
-      String fileUri, Optional<String> dataStorageVersion, Map<String, String> storageOptions)
+      String fileUri,
+      Optional<String> dataStorageVersion,
+      Map<String, String> storageOptions,
+      FileWriteOptions writeOptions)
       throws IOException;
 
   private native void closeNative(long nativeLanceFileReaderHandle) throws IOException;
@@ -97,7 +101,36 @@ public class LanceFileWriter implements AutoCloseable {
       Optional<String> dataStorageVersion,
       Map<String, String> storageOptions)
       throws IOException {
-    LanceFileWriter writer = openNative(path, dataStorageVersion, storageOptions);
+    return open(
+        path,
+        allocator,
+        dictionaryProvider,
+        dataStorageVersion,
+        storageOptions,
+        FileWriteOptions.builder().build());
+  }
+
+  /**
+   * Open a LanceFileWriter with explicit file write options.
+   *
+   * @param path the URI of the file to write to
+   * @param allocator the BufferAllocator to use for the writer
+   * @param dictionaryProvider the DictionaryProvider to use for the writer
+   * @param dataStorageVersion the version of the data storage format to use
+   * @param storageOptions additional storage options for the writer
+   * @param writeOptions options for configuring the current-format file writer
+   * @return a new LanceFileWriter
+   */
+  public static LanceFileWriter open(
+      String path,
+      BufferAllocator allocator,
+      DictionaryProvider dictionaryProvider,
+      Optional<String> dataStorageVersion,
+      Map<String, String> storageOptions,
+      FileWriteOptions writeOptions)
+      throws IOException {
+    Preconditions.checkNotNull(writeOptions, "writeOptions must not be null");
+    LanceFileWriter writer = openNative(path, dataStorageVersion, storageOptions, writeOptions);
     writer.allocator = allocator;
     writer.dictionaryProvider = dictionaryProvider;
     return writer;

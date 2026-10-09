@@ -18,6 +18,7 @@ from typing import Optional
 import pyarrow as pa
 
 from .. import _Fragment
+from ..bitmap import Bitmap
 
 class IndexConfig:
     index_type: str
@@ -25,7 +26,7 @@ class IndexConfig:
 
 class IndexSegment:
     uuid: str
-    fragment_ids: set[int]
+    fragment_ids: Bitmap
     index_version: int
 
     def __repr__(self) -> str: ...
@@ -69,14 +70,14 @@ def transform_vectors(
 ): ...
 def build_rq_model(
     dimension: int,
-    num_bits: int = 1,
+    num_bits: int = 5,
     dtype: str = "float32",
 ) -> str: ...
 
 class IndexSegmentDescription:
     uuid: str
     dataset_version_at_last_update: int
-    fragment_ids: set[int]
+    fragment_ids: Bitmap
     index_version: int
     created_at: Optional[datetime]
     size_bytes: Optional[int]

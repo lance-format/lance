@@ -19,11 +19,13 @@ use tokio::sync::RwLock;
 use tracing::instrument;
 use uuid::Uuid;
 
+use super::MemTableDataTarget;
 use super::index::IndexStore;
 use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 use super::wal::WalFlushFailure;
 use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
+use crate::blob::{BlobIdAllocator, prepared_to_descriptor_blob_schema};
 use batch_store::BatchStore;
 
 /// Default batch store capacity when not specified.
@@ -60,6 +62,13 @@ impl Default for CacheConfig {
 pub struct MemTable {
     /// Schema for this MemTable.
     schema: Arc<ArrowSchema>,
+    /// Caller-visible scan schema.
+    ///
+    /// `schema` describes the prepared arrays stored in the MemTable, including
+    /// bounded inline bytes. Query planning must instead see the public Blob
+    /// descriptor fields (`size`, `position`, and so on), so the scanner keeps
+    /// this derived schema alongside the physical one.
+    scan_schema: Arc<ArrowSchema>,
     /// Lance schema (for index operations).
     lance_schema: Schema,
 
@@ -78,8 +87,18 @@ pub struct MemTable {
     /// Generation number (incremented on flush).
     generation: u64,
 
+    /// Reserved SSTable/data-file identity for this generation.
+    target: Option<MemTableDataTarget>,
+
+    /// Shared across the per-put Blob preprocessors for this target.
+    blob_id_allocator: BlobIdAllocator,
+
     /// Primary key bloom filter for staleness detection.
     pk_bloom_filter: Sbbf,
+    /// Decoded size of the primary-key columns across every batch appended so
+    /// far. Accumulated here because [`Self::update_bloom_filter`] already has
+    /// the key columns in hand.
+    pk_bytes: usize,
     /// Primary key field IDs (for bloom filter updates).
     pk_field_ids: Vec<i32>,
 
@@ -221,7 +240,33 @@ impl MemTable {
         batch_capacity: usize,
         global_offset: usize,
     ) -> Result<Self> {
+        Self::with_capacity_at_target(
+            schema,
+            generation,
+            pk_field_ids,
+            cache_config,
+            batch_capacity,
+            global_offset,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_capacity_at_target(
+        schema: Arc<ArrowSchema>,
+        generation: u64,
+        pk_field_ids: Vec<i32>,
+        cache_config: CacheConfig,
+        batch_capacity: usize,
+        global_offset: usize,
+        target: Option<MemTableDataTarget>,
+    ) -> Result<Self> {
+        let batch_capacity = target
+            .as_ref()
+            .map(|target| batch_capacity.max(target.batch_capacity))
+            .unwrap_or(batch_capacity);
         let lance_schema = Schema::try_from(schema.as_ref())?;
+        let scan_schema = Arc::new(prepared_to_descriptor_blob_schema(schema.as_ref())?);
 
         // Initialize bloom filter for primary key staleness detection.
         let pk_bloom_filter =
@@ -238,7 +283,12 @@ impl MemTable {
         let dataset_uri = format!("memory://{}", Uuid::new_v4());
 
         // Create lock-free batch store
-        let batch_store = Arc::new(BatchStore::with_capacity_at(batch_capacity, global_offset));
+        let batch_store = Arc::new(BatchStore::with_capacity_at_target(
+            batch_capacity,
+            global_offset,
+            target.clone(),
+            generation,
+        ));
 
         // Create memtable_flush_completion cell immediately so backpressure can
         // wait on it even before the memtable is frozen. Every memtable will
@@ -247,14 +297,18 @@ impl MemTable {
 
         Ok(Self {
             schema,
+            scan_schema,
             lance_schema,
             batch_store,
             dataset_uri,
             cache_config,
             cached_dataset: RwLock::new(None),
             generation,
+            target,
+            blob_id_allocator: BlobIdAllocator::new(1),
             pk_bloom_filter,
             pk_field_ids,
+            pk_bytes: 0,
             // Initialize with an empty IndexStore so the visibility cursor has
             // a stable Arc shared between the scanner (via `indexes_arc()`)
             // and the WAL flush handler. Replaced via `set_indexes_arc` if
@@ -576,6 +630,12 @@ impl MemTable {
             bloom.insert_hash(hash);
         }
 
+        // Per column, not per row: the loop above is what costs something here.
+        self.pk_bytes += pk_columns
+            .iter()
+            .map(|column| batch_store::StoredBatch::estimate_array_size(&column.to_data()))
+            .sum::<usize>();
+
         Ok(())
     }
 
@@ -625,6 +685,11 @@ impl MemTable {
     async fn construct_dataset(&self) -> Result<Dataset> {
         if self.batch_store.is_empty() {
             return Err(Error::invalid_input("Cannot construct Dataset: no batches"));
+        }
+        if self.target.is_some() {
+            return Err(Error::not_supported(
+                "constructing a standalone Dataset from a Blob v2 MemTable; use MemTable::scan so descriptors keep the preassigned data-file identity",
+            ));
         }
 
         // Get batches
@@ -689,6 +754,10 @@ impl MemTable {
         &self.schema
     }
 
+    pub(crate) fn scan_schema(&self) -> &Arc<ArrowSchema> {
+        &self.scan_schema
+    }
+
     /// Get the Lance schema.
     pub fn lance_schema(&self) -> &Schema {
         &self.lance_schema
@@ -699,7 +768,20 @@ impl MemTable {
         self.generation
     }
 
+    pub(crate) fn target(&self) -> Option<&MemTableDataTarget> {
+        self.target.as_ref()
+    }
+
+    pub(crate) fn blob_id_allocator(&self) -> BlobIdAllocator {
+        self.blob_id_allocator.clone()
+    }
+
     /// Get total row count.
+    /// Decoded size of the primary-key columns this memtable holds.
+    pub fn pk_bytes(&self) -> usize {
+        self.pk_bytes
+    }
+
     pub fn row_count(&self) -> usize {
         self.batch_store.total_rows()
     }
@@ -790,7 +872,7 @@ impl MemTable {
             .indexes
             .clone()
             .expect("MemTable must have indexes configured for scanning");
-        scanner::MemTableScanner::new(self.batch_store.clone(), indexes, self.schema.clone())
+        scanner::MemTableScanner::new(self.batch_store.clone(), indexes, self.scan_schema.clone())
     }
 
     /// Get a clone of the batch store Arc for external use.

@@ -430,6 +430,11 @@ fn try_bitpack_for_block(data: &FixedWidthDataBlock) -> Option<Box<dyn BlockComp
     let widths = bit_widths.as_primitive::<UInt64Type>();
     let max_bit_width = *widths.values().iter().max().unwrap();
 
+    // Full-width values save no space and leave no bit savings for a runt tail.
+    if max_bit_width >= bits {
+        return None;
+    }
+
     let too_small =
         widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 
@@ -1032,7 +1037,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl)?))
             }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(
                 rle,
@@ -1096,7 +1101,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     .map(|v| LanceBuffer::from_bytes(v.clone(), 1)),
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
-            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
+            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1192,7 +1197,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
             Compression::FixedSizeList(fsl) => {
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
             Compression::OutOfLineBitpacking(out_of_line) => {
                 // Extract the compressed bit width from the values encoding
@@ -1782,6 +1787,22 @@ mod tests {
             debug_str.contains("OutOfLineBitpacking"),
             "expected OutOfLineBitpacking, got: {debug_str}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::runt_tail(1600)]
+    #[case::whole_chunks(2048)]
+    #[cfg(feature = "bitpacking")]
+    fn test_block_skips_full_width_bitpacking(#[case] num_values: usize) {
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(vec![-1_i64; num_values]),
+            num_values: num_values as u64,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+
+        assert!(try_bitpacking_block(&DataBlock::FixedWidth(block)).is_none());
     }
 
     #[test]

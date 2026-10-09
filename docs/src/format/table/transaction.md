@@ -38,6 +38,14 @@ These files serve two purposes:
 1. Enable manifest reconstruction during commit retries when concurrent transactions have been committed
 2. Support conflict detection by describing the operation performed
 
+### Inline Transaction Sections
+
+Small transactions may also be embedded in the manifest file. The manifest stores the byte position of the length-prefixed Transaction message in `transaction_section` (field 23). Readers that do not recognize this manifest field ignore it, so adding a Transaction operation cannot prevent those readers from opening the dataset.
+
+Decoding an inline transaction while opening a manifest is an optional cache optimization. An undecodable or unsupported Transaction message must not make the manifest unreadable. A Transaction whose `operation` holds a field number in the reserved range 100-199 that the reader does not recognize is an operation from a newer writer. Readers must treat it as an unknown operation that conflicts with every concurrent transaction, and must not re-encode or commit it.
+
+`transaction_section_deprecated` (field 21) is the legacy inline position. New writers must leave it absent. Readers may use it to retrieve a transaction from an old manifest when field 23 is absent.
+
 ### Commit Algorithm
 
 The commit process attempts to atomically write a new manifest file using the storage primitives described above.
@@ -200,6 +208,10 @@ This includes operations such as compaction, defragmentation, and re-ordering.
 Rewrite operations change row addresses, requiring index updates.
 New fragment IDs must be reserved via `ReserveFragments` before executing a `Rewrite` transaction.
 
+A rewrite that defers index remapping publishes its address mapping in the
+same commit by replacing the [Fragment Reuse Index](../index/system/frag_reuse.md)
+entry in the manifest's index section.
+
 <details>
 <summary>Rewrite protobuf message</summary>
 
@@ -330,6 +342,7 @@ The Restore operation reverts the table to a previous version. It's generally as
 other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
+- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
 
 ### ReserveFragments
 
@@ -427,6 +440,7 @@ An UpdateConfig operation only modifies table config and tends to be compatible 
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
+- Restore (only if the UpdateConfig updates schema or field metadata)
 - UpdateConfig (only if the two operations modify the same config)
 
 ### DataReplacement
