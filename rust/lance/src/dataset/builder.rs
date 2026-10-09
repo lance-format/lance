@@ -883,9 +883,11 @@ impl DatasetBuilder {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             ensure_can_read_manifest(&manifest)?;
             versions::check_manifest_storage_version(&mut manifest)?;
-            let location = commit_handler
+            let mut location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;
+            // Supplied bytes are not identified by the stored object's ETag.
+            location.e_tag = None;
             if manifest.schema.has_dictionary_types() {
                 let reader = object_store.open(&location.path).await?;
                 populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
