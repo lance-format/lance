@@ -10,6 +10,7 @@ use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::registry::TrainingCriteria;
 
 use super::fts::FtsQueryExpr;
@@ -48,14 +49,26 @@ pub enum Deviation {
     RecordsAnotherName,
     /// Panics on every insert.
     PanicsOnInsert,
+    /// Rejects its flush parameters.
+    RejectsFlushParams,
 }
 
 /// `spec`, maintained by its plugin wrapped with `deviation`.
 pub fn wrapped(spec: MemIndexSpec, deviation: Deviation) -> MemIndexSpec {
+    wrapped_with_flush_params(spec, deviation, None)
+}
+
+/// As [`wrapped`], building on disk with `flush_params` when given.
+pub fn wrapped_with_flush_params(
+    spec: MemIndexSpec,
+    deviation: Deviation,
+    flush_params: Option<ScalarIndexParams>,
+) -> MemIndexSpec {
     MemIndexSpec {
         plugin: Arc::new(Wrapped {
             inner: spec.plugin.clone(),
             deviation,
+            flush_params,
         }),
         ..spec
     }
@@ -65,6 +78,7 @@ pub fn wrapped(spec: MemIndexSpec, deviation: Deviation) -> MemIndexSpec {
 struct Wrapped {
     inner: Arc<dyn MemIndexPlugin>,
     deviation: Deviation,
+    flush_params: Option<ScalarIndexParams>,
 }
 
 #[async_trait::async_trait]
@@ -80,6 +94,15 @@ impl MemIndexPlugin for Wrapped {
     }
     fn training_criteria(&self) -> TrainingCriteria {
         self.inner.training_criteria()
+    }
+    fn flush_params(&self, spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
+        if self.deviation == Deviation::RejectsFlushParams {
+            return Err(Error::invalid_input("flush parameters rejected"));
+        }
+        match &self.flush_params {
+            Some(params) => Ok(params.clone()),
+            None => self.inner.flush_params(spec),
+        }
     }
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         self.inner.resolve(ctx).await

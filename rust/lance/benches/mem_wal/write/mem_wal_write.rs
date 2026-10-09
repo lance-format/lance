@@ -631,6 +631,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     store_params: default_config.store_params,
                                     session: default_config.session,
                                     mem_index_registry: default_config.mem_index_registry,
+                                    index_overrides: default_config.index_overrides,
                                     // Measure the built-in per-shard valve, not
                                     // an injected policy.
                                     backpressure: None,

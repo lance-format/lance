@@ -751,7 +751,7 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
             HnswParams {
                 distance_type,
                 build_params: ctx
-                    .overrides::<HnswBuildParams>()
+                    .overrides::<HnswBuildParams>()?
                     .cloned()
                     .unwrap_or_else(mem_wal_hnsw_default),
             },

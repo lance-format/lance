@@ -993,6 +993,10 @@ fn vector_schema() -> Arc<ArrowSchema> {
     MemIndexSpec::hnsw("idx", 9, "nope", DistanceType::L2),
     Some("not in the shard schema")
 )]
+#[case::flush_params_rejected(
+    wrapped(MemIndexSpec::btree("idx", 0, "id"), Deviation::RejectsFlushParams),
+    Some("flush parameters rejected")
+)]
 fn test_validate_index_specs(#[case] spec: MemIndexSpec, #[case] expected_error: Option<&str>) {
     let schema = vector_schema();
     let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();

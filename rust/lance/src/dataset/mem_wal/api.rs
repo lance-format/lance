@@ -49,6 +49,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
 use lance_index::metrics::NoOpMetricsCollector;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -231,9 +232,9 @@ impl<'a> InitializeMemWalBuilder<'a> {
 
     /// Record `config` as the default `ShardWriter` configuration.
     ///
-    /// Every tunable field is persisted into the MemWAL index so that all
-    /// writers — across processes and restarts — start from the same
-    /// defaults. Shard identity (`shard_id`, `shard_spec_id`) is not a
+    /// Every tunable field except `index_overrides`, whose values are Rust
+    /// objects, is persisted into the MemWAL index so that all writers —
+    /// across processes and restarts — start from the same defaults. Shard identity (`shard_id`, `shard_spec_id`) is not a
     /// configuration default and is not recorded. These remain defaults only:
     /// an individual writer may still override any value at runtime in its own
     /// (non-persisted) `ShardWriterConfig`.
@@ -916,7 +917,7 @@ async fn maintained_index_specs(
     build_index_specs(
         dataset,
         &index_names,
-        &writer_overrides(config),
+        &writer_overrides(config)?,
         &config.mem_index_registry,
         OnMissingIndex::Skip,
         on_unsupported,
@@ -953,18 +954,21 @@ async fn resolve_maintained_indexes(
     Ok((names, OnUnsupportedIndex::Skip))
 }
 
-/// The writer's per-index settings, as the values plugins read.
-fn writer_overrides(config: &ShardWriterConfig) -> HashMap<String, Arc<dyn Any + Send + Sync>> {
-    config
-        .hnsw_params
-        .iter()
-        .map(|(name, params)| {
-            (
-                name.clone(),
-                Arc::new(params.clone()) as Arc<dyn Any + Send + Sync>,
-            )
-        })
-        .collect()
+/// The writer's per-index settings, as the values plugins read. Naming one
+/// index in both `hnsw_params` and `index_overrides` is an error.
+fn writer_overrides(
+    config: &ShardWriterConfig,
+) -> Result<HashMap<String, Arc<dyn Any + Send + Sync>>> {
+    let mut overrides = config.index_overrides.clone();
+    for (name, params) in &config.hnsw_params {
+        if overrides.contains_key(name) {
+            return Err(Error::invalid_input(format!(
+                "index '{name}' has both HNSW parameters and other writer settings"
+            )));
+        }
+        overrides.insert(name.clone(), Arc::new(params.clone()));
+    }
+    Ok(overrides)
 }
 
 /// Build the in-memory index specs for `index_names`.
@@ -1064,16 +1068,22 @@ async fn build_index_specs(
 
         // Not skipped under maintain-all: resolving reads the base index, and a
         // read that fails once must not drop the index for the writer's life.
-        let resolved = plugin
-            .resolve(&ResolveContext {
-                name: index_name,
-                dataset,
-                index_meta: &index_meta,
-                schema: &shard_schema,
-                columns: &columns,
-                overrides: overrides.get(index_name).map(|o| o.as_ref()),
-            })
-            .await?;
+        let ctx = ResolveContext::new(
+            index_name,
+            dataset,
+            &index_meta,
+            &shard_schema,
+            &columns,
+            overrides.get(index_name).map(|o| o.as_ref()),
+        );
+        let resolved = plugin.resolve(&ctx).await?;
+        if ctx.overrides_ignored() {
+            warn!(
+                index = index_name,
+                plugin = plugin.name(),
+                "writer settings for this index were ignored: its plugin reads none"
+            );
+        }
 
         let field_ids =
             match resolved.field_ids {
@@ -1207,6 +1217,7 @@ pub async fn validate_maintained_indexes_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::index::HnswParams;
     use super::super::scanner::SsTableCache;
     use super::*;
 
@@ -1218,6 +1229,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::inverted::DocumentGranularity;
     use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
@@ -2303,6 +2315,97 @@ mod tests {
         );
         let error = specs("nope", OnUnsupportedIndex::Reject).await.unwrap_err();
         assert!(error.to_string().contains("'nope'"), "{error}");
+    }
+
+    /// [`dataset_with_vector_index`] with a MemWAL that maintains every index.
+    async fn vector_table_maintaining_all(uri: &str) -> Dataset {
+        let mut dataset = dataset_with_vector_index(uri, DataType::Float32).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        dataset
+    }
+
+    /// Settings of a type the plugin does not read stop the writer from
+    /// opening; settings for a kind that reads none are ignored, and the index
+    /// is still maintained.
+    #[tokio::test]
+    async fn test_an_index_override_is_checked_only_by_a_plugin_that_reads_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dataset =
+            vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig::new(shard_id).with_index_override("vector_idx", 7u32);
+        let Err(error) = dataset.mem_wal_writer(shard_id, config).await else {
+            panic!("the writer must not open");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("vector_idx"), "{error}");
+
+        let config = ShardWriterConfig::new(shard_id).with_index_override("id_idx", 7u32);
+        let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
+        assert!(
+            writer
+                .maintained_index_names()
+                .await
+                .contains(&"id_idx".to_string())
+        );
+        writer.close().await.unwrap();
+    }
+
+    /// An index named in both `hnsw_params` and `index_overrides` is refused.
+    #[tokio::test]
+    async fn test_an_index_overridden_twice_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset = vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
+            .with_hnsw_params("vector_idx", HnswBuildParams::default())
+            .with_index_override("vector_idx", HnswBuildParams::default());
+        let Err(error) = dataset.mem_wal_writer(shard_id, config).await else {
+            panic!("the writer must not open");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("vector_idx"), "{error}");
+        assert!(error.to_string().contains("both"), "{error}");
+    }
+
+    /// HNSW settings given through `with_index_override` are the ones the index
+    /// is built with.
+    #[tokio::test]
+    async fn test_index_overrides_reach_the_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let dataset = dataset_with_vector_index(&uri, DataType::Float32).await;
+        let settings = HnswBuildParams::default().num_edges(7).ef_construction(33);
+        let config = ShardWriterConfig::new(Uuid::new_v4())
+            .with_index_override("vector_idx", settings.clone());
+        let specs = build_index_specs(
+            &dataset,
+            &["vector_idx".to_string()],
+            &writer_overrides(&config).unwrap(),
+            &MemIndexRegistry::default(),
+            OnMissingIndex::Reject,
+            OnUnsupportedIndex::Reject,
+        )
+        .await
+        .unwrap();
+        let params = specs[0].params::<HnswParams>().unwrap();
+        assert_eq!(params.build_params, settings);
     }
 
     /// A maintained set naming one index twice maintains it once.

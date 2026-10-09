@@ -11,6 +11,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -20,6 +21,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::registry::TrainingCriteria;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
@@ -126,15 +128,16 @@ impl MemIndexBuildContext<'_> {
     /// `params` as `P`, the type this plugin's own
     /// [`resolve`](MemIndexPlugin::resolve) returned.
     pub fn params<P: Any>(&self) -> Result<&P> {
-        (self.params as &dyn Any)
-            .downcast_ref::<P>()
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "index '{}' was built with params of an unexpected type",
-                    self.name
-                ))
-            })
+        downcast_params(self.name, self.params)
     }
+}
+
+fn downcast_params<'a, P: Any>(name: &str, params: &'a dyn MemIndexParams) -> Result<&'a P> {
+    (params as &dyn Any).downcast_ref::<P>().ok_or_else(|| {
+        Error::internal(format!(
+            "index '{name}' was built with params of an unexpected type"
+        ))
+    })
 }
 
 /// What an index needs to resolve its build params from the base table.
@@ -149,14 +152,53 @@ pub struct ResolveContext<'a> {
     pub schema: &'a LanceSchema,
     /// The base-table index's columns, as their full paths.
     pub columns: &'a [String],
-    /// The writer's settings for this index, if any.
-    pub overrides: Option<&'a (dyn Any + Send + Sync)>,
+    /// The writer's settings for this index, read through
+    /// [`Self::overrides`].
+    overrides: Option<&'a (dyn Any + Send + Sync)>,
+    /// Whether the plugin asked for `overrides`.
+    overrides_read: AtomicBool,
 }
 
-impl ResolveContext<'_> {
-    /// The writer's settings for this index, if they are a `P`.
-    pub fn overrides<P: Any>(&self) -> Option<&P> {
-        self.overrides?.downcast_ref::<P>()
+impl<'a> ResolveContext<'a> {
+    pub(crate) fn new(
+        name: &'a str,
+        dataset: &'a Dataset,
+        index_meta: &'a IndexMetadata,
+        schema: &'a LanceSchema,
+        columns: &'a [String],
+        overrides: Option<&'a (dyn Any + Send + Sync)>,
+    ) -> Self {
+        Self {
+            name,
+            dataset,
+            index_meta,
+            schema,
+            columns,
+            overrides,
+            overrides_read: AtomicBool::new(false),
+        }
+    }
+
+    /// The writer's settings for this index as `P`, or `Ok(None)` when the
+    /// writer gave none. Settings of another type are an error.
+    pub fn overrides<P: Any>(&self) -> Result<Option<&P>> {
+        self.overrides_read.store(true, Ordering::Relaxed);
+        let Some(overrides) = self.overrides else {
+            return Ok(None);
+        };
+        overrides.downcast_ref::<P>().map(Some).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "index '{}' was given writer settings of a type its plugin does not read; \
+                 it reads {}",
+                self.name,
+                std::any::type_name::<P>()
+            ))
+        })
+    }
+
+    /// Whether the writer gave settings the plugin never asked for.
+    pub(crate) fn overrides_ignored(&self) -> bool {
+        self.overrides.is_some() && !self.overrides_read.load(Ordering::Relaxed)
     }
 }
 
@@ -274,12 +316,12 @@ pub enum FlushOutcome {
     /// Write no index for this generation, such as a vector index whose
     /// vectors are all null.
     Skip,
-    /// Build the on-disk index from the generation's rows, with the index
-    /// type's default parameters. Scalar index types only.
+    /// Build the on-disk index from the generation's rows with
+    /// [`MemIndexPlugin::flush_params`]. Scalar index types only.
     BuildFromGeneration,
     /// Rows for the on-disk builder, in the shape
-    /// [`MemIndexPlugin::training_criteria`] declares, built with the index
-    /// type's default parameters. Scalar index types only.
+    /// [`MemIndexPlugin::training_criteria`] declares, built with
+    /// [`MemIndexPlugin::flush_params`]. Scalar index types only.
     TrainingData(SendableRecordBatchStream),
     /// The index wrote its own file into the generation; record this metadata.
     Wrote(Box<IndexMetadata>),
@@ -403,9 +445,26 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug + Any {
     /// The shape of the rows [`FlushOutcome::TrainingData`] carries.
     fn training_criteria(&self) -> TrainingCriteria;
 
+    /// The parameters for a [`FlushOutcome::BuildFromGeneration`] or
+    /// [`FlushOutcome::TrainingData`] build; an index returning
+    /// [`FlushOutcome::Wrote`] writes its own. Derive them from `spec.params`,
+    /// so a changed setting is a different index under
+    /// [`MemIndexSpec::same_index`]. Called when the writer opens, so an error
+    /// fails the open, not a flush. By default, the index type's default
+    /// parameters.
+    fn flush_params(&self, _spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::default())
+    }
+
     /// Resolve this index against the base table: the columns it covers and
     /// what it needs to build one. Runs each time a writer opens or refreshes
     /// its index set; do any I/O here so [`create`](Self::create) need not.
+    ///
+    /// A plugin that takes settings reads the writer's settings for this index
+    /// with [`ResolveContext::overrides`], checks them, and keeps them in the
+    /// params it returns, so they reach both [`create`](Self::create) and
+    /// [`flush_params`](Self::flush_params). Settings the plugin never reads
+    /// are ignored, with a warning. The default reads none.
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         Ok(ResolvedIndex::plain(ctx.columns.to_vec()))
     }
@@ -551,6 +610,12 @@ impl MemIndexSpec {
             && self.params.same_as(other.params.as_ref())
     }
 
+    /// `params` as `P`, the type its plugin's own
+    /// [`resolve`](MemIndexPlugin::resolve) returned.
+    pub fn params<P: Any>(&self) -> Result<&P> {
+        downcast_params(&self.name, self.params.as_ref())
+    }
+
     /// The context this spec's plugin validates and builds against.
     fn build_context<'a>(
         &'a self,
@@ -572,7 +637,11 @@ impl MemIndexSpec {
     /// Check that this spec's plugin can maintain it against `schema`.
     pub fn validate(&self, schema: &LanceSchema) -> Result<()> {
         check_column_count(&self.name, &self.columns, &self.field_ids)?;
-        self.plugin.validate(&self.build_context(schema, 0, 0))
+        self.plugin.validate(&self.build_context(schema, 0, 0))?;
+        if self.plugin.flush_index_type().is_scalar() {
+            self.plugin.flush_params(self)?;
+        }
+        Ok(())
     }
 
     /// Build the index this spec describes.

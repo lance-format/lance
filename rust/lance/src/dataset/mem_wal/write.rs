@@ -217,12 +217,23 @@ pub struct ShardWriterConfig {
     /// MemTable (and, on flush, the on-disk graph serialized from it). They are
     /// a property of the writer that builds the MemTable, not of the index
     /// definition: each SSTable is independent, so different writers
-    /// may use different parameters. An index without an entry uses the default
-    /// build parameters. `num_edges` is the HNSW graph degree (level 0 retains
+    /// may use different parameters. An index with no entry here or in
+    /// [`index_overrides`](Self::index_overrides) uses the default build
+    /// parameters. `num_edges` is the HNSW graph degree (level 0 retains
     /// `2 * num_edges`), equivalent to FAISS's `M`.
     ///
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
+
+    /// Settings for the plugin maintaining an index, by index name, as the
+    /// type the plugin reads through
+    /// [`ResolveContext::overrides`](super::index::ResolveContext::overrides).
+    /// Naming an index here and in [`hnsw_params`](Self::hnsw_params) is an
+    /// error. Each writer passes its own: these are not recorded as writer
+    /// defaults.
+    ///
+    /// Default: empty.
+    pub index_overrides: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
 
     /// The memtable index plugins this writer can maintain. Defaults to the
     /// kinds Lance builds in.
@@ -283,6 +294,7 @@ impl Default for ShardWriterConfig {
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
             hnsw_params: HashMap::new(),
+            index_overrides: HashMap::new(),
             mem_index_registry: MemIndexRegistry::default(),
             warmer: None,
             observer: None,
@@ -413,6 +425,18 @@ impl ShardWriterConfig {
     /// The plugins this writer maintains indexes with.
     pub fn with_mem_index_registry(mut self, registry: MemIndexRegistry) -> Self {
         self.mem_index_registry = registry;
+        self
+    }
+
+    /// Give the plugin maintaining `index_name` these settings, replacing any
+    /// given before.
+    pub fn with_index_override(
+        mut self,
+        index_name: impl Into<String>,
+        settings: impl std::any::Any + Send + Sync,
+    ) -> Self {
+        self.index_overrides
+            .insert(index_name.into(), Arc::new(settings));
         self
     }
 

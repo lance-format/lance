@@ -14,7 +14,6 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::{ShardManifest, SsTable};
-use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
@@ -836,7 +835,7 @@ async fn build_scalar_index(
         )));
     }
     let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
-    let params = ScalarIndexParams::default();
+    let params = spec.plugin.flush_params(spec)?;
     let mut builder =
         CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
     if let Some(stream) = training_data {
@@ -2203,5 +2202,47 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(ids, vec![0]);
+    }
+
+    /// A scalar build uses the plugin's flush parameters, whether the index
+    /// hands over its rows or asks the flush to read the generation.
+    #[rstest::rstest]
+    #[case::training_data(Deviation::None)]
+    #[case::build_from_generation(Deviation::AsksForABuild)]
+    #[tokio::test]
+    async fn a_scalar_build_uses_the_plugin_flush_params(#[case] deviation: Deviation) {
+        use crate::dataset::mem_wal::index::test_plugin::wrapped_with_flush_params;
+        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::btree::BTreeParameters;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        const ZONE_SIZE: u64 = 4;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree)
+            .with_params(&serde_json::json!({ "zone_size": ZONE_SIZE }));
+        let spec = wrapped_with_flush_params(
+            MemIndexSpec::btree("id_btree", 0, "id"),
+            deviation,
+            Some(params),
+        );
+        let (generation, _dir) =
+            flush_generation(spec, create_test_batch(&create_test_schema(), 10))
+                .await
+                .unwrap();
+
+        let indices = generation.load_indices().await.unwrap();
+        let built = indices
+            .iter()
+            .find(|index| index.name == "id_btree")
+            .expect("the flush built the index");
+        let derived = generation
+            .open_scalar_index("id", &built.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .derive_index_params()
+            .unwrap();
+        let derived: BTreeParameters =
+            serde_json::from_str(&derived.params.expect("B-tree parameters")).unwrap();
+        assert_eq!(derived.zone_size, Some(ZONE_SIZE));
     }
 }
