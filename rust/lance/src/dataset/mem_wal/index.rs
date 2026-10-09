@@ -36,7 +36,9 @@ use super::wal::WriterCursors;
 use pk::{OwnedPk, PkIndex};
 
 pub use btree::{BTreeMemIndex, BTreeMemIndexPlugin};
-pub use filter::{IndexedFilter, MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter};
+pub(crate) use filter::{
+    IndexedFilter, MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter,
+};
 pub use fts::{FtsEntry, FtsMemIndex, FtsMemIndexPlugin, FtsParams, FtsQueryExpr, SearchOptions};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats, search_cross_column};
 pub use hnsw::{HnswMemIndex, HnswMemIndexPlugin, HnswParams};
@@ -167,7 +169,7 @@ pub struct IndexStore {
     /// Sorted by name, so the same query always reaches the same index.
     indexes: BTreeMap<String, Arc<dyn MemIndex>>,
     /// How a filter expression reaches these indexes.
-    filter_catalog: Arc<MemIndexCatalog>,
+    filter_catalog: MemIndexCatalog,
     pk_index: Option<PkIndex>,
     /// Batches every index holds, as an exclusive count. Not a visibility
     /// bound: readers use [`Self::visible_count`].
@@ -257,11 +259,12 @@ impl IndexStore {
                 spec.build(schema, max_rows, max_batches)?,
             );
         }
-        store.filter_catalog = Arc::new(MemIndexCatalog::new(specs, schema));
+        store.filter_catalog = MemIndexCatalog::new(specs, schema);
         Ok(store)
     }
 
     /// Add a built index. Indexes are added before any row is inserted.
+    /// Filters reach only indexes built by [`Self::from_specs`].
     pub fn add_index(&mut self, name: String, index: Arc<dyn MemIndex>) {
         assert!(
             !self.has_rows.load(Ordering::Acquire),
@@ -423,7 +426,7 @@ impl IndexStore {
     }
 
     /// How a filter expression reaches these indexes.
-    pub fn filter_catalog(&self) -> &MemIndexCatalog {
+    pub(crate) fn filter_catalog(&self) -> &MemIndexCatalog {
         &self.filter_catalog
     }
 

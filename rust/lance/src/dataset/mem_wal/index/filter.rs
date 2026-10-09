@@ -38,20 +38,21 @@ pub struct MemIndexCatalog {
 }
 
 impl MemIndexCatalog {
-    /// The parsers of every spec whose plugin has one.
+    /// The parsers of every single-column spec whose plugin has one. A parsed
+    /// query names no column, so an index over several could not tell which
+    /// one it is about.
     pub fn new(specs: &[MemIndexSpec], schema: &LanceSchema) -> Self {
         let mut catalog = Self {
             columns: HashMap::new(),
             schema: Some(schema.clone()),
         };
         for spec in specs {
-            for column in &spec.columns {
-                if let Some(parser) = spec
+            if let [column] = spec.columns.as_slice()
+                && let Some(parser) = spec
                     .plugin
                     .query_parser(spec.name.clone(), spec.details.as_deref())
-                {
-                    catalog.add_parser(column, parser);
-                }
+            {
+                catalog.add_parser(column, parser);
             }
         }
         catalog
