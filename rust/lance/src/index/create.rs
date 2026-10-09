@@ -2220,10 +2220,16 @@ mod tests {
             RecordBatchIterator::new(sorted_batches.into_iter().map(Ok), train_schema);
 
         // Build one self-contained segment directly from the sorted reader.
+        // `preprocessed_data` declares the generic (row-id) shape most index
+        // types train from; BTree now trains from row addresses, so this
+        // goes through `preprocessed_stream` directly with that criteria.
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
             .name("id_btree".to_string())
-            .preprocessed_data(Box::new(sorted_reader))
+            .preprocessed_stream(
+                reader_to_stream(Box::new(sorted_reader)),
+                TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+            )
             .execute_uncommitted()
             .await
             .unwrap();

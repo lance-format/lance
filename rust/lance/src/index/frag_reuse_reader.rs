@@ -551,6 +551,9 @@ pub mod tests {
             .unwrap();
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let params = ScalarIndexParams::default();
+        // The scan above already produced row addresses (`with_row_address`),
+        // matching what BTree now trains from -- `preprocessed_data`'s
+        // generic (row-id) default criteria would not match this shape.
         let index = crate::index::create::CreateIndexBuilder::new(
             &mut dataset,
             &["i"],
@@ -558,7 +561,13 @@ pub mod tests {
             &params,
         )
         .name("i_idx".into())
-        .preprocessed_data(Box::new(reader))
+        .preprocessed_stream(
+            lance_datafusion::utils::reader_to_stream(Box::new(reader)),
+            lance_index::scalar::registry::TrainingCriteria::new(
+                lance_index::scalar::registry::TrainingOrdering::Values,
+            )
+            .with_row_addr(),
+        )
         .execute_uncommitted()
         .await
         .unwrap();

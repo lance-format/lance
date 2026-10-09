@@ -8872,12 +8872,17 @@ mod tests {
 
         // `create_index` sees no FRI at its own version, so its guard passes and
         // the transaction reaches the rebase.
+        //
+        // Bitmap, not BTree: BTree now always creates an address-domain
+        // segment on a stable-row-id dataset (safe alongside an FRI by
+        // construction), so it can no longer illustrate this race. Bitmap
+        // still stores row ids directly here.
         let err = concurrent
             .create_index(
                 &["id"],
-                IndexType::BTree,
+                IndexType::Bitmap,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
                 false,
             )
             .await
