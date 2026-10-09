@@ -50,6 +50,10 @@ fn entry_weight(key: &InternalCacheKey, size_bytes: usize, weight_unit: usize) -
 ///
 /// Nonzero capacities provide weighted eviction and concurrent-load deduplication.
 /// A zero capacity invokes each loader independently without caching.
+///
+/// Pinned entries keep the [`CacheBackend`] defaults: moka offers no way to
+/// skip an entry on eviction, so a leased entry is charged and evictable
+/// like any other, and its users re-admit it when they find it gone.
 pub struct MokaCacheBackend {
     cache: moka::future::Cache<InternalCacheKey, MokaCacheEntry>,
     capacity: usize,

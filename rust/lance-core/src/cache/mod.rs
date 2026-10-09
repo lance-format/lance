@@ -51,12 +51,13 @@ pub mod codec;
 mod entry_io;
 mod key;
 mod moka;
+pub mod pin;
 mod priority;
 mod quick;
-pub use priority::PriorityEntries;
+pub use priority::{PINNED_PRIORITY, PriorityEntries};
 mod registry;
 
-pub use backend::{CacheBackend, CacheEntry, CacheTier};
+pub use backend::{CacheBackend, CacheEntry, CacheTier, PinnedEntryLoader};
 pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, CacheRangeReader, MAGIC,
@@ -65,6 +66,10 @@ pub use codec::{
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 pub use moka::MokaCacheBackend;
+pub use pin::{
+    CacheLease, CachePin, PINNED_CAP_FRACTION, PinBudget, PinRecord, PinnedStats, PinnedValue,
+    pinned_partition_cap,
+};
 pub use quick::{QuickCacheBackend, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 
@@ -72,7 +77,7 @@ use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{
-    Arc, RwLock, Weak,
+    Arc, Mutex, RwLock, Weak,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -548,6 +553,161 @@ impl LanceCache {
         Ok((entry, was_cached))
     }
 
+    // -- Pinned entries -------------------------------------------------------
+
+    /// Get a RAM-only entry or load it, with a lease that keeps it resident
+    /// while held, on a backend that pins entries (see [`pin`]). A loaded
+    /// value is leased before it is admitted, so it enters the cache pinned;
+    /// a cached value, or one a concurrent caller loaded, is leased as found,
+    /// and admitted again if it left RAM before the lease. The boolean is
+    /// `true` when this call did not run the loader, as in
+    /// [`get_or_insert_with_key_hit`](Self::get_or_insert_with_key_hit).
+    pub async fn get_or_insert_leased_with_key<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<(Arc<K::ValueType>, CacheLease, bool)>
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<K::ValueType>> + Send,
+    {
+        let key = self.sized_key(&cache_key);
+        let state = self.state.clone();
+        let preleased: Arc<Mutex<Option<CacheLease>>> = Arc::default();
+        let loaded_lease = preleased.clone();
+        let typed_loader = Box::pin(async move {
+            let value = Arc::new(loader().await?);
+            let pin = value.cache_pin().clone();
+            *loaded_lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(CachePin::lease(&pin));
+            let size = state.entry_size(value.as_ref());
+            Ok((value as CacheEntry, size, pin))
+        });
+        let (entry, was_cached) = self
+            .state
+            .backend
+            .get_or_insert_pinned(&key, typed_loader)
+            .await?;
+        let value = entry.downcast::<K::ValueType>().map_err(|_| {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+            Error::io(format!(
+                "cache backend returned a value with the wrong concrete type for key type {:?}",
+                K::stable_type_id()
+            ))
+        })?;
+        if was_cached {
+            self.state.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        let preleased = preleased.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let lease = match preleased {
+            Some(lease) if Arc::ptr_eq(lease.pin(), value.cache_pin()) => lease,
+            _ => CachePin::lease(value.cache_pin()),
+        };
+        self.ensure_pinned(&key, || value.clone()).await;
+        Ok((value, lease, was_cached))
+    }
+
+    /// Lease an entry RAM holds, found as an access that refreshes its
+    /// recency: never reads a persistent tier and counts no hit or miss.
+    pub async fn get_resident_leased_with_key<K>(
+        &self,
+        cache_key: &K,
+    ) -> Option<(Arc<K::ValueType>, CacheLease)>
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        let value = self
+            .state
+            .backend
+            .get_leased(&key)
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()?;
+        let lease = CachePin::lease(value.cache_pin());
+        Some((value, lease))
+    }
+
+    /// Admit a RAM-only value that stays resident while its pin is leased;
+    /// see [`CacheBackend::insert_pinned`].
+    pub async fn insert_pinned_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>)
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        let size = self.state.entry_size(value.as_ref());
+        let pin = value.cache_pin().clone();
+        self.state
+            .backend
+            .insert_pinned(&key, value, size, &pin)
+            .await;
+    }
+
+    /// Admit the value `make` gives unless RAM holds an entry under the key,
+    /// as after an eviction, a clear or a refused admission. The check is an
+    /// access that refreshes the entry's recency, so a caller that leases
+    /// the entry keeps it through the next eviction pass. Returns whether it
+    /// admitted the value.
+    ///
+    /// The check and the admission are one
+    /// [`CacheBackend::get_or_insert_pinned`], so an entry a concurrent load
+    /// is admitting counts as held. A single-flight backend can hand the
+    /// loaded value to the load's waiters before the entry is in RAM, as
+    /// quick_cache's guard does; a RAM lookup there misses, and admitting the
+    /// value again would replace the load's entry with a second admission.
+    pub async fn ensure_pinned_with_key<K>(
+        &self,
+        cache_key: &K,
+        make: impl FnOnce() -> Arc<K::ValueType> + Send,
+    ) -> bool
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        self.ensure_pinned(&key, make).await
+    }
+
+    async fn ensure_pinned<V>(
+        &self,
+        key: &InternalCacheKey,
+        make: impl FnOnce() -> Arc<V> + Send,
+    ) -> bool
+    where
+        V: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+    {
+        let state = self.state.clone();
+        let admit = Box::pin(async move {
+            let value = make();
+            let size = state.entry_size(value.as_ref());
+            let pin = value.cache_pin().clone();
+            Ok((value as CacheEntry, size, pin))
+        });
+        match self.state.backend.get_or_insert_pinned(key, admit).await {
+            Ok((_, was_cached)) => !was_cached,
+            Err(error) => {
+                log::warn!("LanceCache: admitting a pinned entry failed: {error}");
+                false
+            }
+        }
+    }
+
+    /// Size of the largest entry the backend admits to RAM; see
+    /// [`CacheBackend::max_entry_bytes`].
+    pub fn max_entry_bytes(&self) -> Option<u64> {
+        self.state.backend.max_entry_bytes()
+    }
+
+    /// What the backend's pin budget holds; see [`CacheBackend::pinned_stats`].
+    pub fn pinned_stats(&self) -> PinnedStats {
+        self.state.backend.pinned_stats()
+    }
+
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
         K: UnsizedCacheKey,
@@ -806,6 +966,63 @@ impl WeakLanceCache {
             return;
         };
         cache.insert_unsized_with_key(cache_key, value).await;
+    }
+
+    /// [`LanceCache::get_or_insert_leased_with_key`], or `None` without
+    /// running the loader once the cache is dropped.
+    pub async fn get_or_insert_leased_with_key<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<Option<(Arc<K::ValueType>, CacheLease, bool)>>
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<K::ValueType>> + Send,
+    {
+        let Some(cache) = self.upgrade() else {
+            return Ok(None);
+        };
+        cache
+            .get_or_insert_leased_with_key(cache_key, loader)
+            .await
+            .map(Some)
+    }
+
+    /// [`LanceCache::get_resident_leased_with_key`]; a dropped cache holds nothing.
+    pub async fn get_resident_leased_with_key<K>(
+        &self,
+        cache_key: &K,
+    ) -> Option<(Arc<K::ValueType>, CacheLease)>
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?
+            .get_resident_leased_with_key(cache_key)
+            .await
+    }
+
+    /// [`LanceCache::ensure_pinned_with_key`]; a dropped cache admits nothing.
+    pub async fn ensure_pinned_with_key<K>(
+        &self,
+        cache_key: &K,
+        make: impl FnOnce() -> Arc<K::ValueType> + Send,
+    ) -> bool
+    where
+        K: CacheKey,
+        K::ValueType: PinnedValue + DeepSizeOf + Send + Sync + 'static,
+    {
+        match self.upgrade() {
+            Some(cache) => cache.ensure_pinned_with_key(cache_key, make).await,
+            None => false,
+        }
+    }
+
+    /// [`LanceCache::max_entry_bytes`]; a dropped cache sets no limit.
+    pub fn max_entry_bytes(&self) -> Option<u64> {
+        self.upgrade()?.max_entry_bytes()
     }
 
     fn upgrade(&self) -> Option<LanceCache> {
@@ -1220,6 +1437,210 @@ mod tests {
 
         drop(cache);
         assert!(weak.plane_admission_gated());
+    }
+
+    struct PinnedTestValue(Arc<CachePin>);
+
+    impl DeepSizeOf for PinnedTestValue {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            0
+        }
+    }
+
+    impl PinnedValue for PinnedTestValue {
+        fn cache_pin(&self) -> &Arc<CachePin> {
+            &self.0
+        }
+    }
+
+    struct PinnedTestKey(u64);
+
+    impl CacheKey for PinnedTestKey {
+        type ValueType = PinnedTestValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.0.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "test.PinnedValue"
+        }
+    }
+
+    /// A backend without pinning stores leased values like any entry:
+    /// charged, never pinned, and with no pin budget or entry limit. One
+    /// without a RAM lookup has nothing to lease without loading.
+    #[tokio::test]
+    async fn default_backend_ignores_pin() {
+        let hash_map = LanceCache::with_backend(Arc::new(HashMapBackend::default()));
+        let moka = TestBackendKind::Moka.cache(4096);
+        for (label, cache) in [("hash map", hash_map), ("moka", moka)] {
+            let (value, lease, hit) = cache
+                .get_or_insert_leased_with_key(PinnedTestKey(1), || async {
+                    Ok(PinnedTestValue(CachePin::new()))
+                })
+                .await
+                .unwrap();
+            assert!(!hit && !lease.is_pinned(), "{label}");
+            assert_eq!(value.0.holders(), 1, "{label}");
+            assert!(
+                cache.get_with_key(&PinnedTestKey(1)).await.is_some(),
+                "{label}"
+            );
+            assert_eq!(cache.pinned_stats(), PinnedStats::default(), "{label}");
+            assert_eq!(cache.max_entry_bytes(), None, "{label}");
+            let resident = cache
+                .get_resident_leased_with_key(&PinnedTestKey(1))
+                .await
+                .is_some();
+            assert_eq!(resident, label == "moka");
+        }
+    }
+
+    /// A RAM backend whose single-flight load hands the loaded value to the
+    /// callers that join it before admitting the entry, as quick_cache's
+    /// guard notifies its waiters before it takes the shard lock. The load
+    /// waits on `admit` in between, and counts its admissions and the
+    /// entries they replaced.
+    #[derive(Debug, Default)]
+    struct PublishFirstBackend {
+        resident: std::sync::Mutex<HashMap<InternalCacheKey, CacheEntry>>,
+        /// Loaded values handed out but not admitted yet.
+        published: std::sync::Mutex<HashMap<InternalCacheKey, CacheEntry>>,
+        loaded: tokio::sync::Notify,
+        admit: tokio::sync::Notify,
+        admissions: AtomicUsize,
+        replaced: AtomicUsize,
+    }
+
+    impl PublishFirstBackend {
+        fn admit_entry(&self, key: &InternalCacheKey, entry: CacheEntry) {
+            self.admissions.fetch_add(1, Ordering::SeqCst);
+            if self.resident.lock().unwrap().insert(*key, entry).is_some() {
+                self.replaced.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for PublishFirstBackend {
+        async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+            self.resident.lock().unwrap().get(key).cloned()
+        }
+
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            _codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            self.get_resident(key).await
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            _size_bytes: usize,
+            _codec: Option<CacheCodec>,
+        ) {
+            self.admit_entry(key, entry);
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            _codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            if let Some(entry) = self.get_resident(key).await {
+                return Ok((entry, true));
+            }
+            let (entry, _) = loader.await?;
+            self.admit_entry(key, entry.clone());
+            Ok((entry, false))
+        }
+
+        async fn insert_pinned(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            _size_bytes: usize,
+            _pin: &Arc<CachePin>,
+        ) {
+            self.admit_entry(key, entry);
+        }
+
+        async fn get_or_insert_pinned<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: PinnedEntryLoader<'a>,
+        ) -> Result<(CacheEntry, bool)> {
+            let held = self.get_resident(key).await;
+            if let Some(entry) = held.or_else(|| self.published.lock().unwrap().get(key).cloned()) {
+                return Ok((entry, true));
+            }
+            let (entry, _, _) = loader.await?;
+            self.published.lock().unwrap().insert(*key, entry.clone());
+            self.loaded.notify_one();
+            self.admit.notified().await;
+            self.admit_entry(key, entry.clone());
+            self.published.lock().unwrap().remove(key);
+            Ok((entry, false))
+        }
+
+        async fn clear(&self) {
+            self.resident.lock().unwrap().clear();
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.resident.lock().unwrap().len()
+        }
+
+        async fn size_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    /// A caller that joins a load whose value the backend handed out before
+    /// admitting it leases the value without admitting it again: the load's
+    /// admission is the only one and replaces nothing.
+    #[tokio::test]
+    async fn leased_join_of_an_admitting_load_admits_once() {
+        let backend = Arc::new(PublishFirstBackend::default());
+        let cache = LanceCache::with_backend(backend.clone());
+        let load = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_or_insert_leased_with_key(PinnedTestKey(1), || async {
+                        Ok(PinnedTestValue(CachePin::new()))
+                    })
+                    .await
+                    .unwrap()
+            }
+        });
+        backend.loaded.notified().await;
+        let (joined, joined_lease, joined_hit) = cache
+            .get_or_insert_leased_with_key(PinnedTestKey(1), || async {
+                Ok(PinnedTestValue(CachePin::new()))
+            })
+            .await
+            .unwrap();
+        backend.admit.notify_one();
+        let (loaded, lease, loaded_hit) = load.await.unwrap();
+
+        assert!(joined_hit && !loaded_hit);
+        assert!(Arc::ptr_eq(&joined, &loaded));
+        assert_eq!(backend.admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.replaced.load(Ordering::SeqCst), 0);
+        assert_eq!(loaded.0.holders(), 2);
+        drop((joined_lease, lease));
+        assert!(
+            !cache
+                .ensure_pinned_with_key(&PinnedTestKey(1), || panic!("admitted twice"))
+                .await
+        );
+        assert_eq!(backend.admissions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
