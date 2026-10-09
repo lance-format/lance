@@ -11,7 +11,9 @@ use crate::vector::bq::layered::{
 use crate::vector::bq::layered_stats;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
 use crate::vector::bq::plane_rows::{PACKED_COLUMNS, PlaneRowsSpec};
-use crate::vector::bq::resident::{ResidentColumnStore, ResidentLoadTrigger, is_resident};
+use crate::vector::bq::resident::{
+    ResidentColumnStore, ResidentLoadTrigger, ResidentRows, is_resident,
+};
 use crate::vector::bq::storage::{RQRowLayout, normalize_entry_codes};
 use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::{QuantizationMetadata, QuantizationType, QuantizerStorage};
@@ -62,9 +64,10 @@ use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
 pub use crate::vector::bq::resident::{
-    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentPreopen,
+    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentPreopen, ResidentStoreViews,
     resident_columns_bytes, resident_store_charge, resident_store_count, resident_store_is_live,
-    resident_store_leases, resident_store_preopen_lease,
+    resident_store_leases, resident_store_preopen_lease, resident_store_views,
+    shares_resident_store,
 };
 
 async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
@@ -1275,11 +1278,12 @@ fn resident_lifetime_from(value: Option<&str>) -> Result<ResidentLifetime> {
 /// resident (see [`RESIDENT_COLUMNS_ENV`]): `codes` (default) or `all`. With
 /// `codes`, a layered index's sign, high and low plane entries and a native
 /// flat index's partition entries ([`PartitionCodes`]) hold only the columns
-/// reads fetch from the file, and every read attaches copies of the resident
-/// rows, so the cache keeps no second copy of the row ids and factors. An
-/// index without a resident store keeps `all`, whatever the setting (see
-/// [`EntryColumns::resolve`]). Results are the same either way. Read once
-/// per process; resolved when an index opens.
+/// reads fetch from the file, and every read attaches the resident rows:
+/// views of the store for whole partitions and planes, copies for gathered
+/// rows (see [`ResidentAttach`]), so the cache keeps no second copy of
+/// the row ids and factors. An index without a resident store keeps `all`,
+/// whatever the setting (see [`EntryColumns::resolve`]). Results are the
+/// same either way. Read once per process; resolved when an index opens.
 pub const ENTRY_COLUMNS_ENV: &str = "LANCE_RQ_ENTRY_COLUMNS";
 
 /// The setting of [`ENTRY_COLUMNS_ENV`] when it is unset.
@@ -1307,6 +1311,41 @@ fn entry_columns_from(value: Option<&str>) -> Result<EntryColumns> {
         _ => Err(Error::invalid_input(format!(
             "{ENTRY_COLUMNS_ENV}={value:?} is invalid, expected codes or all"
         ))),
+    }
+}
+
+/// How a read of an IVF_RQ index with resident small columns attaches the
+/// store's rows to a batch of a whole partition or plane that is never
+/// cached: share (default) or copy. Gathered rows, whole reads that
+/// become cache entries, and partitions streamed out of the index to its
+/// caller are always copied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentAttach {
+    /// A whole partition or plane gets views of the store's buffers, each
+    /// of exactly its rows' bytes, so the read copies nothing and the batch
+    /// is charged what a copy is. A view keeps its store column's whole
+    /// allocation alive until it drops, so no view may reach a cache entry
+    /// or outlive the read that made it.
+    #[default]
+    Share,
+    /// Every attach copies the store's rows into buffers of their own, as
+    /// before the store was shared.
+    Copy,
+}
+
+impl ResidentAttach {
+    /// The mode's name in diagnostics: `share` or `copy`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Share => "share",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentAttach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1766,14 +1805,23 @@ fn sparse_read_extent(rows: &[u32], row_bytes: usize) -> (usize, usize) {
     (runs, pages)
 }
 
-/// The file rows of the partition rows `range`: all of them, or the sorted
-/// partition offsets `rows`.
-fn partition_file_rows(range: &std::ops::Range<usize>, rows: Option<&[u32]>) -> UInt64Array {
-    let start = range.start as u64;
-    match rows {
-        Some(rows) => UInt64Array::from_iter_values(rows.iter().map(|&row| start + u64::from(row))),
-        None => UInt64Array::from_iter_values(start..range.end as u64),
-    }
+/// `batch` as the cache entry of a plane. An entry holds buffers of its own:
+/// one viewing the resident store would keep the store column's whole
+/// allocation alive from the cache, charged its rows alone, so every loader
+/// of a plane entry checks it in debug builds.
+fn plane_cache_entry(batch: RecordBatch) -> PlaneBatch {
+    debug_assert!(
+        !shares_resident_store(&batch),
+        "a plane cache entry holds memory of a resident store"
+    );
+    PlaneBatch(batch)
+}
+
+/// The file rows of the sorted offsets `rows` of a partition whose rows
+/// start at file row `start`.
+fn partition_file_rows(start: usize, rows: &[u32]) -> UInt64Array {
+    let start = start as u64;
+    UInt64Array::from_iter_values(rows.iter().map(|&row| start + u64::from(row)))
 }
 
 /// How stage-2 survivors index a [`GatheredEx`]'s batches.
@@ -1847,6 +1895,8 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     /// What the index asks its cache entries to hold; see
     /// [`Self::entry_columns`].
     entry_columns: EntryColumns,
+    /// See [`Self::resident_attach`].
+    resident_attach: ResidentAttach,
     /// The file's metadata with its sign codes marked packed, which
     /// storages built from code-only entries take, built on first use; `None`
     /// when the file stores them packed. See [`Self::entry_metadata`].
@@ -1963,6 +2013,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             resident_columns: ResidentColumns::default(),
             resident_columns_enabled: false,
             entry_columns: EntryColumns::default(),
+            resident_attach: ResidentAttach::default(),
             packed_metadata: OnceLock::new(),
             attach_schemas: AttachSchemas::default(),
             index_file: None,
@@ -2050,6 +2101,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             resident_columns: ResidentColumns::default(),
             resident_columns_enabled: false,
             entry_columns: EntryColumns::default(),
+            resident_attach: ResidentAttach::default(),
             packed_metadata: OnceLock::new(),
             attach_schemas: AttachSchemas::default(),
             index_file: None,
@@ -2191,6 +2243,24 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// read of a code-only entry needs; [`EntryColumns::All`] otherwise.
     pub fn entry_columns(&self) -> EntryColumns {
         self.entry_columns.resolve(self.resident_columns_enabled)
+    }
+
+    /// Attach the resident rows to the batches of whole partitions and
+    /// planes that reads build and never cache as `resident_attach`; see
+    /// [`Self::resident_attach`]. This lets tests compare both ownership modes.
+    pub fn with_resident_attach(mut self, resident_attach: ResidentAttach) -> Self {
+        self.resident_attach = resident_attach;
+        self
+    }
+
+    /// How reads attach the resident rows to a batch of a whole partition
+    /// or plane that is never cached: views of the store
+    /// ([`ResidentAttach::Share`]) unless the index set
+    /// [`ResidentAttach::Copy`] with [`Self::with_resident_attach`].
+    /// Gathered rows, whole reads that become cache entries, and partitions
+    /// streamed out of the index are always copied.
+    pub fn resident_attach(&self) -> ResidentAttach {
+        self.resident_attach
     }
 
     /// The cache key of plane `plane` of `partition` under this storage's
@@ -2496,16 +2566,22 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// The storage of native partition `part_id` built from `codes`, its
-    /// code-only entry: the columns the resident store keeps are copies of
-    /// its rows, the others the entry's, in the order a storage built from
-    /// a read of the file holds them, so the storage is that one, bit for
-    /// bit and byte for byte. The index loaded the store when it opened; a
-    /// storage built outside an index open loads it on its first build, as a
-    /// fallback, and adds the load's I/O to `load_stats`.
+    /// code-only entry: the columns the resident store keeps are the store's
+    /// rows, attached as `attach` says, the others the entry's, in the order
+    /// a storage built from a read of the file holds them, so the storage is
+    /// that one, bit for bit and byte for byte. A read's own storage takes
+    /// [`Self::resident_attach`] (views of the store by default); one handed
+    /// out of the index, which may outlive the index and its lease on the
+    /// store, takes [`ResidentAttach::Copy`]. The storage is built for one
+    /// read and never cached: views of the store must not reach the cache.
+    /// The index loaded the store when it opened; a storage built outside an
+    /// index open loads it on its first build, as a fallback, and adds the
+    /// load's I/O to `load_stats`. Counted in `code_only_partition_builds`.
     pub async fn partition_from_codes(
         &self,
         part_id: usize,
         codes: &PartitionCodes,
+        attach: ResidentAttach,
         load_stats: Option<&IoStats>,
     ) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
@@ -2524,46 +2600,63 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .partition
             .get_or_init(|| self.partition_schema(&entry.schema()))
             .clone();
-        let batch = if range.is_empty() {
-            // As a read of no rows, which loads no store.
-            RecordBatch::new_empty(schema)
+        // As a read of no rows, which loads no store.
+        let store = if range.is_empty() {
+            None
         } else {
-            let store = self
-                .resident_store(&schema, load_stats)
-                .await?
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "the code-only entry of partition {part_id} needs the resident store"
-                    ))
-                })?;
-            store.attach(schema, Some(entry), &partition_file_rows(&range, None))?
+            let store = self.resident_store(&schema, load_stats).await?;
+            Some(store.ok_or_else(|| {
+                Error::internal(format!(
+                    "the code-only entry of partition {part_id} needs the resident store"
+                ))
+            })?)
         };
-        Q::Storage::try_from_batch_with_remapper(
+        // The build alone, without a fallback load of the store.
+        let started = Instant::now();
+        let batch = match store {
+            None => RecordBatch::new_empty(schema),
+            Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
+        };
+        let storage = Q::Storage::try_from_batch_with_remapper(
             batch,
             self.entry_metadata()?,
             self.distance_type,
             self.frag_reuse_index.clone(),
-        )
+        )?;
+        let stats = layered_stats::counters();
+        stats.code_only_partition_builds.incr();
+        stats.code_only_partition_build_ns.add_elapsed(started);
+        Ok(storage)
     }
 
     /// The storage of native partition `part_id` read through its code-only
     /// entry in `cache` ([`PartitionCodesKey`]), loaded from the file on a
     /// miss and admitted when `write_cache`, and whether the entry was a hit.
-    /// Every read attaches the resident columns ([`Self::partition_from_codes`]),
-    /// which the index loaded when it opened, so a hit reads nothing from the
-    /// file.
+    /// Every read attaches the resident columns as `attach` says
+    /// ([`Self::partition_from_codes`]); the index loaded them when it
+    /// opened, so a hit reads nothing from the file. The entry holds the
+    /// codes alone; the storage, which views the store's rows under
+    /// [`ResidentAttach::Share`], is built for this read and never cached.
     pub async fn load_partition_cached(
         &self,
         part_id: usize,
         cache: &WeakLanceCache,
         write_cache: bool,
+        attach: ResidentAttach,
         io_stats: Option<IoStats>,
     ) -> Result<(Q::Storage, bool)> {
         let key = PartitionCodesKey { partition: part_id };
         let (codes, hit) = if write_cache {
             cache
                 .get_or_insert_with_key_hit(key, || async {
-                    self.read_partition_codes(part_id, io_stats.as_ref()).await
+                    let codes = self
+                        .read_partition_codes(part_id, io_stats.as_ref())
+                        .await?;
+                    debug_assert!(
+                        !shares_resident_store(&codes.0),
+                        "a code-only partition entry holds memory of a resident store"
+                    );
+                    Ok(codes)
                 })
                 .await?
         } else if let Some(codes) = cache.get_with_key(&key).await {
@@ -2575,7 +2668,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             (Arc::new(codes), false)
         };
         let storage = self
-            .partition_from_codes(part_id, &codes, io_stats.as_ref())
+            .partition_from_codes(part_id, &codes, attach, io_stats.as_ref())
             .await?;
         Ok((storage, hit))
     }
@@ -2599,7 +2692,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 for &plane in &planes {
                     cache
                         .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                            Ok(PlaneBatch(
+                            Ok(plane_cache_entry(
                                 self.read_plane_entry(part_id, plane, None).await?,
                             ))
                         })
@@ -2620,7 +2713,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 }
                 cache
                     .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                        Ok(PlaneBatch(
+                        Ok(plane_cache_entry(
                             self.read_plane_entry(part_id, plane, None).await?,
                         ))
                     })
@@ -2738,7 +2831,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         if !cache.plane_admission_gated() {
             return cache
                 .get_or_insert_with_key(key, || async {
-                    Ok(PlaneBatch(
+                    Ok(plane_cache_entry(
                         self.read_plane_entry(part_id, plane, io_stats.clone())
                             .await?,
                     ))
@@ -2753,7 +2846,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let batch = if sign_resident {
             cache
                 .get_or_insert_with_key_hit(key, || async {
-                    Ok(PlaneBatch(
+                    Ok(plane_cache_entry(
                         self.read_plane_entry(part_id, plane, io_stats.clone())
                             .await?,
                     ))
@@ -2867,12 +2960,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Plane `plane` of partition `part_id` at the sorted partition offsets
     /// `rows` (every row when `None`), assembled from `entry`, a cache entry
     /// of the plane at those rows. A full entry is the plane. A code-only
-    /// entry ([`EntryColumns::Codes`]) gets copies of the resident store's
-    /// rows at the rows' file offsets, in the plane's column order, so the
-    /// batch is the one, bit for bit and byte for byte, that a read of the
-    /// file returns (see [`Self::read_plane`]). The index loaded the store
-    /// when it opened; a storage built outside an index open loads it on its
-    /// first attach, as a fallback, and adds the load's I/O to `load_stats`.
+    /// entry ([`EntryColumns::Codes`]) gets the resident store's rows at the
+    /// rows' file offsets, in the plane's column order, so the batch is the
+    /// one, bit for bit and byte for byte, that a read of the file returns
+    /// (see [`Self::read_plane`]): a whole plane as [`Self::resident_attach`]
+    /// says (views of the store by default), selected rows as copies. The
+    /// batch is for this read alone and must never be cached, since a view
+    /// keeps its store column's whole allocation alive. The index loaded the
+    /// store when it opened; a storage built outside an index open loads it
+    /// on its first attach, as a fallback, and adds the load's I/O to
+    /// `load_stats`.
     pub async fn attach_resident(
         &self,
         part_id: usize,
@@ -2902,8 +2999,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             // entry.
             return Ok(entry.clone());
         };
+        let file_rows = rows.map(|rows| partition_file_rows(range.start, rows));
+        let rows = match &file_rows {
+            Some(file_rows) => ResidentRows::Rows(file_rows),
+            None => ResidentRows::Range(range),
+        };
         store
-            .attach(schema, Some(entry), &partition_file_rows(&range, rows))
+            .attach(schema, Some(entry), rows, self.resident_attach)
             .map_err(|error| {
                 Error::internal(format!(
                     "attaching the resident columns of partition {part_id} plane {plane}: {error}"
@@ -3313,7 +3415,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     if promote {
                         cache
                             .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                                Ok(PlaneBatch(
+                                Ok(plane_cache_entry(
                                     self.read_plane_entry(part_id, plane, io_stats.clone())
                                         .await?,
                                 ))
@@ -3566,7 +3668,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// either every row or the sorted partition offsets `rows`, as `params`
     /// selects them. Columns `store` keeps are copies of its rows, and only
     /// the others are read from the file, through `reader`, so the batch is
-    /// the one a read of every column from the file returns.
+    /// the one a read of every column from the file returns. Whole reads
+    /// become cache entries (plane entries holding every column, and
+    /// partition entries), so they copy too: a view of the store would keep
+    /// its whole column alive from the cache.
     async fn read_with_resident_columns(
         &self,
         store: &ResidentColumnStore,
@@ -3615,11 +3720,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 concat_batches(&file_schema, batches.iter())?
             })
         };
-        store.attach(
-            schema,
-            file_batch.as_ref(),
-            &partition_file_rows(&range, rows),
-        )
+        let file_rows = rows.map(|rows| partition_file_rows(range.start, rows));
+        let rows = match &file_rows {
+            Some(file_rows) => ResidentRows::Rows(file_rows),
+            None => ResidentRows::Range(range),
+        };
+        // Always copied: a whole read becomes a plane entry or a partition
+        // entry (`IVFPartitionKey`), which must not hold views of the store.
+        store.attach(schema, file_batch.as_ref(), rows, ResidentAttach::Copy)
     }
 
     /// `columns` of the file at every row of the partition rows `range`,
