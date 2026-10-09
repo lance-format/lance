@@ -1657,6 +1657,8 @@ impl MergeInsertJob {
             .enumerate()
             .filter_map(|(idx, field)| (!on.contains(field.name())).then_some(idx))
             .collect();
+        // Every group has the same projected schema. Deletions and fragment
+        // coverage change its rows, not whether it carries columns to write.
         let has_updated_columns = update_projection.iter().any(|&idx| {
             let name = source_schema.field(idx).name();
             name != ROW_ADDR && name != ROW_ID
@@ -1829,6 +1831,9 @@ impl MergeInsertJob {
                             &spilled_lineage,
                         )?;
                     }
+                    // Keep the matched fragments in the conflict read set even
+                    // without stable row ids: a concurrent rewrite of their
+                    // physical addresses must cause the merge to retry.
                     patched
                         .fragments
                         .lock()
@@ -6928,6 +6933,12 @@ mod tests {
 
     mod subcols {
         use super::*;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::dataset::rowids::{
+            INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+        };
+        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+        use lance_table::format::RowDatasetVersionMeta;
         use rstest::rstest;
 
         struct Fixtures {
@@ -8663,6 +8674,381 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum ConcurrentWrite {
+            Compaction,
+            ColumnRewrite,
+            IndexBuild,
+        }
+
+        #[rstest]
+        #[case::compaction(ConcurrentWrite::Compaction)]
+        #[case::column_rewrite(ConcurrentWrite::ColumnRewrite)]
+        #[case::index_build(ConcurrentWrite::IndexBuild)]
+        #[tokio::test]
+        async fn test_merge_insert_key_only_concurrent_write(
+            #[case] concurrent_write: ConcurrentWrite,
+            #[values(false, true)] stable_row_ids: bool,
+        ) {
+            let initial = record_batch!(
+                ("id", UInt32, [0, 1, 2, 3, 4, 5]),
+                ("value", UInt32, [10, 11, 12, 13, 14, 15]),
+                ("other", UInt32, [20, 21, 22, 23, 24, 25])
+            )
+            .unwrap();
+            let mut ds = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            ds.create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+            let source = record_batch!(("id", UInt32, [0, 4])).unwrap();
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["id".into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .commit_retries(0)
+                .try_build()
+                .unwrap();
+            let prepared = job
+                .clone()
+                .execute_uncommitted_batches(vec![source.clone()])
+                .await
+                .unwrap();
+            assert_eq!(prepared.stats.num_updated_rows, 2);
+            assert_eq!(prepared.stats.num_files_written, 0);
+            let Operation::Update {
+                updated_fragments,
+                fields_modified,
+                ..
+            } = &prepared.transaction.operation
+            else {
+                panic!("expected an in-place update");
+            };
+            assert!(fields_modified.is_empty());
+            assert_eq!(updated_fragments.len(), 2);
+            if !stable_row_ids {
+                assert_eq!(updated_fragments.as_slice(), ds.fragments().as_slice());
+            }
+
+            let mut other = ds.as_ref().clone();
+            match concurrent_write {
+                ConcurrentWrite::Compaction => {
+                    compact_files(
+                        &mut other,
+                        CompactionOptions {
+                            target_rows_per_fragment: 6,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(other.fragments().len(), 1);
+                }
+                ConcurrentWrite::ColumnRewrite => {
+                    let patch =
+                        record_batch!(("id", UInt32, [0]), ("value", UInt32, [99])).unwrap();
+                    let (patched, _) =
+                        MergeInsertBuilder::try_new(Arc::new(other), vec!["id".into()])
+                            .unwrap()
+                            .when_matched(WhenMatched::UpdateAll)
+                            .when_not_matched(WhenNotMatched::DoNothing)
+                            .write_mode(MergeInsertWriteMode::RewriteColumns)
+                            .try_build()
+                            .unwrap()
+                            .execute_batches(vec![patch])
+                            .await
+                            .unwrap();
+                    other = patched.as_ref().clone();
+                }
+                ConcurrentWrite::IndexBuild => {
+                    other
+                        .create_index(
+                            &["value"],
+                            IndexType::BTree,
+                            None,
+                            &ScalarIndexParams::default(),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let mut columns = vec!["id", "value", "other"];
+            if stable_row_ids {
+                columns.push(ROW_LAST_UPDATED_AT_VERSION);
+            }
+            let before = other
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let commit = CommitBuilder::new(Arc::new(other.clone()))
+                .with_max_retries(0)
+                .execute(prepared.transaction)
+                .await;
+            let merged = if matches!(concurrent_write, ConcurrentWrite::IndexBuild) {
+                commit.unwrap()
+            } else {
+                let error = commit.unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("preempted"), "{error}");
+                // Start from the stale handle again: the merge must replay on
+                // the latest fragments instead of resurrecting the old files.
+                let (merged, stats) = job.execute_batches(vec![source]).await.unwrap();
+                assert_eq!(stats.num_attempts, 2);
+                assert_eq!(stats.num_updated_rows, 2);
+                assert_eq!(stats.num_files_written, 0);
+                merged.as_ref().clone()
+            };
+            assert_eq!(merged.fragments().len(), other.fragments().len());
+            for (merged_fragment, current) in
+                merged.fragments().iter().zip(other.fragments().iter())
+            {
+                assert_eq!(merged_fragment.id, current.id);
+                assert_eq!(merged_fragment.files, current.files);
+                if !stable_row_ids {
+                    assert_eq!(merged_fragment, current);
+                }
+            }
+            let after = merged
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                before.project(&[0, 1, 2]).unwrap(),
+                after.project(&[0, 1, 2]).unwrap()
+            );
+            if stable_row_ids {
+                for row in 0..6 {
+                    assert_eq!(
+                        after[ROW_LAST_UPDATED_AT_VERSION]
+                            .as_primitive::<UInt64Type>()
+                            .value(row),
+                        if [0, 4].contains(&row) {
+                            merged.version().version
+                        } else {
+                            before[ROW_LAST_UPDATED_AT_VERSION]
+                                .as_primitive::<UInt64Type>()
+                                .value(row)
+                        }
+                    );
+                }
+            }
+            let live_fragments = merged
+                .fragments()
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<RoaringBitmap>();
+            let indices = merged.load_indices().await.unwrap();
+            let expected_indices = if matches!(concurrent_write, ConcurrentWrite::IndexBuild) {
+                vec!["id_idx", "value_idx"]
+            } else {
+                vec!["id_idx"]
+            };
+            for name in expected_indices {
+                let index = indices.iter().find(|index| index.name == name).unwrap();
+                assert_eq!(index.fragment_bitmap.as_ref(), Some(&live_fragments));
+            }
+            merged.validate().await.unwrap();
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_merge_insert_subcols_deleted_and_spilled_lineage(
+            #[values(false, true)] stable_row_ids: bool,
+            #[values(false, true)] key_only: bool,
+        ) {
+            let initial = record_batch!(
+                ("id", UInt32, [0, 1, 2, 3, 4, 5]),
+                ("value", UInt32, [10, 11, 12, 13, 14, 15]),
+                ("other", UInt32, [20, 21, 22, 23, 24, 25])
+            )
+            .unwrap();
+            let mut ds = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: if stable_row_ids { 1 } else { 3 },
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            if stable_row_ids {
+                ds.update_config([
+                    (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                    (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+                ])
+                .await
+                .unwrap();
+                compact_files(
+                    &mut ds,
+                    CompactionOptions {
+                        target_rows_per_fragment: 3,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(ds.fragments().len(), 2);
+                for fragment in ds.fragments().iter() {
+                    assert!(matches!(
+                        fragment.last_updated_at_version_meta,
+                        Some(RowDatasetVersionMeta::Column)
+                    ));
+                }
+            }
+            ds.create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            ds.delete("id = 1").await.unwrap();
+            assert!(
+                ds.fragments()
+                    .iter()
+                    .any(|fragment| fragment.deletion_file.is_some())
+            );
+            let mut columns = vec!["id", "value", "other"];
+            if stable_row_ids {
+                columns.extend([ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION]);
+            }
+            let before = ds
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let source = record_batch!(
+                ("id", UInt32, [0, 1, 2, 4]),
+                ("value", UInt32, [Some(100), Some(100), None, Some(100)])
+            )
+            .unwrap();
+            let source = if key_only {
+                source.project(&[0]).unwrap()
+            } else {
+                source
+            };
+            let (merged, stats) =
+                MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".into()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .try_build()
+                    .unwrap()
+                    .execute_batches(vec![source])
+                    .await
+                    .unwrap();
+            assert_eq!(stats.num_updated_rows, 3);
+            assert_eq!(stats.num_inserted_rows, 0);
+            assert_eq!(stats.num_deleted_rows, 0);
+            for (merged_fragment, original) in merged.fragments().iter().zip(ds.fragments().iter())
+            {
+                assert_eq!(merged_fragment.id, original.id);
+                assert_eq!(merged_fragment.deletion_file, original.deletion_file);
+                if key_only {
+                    assert_eq!(merged_fragment.files, original.files);
+                } else {
+                    assert_eq!(merged_fragment.files.len(), original.files.len() + 1);
+                    assert_eq!(merged_fragment.files.last().unwrap().fields.as_ref(), &[1]);
+                    assert_eq!(merged_fragment.files[0].fields[0], 0);
+                    assert_eq!(merged_fragment.files[0].fields[1], -2);
+                }
+            }
+            let after = merged
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                after["id"].as_primitive::<UInt32Type>().values().as_ref(),
+                &[0, 2, 3, 4, 5]
+            );
+            assert_eq!(&after[ROW_ID], &before[ROW_ID]);
+            assert_eq!(&after["other"], &before["other"]);
+            if stable_row_ids {
+                assert_eq!(
+                    &after[ROW_CREATED_AT_VERSION],
+                    &before[ROW_CREATED_AT_VERSION]
+                );
+            }
+            for (row, key) in [0, 2, 3, 4, 5].into_iter().enumerate() {
+                let matched = [0, 2, 4].contains(&key);
+                let values = after["value"].as_primitive::<UInt32Type>();
+                assert_eq!(values.is_null(row), !key_only && key == 2);
+                if !values.is_null(row) {
+                    assert_eq!(
+                        values.value(row),
+                        if !key_only && matched { 100 } else { key + 10 }
+                    );
+                }
+                if stable_row_ids {
+                    assert_eq!(
+                        after[ROW_LAST_UPDATED_AT_VERSION]
+                            .as_primitive::<UInt64Type>()
+                            .value(row),
+                        if matched {
+                            merged.version().version
+                        } else {
+                            before[ROW_LAST_UPDATED_AT_VERSION]
+                                .as_primitive::<UInt64Type>()
+                                .value(row)
+                        }
+                    );
+                }
+            }
+            assert!(
+                merged
+                    .scan()
+                    .filter("id = 4")
+                    .unwrap()
+                    .explain_plan(false)
+                    .await
+                    .unwrap()
+                    .contains("ScalarIndexQuery")
+            );
+            merged.validate().await.unwrap();
         }
 
         /// Fragments can carry the same column in different data-file layouts:
