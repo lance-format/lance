@@ -1013,7 +1013,6 @@ impl CommitHandler for AmbiguousCommitHandler {
 }
 
 /// One uncommitted scalar index segment per named fragment.
-#[cfg(test)]
 pub async fn stage_index_segments(
     dataset: &mut Dataset,
     column: &str,

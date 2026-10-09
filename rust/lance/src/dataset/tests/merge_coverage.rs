@@ -536,6 +536,16 @@ async fn test_btree_merge_drops_a_fragment_updated_in_place_since_the_compaction
         .await
         .unwrap();
     assert_eq!(ids_matching(&dataset, "age = 999").await.len(), 1);
+    assert_eq!(ids_matching(&dataset, "age = 0").await, Vec::<i32>::new());
+    let covered = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "age_staged")
+        .map(|index| index.fragment_bitmap.clone().unwrap())
+        .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+    assert!(!covered.contains(rewritten as u32));
 }
 
 /// An overlay on the compaction's output drops coverage (BTree).
@@ -861,9 +871,10 @@ impl Workload {
         *rng % bound
     }
 
-    fn draw(&self, len: usize) -> Vec<Op> {
+    /// `len` operations, with compactions only if `compact`.
+    fn draw(&self, len: usize, compact: bool) -> Vec<Op> {
         use Op::*;
-        let kinds = [
+        let all = [
             Append,
             Delete,
             UpdateInPlace,
@@ -874,6 +885,10 @@ impl Workload {
             AddColumn,
             Config,
         ];
+        let kinds = all
+            .into_iter()
+            .filter(|op| compact || !matches!(op, Compact | CompactFoldingOverlays))
+            .collect::<Vec<_>>();
         (0..len)
             .map(|_| kinds[self.next(kinds.len() as u64) as usize])
             .collect()
@@ -1089,8 +1104,7 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
 
 /// A group compacted while an overlay lands on a fragment outside it: only the
 /// overlaid fragment is left out of the merged coverage, and lookups stay
-/// right. Before, the merge stamped the index current over the overlaid
-/// fragment, so the overlay no longer masked its stale entry.
+/// right even though the merged index is stamped current, past the overlay.
 #[tokio::test]
 async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
     let dir = TempStrDir::default();
@@ -1147,17 +1161,18 @@ async fn merge_under_workload(seed: u64) -> u64 {
     };
 
     let mut staged = stage_val(&dataset, (0..6).collect()).await;
-    let before = workload.draw(3);
+    // No compaction yet, so the second batch is staged at a later version.
+    let before = workload.draw(3, false);
     let dataset = Box::pin(workload.run(dataset, &before)).await;
     let later = fragment_ids(&dataset)
         .into_iter()
         .filter(|id| (6..12).contains(id))
         .collect::<Vec<_>>();
     staged.extend(stage_val(&dataset, later).await);
-    let between = workload.draw(3);
+    let between = workload.draw(3, true);
     let dataset = Box::pin(workload.run(dataset, &between)).await;
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-    let racing = workload.draw(workload.next(3) as usize);
+    let racing = workload.draw(workload.next(3) as usize, true);
     let mut dataset = Box::pin(workload.run(dataset, &racing)).await;
     dataset
         .commit_existing_index_segments("val_idx", "val", vec![merged])
@@ -1194,4 +1209,232 @@ async fn test_merged_index_matches_a_scan_under_a_workload() {
         covered += Box::pin(merge_under_workload(seed)).await;
     }
     assert!(covered >= 16, "only {covered} fragments stayed covered");
+}
+
+/// The fragment that holds the row with `id`.
+async fn fragment_of(dataset: &Dataset, id: i32) -> u32 {
+    let mut scan = dataset.scan();
+    scan.filter(&format!("id = {id}"))
+        .unwrap()
+        .with_row_address()
+        .project(&["id"])
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    (batch[lance_core::ROW_ADDR]
+        .as_primitive::<arrow_array::types::UInt64Type>()
+        .value(0)
+        >> 32) as u32
+}
+
+async fn clean_up(dataset: &Dataset, versions: Vec<u64>) {
+    let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+        .versions(versions)
+        .unwrap()
+        .build();
+    dataset.cleanup_with_policy(policy).await.unwrap();
+}
+
+/// Segments staged at two versions, one of which is cleaned up before the
+/// merge: only the group staged at the lost version is left out, and the merge
+/// and its commit go through.
+#[tokio::test]
+async fn test_btree_merge_leaves_out_only_a_group_whose_build_version_is_gone() {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 4).await;
+    let lost = dataset.manifest.version;
+    let mut staged = stage_val(&dataset, vec![0, 1]).await;
+    dataset.update_config([("next", "batch")]).await.unwrap();
+    staged.extend(stage_val(&dataset, vec![2, 3]).await);
+    let options = CompactionOptions {
+        target_rows_per_fragment: (2 * ROWS) as usize,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+    clean_up(&dataset, vec![lost]).await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([fragment_of(&dataset, 12).await])
+    );
+}
+
+/// Rewriting a column the index does not cover, even one stored in the same
+/// file as the indexed column, keeps the coverage.
+#[tokio::test]
+async fn test_btree_merge_keeps_a_fragment_whose_other_column_was_rewritten() {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 2).await;
+    let staged = stage_val(&dataset, vec![0, 1]).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: (2 * ROWS) as usize,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+    let patch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("spare", DataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(Int32Array::from(vec![7])),
+        ],
+    )
+    .unwrap();
+    let schema = patch.schema();
+    let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+    merge
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns);
+    let (dataset, _) = merge
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+        .await
+        .unwrap();
+    let mut dataset = Arc::unwrap_or_clone(dataset);
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+
+    assert_val_lookups_match_scan(&dataset, (0..12).map(|id| id * 10), "").await;
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        fragment_ids(&dataset)
+            .into_iter()
+            .collect::<RoaringBitmap>()
+    );
+}
+
+/// An index on `s.x`, where `s` is a packed struct: rewriting `s` in place on
+/// the compaction's output rewrites one physical column for the parent, and
+/// that fragment is left out of the merged coverage.
+#[tokio::test]
+async fn test_btree_merge_leaves_out_a_rewritten_packed_parent() {
+    use arrow_array::StructArray;
+    use arrow_schema::Fields;
+    use lance_encoding::constants::PACKED_STRUCT_META_KEY;
+
+    let children = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
+    let mut packed = ArrowField::new("s", DataType::Struct(children.clone()), false);
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("spare", DataType::Int32, false),
+        packed.clone(),
+    ]));
+    let ids = Arc::new(Int32Array::from_iter_values(0..12)) as ArrayRef;
+    let xs = Arc::new(StructArray::new(children.clone(), vec![ids.clone()], None)) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids.clone(), ids, xs]).unwrap();
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: ROWS as usize,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let staged = crate::utils::test::stage_index_segments(
+        &mut dataset.clone(),
+        "s.x",
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+        "x_idx",
+        vec![0, 1],
+    )
+    .await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: (2 * ROWS) as usize,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+    let patch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            packed,
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+            Arc::new(StructArray::new(
+                children,
+                vec![Arc::new(Int32Array::from(vec![333])) as ArrayRef],
+                None,
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![patch])
+        .await
+        .unwrap();
+    dataset.checkout_latest().await.unwrap();
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    dataset
+        .commit_existing_index_segments("x_idx", "s.x", vec![merged])
+        .await
+        .unwrap();
+
+    for (filter, expected) in [("s.x = 333", 1), ("s.x = 3", 0)] {
+        let mut scan = dataset.scan();
+        scan.filter(filter).unwrap().use_scalar_index(false);
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), expected);
+        assert_eq!(
+            dataset.count_rows(Some(filter.into())).await.unwrap(),
+            expected,
+            "{filter} through the index"
+        );
+    }
+}
+
+/// RTree segments whose build version was cleaned up merge into an index that
+/// covers nothing rather than failing the merge.
+#[cfg(feature = "geo")]
+#[tokio::test]
+async fn test_rtree_merge_covers_nothing_once_its_build_version_is_gone() {
+    let dir = TempStrDir::default();
+    let (mut dataset, params) =
+        geo::dataset_with_committed_rtree_index(dir.as_str(), RTREE_ROWS_PER_FRAGMENT, 2).await;
+    let built = dataset.manifest.version;
+    let sources = fragment_ids(&dataset);
+    let staged = geo::stage_rtree_segments(&mut dataset, &params, sources).await;
+    rtree_compact(&mut dataset, 2).await;
+    clean_up(&dataset, vec![built]).await;
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    assert!(merged.fragment_bitmap.as_ref().unwrap().is_empty());
 }
