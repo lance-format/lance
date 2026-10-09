@@ -59,6 +59,9 @@ use crate::dataset::{
     write_manifest_file,
 };
 use crate::index::DatasetIndexInternalExt;
+use crate::index::frag_reuse_with_stable_row_ids::history::{
+    ReadSnapshot, validate_frag_reuse_history,
+};
 use crate::index::vector::details::infer_missing_vector_details;
 use crate::index::{index_is_usable, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -1359,6 +1362,24 @@ pub(crate) async fn do_commit_detached_transaction(
             manifest.version,
         )?;
 
+        // Checked against the manifest the detached one is built on, which need
+        // not be the transaction's read version.
+        if let Err(error) = validate_frag_reuse_history(
+            &transaction.operation,
+            dataset,
+            ReadSnapshot::Version {
+                base: dataset,
+                version: transaction.read_version,
+            },
+            &manifest,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            return Err(error);
+        }
+
         // Try to commit the manifest
         let result = write_manifest_file(
             object_store,
@@ -1681,7 +1702,8 @@ pub(crate) async fn commit_transaction(
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
     // covering every fragment live here holds every row compaction had copied
-    // in by then.
+    // in by then. Fragment reuse history refusals are classified against it,
+    // never against a rebased read version.
     //
     // The Arc is kept rather than cloned out: `load_all_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
@@ -1849,6 +1871,24 @@ pub(crate) async fn commit_transaction(
             &recovered_coverage,
             target_version,
         )?;
+
+        // Before the write, so a refusal is final rather than a commit outcome
+        // to verify. Every attempt checks against the manifest it replaces.
+        if let Err(error) = validate_frag_reuse_history(
+            &transaction.operation,
+            &dataset,
+            ReadSnapshot::Loaded {
+                dataset: &read_version_dataset,
+                indices: read_version_indices.as_slice(),
+            },
+            &manifest,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            return Err(error);
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(

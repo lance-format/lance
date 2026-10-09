@@ -64,13 +64,43 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
+/// The key caches hold a v0 history, and everything decoded through it, under.
+///
+/// Not the entry's UUID: a writer can publish different moves under a UUID the
+/// table used before. This hashes what the history is read from, the encoded
+/// details and the base an external file resolves through; published files are
+/// never rewritten, so one identity always decodes to the same moves.
+pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
+    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lance.frag_reuse.v0_cache_identity");
+    hasher.update(entry.uuid.as_bytes());
+    if let Some(base_id) = entry.base_id {
+        hasher.update(&base_id.to_le_bytes());
+        if let Some(base) = dataset.manifest.base_paths.get(&base_id) {
+            hasher.update(&[u8::from(base.is_dataset_root)]);
+            update_sized(&mut hasher, base.path.as_bytes());
+        }
+    }
+    if let Some(details) = &entry.index_details {
+        update_sized(&mut hasher, details.type_url.as_bytes());
+        update_sized(&mut hasher, &details.value);
+    }
+    let mut identity = [0; 16];
+    identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(identity)
+}
+
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the FRI entry's UUID
-/// identify cached content. Under a tagged history the FRI UUID is
-/// deliberately left out: every rewrite and trim mints a new one, even for
-/// transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history, by its
+/// [`v0_cache_identity`], identify cached content. Under a tagged history the
+/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
+/// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
@@ -473,7 +503,8 @@ pub(crate) async fn plan_staged_segments(
     Ok(Some(plans))
 }
 
-/// Resolve the FRI remapper shared by scalar and vector index loading.
+/// Resolve the FRI remapper shared by scalar and vector index loading, with
+/// its cache identity: [`v0_cache_identity`] for v0, the UUID for tagged.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -510,7 +541,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
     if fri.index_version == 0 {
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
-                legacy.uuid,
+                v0_cache_identity(dataset, fri),
                 ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
             )
         }));
@@ -1526,11 +1557,8 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     transitions: &[pb_fri::Transition],
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
-    // The spec excludes tagged histories on stable-row-id tables: the FRI is
-    // address-based, and under stable row ids a rewrite's rows keep their
-    // ids, so there is no address translation to record. The planner blocks
-    // the deferred-compaction combination already; this covers a hand-built
-    // rewrite committed directly.
+    // Deferred compaction records v0 entries on stable-row-id tables, so only a
+    // hand-built tagged rewrite committed directly reaches this.
     if dataset.manifest.uses_stable_row_ids() {
         return Err(Error::not_supported(
             "Tagged fragment reuse histories are address-based and excluded on \

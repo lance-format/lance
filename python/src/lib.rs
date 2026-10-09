@@ -332,6 +332,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
+    m.add_wrapped(wrap_pyfunction!(frag_reuse_with_stable_row_ids_enabled))?;
     m.add_wrapped(wrap_pyfunction!(schema::parse_field_path))?;
     m.add_wrapped(wrap_pyfunction!(schema::format_field_path))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
@@ -401,6 +402,13 @@ pub fn simd_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
 #[pyfunction(name = "bytes_read_counter")]
 fn bytes_read_counter() -> PyResult<u64> {
     Ok(::lance::io::bytes_read_counter())
+}
+
+/// Not `cfg!(debug_assertions)`: the CI profile disables them for lance-table
+/// but not for this crate.
+#[pyfunction(name = "_frag_reuse_with_stable_row_ids_enabled")]
+fn frag_reuse_with_stable_row_ids_enabled() -> bool {
+    lance_table::feature_flags::frag_reuse_with_stable_row_ids_enabled()
 }
 
 #[pyfunction(name = "_schema_to_json")]

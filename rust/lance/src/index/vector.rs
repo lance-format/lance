@@ -1822,7 +1822,7 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let frag_reuse_uuid = crate::index::frag_reuse_cache_scope(&dataset).await;
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -1921,7 +1921,7 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let frag_reuse_uuid = crate::index::frag_reuse_cache_scope(&dataset).await;
     // Load the index metadata to get the correct index directory
     let index_meta = dataset
         .load_index(uuid)

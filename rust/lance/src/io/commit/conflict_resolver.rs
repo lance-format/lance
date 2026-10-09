@@ -118,6 +118,8 @@ struct RewriteReuseState {
 struct FragReuseBase {
     version: u64,
     entry: Option<IndexMetadata>,
+    /// The history then serves address translation, so it must not skip a rewrite.
+    stable_row_ids: bool,
 }
 
 impl FragReuseBase {
@@ -125,6 +127,7 @@ impl FragReuseBase {
         Ok(Self {
             version: dataset.manifest.version,
             entry: stored_frag_reuse_entry(dataset).await?,
+            stable_row_ids: dataset.manifest.uses_stable_row_ids(),
         })
     }
 
@@ -1600,6 +1603,27 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::Rewrite { groups, .. } => {
+                    // On a stable-row-id table, a recording rewrite must not land
+                    // over a rewrite it did not see, even one that did not record
+                    // (`finish_rewrite` only covers recorded entries).
+                    if let Some(base) = self.frag_reuse_base.as_deref()
+                        && base.stable_row_ids
+                        && other_version > base.version
+                        && !groups.is_empty()
+                    {
+                        return Err(Error::retryable_commit_conflict_source(
+                            other_version,
+                            format!(
+                                "This compaction records its row-address moves on a table with \
+                                 stable row ids, but a concurrent compaction at version \
+                                 {other_version} rewrote fragments after version {}, which its \
+                                 fragment reuse history extends. Plan and run the compaction \
+                                 again.",
+                                base.version
+                            )
+                            .into(),
+                        ));
+                    }
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement

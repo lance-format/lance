@@ -128,6 +128,58 @@ jobs:
       - name: Test Rust
         run: cargo test --profile ci --locked --no-default-features
 
+  frag-reuse-recording:
+    timeout-minutes: 45
+    name: Stable-row-id recording tests
+    runs-on: "ubuntu-24.04-4x"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      # The ci profile turns debug assertions off, and with them lance-table's
+      # stable-row-id recording gate, so the other jobs only see the refusal.
+      # This build turns them back on for lance-table alone.
+      - name: Build with recording enabled
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install maturin==1.13.3 uv
+          maturin develop --uv --profile ci --locked --extras tests \
+            --config 'profile.ci.package.lance-table.debug-assertions=true'
+      - name: Run the recording tests
+        run: |
+          source venv/bin/activate
+          python -c "import lance.lance as m; assert m._frag_reuse_with_stable_row_ids_enabled(), 'recording is off'"
+          pytest -v --junitxml=recording.xml \
+            python/tests/test_optimize.py::test_public_compaction_keeps_recording_with_stable_row_ids \
+            python/tests/test_optimize.py::test_raw_rewrite_without_its_moves_is_refused_with_stable_row_ids \
+            python/tests/test_optimize.py::test_frag_reuse_index_cannot_be_dropped_with_stable_row_ids
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          suite = ET.parse("recording.xml").getroot().find("testsuite")
+          counts = {key: int(suite.get(key)) for key in ("tests", "failures", "errors", "skipped")}
+          assert counts == {"tests": 3, "failures": 0, "errors": 0, "skipped": 0}, counts
+          print("ran with recording:", ", ".join(case.get("name") for case in suite.iter("testcase")))
+          EOF
+
   linux-wheel:
     timeout-minutes: 45
     name: Python Linux x86_64 wheel

@@ -2568,6 +2568,23 @@ impl Dataset {
         self.object_store(index.base_id).await
     }
 
+    /// This table as a reader of `manifest`, another manifest of it, sees its
+    /// files: through that manifest's base paths, with base stores opened
+    /// afresh when those differ, since `base_object_stores` caches by id alone.
+    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
+        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
+            self.base_object_stores.clone()
+        } else {
+            Default::default()
+        };
+        Self {
+            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
+            manifest,
+            base_object_stores,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
         match deletion_file.base_id.as_ref() {
             Some(base_id) => {
@@ -4349,8 +4366,8 @@ pub(crate) async fn write_manifest_file(
             indices.as_deref().unwrap_or_default(),
         );
     }
-    // After the flag reset, which restores the stable-row-id flag a shallow clone
-    // masks. Here rather than in `build_manifest`, which restore and clone bypass.
+    // After the flag reset, so it judges the flags being published. Here rather
+    // than in `build_manifest`, which restore and clone bypass.
     crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
         manifest,
         indices.as_deref().unwrap_or_default(),
