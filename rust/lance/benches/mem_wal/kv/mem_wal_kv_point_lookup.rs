@@ -144,8 +144,9 @@ fn build_queries(rows: usize, queries: usize, miss_ratio: f64, seed: u64) -> Vec
 /// watermark, pick the newest matching row position, and slice that one row
 /// out of the BatchStore. Returns `None` if the key isn't present/visible.
 ///
-/// A lower bound on a MemTable point lookup's latency, with no plan or stream. Single-active-memtable only (the bench never
-/// flushes), `KEY_COL` BTree assumed present.
+/// A lower bound on a MemTable point lookup's latency, with no plan or
+/// stream. Single-active-memtable only (the bench never flushes); `KEY_COL`
+/// must have a B-tree.
 fn fast_lookup(active: &InMemoryMemTableRef, key: i64, key_type: KeyType) -> Option<RecordBatch> {
     use arrow_array::Array;
 

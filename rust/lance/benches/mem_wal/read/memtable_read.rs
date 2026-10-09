@@ -184,9 +184,8 @@ async fn setup_memtable(
     // Compute total rows for HNSW capacity sizing.
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-    // Field IDs: id=0, text=1, vector=2
-    // Filters reach only an index built from a spec.
     let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+    // Field IDs: id=0, text=1, vector=2
     let mut index_store = IndexStore::from_specs(
         &[MemIndexSpec::btree("id_idx", 0, "id")],
         &lance_schema,
