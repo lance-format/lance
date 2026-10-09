@@ -622,6 +622,10 @@ This will likely change in future versions.
 Bitpacking is a compression technique that removes the unused bits from a set of values. For example, if we have
 a u32 array and the maximum value is 5000 then we only need 13 bits to store each value.
 
+Bitpacking applies to fixed-width values up to 64 bits wide. Starting in file format version 2.3 we also bitpack
+128-bit values, which lets `Decimal128` columns be compressed this way. Because a reader limited to an older
+version cannot decode a 128-bit bitpacked block, we only emit one when the file format version is 2.3 or later.
+
 When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
 width inline in the block itself.
 
