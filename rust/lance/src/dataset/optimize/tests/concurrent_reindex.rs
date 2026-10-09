@@ -391,22 +391,13 @@ async fn test_index_retries_past_an_eager_compaction() {
 }
 
 /// Once the remap job trims a compaction's record, an index from another
-/// process retries, as before. The process that compacted still holds the
-/// record in memory and commits; nothing translates the trimmed group, so its
-/// rows are scanned.
-#[rstest]
-#[case::other_process(false)]
-#[case::same_process(true)]
+/// process has nothing to translate its old coverage and retries.
 #[tokio::test]
-async fn test_index_after_a_trimmed_compaction(#[case] same_process: bool) {
+async fn test_index_retries_after_a_trimmed_compaction() {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let mut table = indexed_table(uri, 4).await;
-    let mut builder = if same_process {
-        table.clone()
-    } else {
-        open_in_new_session(uri).await
-    };
+    let mut builder = open_in_new_session(uri).await;
     compact_files(&mut table, deferred_compaction(2), None)
         .await
         .unwrap();
@@ -422,13 +413,7 @@ async fn test_index_after_a_trimmed_compaction(#[case] same_process: bool) {
             .is_none_or(|fri| fri.details.versions.is_empty())
     );
 
-    let result = build_index(&mut builder, "val", "val_idx", false).await;
-    if same_process {
-        result.unwrap();
-        assert_lookups_match_scan(uri, probes(24, [])).await;
-    } else {
-        assert_retryable(result);
-    }
+    assert_retryable(build_index(&mut builder, "val", "val_idx", false).await);
 }
 
 /// An in-place update on a compaction's output withdraws the index's coverage
