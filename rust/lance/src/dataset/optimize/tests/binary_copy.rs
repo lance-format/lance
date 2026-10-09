@@ -14,7 +14,7 @@ const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_merge_small_files(version).await;
+        Box::pin(do_test_binary_copy_merge_small_files(version)).await;
     }
 }
 
