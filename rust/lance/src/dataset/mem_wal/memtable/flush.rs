@@ -466,7 +466,11 @@ impl MemTableFlusher {
             session: self.session.clone(),
             ..Default::default()
         };
-        let mut builder = InsertBuilder::new(uri.as_str()).with_params(&write_params);
+        // The generation's columns keep the base table's field ids: reads and
+        // the merge into base resolve them by id, across renames and drops.
+        let mut builder = InsertBuilder::new(uri.as_str())
+            .with_params(&write_params)
+            .with_table_field_ids();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }

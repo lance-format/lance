@@ -1779,38 +1779,13 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         target_bases_info,
         file_row_counts,
         None,
+        false,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_fragments_internal_to_file(
-    storage_version: ConcreteFileVersion,
-    dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
-    base_dir: &Path,
-    schema: Schema,
-    data: SendableRecordBatchStream,
-    params: WriteParams,
-    preassigned_data_file_name: Arc<String>,
-) -> Result<(Vec<Fragment>, Schema)> {
-    write_fragments_internal_impl(
-        storage_version,
-        dataset,
-        object_store,
-        base_dir,
-        schema,
-        data,
-        params,
-        None,
-        None,
-        Some(preassigned_data_file_name),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn write_fragments_internal_impl(
+pub(crate) async fn write_fragments_internal_impl(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -1821,6 +1796,7 @@ async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    keep_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1840,6 +1816,7 @@ async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
+        keep_field_ids,
     )
     .await
 }
@@ -1858,10 +1835,15 @@ pub(super) fn prepare_write_schema(
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
+    keep_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
         let mut schema = normalized_converted_schema;
-        schema.try_reassign_field_ids(None)?;
+        if keep_field_ids {
+            schema.try_set_field_id(None)?;
+        } else {
+            schema.try_reassign_field_ids(None)?;
+        }
         schema
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
