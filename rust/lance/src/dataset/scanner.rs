@@ -3740,7 +3740,10 @@ impl Scanner {
         };
 
         // Load columns needed for filter and ordering
-        let mut pre_filter_projection = self.dataset.empty_projection();
+        let mut pre_filter_projection = self
+            .dataset
+            .empty_projection()
+            .with_blob_handling(self.blob_handling.clone());
 
         // We may need to take filter columns if we are going to refine
         // an indexed scan.
@@ -3795,15 +3798,8 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Sort
+        // Sort. Ordering columns were loaded with the filter projection above.
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
-            let projection_with_ordering = self
-                .dataset
-                .empty_projection()
-                .union_columns(ordering_columns, OnMissing::Error)?;
-            // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering)?;
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -3944,7 +3940,9 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                // The scan projection can request a row address on its own, for an empty
+                // projection or a sort column that is not selected.
+                projection.with_row_addr || self.projection_plan.physical_projection.with_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,
@@ -4339,6 +4337,17 @@ impl Scanner {
             // If the user is not requesting any columns then we will scan the row address which
             // is cheap
             projection.with_row_addr = true;
+        }
+
+        if let Some(ordering) = &self.ordering {
+            let projected = projection.to_schema();
+            let sort_column_missing = ordering
+                .iter()
+                .any(|col| projected.field(&col.column_name).is_none());
+            if sort_column_missing && !projection.with_row_id && !projection.with_row_addr {
+                // The later take needs a row ID or address.
+                projection.with_row_addr = true;
+            }
         }
 
         // An external mask is applied as the row source inside new_filtered_read, so
@@ -6760,9 +6769,11 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
+            // Filter columns are carried into the search output.
             let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
+                .with_blob_handling(self.blob_handling.clone())
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
 
@@ -10389,6 +10400,237 @@ mod test {
         }
     }
 
+    #[rstest]
+    #[case::postfilter(false)]
+    #[case::prefilter(true)]
+    #[tokio::test]
+    async fn test_all_binary_vector_search_with_blob_filter(#[case] prefilter: bool) {
+        use lance_core::datatypes::BlobHandling;
+
+        let num_rows = 20;
+        let dim = 8;
+        let has_blob = |row: usize| row % 3 != 1;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(item_field.clone(), dim),
+                true,
+            ),
+            blob_field("blobs", true),
+        ]));
+        // Distance from zero increases with row number.
+        let vectors = FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(Float32Array::from_iter_values(
+                (0..num_rows).flat_map(|row| (0..dim).map(move |_| row as f32)),
+            )),
+            None,
+        );
+        let mut blob_builder = BlobArrayBuilder::new(num_rows);
+        for row in 0..num_rows {
+            if has_blob(row) {
+                blob_builder.push_bytes(vec![row as u8; 1024]).unwrap();
+            } else {
+                blob_builder.push_null().unwrap();
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(vectors), blob_builder.finish().unwrap()],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let query = Float32Array::from(vec![0.0f32; dim as usize]);
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, num_rows)
+            .unwrap()
+            .prefilter(prefilter)
+            .filter("blobs IS NOT NULL")
+            .unwrap()
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary);
+        let result = scan.try_into_batch().await.unwrap();
+
+        let blobs = result.column_by_name("blobs").unwrap();
+        assert_eq!(blobs.data_type(), &DataType::LargeBinary);
+        let actual = blobs
+            .as_binary::<i64>()
+            .iter()
+            .map(|value| value.map(<[u8]>::to_vec))
+            .collect::<Vec<_>>();
+        let expected = (0..num_rows)
+            .filter(|&row| has_blob(row))
+            .map(|row| Some(vec![row as u8; 1024]))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::postfilter(false)]
+    #[case::prefilter(true)]
+    #[tokio::test]
+    async fn test_all_binary_indexed_vector_search_with_blob_filter(#[case] prefilter: bool) {
+        use lance_core::datatypes::BlobHandling;
+
+        let num_rows = 32;
+        let dim = 2i32;
+        let has_blob = |row: usize| row % 3 != 1;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(item_field.clone(), dim),
+                true,
+            ),
+            blob_field("blobs", true),
+        ]));
+        let vectors = FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(Float32Array::from_iter_values(
+                (0..num_rows).flat_map(|row| (0..dim).map(move |_| row as f32)),
+            )),
+            None,
+        );
+        let mut blob_builder = BlobArrayBuilder::new(num_rows);
+        for row in 0..num_rows {
+            if has_blob(row) {
+                blob_builder.push_bytes(vec![row as u8; 16]).unwrap();
+            } else {
+                blob_builder.push_null().unwrap();
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(vectors), blob_builder.finish().unwrap()],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, false)
+            .await
+            .unwrap();
+
+        let query = Float32Array::from(vec![0.0f32; dim as usize]);
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, num_rows)
+            .unwrap()
+            .minimum_nprobes(2)
+            .prefilter(prefilter)
+            .filter("blobs IS NOT NULL")
+            .unwrap()
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "expected an indexed search, got {plan}"
+        );
+
+        let result = scan.try_into_batch().await.unwrap();
+        let blobs = result.column_by_name("blobs").unwrap();
+        assert_eq!(blobs.data_type(), &DataType::LargeBinary);
+        let mut actual = blobs
+            .as_binary::<i64>()
+            .iter()
+            .map(|value| value.map(<[u8]>::to_vec))
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = (0..num_rows)
+            .filter(|&row| has_blob(row))
+            .map(|row| Some(vec![row as u8; 16]))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_all_binary_order_by_blob() {
+        use lance_core::datatypes::BlobHandling;
+
+        let payloads = [
+            Some(b"c".to_vec()),
+            Some(b"a".to_vec()),
+            None,
+            Some(b"b".to_vec()),
+        ];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            blob_field("blobs", true),
+        ]));
+        let mut blob_builder = BlobArrayBuilder::new(payloads.len());
+        for payload in &payloads {
+            match payload {
+                Some(bytes) => blob_builder.push_bytes(bytes).unwrap(),
+                None => blob_builder.push_null().unwrap(),
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..payloads.len() as i32)),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
+                "blobs".to_string(),
+            )]))
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary);
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.schema().field(0).name(), "id");
+        assert_eq!(result.num_columns(), 1);
+
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 3, 0, 2]);
+    }
+
     #[tokio::test]
     async fn test_strict_batch_size() {
         let dataset = lance_datagen::gen_batch()
@@ -13670,6 +13912,85 @@ mod test {
         assert_eq!(output.len(), 2);
         assert_eq!(output[0], batch2);
         assert_eq!(output[1], batch1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_order_by_unprojected_column(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(Int32Array::from(vec![20, 40, 10, 30])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
+                "value".to_string(),
+            )]))
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("projection=[id]") && plan.contains("row_id=false, row_addr=true"),
+            "{plan}"
+        );
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_columns(), 1);
+        assert_eq!(result.schema().field(0).name(), "id");
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![2, 0, 3, 1]);
+
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .with_row_address()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
+                "value".to_string(),
+            )]))
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("projection=[id]") && plan.contains("row_id=false, row_addr=true"),
+            "{plan}"
+        );
+        assert!(!plan.contains("row_id=true"), "{plan}");
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_columns(), 2);
+        assert!(result.column_by_name("_rowid").is_none());
+        assert!(result.column_by_name("_rowaddr").is_some());
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![2, 0, 3, 1]);
     }
 
     #[rstest]
