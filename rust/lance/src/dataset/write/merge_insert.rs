@@ -81,7 +81,8 @@ use datafusion::{
     datasource::MemTable,
     execution::{
         context::{SessionConfig, SessionContext},
-        memory_pool::MemoryConsumer,
+        memory_pool::{MemoryConsumer, MemoryPool},
+        runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
@@ -570,6 +571,37 @@ pub enum SourceDedupeBehavior {
     FirstSeen,
 }
 
+/// A memory pool compared by identity, so it can be a parameter of the merge
+/// insert's DataFusion extension node.
+#[derive(Debug, Clone)]
+struct PlanMemoryPool(Arc<dyn MemoryPool>);
+
+impl PlanMemoryPool {
+    fn address(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>() as usize
+    }
+}
+
+impl PartialEq for PlanMemoryPool {
+    fn eq(&self, other: &Self) -> bool {
+        self.address() == other.address()
+    }
+}
+
+impl Eq for PlanMemoryPool {}
+
+impl PartialOrd for PlanMemoryPool {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.address().partial_cmp(&other.address())
+    }
+}
+
+impl std::hash::Hash for PlanMemoryPool {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.address().hash(state);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PlanFileVersion(ConcreteFileVersion);
 
@@ -629,9 +661,15 @@ struct MergeInsertParams {
     target_all_bases: Option<bool>,
     // Exact output data file version. The manifest default is used when absent.
     data_storage_version: Option<PlanFileVersion>,
+    // Caller-supplied pool that all of the merge's DataFusion plans execute in.
+    memory_pool: Option<PlanMemoryPool>,
 }
 
 impl MergeInsertParams {
+    fn memory_pool(&self) -> Option<Arc<dyn MemoryPool>> {
+        self.memory_pool.as_ref().map(|pool| pool.0.clone())
+    }
+
     fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
         self.data_storage_version
             .map(|version| version.0)
@@ -796,6 +834,7 @@ impl MergeInsertBuilder {
                 target_base_names_or_paths: None,
                 target_all_bases: None,
                 data_storage_version: None,
+                memory_pool: None,
             },
         })
     }
@@ -1006,6 +1045,37 @@ impl MergeInsertBuilder {
     /// [`Self::target_base_names_or_paths`].
     pub fn target_all_bases(&mut self, include_primary: bool) -> &mut Self {
         self.params.target_all_bases = Some(include_primary);
+        self
+    }
+
+    /// Execute the merge's DataFusion plans in the given memory pool.
+    ///
+    /// By default the joins run in an unbounded pool and each spilling sort
+    /// gets its own pool sized by `LANCE_MEM_POOL_SIZE`. Supply a pool to bound
+    /// the whole operation, or to share one budget across concurrent
+    /// operations. Spilling operators spill to disk when the pool is full. See
+    /// [`LanceExecutionOptions::memory_pool`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use datafusion::execution::memory_pool::GreedyMemoryPool;
+    /// # use datafusion::physical_plan::SendableRecordBatchStream;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched};
+    /// # async fn test(dataset: Arc<Dataset>, new_data: SendableRecordBatchStream) -> Result<()> {
+    /// let memory_pool = Arc::new(GreedyMemoryPool::new(512 * 1024 * 1024));
+    /// let (updated_dataset, _stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .memory_pool(memory_pool)
+    ///     .try_build()?
+    ///     .execute(new_data)
+    ///     .await?;
+    /// # let _ = updated_dataset;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_pool(&mut self, memory_pool: Arc<dyn MemoryPool>) -> &mut Self {
+        self.params.memory_pool = Some(PlanMemoryPool(memory_pool));
         self
     }
 
@@ -1502,6 +1572,7 @@ impl MergeInsertJob {
             joined,
             LanceExecutionOptions {
                 use_spilling: true,
+                memory_pool: self.params.memory_pool(),
                 ..Default::default()
             },
         )
@@ -1539,13 +1610,22 @@ impl MergeInsertJob {
         Arc::new(ProjectionExec::try_new(exprs, inp).unwrap())
     }
 
+    /// The runtime for plans this job executes outside [`execute_plan`].
+    fn runtime_env(&self) -> Result<Arc<RuntimeEnv>> {
+        let mut builder = RuntimeEnvBuilder::new();
+        if let Some(memory_pool) = self.params.memory_pool() {
+            builder = builder.with_memory_pool(memory_pool);
+        }
+        Ok(builder.build_arc()?)
+    }
+
     // If the join keys are not indexed then we need to do a full scan of the table
     async fn create_full_table_joined_stream(
         &self,
         source: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
         let session_config = SessionConfig::default().with_target_partitions(1);
-        let session_ctx = SessionContext::new_with_config(session_config);
+        let session_ctx = SessionContext::new_with_config_rt(session_config, self.runtime_env()?);
         let schema = source.schema();
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
@@ -1647,6 +1727,7 @@ impl MergeInsertJob {
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         write_version: ConcreteFileVersion,
+        memory_pool: Option<Arc<dyn MemoryPool>>,
     ) -> Result<PatchedFragments> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
@@ -1656,6 +1737,7 @@ impl MergeInsertJob {
         let session_ctx = get_session_context(&LanceExecutionOptions {
             use_spilling: true,
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
+            memory_pool,
             ..Default::default()
         });
         // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
@@ -2568,6 +2650,7 @@ impl MergeInsertJob {
         Option<RowAddrTreeMap>,
         Option<KeyExistenceFilter>,
     )> {
+        let runtime_env = self.runtime_env()?;
         let plan = self.create_plan(provider).await?;
 
         // Execute the plan
@@ -2582,7 +2665,8 @@ impl MergeInsertJob {
         }
 
         // Execute partition 0 (the only partition)
-        let task_context = Arc::new(datafusion::execution::TaskContext::default());
+        let task_context =
+            Arc::new(datafusion::execution::TaskContext::default().with_runtime(runtime_env));
         let mut stream = plan.execute(0, task_context)?;
 
         // Assert that the execution produces no output (this is a write operation)
@@ -2946,6 +3030,7 @@ impl MergeInsertJob {
                 self.dataset.manifest.version + 1,
                 target_bases_info,
                 self.params.write_version(&self.dataset),
+                self.params.memory_pool(),
             )
             .await?;
 
@@ -3268,7 +3353,10 @@ impl MergeInsertJob {
         let plan = cloned_job.create_plan(provider).await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
-        let options = LanceExecutionOptions::default();
+        let options = LanceExecutionOptions {
+            memory_pool: self.params.memory_pool(),
+            ..Default::default()
+        };
         let full_analysis = analyze_plan(plan, options).await?;
 
         // Remove the AnalyzeExec and TracedExec lines from the output
@@ -4018,6 +4106,7 @@ mod tests {
             dataset.manifest().version + 1,
             None,
             dataset.manifest.data_storage_format.lance_file_format(),
+            None,
         )
         .await
         .unwrap_err();
@@ -4486,6 +4575,58 @@ mod tests {
         pairs.sort_unstable();
 
         assert_eq!(pairs, vec![(1, 10), (2, 200), (3, 300), (4, 400)]);
+    }
+
+    #[rstest::rstest]
+    #[case::full_schema_join(false, false, MergeInsertWriteMode::Auto)]
+    #[case::indexed_join(false, true, MergeInsertWriteMode::Auto)]
+    #[case::rewrite_columns(true, false, MergeInsertWriteMode::RewriteColumns)]
+    #[case::partial_schema_full_table_join(true, false, MergeInsertWriteMode::Auto)]
+    #[case::partial_schema_indexed_join(true, true, MergeInsertWriteMode::Auto)]
+    #[tokio::test]
+    async fn test_merge_insert_uses_supplied_memory_pool(
+        #[case] partial: bool,
+        #[case] indexed: bool,
+        #[case] write_mode: MergeInsertWriteMode,
+    ) {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let mut dataset = create_test_dataset("memory://", LanceFileVersion::V2_0, false).await;
+        if indexed {
+            Arc::make_mut(&mut dataset)
+                .create_index(
+                    &["key"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let mut new_batch = create_new_batch(create_test_schema());
+        if partial {
+            new_batch = new_batch.project(&[0, 1]).unwrap();
+        }
+        let merge = |pool_size: usize| {
+            let mut builder =
+                MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()]).unwrap();
+            builder
+                .when_matched(WhenMatched::UpdateAll)
+                .write_mode(write_mode)
+                .memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)));
+            if partial {
+                builder.when_not_matched(WhenNotMatched::DoNothing);
+            }
+            let reader = RecordBatchIterator::new([Ok(new_batch.clone())], new_batch.schema());
+            async move { builder.try_build().unwrap().execute_reader(reader).await }
+        };
+
+        let (_, stats) = merge(64 * 1024 * 1024).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 3);
+
+        let err = merge(1).await.unwrap_err();
+        assert!(err.to_string().contains("Resources exhausted"), "{err}");
     }
 
     #[rstest::rstest]

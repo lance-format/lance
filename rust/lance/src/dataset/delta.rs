@@ -7,7 +7,7 @@ use crate::Result;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
-    BATCH_SIZE_FALLBACK, DatasetRecordBatchStream, get_default_batch_size,
+    BATCH_SIZE_FALLBACK, DatasetRecordBatchStream, Scanner, get_default_batch_size,
 };
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
@@ -15,6 +15,7 @@ use arrow_schema::SortOptions;
 use chrono::{DateTime, Utc};
 use datafusion::common::NullEquality;
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
@@ -95,6 +96,7 @@ pub struct DatasetDeltaBuilder {
     end_version: Option<u64>,
     begin_timestamp: Option<DateTime<Utc>>,
     end_timestamp: Option<DateTime<Utc>>,
+    memory_pool: Option<Arc<dyn MemoryPool>>,
 }
 
 impl DatasetDeltaBuilder {
@@ -107,6 +109,7 @@ impl DatasetDeltaBuilder {
             end_version: None,
             begin_timestamp: None,
             end_timestamp: None,
+            memory_pool: None,
         }
     }
 
@@ -152,6 +155,17 @@ impl DatasetDeltaBuilder {
     /// Cannot be used together with `compared_against_version` or explicit version range.
     pub fn with_end_date(mut self, timestamp: DateTime<Utc>) -> Self {
         self.end_timestamp = Some(timestamp);
+        self
+    }
+
+    /// Execute the delta's DataFusion plans in the given memory pool.
+    ///
+    /// By default the delta's scans run in an unbounded pool, and each sort
+    /// that finds deleted rows gets its own pool sized by `LANCE_MEM_POOL_SIZE`.
+    /// Supply a pool to bound the whole delta, or to share one budget across
+    /// concurrent operations. See [`LanceExecutionOptions::memory_pool`].
+    pub fn with_memory_pool(mut self, memory_pool: Arc<dyn MemoryPool>) -> Self {
+        self.memory_pool = Some(memory_pool);
         self
     }
 
@@ -225,6 +239,7 @@ impl DatasetDeltaBuilder {
             base_dataset: self.dataset,
             begin_timestamp: begin_ts,
             end_timestamp: end_ts,
+            memory_pool: self.memory_pool,
         })
     }
 }
@@ -239,9 +254,18 @@ pub struct DatasetDelta {
     pub(crate) base_dataset: Dataset,
     pub(crate) begin_timestamp: Option<DateTime<Utc>>,
     pub(crate) end_timestamp: Option<DateTime<Utc>>,
+    pub(crate) memory_pool: Option<Arc<dyn MemoryPool>>,
 }
 
 impl DatasetDelta {
+    fn scan(&self) -> Scanner {
+        let mut scanner = self.base_dataset.scan();
+        if let Some(memory_pool) = &self.memory_pool {
+            scanner.memory_pool(memory_pool.clone());
+        }
+        scanner
+    }
+
     /// Resolve the effective version range for this delta.
     ///
     /// If a date window is set (`begin_timestamp` and `end_timestamp` provided), this lazily
@@ -411,6 +435,7 @@ impl DatasetDelta {
             live,
             LanceExecutionOptions {
                 use_spilling: true,
+                memory_pool: self.memory_pool.clone(),
                 ..Default::default()
             },
         )?;
@@ -449,7 +474,7 @@ impl DatasetDelta {
     /// # }
     /// ```
     pub async fn get_inserted_rows(&self) -> Result<DatasetRecordBatchStream> {
-        let mut scanner = self.base_dataset.scan();
+        let mut scanner = self.scan();
 
         // Enable version columns
         scanner.project(&[
@@ -507,7 +532,7 @@ impl DatasetDelta {
     /// # }
     /// ```
     pub async fn get_updated_rows(&self) -> Result<DatasetRecordBatchStream> {
-        let mut scanner = self.base_dataset.scan();
+        let mut scanner = self.scan();
 
         // Enable version columns
         scanner.project(&[
@@ -570,7 +595,7 @@ impl DatasetDelta {
     /// # }
     /// ```
     pub async fn get_upserted_rows(&self) -> Result<DatasetRecordBatchStream> {
-        let mut scanner = self.base_dataset.scan();
+        let mut scanner = self.scan();
 
         // Enable version columns
         scanner.project(&[
@@ -2119,6 +2144,36 @@ mod tests {
         let batches: Vec<_> = stream.try_collect().await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, expected, "anti join dropped or kept the wrong ids");
+    }
+
+    #[tokio::test]
+    async fn test_deleted_row_ids_use_supplied_memory_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let dataset = create_test_dataset(100, 2, "value", true).await;
+        let begin = dataset.manifest.version;
+        let mut dataset = update_where(dataset, "key % 2 = 0", "even").await;
+        dataset.delete("key < 10").await.unwrap();
+        let delta = |pool_size: usize| {
+            dataset
+                .delta()
+                .compared_against_version(begin)
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)))
+                .build()
+                .unwrap()
+        };
+
+        assert_eq!(collect_deleted(&delta(64 * 1024 * 1024)).await.len(), 10);
+
+        let mut stream = delta(1).get_deleted_row_ids().await.unwrap();
+        let err = loop {
+            match stream.try_next().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected the 1-byte pool to be exhausted"),
+                Err(err) => break err,
+            }
+        };
+        assert!(err.to_string().contains("Resources exhausted"), "{err}");
     }
 
     /// Interleaved updates leave every row live; none may read as deleted.
