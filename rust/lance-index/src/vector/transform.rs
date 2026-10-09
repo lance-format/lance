@@ -124,6 +124,28 @@ impl Transformer for KeepFiniteVectors {
             }
         };
 
+        // Fast path: one flat-buffer finiteness check for the common case
+        // where every row is finite, avoiding the per-row iteration below
+        // that materializes an ArrayRef per vector.
+        //
+        // `data.len() == batch.num_rows()` keeps this equivalent to the slow
+        // path for both shapes. A `List<FixedSizeList>` column flattens to the
+        // inner list, whose row count can differ from the batch's, and the slow
+        // path compares its index count against `batch.num_rows()` to decide
+        // whether to take — so shortcutting there would not always agree.
+        let all_finite = data.len() == batch.num_rows()
+            && data.null_count() == 0
+            && match data.value_type() {
+                DataType::Float16 => is_all_finite::<Float16Type>(data.values()),
+                DataType::Float32 => is_all_finite::<Float32Type>(data.values()),
+                DataType::Float64 => is_all_finite::<Float64Type>(data.values()),
+                DataType::UInt8 | DataType::Int8 => data.values().null_count() == 0,
+                _ => false,
+            };
+        if all_finite {
+            return Ok(batch.clone());
+        }
+
         let mut valid = Vec::with_capacity(batch.num_rows());
         data.iter().enumerate().for_each(|(idx, arr)| {
             if let Some(data) = arr {
@@ -235,6 +257,65 @@ mod tests {
     use half::f16;
     use lance_arrow::*;
     use lance_linalg::distance::L2;
+
+    #[test]
+    fn test_keep_finite_vectors_fast_path_matches_slow_path() {
+        fn batch_of(values: Vec<f32>, dim: i32) -> RecordBatch {
+            let fsl =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+            let schema = Schema::new(vec![Field::new(
+                "v",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            )]);
+            RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap()
+        }
+
+        let transformer = KeepFiniteVectors::new("v");
+
+        // All finite: every row survives, which is what the fast path returns
+        // without walking the rows.
+        let batch = batch_of(vec![1.0, 2.0, 3.0, 4.0], 2);
+        let out = transformer.transform(&batch).unwrap();
+        assert_eq!(out.num_rows(), 2);
+
+        // One non-finite value: the fast path must decline and the row is
+        // dropped, not the whole batch.
+        let batch = batch_of(vec![1.0, 2.0, f32::NAN, 4.0], 2);
+        let out = transformer.transform(&batch).unwrap();
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(
+            out.column_by_name("v")
+                .unwrap()
+                .as_fixed_size_list()
+                .value(0)
+                .as_primitive::<Float32Type>()
+                .values(),
+            &[1.0, 2.0]
+        );
+
+        // Infinity is rejected the same way.
+        let batch = batch_of(vec![f32::INFINITY, 2.0, 3.0, 4.0], 2);
+        let out = transformer.transform(&batch).unwrap();
+        assert_eq!(out.num_rows(), 1);
+
+        // A null row also has to go through the slow path, which drops it.
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            2,
+            Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
+        let out = transformer.transform(&batch).unwrap();
+        assert_eq!(out.num_rows(), 1);
+    }
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {
