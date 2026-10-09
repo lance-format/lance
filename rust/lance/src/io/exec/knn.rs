@@ -2716,6 +2716,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
             &self.metrics,
         )?;
 
+        // Same per-segment ownership gate as `ANNIvfSubIndexExec`: only restrict
+        // when every segment has a fragment_bitmap.
+        let has_segment_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
+
         let result_schema = schema.clone();
         let fut = async move {
             let dim = query.key.len() / query_count;
@@ -2723,6 +2727,23 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); query_count];
 
             for index_meta in &indices {
+                // A segment's index file may still hold rows for fragments pruned from
+                // its fragment_bitmap (e.g. after an in-place `update_columns`) that a
+                // newer delta now owns. As in the single-query path, search with the
+                // segment's ownership prefilter and drop any unowned row, so the stale
+                // copy is never returned next to the fresh one.
+                let segment_pre_filter =
+                    prefilter_for_segment(ds.clone(), index_meta, pre_filter.clone()).await?;
+                let seg_mask = match index_meta
+                    .fragment_bitmap
+                    .clone()
+                    .filter(|_| has_segment_bitmaps)
+                    .and_then(|bitmap| {
+                        DatasetPreFilter::create_restricted_deletion_mask(ds.clone(), bitmap)
+                    }) {
+                    Some(fut) => Some(fut.await?),
+                    None => None,
+                };
                 let index = {
                     let _open_timer =
                         IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
@@ -2778,13 +2799,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
 
                 let index_metrics: Arc<dyn MetricsCollector> =
                     Arc::new(metrics.index_metrics.clone());
-                let pre_filter: Arc<dyn PreFilter> = pre_filter.clone();
                 let per_query = index
                     .search_partitions_batch(
                         normalized,
                         partitions_per_query,
                         dists_per_query,
-                        pre_filter,
+                        segment_pre_filter,
                         index_metrics,
                     )
                     .await?;
@@ -2802,6 +2822,7 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     )));
                 }
                 for (query_index, batch) in per_query.into_iter().enumerate() {
+                    let batch = restrict_to_segment(batch, seg_mask.as_deref())?;
                     // Access by name rather than position: the result schema is
                     // `VECTOR_RESULT_SCHEMA` (`_distance`, `_rowid`), and looking
                     // up by name keeps this correct if that column order changes.
@@ -3638,6 +3659,17 @@ mod tests {
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
         let first_schema = first.schema();
         let mut dataset = Dataset::write(first, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_owned()),
+                &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        let first_index = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let first_version = dataset.manifest.version;
         let first_fragments = dataset.fragment_bitmap.as_ref().clone();
         let field_id = dataset.schema().field("vector").unwrap().id;
@@ -3653,7 +3685,7 @@ mod tests {
         let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
         let old_segment = IndexMetadata {
-            uuid: Uuid::new_v4(),
+            uuid: first_index[0].uuid,
             fields: vec![field_id],
             covering_fields: vec![],
             name: "vector_idx".to_string(),
@@ -3714,6 +3746,50 @@ mod tests {
         let mut rows_with_unowned_entry = old_partition_rows;
         rows_with_unowned_entry.insert(u64::from(appended_fragment_id) << 32);
         assert!(!segment_prefilter.is_empty_for(&rows_with_unowned_entry));
+
+        let index = dataset
+            .open_vector_index(
+                "vector",
+                &old_segment.uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let batch_query = Query {
+            column: "vector".to_owned(),
+            key: Arc::new(Float32Array::from(vec![
+                0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
+            ])),
+            k: 5,
+            ..base_query()
+        };
+        let partition = Arc::new(UInt32Array::from(vec![0]));
+        let centroid_dist = Arc::new(Float32Array::from(vec![0.0]));
+        let partitions = vec![partition; 2];
+        let centroid_dists = vec![centroid_dist; 2];
+        let unfiltered = index
+            .clone()
+            .search_partitions_batch(
+                batch_query.clone(),
+                partitions.clone(),
+                centroid_dists.clone(),
+                Arc::new(lance_index::prefilter::NoFilter),
+                Arc::new(lance_index::metrics::NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        let owned = index
+            .search_partitions_batch(
+                batch_query,
+                partitions,
+                centroid_dists,
+                segment_prefilter,
+                Arc::new(lance_index::metrics::NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owned, unfiltered);
+        assert!(owned.iter().all(|batch| batch.num_rows() == 5));
 
         let ordinary_base = Arc::new(
             DatasetPreFilter::new(dataset, &[old_segment, new_segment], None)

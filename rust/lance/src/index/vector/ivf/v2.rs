@@ -2759,15 +2759,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let load_parallelism = get_num_compute_intensive_cpus().max(1);
         let load_index = self.clone();
         let load_metrics = metrics.clone();
+        let load_pre_filter = pre_filter;
         let mut loaded_chunks = stream::iter(assignment_list)
             .map(move |(part_id, probing_queries)| {
                 let index = load_index.clone();
                 let metrics = load_metrics.clone();
+                let pre_filter = load_pre_filter.clone();
                 async move {
+                    let part_id = part_id as usize;
                     let part_entry = index
-                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .load_partition(part_id, true, metrics.as_ref())
                         .await?;
-                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                    let pre_filter = Self::prefilter_for_partition(
+                        &index.index_cache,
+                        part_id,
+                        &part_entry,
+                        pre_filter,
+                    )
+                    .await?;
+                    Result::Ok((part_id, part_entry, probing_queries, pre_filter))
                 }
             })
             .buffered(load_parallelism)
@@ -2793,7 +2803,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         while let Some(chunk) = pending {
             let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
             let index = self.clone();
-            let pre_filter = pre_filter.clone();
             let base_queries = base_queries.clone();
             let raw_query_contexts = raw_query_contexts.clone();
             let scratch_pool = self.scratch_pool.clone();
@@ -2802,7 +2811,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
                 search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                 scratch_pool.with_scratch(|scratch| -> Result<()> {
-                    for (part_id, part_entry, probing_queries) in &chunk {
+                    for (part_id, part_entry, probing_queries, pre_filter) in &chunk {
                         let partition_centroid = index.ivf.centroid(*part_id);
                         for (query_index, dist_q_c) in probing_queries {
                             let mut single_query = base_queries[*query_index].clone();
@@ -3066,7 +3075,7 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -3321,8 +3330,12 @@ mod tests {
         assert_eq!(partitions[1][0].num_rows(), 90);
     }
 
+    #[derive(Default)]
     struct PartitionCoverageTestFilter {
         needs_partition_rows: bool,
+        selected_rows: Arc<RowAddrMask>,
+        coverage_checks: AtomicUsize,
+        mask_reads: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -3339,16 +3352,18 @@ mod tests {
             self.needs_partition_rows
         }
 
-        fn is_empty_for(&self, _rows: &RowAddrTreeMap) -> bool {
-            true
+        fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
+            self.coverage_checks.fetch_add(1, Ordering::Relaxed);
+            self.selected_rows.selects_all(rows)
         }
 
         fn mask(&self) -> Arc<RowAddrMask> {
-            Arc::new(RowAddrMask::all_rows())
+            self.mask_reads.fetch_add(1, Ordering::Relaxed);
+            self.selected_rows.clone()
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-            row_ids.enumerate().map(|(index, _)| index as u64).collect()
+            self.mask().selected_indices(row_ids)
         }
     }
 
@@ -3377,6 +3392,7 @@ mod tests {
 
         let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
             needs_partition_rows: false,
+            ..Default::default()
         });
         let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
             &weak_cache,
@@ -3392,6 +3408,7 @@ mod tests {
 
         let segment_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
             needs_partition_rows: true,
+            ..Default::default()
         });
         let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
             &weak_cache,
@@ -3412,6 +3429,205 @@ mod tests {
         assert!(cache_weight_with_coverage > cache_weight_without_coverage);
         assert!(cache_weight_with_coverage >= entry.deep_size_of());
         assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[case::flat(None)]
+    #[case::pq4(Some(4))]
+    #[case::pq8(Some(8))]
+    #[tokio::test]
+    async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Option<usize>) {
+        const NUM_QUERIES: usize = 4;
+        const K: usize = 10;
+        let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+        let vectors = batch["vector"].as_fixed_size_list();
+        let query = Query {
+            column: "vector".to_owned(),
+            key: vectors.values().slice(0, NUM_QUERIES * DIM),
+            k: PQ_MATRIX_NUM_ROWS,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: LIGHTWEIGHT_PQ_PARTITIONS,
+            maximum_nprobes: Some(LIGHTWEIGHT_PQ_PARTITIONS),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+        ivf.max_iters = 2;
+        ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+        let params = match bits {
+            None => VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf),
+            Some(bits) => VectorIndexParams::with_ivf_pq_params(
+                DistanceType::L2,
+                ivf,
+                lightweight_pq_params_with_bits(bits),
+            ),
+        };
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let metadata = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &metadata[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let mut partitions = Vec::with_capacity(NUM_QUERIES);
+        let mut centroid_dists = Vec::with_capacity(NUM_QUERIES);
+        for query_index in 0..NUM_QUERIES {
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * DIM, DIM);
+            let (parts, dists) = index.find_partitions(&single_query).unwrap();
+            assert_eq!(parts.len(), LIGHTWEIGHT_PQ_PARTITIONS);
+            partitions.push(Arc::new(parts));
+            centroid_dists.push(Arc::new(dists));
+        }
+        let all_results = index
+            .clone()
+            .search_partitions_batch(
+                query.clone(),
+                partitions.clone(),
+                centroid_dists.clone(),
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|batch| {
+                let order = arrow::compute::sort_to_indices(&batch[DIST_COL], None, None).unwrap();
+                arrow::compute::take_record_batch(&batch, &order).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            all_results
+                .iter()
+                .all(|batch| batch.num_rows() == PQ_MATRIX_NUM_ROWS)
+        );
+        for (query_index, result) in all_results.iter().enumerate() {
+            let key = query.key.slice(query_index * DIM, DIM);
+            let truth = dataset
+                .scan()
+                .with_row_id()
+                .project(&[ROW_ID])
+                .unwrap()
+                .nearest("vector", key.as_ref(), K)
+                .unwrap()
+                .use_index(false)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let truth_ids = truth[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let recall = result[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .take(K)
+                .filter(|row_id| truth_ids.contains(row_id))
+                .count() as f32
+                / K as f32;
+            assert_ge!(recall, 0.5);
+        }
+        let row_ids = all_results[0][ROW_ID].as_primitive::<UInt64Type>();
+        let stale_row = row_ids.value(0);
+        let owned_rows = row_ids.values().iter().copied().collect::<RowAddrTreeMap>();
+        let mixed_rows = row_ids
+            .values()
+            .iter()
+            .copied()
+            .filter(|row_id| *row_id != stale_row)
+            .collect::<RowAddrTreeMap>();
+        let mut batch_query = query;
+        batch_query.k = K;
+        for (mask, needs_partition_rows, expect_mask_reads) in [
+            (RowAddrMask::from_allowed(owned_rows), true, false),
+            (RowAddrMask::from_allowed(mixed_rows.clone()), true, true),
+            (RowAddrMask::allow_nothing(), true, true),
+            (RowAddrMask::from_allowed(mixed_rows), false, true),
+        ] {
+            let filter = Arc::new(PartitionCoverageTestFilter {
+                needs_partition_rows,
+                selected_rows: Arc::new(mask),
+                ..Default::default()
+            });
+            let results = index
+                .clone()
+                .search_partitions_batch(
+                    batch_query.clone(),
+                    partitions.clone(),
+                    centroid_dists.clone(),
+                    filter.clone(),
+                    Arc::new(NoOpMetricsCollector),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                filter.coverage_checks.load(Ordering::Relaxed),
+                if needs_partition_rows {
+                    LIGHTWEIGHT_PQ_PARTITIONS
+                } else {
+                    0
+                },
+                "coverage must be checked once per distinct partition, not once per query"
+            );
+            assert_eq!(
+                filter.mask_reads.load(Ordering::Relaxed) > 0,
+                expect_mask_reads,
+                "fully owned partitions must use the bulk scorer without reading the mask"
+            );
+            for (result, all_result) in results.iter().zip(&all_results) {
+                let selected = all_result[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row_id)| filter.selected_rows.selected(**row_id))
+                    .take(K)
+                    .map(|(position, _)| position as u32)
+                    .collect::<Vec<_>>();
+                let expected =
+                    arrow::compute::take_record_batch(all_result, &UInt32Array::from(selected))
+                        .unwrap();
+                let order = arrow::compute::sort_to_indices(&result[DIST_COL], None, None).unwrap();
+                let result = arrow::compute::take_record_batch(result, &order).unwrap();
+                assert_eq!(
+                    result[ROW_ID].as_primitive::<UInt64Type>().values(),
+                    expected[ROW_ID].as_primitive::<UInt64Type>().values(),
+                    "ownership must be applied before truncating the top-k heap"
+                );
+                for (actual, expected) in result[DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .zip(expected[DIST_COL].as_primitive::<Float32Type>().values())
+                {
+                    assert_lt!((actual - expected).abs(), 1e-4);
+                }
+            }
+        }
     }
 
     #[test]
