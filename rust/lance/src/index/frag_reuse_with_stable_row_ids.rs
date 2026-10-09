@@ -1159,7 +1159,7 @@ mod tests {
                 &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .await,
-            "Cannot create index `category_idx`",
+            "Cannot create a full-text index on column `category`",
         );
         let bitmap = index_with(
             "category_idx",
