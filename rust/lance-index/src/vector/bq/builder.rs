@@ -69,7 +69,8 @@ pub(crate) struct RabitQuantizedBatch {
 }
 
 #[inline]
-fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
+#[doc(hidden)]
+pub fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
     codes.fill(0);
     for (bit_idx, value) in rotated.iter().enumerate() {
         if value.is_sign_positive() {
@@ -149,7 +150,8 @@ fn sort_ex_thresholds(values: &mut [u64]) {
     }
 }
 
-fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
+#[doc(hidden)]
+pub fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     let max_value = abs_normalized
         .iter()
         .copied()
@@ -214,6 +216,18 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     best_t
 }
 
+/// `|v_d| / ||v||` for every dimension, or `None` for a zero / non-finite
+/// vector (which encodes as all-zero ex codes).
+#[doc(hidden)]
+pub fn ex_abs_normalized(rotated: &[f32]) -> Option<Vec<f32>> {
+    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
+    if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
+        return None;
+    }
+    let norm = norm_squared.sqrt();
+    Some(rotated.iter().map(|value| value.abs() / norm).collect())
+}
+
 fn quantize_ex_code(
     rotated: &[f32],
     ex_bits: u8,
@@ -221,19 +235,37 @@ fn quantize_ex_code(
     ex_code_values_dst: &mut [u8],
 ) -> f32 {
     debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
-    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
-    if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
+    let Some(abs_normalized) = ex_abs_normalized(rotated) else {
         ex_code_dst.fill(0);
         ex_code_values_dst.fill(0);
         return 0.0;
-    }
-
-    let norm = norm_squared.sqrt();
-    let abs_normalized = rotated
-        .iter()
-        .map(|value| value.abs() / norm)
-        .collect::<Vec<_>>();
+    };
     let t = best_ex_rescale_factor(&abs_normalized, ex_bits);
+    quantize_ex_code_with_scale(
+        rotated,
+        &abs_normalized,
+        ex_bits,
+        t,
+        ex_code_dst,
+        ex_code_values_dst,
+    )
+}
+
+/// Quantize the ex codes of one rotated residual with an explicit rescale
+/// factor `t` (normally the output of [`best_ex_rescale_factor`]). Writes the
+/// blocked-layout codes into `ex_code_dst`, the per-dim code values into
+/// `ex_code_values_dst`, and returns `sum_d rotated[d] * (full_code[d] + code_bias)`.
+#[doc(hidden)]
+pub fn quantize_ex_code_with_scale(
+    rotated: &[f32],
+    abs_normalized: &[f32],
+    ex_bits: u8,
+    t: f32,
+    ex_code_dst: &mut [u8],
+    ex_code_values_dst: &mut [u8],
+) -> f32 {
+    debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
+    debug_assert_eq!(rotated.len(), abs_normalized.len());
     let max_code = ((1u16 << ex_bits) - 1) as u8;
     let mask = max_code;
     let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
