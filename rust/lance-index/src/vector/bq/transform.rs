@@ -87,12 +87,13 @@ impl RQTransformer {
     }
 }
 
-struct RabitRawQueryFactors {
-    add_factors: Float32Array,
-    scale_factors: Float32Array,
-    error_factors: Float32Array,
-    ex_add_factors: Option<Float32Array>,
-    ex_scale_factors: Option<Float32Array>,
+#[doc(hidden)]
+pub struct RabitRawQueryFactors {
+    pub add_factors: Float32Array,
+    pub scale_factors: Float32Array,
+    pub error_factors: Float32Array,
+    pub ex_add_factors: Option<Float32Array>,
+    pub ex_scale_factors: Option<Float32Array>,
 }
 
 #[inline]
@@ -136,7 +137,8 @@ fn error_factor_value(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_raw_query_factors(
+#[doc(hidden)]
+pub fn compute_raw_query_factors(
     distance_type: DistanceType,
     res_norm_square: &Float32Array,
     rotated_residuals: &[f32],
