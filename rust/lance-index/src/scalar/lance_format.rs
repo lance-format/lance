@@ -736,9 +736,9 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
+    use lance_core::ROW_ADDR;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
-    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
 
@@ -2124,7 +2124,7 @@ mod tests {
                     false,
                 )))),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
@@ -2240,7 +2240,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
                 true,
             ),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),

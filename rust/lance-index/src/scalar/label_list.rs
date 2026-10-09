@@ -30,7 +30,7 @@ use lance_core::cache::{
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_datafusion::exec::{
     HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
 };
@@ -60,7 +60,20 @@ use crate::{Index, IndexType};
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const LABEL_LIST_NULLS_METADATA_KEY: &str = "lance:label_list_nulls";
 pub const LABEL_LIST_NULLS_MIN_VERSION: i32 = 1;
-const LABEL_LIST_INDEX_VERSION: u32 = 1;
+/// LabelList index format version 1: the underlying bitmap stores row ids
+/// (`_rowid`). Also the version floor for list-null metadata support (see
+/// [`LABEL_LIST_NULLS_MIN_VERSION`]); row-address-domain support came later,
+/// so every row-id-domain segment this build can still read already has that
+/// metadata.
+pub const LABEL_LIST_ROW_ID_DOMAIN_VERSION: u32 = 1;
+/// LabelList index format version 2: the underlying bitmap stores physical
+/// row addresses (`_rowaddr`).
+///
+/// The older version (1) stored row ids (`_rowid`).
+pub const LABEL_LIST_ROW_ADDR_DOMAIN_VERSION: u32 = 2;
+/// The latest index format version (mainly used in tests that don't want to
+/// target a specific version)
+const LABEL_LIST_INDEX_VERSION: u32 = LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
 
 #[async_trait]
 trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
@@ -107,13 +120,15 @@ impl LabelListIndex {
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
-        // LabelList always stores row ids directly, unlike the standalone
-        // Bitmap index: it trains and merges through the shared
-        // `build_index_map`/`merge_index_maps` helpers with an explicit
-        // `ROW_ID` id column, never `ROW_ADDR`.
-        let values_index =
-            BitmapIndex::load(store.clone(), frag_reuse_index.clone(), index_cache, false).await?;
+        let values_index = BitmapIndex::load(
+            store.clone(),
+            frag_reuse_index.clone(),
+            index_cache,
+            results_are_row_addresses,
+        )
+        .await?;
         let list_nulls = read_list_nulls(store, frag_reuse_index).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
@@ -124,11 +139,16 @@ impl LabelListIndex {
         store: Arc<dyn IndexStore>,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        let values_index =
-            BitmapIndex::load_with_remapping(store.clone(), remapping.clone(), index_cache, false)
-                .await?;
+        let values_index = BitmapIndex::load_with_remapping(
+            store.clone(),
+            remapping.clone(),
+            index_cache,
+            results_are_row_addresses,
+        )
+        .await?;
         let list_nulls = read_list_nulls_with_remapping(store, remapping).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
@@ -241,6 +261,10 @@ impl ScalarIndex for LabelListIndex {
         true
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.values_index.results_are_row_addresses()
+    }
+
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
@@ -266,7 +290,16 @@ impl ScalarIndex for LabelListIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
-            index_version: LABEL_LIST_INDEX_VERSION,
+            // Preserve this segment's own domain rather than the latest
+            // version this build can write: remapping a row-id-domain
+            // segment (valid on a dataset without stable row ids, where a
+            // row id already is a row address) must not silently flip it to
+            // address-domain.
+            index_version: if self.results_are_row_addresses() {
+                LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
+            } else {
+                LABEL_LIST_ROW_ID_DOMAIN_VERSION
+            },
             files: vec![file],
         })
     }
@@ -284,13 +317,21 @@ impl ScalarIndex for LabelListIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
-            index_version: LABEL_LIST_INDEX_VERSION,
+            // Preserve this segment's own domain -- see the matching comment
+            // on `remap`. The caller is responsible for never reaching this
+            // with new address-domain data to merge onto a row-id-domain
+            // segment (see `legacy_domain_mismatch` in `append.rs`).
+            index_version: if self.results_are_row_addresses() {
+                LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
+            } else {
+                LABEL_LIST_ROW_ID_DOMAIN_VERSION
+            },
             files: vec![file],
         })
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -345,7 +386,7 @@ fn record_list_nulls(
     list_nulls: &Arc<Mutex<RowAddrTreeMap>>,
 ) -> datafusion_common::Result<()> {
     let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-    let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
+    let row_ids = batch.column_by_name(ROW_ADDR).expect_ok()?;
     let row_ids = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
 
     let mut local_nulls = RowAddrTreeMap::new();
@@ -625,7 +666,7 @@ async fn write_label_list_index(
         })
         .into_iter()
         .collect();
-    build_index_map(sorted_labels, old_segments, &mut writer, ROW_ID).await?;
+    build_index_map(sorted_labels, old_segments, &mut writer, ROW_ADDR).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
@@ -753,6 +794,7 @@ pub async fn merge_label_list_indices(
     }
 
     let value_type = source_indices[0].values_index.value_type().clone();
+    let results_are_row_addresses = source_indices[0].results_are_row_addresses();
     let mut merged_nulls = RowAddrTreeMap::new();
 
     let mut values_indices = Vec::with_capacity(source_indices.len());
@@ -763,6 +805,13 @@ pub async fn merge_label_list_indices(
                 source_index.values_index.value_type(),
                 value_type
             )));
+        }
+        if source_index.results_are_row_addresses() != results_are_row_addresses {
+            return Err(Error::index(
+                "cannot merge LabelList segments that disagree on whether they store row \
+                 ids or row addresses -- rebuild them into one segment first"
+                    .to_string(),
+            ));
         }
         values_indices.push(source_index.values_index.clone());
 
@@ -814,7 +863,14 @@ pub async fn merge_label_list_indices(
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
             .unwrap(),
-        index_version: LABEL_LIST_INDEX_VERSION,
+        // Preserve the source segments' own domain (checked above to agree)
+        // rather than the latest version this build can write -- see the
+        // matching comment on `ScalarIndex::remap` for `LabelListIndex`.
+        index_version: if results_are_row_addresses {
+            LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
+        } else {
+            LABEL_LIST_ROW_ID_DOMAIN_VERSION
+        },
         files: vec![file],
     })
 }
@@ -969,7 +1025,7 @@ impl BasicTrainer for LabelListIndexPlugin {
         validate_label_list_data_type(field.data_type())?;
 
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 
@@ -1047,14 +1103,18 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            LabelListIndex::load(index_store, frag_reuse_index, cache).await?
-                as Arc<dyn ScalarIndex>,
+        let results_are_row_addresses = index_version >= LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
+        Ok(LabelListIndex::load(
+            index_store,
+            frag_reuse_index,
+            cache,
+            results_are_row_addresses,
         )
+        .await? as Arc<dyn ScalarIndex>)
     }
 
     fn supports_batch_row_id_remapping(&self) -> bool {
@@ -1065,11 +1125,18 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(LabelListIndex::load_with_remapping(index_store, remapping, cache).await?)
+        let results_are_row_addresses = index_version >= LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
+        Ok(LabelListIndex::load_with_remapping(
+            index_store,
+            remapping,
+            cache,
+            results_are_row_addresses,
+        )
+        .await?)
     }
 
     async fn get_from_cache(
@@ -1342,7 +1409,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 true,
             ),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]))
     }
 
@@ -1578,7 +1645,7 @@ mod tests {
         train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
             .await
             .unwrap();
-        let index = LabelListIndex::load(store, None, &LanceCache::no_cache())
+        let index = LabelListIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         (tmpdir, index)
@@ -1603,7 +1670,7 @@ mod tests {
         train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
             .await
             .unwrap();
-        let index = LabelListIndex::load(src_store.clone(), None, &LanceCache::no_cache())
+        let index = LabelListIndex::load(src_store.clone(), None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1945,7 +2012,7 @@ mod tests {
         let labels = list_builder.finish();
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, labels.data_type().clone(), true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -2026,9 +2093,10 @@ mod tests {
             read_index_contents(legacy_store.as_ref()).await,
             "an unsorted file must carry the same contents"
         );
-        let legacy = LabelListIndex::load(legacy_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let legacy =
+            LabelListIndex::load(legacy_store.clone(), None, &LanceCache::no_cache(), true)
+                .await
+                .unwrap();
 
         // Updating: streaming the unsorted index in as a merge input must still
         // produce the same index as a full rebuild.
@@ -2149,7 +2217,7 @@ mod tests {
                 train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
                     .await
                     .unwrap();
-                let index = LabelListIndex::load(src_store, None, &LanceCache::no_cache())
+                let index = LabelListIndex::load(src_store, None, &LanceCache::no_cache(), true)
                     .await
                     .unwrap();
                 // Identity mapping: the addresses must survive untouched.

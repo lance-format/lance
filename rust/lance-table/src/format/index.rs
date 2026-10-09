@@ -162,11 +162,18 @@ impl IndexMetadata {
             // (`lance_index::scalar::bitmap::BITMAP_ROW_ADDR_DOMAIN_VERSION`).
             let is_bitmap_addr_domain =
                 details.type_url.ends_with("BitmapIndexDetails") && self.index_version >= 1;
+            // Likewise for LabelList, from format version 2 onward
+            // (`lance_index::scalar::label_list::LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`).
+            // Version 1 is the row-id-domain floor for list-null metadata
+            // support (`LABEL_LIST_NULLS_MIN_VERSION`), not address domain.
+            let is_label_list_addr_domain =
+                details.type_url.ends_with("LabelListIndexDetails") && self.index_version >= 2;
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
                 || is_btree_addr_domain
                 || is_bitmap_addr_domain
+                || is_label_list_addr_domain
         })
     }
 
