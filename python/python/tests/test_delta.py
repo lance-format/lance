@@ -111,6 +111,43 @@ def test_delta_with_explicit_version_range():
     assert total_rows == 2
 
 
+def test_delta_begin_version_zero():
+    # Version 0 is the empty snapshot, so (0, N] covers everything written up
+    # to version N. Regression test for #9793: begin_version=0 was dropped by a
+    # truthiness check in LanceDataset.delta() before reaching the Rust builder.
+    table1 = pa.table(
+        {
+            "id": pa.array([1, 2], type=pa.int32()),
+            "val": pa.array(["a", "b"], type=pa.string()),
+        }
+    )
+    ds = write_dataset(
+        table1, "memory://delta_begin_version_zero", enable_stable_row_ids=True
+    )
+
+    table2 = pa.table(
+        {
+            "id": pa.array([3], type=pa.int32()),
+            "val": pa.array(["c"], type=pa.string()),
+        }
+    )
+    ds.insert(table2)
+
+    # (0, 1] returns the rows written in version 1
+    delta = ds.delta(begin_version=0, end_version=1)
+    inserted = []
+    for batch in delta.get_inserted_rows():
+        inserted.extend(batch.column("id").to_pylist())
+    assert sorted(inserted) == [1, 2]
+
+    # (0, 2] returns everything written up to version 2
+    delta_all = ds.delta(begin_version=0, end_version=2)
+    inserted_all = []
+    for batch in delta_all.get_inserted_rows():
+        inserted_all.extend(batch.column("id").to_pylist())
+    assert sorted(inserted_all) == [1, 2, 3]
+
+
 def test_delta_validation_errors():
     table = pa.table({"id": pa.array([1, 2, 3], type=pa.int32())})
     ds = write_dataset(table, "memory://delta_validation_test")
@@ -134,6 +171,14 @@ def test_delta_validation_errors():
         "and with_end_version",
     ):
         ds.delta(end_version=2)
+
+    # Error: only begin_version=0 specified (0 is a valid version, not "unset")
+    with pytest.raises(
+        ValueError,
+        match="Invalid user input: Must specify both with_begin_version "
+        "and with_end_version",
+    ):
+        ds.delta(begin_version=0)
 
 
 def test_delta_get_deleted_row_ids():
