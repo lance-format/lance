@@ -61,6 +61,7 @@ use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use lance_core::cache::CacheLoadOrigin;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -2414,6 +2415,7 @@ impl Index for BTreeIndex {
         while let Some((page_idx, page)) = pages.try_next().await? {
             let inserted = self
                 .index_cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,

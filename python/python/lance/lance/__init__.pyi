@@ -346,6 +346,20 @@ class _Session:
         ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
+    def cache_diagnostics(
+        self, refresh: bool = False, by_type: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """Inspect lifetime activity and backend accounting for both caches.
+
+        The top-level keys are ``index`` and ``metadata``. Each value contains
+        ``activity``, ``backend``, and ``utilization``. Unsupported backend
+        measurements, unknown capacities, and utilization for zero capacity are
+        represented by ``None``. Setting ``refresh`` requests backend maintenance
+        before sampling. Setting ``by_type`` scans resident entries and adds a
+        ``by_type`` dictionary with bounded activity and approximate occupancy.
+        Either option may be more expensive.
+        """
+        ...
 
 class LanceBlobFile:
     def close(self): ...

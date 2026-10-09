@@ -1764,6 +1764,10 @@ mod tests {
         base.prewarm_mem_wal(std::slice::from_ref(&snapshot), Some(&cache))
             .await
             .expect("prewarm must open the generation and warm its index");
+        let diagnostics = base.session().cache_diagnostics();
+        let warm_activity = &diagnostics.index.activity.warm;
+        assert!(warm_activity.attempts > 0);
+        assert!(warm_activity.loads_succeeded > 0);
 
         // The generation is resident in the cache (same session), with its
         // index loadable — a later lookup that opens this path is a pure hit.

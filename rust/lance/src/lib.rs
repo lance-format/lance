@@ -100,6 +100,14 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
 }
 
+/// Protobuf transport used by cache diagnostics language bindings.
+///
+/// These messages are runtime API payloads and are not part of the persisted
+/// Lance file format.
+pub mod cache_diagnostics_pb {
+    include!(concat!(env!("OUT_DIR"), "/lance.cache.rs"));
+}
+
 pub use blob::{
     BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
     BlobFieldOptions, BlobRange, DedicatedBlobWriter, PackedBlobWriter, blob_field,

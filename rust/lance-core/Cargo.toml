@@ -27,6 +27,7 @@ futures.workspace = true
 libc.workspace = true
 libm.workspace = true
 moka.workspace = true
+metrics = { workspace = true, optional = true }
 quick_cache = "0.6"
 num_cpus = "1.0"
 object_store = { workspace = true }
@@ -47,6 +48,7 @@ log.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+metrics-util.workspace = true
 rstest.workspace = true
 tokio-stream.workspace = true
 
@@ -56,10 +58,24 @@ tokio-stream.workspace = true
 # is still gated by RUST_BACKTRACE=1.
 backtrace = []
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
+metrics = ["dep:metrics"]
 
 [[bench]]
 name = "cache_keys"
 harness = false
+
+[[bench]]
+name = "cache_metrics_regressions"
+harness = false
+
+[[bench]]
+name = "cache_metrics_allocations"
+harness = false
+
+[[bench]]
+name = "cache_metrics_export"
+harness = false
+required-features = ["metrics"]
 
 [lints]
 workspace = true

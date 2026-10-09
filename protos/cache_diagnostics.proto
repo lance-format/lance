@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.cache;
+
+option java_package = "org.lance.protobuf";
+option java_outer_classname = "CacheDiagnosticsProto";
+
+/*
+ * Runtime diagnostics transport for language bindings. This is not a
+ * persisted Lance file-format message.
+ */
+message CacheActivityDiagnostics {
+  uint64 hits = 1;
+  uint64 misses = 2;
+  uint64 lookup_errors = 3;
+  uint64 type_mismatches = 4;
+  uint64 loads_started = 5;
+  uint64 loads_succeeded = 6;
+  uint64 loads_failed = 7;
+  uint64 loads_cancelled = 8;
+  uint64 loads_in_flight = 9;
+  uint64 load_success_duration_ns = 10;
+  uint64 load_error_duration_ns = 11;
+  uint64 load_cancelled_duration_ns = 12;
+  CacheWarmActivityDiagnostics warm = 13;
+}
+
+message CacheWarmActivityDiagnostics {
+  uint64 attempts = 1;
+  uint64 hits = 2;
+  uint64 loads_started = 3;
+  uint64 loads_succeeded = 4;
+  uint64 loads_failed = 5;
+  uint64 loads_cancelled = 6;
+  uint64 load_bytes = 7;
+  uint64 errors = 8;
+}
+
+message CacheBackendDiagnostics {
+  enum Kind {
+    CUSTOM = 0;
+    QUICK = 1;
+    MOKA = 2;
+  }
+
+  Kind kind = 1;
+  optional uint64 pool_id = 2;
+  optional uint64 capacity_bytes = 3;
+  optional bool enabled = 4;
+  optional uint64 size_bytes = 5;
+  optional uint64 num_entries = 6;
+  optional uint64 write_attempts = 7;
+  optional uint64 write_bytes = 8;
+  optional uint64 size_removals = 9;
+  optional uint64 size_removed_bytes = 10;
+  optional uint64 disabled_write_rejections = 11;
+  optional uint64 disabled_bypasses = 12;
+  optional uint64 lost_placeholder_rejections = 13;
+  optional uint64 weight_saturations = 14;
+  bool write_rejections_complete = 15;
+  optional uint64 resident_evictions = 16;
+  optional uint64 admissions = 17;
+  optional uint64 coalesced_loads = 18;
+}
+
+message CacheTypeActivityDiagnostics {
+  string type_name = 1;
+  CacheActivityDiagnostics activity = 2;
+}
+
+message CacheTypeOccupancyDiagnostics {
+  string type_name = 1;
+  uint64 size_bytes = 2;
+  uint64 num_entries = 3;
+}
+
+message CacheOccupancyByTypeDiagnostics {
+  repeated CacheTypeOccupancyDiagnostics types = 1;
+  uint64 untagged_size_bytes = 2;
+  uint64 untagged_num_entries = 3;
+}
+
+message CacheByTypeDiagnostics {
+  repeated CacheTypeActivityDiagnostics activity = 1;
+  // Absent when the backend cannot enumerate tagged resident records.
+  CacheOccupancyByTypeDiagnostics occupancy = 2;
+  uint64 type_label_overflow_events = 3;
+}
+
+message CacheDiagnosticsSnapshot {
+  CacheActivityDiagnostics activity = 1;
+  CacheBackendDiagnostics backend = 2;
+  optional double utilization = 3;
+  // Present only when the caller explicitly requests a per-type scan.
+  CacheByTypeDiagnostics by_type = 4;
+}
+
+message SessionCacheDiagnostics {
+  CacheDiagnosticsSnapshot index = 1;
+  CacheDiagnosticsSnapshot metadata = 2;
+}

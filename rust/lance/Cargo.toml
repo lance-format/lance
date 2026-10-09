@@ -164,7 +164,7 @@ goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
 # Publish object store metrics via the `metrics` crate.
-metrics = ["lance-io/metrics"]
+metrics = ["lance-core/metrics", "lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []

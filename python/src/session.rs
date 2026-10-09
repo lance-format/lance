@@ -6,10 +6,13 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyString};
-use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
+use pyo3::{Bound, PyAny, PyResult, Python, pyclass, pymethods};
 
 use lance::session::{CacheSpec, Session as LanceSession};
-use lance_core::cache::{BackendConfig, build_from_config, build_from_uri};
+use lance_core::cache::{
+    BackendConfig, CacheActivity, CacheDiagnostics, CacheSnapshotMode, build_from_config,
+    build_from_uri,
+};
 
 use crate::object_store::PyObjectStoreRegistry;
 use crate::rt;
@@ -161,6 +164,112 @@ fn backend_config_from_dict(field: &str, dict: &Bound<'_, PyDict>) -> PyResult<B
     Ok(config)
 }
 
+fn activity_to_dict<'py>(
+    py: Python<'py>,
+    activity: &CacheActivity,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("hits", activity.hits)?;
+    result.set_item("misses", activity.misses)?;
+    result.set_item("lookup_errors", activity.lookup_errors)?;
+    result.set_item("type_mismatches", activity.type_mismatches)?;
+    result.set_item("loads_started", activity.loads_started)?;
+    result.set_item("loads_succeeded", activity.loads_succeeded)?;
+    result.set_item("loads_failed", activity.loads_failed)?;
+    result.set_item("loads_cancelled", activity.loads_cancelled)?;
+    result.set_item("loads_in_flight", activity.loads_in_flight)?;
+    result.set_item(
+        "load_success_duration_ns",
+        activity.load_success_duration_ns,
+    )?;
+    result.set_item("load_error_duration_ns", activity.load_error_duration_ns)?;
+    result.set_item(
+        "load_cancelled_duration_ns",
+        activity.load_cancelled_duration_ns,
+    )?;
+    let warm = PyDict::new(py);
+    warm.set_item("attempts", activity.warm.attempts)?;
+    warm.set_item("hits", activity.warm.hits)?;
+    warm.set_item("loads_started", activity.warm.loads_started)?;
+    warm.set_item("loads_succeeded", activity.warm.loads_succeeded)?;
+    warm.set_item("loads_failed", activity.warm.loads_failed)?;
+    warm.set_item("loads_cancelled", activity.warm.loads_cancelled)?;
+    warm.set_item("load_bytes", activity.warm.load_bytes)?;
+    warm.set_item("errors", activity.warm.errors)?;
+    result.set_item("warm", warm)?;
+    Ok(result)
+}
+
+fn diagnostics_to_dict<'py>(
+    py: Python<'py>,
+    diagnostics: &CacheDiagnostics,
+) -> PyResult<Bound<'py, PyDict>> {
+    let backend = PyDict::new(py);
+    backend.set_item("kind", diagnostics.backend.kind.as_str())?;
+    backend.set_item("pool_id", diagnostics.backend.pool_id)?;
+    backend.set_item("capacity_bytes", diagnostics.backend.capacity_bytes)?;
+    backend.set_item("enabled", diagnostics.backend.enabled)?;
+    backend.set_item("size_bytes", diagnostics.backend.size_bytes)?;
+    backend.set_item("num_entries", diagnostics.backend.num_entries)?;
+    backend.set_item("write_attempts", diagnostics.backend.write_attempts)?;
+    backend.set_item("write_bytes", diagnostics.backend.write_bytes)?;
+    backend.set_item("size_removals", diagnostics.backend.size_removals)?;
+    backend.set_item("size_removed_bytes", diagnostics.backend.size_removed_bytes)?;
+    backend.set_item(
+        "disabled_write_rejections",
+        diagnostics.backend.disabled_write_rejections,
+    )?;
+    backend.set_item("disabled_bypasses", diagnostics.backend.disabled_bypasses)?;
+    backend.set_item(
+        "lost_placeholder_rejections",
+        diagnostics.backend.lost_placeholder_rejections,
+    )?;
+    backend.set_item("weight_saturations", diagnostics.backend.weight_saturations)?;
+    backend.set_item(
+        "write_rejections_complete",
+        diagnostics.backend.write_rejections_complete,
+    )?;
+    backend.set_item("resident_evictions", diagnostics.backend.resident_evictions)?;
+    backend.set_item("admissions", diagnostics.backend.admissions)?;
+    backend.set_item("coalesced_loads", diagnostics.backend.coalesced_loads)?;
+
+    let result = PyDict::new(py);
+    result.set_item("activity", activity_to_dict(py, &diagnostics.activity)?)?;
+    result.set_item("backend", backend)?;
+    result.set_item("utilization", diagnostics.utilization)?;
+    if let Some(by_type) = &diagnostics.by_type {
+        let activity = PyDict::new(py);
+        for item in &by_type.activity {
+            activity.set_item(&item.type_name, activity_to_dict(py, &item.activity)?)?;
+        }
+
+        let detail = PyDict::new(py);
+        detail.set_item("activity", activity)?;
+        detail.set_item(
+            "type_label_overflow_events",
+            by_type.type_label_overflow_events,
+        )?;
+        if let Some(occupancy) = &by_type.occupancy {
+            let types = PyDict::new(py);
+            for item in &occupancy.types {
+                let values = PyDict::new(py);
+                values.set_item("size_bytes", item.size_bytes)?;
+                values.set_item("num_entries", item.num_entries)?;
+                types.set_item(&item.type_name, values)?;
+            }
+            let values = PyDict::new(py);
+            values.set_item("types", types)?;
+            values.set_item("untagged_size_bytes", occupancy.untagged_size_bytes)?;
+            values.set_item("untagged_num_entries", occupancy.untagged_num_entries)?;
+            detail.set_item("occupancy", values)?;
+        } else {
+            detail.set_item("occupancy", py.None())?;
+        }
+        result.set_item("by_type", detail)?;
+    }
+    Ok(result)
+}
+
 #[pymethods]
 impl Session {
     #[new]
@@ -223,6 +332,55 @@ impl Session {
         rt().block_on(None, async move {
             self.inner.index_cache_stats().await.size_bytes as u64
         })
+    }
+
+    /// Inspect lifetime activity and physical accounting for both session caches.
+    ///
+    /// The returned dictionary contains ``index`` and ``metadata`` entries.
+    /// Each has an ``activity`` dictionary, a ``backend`` dictionary, and a
+    /// derived ``utilization`` value. Unsupported measurements and utilization
+    /// for zero or unknown capacity are ``None``. Counts do not reset when the
+    /// cache is cleared. Fields are sampled independently and may change while
+    /// cache operations are running.
+    /// ``activity["warm"]`` reports explicit prewarm attempts, hits, submitted
+    /// materializations, accounted bytes, and cache-call errors.
+    ///
+    /// Set ``refresh=True`` to request backend maintenance before sampling.
+    /// Set ``by_type=True`` to scan resident entries and include bounded
+    /// per-type activity and occupancy. Either option can be more expensive,
+    /// and the GIL is released while waiting.
+    #[pyo3(signature = (refresh=false, by_type=false))]
+    pub fn cache_diagnostics<'py>(
+        &self,
+        py: Python<'py>,
+        refresh: bool,
+        by_type: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let diagnostics = if by_type {
+            let session = self.inner.clone();
+            let mode = if refresh {
+                CacheSnapshotMode::Refreshed
+            } else {
+                CacheSnapshotMode::Approximate
+            };
+            rt().block_on(Some(py), async move {
+                session.cache_diagnostics_by_type(mode).await
+            })?
+        } else if refresh {
+            let session = self.inner.clone();
+            rt().block_on(Some(py), async move {
+                session
+                    .cache_diagnostics_with_mode(CacheSnapshotMode::Refreshed)
+                    .await
+            })?
+        } else {
+            self.inner.cache_diagnostics()
+        };
+
+        let result = PyDict::new(py);
+        result.set_item("index", diagnostics_to_dict(py, &diagnostics.index)?)?;
+        result.set_item("metadata", diagnostics_to_dict(py, &diagnostics.metadata)?)?;
+        Ok(result)
     }
 
     /// Return whether the other session is the same as this one.

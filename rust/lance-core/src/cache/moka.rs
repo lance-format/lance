@@ -1,25 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::pin::Pin;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use futures::Future;
 
 use crate::Result;
 use crate::deepsize::Context;
 use crate::error::CloneableError;
 
-use super::backend::{CacheBackend, CacheEntry};
-use super::{CacheCodec, InternalCacheKey};
+use super::backend::{CacheBackend, CacheEntry, CacheLoader};
+use super::backend_metrics::BackendCounters;
+use super::{
+    CacheBackendDiagnostics, CacheBackendKind, CacheCodec, CacheLoadOutcome, CacheOccupancyByType,
+    CacheOperationContext, CacheSnapshotMode, CacheTypeOccupancy, InternalCacheKey,
+};
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
 struct MokaCacheEntry {
     entry: CacheEntry,
     size_bytes: usize,
+    type_name: Option<&'static str>,
 }
 
 /// Per-entry key cost for eviction.
@@ -54,6 +58,62 @@ pub struct MokaCacheBackend {
     cache: moka::future::Cache<InternalCacheKey, MokaCacheEntry>,
     capacity: usize,
     weight_unit: usize,
+    metrics: Arc<BackendCounters>,
+}
+
+/// Configuration for a [`MokaCacheBackend`].
+///
+/// Size-removal metrics are disabled by default because Moka's eviction
+/// listener adds overhead to writes and eviction maintenance.
+#[derive(Debug)]
+pub struct MokaCacheBackendBuilder {
+    capacity: usize,
+    has_size_removal_metrics: bool,
+}
+
+impl MokaCacheBackendBuilder {
+    /// Enable size-removal counts and accounted bytes through Moka's eviction listener.
+    ///
+    /// Size removals include rejected candidates as well as resident victims.
+    /// The corresponding diagnostics fields are `None` unless this is enabled.
+    pub fn with_size_removal_metrics(mut self) -> Self {
+        self.has_size_removal_metrics = true;
+        self
+    }
+
+    /// Build the configured backend.
+    pub fn build(self) -> MokaCacheBackend {
+        let metrics = Arc::new(BackendCounters::new(
+            CacheBackendKind::Moka,
+            self.has_size_removal_metrics,
+        ));
+        let weight_unit = weight_unit(self.capacity);
+        let capacity_weight = self.capacity.div_ceil(weight_unit) as u64;
+        let cache_builder = moka::future::Cache::builder()
+            .max_capacity(capacity_weight)
+            .weigher(move |key: &InternalCacheKey, entry: &MokaCacheEntry| {
+                entry_weight(key, entry.size_bytes, weight_unit)
+            });
+        let cache_builder = if self.has_size_removal_metrics {
+            let removal_metrics = metrics.clone();
+            cache_builder.eviction_listener(move |key, entry: MokaCacheEntry, cause| {
+                if cause == moka::notification::RemovalCause::Size {
+                    // The same signal covers rejected candidates and resident victims.
+                    let bytes = (entry_weight(key.as_ref(), entry.size_bytes, weight_unit) as u64)
+                        .saturating_mul(weight_unit as u64);
+                    removal_metrics.size_removal(1, bytes);
+                }
+            })
+        } else {
+            cache_builder
+        };
+        MokaCacheBackend {
+            cache: cache_builder.build(),
+            capacity: self.capacity,
+            weight_unit,
+            metrics,
+        }
+    }
 }
 
 impl std::fmt::Debug for MokaCacheBackend {
@@ -65,28 +125,30 @@ impl std::fmt::Debug for MokaCacheBackend {
 }
 
 impl MokaCacheBackend {
-    pub fn with_capacity(capacity: usize) -> Self {
-        let weight_unit = weight_unit(capacity);
-        let capacity_weight = capacity.div_ceil(weight_unit) as u64;
-        let cache = moka::future::Cache::builder()
-            .max_capacity(capacity_weight)
-            .weigher(move |key: &InternalCacheKey, entry: &MokaCacheEntry| {
-                entry_weight(key, entry.size_bytes, weight_unit)
-            })
-            .build();
-        Self {
-            cache,
+    /// Configure a Moka backend with `capacity` weighted bytes.
+    ///
+    /// Size-removal metrics are disabled unless explicitly enabled:
+    ///
+    /// ```
+    /// use lance_core::cache::MokaCacheBackend;
+    /// let backend = MokaCacheBackend::builder(1024)
+    ///     .with_size_removal_metrics()
+    ///     .build();
+    /// assert_eq!(backend.capacity(), 1024);
+    /// ```
+    pub fn builder(capacity: usize) -> MokaCacheBackendBuilder {
+        MokaCacheBackendBuilder {
             capacity,
-            weight_unit,
+            has_size_removal_metrics: false,
         }
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::builder(capacity).build()
+    }
+
     pub fn no_cache() -> Self {
-        Self {
-            cache: moka::future::Cache::new(0),
-            capacity: 0,
-            weight_unit: 1,
-        }
+        Self::with_capacity(0)
     }
 
     /// Configured weighted capacity in bytes.
@@ -100,6 +162,128 @@ impl MokaCacheBackend {
             .saturating_mul(self.weight_unit as u64)
             .try_into()
             .unwrap_or(usize::MAX)
+    }
+
+    fn record_write(&self, key: &InternalCacheKey, size_bytes: usize) {
+        let bytes = (entry_weight(key, size_bytes, self.weight_unit) as u64)
+            .saturating_mul(self.weight_unit as u64);
+        self.metrics.write(bytes);
+        if self.capacity == 0 {
+            self.metrics.disabled_rejection();
+        }
+        if key_footprint(key).checked_add(size_bytes).is_none()
+            || physical_size(key, size_bytes).div_ceil(self.weight_unit) > u32::MAX as usize
+        {
+            self.metrics
+                .weight_saturations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn insert_tagged(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        type_name: Option<&'static str>,
+    ) {
+        self.record_write(key, size_bytes);
+        self.cache
+            .insert(
+                *key,
+                MokaCacheEntry {
+                    entry,
+                    size_bytes,
+                    type_name,
+                },
+            )
+            .await;
+    }
+
+    async fn get_or_insert_tagged<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+        type_name: Option<&'static str>,
+    ) -> Result<(CacheEntry, bool)> {
+        self.get_or_insert_tagged_outcome(key, loader, type_name)
+            .await
+            .map(|(entry, outcome)| (entry, outcome.was_loader_skipped()))
+    }
+
+    async fn get_or_insert_tagged_outcome<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+        type_name: Option<&'static str>,
+    ) -> Result<(CacheEntry, CacheLoadOutcome)> {
+        if self.capacity == 0 {
+            self.metrics.disabled_bypass();
+            return loader
+                .await
+                .map(|(entry, _)| (entry, CacheLoadOutcome::Loaded));
+        }
+
+        let was_loaded = AtomicBool::new(false);
+        let init = async {
+            was_loaded.store(true, Ordering::Relaxed);
+            loader
+                .await
+                .map(|(entry, size_bytes)| {
+                    self.record_write(key, size_bytes);
+                    MokaCacheEntry {
+                        entry,
+                        size_bytes,
+                        type_name,
+                    }
+                })
+                .map_err(CloneableError)
+        };
+
+        self.cache
+            .try_get_with_by_ref(key, init)
+            .await
+            .map(|record| {
+                let outcome = if was_loaded.load(Ordering::Relaxed) {
+                    CacheLoadOutcome::Loaded
+                } else {
+                    CacheLoadOutcome::LoaderSkippedUnknown
+                };
+                (record.entry, outcome)
+            })
+            .map_err(|error| Arc::unwrap_or_clone(error).0)
+    }
+
+    fn occupancy_by_type(&self) -> CacheOccupancyByType {
+        let mut types = BTreeMap::<&'static str, (u64, u64)>::new();
+        let mut untagged_size_bytes = 0_u64;
+        let mut untagged_num_entries = 0_u64;
+        for (key, record) in self.cache.iter() {
+            let weight = (entry_weight(key.as_ref(), record.size_bytes, self.weight_unit) as u64)
+                .saturating_mul(self.weight_unit as u64);
+            if let Some(type_name) = record.type_name {
+                let totals = types.entry(type_name).or_default();
+                totals.0 = totals.0.saturating_add(weight);
+                totals.1 = totals.1.saturating_add(1);
+            } else {
+                untagged_size_bytes = untagged_size_bytes.saturating_add(weight);
+                untagged_num_entries = untagged_num_entries.saturating_add(1);
+            }
+        }
+        CacheOccupancyByType {
+            types: types
+                .into_iter()
+                .map(
+                    |(type_name, (size_bytes, num_entries))| CacheTypeOccupancy {
+                        type_name: type_name.to_string(),
+                        size_bytes,
+                        num_entries,
+                    },
+                )
+                .collect(),
+            untagged_size_bytes,
+            untagged_num_entries,
+        }
     }
 }
 
@@ -116,42 +300,50 @@ impl CacheBackend for MokaCacheBackend {
         size_bytes: usize,
         _codec: Option<CacheCodec>,
     ) {
-        self.cache
-            .insert(*key, MokaCacheEntry { entry, size_bytes })
+        self.insert_tagged(key, entry, size_bytes, None).await;
+    }
+
+    async fn insert_with_context(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        _codec: Option<CacheCodec>,
+        context: CacheOperationContext,
+    ) {
+        self.insert_tagged(key, entry, size_bytes, context.type_name())
             .await;
     }
 
     async fn get_or_insert<'a>(
         &self,
         key: &InternalCacheKey,
-        loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        loader: CacheLoader<'a>,
         _codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
-        // Avoid Moka's single-flight waiters when nothing can be cached.
-        if self.capacity == 0 {
-            return loader.await.map(|(entry, _)| (entry, false));
-        }
+        self.get_or_insert_tagged(key, loader, None).await
+    }
 
-        // Track whether the loader actually ran (= cache miss).
-        let was_miss = Arc::new(AtomicBool::new(false));
-        let was_miss_clone = was_miss.clone();
+    async fn get_or_insert_with_context<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+        _codec: Option<CacheCodec>,
+        context: CacheOperationContext,
+    ) -> Result<(CacheEntry, bool)> {
+        self.get_or_insert_tagged(key, loader, context.type_name())
+            .await
+    }
 
-        let init = async move {
-            was_miss_clone.store(true, Ordering::Relaxed);
-            loader
-                .await
-                .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
-                .map_err(CloneableError)
-        };
-
-        let owned_key = *key;
-        match self.cache.try_get_with(owned_key, init).await {
-            Ok(record) => {
-                let was_cached = !was_miss.load(Ordering::Relaxed);
-                Ok((record.entry, was_cached))
-            }
-            Err(error) => Err(Arc::unwrap_or_clone(error).0),
-        }
+    async fn get_or_insert_with_context_outcome<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+        _codec: Option<CacheCodec>,
+        context: CacheOperationContext,
+    ) -> Result<(CacheEntry, CacheLoadOutcome)> {
+        self.get_or_insert_tagged_outcome(key, loader, context.type_name())
+            .await
     }
 
     async fn clear(&self) {
@@ -171,6 +363,25 @@ impl CacheBackend for MokaCacheBackend {
 
     fn capacity_bytes(&self) -> Option<usize> {
         Some(self.capacity)
+    }
+
+    fn diagnostics(&self) -> CacheBackendDiagnostics {
+        self.metrics.snapshot(
+            CacheBackendKind::Moka,
+            self.capacity,
+            self.approx_size_bytes(),
+            self.approx_num_entries(),
+        )
+    }
+
+    async fn diagnostics_with_types(
+        &self,
+        mode: CacheSnapshotMode,
+    ) -> (CacheBackendDiagnostics, Option<CacheOccupancyByType>) {
+        if mode == CacheSnapshotMode::Refreshed {
+            self.cache.run_pending_tasks().await;
+        }
+        (self.diagnostics(), Some(self.occupancy_by_type()))
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -312,6 +523,95 @@ mod tests {
         assert_eq!(weight as usize, expected);
         assert_ne!(weight, u32::MAX);
     }
+
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    async fn diagnostics_use_scaled_accounting_and_report_saturation() {
+        let backend = MokaCacheBackend::builder(6 << 30)
+            .with_size_removal_metrics()
+            .build();
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let declared_size = u32::MAX as usize + 1024;
+        let expected = entry_weight(&key, declared_size, backend.weight_unit) as u64
+            * backend.weight_unit as u64;
+        backend
+            .insert(&key, Arc::new(()), declared_size, None)
+            .await;
+        let snapshot = backend
+            .diagnostics_with_mode(super::super::CacheSnapshotMode::Refreshed)
+            .await;
+        assert_eq!(snapshot.write_bytes, Some(expected));
+        assert_eq!(snapshot.size_bytes, Some(expected));
+        assert_eq!(snapshot.weight_saturations, Some(0));
+
+        backend.clear().await;
+        backend.insert(&key, Arc::new(()), usize::MAX, None).await;
+        let snapshot = backend
+            .diagnostics_with_mode(super::super::CacheSnapshotMode::Refreshed)
+            .await;
+        assert_eq!(snapshot.weight_saturations, Some(1));
+        assert_eq!(snapshot.size_removals, Some(1));
+        assert_eq!(
+            snapshot.size_removed_bytes,
+            Some(u32::MAX as u64 * backend.weight_unit as u64)
+        );
+        assert_eq!(snapshot.resident_evictions, None);
+    }
+
+    #[tokio::test]
+    async fn size_removal_metrics_are_opt_in_and_exclude_explicit_removals() {
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let disabled = MokaCacheBackend::with_capacity(256);
+        disabled.insert(&key, Arc::new(()), 1024, None).await;
+        let snapshot = disabled
+            .diagnostics_with_mode(CacheSnapshotMode::Refreshed)
+            .await;
+        assert_eq!(
+            (snapshot.size_removals, snapshot.size_removed_bytes),
+            (None, None)
+        );
+
+        let enabled = MokaCacheBackend::builder(256)
+            .with_size_removal_metrics()
+            .build();
+        enabled.insert(&key, Arc::new(()), 1024, None).await;
+        let snapshot = enabled
+            .diagnostics_with_mode(CacheSnapshotMode::Refreshed)
+            .await;
+        assert_eq!(
+            (snapshot.size_removals, snapshot.size_removed_bytes),
+            (Some(1), Some(1040))
+        );
+        enabled.insert(&key, Arc::new(()), 48, None).await;
+        enabled.clear().await;
+        let snapshot = enabled
+            .diagnostics_with_mode(CacheSnapshotMode::Refreshed)
+            .await;
+        assert_eq!(
+            (snapshot.size_removals, snapshot.size_removed_bytes),
+            (Some(1), Some(1040))
+        );
+
+        for id in 1..8 {
+            enabled
+                .insert(
+                    &InternalCacheKey::from_bytes([id; 16]),
+                    Arc::new(()),
+                    48,
+                    None,
+                )
+                .await;
+        }
+        let snapshot = enabled
+            .diagnostics_with_mode(CacheSnapshotMode::Refreshed)
+            .await;
+        let removals = snapshot.size_removals.unwrap();
+        assert!(removals > 1);
+        assert_eq!(
+            snapshot.size_removed_bytes,
+            Some(1040 + (removals - 1) * 64)
+        );
+    }
 }
 
 /// Registry identifier for the built-in Moka backend.
@@ -322,6 +622,8 @@ pub const MOKA_BACKEND_KIND: &str = "moka";
 /// Recognized options:
 ///   * `capacity` — total weighted capacity in bytes (`usize`).
 ///     This must be present and non-empty.
+///   * `size_removal_metrics` — `true` enables size-removal metrics through
+///     Moka's eviction listener; defaults to `false`.
 ///
 /// Unknown options are rejected so typos surface immediately instead of
 /// silently falling through to the default capacity.
@@ -329,6 +631,7 @@ pub(super) fn build_moka_backend(
     config: &super::registry::BackendConfig,
 ) -> Result<MokaCacheBackend> {
     let mut capacity: Option<usize> = None;
+    let mut has_size_removal_metrics = false;
     for (key, value) in &config.options {
         match key.as_str() {
             "capacity" => {
@@ -345,6 +648,14 @@ pub(super) fn build_moka_backend(
                     })?);
                 }
             }
+            "size_removal_metrics" => {
+                has_size_removal_metrics = value.parse::<bool>().map_err(|err| {
+                    crate::Error::invalid_input(format!(
+                        "moka cache backend: cannot parse size_removal_metrics {:?}: {}",
+                        value, err
+                    ))
+                })?;
+            }
             other => {
                 return Err(crate::Error::invalid_input(format!(
                     "moka cache backend: unknown option {:?}",
@@ -358,7 +669,11 @@ pub(super) fn build_moka_backend(
             "moka cache backend: capacity is required; use moka://?capacity=<bytes>",
         )
     })?;
-    Ok(MokaCacheBackend::with_capacity(capacity))
+    let mut builder = MokaCacheBackend::builder(capacity);
+    if has_size_removal_metrics {
+        builder = builder.with_size_removal_metrics();
+    }
+    Ok(builder.build())
 }
 
 pub(super) fn build_moka(config: &super::registry::BackendConfig) -> Result<Arc<dyn CacheBackend>> {
@@ -379,6 +694,7 @@ mod moka_registry_tests {
             .with_option("capacity", "1048576");
         let backend = build_moka_backend(&cfg).unwrap();
         assert_eq!(backend.capacity(), 1048576);
+        assert_eq!(backend.diagnostics().size_removals, None);
         let _backend = build_from_config(&cfg).unwrap();
     }
 
@@ -388,7 +704,33 @@ mod moka_registry_tests {
         let cfg = parse_backend_uri("moka://?capacity=1048576").unwrap();
         let backend = build_moka_backend(&cfg).unwrap();
         assert_eq!(backend.capacity(), 1048576);
+        assert_eq!(backend.diagnostics().size_removals, None);
         let _backend = build_from_uri("moka://?capacity=1048576").unwrap();
+    }
+
+    #[test]
+    fn test_moka_size_removal_metrics_option() {
+        let _lock = registry_test_lock();
+        let cfg = parse_backend_uri("moka://?capacity=256&size_removal_metrics=true").unwrap();
+        let backend = build_moka_backend(&cfg).unwrap();
+        assert_eq!(backend.diagnostics().size_removals, Some(0));
+
+        let cfg = parse_backend_uri("moka://?capacity=256&size_removal_metrics=false").unwrap();
+        let backend = build_moka_backend(&cfg).unwrap();
+        assert_eq!(backend.diagnostics().size_removals, None);
+    }
+
+    #[test]
+    fn test_moka_rejects_invalid_size_removal_metrics_option() {
+        let _lock = registry_test_lock();
+        let cfg = BackendConfig::new("moka")
+            .unwrap()
+            .with_option("capacity", "256")
+            .with_option("size_removal_metrics", "yes");
+        let err = build_moka_backend(&cfg).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("size_removal_metrics"));
+        assert!(err.to_string().contains("yes"));
     }
 
     #[test]

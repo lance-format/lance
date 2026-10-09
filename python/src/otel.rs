@@ -258,6 +258,9 @@ fn register_bounds() {
     for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
+    for (name, values) in lance_core::cache::histogram_bounds() {
+        bounds.insert((*name).to_string(), Arc::from(*values));
+    }
 }
 
 /// Describe every metric-emitting subsystem so the catalog is populated. Must
@@ -265,6 +268,7 @@ fn register_bounds() {
 /// `describe_metrics()` here.
 fn describe_all() {
     lance_io::object_store::metrics::describe_metrics();
+    lance_core::cache::describe_metrics();
 }
 
 enum MetricValue {
@@ -419,7 +423,10 @@ pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
     let Some(registry) = REGISTRY.get() else {
         return Vec::new();
     };
-    let points = py.detach(|| collect_points(registry));
+    let points = py.detach(|| {
+        lance_core::cache::refresh_metrics();
+        collect_points(registry)
+    });
     points.into_iter().map(PyMetricPoint::from).collect()
 }
 
@@ -617,7 +624,8 @@ mod tests {
     }
 
     #[test]
-    fn describe_all_covers_object_store_metrics() {
+    fn describe_all_covers_emitted_metrics() {
+        use lance_core::cache::telemetry as cache;
         use lance_io::object_store::metrics as os;
 
         let registry = Arc::new(Registry::new(LanceStorage));
@@ -636,5 +644,16 @@ mod tests {
         assert!(matches!(kind(os::METRIC_RETRYABLE), MetricKind::Counter));
         assert!(matches!(kind(os::METRIC_IN_FLIGHT), MetricKind::Gauge));
         assert!(matches!(kind(os::METRIC_DURATION), MetricKind::Histogram));
+        assert!(matches!(kind(cache::METRIC_LOOKUPS), MetricKind::Counter));
+        assert!(matches!(kind(cache::METRIC_LOADS), MetricKind::Counter));
+        assert!(matches!(
+            kind(cache::METRIC_LOAD_DURATION),
+            MetricKind::Histogram
+        ));
+        assert!(matches!(
+            kind(cache::METRIC_ENTRY_SIZE),
+            MetricKind::Histogram
+        ));
+        assert!(matches!(kind(cache::METRIC_CAPACITY), MetricKind::Gauge));
     }
 }

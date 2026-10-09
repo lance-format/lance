@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use arc_swap::ArcSwapWeak;
 use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
-use lance_core::cache::{CacheKey, WeakLanceCache};
+use lance_core::cache::{CacheKey, CacheLoadOrigin, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
@@ -2169,6 +2169,7 @@ impl PartitionDocuments {
                         row_ids: row_ids.clone(),
                     });
                     self.index_cache
+                        .with_load_origin(CacheLoadOrigin::Warm)
                         .insert_with_key(
                             &DocRowIdsKey {
                                 partition_id: self.partition_id,

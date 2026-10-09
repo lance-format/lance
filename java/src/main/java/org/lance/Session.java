@@ -296,6 +296,61 @@ public class Session implements Closeable {
   }
 
   /**
+   * Returns statistics for the index cache of this session.
+   *
+   * <p>The returned legacy statistics reset when the cache is cleared. Use {@link
+   * #getCacheDiagnostics()} for lifetime counts and backend support information.
+   *
+   * @return the index cache statistics
+   */
+  public CacheStats getIndexCacheStats() {
+    Preconditions.checkArgument(nativeSessionHandle != 0, "Session is closed");
+    return indexCacheStatsNative();
+  }
+
+  /**
+   * Returns cheap, approximate lifetime diagnostics for both session caches.
+   *
+   * <p>This does not require OpenTelemetry, scan entries, or request backend maintenance. Fields
+   * are sampled independently and may change concurrently.
+   *
+   * @return diagnostics for the index and metadata caches
+   */
+  public CacheDiagnostics getCacheDiagnostics() {
+    return getCacheDiagnostics(CacheDiagnosticsOptions.builder().build());
+  }
+
+  /**
+   * Returns lifetime diagnostics for both session caches.
+   *
+   * <p>When {@code refresh} is true, each backend is asked to perform maintenance before sampling
+   * occupancy. The result is still not an atomic snapshot.
+   *
+   * @param refresh whether to request backend maintenance before sampling
+   * @return diagnostics for the index and metadata caches
+   */
+  public CacheDiagnostics getCacheDiagnostics(boolean refresh) {
+    return getCacheDiagnostics(CacheDiagnosticsOptions.builder().refresh(refresh).build());
+  }
+
+  /**
+   * Returns lifetime diagnostics for both session caches with explicit collection options.
+   *
+   * <p>Per-type collection scans resident backend records and may take time proportional to the
+   * number of entries. Its occupancy is approximate under concurrent mutation. Ordinary diagnostics
+   * remain constant cost.
+   *
+   * @param options refresh and per-type collection options
+   * @return diagnostics for the index and metadata caches
+   */
+  public CacheDiagnostics getCacheDiagnostics(CacheDiagnosticsOptions options) {
+    Preconditions.checkNotNull(options, "options");
+    Preconditions.checkArgument(nativeSessionHandle != 0, "Session is closed");
+    return CacheDiagnostics.fromBytes(
+        cacheDiagnosticsNative(options.getRefresh(), options.getByType()));
+  }
+
+  /**
    * Returns whether the other session is the same as this one.
    *
    * <p>Two sessions are considered the same if they share the same underlying native session. This
@@ -370,6 +425,10 @@ public class Session implements Closeable {
   private native long sizeBytesNative();
 
   private native CacheStats metadataCacheStatsNative();
+
+  private native CacheStats indexCacheStatsNative();
+
+  private native byte[] cacheDiagnosticsNative(boolean refresh, boolean byType);
 
   private static native void releaseNative(long handle);
 

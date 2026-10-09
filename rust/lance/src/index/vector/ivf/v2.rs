@@ -35,7 +35,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -1885,6 +1885,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Q::Metadata: 'static,
         Q::Storage: 'static,
     {
+        let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -1893,7 +1894,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
             let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
-            if self.index_cache.get_with_key(&leader_key).await.is_some() {
+            if index_cache.get_with_key(&leader_key).await.is_some() {
                 partition_id += 1;
                 continue;
             }
@@ -1904,14 +1905,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             let mut run_end = partition_id + 1;
             while run_end < partitions.end {
                 let key = IVFPartitionKey::<S, Q>::new(run_end);
-                if self.index_cache.get_with_key(&key).await.is_some() {
+                if index_cache.get_with_key(&key).await.is_some() {
                     break;
                 }
                 run_end += 1;
             }
             let run = partition_id..run_end;
-            let (_, was_cached) = self
-                .index_cache
+            let (_, was_cached) = index_cache
                 .get_or_insert_with_key_hit(leader_key, || async {
                     let (index_batches, storage_batches) = tokio::try_join!(
                         read_partition_window_batches(
@@ -1953,9 +1953,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     let mut follower_loads = FuturesUnordered::new();
                     for (offset, batches) in payloads.enumerate() {
                         let follower_id = run.start + offset + 1;
+                        let index_cache = &index_cache;
                         follower_loads.push(async move {
                             let key = IVFPartitionKey::<S, Q>::new(follower_id);
-                            self.index_cache
+                            index_cache
                                 .get_or_insert_with_key(key, || async move {
                                     self.materialize_prewarm_partition(follower_id, batches)
                                         .await
@@ -9113,6 +9114,14 @@ mod tests {
         let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
         assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
 
+        // Prewarm an index that was already opened for demand, so its retained
+        // cache handle must remain suitable for the later query.
+        dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let before_prewarm = dataset.session().cache_diagnostics();
+
         // Reset IO stats after index creation.
         dataset.object_store.as_ref().io_stats_incremental();
 
@@ -9133,6 +9142,19 @@ mod tests {
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
         );
+        let after_prewarm = dataset.session().cache_diagnostics();
+        assert!(
+            after_prewarm.index.activity.warm.attempts
+                > before_prewarm.index.activity.warm.attempts
+        );
+        assert!(
+            after_prewarm.index.activity.warm.loads_succeeded
+                > before_prewarm.index.activity.warm.loads_succeeded
+        );
+        assert!(
+            after_prewarm.index.activity.warm.load_bytes
+                > before_prewarm.index.activity.warm.load_bytes
+        );
 
         // Query should not perform IO after prewarming all deltas.
         let q = vectors.value(0);
@@ -9151,6 +9173,16 @@ mod tests {
             read_iops,
             0,
             "query should not perform IO after prewarm"
+        );
+        let after_query = dataset.session().cache_diagnostics();
+        assert!(after_query.index.activity.hits > after_prewarm.index.activity.hits);
+        assert_eq!(
+            after_query.index.activity.warm.attempts,
+            after_prewarm.index.activity.warm.attempts
+        );
+        assert_eq!(
+            after_query.index.activity.warm.loads_succeeded,
+            after_prewarm.index.activity.warm.loads_succeeded
         );
 
         // Second prewarm should not need IO (already cached).

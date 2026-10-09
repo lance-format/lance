@@ -95,6 +95,11 @@ async fn test_posting_cache_conflict_across_partitions() {
 
     // Prewarm the inverted index (this loads posting lists into cache)
     index.prewarm().await.unwrap();
+    let diagnostics = cache.diagnostics();
+    let warm = &diagnostics.activity.warm;
+    assert!(warm.attempts > 0);
+    assert!(warm.loads_succeeded > 0);
+    assert!(warm.load_bytes > 0);
 
     let tokens = Arc::new(Tokens::new(vec!["test".to_string()], DocType::Text));
     let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
