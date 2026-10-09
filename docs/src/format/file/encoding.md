@@ -567,6 +567,11 @@ free to pretend that the fixed-size list data type does not exist.
 
 ## Compression
 
+Generic block compression (including Range, Delta, block dictionary compositions and generic mini-block
+offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
+contracts. The complete 2.3 format will undergo a consolidated format vote when it is proposed for stable
+status; intermediate unstable revisions do not establish compatibility requirements.
+
 Once a structural encoding is chosen we must determine how to compress the data. There are various buffers that
 might be compressed (e.g. data, repetition, definition, dictionary, etc.). The available compression algorithms
 are also constrained by the structural encoding chosen. For example, when using the full zip layout we require
