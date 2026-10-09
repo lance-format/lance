@@ -146,20 +146,6 @@ or independently of column indices due to variable encoding widths (for Lance fi
 
 </details>
 
-### File Metadata Size Hints
-
-`DataFile.file_metadata_size_bytes` records the suffix length from the Lance
-schema descriptor through the end of the data file. `IndexFile` records the
-same value for Lance-format files in an index segment; it is zero for other
-file formats. Combined with the corresponding total file size, a reader can
-request this suffix before decoding the footer and remove a dependent metadata
-request.
-
-The value is advisory. Zero means unavailable, values larger than the file are
-invalid, and the offsets and counts decoded from the file footer remain
-authoritative. A reader must preserve the ordinary footer-directed fallback
-for missing, invalid, underestimated, or otherwise inconsistent hints.
-
 !!! note "Field-to-column mapping differs between data storage versions"
 
     In **2.0**, all fields (including non-leaf fields like struct and list containers) are assigned
@@ -170,6 +156,22 @@ for missing, invalid, underestimated, or otherwise inconsistent hints.
     levels. Only leaf fields and packed structs have column indices.
 
     See the [5.0.0 migration guide](../../guide/migration.md#500) for a detailed example.
+
+### File Metadata Size Hints
+
+`DataFile.file_metadata_size_bytes` and `IndexFile.file_metadata_size_bytes`
+record the size in bytes of a file's metadata suffix, or 0 if unknown. For a
+Lance file of format version 2.0 or later, this is the file size minus the
+position of global buffer 0, which holds the file's `FileDescriptor`. That
+position is stored in the first entry of the global buffer offset table, which
+the footer locates; see the [file layout](../file/index.md#detailed-overview).
+It is always 0 for legacy (0.1) files and for index files in other formats.
+Writers record either this exact value or 0.
+
+The hint is advisory: it lets a reader fetch the last
+`file_metadata_size_bytes` bytes of the file before decoding the footer. The
+footer stays authoritative. Readers must ignore a value larger than the file
+and read any metadata the footer references outside the hinted range.
 
 ## Deletion Files
 

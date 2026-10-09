@@ -58,9 +58,10 @@ pub struct DataFile {
 
     /// The metadata suffix size in bytes, if known.
     ///
-    /// The suffix starts at the Lance schema descriptor and ends at EOF. Readers
-    /// treat this as an advisory hint and use the file footer as authoritative.
-    /// `None` preserves the footer-directed open path used for older manifests.
+    /// The suffix starts at global buffer 0, which holds the `FileDescriptor`,
+    /// and ends at EOF. Readers treat this as an advisory hint and use the file
+    /// footer as authoritative. `None` preserves the footer-directed open path
+    /// used for older manifests.
     pub file_metadata_size_bytes: Option<NonZero<u64>>,
 
     /// The base path of the datafile, when the datafile is outside the dataset.
@@ -79,17 +80,14 @@ impl DeepSizeOf for DataFile {
 impl Serialize for DataFile {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let field_count = 7 + usize::from(self.file_metadata_size_bytes.is_some());
-        let mut s = serializer.serialize_struct("DataFile", field_count)?;
+        let mut s = serializer.serialize_struct("DataFile", 8)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("fields", self.fields.as_ref())?;
         s.serialize_field("column_indices", self.column_indices.as_ref())?;
         s.serialize_field("file_major_version", &self.file_major_version)?;
         s.serialize_field("file_minor_version", &self.file_minor_version)?;
         s.serialize_field("file_size_bytes", &self.file_size_bytes)?;
-        if let Some(file_metadata_size_bytes) = self.file_metadata_size_bytes {
-            s.serialize_field("file_metadata_size_bytes", &file_metadata_size_bytes)?;
-        }
+        s.serialize_field("file_metadata_size_bytes", &self.file_metadata_size_bytes)?;
         s.serialize_field("base_id", &self.base_id)?;
         s.end()
     }
@@ -109,7 +107,6 @@ impl<'de> Deserialize<'de> for DataFile {
             #[serde(default)]
             file_minor_version: u32,
             file_size_bytes: CachedFileSize,
-            #[serde(default)]
             file_metadata_size_bytes: Option<NonZero<u64>>,
             base_id: Option<u32>,
         }
@@ -945,6 +942,7 @@ mod tests {
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
     use object_store::path::Path;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use serde_json::{Value, json};
 
     #[test]
@@ -1225,11 +1223,38 @@ mod tests {
         assert_eq!(current_file.schema(&schema), schema);
     }
 
-    #[test]
-    fn test_to_json() {
+    #[rstest]
+    #[case::present(1_024, NonZero::new(1_024))]
+    #[case::absent(0, None)]
+    fn test_intern_fragment_file_metadata_size_bytes(
+        #[case] encoded: u64,
+        #[case] expected: Option<NonZero<u64>>,
+    ) {
+        let proto = pb::DataFragment {
+            files: vec![pb::DataFile {
+                path: "data.lance".to_string(),
+                fields: vec![0],
+                file_metadata_size_bytes: encoded,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let interned = DataFileFieldInterner::default()
+            .intern_fragment(proto.clone())
+            .unwrap();
+        assert_eq!(interned.files[0].file_metadata_size_bytes, expected);
+        assert_eq!(interned, Fragment::try_from(proto).unwrap());
+    }
+
+    #[rstest]
+    #[case::present(NonZero::new(1_024))]
+    #[case::absent(None)]
+    fn test_to_json(#[case] file_metadata_size_bytes: Option<NonZero<u64>>) {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
         fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.files[0].file_metadata_size_bytes = file_metadata_size_bytes;
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -1240,7 +1265,7 @@ mod tests {
 
         let json = serde_json::to_string(&fragment).unwrap();
 
-        let value: Value = serde_json::from_str(&json).unwrap();
+        let mut value: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             value,
             json!({
@@ -1248,7 +1273,8 @@ mod tests {
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], 
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null, "base_id": null }
+                     "file_size_bytes": null, "file_metadata_size_bytes": file_metadata_size_bytes,
+                     "base_id": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                   "num_deleted_rows": 10, "base_id": null},
@@ -1257,6 +1283,14 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+
+        // JSON written before the hint existed has no key for it.
+        value["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("file_metadata_size_bytes");
+        let frag3: Fragment = serde_json::from_value(value).unwrap();
+        assert_eq!(frag3.files[0].file_metadata_size_bytes, None);
     }
 
     #[test]

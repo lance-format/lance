@@ -26,11 +26,12 @@ pub struct IndexFile {
     pub path: String,
     /// Size of the file in bytes
     pub size_bytes: u64,
-    /// The metadata suffix size in bytes, if this is a Lance-format file.
+    /// The metadata suffix size in bytes, if known.
     ///
-    /// The suffix starts at the Lance schema descriptor and ends at EOF. Readers
-    /// treat this as an advisory hint and use the file footer as authoritative.
-    /// `None` also represents index files that use another format.
+    /// The suffix starts at global buffer 0, which holds the `FileDescriptor`,
+    /// and ends at EOF. Readers treat this as an advisory hint and use the file
+    /// footer as authoritative. `None` also represents legacy (0.1) Lance files
+    /// and index files that use another format.
     pub file_metadata_size_bytes: Option<NonZero<u64>>,
 }
 

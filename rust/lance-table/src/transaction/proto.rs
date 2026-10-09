@@ -896,4 +896,29 @@ mod tests {
             other => panic!("expected DataOverlay, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_rewritten_index_roundtrips() {
+        let rewritten_index = RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any::default(),
+            new_index_version: 1,
+            new_index_files: Some(vec![
+                IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 4_096,
+                    file_metadata_size_bytes: NonZero::new(256),
+                },
+                IndexFile {
+                    path: "auxiliary.idx".to_string(),
+                    size_bytes: 1_024,
+                    file_metadata_size_bytes: None,
+                },
+            ]),
+        };
+
+        let message = pb::transaction::rewrite::RewrittenIndex::from(&rewritten_index);
+        assert_eq!(RewrittenIndex::try_from(&message).unwrap(), rewritten_index);
+    }
 }
