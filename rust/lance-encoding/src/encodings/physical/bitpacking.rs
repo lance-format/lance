@@ -50,7 +50,7 @@ pub(crate) fn out_of_line_payload_bytes(
             "Out-of-line bitpacking requires an 8, 16, 32, or 64-bit word, got {uncompressed_bit_width}"
         )));
     }
-    if compressed_bit_width == 0 || compressed_bit_width >= uncompressed_bit_width {
+    if compressed_bit_width > uncompressed_bit_width {
         return Err(Error::invalid_input(format!(
             "Out-of-line bitpacking width {compressed_bit_width} is invalid for {uncompressed_bit_width}-bit values"
         )));
@@ -717,7 +717,7 @@ mod test {
     };
     use crate::{
         buffer::LanceBuffer,
-        compression::{BlockDecompressor, MiniBlockDecompressor},
+        compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor},
         data::{BlockInfo, DataBlock, FixedWidthDataBlock},
         testing::{TestCases, check_round_trip_encoding_of_data},
     };
@@ -947,6 +947,27 @@ mod test {
         let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
         let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
         assert_eq!(decoded_values.as_ref(), values.as_slice());
+    }
+
+    #[test]
+    fn test_out_of_line_bitpack_zero_width_roundtrip() {
+        let values = vec![0_u16; 1025];
+        let compressor = OutOfLineBitpacking::new(0, 16);
+        let (payload, _) = compressor
+            .compress(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(values.clone()),
+                bits_per_value: 16,
+                num_values: values.len() as u64,
+                block_info: BlockInfo::new(),
+            }))
+            .unwrap();
+        assert_eq!(payload.as_ref().map(LanceBuffer::len), Some(0));
+
+        let decoded = compressor.decompress(payload, values.len() as u64).unwrap();
+        let DataBlock::FixedWidth(decoded) = decoded else {
+            panic!("expected fixed-width data");
+        };
+        assert_eq!(decoded.data.borrow_to_typed_slice::<u16>().as_ref(), values);
     }
 
     #[test]
