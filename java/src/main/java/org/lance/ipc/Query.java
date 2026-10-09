@@ -33,6 +33,8 @@ public class Query {
   private final boolean useIndex;
   private final int queryParallelism;
   private final ApproxMode approxMode;
+  private final RQPrecision rqPrecision;
+  private final Optional<Integer> rqCascadeFactor;
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
@@ -54,6 +56,8 @@ public class Query {
     this.useIndex = builder.useIndex;
     this.queryParallelism = builder.queryParallelism;
     this.approxMode = builder.approxMode;
+    this.rqPrecision = builder.rqPrecision;
+    this.rqCascadeFactor = builder.rqCascadeFactor;
   }
 
   public String getColumn() {
@@ -100,6 +104,18 @@ public class Query {
     return queryParallelism;
   }
 
+  public Optional<Integer> getRqCascadeFactor() {
+    return rqCascadeFactor;
+  }
+
+  public RQPrecision getRqPrecision() {
+    return rqPrecision;
+  }
+
+  public String getRqPrecisionString() {
+    return rqPrecision.toRustString();
+  }
+
   public ApproxMode getApproxMode() {
     return approxMode;
   }
@@ -137,6 +153,8 @@ public class Query {
     private boolean useIndex = true;
     private int queryParallelism = 0;
     private ApproxMode approxMode = ApproxMode.NORMAL;
+    private RQPrecision rqPrecision = RQPrecision.FULL;
+    private Optional<Integer> rqCascadeFactor = Optional.empty();
 
     /**
      * Sets the column to be searched.
@@ -296,6 +314,18 @@ public class Query {
      * @param approxMode The approximate search mode to use for the query.
      * @return The Builder instance for method chaining.
      */
+    /** Select the precision of a layered IVF_RQ query; default FULL. */
+    /** Candidate oversampling; absent disables cascading. Rust validates positive values. */
+    public Builder setRqCascadeFactor(int factor) {
+      this.rqCascadeFactor = Optional.of(factor);
+      return this;
+    }
+
+    public Builder setRqPrecision(RQPrecision precision) {
+      this.rqPrecision = Preconditions.checkNotNull(precision, "RQPrecision must not be null");
+      return this;
+    }
+
     public Builder setApproxMode(ApproxMode approxMode) {
       this.approxMode = Preconditions.checkNotNull(approxMode, "ApproxMode must not be null");
       return this;

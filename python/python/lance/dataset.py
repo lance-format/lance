@@ -4482,6 +4482,10 @@ class LanceDataset(pa.dataset.Dataset):
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
+            - layered
+                Opt in to independently readable sign/high/low planes. Default is
+                False. Supported total widths are 5 (1+2+2), 7 (1+4+2), and 9
+                (1+4+4); this layout requires a layered-capable reader.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -7144,6 +7148,8 @@ class ScannerBuilder:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        rq_precision: Literal["sign", "high", "full"] = "full",
+        rq_cascade_factor: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7172,7 +7178,19 @@ class ScannerBuilder:
             RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
-            recall and may increase latency.
+            recall and may increase latency. Layered RQ uses the native angular
+            confidence policy in normal mode and a conservative estimator-difference
+            pruning bound in accurate mode. Neither requires raw-vector refinement.
+        rq_precision: {"sign", "high", "full"}, default "full"
+            Select a stored level of a layered IVF_RQ index. High uses 3 total
+            bits for RQ5 and 5 total bits for RQ7/RQ9. Non-layered indexes only
+            support full. The legacy approx_mode="fast" still scores binary codes.
+        rq_cascade_factor: int, optional
+            Positive oversampling factor for quantized candidate reranking.
+            Requires layered full precision and normal/accurate approx_mode.
+            Lower planes are fetched only for candidates; no raw-vector Take is
+            required. refine_factor may additionally refine with data-file vectors.
+            Range queries and row-id remapping use complete partition scoring.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7187,6 +7205,8 @@ class ScannerBuilder:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            rq_precision=rq_precision,
+            rq_cascade_factor=rq_cascade_factor,
             approx_mode=approx_mode,
             distance_range=distance_range,
         )
@@ -8397,6 +8417,8 @@ def _build_vector_search_query(
     query_parallelism: Optional[int] = None,
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+    rq_precision: Literal["sign", "high", "full"] = "full",
+    rq_cascade_factor: Optional[int] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8541,6 +8563,8 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "rq_precision": rq_precision,
+        "rq_cascade_factor": rq_cascade_factor,
         "distance_range": distance_range,
     }
 
@@ -8697,6 +8721,8 @@ class VectorSearchQuery:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
+        rq_precision: Literal["sign", "high", "full"] = "full",
+        rq_cascade_factor: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     ):
         self._inner = _build_vector_search_query(
@@ -8711,6 +8737,8 @@ class VectorSearchQuery:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            rq_precision=rq_precision,
+            rq_cascade_factor=rq_cascade_factor,
             approx_mode=approx_mode,
         )
 
