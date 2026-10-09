@@ -2828,6 +2828,10 @@ mod tests {
             self.inner.with_io_priority(io_priority)
         }
 
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_buffer_size(bytes)
+        }
+
         async fn new_index_file(
             &self,
             name: &str,
@@ -2924,6 +2928,10 @@ mod tests {
 
         fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
             self.inner.with_io_priority(io_priority)
+        }
+
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_buffer_size(bytes)
         }
 
         async fn new_index_file(
@@ -3054,6 +3062,11 @@ mod tests {
 
         fn with_io_priority(&self, _io_priority: u64) -> Arc<dyn IndexStore> {
             // No backing scheduler, so priority is meaningless here.
+            self.clone_arc()
+        }
+
+        fn with_io_buffer_size(&self, _bytes: u64) -> Arc<dyn IndexStore> {
+            // Write-only store: `open_index_file` is unsupported, so there is no read to bound.
             self.clone_arc()
         }
 

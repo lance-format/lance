@@ -78,6 +78,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
+use lance_io::scheduler::SchedulerConfig;
 use lance_io::stream::RecordBatchStream;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use log::{debug, warn};
@@ -91,6 +92,11 @@ mod flat;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
+
+/// Floor for a merge source's share: one storage page, so a source fetches a whole page
+/// rather than trickling. Throughput only — the scheduler admits a pending request whenever
+/// nothing of lower priority is in flight, so a source progresses at any budget.
+const MERGE_MIN_BYTES_PER_SOURCE: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
 const DEFAULT_RANGE_PARTITIONED: bool = false;
@@ -1669,6 +1675,15 @@ impl DeepSizeOf for BTreeIndex {
 }
 
 impl BTreeIndex {
+    /// The same index, reading through a store whose outstanding bytes are capped at
+    /// `bytes`. Only the store differs; the lookup and caches are shared.
+    fn with_io_buffer_size(&self, bytes: u64) -> Self {
+        Self {
+            store: self.store.with_io_buffer_size(bytes),
+            ..self.clone()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         page_lookup: Arc<BTreeLookup>,
@@ -2237,11 +2252,27 @@ impl BTreeIndex {
             )));
         }
 
+        // Every source stream below is built before any is consumed, and `data_stream`
+        // schedules a whole-file read eagerly. Each segment carries its own store, so without
+        // rescoping the merge holds one full byte budget per source, none of it visible to
+        // the memory pool. Count and parallelism come from the sources actually read:
+        // `segments[0]` may be one of the skipped ones, and segments under different base
+        // paths carry different parallelism.
+        let (num_sources, io_parallelism) = segments
+            .iter()
+            .zip(old_data_filters)
+            .filter(|(_, filter)| !filter_keeps_nothing(filter))
+            .fold((0_u64, 0_usize), |(count, parallelism), (segment, _)| {
+                (count + 1, parallelism.max(segment.store.io_parallelism()))
+            });
+        let source_io_buffer_size = merge_io_buffer_size(io_parallelism, num_sources);
+
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
         for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
             if filter_keeps_nothing(old_data_filter) {
                 continue;
             }
+            let segment = segment.with_io_buffer_size(source_io_buffer_size);
             let stream = segment.data_stream().await?;
             let stream = if let Some(frag_reuse_index) = segment.frag_reuse_index.clone() {
                 // Legacy synchronous remapping path.
@@ -2309,6 +2340,17 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// One merge source's share of the byte budget a single scan would have been given.
+///
+/// The aggregate is `max(one scan's budget, num_sources * MERGE_MIN_BYTES_PER_SOURCE)`, so
+/// the division conserves one scan's budget only while `num_sources <= io_parallelism` — 8
+/// sources on local storage, 64 on cloud. Past that the floor binds, the aggregate grows
+/// with the source count, and a caller wanting a fixed total must merge in passes.
+fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
+    let total = SchedulerConfig::max_bandwidth_bytes(io_parallelism);
+    (total / num_sources.max(1)).max(MERGE_MIN_BYTES_PER_SOURCE)
 }
 
 /// True if `filter` would keep no rows at all (its keep-set is empty), letting
@@ -7736,5 +7778,212 @@ mod tests {
             data_stream_iops,
             num_pages
         );
+    }
+
+    /// Records the budget of every `with_io_buffer_size` call made against the store it
+    /// wraps, so a test can assert what `merge_segments` asked each source for.
+    #[derive(Debug)]
+    struct RescopeRecorder {
+        inner: Arc<dyn IndexStore>,
+        seen: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl RescopeRecorder {
+        fn wrap(inner: Arc<dyn IndexStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                seen: Default::default(),
+            })
+        }
+
+        /// A derived store that keeps recording into the same log.
+        fn relay(&self, inner: Arc<dyn IndexStore>) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner,
+                seen: self.seen.clone(),
+            })
+        }
+
+        /// The budgets this store was rescoped to, in call order.
+        fn seen(&self) -> Vec<u64> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl DeepSizeOf for RescopeRecorder {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+            self.inner.deep_size_of_children(context)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IndexStore for RescopeRecorder {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            self.relay(self.inner.clone())
+        }
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.relay(self.inner.with_io_priority(io_priority))
+        }
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            self.seen.lock().unwrap().push(bytes);
+            self.relay(self.inner.with_io_buffer_size(bytes))
+        }
+        async fn open_index_file(
+            &self,
+            name: &str,
+        ) -> lance_core::Result<Arc<dyn crate::scalar::IndexReader>> {
+            self.inner.open_index_file(name).await
+        }
+
+        // A merge only reads its sources; reaching anything below means the path under test
+        // changed and the assertions no longer describe it.
+        async fn new_index_file(
+            &self,
+            _: &str,
+            _: Arc<arrow_schema::Schema>,
+        ) -> lance_core::Result<Box<dyn crate::scalar::IndexWriter>> {
+            unimplemented!("merge source is read-only")
+        }
+        async fn copy_index_file(
+            &self,
+            _: &str,
+            _: &dyn IndexStore,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            unimplemented!("merge source is read-only")
+        }
+        async fn copy_index_file_to(
+            &self,
+            _: &str,
+            _: &str,
+            _: &dyn IndexStore,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            unimplemented!("merge source is read-only")
+        }
+        async fn rename_index_file(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> lance_core::Result<crate::scalar::IndexFile> {
+            unimplemented!("merge source is read-only")
+        }
+        async fn delete_index_file(&self, _: &str) -> lance_core::Result<()> {
+            unimplemented!("merge source is read-only")
+        }
+        async fn list_files_with_sizes(&self) -> lance_core::Result<Vec<crate::scalar::IndexFile>> {
+            unimplemented!("merge source is read-only")
+        }
+    }
+
+    fn local_store(dir: &TempObjDir) -> Arc<LanceIndexStore> {
+        Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dir.as_ref().clone(),
+            Arc::new(LanceCache::no_cache()),
+        ))
+    }
+
+    /// `rows` sorted `(value, _rowid)` pairs from `start`, so segments built from different
+    /// starts are disjoint.
+    fn sorted_values(start: i32, rows: i32) -> SendableRecordBatchStream {
+        let values: Vec<i32> = (start..start + rows).collect();
+        let row_ids: Vec<u64> = values.iter().map(|v| *v as u64).collect();
+        let batch = record_batch!(("value", Int32, values), ("_rowid", UInt64, row_ids)).unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::once(futures::future::ok(batch)),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_merge_segments_rescopes_each_source_it_reads() {
+        let dirs: Vec<TempObjDir> = (0..4).map(|_| TempObjDir::default()).collect();
+        let mut segments = Vec::new();
+        let mut recorders = Vec::new();
+        for (i, dir) in dirs[..3].iter().enumerate() {
+            let backing = local_store(dir);
+            train_btree_index(
+                sorted_values(i as i32 * 1000, 500),
+                &*backing,
+                64,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let recorder = RescopeRecorder::wrap(backing);
+            segments.push(
+                BTreeIndex::load(recorder.clone(), None, &LanceCache::no_cache())
+                    .await
+                    .unwrap(),
+            );
+            recorders.push(recorder);
+        }
+
+        // The middle filter keeps nothing, so the merge skips it and divides two ways.
+        let filters = [
+            None,
+            Some(OldIndexDataFilter::RowIds(RowAddrTreeMap::new())),
+            None,
+        ];
+        BTreeIndex::merge_segments(
+            &segments,
+            sorted_values(5000, 100),
+            &*local_store(&dirs[3]),
+            &filters,
+        )
+        .await
+        .unwrap();
+
+        let share = super::merge_io_buffer_size(ObjectStore::local().io_parallelism(), 2);
+        assert_eq!(
+            [
+                recorders[0].seen(),
+                recorders[1].seen(),
+                recorders[2].seen()
+            ],
+            [vec![share], vec![], vec![share]],
+            "each source the merge reads is rescoped once to its share of one scan's \
+             budget, and the source it skips is never rescoped"
+        );
+    }
+
+    #[test]
+    fn test_merge_io_buffer_size_divides_one_scans_budget() {
+        use super::{MERGE_MIN_BYTES_PER_SOURCE as FLOOR, SchedulerConfig, merge_io_buffer_size};
+
+        // One source gets what a single scan would have had.
+        let one_scan = SchedulerConfig::max_bandwidth_bytes(64);
+        assert_eq!(merge_io_buffer_size(64, 1), one_scan);
+
+        // Several sources divide that budget rather than each taking it whole.
+        for sources in [2, 4, 8, 16, 32, 64] {
+            assert_eq!(
+                merge_io_buffer_size(64, sources) * sources,
+                one_scan,
+                "{sources} sources should still total one scan's budget"
+            );
+        }
+
+        // Conservation holds only while sources <= io_parallelism, and local storage has a
+        // parallelism of 8, so the floor binds there from the 9th source.
+        let one_local_scan = SchedulerConfig::max_bandwidth_bytes(8);
+        assert_eq!(merge_io_buffer_size(8, 8) * 8, one_local_scan);
+        assert_eq!(merge_io_buffer_size(8, 9), FLOOR);
+        assert_eq!(merge_io_buffer_size(8, 9) * 9, one_local_scan + FLOOR);
+
+        // Past that each source keeps one storage page and the aggregate grows.
+        assert_eq!(merge_io_buffer_size(64, 128), FLOOR);
+        assert_eq!(merge_io_buffer_size(64, 1024), FLOOR);
+
+        // Degenerate inputs neither divide by zero nor hand out a zero budget, which the
+        // scheduler reads as "no backpressure" rather than "the smallest budget".
+        assert_eq!(merge_io_buffer_size(0, 0), FLOOR);
+        assert_eq!(merge_io_buffer_size(8, 0), FLOOR * 8);
     }
 }

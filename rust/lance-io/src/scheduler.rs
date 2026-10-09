@@ -833,6 +833,10 @@ impl Drop for Response {
     }
 }
 
+/// Bytes [`SchedulerConfig::max_bandwidth`] allows per I/O thread, sized to hold one
+/// storage page of the largest size we write.
+const MAX_BANDWIDTH_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
     /// the # of bytes that can be buffered but not yet requested.
@@ -868,7 +872,14 @@ impl SchedulerConfig {
     /// Configuration that should generally maximize bandwidth (not trying to save RAM
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
-        Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
+        Self::new(Self::max_bandwidth_bytes(store.io_parallelism()))
+    }
+
+    /// The byte budget [`Self::max_bandwidth`] would give a store with this I/O parallelism,
+    /// for callers that must reason about it without holding the store — to divide it between
+    /// several schedulers, say.
+    pub fn max_bandwidth_bytes(io_parallelism: usize) -> u64 {
+        MAX_BANDWIDTH_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64
     }
 
     pub fn with_lite_scheduler(self) -> Self {

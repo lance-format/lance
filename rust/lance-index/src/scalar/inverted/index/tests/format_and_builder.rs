@@ -216,6 +216,16 @@ impl IndexStore for ControlledMergeStore {
         })
     }
 
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_buffer_size(bytes),
+            posting_file: self.posting_file.clone(),
+            io_parallelism: self.io_parallelism,
+            control: self.control.clone(),
+            fail_token: self.fail_token,
+        })
+    }
+
     async fn copy_index_file(
         &self,
         name: &str,
@@ -298,6 +308,12 @@ impl IndexStore for MetadataAccessDeniedStore {
     fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
         Arc::new(Self {
             inner: self.inner.with_io_priority(io_priority),
+        })
+    }
+
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_buffer_size(bytes),
         })
     }
 
