@@ -74,21 +74,16 @@ def _efficient_sample(
     buf: list[pa.RecordBatch] = []
     total_records = len(dataset)
     assert total_records > n
-    chunk_size = total_records // max_takes
-    chunk_sample_size = n // max_takes
-
-    num_sampled = 0
+    chunk_size = math.ceil(total_records / max_takes)
 
     for idx, i in enumerate(range(0, total_records, chunk_size)):
-        # If we have already sampled enough, break. This can happen if there
-        # is a remainder in the division.
-        if num_sampled >= n:
-            break
-        num_sampled += chunk_sample_size
-
-        # If we are at the last chunk, we may not have enough records to sample.
-        local_size = min(chunk_size, total_records - i)
-        local_sample_size = min(chunk_sample_size, local_size)
+        end = min(i + chunk_size, total_records)
+        local_size = end - i
+        # Sample each chunk in proportion to its size. The per-chunk counts add
+        # up to exactly n, and never exceed the chunk size because n < total.
+        local_sample_size = n * end // total_records - n * i // total_records
+        if local_sample_size == 0:
+            continue
 
         if local_sample_size < local_size:
             # Add more randomness within each chunk, if there is room.
@@ -103,7 +98,7 @@ def _efficient_sample(
             ).to_batches()
         )
         if idx % 50 == 0:
-            LOGGER.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
+            LOGGER.info("Sampled at offset=%s, len=%s", offset, local_sample_size)
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
