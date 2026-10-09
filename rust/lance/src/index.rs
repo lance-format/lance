@@ -14051,22 +14051,36 @@ mod tests {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        // A text column alongside `two_column_reader`'s numeric ones: every
+        // remaining row-id-domain scalar index type (NGram here) requires text,
+        // unlike BTree and Bitmap, which moved to row-address domain and no
+        // longer exercise this test.
+        fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
+            lance_datagen::gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .col("payload", array::step::<Int32Type>())
+                .col("text", array::rand_utf8(ByteCount::from(8), false))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+        }
+
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             max_rows_per_file: 5,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        let mut dataset =
+            Dataset::write(three_column_reader(), test_uri, Some(write_params.clone()))
+                .await
+                .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
         // Row-id-domain: its coverage is recalculated (not dropped) across a
         // rewrite under stable row ids, which is exactly the property this test
-        // checks. BTree moved to row-address domain and no longer exercises it.
-        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        // checks. BTree and Bitmap moved to row-address domain and no longer
+        // exercise it.
+        let ngram_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
         dataset
-            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .create_index_builder(&["text"], IndexType::NGram, &ngram_params)
             .name("id_idx".to_string())
             .train(false)
             .await
@@ -14076,7 +14090,7 @@ mod tests {
         // A fragment the index does not cover, so a bin holding it together with
         // the covered ones would split the index's coverage.
         let mut dataset = Dataset::write(
-            two_column_reader(),
+            three_column_reader(),
             test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,

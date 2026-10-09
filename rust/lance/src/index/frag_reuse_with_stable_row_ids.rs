@@ -667,8 +667,8 @@ mod tests {
         dataset
             .create_index_builder(
                 &["category"],
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::NGram,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -715,23 +715,36 @@ mod tests {
 
     /// Typed requests ignore the params' index type; generic ones resolve it.
     #[rstest]
-    #[case::typed_zone_map(IndexType::ZoneMap, ScalarIndexParams::default(), None)]
+    #[case::typed_zone_map("i", IndexType::ZoneMap, ScalarIndexParams::default(), None)]
     #[case::generic_zone_map(
+        "i",
         IndexType::Scalar,
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
         None
     )]
     // BTree always stores row addresses now, so it applies the fragment
     // reuse index like ZoneMap/Bitmap and is no longer rejected here.
-    #[case::generic_default_btree(IndexType::Scalar, ScalarIndexParams::default(), None)]
+    #[case::generic_default_btree("i", IndexType::Scalar, ScalarIndexParams::default(), None)]
     #[case::typed_btree_with_zone_map_params(
+        "i",
         IndexType::BTree,
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
         None
     )]
-    #[case::typed_bitmap(IndexType::Bitmap, ScalarIndexParams::default(), Some("Bitmap"))]
+    // Bitmap also always stores row addresses now, so it is no longer rejected
+    // here either -- see the generic_default_btree case above.
+    #[case::typed_bitmap("i", IndexType::Bitmap, ScalarIndexParams::default(), None)]
+    // NGram still stores row ids directly, and (unlike BTree/Bitmap) needs a
+    // text column, hence the different column here.
+    #[case::typed_ngram(
+        "category",
+        IndexType::NGram,
+        ScalarIndexParams::default(),
+        Some("NGram")
+    )]
     #[tokio::test]
     async fn test_create_scalar_index_under_frag_reuse(
+        #[case] column: &str,
         #[case] index_type: IndexType,
         #[case] params: ScalarIndexParams,
         #[case] rejected_type: Option<&str>,
@@ -743,12 +756,15 @@ mod tests {
             .unwrap();
         let version = dataset.version().version;
 
-        let result = create_index(&mut dataset, "i", index_type, &params).await;
+        let result = create_index(&mut dataset, column, index_type, &params).await;
         match rejected_type {
             None => result.unwrap(),
             Some(type_name) => {
                 let message = result.as_ref().unwrap_err().to_string();
-                assert!(message.contains("Cannot create index `i_idx`"), "{message}");
+                assert!(
+                    message.contains(&format!("Cannot create index `{column}_idx`")),
+                    "{message}"
+                );
                 assert_rejected(result, type_name);
                 dataset.checkout_latest().await.unwrap();
                 assert_eq!(dataset.version().version, version);
@@ -832,8 +848,8 @@ mod tests {
         dataset
             .create_index_builder(
                 &["category"],
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::NGram,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -929,7 +945,7 @@ mod tests {
         values
     }
 
-    /// The bitmap's stable row ids collide with compacted fragment 0's old
+    /// The NGram index's stable row ids collide with compacted fragment 0's old
     /// addresses, so applying the fragment reuse index to it would lose rows.
     #[tokio::test]
     async fn test_incompatible_indices_are_hidden_from_readers() {
@@ -937,8 +953,8 @@ mod tests {
         create_index(
             &mut dataset,
             "category",
-            IndexType::Bitmap,
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            IndexType::NGram,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
         )
         .await
         .unwrap();
@@ -1133,8 +1149,8 @@ mod tests {
             create_index(
                 &mut dataset,
                 "category",
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::NGram,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
             )
             .await,
             "Cannot create index `category_idx`",
@@ -1160,18 +1176,18 @@ mod tests {
 
     #[rstest]
     #[case::frag_reuse_index_first(true)]
-    #[case::bitmap_first(false)]
+    #[case::ngram_first(false)]
     #[tokio::test]
     async fn test_racing_index_creation_is_rejected_after_rebase(#[case] frag_reuse_first: bool) {
         let dir = TempStrDir::default();
         let mut dataset = stable_row_id_dataset(dir.as_str()).await;
         let mut other = Dataset::open(dir.as_str()).await.unwrap();
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
-        let bitmap = other
+        let ngram_index = other
             .create_index_builder(
                 &["category"],
-                IndexType::Bitmap,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                IndexType::NGram,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -1183,9 +1199,11 @@ mod tests {
             commit_new_indices(&mut dataset, vec![frag_reuse])
                 .await
                 .unwrap();
-            commit_new_indices(&mut other, vec![bitmap]).await
+            commit_new_indices(&mut other, vec![ngram_index]).await
         } else {
-            commit_new_indices(&mut other, vec![bitmap]).await.unwrap();
+            commit_new_indices(&mut other, vec![ngram_index])
+                .await
+                .unwrap();
             commit_new_indices(&mut dataset, vec![frag_reuse]).await
         };
         assert_rejected(result, "`category_idx`");
