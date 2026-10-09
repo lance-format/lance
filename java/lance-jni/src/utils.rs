@@ -315,6 +315,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             .i()?;
         let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
         let approx_mode = parse_approx_mode(&approx_mode_str)?;
+        let rq_precision = env
+            .get_string_from_method(&java_obj, "getRqPrecisionString")?
+            .parse()?;
 
         Ok(Query {
             column,
@@ -331,6 +334,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            rq_precision,
+            rq_cascade_factor: env.get_optional_u32_from_method(&java_obj, "getRqCascadeFactor")?,
         })
     })?;
 
@@ -527,7 +532,8 @@ pub fn get_vector_index_params(
                 "getRqParams",
                 |env, rq_obj| {
                     let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
-                    Ok(RQBuildParams::new(num_bits))
+                    let layered = env.call_method(&rq_obj, "getLayered", "()Z", &[])?.z()?;
+                    Ok(RQBuildParams::new(num_bits).with_layered(layered))
                 },
             )?;
 

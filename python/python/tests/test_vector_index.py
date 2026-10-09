@@ -3745,3 +3745,61 @@ def test_fts_filter_vector_search(tmp_path):
 
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+@pytest.mark.parametrize("num_bits", [5, 7, 9])
+def test_layered_rq_precision_and_cascade(tmp_path, num_bits):
+    rng = np.random.default_rng(472)
+    vectors = rng.normal(size=(512, 64)).astype(np.float32)
+    table = pa.table({"vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), 64)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=128)
+    dataset.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_bits=num_bits,
+        layered=True,
+        num_partitions=4,
+    )
+    query = vectors[0]
+    nearest = {"column": "vector", "q": query, "k": 100, "nprobes": 4}
+    exact = dataset.to_table(
+        columns=[], with_row_id=True, nearest={**nearest, "use_index": False}
+    )["_rowid"].to_pylist()
+    full = None
+    for precision in ["sign", "high", "full"]:
+        result = dataset.to_table(
+            columns=[], with_row_id=True, nearest={**nearest, "rq_precision": precision}
+        )
+        assert len(set(result["_rowid"].to_pylist()) & set(exact)) >= 50
+        if precision == "full":
+            full = result
+    cold = lance.dataset(tmp_path, index_cache_size_bytes=0)
+    cascade = cold.to_table(
+        columns=[], with_row_id=True, nearest={**nearest, "rq_cascade_factor": 32}
+    )
+    assert cascade.equals(full)
+    with pytest.raises(ValueError, match="rq_precision"):
+        dataset.to_table(nearest={**nearest, "rq_precision": "invalid"})
+    with pytest.raises(ValueError, match="positive"):
+        dataset.to_table(nearest={**nearest, "rq_cascade_factor": 0})
+
+
+@pytest.mark.parametrize("num_bits", [1, 2, 3, 4, 6, 8])
+def test_layered_rq_rejects_unsupported_bits(tmp_path, num_bits):
+    vectors = np.zeros((64, 64), dtype=np.float32)
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), 64),
+            }
+        ),
+        tmp_path,
+    )
+    with pytest.raises(ValueError, match="requires num_bits=5, 7 or 9"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_bits=num_bits,
+            layered=True,
+            num_partitions=1,
+        )
