@@ -378,7 +378,7 @@ class ShardedFragmentSampler(FragmentSampler):
     ) -> Generator[lance.LanceFragment, None, None]:
         fragments = dataset.get_fragments()
         if self._randomize:
-            random.seed(self._seed)
+            random.seed(self._seed + self._epoch)
             random.shuffle(fragments)
         for idx in range(self._rank, len(fragments), self._world_size):
             yield fragments[idx]
@@ -545,7 +545,7 @@ class ShardedBatchSampler(Sampler):
 
         ranges = list(_gen_ranges())
         if self._randomize:
-            random.seed(self._seed)
+            random.seed(self._seed + self._epoch)
             random.shuffle(ranges)
 
         return dataset._ds.take_scan(

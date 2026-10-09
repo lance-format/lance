@@ -7,7 +7,12 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.sampler import ShardedBatchSampler, ShardedFixedBatchSampler, maybe_sample
+from lance.sampler import (
+    ShardedBatchSampler,
+    ShardedFixedBatchSampler,
+    ShardedFragmentSampler,
+    maybe_sample,
+)
 
 TEST_CONFIG = {
     "total_rows": 1000,
@@ -199,6 +204,25 @@ def test_randomization_effect():
     epoch1 = list(sampler)
     sampler.set_epoch(2)
     epoch2 = list(sampler)
+
+    assert epoch1 != epoch2, "Different epochs should produce different orders"
+
+
+@pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
+def test_set_epoch_reshuffles(tmp_path: Path, sampler_cls):
+    ds = lance.write_dataset(
+        pa.table({"id": range(2000)}), tmp_path / "data.lance", max_rows_per_file=100
+    )
+    sampler = sampler_cls(rank=0, world_size=2, randomize=True, seed=42)
+
+    def first_ids():
+        batches = sampler(ds, columns=["id"], batch_size=100)
+        return [batch["id"][0].as_py() for batch in batches]
+
+    sampler.set_epoch(1)
+    epoch1 = first_ids()
+    sampler.set_epoch(2)
+    epoch2 = first_ids()
 
     assert epoch1 != epoch2, "Different epochs should produce different orders"
 
