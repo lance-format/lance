@@ -256,21 +256,25 @@ impl LsmDataSourceCollector {
                 schema: m.schema.clone(),
                 shard_id,
                 generation: LsmGeneration::memtable(m.generation),
+                visible_count: m.index_store.visible_count(),
             })
             .collect()
     }
 
-    /// True when `generation` for `shard_id` is still pinned in memory as a
-    /// frozen memtable. During the post-flush grace window a generation is both
-    /// committed to the manifest (a flushed source) and held in memory (an
-    /// in-memory source); it must be served only from memory — which preserves
-    /// the per-batch boundaries the SSTable dataset has lost, so as-of reads
-    /// stay snapshot-bounded — and its on-disk copy skipped to avoid scanning
-    /// the generation twice. See `ShardWriterConfig::frozen_memtable_grace`.
+    /// True when `generation` for `shard_id` is still pinned in memory as the
+    /// active or a frozen memtable. During the post-flush grace window a
+    /// generation is both committed to the manifest (a flushed source) and held
+    /// in memory (an in-memory source); it must be served only from memory —
+    /// which preserves the per-batch boundaries the SSTable dataset has lost, so
+    /// as-of reads stay snapshot-bounded — and its on-disk copy skipped to avoid
+    /// scanning the generation twice. See `ShardWriterConfig::frozen_memtable_grace`.
+    /// The active case covers in-memory refs captured before the generation was
+    /// frozen, paired with a manifest read after it was flushed.
     fn sstable_pinned_in_memory(&self, shard_id: &Uuid, generation: u64) -> bool {
-        self.in_memory_memtables
-            .get(shard_id)
-            .is_some_and(|mems| mems.frozen.iter().any(|f| f.generation == generation))
+        self.in_memory_memtables.get(shard_id).is_some_and(|mems| {
+            mems.active.generation == generation
+                || mems.frozen.iter().any(|f| f.generation == generation)
+        })
     }
 
     /// Collect all data sources.
@@ -541,5 +545,54 @@ mod tests {
             "only the unpinned SSTable gen from disk"
         );
         assert_eq!(in_memory, vec![2, 3], "pinned gen 2 served from memory");
+    }
+
+    /// In-memory refs captured while gen 2 was still active, paired with a
+    /// manifest read after gen 2 was flushed: gen 2 must be read once, from
+    /// memory, not also from its SSTable.
+    #[test]
+    fn test_collect_suppresses_sstable_of_active_generation() {
+        let shard = Uuid::new_v4();
+        let snapshot = ShardSnapshot {
+            shard_id: shard,
+            spec_id: 0,
+            current_generation: 3,
+            sstables: vec![
+                SsTable {
+                    generation: 1,
+                    path: "gen_1".to_string(),
+                },
+                SsTable {
+                    generation: 2,
+                    path: "gen_2".to_string(),
+                },
+            ],
+        };
+        let mems = InMemoryMemTables {
+            active: memtable_ref(2),
+            frozen: vec![],
+        };
+        let collector = LsmDataSourceCollector::without_base_table("/tmp/x", vec![snapshot])
+            .with_in_memory_memtables(shard, mems);
+
+        for sources in [
+            collector.collect().unwrap(),
+            collector
+                .collect_for_shards(&HashSet::from([shard]))
+                .unwrap(),
+        ] {
+            let sstable_gens: Vec<u64> = sources
+                .iter()
+                .filter(|s| !s.is_active_memtable())
+                .map(|s| s.generation().as_u64())
+                .collect();
+            let in_memory: Vec<u64> = sources
+                .iter()
+                .filter(|s| s.is_active_memtable())
+                .map(|s| s.generation().as_u64())
+                .collect();
+            assert_eq!(sstable_gens, vec![1], "gen 2 must not be read from disk");
+            assert_eq!(in_memory, vec![2]);
+        }
     }
 }

@@ -309,21 +309,20 @@ fn active_source_can_execute_fts(
         LsmDataSource::ActiveMemTable {
             batch_store,
             index_store,
+            visible_count,
             ..
         } => {
             index_store
                 .get_fts_by_column_and_granularity(column, document_granularity)
                 .is_some_and(|index| !index.is_empty())
-                && batch_store
-                    .max_visible_row(index_store.visible_count())
-                    .is_some()
+                && batch_store.max_visible_row(*visible_count).is_some()
         }
         _ => false,
     }
 }
 
 /// Build a throwaway [`IndexStore`] carrying an inverted index on `column`,
-/// populated from the memtable's visible prefix.
+/// populated from the memtable's first `visible_batches` batches.
 ///
 /// The active memtable indexes only the columns in the write spec's maintained
 /// set, and that set is fixed when the spec is installed — an FTS index created
@@ -340,14 +339,13 @@ fn active_source_can_execute_fts(
 /// pays nothing.
 fn transient_fts_index_store(
     batch_store: &Arc<BatchStore>,
-    source: &IndexStore,
+    visible_batches: usize,
     schema: &SchemaRef,
     columns: &[String],
     document_granularity: DocumentGranularity,
     pk_columns: &[String],
     index_params: &HashMap<&str, InvertedIndexParams>,
 ) -> Result<Option<Arc<IndexStore>>> {
-    let visible_batches = source.visible_count();
     if visible_batches == 0 {
         return Ok(None);
     }
@@ -411,9 +409,9 @@ fn transient_fts_index_store(
         )?;
     }
 
-    // Exactly the prefix the real store publishes. A bare `IndexStore` carries
-    // no durability cursors, so its own `visible_count` is its indexed prefix —
-    // indexing this many batches makes the two agree.
+    // Exactly the query's snapshot of the published prefix. A bare `IndexStore`
+    // carries no durability cursors, so its own `visible_count` is its indexed
+    // prefix — indexing this many batches makes the two agree.
     for position in 0..visible_batches {
         let Some(stored) = batch_store.get(position) else {
             break;
@@ -1230,6 +1228,7 @@ impl LsmFtsSearchPlanner {
                 batch_store,
                 index_store,
                 schema,
+                visible_count,
                 ..
             } => {
                 let document_granularity = query_document_granularity(query)?;
@@ -1297,7 +1296,7 @@ impl LsmFtsSearchPlanner {
                 } else {
                     match transient_fts_index_store(
                         batch_store,
-                        index_store,
+                        *visible_count,
                         schema,
                         &stored_names,
                         document_granularity,
@@ -1313,8 +1312,14 @@ impl LsmFtsSearchPlanner {
                     }
                 };
                 validate_lsm_fts_query(query)?;
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store, schema.clone());
+                // The block lists were built at this count; re-reading the cursor
+                // could surface rows whose older copies they do not block.
+                let mut scanner = MemTableScanner::new_at_readable_count(
+                    batch_store.clone(),
+                    index_store,
+                    schema.clone(),
+                    *visible_count,
+                );
                 // The append-only inverted index keeps an updated row's old
                 // postings live, so the memtable FTS exec needs PK columns to
                 // drop stale hits before it applies the query limit.
@@ -5486,5 +5491,110 @@ mod tests {
             let count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
             assert_eq!(count, 1, "the unchanged nested text field still matches");
         }
+    }
+
+    /// A row that becomes visible in the active memtable while a search is
+    /// being planned must not be returned alongside the older copy it replaces.
+    #[tokio::test]
+    async fn write_during_planning_returns_key_once() {
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+
+        // Gen 1 (SSTable) holds id=1; the active gen 2 holds only id=2.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 =
+            write_dataset(&gen1_uri, vec![make_batch(&schema, &[1], &["lance old"])]).await;
+        gen1.create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let initial = make_batch(&schema, &[2], &["lance other"]);
+        let (position, offset, _) = batch_store.append(initial.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&initial, offset, Some(position))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        // The concurrent write: a new version of id=1, appended and indexed so
+        // the active memtable's visible count grows mid-plan. The planner's
+        // first open resolves the index contract; the second loads the PK
+        // index for the block lists.
+        let cache = Arc::new(RunOnOpen::new(2, {
+            let batch_store = batch_store.clone();
+            let index_store = index_store.clone();
+            let update = make_batch(&schema, &[1], &["lance new"]);
+            move || {
+                let (position, offset, _) = batch_store.append(update.clone()).unwrap();
+                index_store
+                    .insert_with_batch_position(&update, offset, Some(position))
+                    .unwrap();
+            }
+        }));
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: batch_store.clone(),
+                        index_store: index_store.clone(),
+                        schema: schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_sstable_cache(cache.clone());
+
+        let plan = planner
+            .plan_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(cache.has_run(), "the write must land during planning");
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..b.num_rows()).map(|i| col.value(i)));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2], "each key must be returned once");
     }
 }

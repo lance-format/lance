@@ -176,6 +176,10 @@ pub enum LsmDataSource {
         shard_id: Uuid,
         /// Generation number.
         generation: LsmGeneration,
+        /// Visible batch count, read once when the source is collected. Every
+        /// part of a query reads the memtable up to this count, so the
+        /// cross-generation block lists and the memtable scan see the same rows.
+        visible_count: usize,
     },
 }
 
