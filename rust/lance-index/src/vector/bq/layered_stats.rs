@@ -179,8 +179,9 @@ layered_lazy_counters! {
         origin_row_reads,
         /// Origin requests of those reads after coalescing within the lazy
         /// origin gap (`LANCE_RQ_LAZY_ORIGIN_GAP_BYTES`) and splitting, which
-        /// are GETs on an object store. A load of the resident columns that
-        /// such a read starts is counted in `resident_columns_load_requests`
+        /// are GETs on an object store. A fallback load of the resident
+        /// columns that such a read starts, for a storage whose store no
+        /// index open loaded, is counted in `resident_columns_load_requests`
         /// instead.
         origin_sparse_requests,
         /// Bytes those requests read, the gaps they span included.
@@ -238,9 +239,11 @@ layered_lazy_counters! {
         /// Bytes of planes loaded by promotions, resident afterwards or not,
         /// apart from critical-path reads.
         promotion_bytes,
-        /// Bytes of values each load of an index's resident columns keeps in
-        /// memory (see `LANCE_RQ_RESIDENT_COLUMNS`). An index loads them
-        /// once, so over every snapshot this sums to the store's size.
+        /// Bytes of values each load of an index file's resident columns
+        /// keeps in memory (see `LANCE_RQ_RESIDENT_COLUMNS`). The first index
+        /// of the file to open loads them once, so over every snapshot this
+        /// sums to the store's size, plus a size per reload after an idle
+        /// eviction.
         resident_columns_bytes,
         /// Memory the arrays of those loads hold: the capacity of their
         /// buffers, counted per column. It exceeds `resident_columns_bytes`
@@ -295,9 +298,15 @@ layered_lazy_counters! {
         /// Time the `far_permit_waits` waited for a permit or the ordinary
         /// window.
         far_permit_wait_ns,
-        /// Loads of an index file's resident store: one per store while the
-        /// index cache keeps it, and one more after it evicted the store idle.
+        /// Loads of an index file's resident store: one per store when an
+        /// index of its file opens while no live index or cache holds it,
+        /// and so one more for each reload after an idle eviction.
         resident_columns_loads,
+        /// Of those loads, the ones a read started because no index open had
+        /// loaded the store: only a storage built outside an index open
+        /// reads before its store loads. 0 for every index opened through a
+        /// `Dataset`.
+        resident_columns_read_loads,
         /// Index opens that bound a resident store a live index of the file
         /// had loaded, found through the process's weak registry of stores.
         resident_columns_registry_reuses,
@@ -311,6 +320,12 @@ layered_lazy_counters! {
         /// cache's largest admissible entry than `auto` allows, so `auto`
         /// kept the small columns in the file (`on` keeps them resident).
         resident_columns_oversize,
+        /// Index opens under `auto` whose resident store would fit the index
+        /// cache but whose cache has no pin budget (a backend that never
+        /// pins, such as Moka), so `auto` kept the small columns in the
+        /// file rather than keep a store a lease cannot pin (`on` keeps
+        /// them resident).
+        resident_columns_unpinnable,
         /// Index opens that leased the cached resident store before their
         /// first index-cache access.
         resident_columns_preopen_leases,
