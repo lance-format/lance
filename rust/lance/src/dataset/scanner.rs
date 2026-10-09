@@ -232,6 +232,23 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
     columns
 }
 
+/// The multiple of the exact distance a vector index ranks by. Lance indexes
+/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
+/// and RQ rank it, and every other metric, on its own scale.
+fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
+    let quantized_as_l2 = segments.iter().any(|segment| {
+        segment.index_details.as_ref().is_some_and(|details| {
+            let index_type = crate::index::vector::details::derive_vector_index_type(details);
+            index_type.ends_with("PQ") || index_type.ends_with("SQ")
+        })
+    });
+    if metric == MetricType::Cosine && quantized_as_l2 {
+        2.0
+    } else {
+        1.0
+    }
+}
+
 fn collect_phrase_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
     match query {
         FtsQuery::Phrase(query) => {
@@ -6707,8 +6724,28 @@ impl Scanner {
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    self.ann(&q, &index_segments, filter_plan, overlay_block.clone())
-                        .await?
+                    // Refine applies the distance range to exact distances, but
+                    // the search still has to, or a lower bound leaves it only
+                    // candidates refine then drops. It ranks on the index's own
+                    // scale, so it gets the range on that scale.
+                    let ann_query = match q.refine_factor {
+                        Some(_) => {
+                            let scale = index_distance_scale(index_metric, &index_segments);
+                            Query {
+                                lower_bound: q.lower_bound.map(|lower| lower * scale),
+                                upper_bound: q.upper_bound.map(|upper| upper * scale),
+                                ..q.clone()
+                            }
+                        }
+                        None => q.clone(),
+                    };
+                    self.ann(
+                        &ann_query,
+                        &index_segments,
+                        filter_plan,
+                        overlay_block.clone(),
+                    )
+                    .await?
                 }
                 DataType::List(_) => {
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
@@ -12023,6 +12060,99 @@ mod test {
             None,
         )
         .await;
+    }
+
+    /// A cosine SQ index ranks as twice `1 - cos`, so a refined search that also
+    /// applied the range inside the index would drop rows whose exact distance
+    /// is in range.
+    #[tokio::test]
+    async fn test_refined_knn_applies_distance_range_to_exact_distances() {
+        use lance_linalg::distance::cosine_distance;
+
+        const DIM: usize = 16;
+        const ROWS: usize = 2000;
+        let mut seed: u64 = 42;
+        let values: Vec<f32> = (0..ROWS * DIM)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(values.clone()),
+                    DIM as i32,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_hnsw_sq_params(
+                    DistanceType::Cosine,
+                    IvfBuildParams::new(1),
+                    HnswBuildParams::default(),
+                    SQBuildParams::default(),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = values[..DIM].to_vec();
+        let mut exact: Vec<f32> = values
+            .chunks_exact(DIM)
+            .map(|row| cosine_distance(&query, row))
+            .collect();
+        exact.sort_by(f32::total_cmp);
+        // Rows from the 20th nearest out, capped so that `upper <= 2 * lower`:
+        // no row is in range on both the exact and the doubled scale.
+        let lower = exact[20];
+        let upper = exact[60].min(2.0 * lower);
+        assert!(upper > lower);
+
+        let batch = dataset
+            .scan()
+            .nearest("vec", &Float32Array::from(query), 5)
+            .unwrap()
+            .distance_metric(DistanceType::Cosine)
+            .refine(1)
+            .distance_range(Some(lower), Some(upper))
+            .try_into_batch()
+            .await
+            .unwrap();
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(!distances.is_empty(), "no rows within the exact range");
+        for distance in distances {
+            assert!(
+                (lower..upper).contains(distance),
+                "{distance} is outside [{lower}, {upper})"
+            );
+        }
     }
 
     #[tokio::test]
