@@ -246,6 +246,20 @@ pub struct JsonIndexParameters {
     path: String,
 }
 
+/// The target index type named by a JSON index's own serialized parameters
+/// (the `params` field of the `ScalarIndexParams` that `JsonIndex::derive_index_params`
+/// returns -- not the target's own params). `None` if `params_json` doesn't parse as
+/// [`JsonIndexParameters`].
+///
+/// Exposed so callers that only have a `ScalarIndexParams` (not a live `JsonIndex`) can
+/// still tell what a JSON index wraps, e.g. to reject an unsafe wrapped combination before
+/// training -- see `build_scalar_index`'s JSON-wrapped-BTREE guard.
+pub fn json_wrapped_target_type(params_json: &str) -> Option<String> {
+    serde_json::from_str::<JsonIndexParameters>(params_json)
+        .ok()
+        .map(|parameters| parameters.target_index_type)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum JsonIndexTargetType {
     Boolean,
@@ -1248,6 +1262,21 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("only scalar values"), "{message}");
+    }
+
+    #[test]
+    fn test_json_wrapped_target_type() {
+        assert_eq!(
+            json_wrapped_target_type(r#"{"target_index_type":"btree","path":"x"}"#),
+            Some("btree".to_string())
+        );
+        // Case is preserved here; callers that care compare case-insensitively.
+        assert_eq!(
+            json_wrapped_target_type(r#"{"target_index_type":"BTREE","path":"x"}"#),
+            Some("BTREE".to_string())
+        );
+        assert_eq!(json_wrapped_target_type("not json"), None);
+        assert_eq!(json_wrapped_target_type(r#"{"path":"x"}"#), None);
     }
 
     #[test]

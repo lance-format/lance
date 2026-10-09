@@ -14,8 +14,9 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{
-        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        BuiltinIndexType, CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
         inverted::InvertedIndex,
+        json::json_wrapped_target_type,
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
@@ -616,6 +617,31 @@ async fn merge_scalar_indices<'a>(
     let reference_index = dataset
         .open_scalar_index_for_maintenance(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
+
+    // A JSON-wrapped BTREE segment cannot yet carry the row-address-domain
+    // migration safely on a stable-row-id dataset -- see `build_scalar_index`'s
+    // matching guard, which this mirrors so maintenance is rejected too, not
+    // just creation. Checked here, before deciding between a merge or a
+    // rebuild, rather than relying on that guard to be reached only if the
+    // rebuild branch happens to be picked.
+    if dataset.manifest.uses_stable_row_ids() {
+        let reference_params = reference_index.derive_index_params()?;
+        if reference_params.index_type.eq_ignore_ascii_case("json")
+            && reference_params
+                .params
+                .as_deref()
+                .and_then(json_wrapped_target_type)
+                .is_some_and(|target| target.eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str()))
+        {
+            return Err(Error::not_supported(
+                "a JSON-wrapped BTREE index is not yet supported on a dataset with stable row \
+                 ids enabled -- create a plain BTREE index on this column instead, or disable \
+                 stable row ids for this dataset"
+                    .to_string(),
+            ));
+        }
+    }
+
     let update_criteria = reference_index.update_criteria();
 
     // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
@@ -4124,6 +4150,134 @@ mod tests {
         for id in ["song-10", "song-100", "song-200"] {
             assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
         }
+    }
+
+    fn json_btree_schema_and_batch(ids: std::ops::Range<i32>) -> (Arc<Schema>, RecordBatch) {
+        // A plain Utf8 field tagged with the `arrow.json` extension is read as
+        // JSON text (`JsonEncoding::of_field`) -- simpler to construct by hand
+        // than genuine JSONB bytes, and exercised the same way by
+        // `test_json_text_input_extracts_like_jsonb` in lance-index.
+        let doc_field = Field::new("doc", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            doc_field,
+        ]));
+        let doc_values: Vec<String> = ids.clone().map(|i| format!(r#"{{"x":{i}}}"#)).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(ids)),
+                Arc::new(StringArray::from(doc_values)),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    fn json_btree_params() -> ScalarIndexParams {
+        ScalarIndexParams {
+            index_type: "json".to_string(),
+            params: Some(r#"{"target_index_type":"btree","path":"x"}"#.to_string()),
+        }
+    }
+
+    /// A JSON-wrapped BTREE index cannot yet carry the row-address-domain
+    /// migration through its own metadata (see the guard in
+    /// `super::super::scalar::build_scalar_index`), so creating one on a
+    /// stable-row-id dataset must be rejected rather than silently produce an
+    /// address-domain segment none of the domain-safety checks elsewhere can
+    /// see through the wrapper.
+    #[tokio::test]
+    async fn test_json_wrapped_btree_create_rejected_with_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (schema, batch) = json_btree_schema_and_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = json_btree_params();
+        let err = dataset
+            .create_index_builder(&["doc"], IndexType::Scalar, &params)
+            .name("doc_idx".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("JSON-wrapped BTREE"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dataset
+                .load_indices_by_name("doc_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rejected index must not be committed"
+        );
+    }
+
+    /// The same combination is unaffected -- and must keep working exactly as
+    /// before this guard was added -- on a dataset that does not use stable
+    /// row ids, where a row id and a row address are the same value.
+    #[tokio::test]
+    async fn test_json_wrapped_btree_create_and_optimize_without_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (schema, batch) = json_btree_schema_and_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let params = json_btree_params();
+        dataset
+            .create_index_builder(&["doc"], IndexType::Scalar, &params)
+            .name("doc_idx".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
+            1
+        );
+
+        // Maintenance (insert + optimize) on the same, still-unaffected
+        // combination must keep working too.
+        let (_, more) = json_btree_schema_and_batch(10..20);
+        let appended = RecordBatchIterator::new(vec![Ok(more)], schema);
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
+            1,
+            "optimize should merge into a single segment, not fail or leave extras"
+        );
     }
 
     #[tokio::test]
