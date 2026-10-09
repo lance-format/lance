@@ -168,8 +168,8 @@ pub trait ObjectStoreExt {
 }
 
 #[async_trait]
-pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
-    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+pub(super) trait DirectoryOperations: std::fmt::Debug + Send + Sync {
+    async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()>;
 }
 
 #[async_trait]
@@ -203,8 +203,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
-    // Provider-owned native directory operations for rooted local stores.
-    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
+    // Provider-owned operations that preserve native directory semantics.
+    directory_operations: Option<Arc<dyn DirectoryOperations>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -683,7 +683,7 @@ impl ObjectStore {
 
             let store = Self {
                 inner: tracked_store,
-                local_dir_operations: None,
+                directory_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -1522,11 +1522,8 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if let Some(local_dir_operations) = &self.local_dir_operations {
-            let metrics = self.io_tracker.begin_io("delete");
-            let result = local_dir_operations.remove_dir_all(&path).await;
-            metrics.record(&result, 0);
-            return result;
+        if let Some(directory_operations) = &self.directory_operations {
+            return directory_operations.remove_dir_all(&path, self).await;
         }
         if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.
@@ -1859,7 +1856,7 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
-            local_dir_operations: None,
+            directory_operations: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

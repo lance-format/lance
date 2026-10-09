@@ -4,7 +4,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 #[cfg(any(windows, test))]
-use crate::object_store::LocalDirOperations;
+use crate::object_store::DirectoryOperations;
 use crate::object_store::{
     DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
@@ -27,18 +27,22 @@ struct FileSystemDirOperations {
 
 #[cfg(any(windows, test))]
 #[async_trait::async_trait]
-impl LocalDirOperations for FileSystemDirOperations {
-    async fn remove_dir_all(&self, path: &Path) -> Result<()> {
+impl DirectoryOperations for FileSystemDirOperations {
+    async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()> {
         let local_path = self.local_file_system.path_to_filesystem(path)?;
         let object_store_path = path.to_string();
-        tokio::task::spawn_blocking(move || {
+        let metrics = store.io_tracker.begin_io("delete");
+        let result = tokio::task::spawn_blocking(move || {
             std::fs::remove_dir_all(local_path).map_err(|error| match error.kind() {
                 ErrorKind::NotFound => Error::not_found(object_store_path),
                 _ => Error::from(error),
             })
         })
         .await
-        .map_err(|error| Error::io(format!("recursive directory removal task failed: {error}")))?
+        .map_err(|error| Error::io(format!("recursive directory removal task failed: {error}")))
+        .and_then(|result| result);
+        metrics.record(&result, 0);
+        result
     }
 }
 
@@ -107,7 +111,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
 
         #[cfg(windows)]
-        let (inner, local_dir_operations) = match windows::extract_unc_path(&base_path)? {
+        let (inner, directory_operations) = match windows::extract_unc_path(&base_path)? {
             Some(unc_path) => {
                 let inner = LocalFileSystem::new_with_prefix(unc_path.root)?;
                 let operations = FileSystemDirOperations {
@@ -115,7 +119,7 @@ impl ObjectStoreProvider for FileStoreProvider {
                 };
                 (
                     inner,
-                    Some(Arc::new(operations) as Arc<dyn LocalDirOperations>),
+                    Some(Arc::new(operations) as Arc<dyn DirectoryOperations>),
                 )
             }
             None => (LocalFileSystem::new(), None),
@@ -123,11 +127,11 @@ impl ObjectStoreProvider for FileStoreProvider {
         #[cfg(not(windows))]
         let inner = LocalFileSystem::new();
         #[cfg(not(windows))]
-        let local_dir_operations = None;
+        let directory_operations = None;
 
         Ok(ObjectStore {
             inner: Arc::new(inner),
-            local_dir_operations,
+            directory_operations,
             scheme: base_path.scheme().to_owned(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -188,12 +192,12 @@ mod tests {
 
     fn rooted_local_store(root: &StdPath) -> ObjectStore {
         let inner = LocalFileSystem::new_with_prefix(root).unwrap();
-        let local_dir_operations = Arc::new(FileSystemDirOperations {
+        let directory_operations = Arc::new(FileSystemDirOperations {
             local_file_system: inner.clone(),
         });
         ObjectStore {
             inner: Arc::new(inner),
-            local_dir_operations: Some(local_dir_operations),
+            directory_operations: Some(directory_operations),
             scheme: "file".to_owned(),
             block_size: DEFAULT_LOCAL_BLOCK_SIZE,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

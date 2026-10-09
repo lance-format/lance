@@ -339,7 +339,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
 
         Ok(ObjectStore {
             inner,
-            local_dir_operations: None,
+            directory_operations: None,
             scheme: String::from("gs"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
