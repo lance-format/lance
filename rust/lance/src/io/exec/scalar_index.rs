@@ -147,9 +147,12 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
 
 /// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
 ///
-/// Address-domain index results are always positive allow-lists (`AtMost`), so
-/// a block-list here would mean a boolean op was applied before translation,
-/// which is unsupported.
+/// Address-domain index results are almost always positive allow-lists
+/// (`AtMost`); a non-empty block-list here would mean a boolean op was
+/// applied before translation, which is unsupported. The one exception is an
+/// empty block-list (`AtLeast(empty)`, e.g. NGram's "cannot tell, scan
+/// everything" result for an untokenizable query): blocking nothing is the
+/// same set of rows in either domain, so it needs no translation.
 async fn translate_addr_mask_to_row_ids(
     dataset: &Dataset,
     mask: NullableRowAddrMask,
@@ -158,6 +161,9 @@ async fn translate_addr_mask_to_row_ids(
         NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
             translate_addr_set_to_row_ids(dataset, set).await?,
         )),
+        NullableRowAddrMask::BlockList(set) if set.is_empty() => {
+            Ok(NullableRowAddrMask::BlockList(set))
+        }
         NullableRowAddrMask::BlockList(_) => Err(Error::internal(
             "cannot translate a block-list address mask to the row-id domain",
         )),

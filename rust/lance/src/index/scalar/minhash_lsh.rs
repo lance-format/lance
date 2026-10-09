@@ -41,8 +41,9 @@ pub(in crate::index) async fn merge_segments(
         .min()
         .unwrap_or(dataset.manifest.version);
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    // MinHash LSH only reads its current format, which stores row addresses.
     let (fragment_bitmap, filters) =
-        build_per_segment_filters(dataset, &segment_refs, staged, false).await?;
+        build_per_segment_filters(dataset, &segment_refs, staged, true).await?;
 
     let scalar_indices = try_join_all(segments.iter().map(|segment| {
         let field_path = &field_path;

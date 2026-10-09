@@ -508,14 +508,17 @@ async fn overlay_rescan(
 /// Whether a merge's old-data filters, and so the stale rows subtracted from them, key rows by
 /// physical address rather than by stable row id (see [`build_old_data_filter`] and
 /// [`overlay_rescan`]). This is the domain the merged index stores, not whether its type
-/// migrated from row ids: BTree and Bitmap merge as address-domain segments (a row-id-domain
-/// one under stable row ids is rebuilt instead), NGram stores row ids, a LabelList segment
+/// migrated from row ids: BTree, Bitmap, NGram, RTree and MinHash LSH merge as address-domain
+/// segments (a row-id-domain one under stable row ids is rebuilt instead), a LabelList segment
 /// reports its own domain, and of the other types a JSON index over an address-domain target
 /// and a list-element index store addresses.
 fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIndex) -> bool {
     match index_type {
-        IndexType::BTree | IndexType::Bitmap => true,
-        IndexType::NGram => false,
+        IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::NGram
+        | IndexType::RTree
+        | IndexType::MinHashLsh => true,
         IndexType::LabelList => reference_index.results_are_row_addresses(),
         _ => {
             let index = reference_index.as_any();
@@ -936,16 +939,15 @@ async fn merge_scalar_indices<'a>(
     }
 
     // Whether a segment's type moved to an address-domain format version, so
-    // that it may predate that move: BTree, Bitmap, LabelList, and a JSON index
-    // over a target that stores row addresses today.
+    // that it may predate that move: BTree, Bitmap, LabelList, NGram, RTree,
+    // MinHashLsh, and a JSON index over a target that stores row addresses
+    // today.
     let migrated_to_row_addrs = |segment: &IndexMetadata| {
-        matches!(
-            index_type,
-            IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
-        ) || segment
-            .index_details
-            .as_deref()
-            .is_some_and(json::wraps_row_addr_domain_target)
+        has_legacy_row_id_domain(index_type)
+            || segment
+                .index_details
+                .as_deref()
+                .is_some_and(json::wraps_row_addr_domain_target)
     };
 
     // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
@@ -1260,7 +1262,7 @@ async fn merge_scalar_indices<'a>(
                         dataset.as_ref(),
                         &selected_old_indices,
                         None,
-                        false,
+                        true,
                     )
                     .await?;
                     let old_data_filters = per_segment_filters(old_data_filters);
@@ -1274,34 +1276,19 @@ async fn merge_scalar_indices<'a>(
                     )
                     .await?
                 }
-                IndexType::LabelList => {
-                    // No N:1 merge primitive wired into this path (unlike
-                    // BTree/Bitmap/NGram above) -- `has_segment_merge_primitive`
-                    // excludes it, so `can_merge_segments` only allows this arm
-                    // with exactly one selected segment, which `update` below
-                    // updates in place. Its domain can be either: harmless
-                    // without stable row ids (the two domains coincide), and
-                    // `legacy_domain_mismatch` above already forces a full
-                    // rebuild instead of reaching here for a stale row-id-domain
-                    // segment under stable row ids. So pass its own domain
-                    // through, not a hardcoded one.
-                    let old_data_filter = build_old_data_filter(
-                        dataset.as_ref(),
-                        &effective_old_frags,
-                        &deleted_old_frags,
-                        address_domain,
-                    )
-                    .await?;
-                    let old_data_filter =
-                        block_stale_rows(dataset.as_ref(), old_data_filter, &stale_rows);
-                    reference_index
-                        .update(new_data_stream, &new_store, old_data_filter)
-                        .await?
-                }
                 _ => {
-                    // A JSON index over an address-domain target, and a
-                    // list-element index, store row addresses, which a row-id
-                    // filter would wrongly prune.
+                    // Without an N:1 merge primitive (unlike BTree/Bitmap/NGram
+                    // above), `can_merge_segments` only allows this arm with
+                    // exactly one selected segment, which `update` updates in
+                    // place. Its domain can be either: a LabelList segment
+                    // reports its own, while a JSON index over an
+                    // address-domain target and a list-element index store row
+                    // addresses, which a row-id filter would wrongly prune.
+                    // That is harmless without stable row ids (the two domains
+                    // coincide), and `legacy_domain_mismatch` above already
+                    // forces a full rebuild instead of reaching here for a
+                    // stale row-id-domain segment under stable row ids. So pass
+                    // its own domain through, not a hardcoded one.
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
                         &effective_old_frags,
@@ -1336,6 +1323,21 @@ async fn merge_scalar_indices<'a>(
         created_index,
         new_dataset_version,
     )))
+}
+
+/// Index types whose segments persisted before their move to the row-address
+/// domain store row ids, so a stable-row-id dataset must rebuild rather than
+/// merge them with newly scanned (address-domain) data.
+fn has_legacy_row_id_domain(index_type: IndexType) -> bool {
+    matches!(
+        index_type,
+        IndexType::BTree
+            | IndexType::Bitmap
+            | IndexType::LabelList
+            | IndexType::NGram
+            | IndexType::RTree
+            | IndexType::MinHashLsh
+    )
 }
 
 async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
@@ -4789,12 +4791,18 @@ mod tests {
     /// (`num_indices_to_merge: Some(0)`), so without folding every remaining
     /// legacy segment into the rebuild regardless of what it selected, this is
     /// exactly what append-mode optimize would do under stable row ids.
+    #[rstest]
+    #[case::btree(IndexType::BTree, "id = '{}'")]
+    #[case::ngram(IndexType::NGram, "contains(id, '{}')")]
     #[tokio::test]
-    async fn test_optimize_btree_append_rebuilds_stray_legacy_segment_with_stable_row_ids() {
-        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+    async fn test_optimize_append_rebuilds_stray_legacy_segment_with_stable_row_ids(
+        #[case] index_type: IndexType,
+        #[case] filter_template: &str,
+    ) {
+        let query_id_count = async |dataset: &Dataset, id: &str| -> usize {
             dataset
                 .scan()
-                .filter(&format!("id = '{}'", id))
+                .filter(&filter_template.replace("{}", id))
                 .unwrap()
                 .project(&["id"])
                 .unwrap()
@@ -4802,7 +4810,7 @@ mod tests {
                 .await
                 .unwrap()
                 .num_rows()
-        }
+        };
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
@@ -4813,7 +4821,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
         };
 
-        // One fragment, one BTree segment, built under stable row ids so row
+        // One fragment, one segment, built under stable row ids so row
         // ids and row addresses are already two independent numbering schemes.
         let reader = RecordBatchIterator::new(vec![Ok(make_batch(0, 64))], schema.clone());
         let mut dataset = Dataset::write(
@@ -4828,12 +4836,12 @@ mod tests {
         .await
         .unwrap();
 
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let params = ScalarIndexParams::for_builtin(index_type.try_into().unwrap());
         let original_fragment_id = dataset.get_fragments()[0].id() as u32;
         let segment = crate::index::create::CreateIndexBuilder::new(
             &mut dataset,
             &["id"],
-            IndexType::BTree,
+            index_type,
             &params,
         )
         .name("id_idx".into())
@@ -4849,8 +4857,8 @@ mod tests {
         // Relabel it as a pre-migration (row-id-domain) segment: index_version
         // is exactly how `results_are_row_addrs` tells the two apart, and real
         // legacy segments on disk differ from a fresh one only in that label
-        // (`BTreeIndexPlugin::load_index` derives domain purely from the
-        // version its caller passes in, never from the file itself).
+        // (each plugin's `load_index` derives domain purely from the version
+        // its caller passes in, never from the file itself).
         let legacy_segment = IndexMetadata {
             index_version: 0,
             ..segment
@@ -4900,7 +4908,8 @@ mod tests {
         // Rows from both the original and the newly appended fragment must be
         // findable -- in particular rows only the new segment's data covers,
         // which a stray legacy segment reporting the wrong domain would drop.
-        for id in ["song-10", "song-100", "song-127"] {
+        // (Each id is no other id's substring, so `contains` matches one row.)
+        for id in ["song-63", "song-99", "song-127"] {
             assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
         }
     }
@@ -6270,7 +6279,7 @@ mod tests {
     /// unreadable deletion vector by deleting the file the manifest still
     /// references, then assert optimize errors instead of succeeding.
     #[rstest::rstest]
-    #[case::row_id_ngram(IndexType::NGram, BuiltinIndexType::NGram)]
+    #[case::row_id_inverted(IndexType::Inverted, BuiltinIndexType::Inverted)]
     #[case::address_btree(IndexType::BTree, BuiltinIndexType::BTree)]
     #[tokio::test]
     async fn test_optimize_errors_when_deletion_vector_unreadable(

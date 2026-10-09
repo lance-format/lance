@@ -400,10 +400,13 @@ mod tests {
     #[case::bitmap(details(&pbold::BitmapIndexDetails::default()), 0, false)]
     #[case::label_list(details(&pbold::LabelListIndexDetails::default()), 0, false)]
     #[case::ngram(details(&pbold::NGramIndexDetails::default()), 0, false)]
+    #[case::ngram_address_domain(details(&pbold::NGramIndexDetails::default()), 1, true)]
+    #[case::rtree(details(&pb::RTreeIndexDetails::default()), 0, false)]
+    #[case::rtree_address_domain(details(&pb::RTreeIndexDetails::default()), 1, true)]
     #[case::inverted(details(&pbold::InvertedIndexDetails::default()), 0, false)]
     #[case::vector(details(&pb::VectorIndexDetails::default()), 0, false)]
     #[case::fm(details(&pb::FmIndexDetails::default()), 0, false)]
-    #[case::min_hash(details(&pb::MinHashLshIndexDetails::default()), 0, false)]
+    #[case::min_hash(details(&pb::MinHashLshIndexDetails::default()), 1, false)]
     #[case::json(details(&pb::JsonIndexDetails::default()), 0, false)]
     #[case::json_over_zone_map(
         json_over(details(&pbold::ZoneMapIndexDetails::default())),
@@ -779,8 +782,8 @@ mod tests {
         dataset
             .create_index_builder(
                 &["category"],
-                IndexType::NGram,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -846,13 +849,16 @@ mod tests {
     // Bitmap also always stores row addresses now, so it is no longer rejected
     // here either -- see the generic_default_btree case above.
     #[case::typed_bitmap("i", IndexType::Bitmap, ScalarIndexParams::default(), None)]
-    // NGram still stores row ids directly, and (unlike BTree/Bitmap) needs a
-    // text column, hence the different column here.
-    #[case::typed_ngram(
+    // NGram also stores row addresses now; it needs a text column, hence the
+    // different column here.
+    #[case::typed_ngram("category", IndexType::NGram, ScalarIndexParams::default(), None)]
+    // MinHash LSH stores row addresses but does not apply the fragment reuse
+    // index when it is loaded.
+    #[case::typed_minhash_lsh(
         "category",
-        IndexType::NGram,
+        IndexType::MinHashLsh,
         ScalarIndexParams::default(),
-        Some("NGram")
+        Some("MinHashLsh")
     )]
     #[tokio::test]
     async fn test_create_scalar_index_under_frag_reuse(
@@ -960,8 +966,8 @@ mod tests {
         dataset
             .create_index_builder(
                 &["category"],
-                IndexType::NGram,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -1057,7 +1063,7 @@ mod tests {
         values
     }
 
-    /// The NGram index's stable row ids collide with compacted fragment 0's old
+    /// The Inverted index's stable row ids collide with compacted fragment 0's old
     /// addresses, so applying the fragment reuse index to it would lose rows.
     #[tokio::test]
     async fn test_incompatible_indices_are_hidden_from_readers() {
@@ -1065,8 +1071,8 @@ mod tests {
         create_index(
             &mut dataset,
             "category",
-            IndexType::NGram,
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            IndexType::Inverted,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
         )
         .await
         .unwrap();
@@ -1261,8 +1267,8 @@ mod tests {
             create_index(
                 &mut dataset,
                 "category",
-                IndexType::NGram,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .await,
             "Cannot create index `category_idx`",
@@ -1288,18 +1294,18 @@ mod tests {
 
     #[rstest]
     #[case::frag_reuse_index_first(true)]
-    #[case::ngram_first(false)]
+    #[case::inverted_first(false)]
     #[tokio::test]
     async fn test_racing_index_creation_is_rejected_after_rebase(#[case] frag_reuse_first: bool) {
         let dir = TempStrDir::default();
         let mut dataset = stable_row_id_dataset(dir.as_str()).await;
         let mut other = Dataset::open(dir.as_str()).await.unwrap();
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
-        let ngram_index = other
+        let inverted_index = other
             .create_index_builder(
                 &["category"],
-                IndexType::NGram,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                IndexType::Inverted,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             )
             .name("category_idx".to_string())
             .train(false)
@@ -1311,9 +1317,9 @@ mod tests {
             commit_new_indices(&mut dataset, vec![frag_reuse])
                 .await
                 .unwrap();
-            commit_new_indices(&mut other, vec![ngram_index]).await
+            commit_new_indices(&mut other, vec![inverted_index]).await
         } else {
-            commit_new_indices(&mut other, vec![ngram_index])
+            commit_new_indices(&mut other, vec![inverted_index])
                 .await
                 .unwrap();
             commit_new_indices(&mut dataset, vec![frag_reuse]).await
