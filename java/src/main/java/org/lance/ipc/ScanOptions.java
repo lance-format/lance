@@ -24,6 +24,7 @@ import java.util.UUID;
 /** Lance scan options. */
 public class ScanOptions {
   private final Optional<List<Integer>> fragmentIds;
+  private final Optional<List<FragmentSlice>> fragmentSlices;
   private final Optional<List<UUID>> indexSegments;
   private final Optional<Long> batchSize;
   private final Optional<Long> batchSizeBytes;
@@ -222,6 +223,7 @@ public class ScanOptions {
       boolean disableScoringAutoprojection) {
     this(
         fragmentIds,
+        Optional.empty(),
         indexSegments,
         batchSize,
         Optional.empty(),
@@ -252,6 +254,7 @@ public class ScanOptions {
 
   private ScanOptions(
       Optional<List<Integer>> fragmentIds,
+      Optional<List<FragmentSlice>> fragmentSlices,
       Optional<List<UUID>> indexSegments,
       Optional<Long> batchSize,
       Optional<Long> batchSizeBytes,
@@ -299,6 +302,7 @@ public class ScanOptions {
         !(strictBatchSize && batchSizeBytes.isPresent()),
         "strictBatchSize=true cannot be combined with batchSizeBytes");
     this.fragmentIds = fragmentIds;
+    this.fragmentSlices = fragmentSlices;
     this.indexSegments = indexSegments;
     this.batchSize = batchSize;
     this.batchSizeBytes = batchSizeBytes;
@@ -334,6 +338,18 @@ public class ScanOptions {
    */
   public Optional<List<Integer>> getFragmentIds() {
     return fragmentIds;
+  }
+
+  /**
+   * Get the physical row slices to scan.
+   *
+   * <p>When fragment IDs are also specified, both restrictions are applied. Overlapping slices use
+   * set semantics and do not duplicate rows.
+   *
+   * @return Optional containing the fragment slices if specified, otherwise empty.
+   */
+  public Optional<List<FragmentSlice>> getFragmentSlices() {
+    return fragmentSlices;
   }
 
   /**
@@ -564,6 +580,7 @@ public class ScanOptions {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("fragmentIds", fragmentIds.orElse(null))
+        .add("fragmentSlices", fragmentSlices.orElse(null))
         .add("indexSegments", indexSegments.orElse(null))
         .add("batchSize", batchSize.orElse(null))
         .add("batchSizeBytes", batchSizeBytes.orElse(null))
@@ -600,6 +617,7 @@ public class ScanOptions {
   /** Builder for constructing LanceScanOptions. */
   public static class Builder {
     private Optional<List<Integer>> fragmentIds = Optional.empty();
+    private Optional<List<FragmentSlice>> fragmentSlices = Optional.empty();
     private Optional<List<UUID>> indexSegments = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
     private Optional<Long> batchSizeBytes = Optional.empty();
@@ -636,6 +654,7 @@ public class ScanOptions {
      */
     public Builder(ScanOptions options) {
       this.fragmentIds = options.getFragmentIds();
+      this.fragmentSlices = options.getFragmentSlices();
       this.indexSegments = options.getIndexSegments();
       this.batchSize = options.getBatchSize();
       this.batchSizeBytes = options.getBatchSizeBytes();
@@ -672,6 +691,24 @@ public class ScanOptions {
      */
     public Builder fragmentIds(List<Integer> fragmentIds) {
       this.fragmentIds = Optional.of(fragmentIds);
+      return this;
+    }
+
+    /**
+     * Restrict the scan to physical row slices within fragments.
+     *
+     * <p>Each slice is interpreted against the dataset snapshot used to create the scanner. When
+     * {@link #fragmentIds(List)} is also set, both restrictions are applied. Slice order is not an
+     * output ordering contract; results follow the scanner's fragment and physical-row order.
+     * Fragment slices require V2 storage; legacy V1 storage throws {@link
+     * UnsupportedOperationException} when the scan is executed. Fragment slices currently cannot be
+     * combined with nearest-neighbor or full-text search.
+     *
+     * @param fragmentSlices physical fragment slices to scan
+     * @return Builder instance for method chaining.
+     */
+    public Builder fragmentSlices(List<FragmentSlice> fragmentSlices) {
+      this.fragmentSlices = Optional.of(fragmentSlices);
       return this;
     }
 
@@ -999,6 +1036,7 @@ public class ScanOptions {
     public ScanOptions build() {
       return new ScanOptions(
           fragmentIds,
+          fragmentSlices,
           indexSegments,
           batchSize,
           batchSizeBytes,

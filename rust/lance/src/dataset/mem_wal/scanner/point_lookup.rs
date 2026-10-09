@@ -446,7 +446,6 @@ impl LsmPointLookupPlanner {
                         match probe_memtable(
                             &m.batch_store,
                             &m.index_store,
-                            &self.pk_columns[0],
                             &pk_values[0],
                             target,
                             self.visibility,
@@ -550,7 +549,6 @@ impl LsmPointLookupPlanner {
                 .await;
         }
 
-        let pk_col = &self.pk_columns[0];
         let refs = self.collector.in_memory_refs_newest_first();
         // Hits grouped by (memtable index, batch index) so each source batch is
         // gathered with a single `take`.
@@ -559,8 +557,7 @@ impl LsmPointLookupPlanner {
         for key in keys {
             let mut resolved = false;
             for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key, self.visibility)?
-                {
+                match probe_position(&m.batch_store, &m.index_store, key, self.visibility)? {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -714,7 +711,10 @@ impl LsmPointLookupPlanner {
                 // rustc's depth limit up this point-lookup chain, and boxing inside
                 // `create_plan` instead triggers a `Box<Future>: Send` solver overflow
                 // (E0275 downstream). Same for the other arms below.
-                Box::pin(scanner.create_plan()).await?
+                let scan = Box::pin(scanner.create_plan()).await?;
+                // The source schema narrows a struct in declaration order, the
+                // canonical one in selection order; cast the children by name.
+                project_to_canonical(scan, &target)?
             }
             LsmDataSource::SsTable { path, .. } => {
                 let dataset = open_sstable(
@@ -1000,13 +1000,12 @@ enum ProbePos {
 }
 
 /// Resolve the `(batch_idx, row)` of a key's newest *visible* row in one
-/// in-memory memtable via a seek-and-stop on the ordered skiplist
-/// (`BTreeMemIndex::get_newest_visible`), honoring the MVCC watermark. No
+/// in-memory memtable with one seek on its primary-key index
+/// ([`IndexStore::pk_newest_visible`]), honoring the MVCC watermark. No
 /// materialization.
 fn probe_position(
     batch_store: &BatchStore,
     index_store: &IndexStore,
-    pk_column: &str,
     pk_value: &ScalarValue,
     visibility: MemTableVisibility,
 ) -> Result<ProbePos> {
@@ -1032,14 +1031,13 @@ fn probe_position(
     }
     let max_visible_row = visible_end - 1;
 
-    // A single-column primary key always has a value-keyed BTree (reused or
-    // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
-    // seek yields the answer with no re-check. Absent only when the table has no
-    // PK index, where the caller falls back to the plan path.
-    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
+    // One seek on the primary-key index, no re-check; without one the caller
+    // plans instead.
+    if !index_store.has_pk_index() {
         return Ok(ProbePos::NoIndex);
-    };
-    let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
+    }
+    let Some(pos) = index_store.pk_newest_visible(std::slice::from_ref(pk_value), max_visible_row)
+    else {
         return Ok(ProbePos::Miss);
     };
     let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
@@ -1141,12 +1139,11 @@ fn gather_rows(
 fn probe_memtable(
     batch_store: &BatchStore,
     index_store: &IndexStore,
-    pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
     visibility: MemTableVisibility,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value, visibility)? {
+    match probe_position(batch_store, index_store, pk_value, visibility)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {
@@ -2378,26 +2375,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_against_from_configs_built_index() {
-        // A point lookup against an index built the production way
-        // (`IndexStore::from_configs`) resolves correctly via the seek-and-stop
-        // skiplist probe.
-        use crate::dataset::mem_wal::index::{BTreeIndexConfig, IndexStore, MemIndexConfig};
+    async fn test_lookup_against_from_specs_built_index() {
+        // An index built as a writer builds it answers through the key index.
+        use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
 
         let schema = create_pk_schema();
         let batch = create_test_batch(&schema, &[10, 20, 30], "v");
         let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let index_store = IndexStore::from_configs(
-            &[MemIndexConfig::BTree(BTreeIndexConfig {
-                name: "id_idx".to_string(),
-                field_id: 0,
-                column: "id".to_string(),
-            })],
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let mut index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &lance_schema,
             1000,
             100,
         )
         .unwrap();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         let (idx, row_offset, _) = batch_store.append(batch.clone()).unwrap();
         index_store
             .insert_with_batch_position(&batch, row_offset, Some(idx))
@@ -2425,7 +2419,7 @@ mod tests {
             .lookup(&[ScalarValue::Int32(Some(20))], None)
             .await
             .unwrap()
-            .expect("range fallback must find the row");
+            .expect("the key index finds the row");
         assert_eq!(id_at(&row), 20);
         assert!(
             planner
@@ -2786,5 +2780,93 @@ mod tests {
                 "the output follows the selection, not the declaration"
             );
         }
+    }
+
+    /// Where the planned lookup reads the key from.
+    #[derive(Clone, Copy, Debug)]
+    enum NestedArm {
+        Base,
+        SsTable,
+        ActiveMemTable,
+    }
+
+    /// The planned lookup (not the in-memory fast path) narrows a struct the
+    /// way the fast path does, from whichever source holds the key. A WAL shard
+    /// sends a nested selection as its leaf paths, so `meta` itself is never
+    /// named.
+    #[rstest]
+    #[case::base(NestedArm::Base)]
+    #[case::sstable(NestedArm::SsTable)]
+    #[case::active_memtable(NestedArm::ActiveMemTable)]
+    #[tokio::test]
+    async fn a_planned_lookup_narrows_a_struct_selected_by_leaf_paths(#[case] arm: NestedArm) {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        use futures::TryStreamExt;
+
+        let schema = create_nested_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let batch = create_nested_batch(&schema, &[1, 2]);
+        let collector = match arm {
+            NestedArm::Base => {
+                let base = Arc::new(create_dataset(&base_uri, vec![batch]).await);
+                LsmDataSourceCollector::new(base, vec![])
+            }
+            NestedArm::SsTable => {
+                let shard_id = Uuid::new_v4();
+                let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+                create_dataset(&gen1_uri, vec![batch]).await;
+                let shard = ShardSnapshot::new(shard_id)
+                    .with_current_generation(2)
+                    .with_sstable(1, "gen_1".to_string());
+                LsmDataSourceCollector::without_base_table(base_uri, vec![shard])
+            }
+            NestedArm::ActiveMemTable => {
+                LsmDataSourceCollector::without_base_table(base_uri, vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: active_memtable_ref(&schema, &[batch], 1),
+                            frozen: vec![],
+                        },
+                    )
+            }
+        };
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
+
+        let projection = ["id", "meta.b", "meta.a"].map(String::from);
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(2))], Some(&projection))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+        assert_eq!(rows.len(), 1, "expected exactly one row for pk=2");
+        let row = rows[0];
+
+        assert_eq!(id_at(row), 2);
+        assert_eq!(meta_children(row), vec!["b", "a"]);
+        let meta = row.column_by_name("meta").unwrap().as_struct();
+        assert_eq!(
+            meta.column_by_name("a")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            20
+        );
+        assert_eq!(
+            meta.column_by_name("b")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            "b_2"
+        );
     }
 }

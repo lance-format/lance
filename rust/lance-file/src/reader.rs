@@ -540,17 +540,9 @@ pub(crate) fn normalized_column_num_rows(info: &ColumnInfo) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
         let page_rows = match &page.encoding {
             PageEncoding::Structural(layout) => match &layout.layout {
-                Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => sparse
-                    .structural_layers
-                    .first()
-                    .and_then(|layer| layer.layer.as_ref())
-                    .map_or(page.num_rows, |layer| match layer {
-                        pbenc21::sparse_structural_layer::Layer::Validity(layer) => layer.num_slots,
-                        pbenc21::sparse_structural_layer::Layer::List(layer) => layer.num_slots,
-                        pbenc21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
-                            layer.num_slots
-                        }
-                    }),
+                Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => {
+                    sparse.row_count_and_scale(page.num_rows)?.0
+                }
                 _ => page.num_rows,
             },
             _ => page.num_rows,
@@ -2473,8 +2465,14 @@ mod tests {
         )
     }
 
+    #[rstest::rstest]
+    #[case("nullable")]
+    #[case("rle")]
+    #[case("dictionary")]
+    #[case("binary_range")]
+    #[case("binary_delta")]
     #[tokio::test]
-    async fn sparse_file_writer_reader_scan_range_and_take_roundtrip() {
+    async fn sparse_file_writer_reader_scan_range_and_take_roundtrip(#[case] kind: &str) {
         let fs = FsFixture::default();
         let sparse_metadata = HashMap::from([(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -2499,7 +2497,7 @@ mod tests {
             Some(NullBuffer::from(vec![true, false, true, true, true, true])),
         )
         .unwrap();
-        let batch = RecordBatch::try_new(
+        let mut batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![
@@ -2514,7 +2512,69 @@ mod tests {
             ],
         )
         .unwrap();
-        let input = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema);
+        if matches!(kind, "rle" | "dictionary") {
+            let counts = (0..2048).map(|i| {
+                if kind == "rle" {
+                    i / 128 + 1
+                } else {
+                    [1, 31, 127][i % 3]
+                }
+            });
+            let mut offsets = vec![0_i32];
+            for count in counts {
+                offsets.push(offsets.last().unwrap() + count as i32);
+            }
+            let values = Int32Array::from_iter_values(0..*offsets.last().unwrap());
+            let list = ListArray::try_new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Arc::new(values),
+                None,
+            )
+            .unwrap();
+            batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..2048)),
+                    Arc::new(list),
+                ],
+            )
+            .unwrap();
+        }
+        if kind.starts_with("binary_") {
+            let metadata = HashMap::from([
+                (
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    STRUCTURAL_ENCODING_SPARSE.to_string(),
+                ),
+                ("lance-encoding:compression".to_string(), "none".to_string()),
+            ]);
+            let values = Arc::new(StringArray::from_iter_values((0..2048).map(|i| {
+                let len = if kind == "binary_range" {
+                    8
+                } else {
+                    [4, 10, 5, 8][i % 4]
+                };
+                char::from(b'a' + (i % 26) as u8).to_string().repeat(len)
+            })));
+            let item = Arc::new(Field::new("item", DataType::Utf8, true));
+            let lists = ListArray::try_new(
+                item.clone(),
+                OffsetBuffer::new(ScalarBuffer::from((0..=2048).collect::<Vec<i32>>())),
+                values.clone(),
+                None,
+            )
+            .unwrap();
+            batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("values", DataType::Utf8, true).with_metadata(metadata.clone()),
+                    Field::new("items", DataType::List(item), true).with_metadata(metadata),
+                ])),
+                vec![values, Arc::new(lists)],
+            )
+            .unwrap();
+        }
+        let input = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         write_lance_file(
             input,
             &fs,
@@ -2538,6 +2598,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(file_reader.metadata().column_infos.len(), 2);
+        if matches!(kind, "rle" | "dictionary") {
+            let PageEncoding::Structural(layout) =
+                &file_reader.metadata().column_infos[1].page_infos[0].encoding
+            else {
+                panic!("expected structural page")
+            };
+            let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
+                panic!("expected sparse page")
+            };
+            let counts = sparse
+                .structural_layers
+                .iter()
+                .find_map(|layer| {
+                    if let Some(pb21::sparse_structural_layer::Layer::List(list)) = &layer.layer {
+                        list.counts.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    (kind, &counts.compression),
+                    ("rle", Some(pb21::compressive_encoding::Compression::Rle(_)))
+                        | (
+                            "dictionary",
+                            Some(pb21::compressive_encoding::Compression::Dictionary(_))
+                        )
+                ),
+                "unexpected count codec: {counts:?}"
+            );
+        }
+        if kind.starts_with("binary_") {
+            for column in &file_reader.metadata().column_infos {
+                let PageEncoding::Structural(layout) = &column.page_infos[0].encoding else {
+                    panic!("expected structural page")
+                };
+                let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
+                    panic!("expected sparse page")
+                };
+                let Some(pb21::compressive_encoding::Compression::Variable(variable)) =
+                    &sparse.value_compression.as_ref().unwrap().compression
+                else {
+                    panic!("expected variable values")
+                };
+                let offsets = &variable.offsets.as_ref().unwrap().compression;
+                if kind == "binary_range" {
+                    assert!(matches!(
+                        offsets,
+                        Some(pb21::compressive_encoding::Compression::Range(_))
+                    ));
+                } else {
+                    assert!(matches!(
+                        offsets,
+                        Some(pb21::compressive_encoding::Compression::Delta(_))
+                    ));
+                }
+            }
+        }
         assert!(
             file_reader
                 .metadata()
@@ -2568,7 +2687,10 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(scan, vec![batch.clone()]);
+        assert_eq!(
+            arrow_select::concat::concat_batches(&batch.schema(), &scan).unwrap(),
+            batch
+        );
 
         let range = file_reader
             .read_stream(

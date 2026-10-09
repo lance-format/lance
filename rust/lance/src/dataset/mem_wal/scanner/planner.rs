@@ -1526,7 +1526,7 @@ mod integration_tests {
         );
         assert!(
             !plan_str.contains("BTreeIndexExec"),
-            "Active filtered read no longer uses the BTree skip"
+            "the active memtable must not use the index skip"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets

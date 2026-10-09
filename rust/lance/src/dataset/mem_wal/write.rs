@@ -37,10 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use uuid::Uuid;
 
-pub use super::index::{
-    BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
-    MemIndexKind, validate_index_configs,
-};
+pub use super::index::{BTreeMemIndex, IndexStore, MemIndexSpec, validate_index_specs};
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
 pub use super::memtable::batch_store::{BatchStore, StoreFull, StoredBatch};
@@ -49,6 +46,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
+use super::index::{MemIndexPlugin, MemIndexRegistry};
 use super::memtable::flush::TriggerMemTableFlush;
 use super::observer::WalObserver;
 use super::scanner::InMemoryMemTableRef;
@@ -195,7 +193,7 @@ pub struct ShardWriterConfig {
     ///
     /// When `false`, the writer skips the MemTable layer entirely:
     /// - No MemTable / BatchStore / IndexStore is allocated.
-    /// - `index_configs` must be empty (validated at open time).
+    /// - `index_specs` must be empty (validated at open time).
     /// - No MemTable freezing or Lance file flushing happens.
     /// - `max_unflushed_memtable_bytes` is reused as the backpressure
     ///   budget for the WAL-only pending-batch queue: `put` blocks while
@@ -225,6 +223,10 @@ pub struct ShardWriterConfig {
     ///
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
+
+    /// The memtable index plugins this writer can maintain. Defaults to the
+    /// kinds Lance builds in.
+    pub mem_index_registry: MemIndexRegistry,
 
     /// Optional warmer fired pre-commit for each new generation (zero cold reads
     /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
@@ -281,6 +283,7 @@ impl Default for ShardWriterConfig {
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
             hnsw_params: HashMap::new(),
+            mem_index_registry: MemIndexRegistry::default(),
             warmer: None,
             observer: None,
             store_params: None,
@@ -397,6 +400,19 @@ impl ShardWriterConfig {
     /// full WAL-only-mode contract. Defaults to `true`.
     pub fn with_enable_memtable(mut self, enable: bool) -> Self {
         self.enable_memtable = enable;
+        self
+    }
+
+    /// Register a memtable index plugin. Fails if another plugin already
+    /// maintains the same base-table index.
+    pub fn with_mem_index_plugin(mut self, plugin: Arc<dyn MemIndexPlugin>) -> Result<Self> {
+        self.mem_index_registry.add_plugin(plugin)?;
+        Ok(self)
+    }
+
+    /// The plugins this writer maintains indexes with.
+    pub fn with_mem_index_registry(mut self, registry: MemIndexRegistry) -> Self {
+        self.mem_index_registry = registry;
         self
     }
 
@@ -1439,7 +1455,7 @@ async fn replay_memtable_from_wal(
     pk_columns: &[String],
     flusher: &MemTableFlusher,
     wal_flusher: &WalFlusher,
-    index_configs: &[MemIndexConfig],
+    index_specs: &[MemIndexSpec],
     max_memtable_size: usize,
     max_memtable_rows: usize,
     max_resident_bytes: usize,
@@ -1496,7 +1512,7 @@ async fn replay_memtable_from_wal(
                             our_epoch,
                             position.saturating_sub(1),
                             global_end,
-                            index_configs,
+                            index_specs,
                         )
                         .await?;
                         active = make_memtable(generation, global_end, None)?;
@@ -1529,7 +1545,7 @@ async fn replay_memtable_from_wal(
                                 our_epoch,
                                 position.saturating_sub(1),
                                 global_end,
-                                index_configs,
+                                index_specs,
                             )
                             .await?;
                         }
@@ -1614,7 +1630,7 @@ async fn replay_memtable_from_wal(
                             our_epoch,
                             covered,
                             global_end,
-                            index_configs,
+                            index_specs,
                         )
                         .await?;
 
@@ -1785,30 +1801,33 @@ async fn flush_replayed_memtable(
     epoch: u64,
     covered: u64,
     durable: usize,
-    index_configs: &[MemIndexConfig],
+    index_specs: &[MemIndexSpec],
 ) -> Result<()> {
     index_replayed_batches(memtable).await?;
-    if index_configs.is_empty() {
+    if index_specs.is_empty() {
         flusher.flush(memtable, epoch, covered, durable).await?;
     } else {
-        Box::pin(flusher.flush_with_indexes(memtable, epoch, index_configs, covered, durable))
+        Box::pin(flusher.flush_with_indexes(memtable, epoch, index_specs, covered, durable))
             .await?;
     }
     Ok(())
 }
 
 /// Whether two maintained sets describe the same indexes.
-fn same_index_set(current: &[MemIndexConfig], next: &[MemIndexConfig]) -> bool {
+fn same_index_set(current: &[MemIndexSpec], next: &[MemIndexSpec]) -> bool {
     if current.len() != next.len() {
         return false;
     }
     // Names are unique within a set, so ordering by name is canonical.
-    fn by_name(configs: &[MemIndexConfig]) -> Vec<&MemIndexConfig> {
-        let mut configs: Vec<&MemIndexConfig> = configs.iter().collect();
-        configs.sort_unstable_by_key(|config| config.name());
-        configs
+    fn by_name(specs: &[MemIndexSpec]) -> Vec<&MemIndexSpec> {
+        let mut specs: Vec<&MemIndexSpec> = specs.iter().collect();
+        specs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
-    by_name(current) == by_name(next)
+    by_name(current)
+        .into_iter()
+        .zip(by_name(next))
+        .all(|(a, b)| a.same_index(b))
 }
 
 /// Pair each primary-key column name with its field id (both derived from the
@@ -1961,19 +1980,19 @@ struct WriterSchema {
     /// `storage` with Blob v2 payload columns replaced by their prepared
     /// descriptors. Memtables are created under this one.
     prepared: Arc<ArrowSchema>,
-    /// `storage` as a Lance schema, for validating index configs and resolving
+    /// `storage` as a Lance schema, for validating index specs and resolving
     /// FTS field ids.
     lance_schema: Schema,
     pk_field_ids: Vec<i32>,
     /// Primary-key column names, for each memtable's PK-position index.
     pk_columns: Vec<String>,
-    index_configs: Arc<[MemIndexConfig]>,
+    index_specs: Arc<[MemIndexSpec]>,
 }
 
 impl WriterSchema {
     /// Derive the writer's schemas from the caller's, which should carry field
     /// ids under `lance:field_id`.
-    fn try_new(schema: &ArrowSchema, index_configs: Vec<MemIndexConfig>) -> Result<Self> {
+    fn try_new(schema: &ArrowSchema, index_specs: Vec<MemIndexSpec>) -> Result<Self> {
         // lance owns `_tombstone` and appends it here — idempotent across reopens.
         let tombstoned = schema_with_tombstone(schema);
         let pk_fields = Schema::try_from(tombstoned.as_ref())?;
@@ -1993,24 +2012,24 @@ impl WriterSchema {
             prepared,
             pk_field_ids,
             pk_columns,
-            index_configs: Arc::from([]),
+            index_specs: Arc::from([]),
         }
-        .with_index_configs(index_configs)
+        .with_index_specs(index_specs)
     }
 
-    /// The same schema with `index_configs` instead.
+    /// The same schema with `index_specs` instead.
     ///
     /// A bad config is rejected before any row is accepted, since it would
     /// fail every insert, including WAL replay.
-    fn with_index_configs(&self, index_configs: Vec<MemIndexConfig>) -> Result<Self> {
-        validate_index_configs(
-            &index_configs,
+    fn with_index_specs(&self, index_specs: Vec<MemIndexSpec>) -> Result<Self> {
+        validate_index_specs(
+            &index_specs,
             self.storage.as_ref(),
             &self.lance_schema,
             &self.pk_columns,
         )?;
         Ok(Self {
-            index_configs: index_configs.into(),
+            index_specs: index_specs.into(),
             ..self.clone()
         })
     }
@@ -2025,7 +2044,7 @@ impl WriterSchema {
     fn is_equivalent(&self, other: &Self) -> bool {
         self.storage == other.storage
             && self.logical == other.logical
-            && same_index_set(&self.index_configs, &other.index_configs)
+            && same_index_set(&self.index_specs, &other.index_specs)
     }
 
     /// A new memtable under this schema at the given generation and offset.
@@ -2062,8 +2081,12 @@ impl WriterSchema {
             global_offset,
             target,
         )?;
-        let mut indexes =
-            IndexStore::from_configs(&self.index_configs, max_memtable_rows, batch_capacity)?;
+        let mut indexes = IndexStore::from_specs(
+            &self.index_specs,
+            &self.lance_schema,
+            max_memtable_rows,
+            batch_capacity,
+        )?;
         if !self.pk_columns.is_empty() {
             indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
         }
@@ -2374,7 +2397,7 @@ impl SharedWriterState {
 
         let _ = self.memtable_flush_tx.send(TriggerMemTableFlush::Flush {
             memtable: frozen_memtable,
-            index_configs: Arc::clone(&old_schema.index_configs),
+            index_specs: Arc::clone(&old_schema.index_specs),
             done: None,
         });
 
@@ -2617,14 +2640,14 @@ impl ShardWriter {
     /// `schema` should carry each field's id under `lance:field_id` in its
     /// field metadata; without them a replayed entry is matched by name, which
     /// a rename loses.
-    #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_configs.len()))]
+    #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_specs.len()))]
     pub async fn open(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
-        index_configs: Vec<MemIndexConfig>,
+        index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
         Box::pin(Self::open_inner(
             object_store,
@@ -2632,7 +2655,7 @@ impl ShardWriter {
             base_uri.into(),
             config,
             schema,
-            index_configs,
+            index_specs,
         ))
         .await
     }
@@ -2643,9 +2666,9 @@ impl ShardWriter {
         base_uri: String,
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
-        index_configs: Vec<MemIndexConfig>,
+        index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
-        if !config.enable_memtable && !index_configs.is_empty() {
+        if !config.enable_memtable && !index_specs.is_empty() {
             return Err(Error::invalid_input(
                 "indexes require enable_memtable = true; \
                  WAL-only mode does not maintain in-memory indexes",
@@ -2678,11 +2701,11 @@ impl ShardWriter {
         // Derive PK metadata and run every side-effect-free validation *before*
         // claiming the epoch. `claim_epoch` durably bumps the stored epoch and,
         // for a successor, `write_fence_sentinel` fences the predecessor — so an
-        // open doomed by purely local input (an index config that disagrees with
+        // open doomed by purely local input (an index spec that disagrees with
         // the schema) must fail here, before it can knock the healthy incumbent off
         // the shard. Memtable-only: WAL-only mode has no indexes to validate.
         let writer_schema = if config.enable_memtable {
-            let writer_schema = WriterSchema::try_new(&schema, index_configs)?;
+            let writer_schema = WriterSchema::try_new(&schema, index_specs)?;
 
             // An HNSW graph reserves its whole capacity before the first insert,
             // but the seal trigger only measures row bytes. A reservation with no
@@ -2709,8 +2732,9 @@ impl ShardWriter {
 
                 // Built the way `make_bound_memtable` builds it below, so this is
                 // the figure the controller will actually read.
-                let mut indexes = IndexStore::from_configs(
-                    &writer_schema.index_configs,
+                let mut indexes = IndexStore::from_specs(
+                    &writer_schema.index_specs,
+                    &writer_schema.lance_schema,
                     config.max_memtable_rows,
                     config.max_memtable_batches,
                 )?;
@@ -2915,7 +2939,7 @@ impl ShardWriter {
             &schema.pk_columns,
             &flusher,
             &wal_flusher,
-            &schema.index_configs,
+            &schema.index_specs,
             config.max_memtable_size,
             config.max_memtable_rows,
             config.max_unflushed_memtable_bytes,
@@ -3715,9 +3739,9 @@ impl ShardWriter {
                     .read()
                     .await
                     .schema
-                    .index_configs
+                    .index_specs
                     .iter()
-                    .map(|config| config.name().to_string())
+                    .map(|spec| spec.name.clone())
                     .collect();
                 names.sort_unstable();
                 names
@@ -3915,7 +3939,7 @@ impl ShardWriter {
         }))
     }
 
-    /// Switch this writer to `schema` and `index_configs` without reopening it.
+    /// Switch this writer to `schema` and `index_specs` without reopening it.
     ///
     /// The active memtable is sealed and flushed under its old schema. Reads
     /// match columns by field id, so older rows show up under the new names.
@@ -3941,10 +3965,10 @@ impl ShardWriter {
     pub async fn evolve_schema(
         &self,
         schema: Arc<ArrowSchema>,
-        index_configs: Vec<MemIndexConfig>,
+        index_specs: Vec<MemIndexSpec>,
     ) -> Result<Option<SealFence>> {
         self.replace_writer_schema("evolve_schema", |_current| {
-            WriterSchema::try_new(&schema, index_configs)
+            WriterSchema::try_new(&schema, index_specs)
         })
         .await
     }
@@ -4016,20 +4040,20 @@ impl ShardWriter {
     /// rows answer neither search until compaction.
     ///
     /// `Ok(None)` when the set is already current; nothing is sealed.
-    #[instrument(name = "sw_replace_index_configs", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch, index_count = configs.len()))]
+    #[instrument(name = "sw_replace_index_configs", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch, index_count = specs.len()))]
     pub async fn replace_index_configs(
         &self,
-        configs: Vec<MemIndexConfig>,
+        specs: Vec<MemIndexSpec>,
     ) -> Result<Option<SealFence>> {
         // Usually already current: check under the read lock and skip the
         // fence check, which reads the manifest.
         if let WriterMode::MemTable { state, .. } = &self.mode
-            && same_index_set(&state.read().await.schema.index_configs, &configs)
+            && same_index_set(&state.read().await.schema.index_specs, &specs)
         {
             return Ok(None);
         }
         self.replace_writer_schema("replace_index_configs", |current| {
-            current.with_index_configs(configs)
+            current.with_index_specs(specs)
         })
         .await
     }
@@ -4756,10 +4780,10 @@ impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
         match message {
             TriggerMemTableFlush::Flush {
                 memtable,
-                index_configs,
+                index_specs,
                 done,
             } => {
-                let result = self.flush_memtable(memtable, &index_configs).await;
+                let result = self.flush_memtable(memtable, &index_specs).await;
                 if let Some(tx) = done {
                     // Send result through the channel - caller is waiting for it
                     let _ = tx.send(result);
@@ -4785,13 +4809,13 @@ impl MemTableFlushHandler {
     /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
     /// dropped watch channel and return `Err` instead of the actual outcome.
     ///
-    /// `index_configs` are the indexes the memtable was built with. They are
+    /// `index_specs` are the indexes the memtable was built with. They are
     /// rebuilt on the generation, without which `fast_search` misses its rows.
     #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
         memtable: Arc<MemTable>,
-        index_configs: &[MemIndexConfig],
+        index_specs: &[MemIndexSpec],
     ) -> Result<super::memtable::flush::FlushResult> {
         let start = Instant::now();
 
@@ -4830,7 +4854,7 @@ impl MemTableFlushHandler {
             // `batch_count` is fixed at freeze, so this waits for a target that
             // cannot move, and the watcher surfaces a poisoned writer rather
             // than blocking on a cursor that will never arrive.
-            if !index_configs.is_empty()
+            if !index_specs.is_empty()
                 && let Some(indexes) = memtable.indexes_arc()
             {
                 let target_indexed = memtable.batch_count();
@@ -4862,7 +4886,7 @@ impl MemTableFlushHandler {
             // short of it and trip the flush precondition.
             let durable = self.wal_flusher.durable();
 
-            if index_configs.is_empty() {
+            if index_specs.is_empty() {
                 self.flusher
                     .flush(&memtable, self.epoch, covered_wal_entry_position, durable)
                     .await
@@ -4870,7 +4894,7 @@ impl MemTableFlushHandler {
                 Box::pin(self.flusher.flush_with_indexes(
                     &memtable,
                     self.epoch,
-                    index_configs,
+                    index_specs,
                     covered_wal_entry_position,
                     durable,
                 ))
@@ -5346,12 +5370,12 @@ mod tests {
         );
         let schema = first.schema();
         let second = create_blob_v2_batch(8, &[BlobTestValue::Bytes(b"later".to_vec())]);
-        let index_configs = vec![MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-            "vector_idx".to_string(),
+        let index_specs = vec![MemIndexSpec::hnsw(
+            "vector_idx",
             4,
-            "vector".to_string(),
+            "vector",
             lance_linalg::distance::DistanceType::L2,
-        )))];
+        )];
         let config = ShardWriterConfig {
             shard_id,
             durable_write: true,
@@ -5367,7 +5391,7 @@ mod tests {
                 base_uri.clone(),
                 config.clone(),
                 schema.clone(),
-                index_configs.clone(),
+                index_specs.clone(),
             )
             .await
             .unwrap();
@@ -5474,7 +5498,7 @@ mod tests {
             base_uri.clone(),
             replay_config,
             schema,
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -6498,7 +6522,6 @@ mod tests {
         filter: Option<&str>,
     ) -> Vec<i32> {
         use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
-        use futures::TryStreamExt;
 
         let manifest = writer.manifest().await.unwrap().unwrap();
         let mut snapshot =
@@ -6506,12 +6529,42 @@ mod tests {
         for sstable in &manifest.sstables {
             snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
-        let mut scanner = LsmScanner::without_base_table(
+        let scanner = LsmScanner::without_base_table(
             schema,
             base_uri.to_string(),
             vec![snapshot],
             vec!["id".to_string()],
         );
+        scan_ids(scanner, filter).await
+    }
+
+    /// The ids a read of the writer's in-memory memtables returns.
+    async fn read_memtable_ids_via_lsm(
+        writer: &ShardWriter,
+        schema: Arc<ArrowSchema>,
+        base_uri: &str,
+        shard_id: Uuid,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema,
+            base_uri.to_string(),
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        scan_ids(scanner, filter).await
+    }
+
+    async fn scan_ids(
+        mut scanner: crate::dataset::mem_wal::scanner::LsmScanner,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use futures::TryStreamExt;
+
         if let Some(predicate) = filter {
             scanner = scanner.filter(predicate).unwrap();
         }
@@ -6591,6 +6644,79 @@ mod tests {
         writer.close().await.unwrap();
     }
 
+    /// A user index may carry any name, including one shaped like an internal
+    /// key index. It keeps its own column through writes, overwrites, deletes,
+    /// a flush and a reopen, and the key index keeps deduplicating beside it.
+    #[tokio::test]
+    async fn test_user_index_named_like_a_key_index_keeps_its_column() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let index_specs = vec![MemIndexSpec::btree("__pk__id", 1, "name")];
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                flush_test_config(shard_id),
+                schema.clone(),
+                index_specs.clone(),
+            )
+        };
+        let renamed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["renamed"])),
+            ],
+        )
+        .unwrap();
+        let cases = [
+            ("name = 'renamed'", vec![1]),
+            ("name = 'name_1'", vec![]),
+            ("name = 'name_2'", vec![]),
+            ("name = 'name_3'", vec![3]),
+            ("id = 1", vec![1]),
+            ("id = 2", vec![]),
+        ];
+
+        let writer = open().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.put(vec![renamed]).await.unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+        for (filter, expected) in &cases {
+            let ids = read_memtable_ids_via_lsm(
+                &writer,
+                schema.clone(),
+                &base_uri,
+                shard_id,
+                Some(filter),
+            )
+            .await;
+            assert_eq!(&ids, expected, "fresh read of {filter}");
+        }
+
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        writer.close().await.unwrap();
+        let writer = open().await.unwrap();
+        for (filter, expected) in &cases {
+            let ids = read_sstable_ids_via_lsm(
+                &writer,
+                schema.clone(),
+                &base_uri,
+                shard_id,
+                Some(filter),
+            )
+            .await;
+            assert_eq!(&ids, expected, "flushed read of {filter}");
+        }
+        writer.close().await.unwrap();
+    }
+
     /// Insert+flush, then delete+flush: the tombstone lands in a *newer*
     /// generation than the live row, so the cross-generation block-list must
     /// mask the older row by PK. This is the wallop scenario (seed flushed,
@@ -6649,18 +6775,14 @@ mod tests {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let shard_id = Uuid::new_v4();
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
         let writer = ShardWriter::open(
             store,
             base_path,
             base_uri.clone(),
             flush_test_config(shard_id),
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -7028,11 +7150,7 @@ mod tests {
             ..Default::default()
         };
 
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let writer = ShardWriter::open(
             store,
@@ -7040,7 +7158,7 @@ mod tests {
             base_uri,
             config,
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -7062,13 +7180,8 @@ mod tests {
     #[test]
     fn test_a_changed_metric_is_a_changed_index_set() {
         use lance_linalg::distance::DistanceType;
-        let old = MemIndexConfig::hnsw("vector_idx".into(), 1, "vector".into(), DistanceType::L2);
-        let new = MemIndexConfig::hnsw(
-            "vector_idx".into(),
-            1,
-            "vector".into(),
-            DistanceType::Cosine,
-        );
+        let old = MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2);
+        let new = MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::Cosine);
         assert!(!same_index_set(&[old], &[new]));
     }
 
@@ -7093,11 +7206,7 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         };
-        let id_idx = MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        });
+        let id_idx = MemIndexSpec::btree("id_idx", 0, "id");
         let writer = Arc::new(
             ShardWriter::open(
                 store,
@@ -7193,11 +7302,7 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         };
-        let id_idx = MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        });
+        let id_idx = MemIndexSpec::btree("id_idx", 0, "id");
         let writer = ShardWriter::open(
             store,
             base_path,
@@ -7297,11 +7402,7 @@ mod tests {
             ..Default::default()
         };
 
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let writer = ShardWriter::open(
             store,
@@ -7309,7 +7410,7 @@ mod tests {
             base_uri.clone(),
             config,
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -8701,14 +8802,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_only_rejects_index_configs() {
+    async fn test_wal_only_rejects_index_specs() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let err = ShardWriter::open(
             store,
@@ -8716,7 +8813,7 @@ mod tests {
             base_uri,
             wal_only_config(Uuid::new_v4()),
             schema,
-            index_configs,
+            index_specs,
         )
         .await
         .err()
@@ -9064,14 +9161,10 @@ mod tests {
             .await
             .unwrap();
 
-        // An index config that disagrees with the schema (FTS on the Int32 `id`
+        // An index spec that disagrees with the schema (FTS on the Int32 `id`
         // column) is rejected on local validation. On the old path this rejection
         // landed only after the epoch had already been claimed.
-        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
-            "bad_fts".to_string(),
-            0,
-            "id".to_string(),
-        ));
+        let bad_fts = MemIndexSpec::fts("bad_fts", 0, "id");
         let err = ShardWriter::open(
             store.clone(),
             base_path.clone(),
@@ -9303,7 +9396,7 @@ mod tests {
                 base_uri.clone(),
                 writer_a_config,
                 schema.clone(),
-                // WAL-only mode builds no index; writer B carries the HNSW configs.
+                // WAL-only mode builds no index; writer B carries the HNSW specs.
                 vec![],
             )
             .await
@@ -9317,10 +9410,9 @@ mod tests {
         }
 
         // Replay has 32 rows to place into memtables capped at 8.
-        let writer_b =
-            ShardWriter::open(store, base_path, base_uri, config, schema, hnsw_configs())
-                .await
-                .expect("a WAL holding more rows than the cap must still reopen");
+        let writer_b = ShardWriter::open(store, base_path, base_uri, config, schema, hnsw_specs())
+            .await
+            .expect("a WAL holding more rows than the cap must still reopen");
 
         let manifest = writer_b.manifest().await.unwrap().unwrap();
         assert!(
@@ -9785,7 +9877,7 @@ mod tests {
         );
     }
 
-    /// An index config that disagrees with the schema fails `open()` outright.
+    /// An index spec that disagrees with the schema fails `open()` outright.
     /// It must not be allowed to accept writes: the insert would fail
     /// deterministically on every batch, including batches replayed from the
     /// WAL, so once a row was durable the shard could never reopen. Before this
@@ -9798,11 +9890,7 @@ mod tests {
         let shard_id = Uuid::new_v4();
 
         // `id` is Int32, not a string column.
-        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
-            "bad_fts".to_string(),
-            0,
-            "id".to_string(),
-        ));
+        let bad_fts = MemIndexSpec::fts("bad_fts", 0, "id");
 
         let Err(err) = ShardWriter::open(
             store,
@@ -10292,11 +10380,7 @@ mod tests {
         // silently reading zero after index apply moved off the WAL-flush path.
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_pk_test_schema();
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let writer = ShardWriter::open(
             store,
@@ -10304,7 +10388,7 @@ mod tests {
             base_uri,
             flush_test_config(Uuid::new_v4()),
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -11127,7 +11211,7 @@ mod tests {
             base_uri,
             config,
             schema.clone(),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .unwrap();
@@ -11174,11 +11258,7 @@ mod tests {
         ]));
         // Keys long enough to spill out of the skiplist nodes, so the index heap
         // grows with the column instead of staying a fixed reservation.
-        let btree = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "text_idx".to_string(),
-            field_id: 1,
-            column: "text".to_string(),
-        })];
+        let btree = vec![MemIndexSpec::btree("text_idx", 1, "text")];
 
         let rows = 2_000usize;
         let width = 512usize;
@@ -11244,7 +11324,7 @@ mod tests {
             max_memtable_rows: 2_000,
             ..Default::default()
         };
-        let reserved = reserved_index_bytes(&sizing, &hnsw_configs());
+        let reserved = reserved_index_bytes(&sizing, &hnsw_specs());
         let (store, base_path, base_uri, _t) = create_local_store().await;
         let config = ShardWriterConfig {
             shard_id: Uuid::new_v4(),
@@ -11261,7 +11341,7 @@ mod tests {
             base_uri,
             config,
             hnsw_schema(8),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .err()
@@ -11286,20 +11366,26 @@ mod tests {
         ]))
     }
 
-    fn hnsw_configs() -> Vec<MemIndexConfig> {
-        vec![MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-            "vec_idx".to_string(),
+    /// The shard schema the reservation tests build memtables against.
+    fn test_lance_schema() -> Schema {
+        Schema::try_from(hnsw_schema(8).as_ref()).unwrap()
+    }
+
+    fn hnsw_specs() -> Vec<MemIndexSpec> {
+        vec![MemIndexSpec::hnsw(
+            "vec_idx",
             1,
-            "vector".to_string(),
+            "vector",
             lance_linalg::distance::DistanceType::L2,
-        )))]
+        )]
     }
 
     /// What the configured indexes owe before a single row arrives — the figure
     /// `open` validates against, computed the way the memtable will build them.
-    fn reserved_index_bytes(config: &ShardWriterConfig, configs: &[MemIndexConfig]) -> usize {
-        IndexStore::from_configs(
-            configs,
+    fn reserved_index_bytes(config: &ShardWriterConfig, specs: &[MemIndexSpec]) -> usize {
+        IndexStore::from_specs(
+            specs,
+            &test_lance_schema(),
             config.max_memtable_rows,
             config.max_memtable_batches,
         )
@@ -11324,7 +11410,7 @@ mod tests {
             max_unflushed_memtable_bytes: 1024 * 1024,
             ..Default::default()
         };
-        let reserved = reserved_index_bytes(&config, &hnsw_configs());
+        let reserved = reserved_index_bytes(&config, &hnsw_specs());
         assert!(
             reserved > config.max_unflushed_memtable_bytes,
             "the fixture must actually over-subscribe the ceiling, got {reserved}"
@@ -11336,7 +11422,7 @@ mod tests {
             base_uri,
             config,
             hnsw_schema(32),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .err()
@@ -11455,7 +11541,7 @@ mod tests {
             max_memtable_rows: 2_000,
             ..Default::default()
         };
-        let reserved = reserved_index_bytes(&sizing, &hnsw_configs());
+        let reserved = reserved_index_bytes(&sizing, &hnsw_specs());
         let max_memtable_size = 4 * 1024;
 
         let config = ShardWriterConfig {
@@ -11475,7 +11561,7 @@ mod tests {
             base_uri,
             config,
             schema.clone(),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .expect("a reservation that leaves room under the ceiling must open");

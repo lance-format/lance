@@ -1024,14 +1024,23 @@ fn apply_probe_bounds(
             .map_err(|_| Error::invalid_input(format!("{name} must be non-negative")))
     };
 
+    let maximum_is_unbounded = maximum_nprobes == Some(0);
     if let Some(nprobes) = nprobes {
-        scanner.nprobes(parse_probe_count("nprobes", nprobes)?);
+        let nprobes = parse_probe_count("nprobes", nprobes)?;
+        if maximum_is_unbounded {
+            scanner.minimum_nprobes(nprobes);
+        } else {
+            scanner.nprobes(nprobes);
+        }
     }
     if let Some(minimum_nprobes) = minimum_nprobes {
         scanner.minimum_nprobes(parse_probe_count("minimum_nprobes", minimum_nprobes)?);
     }
     if let Some(maximum_nprobes) = maximum_nprobes {
-        scanner.maximum_nprobes(parse_probe_count("maximum_nprobes", maximum_nprobes)?);
+        let maximum_nprobes = parse_probe_count("maximum_nprobes", maximum_nprobes)?;
+        if maximum_nprobes != 0 {
+            scanner.maximum_nprobes(maximum_nprobes);
+        }
     }
     Ok(())
 }
@@ -14418,6 +14427,35 @@ mod tests {
             let plan = namespace.explain_table_query_plan(request).await.unwrap();
             assert!(plan.contains("minimum_nprobes=20"), "{plan}");
             assert!(plan.contains("maximum_nprobes=Some(20)"), "{plan}");
+
+            let query = QueryTableRequest {
+                id: None,
+                k: 2,
+                vector: vector(),
+                nprobes: Some(1),
+                maximum_nprobes: Some(0),
+                ..Default::default()
+            };
+            let mut request = ExplainTableQueryPlanRequest::new(query);
+            request.id = Some(table_id.clone());
+
+            let plan = namespace.explain_table_query_plan(request).await.unwrap();
+            assert!(plan.contains("minimum_nprobes=1"), "{plan}");
+            assert!(plan.contains("maximum_nprobes=None"), "{plan}");
+
+            let request = QueryTableRequest {
+                id: Some(table_id.clone()),
+                k: 2,
+                vector: vector(),
+                nprobes: Some(1),
+                maximum_nprobes: Some(0),
+                ..Default::default()
+            };
+            let bytes = namespace.query_table(request).await.unwrap();
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = FileReader::try_new(cursor, None).unwrap();
+            let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+            assert_eq!(total_rows, 2);
 
             let query = QueryTableRequest {
                 id: None,

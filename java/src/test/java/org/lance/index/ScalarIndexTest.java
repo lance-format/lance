@@ -49,10 +49,13 @@ import org.junit.jupiter.params.provider.EnumSource;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -63,6 +66,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -759,6 +763,307 @@ public class ScalarIndexTest {
             dataset.countIndexedRows(
                 indexName, "name >= 'Person 3' AND name < 'Person 8'", Optional.empty()));
       }
+    }
+  }
+
+  @Test
+  public void testCountIndexedRowsSelectsPhysicalSegments(@TempDir Path tempDir) throws Exception {
+    assertPhysicalSegmentSelection(tempDir.resolve("segments"), false);
+  }
+
+  @Test
+  public void testCountIndexedRowsStableRowIdsExcludeDeletions(@TempDir Path tempDir)
+      throws Exception {
+    assertPhysicalSegmentSelection(tempDir.resolve("stable-segments"), true);
+  }
+
+  @Test
+  public void testCountIndexedRowsDoesNotOpenUnselectedSegment(@TempDir Path tempDir)
+      throws Exception {
+    String filter = "name >= 'Person 0'";
+    Path datasetPath = tempDir.resolve("unopened");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      UUID segmentA;
+      UUID segmentB;
+      String indexName;
+      try (NamedSegments segments = createNamedSegments(allocator, datasetPath, false, 10, 4)) {
+        segmentA = segments.segmentA.uuid();
+        segmentB = segments.segmentB.uuid();
+        indexName = segments.indexName;
+      }
+      // Reopen after deleting B so a session cache cannot satisfy the query.
+      deleteIndexSegment(datasetPath, segmentB);
+      try (Dataset dataset = Dataset.open(datasetPath.toString(), allocator)) {
+        assertEquals(
+            10,
+            dataset.countIndexedRows(
+                indexName, filter, Collections.singletonList(segmentA), Optional.empty()));
+        Exception missingSegment =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.countIndexedRows(
+                        indexName, filter, Collections.singletonList(segmentB), Optional.empty()));
+        assertTrue(
+            missingSegment.getMessage() != null && !missingSegment.getMessage().isEmpty(),
+            "opening the deleted segment should fail, got: " + missingSegment);
+      }
+    }
+  }
+
+  private void assertPhysicalSegmentSelection(Path datasetPath, boolean stableRowIds)
+      throws Exception {
+    String filter = "name >= 'Person 0'";
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        NamedSegments segments = createNamedSegments(allocator, datasetPath, stableRowIds, 10, 4)) {
+      Dataset dataset = segments.dataset;
+      List<UUID> segmentA = Collections.singletonList(segments.segmentA.uuid());
+      List<UUID> segmentB = Collections.singletonList(segments.segmentB.uuid());
+      List<UUID> both = Arrays.asList(segments.segmentB.uuid(), segments.segmentA.uuid());
+      int fragmentA = fragmentId(segments.segmentA);
+      int fragmentB = fragmentId(segments.segmentB);
+
+      assertEquals(
+          10, dataset.countIndexedRows(segments.indexName, filter, segmentA, Optional.empty()));
+      assertEquals(
+          4, dataset.countIndexedRows(segments.indexName, filter, segmentB, Optional.empty()));
+      assertEquals(
+          14, dataset.countIndexedRows(segments.indexName, filter, both, Optional.empty()));
+      assertEquals(14, dataset.countIndexedRows(segments.indexName, filter, Optional.empty()));
+      assertEquals(
+          14,
+          dataset.countIndexedRows(
+              segments.indexName, filter, both, Optional.of(Arrays.asList(fragmentB, fragmentA))));
+      assertEquals(
+          10,
+          dataset.countIndexedRows(
+              segments.indexName, filter, Optional.of(Collections.singletonList(fragmentA))));
+
+      Exception unindexedFilter =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.countIndexedRows(segments.indexName, "id = 0", Optional.empty()));
+      assertTrue(
+          unindexedFilter.getMessage().contains(segments.indexName), unindexedFilter.getMessage());
+      assertTrue(
+          unindexedFilter.getMessage().contains("cannot be planned"), unindexedFilter.getMessage());
+
+      Exception coverageMismatch =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      segmentA,
+                      Optional.of(Collections.singletonList(fragmentB))));
+      assertTrue(
+          coverageMismatch.getMessage().contains("do not match selected segment coverage"),
+          coverageMismatch.getMessage());
+      assertTrue(
+          coverageMismatch.getMessage().contains(Integer.toString(fragmentA)),
+          coverageMismatch.getMessage());
+      assertTrue(
+          coverageMismatch.getMessage().contains(Integer.toString(fragmentB)),
+          coverageMismatch.getMessage());
+
+      Exception unknownFragment =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      segmentA,
+                      Optional.of(Collections.singletonList(99))));
+      assertTrue(
+          unknownFragment.getMessage().contains("unknown fragment IDs"),
+          unknownFragment.getMessage());
+
+      Exception duplicateFragments =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      segmentA,
+                      Optional.of(Arrays.asList(fragmentA, fragmentA))));
+      assertTrue(
+          duplicateFragments.getMessage().contains("duplicate fragment IDs"),
+          duplicateFragments.getMessage());
+
+      Exception unknownSegment =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      Collections.singletonList(UUID.randomUUID()),
+                      Optional.empty()));
+      assertTrue(
+          unknownSegment.getMessage().contains("does not exist"), unknownSegment.getMessage());
+
+      Index otherIndex =
+          dataset.createIndex(
+              IndexOptions.builder(
+                      Collections.singletonList("id"), IndexType.BTREE, btreeIndexParams())
+                  .withIndexName("other_index")
+                  .build());
+      Exception wrongIndex =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      Collections.singletonList(otherIndex.uuid()),
+                      Optional.empty()));
+      assertTrue(wrongIndex.getMessage().contains("other_index"), wrongIndex.getMessage());
+      assertTrue(wrongIndex.getMessage().contains(segments.indexName), wrongIndex.getMessage());
+
+      Exception duplicateSegments =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      Arrays.asList(segments.segmentA.uuid(), segments.segmentA.uuid()),
+                      Optional.empty()));
+      assertTrue(
+          duplicateSegments.getMessage().contains("duplicate UUIDs"),
+          duplicateSegments.getMessage());
+      Assertions.assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              dataset.countIndexedRows(
+                  segments.indexName, filter, Collections.emptyList(), Optional.empty()));
+
+      dataset.delete("name = 'Person 0'");
+      assertEquals(
+          9, dataset.countIndexedRows(segments.indexName, filter, segmentA, Optional.empty()));
+      assertEquals(
+          3, dataset.countIndexedRows(segments.indexName, filter, segmentB, Optional.empty()));
+      assertEquals(
+          12, dataset.countIndexedRows(segments.indexName, filter, both, Optional.empty()));
+      assertEquals(12, dataset.countRows(filter));
+    }
+  }
+
+  private NamedSegments createNamedSegments(
+      BufferAllocator allocator, Path datasetPath, boolean stableRowIds, int rowsA, int rowsB)
+      throws Exception {
+    TestUtils.SimpleTestDataset testDataset =
+        new TestUtils.SimpleTestDataset(allocator, datasetPath.toString());
+    WriteParams.Builder createParams = new WriteParams.Builder();
+    if (stableRowIds) {
+      createParams.withEnableStableRowIds(true);
+    }
+    testDataset.createDatasetWithWriteParams(createParams.build()).close();
+    testDataset.write(1, rowsA).close();
+    Dataset dataset = testDataset.write(2, rowsB);
+    List<Fragment> fragments = dataset.getFragments();
+    assertEquals(2, fragments.size());
+    Fragment fragmentA = null;
+    Fragment fragmentB = null;
+    for (Fragment fragment : fragments) {
+      long physicalRows = fragment.metadata().getPhysicalRows();
+      if (physicalRows == rowsA) {
+        fragmentA = fragment;
+      } else if (physicalRows == rowsB) {
+        fragmentB = fragment;
+      }
+    }
+    assertNotNull(fragmentA);
+    assertNotNull(fragmentB);
+
+    String indexName = "name_idx";
+    List<Index> committed =
+        commitBtreeSegments(dataset, indexName, "name", Arrays.asList(fragmentA, fragmentB));
+    return new NamedSegments(
+        dataset,
+        indexName,
+        indexCovering(committed, fragmentA.getId()),
+        indexCovering(committed, fragmentB.getId()));
+  }
+
+  private static IndexParams btreeIndexParams() {
+    return IndexParams.builder()
+        .setScalarIndexParams(ScalarIndexParams.create("btree", "{\"zone_size\": 2048}"))
+        .build();
+  }
+
+  private static List<Index> commitBtreeSegments(
+      Dataset dataset, String indexName, String column, List<Fragment> fragments) {
+    List<Index> segments = new ArrayList<>();
+    for (Fragment fragment : fragments) {
+      segments.add(
+          dataset.createIndex(
+              IndexOptions.builder(
+                      Collections.singletonList(column), IndexType.BTREE, btreeIndexParams())
+                  .withIndexName(indexName)
+                  .withFragmentIds(Collections.singletonList(fragment.getId()))
+                  .build()));
+    }
+    List<Index> committed = dataset.commitExistingIndexSegments(indexName, column, segments);
+    assertEquals(fragments.size(), committed.size());
+    return committed;
+  }
+
+  private static Index indexCovering(List<Index> indexes, int fragmentId) {
+    for (Index index : indexes) {
+      if (index.fragments().orElse(Collections.emptyList()).contains(fragmentId)) {
+        return index;
+      }
+    }
+    throw new AssertionError("no committed segment covers fragment " + fragmentId);
+  }
+
+  private static int fragmentId(Index segment) {
+    List<Integer> fragments =
+        segment
+            .fragments()
+            .orElseThrow(
+                () ->
+                    new AssertionError("segment " + segment.uuid() + " has no fragment coverage"));
+    assertEquals(1, fragments.size(), "expected one fragment in " + segment.uuid());
+    return fragments.get(0);
+  }
+
+  private static void deleteIndexSegment(Path datasetPath, UUID uuid) throws IOException {
+    Path indexDir = datasetPath.resolve("_indices").resolve(uuid.toString());
+    assertTrue(Files.isDirectory(indexDir), "expected index directory " + indexDir);
+    try (Stream<Path> walk = Files.walk(indexDir)) {
+      walk.sorted(Comparator.reverseOrder())
+          .forEach(
+              path -> {
+                try {
+                  Files.delete(path);
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
+              });
+    }
+  }
+
+  private static final class NamedSegments implements AutoCloseable {
+    private final Dataset dataset;
+    private final String indexName;
+    private final Index segmentA;
+    private final Index segmentB;
+
+    private NamedSegments(Dataset dataset, String indexName, Index segmentA, Index segmentB) {
+      this.dataset = dataset;
+      this.indexName = indexName;
+      this.segmentA = segmentA;
+      this.segmentB = segmentB;
+    }
+
+    @Override
+    public void close() {
+      dataset.close();
     }
   }
 

@@ -7845,7 +7845,6 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                     ctx.field,
                     self.compression.as_ref(),
                     data,
-                    MiniblockChunkSize::U32,
                 ) {
                     Ok(prepared_values) => prepared_values,
                     Err(error) => {
@@ -7920,7 +7919,6 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 plan,
                 row_number,
                 num_rows,
-                MiniblockChunkSize::U32,
             )?,
         ))
     }
@@ -8027,12 +8025,12 @@ mod tests {
         FixedWidthDictionaryEncoding, FullZipCacheableState, FullZipDecodeDetails,
         FullZipDecodeTaskItem, FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler,
         LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk, MiniBlockChunkIndex,
-        MiniBlockCompressed, MiniblockChunkSize, PageCacheView, PageDataCacheKey,
-        PageInfoAndScheduler, PageInitialization, PerValueDataBlock, PerValueDecompressor,
-        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, SimpleAllNullScheduler,
-        StructuralPageScheduler, StructuralPrimitiveFieldScheduler, VariableFullZipDecoder,
-        dense_levels_from_block, map_ranges_to_pages, pages_overlapping_ranges,
-        validate_complex_all_null_levels,
+        MiniBlockCompressed, MiniBlockScheduler, MiniblockChunkSize, PageCacheView,
+        PageDataCacheKey, PageInfoAndScheduler, PageInitialization, PerValueDataBlock,
+        PerValueDecompressor, PreambleAction, RunEndsBuilder, RunPosition, RunStorage,
+        SimpleAllNullScheduler, StructuralPageScheduler, StructuralPrimitiveFieldScheduler,
+        VariableFullZipDecoder, dense_levels_from_block, map_ranges_to_pages,
+        pages_overlapping_ranges, validate_complex_all_null_levels,
     };
     use crate::EncodingsIo;
     use crate::buffer::LanceBuffer;
@@ -8040,9 +8038,9 @@ mod tests {
         BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
     };
     use crate::constants::{
-        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
+        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
+        DICT_VALUES_COMPRESSION_LEVEL_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
+        STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
     use crate::decoder::{
@@ -8068,8 +8066,14 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
+    use futures::{FutureExt, future::BoxFuture};
+    use prost::Message;
     use std::collections::HashMap;
-    use std::{collections::VecDeque, ops::Range, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        ops::Range,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Debug)]
     struct CacheMarker(u8);
@@ -11463,6 +11467,199 @@ mod tests {
             pages.push(task.await.unwrap());
         }
         pages.into_iter().next().unwrap()
+    }
+
+    fn variable_offset_test_field() -> arrow_schema::Field {
+        arrow_schema::Field::new("c", DataType::Utf8, false).with_metadata(HashMap::from([
+            (
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+            ),
+            (COMPRESSION_META_KEY.to_string(), "none".to_string()),
+            (DICT_DIVISOR_META_KEY.to_string(), "100000".to_string()),
+        ]))
+    }
+
+    fn variable_offset_test_array(lengths: &[usize], num_rows: usize) -> ArrayRef {
+        Arc::new(StringArray::from_iter_values((0..num_rows).map(|index| {
+            let length = lengths[index % lengths.len()];
+            format!("{index:04x}{}", "x".repeat(length - 4))
+        })))
+    }
+
+    fn miniblock_layout(page: &crate::encoder::EncodedPage) -> &pb21::MiniBlockLayout {
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("expected structural page encoding");
+        };
+        let Some(pb21::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref()
+        else {
+            panic!("expected mini-block page layout");
+        };
+        layout
+    }
+
+    fn variable_offset_compression(
+        page: &crate::encoder::EncodedPage,
+    ) -> &pb21::compressive_encoding::Compression {
+        let value_encoding = miniblock_layout(page).value_compression.as_ref().unwrap();
+        let Compression::Variable(variable) = value_encoding.compression.as_ref().unwrap() else {
+            panic!("expected Variable value compression");
+        };
+        variable
+            .offsets
+            .as_deref()
+            .and_then(|offsets| offsets.compression.as_ref())
+            .unwrap()
+    }
+
+    fn variable_value_wire_bytes(page: &crate::encoder::EncodedPage) -> usize {
+        miniblock_layout(page)
+            .value_compression
+            .as_ref()
+            .unwrap()
+            .encoded_len()
+            + page.data.iter().map(LanceBuffer::len).sum::<usize>()
+    }
+
+    #[derive(Debug)]
+    struct OffsetIoRecorder {
+        data: Bytes,
+        requests: Mutex<Vec<Vec<Range<u64>>>>,
+    }
+
+    impl OffsetIoRecorder {
+        fn take_requests(&self) -> Vec<Vec<Range<u64>>> {
+            std::mem::take(&mut *self.requests.lock().unwrap())
+        }
+    }
+
+    impl EncodingsIo for OffsetIoRecorder {
+        fn submit_request(
+            &self,
+            ranges: Vec<Range<u64>>,
+            _priority: u64,
+        ) -> BoxFuture<'static, lance_core::Result<Vec<Bytes>>> {
+            self.requests.lock().unwrap().push(ranges.clone());
+            let data = ranges
+                .into_iter()
+                .map(|range| self.data.slice(range.start as usize..range.end as usize))
+                .collect();
+            std::future::ready(Ok(data)).boxed()
+        }
+    }
+
+    async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [usize; 6] {
+        let mut position = 0_u64;
+        let buffer_offsets_and_sizes = page
+            .data
+            .iter()
+            .map(|buffer| {
+                let size = buffer.len() as u64;
+                let descriptor = (position, size);
+                position += size;
+                descriptor
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::with_capacity(position as usize);
+        for buffer in &page.data {
+            bytes.extend_from_slice(buffer);
+        }
+
+        let recorder = Arc::new(OffsetIoRecorder {
+            data: Bytes::from(bytes),
+            requests: Mutex::new(Vec::new()),
+        });
+        let io: Arc<dyn EncodingsIo> = recorder.clone();
+        let decompression = DefaultDecompressionStrategy::default();
+        let mut cold = MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            0,
+            page.num_rows,
+            miniblock_layout(page),
+            &decompression,
+        )
+        .unwrap();
+        let initialization = cold.init_layout().unwrap();
+        let ranges = initialization.required_ranges().cloned().collect();
+        let buffers = io.submit_request(ranges, 0).await.unwrap();
+        let buffers = initialization.with_buffers(buffers).unwrap();
+        let cached = cold.init_from_buffers(buffers, &io).await.unwrap();
+        cold.try_load(&cached).unwrap();
+        let initialize_requests = recorder.take_requests();
+
+        let cold_tasks = cold.schedule_ranges(&[123..124], &io).unwrap();
+        let cold_requests = recorder.take_requests();
+        for task in cold_tasks {
+            task.decoder_fut.await.unwrap();
+        }
+
+        let mut warm = MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            0,
+            page.num_rows,
+            miniblock_layout(page),
+            &decompression,
+        )
+        .unwrap();
+        warm.try_load(&cached).unwrap();
+        let warm_tasks = warm.schedule_ranges(&[123..124], &io).unwrap();
+        let warm_requests = recorder.take_requests();
+        for task in warm_tasks {
+            task.decoder_fut.await.unwrap();
+        }
+
+        [
+            initialize_requests.len(),
+            initialize_requests.iter().map(Vec::len).sum(),
+            cold_requests.len(),
+            cold_requests.iter().map(Vec::len).sum(),
+            warm_requests.len(),
+            warm_requests.iter().map(Vec::len).sum(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_generic_offsets_preserve_legacy_and_take_io() {
+        let array = variable_offset_test_array(&[4, 10, 5, 8], 10_000);
+        let v2_1 = encode_first_page(
+            variable_offset_test_field(),
+            array.clone(),
+            TestEncoding::StructuralU16,
+        )
+        .await;
+        let v2_2 = encode_first_page(
+            variable_offset_test_field(),
+            array.clone(),
+            TestEncoding::StructuralU32,
+        )
+        .await;
+        let v2_3 = encode_first_page(
+            variable_offset_test_field(),
+            array,
+            TestEncoding::StructuralSparse,
+        )
+        .await;
+
+        assert!(matches!(
+            variable_offset_compression(&v2_1),
+            Compression::Flat(_)
+        ));
+        assert!(matches!(
+            variable_offset_compression(&v2_2),
+            Compression::Flat(_)
+        ));
+        assert!(matches!(
+            variable_offset_compression(&v2_3),
+            Compression::Delta(_)
+        ));
+        assert!(variable_value_wire_bytes(&v2_3) < variable_value_wire_bytes(&v2_2));
+        assert_eq!(miniblock_layout(&v2_2).num_buffers, 1);
+        assert_eq!(miniblock_layout(&v2_3).num_buffers, 2);
+
+        let legacy_requests = miniblock_take_request_shape(&v2_2).await;
+        let generic_requests = miniblock_take_request_shape(&v2_3).await;
+        assert_eq!(legacy_requests, [1, 1, 1, 1, 1, 1]);
+        assert_eq!(generic_requests, legacy_requests);
     }
 
     #[tokio::test]
