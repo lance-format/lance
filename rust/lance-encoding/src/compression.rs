@@ -42,12 +42,17 @@ use crate::{
             byte_stream_split::{
                 ByteStreamSplitDecompressor, ByteStreamSplitEncoder, should_use_bss,
             },
-            constant::ConstantDecompressor,
+            constant::{ConstantBlockDecompressor, ConstantDecompressor},
+            delta::DeltaDecompressor,
+            dictionary::BlockDictionaryDecompressor,
             fsst::{
                 FsstMiniBlockDecompressor, FsstMiniBlockEncoder, FsstPerValueDecompressor,
                 FsstPerValueEncoder,
             },
-            general::{GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor},
+            general::{
+                FixedWidthGeneralBlockDecompressor, GeneralMiniBlockCompressor,
+                GeneralMiniBlockDecompressor,
+            },
             packed::{
                 PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
                 PackedStructFixedWidthMiniBlockDecompressor,
@@ -55,9 +60,10 @@ use crate::{
                 PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
                 VariablePackedStructFieldKind,
             },
+            range::RangeDecompressor,
             rle::{
-                RleChildDecompressor, RleDecompressor, RleEncoder, RunLengthWidth,
-                rle_encoded_size, select_run_length_width,
+                BlockRleDecompressor, BlockRleRunCount, RleChildDecompressor, RleDecompressor,
+                RleEncoder, RunLengthWidth, rle_encoded_size, select_run_length_width,
             },
             value::{ValueDecompressor, ValueEncoder},
         },
@@ -1074,6 +1080,15 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     compression_config,
                 )))
             }
+            compression @ (Compression::Range(_) | Compression::Delta(_)) => {
+                Err(Error::not_supported_source(
+                    format!(
+                        "{} compression is only supported in block positions",
+                        compression_name(compression)
+                    )
+                    .into(),
+                ))
+            }
             _ => todo!(),
         }
     }
@@ -1231,10 +1246,318 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(general_decompressor))
             }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(rle, self)?)),
+            Compression::Range(range) => create_fixed_width_block_decompressor(
+                description,
+                range.uncompressed_bits_per_value,
+            ),
+            Compression::Delta(delta) => create_fixed_width_block_decompressor(
+                description,
+                delta.uncompressed_bits_per_value,
+            ),
             _ => todo!(),
         }
     }
 }
+
+/// Builds the bounded decoder tree used by generic unsigned block sequences.
+///
+/// This is intentionally separate from [`DecompressionStrategy::create_block_decompressor`]:
+/// stable 2.1/2.2 block readers keep their existing grammar and framing, while
+/// the 2.3 offset container opts into this typed grammar explicitly.
+pub(crate) fn create_fixed_width_block_decompressor(
+    description: &CompressiveEncoding,
+    expected_bits_per_value: u64,
+) -> Result<Box<dyn BlockDecompressor>> {
+    if !matches!(expected_bits_per_value, 32 | 64) {
+        return Err(Error::invalid_input(format!(
+            "Generic block decoding only supports 32 or 64-bit values, got {expected_bits_per_value}"
+        )));
+    }
+    create_fixed_width_block_decompressor_inner(description, expected_bits_per_value, true)
+}
+
+fn create_fixed_width_block_decompressor_inner(
+    description: &CompressiveEncoding,
+    expected_bits_per_value: u64,
+    allow_composite: bool,
+) -> Result<Box<dyn BlockDecompressor>> {
+    let compression = description
+        .compression
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input("Block encoding is missing its compression variant"))?;
+    match compression {
+        Compression::Flat(flat) => {
+            if flat.bits_per_value != expected_bits_per_value {
+                return Err(Error::invalid_input(format!(
+                    "Flat declares {}-bit values, expected {expected_bits_per_value}",
+                    flat.bits_per_value
+                )));
+            }
+            if flat.data.is_some() {
+                return Err(Error::invalid_input(
+                    "Generic block Flat cannot contain buffer compression",
+                ));
+            }
+            Ok(Box::new(ValueDecompressor::from_flat(flat)))
+        }
+        Compression::Constant(constant) => {
+            let value = decode_fixed_width_constant(constant, expected_bits_per_value)?;
+            Ok(Box::new(ConstantBlockDecompressor::new(
+                expected_bits_per_value,
+                value,
+            )))
+        }
+        Compression::Range(range) => {
+            if range.uncompressed_bits_per_value != expected_bits_per_value {
+                return Err(Error::invalid_input(format!(
+                    "Range declares {}-bit values, expected {expected_bits_per_value}",
+                    range.uncompressed_bits_per_value
+                )));
+            }
+            Ok(Box::new(RangeDecompressor::new(
+                expected_bits_per_value,
+                range.start,
+                range.step,
+            )))
+        }
+        Compression::InlineBitpacking(bitpacking) => {
+            if bitpacking.uncompressed_bits_per_value != expected_bits_per_value {
+                return Err(Error::invalid_input(format!(
+                    "Inline bitpacking declares {}-bit values, expected {expected_bits_per_value}",
+                    bitpacking.uncompressed_bits_per_value
+                )));
+            }
+            #[cfg(feature = "bitpacking")]
+            {
+                Ok(Box::new(InlineBitpacking::from_description(bitpacking)))
+            }
+            #[cfg(not(feature = "bitpacking"))]
+            {
+                Err(Error::not_supported_source(
+                    "this runtime was not built with bitpacking support".into(),
+                ))
+            }
+        }
+        Compression::OutOfLineBitpacking(bitpacking) => {
+            if bitpacking.uncompressed_bits_per_value != expected_bits_per_value {
+                return Err(Error::invalid_input(format!(
+                    "Out-of-line bitpacking declares {}-bit values, expected {expected_bits_per_value}",
+                    bitpacking.uncompressed_bits_per_value
+                )));
+            }
+            let values = bitpacking.values.as_deref().ok_or_else(|| {
+                Error::invalid_input("Out-of-line bitpacking is missing its values encoding")
+            })?;
+            let compressed_bits = match values.compression.as_ref() {
+                Some(Compression::Flat(flat)) if flat.data.is_none() => flat.bits_per_value,
+                _ => {
+                    return Err(Error::invalid_input(
+                        "Out-of-line bitpacking values must use plain Flat encoding",
+                    ));
+                }
+            };
+            if compressed_bits == 0 || compressed_bits >= expected_bits_per_value {
+                return Err(Error::invalid_input(format!(
+                    "Out-of-line bitpacking width {compressed_bits} is invalid for {expected_bits_per_value}-bit values"
+                )));
+            }
+            #[cfg(feature = "bitpacking")]
+            {
+                Ok(Box::new(OutOfLineBitpacking::new(
+                    compressed_bits,
+                    expected_bits_per_value,
+                )))
+            }
+            #[cfg(not(feature = "bitpacking"))]
+            {
+                Err(Error::not_supported_source(
+                    "this runtime was not built with bitpacking support".into(),
+                ))
+            }
+        }
+        Compression::Delta(delta) if allow_composite => {
+            if delta.uncompressed_bits_per_value != expected_bits_per_value {
+                return Err(Error::invalid_input(format!(
+                    "Delta declares {}-bit values, expected {expected_bits_per_value}",
+                    delta.uncompressed_bits_per_value
+                )));
+            }
+            let child = delta.deltas.as_deref().ok_or_else(|| {
+                Error::invalid_input("Delta is missing its deltas child encoding")
+            })?;
+            let child =
+                create_fixed_width_block_decompressor_inner(child, expected_bits_per_value, false)?;
+            Ok(Box::new(DeltaDecompressor::new(
+                expected_bits_per_value,
+                delta.base,
+                child,
+            )))
+        }
+        Compression::General(general) if allow_composite => {
+            let child = general.values.as_deref().ok_or_else(|| {
+                Error::invalid_input("General block compression is missing its values encoding")
+            })?;
+            if !matches!(
+                child.compression.as_ref(),
+                Some(Compression::Flat(flat))
+                    if flat.bits_per_value == expected_bits_per_value && flat.data.is_none()
+            ) {
+                return Err(Error::invalid_input(
+                    "Generic General compression must wrap plain Flat values",
+                ));
+            }
+            let child =
+                create_fixed_width_block_decompressor_inner(child, expected_bits_per_value, false)?;
+            let compression = general.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input("General block compression is missing its compression config")
+            })?;
+            let scheme = compression.scheme().try_into()?;
+            let config = CompressionConfig::new(scheme, compression.level);
+            Ok(Box::new(FixedWidthGeneralBlockDecompressor::new(
+                child,
+                config,
+                expected_bits_per_value,
+            )))
+        }
+        Compression::Rle(rle) if allow_composite => {
+            let values = rle.values.as_deref().ok_or_else(|| {
+                Error::invalid_input("RLE compression is missing its values encoding")
+            })?;
+            let run_lengths = rle.run_lengths.as_deref().ok_or_else(|| {
+                Error::invalid_input("RLE compression is missing its run-length encoding")
+            })?;
+            let run_count = match run_lengths.compression.as_ref() {
+                Some(Compression::Constant(constant)) => {
+                    BlockRleRunCount::ConstantRunLength(decode_fixed_width_constant(constant, 32)?)
+                }
+                Some(Compression::Range(range)) if range.uncompressed_bits_per_value == 32 => {
+                    BlockRleRunCount::RangeRunLengths {
+                        start: range.start,
+                        step: range.step,
+                    }
+                }
+                _ if matches!(values.compression.as_ref(), Some(Compression::Flat(flat)) if flat.bits_per_value == expected_bits_per_value && flat.data.is_none()) => {
+                    BlockRleRunCount::FlatValues
+                }
+                _ if matches!(run_lengths.compression.as_ref(), Some(Compression::Flat(flat)) if flat.bits_per_value == 32 && flat.data.is_none()) => {
+                    BlockRleRunCount::FlatRunLengths
+                }
+                _ => {
+                    return Err(Error::invalid_input(
+                        "RLE requires metadata run lengths or one plain Flat child to recover the run count",
+                    ));
+                }
+            };
+            let values = create_fixed_width_block_decompressor_inner(
+                values,
+                expected_bits_per_value,
+                false,
+            )?;
+            let run_lengths = create_fixed_width_block_decompressor_inner(run_lengths, 32, false)?;
+            Ok(Box::new(BlockRleDecompressor::try_new(
+                expected_bits_per_value,
+                values,
+                run_lengths,
+                run_count,
+            )?))
+        }
+        Compression::Dictionary(dictionary) if allow_composite => {
+            let indices = dictionary.indices.as_deref().ok_or_else(|| {
+                Error::invalid_input("Dictionary is missing its indices encoding")
+            })?;
+            let items = dictionary
+                .items
+                .as_deref()
+                .ok_or_else(|| Error::invalid_input("Dictionary is missing its items encoding"))?;
+            let indices = create_fixed_width_block_decompressor_inner(indices, 32, false)?;
+            let items =
+                create_fixed_width_block_decompressor_inner(items, expected_bits_per_value, false)?;
+            Ok(Box::new(BlockDictionaryDecompressor::try_new(
+                expected_bits_per_value,
+                dictionary.num_dictionary_items,
+                indices,
+                items,
+            )?))
+        }
+        other => Err(Error::invalid_input(format!(
+            "{} is not allowed at this position in a generic block encoding",
+            compression_name(other)
+        ))),
+    }
+}
+
+fn decode_fixed_width_constant(
+    constant: &crate::format::pb21::Constant,
+    bits_per_value: u64,
+) -> Result<u64> {
+    let value = constant
+        .value
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input("Typed Constant is missing its scalar value"))?;
+    let expected_bytes = usize::try_from(bits_per_value / 8)
+        .map_err(|_| Error::invalid_input("Constant scalar width does not fit usize"))?;
+    if value.len() != expected_bytes {
+        return Err(Error::invalid_input(format!(
+            "Constant scalar has {} bytes, expected {expected_bytes}",
+            value.len()
+        )));
+    }
+    Ok(match bits_per_value {
+        32 => u64::from(u32::from_le_bytes(
+            value
+                .as_ref()
+                .try_into()
+                .expect("constant width was checked"),
+        )),
+        64 => u64::from_le_bytes(
+            value
+                .as_ref()
+                .try_into()
+                .expect("constant width was checked"),
+        ),
+        _ => {
+            return Err(Error::invalid_input(format!(
+                "Constant only supports 32 or 64-bit values, got {bits_per_value}"
+            )));
+        }
+    })
+}
+
+pub(crate) fn validate_delta_child_encoding(
+    child: &CompressiveEncoding,
+    expected_bits_per_value: u64,
+) -> Result<()> {
+    let child_bits_per_value = match child.compression.as_ref() {
+        Some(Compression::Flat(flat)) => flat.bits_per_value,
+        Some(Compression::Constant(constant)) => {
+            decode_fixed_width_constant(constant, expected_bits_per_value)?;
+            expected_bits_per_value
+        }
+        Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
+        Some(Compression::InlineBitpacking(bitpacking)) => bitpacking.uncompressed_bits_per_value,
+        Some(Compression::OutOfLineBitpacking(bitpacking)) => {
+            bitpacking.uncompressed_bits_per_value
+        }
+        Some(other) => {
+            return Err(Error::invalid_input(format!(
+                "Delta does not support a {} child",
+                compression_name(other)
+            )));
+        }
+        None => {
+            return Err(Error::invalid_input(
+                "Delta child is missing its compression variant",
+            ));
+        }
+    };
+    if child_bits_per_value != expected_bits_per_value {
+        return Err(Error::invalid_input(format!(
+            "Delta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn create_rle_decompressor(
     rle: &crate::format::pb21::Rle,
     decompression_strategy: &dyn DecompressionStrategy,
@@ -1403,6 +1726,8 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
         Compression::Rle(_) => "rle",
+        Compression::Range(_) => "range",
+        Compression::Delta(_) => "delta",
     }
 }
 
@@ -2816,6 +3141,73 @@ mod tests {
         assert!(
             !debug_str.contains("RleEncoder"),
             "RLE should not be used for V2.1"
+        );
+    }
+
+    #[test]
+    fn generic_block_rle_round_trips_metadata_children() {
+        use crate::encodings::physical::{
+            constant::ConstantEncoder, range::RangeEncoder, rle::BlockRleEncoder,
+        };
+
+        let values = vec![10_u64, 10, 20, 20, 30, 30];
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            num_values: values.len() as u64,
+            block_info: BlockInfo::default(),
+        });
+        let encoder = BlockRleEncoder::try_new(
+            64,
+            Box::new(RangeEncoder::new(64, 10, 10)),
+            Box::new(ConstantEncoder::new(32, 2)),
+        )
+        .unwrap();
+        let (payload, encoding) = encoder.compress(block).unwrap();
+        assert!(payload.is_none());
+
+        let decoder = create_fixed_width_block_decompressor(&encoding, 64).unwrap();
+        let decoded = decoder.decompress(None, values.len() as u64).unwrap();
+        assert_eq!(
+            decoded
+                .as_fixed_width()
+                .unwrap()
+                .data
+                .borrow_to_typed_slice::<u64>()
+                .as_ref(),
+            values
+        );
+    }
+
+    #[test]
+    fn generic_block_dictionary_uses_the_typed_decoder_tree() {
+        use crate::encodings::physical::{dictionary::BlockDictionaryEncoder, value::ValueEncoder};
+
+        let values = vec![10_u64, 20, 10, 20];
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            num_values: values.len() as u64,
+            block_info: BlockInfo::default(),
+        });
+        let encoder = BlockDictionaryEncoder::try_new(
+            64,
+            Arc::from([10, 20]),
+            Box::new(ValueEncoder::default()),
+            Box::new(ValueEncoder::default()),
+        )
+        .unwrap();
+        let (payload, encoding) = encoder.compress(block).unwrap();
+        let decoder = create_fixed_width_block_decompressor(&encoding, 64).unwrap();
+        let decoded = decoder.decompress(payload, values.len() as u64).unwrap();
+        assert_eq!(
+            decoded
+                .as_fixed_width()
+                .unwrap()
+                .data
+                .borrow_to_typed_slice::<u64>()
+                .as_ref(),
+            values
         );
     }
 }

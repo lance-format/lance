@@ -1388,8 +1388,10 @@ impl SparseStructuralScheduler {
                             .filter_map(|field| field.value.as_ref()),
                     );
                 }
+                Compression::Delta(delta) => stack.extend(delta.deltas.as_deref()),
                 Compression::Flat(_)
                 | Compression::Constant(_)
+                | Compression::Range(_)
                 | Compression::InlineBitpacking(_) => {}
             }
         }
@@ -1537,6 +1539,8 @@ impl SparseStructuralScheduler {
             Compression::Constant(_)
             | Compression::OutOfLineBitpacking(_)
             | Compression::Dictionary(_)
+            | Compression::Range(_)
+            | Compression::Delta(_)
             | Compression::VariablePackedStruct(_) => Err(Error::invalid_input_source(
                 "Sparse value compression uses an unsupported mini-block encoding".into(),
             )),

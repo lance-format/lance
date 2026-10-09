@@ -99,6 +99,9 @@ fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result
             }
             Ok(())
         }
+        Some(Compression::Range(_) | Compression::Delta(_)) => Err(Error::invalid_input_source(
+            "Range and delta compression are not part of the Lance v2.2 grammar".into(),
+        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.2 compressive encoding is missing its compression variant".into(),
         )),
@@ -304,5 +307,32 @@ mod grammar_tests {
                 .to_string()
                 .contains("flat values and flat u8 run lengths")
         );
+    }
+
+    #[test]
+    fn rejects_range_and_delta() {
+        let range = CompressiveEncoding {
+            compression: Some(Compression::Range(pb21::Range {
+                uncompressed_bits_per_value: 64,
+                start: 0,
+                step: 1,
+            })),
+        };
+        let delta = CompressiveEncoding {
+            compression: Some(Compression::Delta(Box::new(pb21::Delta {
+                uncompressed_bits_per_value: 64,
+                base: 0,
+                deltas: Some(Box::new(range.clone())),
+            }))),
+        };
+
+        for encoding in [&range, &delta] {
+            let error = validate_compressive_encoding(encoding).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not part of the Lance v2.2 grammar")
+            );
+        }
     }
 }

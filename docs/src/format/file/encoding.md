@@ -567,6 +567,11 @@ free to pretend that the fixed-size list data type does not exist.
 
 ## Compression
 
+Generic block compression (including Range, Delta, block dictionary compositions and generic mini-block
+offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
+contracts. The complete 2.3 format will undergo a consolidated format vote when it is proposed for stable
+status; intermediate unstable revisions do not establish compatibility requirements.
+
 Once a structural encoding is chosen we must determine how to compress the data. There are various buffers that
 might be compressed (e.g. data, repetition, definition, dictionary, etc.). The available compression algorithms
 are also constrained by the structural encoding chosen. For example, when using the full zip layout we require
@@ -585,6 +590,9 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Flat            | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
+| Range           | ✅ (2.3)              | ❌                       | ❌                         |
+| Delta           | ✅ (2.3)              | ❌                       | ❌                         |
+| Dictionary      | ✅ (2.3)              | ❌                       | ❌                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -616,6 +624,41 @@ we have passed.
 Constant compression is currently only utilized in a few specialized scenarios such as all-null arrays.
 
 This will likely change in future versions.
+
+### Range
+
+Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences. It stores the first
+value and a positive step; the containing block supplies the number of values. Readers compute value `i` as
+`start + step * i` and reject invalid widths or arithmetic overflow.
+
+```protobuf
+%%% proto.message.Range %%%
+```
+
+### Delta
+
+Delta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1` adjacent
+differences. The differences are represented by a child block codec. Delta has a payload exactly when its child
+has one, and readers reconstruct values with checked prefix sums.
+
+```protobuf
+%%% proto.message.Delta %%%
+```
+
+### Block Dictionary
+
+A block dictionary represents unsigned `u32` or `u64` values with a `u32` indices child and a dictionary-items
+child. Both children are concrete block codecs. When either child has a payload, the outer payload is framed as:
+
+```text
+u64 indices_payload_bytes
+u64 items_payload_bytes
+indices payload
+dictionary-items payload
+```
+
+A metadata-only child has a zero framed length. If both children are metadata-only, the dictionary itself has no
+payload. Readers validate the frame boundaries, child widths and cardinalities, and every dictionary index.
 
 ### Bitpacking
 
