@@ -5,17 +5,23 @@
 //! whose hit path is one atomic bit — no read-op channel or inline
 //! housekeeping. Used for the session index and metadata caches; the index
 //! cache sees thousands of cache reads per query.
+//!
+//! Entries admitted with a [`CachePin`] stay while leased: quick_cache skips
+//! them on eviction ([`PinLifecycle`]), and the strict priority tier does
+//! too. A [`PinBudget`] with one partition per shard caps what pins hold, so
+//! a shard always has unpinned weight to evict.
 
-use super::PriorityEntries;
+use super::{PINNED_PRIORITY, PriorityEntries};
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::Future;
 
-use super::backend::{CacheBackend, CacheEntry};
+use super::backend::{CacheBackend, CacheEntry, PinnedEntryLoader};
 use super::moka::key_footprint;
+use super::pin::{CachePin, PinBudget, PinRecord, PinnedStats};
 use super::{CacheCodec, InternalCacheKey};
 use crate::Result;
 use crate::deepsize::Context;
@@ -24,6 +30,31 @@ use crate::deepsize::Context;
 struct QuickEntry {
     entry: CacheEntry,
     size_bytes: usize,
+    /// The admission of a pinned-kind entry in the backend's pin budget,
+    /// shared by every copy of the entry, so that it lasts while any tier
+    /// or in-flight load still holds the entry.
+    pin: Option<Arc<PinRecord>>,
+}
+
+impl QuickEntry {
+    fn is_pinned(&self) -> bool {
+        self.pin.as_ref().is_some_and(|record| record.is_pinned())
+    }
+}
+
+/// Keeps pinned entries through quick_cache's eviction passes, which check
+/// every candidate as they visit it.
+#[derive(Clone, Copy, Debug, Default)]
+struct PinLifecycle;
+
+impl quick_cache::Lifecycle<InternalCacheKey, QuickEntry> for PinLifecycle {
+    type RequestState = ();
+
+    fn is_pinned(&self, _key: &InternalCacheKey, value: &QuickEntry) -> bool {
+        value.is_pinned()
+    }
+
+    fn begin_request(&self) -> Self::RequestState {}
 }
 
 #[derive(Clone)]
@@ -36,12 +67,22 @@ impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
     }
 }
 
+type QuickCache = quick_cache::sync::Cache<
+    InternalCacheKey,
+    QuickEntry,
+    EntryWeighter,
+    quick_cache::DefaultHashBuilder,
+    PinLifecycle,
+>;
+
 pub struct QuickCacheBackend {
     capacity: usize,
     generation: AtomicU64,
     priority_active: AtomicBool,
     priority: Mutex<PriorityEntries<QuickEntry>>,
-    cache: quick_cache::sync::Cache<InternalCacheKey, QuickEntry, EntryWeighter>,
+    cache: QuickCache,
+    /// Caps the bytes leased entries pin, per shard.
+    pins: Arc<PinBudget>,
 }
 
 impl std::fmt::Debug for QuickCacheBackend {
@@ -93,18 +134,42 @@ impl QuickCacheBackend {
             .build()
             // Only errors when weight/item capacity is missing; both are set.
             .expect("quick_cache options");
-        let cache = quick_cache::sync::Cache::with_options(
-            options,
-            EntryWeighter,
-            Default::default(),
-            Default::default(),
-        );
+        let cache =
+            QuickCache::with_options(options, EntryWeighter, Default::default(), PinLifecycle);
+        let pins = Arc::new(PinBudget::new(capacity as u64, cache.num_shards()));
         Self {
             cache,
             capacity,
             generation: AtomicU64::new(0),
             priority_active: AtomicBool::new(false),
             priority: Mutex::new(PriorityEntries::default()),
+            pins,
+        }
+    }
+
+    /// An admission of a pinned-kind entry, charged what the weigher charges.
+    fn pin_record(
+        &self,
+        key: &InternalCacheKey,
+        size_bytes: usize,
+        pin: &Arc<CachePin>,
+    ) -> Arc<PinRecord> {
+        let bytes = key_footprint(key).saturating_add(size_bytes) as u64;
+        Arc::new(CachePin::record(
+            pin,
+            &self.pins,
+            self.cache.shard_index(key),
+            bytes,
+        ))
+    }
+
+    /// Priority of `item` in the strict tier: pinned-kind entries outrank
+    /// every plane, and entries without a plane priority rank with signs.
+    fn strict_priority(item: &QuickEntry, priority: u8) -> u8 {
+        match (item.pin.is_some(), priority) {
+            (true, _) => PINNED_PRIORITY,
+            (false, 0) => 3,
+            (false, priority) => priority,
         }
     }
     fn admit_priority(
@@ -127,19 +192,38 @@ impl QuickCacheBackend {
                 let existing: Vec<_> = self.cache.iter().collect();
                 for (key, value) in existing {
                     let size = key_footprint(&key).saturating_add(value.size_bytes);
-                    dropped.extend(entries.insert(key, value, size, 3, self.capacity));
+                    if value.pin.is_some() {
+                        // Eviction below cannot move a pinned entry, so move
+                        // it here rather than hold it in both tiers.
+                        dropped.extend(
+                            self.cache
+                                .remove_if(&key, |held| held.pin.is_some())
+                                .map(|(_, held)| held),
+                        );
+                    }
+                    let priority = Self::strict_priority(&value, 0);
+                    dropped.extend(entries.insert_with(
+                        key,
+                        value,
+                        size,
+                        priority,
+                        self.capacity,
+                        QuickEntry::is_pinned,
+                    ));
                 }
                 // Evict resident values without invalidating single-flight
                 // placeholders: their loaders still belong to this generation.
                 self.cache.set_capacity(0);
             }
             let size = key_footprint(&key).saturating_add(item.size_bytes);
-            dropped.extend(entries.insert(
+            let priority = Self::strict_priority(&item, priority);
+            dropped.extend(entries.insert_with(
                 key,
                 item,
                 size,
-                if priority == 0 { 3 } else { priority },
+                priority,
                 self.capacity,
+                QuickEntry::is_pinned,
             ));
             dropped
         };
@@ -190,7 +274,11 @@ impl CacheBackend for QuickCacheBackend {
         codec: Option<CacheCodec>,
     ) {
         let priority = codec.map(|c| c.memory_priority()).unwrap_or(0);
-        let item = QuickEntry { entry, size_bytes };
+        let item = QuickEntry {
+            entry,
+            size_bytes,
+            pin: None,
+        };
         if priority > 0 || self.priority_active.load(Ordering::Acquire) {
             self.admit_priority(
                 *key,
@@ -227,6 +315,7 @@ impl CacheBackend for QuickCacheBackend {
                 let item = QuickEntry {
                     entry: entry.clone(),
                     size_bytes,
+                    pin: None,
                 };
                 if guard.insert(item.clone()).is_ok()
                     && (priority > 0 || self.priority_active.load(Ordering::Acquire))
@@ -236,6 +325,81 @@ impl CacheBackend for QuickCacheBackend {
                 Ok((entry, false))
             }
         }
+    }
+
+    /// A RAM hit refreshes the entry's recency like [`get`](Self::get): a
+    /// quick_cache hit sets its reference bit, which an eviction pass would
+    /// otherwise have cleared while the entry was pinned.
+    async fn get_leased(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.get_resident(key).await
+    }
+
+    async fn insert_pinned(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        pin: &Arc<CachePin>,
+    ) {
+        let item = QuickEntry {
+            entry,
+            size_bytes,
+            pin: Some(self.pin_record(key, size_bytes, pin)),
+        };
+        if self.priority_active.load(Ordering::Acquire) {
+            self.admit_priority(
+                *key,
+                item,
+                PINNED_PRIORITY,
+                self.generation.load(Ordering::Acquire),
+            );
+        } else {
+            self.cache.insert(*key, item);
+        }
+    }
+
+    async fn get_or_insert_pinned<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: PinnedEntryLoader<'a>,
+    ) -> Result<(CacheEntry, bool)> {
+        if self.priority_active.load(Ordering::Acquire)
+            && let Some(value) = self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+        {
+            return Ok((value.entry, true));
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        match self.cache.get_value_or_guard_async(key).await {
+            Ok(value) => Ok((value.entry, true)),
+            Err(guard) => {
+                let (entry, size_bytes, pin) = loader.await?;
+                let item = QuickEntry {
+                    entry: entry.clone(),
+                    size_bytes,
+                    pin: Some(self.pin_record(key, size_bytes, &pin)),
+                };
+                if guard.insert(item.clone()).is_ok()
+                    && self.priority_active.load(Ordering::Acquire)
+                {
+                    self.admit_priority(*key, item, PINNED_PRIORITY, generation);
+                }
+                Ok((entry, false))
+            }
+        }
+    }
+
+    /// A shard's budget: quick_cache refuses an unpinned entry heavier than
+    /// about its shard's weight.
+    fn max_entry_bytes(&self) -> Option<u64> {
+        Some((self.capacity / self.cache.num_shards()) as u64)
+    }
+
+    fn pinned_stats(&self) -> PinnedStats {
+        self.pins.stats()
     }
 
     async fn clear(&self) {
@@ -324,7 +488,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::cache::{CacheKey, CacheTier, LanceCache};
+    use crate::cache::{CacheKey, CacheLease, CacheTier, LanceCache};
 
     struct TestKey<T: 'static> {
         key: String,
@@ -507,12 +671,349 @@ mod tests {
         }
     }
 
+    /// A value leased through its own pin, charged `bytes` beyond its struct.
+    struct Pinned {
+        pin: Arc<CachePin>,
+        bytes: usize,
+    }
+
+    impl crate::deepsize::DeepSizeOf for Pinned {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            self.bytes
+        }
+    }
+
+    impl crate::cache::PinnedValue for Pinned {
+        fn cache_pin(&self) -> &Arc<CachePin> {
+            &self.pin
+        }
+    }
+
+    /// Capacity of the caches the pinning tests churn: one shard, as the
+    /// benchmark's caches below 4 GiB have.
+    const PIN_TEST_CAPACITY: usize = 1 << 20;
+    /// Bytes of each churned entry, as a small plane.
+    const CHURN_ENTRY_BYTES: usize = 4096;
+
+    fn single_shard_cache() -> (Arc<QuickCacheBackend>, LanceCache) {
+        let backend = Arc::new(QuickCacheBackend::with_capacity(PIN_TEST_CAPACITY));
+        assert_eq!(backend.cache.num_shards(), 1);
+        (backend.clone(), LanceCache::with_backend(backend))
+    }
+
+    /// Admit `bytes` of entries under `prefix`, reading each back so that it
+    /// is promoted to the hot ring and pushes older hot entries out, as the
+    /// planes queries read do.
+    async fn churn(cache: &LanceCache, prefix: &str, bytes: usize) {
+        for i in 0..bytes / CHURN_ENTRY_BYTES {
+            let key = TestKey::<Vec<u8>>::new(&format!("{prefix}-{i}"));
+            cache
+                .insert_with_key(&key, Arc::new(vec![0u8; CHURN_ENTRY_BYTES]))
+                .await;
+            cache.get_with_key(&key).await;
+        }
+    }
+
+    /// Load `name`, a pinned value of `bytes`, and lease it.
+    async fn leased(cache: &LanceCache, name: &str, bytes: usize) -> (Arc<Pinned>, CacheLease) {
+        let (value, lease, _) = cache
+            .get_or_insert_leased_with_key(TestKey::<Pinned>::new(name), || async move {
+                Ok(Pinned {
+                    pin: CachePin::new(),
+                    bytes,
+                })
+            })
+            .await
+            .unwrap();
+        (value, lease)
+    }
+
+    async fn is_resident(cache: &LanceCache, name: &str) -> bool {
+        cache
+            .peek_resident_with_key(&TestKey::<Pinned>::new(name))
+            .await
+    }
+
+    /// A store of 30% of a single-shard cache stays through ten times the
+    /// capacity of plane churn while leased, with planes and the store
+    /// within the capacity; unleased, the churn evicts it.
+    #[tokio::test]
+    async fn pinned_entry_survives_pressure_while_leased() {
+        let (_, cache) = single_shard_cache();
+        let store_bytes = PIN_TEST_CAPACITY * 3 / 10;
+        let (_store, lease) = leased(&cache, "store", store_bytes).await;
+        assert!(lease.is_pinned());
+        for round in 0..10 {
+            churn(&cache, &format!("planes-{round}"), PIN_TEST_CAPACITY).await;
+            assert!(is_resident(&cache, "store").await, "round {round}");
+            assert!(
+                cache.size_bytes().await <= PIN_TEST_CAPACITY,
+                "round {round}"
+            );
+        }
+        let stats = cache.pinned_stats();
+        assert_eq!((stats.pinned_entries, stats.overflow), (1, 0), "{stats:?}");
+        assert!(stats.pinned_bytes >= store_bytes as u64, "{stats:?}");
+
+        drop(lease);
+        churn(&cache, "idle", 10 * PIN_TEST_CAPACITY).await;
+        assert!(!is_resident(&cache, "store").await);
+        assert_eq!(cache.pinned_stats().pinned_bytes, 0);
+    }
+
+    /// Entries admitted once the hot ring holds its target enter the cold
+    /// ring, where churn evicts an idle one first; a leased one stays.
+    #[tokio::test]
+    async fn pinned_entry_admitted_leased_above_hot_target() {
+        let (backend, cache) = single_shard_cache();
+        for i in 0..PIN_TEST_CAPACITY / CHURN_ENTRY_BYTES {
+            let key = TestKey::<Vec<u8>>::new(&format!("fill-{i}"));
+            cache
+                .insert_with_key(&key, Arc::new(vec![0u8; CHURN_ENTRY_BYTES]))
+                .await;
+        }
+        let (_store, lease) = leased(&cache, "store", PIN_TEST_CAPACITY / 5).await;
+        assert!(lease.is_pinned());
+        let idle = Arc::new(Pinned {
+            pin: CachePin::new(),
+            bytes: PIN_TEST_CAPACITY / 5,
+        });
+        cache
+            .insert_pinned_with_key(&TestKey::<Pinned>::new("idle"), idle)
+            .await;
+        assert!(is_resident(&cache, "idle").await);
+        churn(&cache, "planes", 10 * PIN_TEST_CAPACITY).await;
+        assert!(is_resident(&cache, "store").await);
+        assert!(!is_resident(&cache, "idle").await);
+        assert!(backend.size_bytes().await <= PIN_TEST_CAPACITY);
+    }
+
+    /// A leased lookup is an access, as a get is: an idle entry found
+    /// through it keeps the reference bit a peek leaves clear, so it
+    /// survives the eviction pass that takes a peeked entry.
+    #[tokio::test]
+    async fn leased_get_refreshes_referenced() {
+        const ENTRY_BYTES: usize = 100;
+        const HOT_ENTRIES: u8 = 9;
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        for lease_with_get in [false, true] {
+            let entry_weight = key_footprint(&key(0)) + ENTRY_BYTES;
+            let cache =
+                QuickCacheBackend::with_capacity(entry_weight * (usize::from(HOT_ENTRIES) + 1));
+            for id in 0..HOT_ENTRIES {
+                cache
+                    .insert(&key(id), Arc::new(id), ENTRY_BYTES, None)
+                    .await;
+            }
+            // The only cold entry, admitted leased and then left idle.
+            let victim = key(HOT_ENTRIES);
+            let pin = CachePin::new();
+            let lease = CachePin::lease(&pin);
+            cache
+                .insert_pinned(&victim, Arc::new(0u8), ENTRY_BYTES, &pin)
+                .await;
+            assert!(lease.is_pinned());
+            drop(lease);
+            if lease_with_get {
+                assert!(cache.get_leased(&victim).await.is_some());
+                drop(CachePin::lease(&pin));
+            } else {
+                assert!(cache.peek_resident(&victim).await);
+            }
+            cache
+                .insert(&key(HOT_ENTRIES + 1), Arc::new(0u8), ENTRY_BYTES, None)
+                .await;
+            assert_eq!(
+                cache.peek_resident(&victim).await,
+                lease_with_get,
+                "get={lease_with_get}"
+            );
+        }
+    }
+
+    /// Two leased stores of 30% each under the 50% cap: the second counts
+    /// an overflow and churn evicts it, and it is pinned again when admitted
+    /// once the first is released.
+    #[tokio::test]
+    async fn pinned_cap_leaves_overflow_unpinned() {
+        let (_, cache) = single_shard_cache();
+        let store_bytes = PIN_TEST_CAPACITY * 3 / 10;
+        let (_first, first) = leased(&cache, "first", store_bytes).await;
+        let (second_store, second) = leased(&cache, "second", store_bytes).await;
+        assert!(first.is_pinned());
+        assert!(!second.is_pinned() && second.pin().is_overflowed());
+        let stats = cache.pinned_stats();
+        assert_eq!(stats.cap_bytes, PIN_TEST_CAPACITY as u64 / 2);
+        assert_eq!(
+            (stats.pinned_entries, stats.leased_entries, stats.overflow),
+            (1, 2, 1)
+        );
+        churn(&cache, "planes", 10 * PIN_TEST_CAPACITY).await;
+        assert!(is_resident(&cache, "first").await);
+        assert!(!is_resident(&cache, "second").await);
+
+        drop(first);
+        let key = TestKey::<Pinned>::new("second");
+        assert!(
+            cache
+                .ensure_pinned_with_key(&key, || second_store.clone())
+                .await
+        );
+        assert!(second.is_pinned());
+    }
+
+    /// However many stores are leased, pins hold at most the cap, and
+    /// churn stays within the capacity plus one entry.
+    #[tokio::test]
+    async fn pins_never_push_inserts_over_capacity() {
+        let (_, cache) = single_shard_cache();
+        let store_bytes = PIN_TEST_CAPACITY / 5;
+        let mut stores = Vec::new();
+        for store in 0..4 {
+            stores.push(leased(&cache, &format!("store-{store}"), store_bytes).await);
+        }
+        let pinned = stores.iter().filter(|(_, lease)| lease.is_pinned()).count();
+        assert_eq!(pinned, 2);
+        let slack = CHURN_ENTRY_BYTES + 1024;
+        for round in 0..10 {
+            churn(&cache, &format!("planes-{round}"), PIN_TEST_CAPACITY).await;
+            let bytes = cache.size_bytes().await;
+            assert!(bytes <= PIN_TEST_CAPACITY + slack, "round {round}: {bytes}");
+            let stats = cache.pinned_stats();
+            assert!(stats.pinned_bytes <= stats.cap_bytes, "{stats:?}");
+        }
+        for (store, (_, lease)) in stores.iter().enumerate() {
+            let name = format!("store-{store}");
+            assert_eq!(
+                is_resident(&cache, &name).await,
+                lease.is_pinned(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Concurrent first callers load a pinned entry once and all lease it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_or_insert_pinned_is_single_flight() {
+        const CALLERS: usize = 32;
+        let (_, cache) = single_shard_cache();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let (cache, loads, barrier) = (cache.clone(), loads.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    cache
+                        .get_or_insert_leased_with_key(
+                            TestKey::<Pinned>::new("store"),
+                            || async move {
+                                loads.fetch_add(1, Ordering::SeqCst);
+                                tokio::task::yield_now().await;
+                                Ok(Pinned {
+                                    pin: CachePin::new(),
+                                    bytes: 1024,
+                                })
+                            },
+                        )
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(CALLERS);
+        for caller in callers {
+            results.push(caller.await.unwrap());
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        let store = results[0].0.clone();
+        assert!(
+            results
+                .iter()
+                .all(|(value, lease, _)| Arc::ptr_eq(value, &store) && lease.is_pinned())
+        );
+        assert_eq!(results.iter().filter(|(_, _, hit)| !hit).count(), 1);
+        assert_eq!(store.pin.holders(), CALLERS);
+        drop(results);
+        assert_eq!(store.pin.holders(), 0);
+        assert!(!store.pin.is_pinned());
+    }
+
+    /// The largest admissible entry is a shard's weight budget, and the pin
+    /// cap is half of every shard's.
+    #[test]
+    fn max_entry_bytes_is_shard_budget() {
+        for capacity in [0, PIN_TEST_CAPACITY, 16 << 30] {
+            let backend = QuickCacheBackend::with_capacity(capacity);
+            let shards = backend.cache.num_shards();
+            let shard_bytes = (capacity / shards) as u64;
+            assert_eq!(backend.max_entry_bytes(), Some(shard_bytes), "{capacity}");
+            let cap = (shard_bytes as f64 * crate::cache::PINNED_CAP_FRACTION) as u64;
+            assert_eq!(
+                backend.pinned_stats().cap_bytes,
+                cap * shards as u64,
+                "{capacity}"
+            );
+        }
+    }
+
+    /// A clear drops a leased entry and its pin; admitting it again pins it
+    /// again through the leases it still has.
+    #[tokio::test]
+    async fn recharge_after_clear() {
+        let (_, cache) = single_shard_cache();
+        let (store, lease) = leased(&cache, "store", 1 << 16).await;
+        assert!(lease.is_pinned());
+        cache.clear().await;
+        assert!(!is_resident(&cache, "store").await);
+        assert!(!lease.is_pinned());
+        assert_eq!(cache.pinned_stats().leased_entries, 0);
+        let key = TestKey::<Pinned>::new("store");
+        assert!(cache.ensure_pinned_with_key(&key, || store.clone()).await);
+        assert!(lease.is_pinned());
+        assert!(
+            !cache
+                .ensure_pinned_with_key(&key, || panic!("admitted twice"))
+                .await
+        );
+        let stats = cache.pinned_stats();
+        assert_eq!((stats.pinned_entries, stats.leased_entries), (1, 1));
+    }
+
+    /// Once sign-priority planes activate the strict tier, a leased store
+    /// stays through their churn, moved there with the pinned priority, and
+    /// an overflowed store outranks the planes too.
+    #[tokio::test]
+    async fn strict_tier_keeps_leased_pinned_entries() {
+        let (backend, cache) = single_shard_cache();
+        let store_bytes = PIN_TEST_CAPACITY * 3 / 10;
+        let (_store, lease) = leased(&cache, "store", store_bytes).await;
+        let (_other, other) = leased(&cache, "other", store_bytes).await;
+        assert!(lease.is_pinned() && !other.is_pinned());
+        let codec = CacheCodec::new("test.sign", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+            .with_memory_priority(3);
+        for id in 0..(10 * PIN_TEST_CAPACITY / CHURN_ENTRY_BYTES) as u64 {
+            let mut bytes = [0xAB; 16];
+            bytes[..8].copy_from_slice(&id.to_le_bytes());
+            let key = InternalCacheKey::from_bytes(bytes);
+            backend
+                .insert(&key, Arc::new(id), CHURN_ENTRY_BYTES, Some(codec))
+                .await;
+        }
+        assert!(backend.priority_active.load(Ordering::Acquire));
+        assert!(is_resident(&cache, "store").await);
+        assert!(is_resident(&cache, "other").await);
+        assert!(backend.size_bytes().await <= PIN_TEST_CAPACITY);
+        assert_eq!(cache.pinned_stats().pinned_entries, 1);
+    }
+
     #[test]
     fn entry_weight_includes_fixed_key() {
         let key = InternalCacheKey::from_bytes([0; 16]);
         let entry = QuickEntry {
             entry: Arc::new(()),
             size_bytes: 7,
+            pin: None,
         };
         assert_eq!(
             quick_cache::Weighter::weight(&EntryWeighter, &key, &entry),
