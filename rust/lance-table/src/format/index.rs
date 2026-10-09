@@ -158,10 +158,15 @@ impl IndexMetadata {
             // reinterpreted as addresses.
             let is_btree_addr_domain =
                 details.type_url.ends_with("BTreeIndexDetails") && self.index_version >= 1;
+            // Likewise for Bitmap, from format version 1 onward
+            // (`lance_index::scalar::bitmap::BITMAP_ROW_ADDR_DOMAIN_VERSION`).
+            let is_bitmap_addr_domain =
+                details.type_url.ends_with("BitmapIndexDetails") && self.index_version >= 1;
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
                 || is_btree_addr_domain
+                || is_bitmap_addr_domain
         })
     }
 

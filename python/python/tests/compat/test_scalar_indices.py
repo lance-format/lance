@@ -402,6 +402,195 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
+@compat_test(min_version="0.39.0")
+class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
+    """Test BITMAP forward/backward compatibility across the row-address-domain
+    format change.
+
+    min_version is 0.39.0, not BitmapLabelListIndex's 0.22.0, because this
+    test's whole point is an old build correctly ignoring an index format
+    version newer than it understands -- and that mechanism itself was only
+    introduced in 0.39.0 (#4906). Before that, an old build doesn't inspect
+    index_version at all and will happily misuse a too-new BITMAP index.
+
+    BITMAP was changed to store physical row addresses (``_rowaddr``)
+    instead of row ids, which bumped its on-disk format version. This
+    dataset enables stable row ids, so the two domains genuinely differ and
+    updating a pre-change segment must rebuild it rather than merge new
+    data into it (a merge would otherwise silently combine row ids and row
+    addresses in the same column). This test checks the full story:
+
+    - An old-format (row-id domain) BITMAP index is loaded and used
+      correctly by the current build.
+    - Updating it (inserting rows, then optimizing) with the current build
+      keeps both old and new rows queryable.
+    - Once the current build has touched the index this way, an older build
+      must no longer use it -- its format version has moved past what that
+      build supports -- but it must still answer every query correctly via
+      a full scan, and must not error out when writing to the dataset
+      afterwards.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create a stable-row-id dataset with a BITMAP index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "bitmap": pa.array(range(1000)),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+            enable_stable_row_ids=True,
+        )
+        dataset.create_scalar_index("bitmap", "BITMAP")
+
+    def _assert_queryable(self, expect_index_used: bool):
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="bitmap == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        explain = ds.scanner(filter="bitmap == 7").explain_plan()
+        used_index = "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+        if expect_index_used:
+            assert used_index, "expected the BITMAP index to be used"
+        else:
+            assert not used_index, (
+                "an older build must not use a BITMAP index in a format it "
+                "does not understand -- it should fall back to a full scan"
+            )
+
+    def check_read(self):
+        """An old-format index must be used by the current build; a
+        too-new one must be safely ignored (but answers must stay correct)
+        by an older build."""
+        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+
+    def check_write(self):
+        """Insert a row and update the index, then verify old and new rows
+        both stay correct -- whether or not this build can even see the
+        index."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "bitmap": pa.array([1000]),
+            }
+        )
+        ds.insert(data)
+        # For a build that cannot see this index at all, there is nothing
+        # registered to update, so this is a safe no-op rather than an
+        # error. For the current build updating a legacy row-id-domain
+        # segment, this must rebuild (not merge) the index -- see the class
+        # docstring.
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="bitmap == 7")
+        assert table.num_rows == 1
+        # `check_write` runs more than once across the upgrade/downgrade
+        # round trip, each time inserting another `bitmap == 1000` row, so
+        # this can't assert an exact count the way the `== 7` row (written
+        # once, in `create`) can.
+        table = ds.to_table(filter="bitmap == 1000")
+        assert table.num_rows >= 1
+
+
+@compat_test(min_version="0.22.0")
+class BitmapRowIdDomainIndex(UpgradeDowngradeTest):
+    """Test that a BITMAP index on a dataset *without* stable row ids stays
+    usable -- not just readable -- by an older build, no matter which build
+    wrote it.
+
+    BITMAP moved to storing physical row addresses (``_rowaddr``) instead of
+    row ids, bumping its on-disk format version to 1 (see
+    BitmapRowAddressDomainIndex above). But a row id and a row address are
+    the same value on a dataset that does not enable stable row ids, so the
+    current build keeps writing the old format (index_version 0) there --
+    on creation, and again on every rebuild during optimize -- specifically
+    so a user who never turns on stable row ids sees no
+    forward-compatibility impact from that migration.
+
+    Unlike BitmapLabelListIndex above, this asserts the index is genuinely
+    *used* (not answered via a full-scan fallback) in every direction: right
+    after the current build creates it, and after the current build has
+    rebuilt it with optimize_indices() -- the scenario that would have
+    forced a fallback if the rebuild had silently bumped the format
+    version.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create a dataset without stable row ids and a BITMAP index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "bitmap": pa.array(range(1000)),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
+        dataset.create_scalar_index("bitmap", "BITMAP")
+
+    def _assert_queryable_and_indexed(self):
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="bitmap == 7")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [7]
+
+        explain = ds.scanner(filter="bitmap == 7").explain_plan()
+        assert "ScalarIndexQuery" in explain or "MaterializeIndex" in explain, (
+            "a BITMAP index on a dataset without stable row ids must stay "
+            "usable by every build, not fall back to a full scan"
+        )
+
+    def check_read(self):
+        """The index must be used, whichever build wrote it."""
+        self._assert_queryable_and_indexed()
+
+    def check_write(self):
+        """Insert a row and rebuild the index, then verify it is still
+        queryable -- and still actually used, including by an older build
+        reading what the current build just rebuilt."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "bitmap": pa.array([1000]),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="bitmap == 7")
+        assert table.num_rows == 1
+        # `check_write` runs more than once across the upgrade/downgrade
+        # round trip, each time inserting another `bitmap == 1000` row, so
+        # this can't assert an exact count the way the `== 7` row (written
+        # once, in `create`) can.
+        table = ds.to_table(filter="bitmap == 1000")
+        assert table.num_rows >= 1
+        self._assert_queryable_and_indexed()
+
+
 @compat_test(min_version="0.36.0")
 class NgramIndex(UpgradeDowngradeTest):
     """Test NGRAM index compatibility (introduced in 0.36.0)."""

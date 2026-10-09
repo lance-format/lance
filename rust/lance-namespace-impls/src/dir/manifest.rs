@@ -1179,8 +1179,12 @@ impl ManifestNamespace {
     fn object_type_index_stream(
         object_types: BTreeMap<&'static str, RoaringBitmap>,
     ) -> SendableRecordBatchStream {
+        // Like `object_id_index_stream`, but for Bitmap: Bitmap training also
+        // reads its id column as `ROW_ADDR`, never `ROW_ID` (see
+        // `BITMAP_ROW_ADDR_DOMAIN_VERSION`). Only the column name needs to
+        // change, not the values -- see `value_row_addr_schema`.
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let entries = object_types
             .into_iter()

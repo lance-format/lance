@@ -440,22 +440,29 @@ pub(super) async fn build_scalar_index(
         )
         .await?;
 
-    // BTree always trains on physical row addresses -- the plugin's
-    // TrainingCriteria has no per-dataset awareness to vary that -- but a
-    // row address and a row id are the same value on a dataset that does
-    // not use stable row ids, so the trained page data is identical either
-    // way there. Label it with the pre-migration version in that case: an
-    // old build already understands it, so a user who never turns on
-    // stable row ids sees no forward-compatibility impact from the
-    // address-domain migration (see BTREE_ROW_ID_DOMAIN_VERSION). Only a
-    // stable-row-id dataset -- where the two domains genuinely diverge --
-    // needs the address-domain version this plugin actually trained.
-    if params
-        .index_type
-        .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
-        && !dataset.manifest.uses_stable_row_ids()
-    {
-        created_index.index_version = lance_index::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION;
+    // BTree and Bitmap always train on physical row addresses -- the
+    // plugins' TrainingCriteria has no per-dataset awareness to vary that --
+    // but a row address and a row id are the same value on a dataset that
+    // does not use stable row ids, so the trained page data is identical
+    // either way there. Label it with the pre-migration version in that
+    // case: an old build already understands it, so a user who never turns
+    // on stable row ids sees no forward-compatibility impact from the
+    // address-domain migration (see BTREE_ROW_ID_DOMAIN_VERSION and
+    // BITMAP_ROW_ID_DOMAIN_VERSION). Only a stable-row-id dataset -- where
+    // the two domains genuinely diverge -- needs the address-domain version
+    // these plugins actually trained.
+    if !dataset.manifest.uses_stable_row_ids() {
+        if params
+            .index_type
+            .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
+        {
+            created_index.index_version = lance_index::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION;
+        } else if params
+            .index_type
+            .eq_ignore_ascii_case(BuiltinIndexType::Bitmap.as_str())
+        {
+            created_index.index_version = lance_index::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION;
+        }
     }
 
     Ok(created_index)
@@ -500,7 +507,7 @@ pub(super) async fn build_bitmap_index_segment(
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
-    trainer
+    let mut created_index = trainer
         .train_index(
             training_data,
             &index_store,
@@ -508,7 +515,17 @@ pub(super) async fn build_bitmap_index_segment(
             None,
             progress,
         )
-        .await
+        .await?;
+
+    // See the matching comment in `build_scalar_index`: Bitmap always trains
+    // on physical row addresses, but without stable row ids a row address and
+    // a row id are the same value, so label it with the pre-migration
+    // version an old build already understands.
+    if !dataset.manifest.uses_stable_row_ids() {
+        created_index.index_version = lance_index::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION;
+    }
+
+    Ok(created_index)
 }
 
 /// Fetches the scalar index plugin for a given index metadata

@@ -108,8 +108,12 @@ impl LabelListIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        // LabelList always stores row ids directly, unlike the standalone
+        // Bitmap index: it trains and merges through the shared
+        // `build_index_map`/`merge_index_maps` helpers with an explicit
+        // `ROW_ID` id column, never `ROW_ADDR`.
         let values_index =
-            BitmapIndex::load(store.clone(), frag_reuse_index.clone(), index_cache).await?;
+            BitmapIndex::load(store.clone(), frag_reuse_index.clone(), index_cache, false).await?;
         let list_nulls = read_list_nulls(store, frag_reuse_index).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
@@ -123,7 +127,8 @@ impl LabelListIndex {
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let values_index =
-            BitmapIndex::load_with_remapping(store.clone(), remapping.clone(), index_cache).await?;
+            BitmapIndex::load_with_remapping(store.clone(), remapping.clone(), index_cache, false)
+                .await?;
         let list_nulls = read_list_nulls_with_remapping(store, remapping).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
@@ -620,7 +625,7 @@ async fn write_label_list_index(
         })
         .into_iter()
         .collect();
-    build_index_map(sorted_labels, old_segments, &mut writer).await?;
+    build_index_map(sorted_labels, old_segments, &mut writer, ROW_ID).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
