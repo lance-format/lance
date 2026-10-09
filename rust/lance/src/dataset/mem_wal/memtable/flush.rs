@@ -1878,6 +1878,133 @@ mod tests {
         );
     }
 
+    /// A flushed cosine index must hold normalized vectors: its search
+    /// normalizes the query and ranks by L2, which only tracks cosine when the
+    /// stored side is normalized too.
+    #[tokio::test]
+    async fn test_flusher_cosine_index_ranks_unnormalized_vectors() {
+        use super::super::super::index::IndexStore;
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_linalg::distance::DistanceType;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        // Norms spread over 0.2..5.0, so ranking by L2 against raw vectors
+        // would disagree with cosine.
+        let (dim, num_vectors) = (32usize, 2000usize);
+        let mut seed: u64 = 42;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        let mut vectors = Vec::with_capacity(num_vectors * dim);
+        for _ in 0..num_vectors {
+            let row: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let target = 0.2 + 4.8 * (next() * 0.5 + 0.5);
+            vectors.extend(row.iter().map(|x| x * target / norm));
+        }
+        let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let cosine_distance = |id: usize| {
+            lance_linalg::distance::cosine_distance(&query, &vectors[id * dim..][..dim])
+        };
+        let mut by_distance: Vec<usize> = (0..num_vectors).collect();
+        by_distance.sort_by(|a, b| cosine_distance(*a).total_cmp(&cosine_distance(*b)));
+        let nearest: std::collections::HashSet<i32> =
+            by_distance[..10].iter().map(|id| *id as i32).collect();
+
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(item.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let index_specs = vec![MemIndexSpec::hnsw(
+            "vector_hnsw",
+            1,
+            "vector",
+            DistanceType::Cosine,
+        )];
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        memtable.set_indexes(
+            IndexStore::from_specs(&index_specs, &lance_schema, num_vectors, 100).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_vectors as i32)),
+                Arc::new(
+                    FixedSizeListArray::try_new(
+                        item,
+                        dim as i32,
+                        Arc::new(Float32Array::from(vectors.clone())),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &index_specs, 1, frag_id + 1)
+            .await
+            .unwrap();
+        let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, result.sstable.path);
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &Float32Array::from(query.clone()), 10)
+            .unwrap();
+        scan.distance_metric(DistanceType::Cosine);
+        // A wide search list keeps graph recall out of what this measures.
+        scan.ef(500);
+        scan.fast_search();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let distances = batch["_distance"]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+
+        let found = ids
+            .values()
+            .iter()
+            .filter(|id| nearest.contains(id))
+            .count();
+        assert!(found >= 9, "recall@10 was {found}/10");
+        // Lance's SQ index reports cosine as L2 over normalized vectors.
+        for (id, distance) in ids.values().iter().zip(distances.values()) {
+            let expected = 2.0 * cosine_distance(*id as usize);
+            assert!(
+                (distance - expected).abs() < 0.05,
+                "id={id} reported {distance}, expected {expected}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_flusher_with_fts_index() {
         use super::super::super::index::IndexStore;
