@@ -134,6 +134,42 @@ public class MergeInsertTest {
   }
 
   @Test
+  public void testMergeInsertRejectsNullArguments() throws Exception {
+    // mergeInsert was the only write method missing a null-argument guard; its
+    // sibling update rejects null params up front, so a null argument must be a
+    // clean exception, not a raw dereference into JNI.
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
+        ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+      MergeInsertParams params = new MergeInsertParams(Collections.singletonList("id"));
+      NullPointerException nullParams =
+          Assertions.assertThrows(
+              NullPointerException.class, () -> dataset.mergeInsert(null, sourceStream));
+      Assertions.assertTrue(nullParams.getMessage().contains("mergeInsert must not be null"));
+      NullPointerException nullSource =
+          Assertions.assertThrows(
+              NullPointerException.class, () -> dataset.mergeInsert(params, null));
+      Assertions.assertTrue(nullSource.getMessage().contains("source must not be null"));
+    }
+  }
+
+  @Test
+  public void testMergeInsertRejectsClosedDataset() throws Exception {
+    // Calling a write on a closed dataset must raise "Dataset is closed" like its
+    // siblings, not pass a zero handle into native code (which can crash the JVM).
+    String path = tempDir.resolve(UUID.randomUUID().toString()).toString();
+    Dataset closed = new TestUtils.SimpleTestDataset(allocator, path).createEmptyDataset();
+    closed.close();
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
+        ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+      MergeInsertParams params = new MergeInsertParams(Collections.singletonList("id"));
+      IllegalArgumentException error =
+          Assertions.assertThrows(
+              IllegalArgumentException.class, () -> closed.mergeInsert(params, sourceStream));
+      Assertions.assertTrue(error.getMessage().contains("Dataset is closed"));
+    }
+  }
+
+  @Test
   public void testWhenNotMatchedDoNothing() throws Exception {
     // Test ignore unmatched source rows
 
