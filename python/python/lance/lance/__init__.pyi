@@ -151,6 +151,17 @@ class CleanupStats:
     deletion_files_removed: int
     failed_deletes: int
 
+class ExpireVersionsStats:
+    versions_removed: int
+    versions_retained: int
+    bytes_removed: int
+    failed_deletes: int
+
+class ExpireVersionsPlan:
+    versions: List[int]
+    stats: ExpireVersionsStats
+    tagged_but_kept: List[int]
+
 class CleanupCandidateFile:
     path: str
     kind: str
