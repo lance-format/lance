@@ -1093,13 +1093,14 @@ async fn assert_val_lookups_match_scan(
     }
 }
 
+/// The fragments `val_idx`'s segments cover together.
 async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
-    let index = dataset
-        .load_index_by_name("val_idx")
-        .await
-        .unwrap()
-        .unwrap();
-    index.fragment_bitmap.unwrap()
+    let indices = dataset.load_indices().await.unwrap();
+    indices
+        .iter()
+        .filter(|index| index.name == "val_idx")
+        .map(|index| index.fragment_bitmap.clone().unwrap())
+        .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap)
 }
 
 /// A group compacted while an overlay lands on a fragment outside it: only the
@@ -1437,4 +1438,101 @@ async fn test_rtree_merge_covers_nothing_once_its_build_version_is_gone() {
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert!(merged.fragment_bitmap.as_ref().unwrap().is_empty());
+}
+
+/// Restores the table to `version` as a new version.
+async fn restore(dataset: &Dataset, version: u64) -> Dataset {
+    let mut restored = dataset.checkout_version(version).await.unwrap();
+    restored.restore().await.unwrap();
+    restored
+}
+
+/// Segments staged after a restore removed an overlay, committed after another
+/// restore brings it back: its commit version predates the segments, so it
+/// does not mask them, and the fragment it overlays is left out instead.
+#[tokio::test]
+async fn test_staged_segments_committed_after_a_restore_brings_back_an_overlay() {
+    let dir = TempStrDir::default();
+    let dataset = val_table(dir.as_str(), 2).await;
+    let before_overlay = dataset.manifest.version;
+    let val = dataset.schema().field("val").unwrap().id;
+    let dataset = commit_overlay(
+        dataset,
+        "overlay",
+        0,
+        &[val],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+    let overlaid = dataset.manifest.version;
+    let dataset = restore(&dataset, before_overlay).await;
+    let staged = stage_val(&dataset, vec![0, 1]).await;
+    let mut dataset = restore(&dataset, overlaid).await;
+
+    dataset
+        .commit_existing_index_segments("val_idx", "val", staged)
+        .await
+        .unwrap();
+
+    let probes = (0..12).map(|id| id * 10).chain([999]);
+    assert_val_lookups_match_scan(&dataset, probes, "").await;
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([1])
+    );
+}
+
+/// Segments staged after a delete, committed after a restore revives the
+/// deleted row: they never indexed it, so its fragment is left out.
+#[tokio::test]
+async fn test_staged_segments_committed_after_a_restore_revives_a_row() {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 2).await;
+    let before_delete = dataset.manifest.version;
+    dataset.delete("id = 0").await.unwrap();
+    let staged = stage_val(&dataset, vec![0, 1]).await;
+    let mut dataset = restore(&dataset, before_delete).await;
+
+    dataset
+        .commit_existing_index_segments("val_idx", "val", staged)
+        .await
+        .unwrap();
+
+    assert_val_lookups_match_scan(&dataset, (0..12).map(|id| id * 10), "").await;
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([1])
+    );
+}
+
+/// An overlay committed after the segments were built is masked at query
+/// time, so committing them keeps the fragment it overlays covered.
+#[tokio::test]
+async fn test_staged_segments_keep_a_fragment_overlaid_after_their_build() {
+    let dir = TempStrDir::default();
+    let dataset = val_table(dir.as_str(), 2).await;
+    let staged = stage_val(&dataset, vec![0, 1]).await;
+    let val = dataset.schema().field("val").unwrap().id;
+    let mut dataset = commit_overlay(
+        dataset,
+        "overlay",
+        0,
+        &[val],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    dataset
+        .commit_existing_index_segments("val_idx", "val", staged)
+        .await
+        .unwrap();
+
+    let probes = (0..12).map(|id| id * 10).chain([999]);
+    assert_val_lookups_match_scan(&dataset, probes, "").await;
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([0, 1])
+    );
 }

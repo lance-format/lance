@@ -546,8 +546,8 @@ fn indexed_overlays<'a>(
 /// Whether a row deleted in `before` is live again in `after` (only a restore
 /// does this; an index built in between never saw the row).
 async fn revives_rows(
-    before: &Snapshot,
-    after: &Snapshot,
+    before: &Dataset,
+    after: &Dataset,
     then: &Fragment,
     now: &Fragment,
 ) -> Result<bool> {
@@ -560,9 +560,30 @@ async fn revives_rows(
     if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
         return Ok(false);
     }
-    let rows_then = read_dataset_deletion_file(&before.dataset, then.id, deleted_then).await?;
-    let rows_now = read_dataset_deletion_file(&after.dataset, now.id, deleted_now).await?;
+    let rows_then = read_dataset_deletion_file(before, then.id, deleted_then).await?;
+    let rows_now = read_dataset_deletion_file(after, now.id, deleted_now).await?;
     Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
+}
+
+/// Whether a restore changed `fragment` under an index built at `version`: an
+/// overlay on an indexed field from before `version` was added or taken away,
+/// or a row deleted then is live again. Newer overlays are left to query-time
+/// masking.
+async fn restored_since(
+    before: &Dataset,
+    after: &Dataset,
+    then: &Fragment,
+    now: &Fragment,
+    version: u64,
+    indexed: &HashSet<i32>,
+) -> Result<bool> {
+    let up_to = |fragment| {
+        indexed_overlays(fragment, indexed, after.schema())
+            .into_iter()
+            .filter(|(committed, _, _)| *committed <= version)
+            .collect::<HashSet<_>>()
+    };
+    Ok(up_to(then) != up_to(now) || revives_rows(before, after, then, now).await?)
 }
 
 /// Whether `fragment`'s indexed data differs between `before` and `after`: a
@@ -584,7 +605,7 @@ async fn indexed_data_differs(
     {
         return Ok(true);
     }
-    revives_rows(before, after, then, now).await
+    revives_rows(&before.dataset, &after.dataset, then, now).await
 }
 
 /// The version each covered fragment's index entries describe: its segment's
@@ -823,43 +844,65 @@ async fn prune_stale_segment_coverage(
             .filter(|segment| segment.dataset_version() == version)
         {
             let indexed_field_ids = indexed_field_ids(dataset, segment.fields())?;
-            let stale_fragments = segment
-                .fragment_bitmap()
-                .iter()
-                .filter(|fragment_id| {
-                    let historical_fragment = historical_fragments.get(fragment_id);
-                    if historical_fragment.is_none()
-                        && !historically_missing_exempt.contains(*fragment_id)
-                    {
-                        return prune_historically_missing;
+            let mut stale_fragments = Vec::new();
+            for fragment_id in segment.fragment_bitmap().iter() {
+                let historical_fragment = historical_fragments.get(&fragment_id).copied();
+                if historical_fragment.is_none()
+                    && !historically_missing_exempt.contains(fragment_id)
+                {
+                    if prune_historically_missing {
+                        stale_fragments.push(fragment_id);
                     }
-                    let Some(current_fragment) = current_fragments.get(fragment_id) else {
-                        return !lineage
-                            .as_ref()
-                            .is_some_and(|lineage| lineage.contains(*fragment_id));
-                    };
-                    // A fragment the remap added may have no counterpart at
-                    // this version to compare; the overlay check still applies.
-                    let changed_files = historical_fragment.is_some_and(|historical_fragment| {
+                    continue;
+                }
+                let Some(current_fragment) = current_fragments.get(&fragment_id).copied() else {
+                    if !lineage
+                        .as_ref()
+                        .is_some_and(|lineage| lineage.contains(fragment_id))
+                    {
+                        stale_fragments.push(fragment_id);
+                    }
+                    continue;
+                };
+                // A fragment the remap added may have no counterpart at this
+                // version to compare; the newer-overlay check still applies.
+                let changed = match historical_fragment {
+                    Some(historical_fragment) => {
                         let historical_files = fragment_field_files(
                             &historical,
                             historical_fragment,
                             &indexed_field_ids,
                         );
-                        let current_files =
-                            fragment_field_files(dataset, current_fragment, &indexed_field_ids);
-                        historical_files.is_none() || historical_files != current_files
-                    });
-                    let changed_overlays = prune_newer_overlays
-                        && has_overlay_newer_than(
-                            current_fragment,
-                            version,
-                            &indexed_field_ids,
-                            dataset.schema(),
-                        );
-                    changed_files || changed_overlays
-                })
-                .collect::<Vec<_>>();
+                        historical_files.is_none()
+                            || historical_files
+                                != fragment_field_files(
+                                    dataset,
+                                    current_fragment,
+                                    &indexed_field_ids,
+                                )
+                            || restored_since(
+                                &historical,
+                                dataset,
+                                historical_fragment,
+                                current_fragment,
+                                version,
+                                &indexed_field_ids,
+                            )
+                            .await?
+                    }
+                    None => false,
+                };
+                let changed_overlays = prune_newer_overlays
+                    && has_overlay_newer_than(
+                        current_fragment,
+                        version,
+                        &indexed_field_ids,
+                        dataset.schema(),
+                    );
+                if changed || changed_overlays {
+                    stale_fragments.push(fragment_id);
+                }
+            }
             for fragment_id in stale_fragments {
                 segment.fragment_bitmap_mut().remove(fragment_id);
             }
