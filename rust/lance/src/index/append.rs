@@ -1837,7 +1837,7 @@ mod tests {
         "has type"
     )]
     #[tokio::test]
-    async fn test_vector_append_validates_logical_query_compatibility(
+    async fn test_commit_index_segments_rejects_logical_query_incompatibility(
         #[case] first_params: VectorIndexParams,
         #[case] second_params: VectorIndexParams,
         #[case] expected_error: &str,
@@ -1892,38 +1892,8 @@ mod tests {
                     .unwrap(),
             );
         }
-        dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", segments)
-            .await
-            .unwrap();
-
-        let (appended_batch, _) = clustered_vector_batch(
-            schema.clone(),
-            (2 * ROWS_PER_FRAGMENT) as i32,
-            ROWS_PER_FRAGMENT,
-            DIMENSION,
-            200.0,
-        );
-        dataset
-            .append(
-                RecordBatchIterator::new(vec![Ok(appended_batch)], schema),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let version_before = dataset.version().version;
-        let segments_before = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        let object_store = dataset.object_store.clone();
-        let directories_before = object_store
-            .read_dir(dataset.indices_dir())
-            .await
-            .unwrap()
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-
         let error = dataset
-            .optimize_indices(&OptimizeOptions::append())
+            .commit_existing_index_segments(INDEX_NAME, "vector", segments)
             .await
             .unwrap_err();
         assert!(
@@ -1937,27 +1907,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             latest.version().version,
-            version_before,
-            "incompatible logical segments must fail before committing"
+            dataset.version().version,
+            "a rejected segment commit must not create a new dataset version"
         );
-        let mut segments_after = latest.load_indices_by_name(INDEX_NAME).await.unwrap();
-        let mut segments_before = segments_before;
-        for segment in segments_after.iter_mut().chain(segments_before.iter_mut()) {
-            segment.created_at = None;
-        }
-        assert_eq!(
-            segments_after, segments_before,
-            "incompatible logical segments must remain unchanged"
-        );
-        let directories_after = object_store
-            .read_dir(latest.indices_dir())
-            .await
-            .unwrap()
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(
-            directories_after, directories_before,
-            "query compatibility validation must run before staging a new segment"
+        assert!(
+            latest
+                .load_indices_by_name(INDEX_NAME)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rejected segment commit must not persist any segment"
         );
     }
 
