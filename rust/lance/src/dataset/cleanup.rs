@@ -927,6 +927,7 @@ impl<'a> CleanupTask<'a> {
             "file" | "file+uring" | "file-object-store"
         );
         let indices_dir = self.dataset.indices_dir();
+        let data_dir = self.dataset.data_dir();
         let retained_index_dirs = inspection
             .referenced_files
             .index_uuids
@@ -934,6 +935,19 @@ impl<'a> CleanupTask<'a> {
             .map(|uuid| indices_dir.clone().join(uuid.as_str()))
             .collect::<HashSet<_>>();
         let index_dirs_to_remove = Mutex::new(HashSet::new());
+        // Sidecar directories inherit their parent data file's retention, even if empty.
+        let retained_data_dirs = if deletes_files && removes_empty_dirs {
+            inspection
+                .referenced_files
+                .data_paths
+                .iter()
+                .filter_map(|path| path.as_ref().strip_suffix(".lance"))
+                .map(|path| Path::parse(format!("{}/{path}", self.dataset.base)))
+                .collect::<std::result::Result<HashSet<_>, _>>()?
+        } else {
+            HashSet::new()
+        };
+        let data_dirs_to_remove = Mutex::new(HashSet::new());
         // Versions whose manifest could not be deleted. Their store records must
         // survive with them: a record outliving its manifest is retired by the next
         // cleanup, but a manifest outliving its record is a lost version.
@@ -1056,14 +1070,24 @@ impl<'a> CleanupTask<'a> {
                     CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest => {}
                 }
             }
-            if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
+            if deletes_files
+                && removes_empty_dirs
+                && matches!(file.kind, CleanupFileKind::Index | CleanupFileKind::Data)
+            {
+                let (root, dirs_to_remove) = if matches!(file.kind, CleanupFileKind::Index) {
+                    (&indices_dir, &index_dirs_to_remove)
+                } else {
+                    (&data_dir, &data_dirs_to_remove)
+                };
                 let mut parent = file.path.parent();
-                let mut index_dirs = index_dirs_to_remove.lock().unwrap();
+                let mut dirs = dirs_to_remove.lock().map_err(|error| {
+                    Error::internal(format!("Failed to lock cleanup directory candidates: {error}"))
+                })?;
                 while let Some(dir_path) = parent {
-                    if dir_path == indices_dir || !dir_path.prefix_matches(&indices_dir) {
+                    if dir_path == *root || !dir_path.prefix_matches(root) {
                         break;
                     }
-                    index_dirs.insert(dir_path.clone());
+                    dirs.insert(dir_path.clone());
                     parent = dir_path.parent();
                 }
             }
@@ -1142,23 +1166,34 @@ impl<'a> CleanupTask<'a> {
                     .await?;
             }
 
-            if removes_empty_dirs
-                && let Err(error) = self
-                    .dataset
-                    .object_store
-                    .remove_empty_dirs(
-                        indices_dir.clone(),
-                        retained_index_dirs,
-                        index_dirs_to_remove.into_inner().unwrap(),
-                        (!self.policy.delete_unverified).then_some(verification_threshold),
-                    )
-                    .await
-            {
-                warn!(
-                    path = indices_dir.as_ref(),
-                    error = %error,
-                    "Failed to remove empty index directories"
-                );
+            if removes_empty_dirs {
+                for (root, retained_dirs, dirs_to_remove) in [
+                    (indices_dir, retained_index_dirs, index_dirs_to_remove),
+                    (data_dir, retained_data_dirs, data_dirs_to_remove),
+                ] {
+                    let verified_dirs = dirs_to_remove.into_inner().map_err(|error| {
+                        Error::internal(format!(
+                            "Failed to read cleanup directory candidates: {error}"
+                        ))
+                    })?;
+                    if let Err(error) = self
+                        .dataset
+                        .object_store
+                        .remove_empty_dirs(
+                            root.clone(),
+                            retained_dirs,
+                            verified_dirs,
+                            (!self.policy.delete_unverified).then_some(verification_threshold),
+                        )
+                        .await
+                    {
+                        warn!(
+                            path = root.as_ref(),
+                            error = %error,
+                            "Failed to remove empty cleanup directories"
+                        );
+                    }
+                }
             }
         } else {
             // Nothing is deleted, so the stats describe what would be removed.
@@ -2294,6 +2329,7 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
@@ -3243,50 +3279,74 @@ mod tests {
         assert_eq!(removed.bytes_removed, before.num_bytes - after.num_bytes);
     }
 
+    #[rstest]
+    #[case::packed(100 * 1024)]
+    #[case::dedicated(5 * 1024 * 1024)]
     #[tokio::test]
-    async fn cleanup_blob_v2_sidecar_files() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-
-        // First version: write a packed blob (sidecar .blob file).
+    async fn cleanup_blob_v2_sidecar_files(#[case] blob_len: usize) {
+        let tmpdir = TempStrDir::default();
+        let params = WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        };
         Dataset::write(
-            blob_v2_batch(100 * 1024),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                commit_handler: Some(Arc::new(RenameCommitHandler)),
-                mode: WriteMode::Create,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
+            blob_v2_batch(blob_len),
+            tmpdir.as_str(),
+            Some(params.clone()),
         )
         .await
         .unwrap();
-        assert_gt!(fixture.count_blob_files().await.unwrap(), 0);
-
-        // Second version: overwrite with an inline blob (no sidecar).
-        Dataset::write(
-            blob_v2_batch(1024),
-            &fixture.dataset_path,
+        let mut dataset = Dataset::write(
+            blob_v2_batch(blob_len),
+            tmpdir.as_str(),
             Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                commit_handler: Some(Arc::new(RenameCommitHandler)),
-                mode: WriteMode::Overwrite,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
+                mode: WriteMode::Append,
+                ..params
             }),
         )
         .await
         .unwrap();
 
-        // Advance time so the unverified threshold doesn't interfere.
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let data_dir = std::path::Path::new(tmpdir.as_str()).join("data");
+        let stale_dirs = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(stale_dirs.len(), 2);
 
-        fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+        compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 1);
 
-        assert_eq!(fixture.count_blob_files().await.unwrap(), 0);
+        let removed = cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now() + TimeDelta::seconds(1))
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(removed.data_files_removed, 4);
+        for stale_dir in stale_dirs {
+            assert!(!stale_dir.exists(), "{} remains", stale_dir.display());
+        }
+        let retained_dirs = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_dirs.len(), 1);
+        assert!(
+            std::fs::read_dir(&retained_dirs[0])
+                .unwrap()
+                .next()
+                .is_some()
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -3306,6 +3366,13 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let data_dir = std::path::Path::new(fixture.tmpdir.as_str()).join("my_db/data");
+        let sidecar_dir = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap();
 
         Dataset::write(
             blob_v2_batch(1024),
@@ -3329,6 +3396,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(fixture.count_blob_files().await.unwrap(), 0);
+        assert!(!sidecar_dir.exists());
+    }
+
+    #[rstest]
+    #[case::default_policy(false, 0, true)]
+    #[case::delete_unverified(true, 0, false)]
+    #[case::old_empty_directory(false, 10, false)]
+    #[tokio::test]
+    async fn cleanup_applies_sidecar_directory_retention_policy(
+        #[case] delete_unverified: bool,
+        #[case] days_elapsed: i64,
+        #[case] should_preserve: bool,
+    ) {
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        MockClock::set_system_time(real_now);
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let data_dir = std::path::Path::new(fixture.tmpdir.as_str()).join("my_db/data");
+        let retained_dir = data_dir.join(
+            dataset.manifest.fragments[0].files[0]
+                .path
+                .strip_suffix(".lance")
+                .unwrap(),
+        );
+        let in_progress_dir = data_dir.join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&retained_dir).unwrap();
+        std::fs::create_dir_all(&in_progress_dir).unwrap();
+        MockClock::set_system_time(
+            real_now + TimeDelta::try_days(days_elapsed).unwrap().to_std().unwrap(),
+        );
+
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now())
+            .delete_unverified(delete_unverified)
+            .build();
+        dataset.cleanup(policy.clone()).explain().await.unwrap();
+        assert!(retained_dir.exists());
+        assert!(in_progress_dir.exists());
+
+        let removed = cleanup_old_versions(&dataset, policy).await.unwrap();
+        assert_eq!(removed.data_files_removed, 0);
+        assert!(data_dir.exists());
+        assert!(retained_dir.exists());
+        assert_eq!(in_progress_dir.exists(), should_preserve);
     }
 
     #[tokio::test]
@@ -4256,8 +4371,11 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[rstest]
+    #[case::indices("_indices")]
+    #[case::sidecars("data")]
     #[tokio::test]
-    async fn cleanup_does_not_remove_empty_directory_through_index_symlink() {
+    async fn cleanup_does_not_remove_empty_directory_through_symlink(#[case] subtree: &str) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
 
@@ -4265,7 +4383,10 @@ mod tests {
         let outside_empty_dir = outside.path().join("must_remain");
         std::fs::create_dir_all(&outside_empty_dir).unwrap();
 
-        let link_path = fixture.local_index_dir(Uuid::new_v4());
+        let link_path = std::path::Path::new(fixture.tmpdir.as_str())
+            .join("my_db")
+            .join(subtree)
+            .join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
 
