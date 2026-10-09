@@ -11524,18 +11524,18 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct RecordingScheduler {
+    struct OffsetIoRecorder {
         data: Bytes,
         requests: Mutex<Vec<Vec<Range<u64>>>>,
     }
 
-    impl RecordingScheduler {
+    impl OffsetIoRecorder {
         fn take_requests(&self) -> Vec<Vec<Range<u64>>> {
             std::mem::take(&mut *self.requests.lock().unwrap())
         }
     }
 
-    impl EncodingsIo for RecordingScheduler {
+    impl EncodingsIo for OffsetIoRecorder {
         fn submit_request(
             &self,
             ranges: Vec<Range<u64>>,
@@ -11567,7 +11567,7 @@ mod tests {
             bytes.extend_from_slice(buffer);
         }
 
-        let recorder = Arc::new(RecordingScheduler {
+        let recorder = Arc::new(OffsetIoRecorder {
             data: Bytes::from(bytes),
             requests: Mutex::new(Vec::new()),
         });
@@ -11581,7 +11581,12 @@ mod tests {
             &decompression,
         )
         .unwrap();
-        let cached = cold.initialize(&io).await.unwrap();
+        let initialization = cold.init_layout().unwrap();
+        let ranges = initialization.required_ranges().cloned().collect();
+        let buffers = io.submit_request(ranges, 0).await.unwrap();
+        let buffers = initialization.with_buffers(buffers).unwrap();
+        let cached = cold.init_from_buffers(buffers, &io).await.unwrap();
+        cold.try_load(&cached).unwrap();
         let initialize_requests = recorder.take_requests();
 
         let cold_tasks = cold.schedule_ranges(&[123..124], &io).unwrap();
@@ -11598,7 +11603,7 @@ mod tests {
             &decompression,
         )
         .unwrap();
-        warm.load(&cached);
+        warm.try_load(&cached).unwrap();
         let warm_tasks = warm.schedule_ranges(&[123..124], &io).unwrap();
         let warm_requests = recorder.take_requests();
         for task in warm_tasks {

@@ -1164,7 +1164,7 @@ mod tests {
         },
         format::pb21::compressive_encoding::Compression,
         format::{ProtobufUtils21, pb21, pb21::CompressiveEncoding},
-        testing::{TestEncoding, check_specific_random},
+        testing::check_specific_random,
     };
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};

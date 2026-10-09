@@ -668,6 +668,9 @@ pub fn try_variable_width_miniblock(
 }
 
 /// Encode variable-width miniblocks whose offset chunks may use generic block codecs.
+///
+/// Only the unstable Lance 2.3 compression strategy may select this grammar.
+/// Stable 2.1/2.2 strategies must use [`try_variable_width_miniblock`].
 pub fn try_variable_width_miniblock_with_generic_offsets(
     field: &Field,
     data: &DataBlock,
