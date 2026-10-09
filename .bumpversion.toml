@@ -92,6 +92,11 @@ replace = 'lance-io = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-jsonb = {{ version = "={current_version}"'
+replace = 'lance-jsonb = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'lance-linalg = {{ version = "={current_version}"'
 replace = 'lance-linalg = {{ version = "={new_version}"'
 
