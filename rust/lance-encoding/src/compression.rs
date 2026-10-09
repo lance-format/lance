@@ -430,6 +430,11 @@ fn try_bitpack_for_block(data: &FixedWidthDataBlock) -> Option<Box<dyn BlockComp
     let widths = bit_widths.as_primitive::<UInt64Type>();
     let max_bit_width = *widths.values().iter().max().unwrap();
 
+    // Full-width values save no space and leave no bit savings for a runt tail.
+    if max_bit_width >= bits {
+        return None;
+    }
+
     let too_small =
         widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 
@@ -935,6 +940,14 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn requires_payload(&self) -> bool {
         true
     }
+
+    /// Inspect a block for an exact payload-derived value count when supported.
+    ///
+    /// This must not materialize the decoded values. `None` means the encoding requires an
+    /// external count or cannot safely prove one from this payload.
+    fn infer_num_values(&self, _data: &LanceBuffer) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn require_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<LanceBuffer> {
@@ -1024,7 +1037,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl)?))
             }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(
                 rle,
@@ -1063,6 +1076,15 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     compression_config,
                 )))
             }
+            compression @ (Compression::Range(_) | Compression::Delta(_)) => {
+                Err(Error::not_supported_source(
+                    format!(
+                        "{} compression is only supported in block positions",
+                        compression_name(compression)
+                    )
+                    .into(),
+                ))
+            }
             _ => todo!(),
         }
     }
@@ -1079,7 +1101,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     .map(|v| LanceBuffer::from_bytes(v.clone(), 1)),
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
-            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
+            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1175,7 +1197,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
             Compression::FixedSizeList(fsl) => {
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())))
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl.as_ref())?))
             }
             Compression::OutOfLineBitpacking(out_of_line) => {
                 // Extract the compressed bit width from the values encoding
@@ -1258,32 +1280,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 let child = delta.deltas.as_deref().ok_or_else(|| {
                     Error::invalid_input("Delta is missing its deltas child encoding")
                 })?;
-                let child_bits = match child.compression.as_ref() {
-                    Some(Compression::Flat(flat)) => flat.bits_per_value,
-                    Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
-                    Some(Compression::InlineBitpacking(bitpacking)) => {
-                        bitpacking.uncompressed_bits_per_value
-                    }
-                    Some(Compression::OutOfLineBitpacking(bitpacking)) => {
-                        bitpacking.uncompressed_bits_per_value
-                    }
-                    Some(other) => {
-                        return Err(Error::invalid_input(format!(
-                            "Delta does not support a {} child",
-                            compression_name(other)
-                        )));
-                    }
-                    None => {
-                        return Err(Error::invalid_input(
-                            "Delta child is missing its compression variant",
-                        ));
-                    }
-                };
-                if child_bits != bits_per_value {
-                    return Err(Error::invalid_input(format!(
-                        "Delta child declares {child_bits}-bit values, expected {bits_per_value}"
-                    )));
-                }
+                validate_delta_child_encoding(child, bits_per_value)?;
                 let child = self.create_block_decompressor(child)?;
                 Ok(Box::new(DeltaDecompressor::new(
                     bits_per_value,
@@ -1295,6 +1292,38 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
         }
     }
 }
+
+pub(crate) fn validate_delta_child_encoding(
+    child: &CompressiveEncoding,
+    expected_bits_per_value: u64,
+) -> Result<()> {
+    let child_bits_per_value = match child.compression.as_ref() {
+        Some(Compression::Flat(flat)) => flat.bits_per_value,
+        Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
+        Some(Compression::InlineBitpacking(bitpacking)) => bitpacking.uncompressed_bits_per_value,
+        Some(Compression::OutOfLineBitpacking(bitpacking)) => {
+            bitpacking.uncompressed_bits_per_value
+        }
+        Some(other) => {
+            return Err(Error::invalid_input(format!(
+                "Delta does not support a {} child",
+                compression_name(other)
+            )));
+        }
+        None => {
+            return Err(Error::invalid_input(
+                "Delta child is missing its compression variant",
+            ));
+        }
+    };
+    if child_bits_per_value != expected_bits_per_value {
+        return Err(Error::invalid_input(format!(
+            "Delta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn create_rle_decompressor(
     rle: &crate::format::pb21::Rle,
     decompression_strategy: &dyn DecompressionStrategy,
@@ -1758,6 +1787,22 @@ mod tests {
             debug_str.contains("OutOfLineBitpacking"),
             "expected OutOfLineBitpacking, got: {debug_str}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::runt_tail(1600)]
+    #[case::whole_chunks(2048)]
+    #[cfg(feature = "bitpacking")]
+    fn test_block_skips_full_width_bitpacking(#[case] num_values: usize) {
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(vec![-1_i64; num_values]),
+            num_values: num_values as u64,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+
+        assert!(try_bitpacking_block(&DataBlock::FixedWidth(block)).is_none());
     }
 
     #[test]

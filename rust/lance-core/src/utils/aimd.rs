@@ -25,7 +25,7 @@ use crate::Result;
 ///
 /// - initial_rate: 2000 req/s
 /// - min_rate: 1 req/s
-/// - max_rate: 5000 req/s (0.0 disables ceiling)
+/// - max_rate: 5000 req/s (0.0 disables the ceiling; must be finite otherwise)
 /// - decrease_factor: 0.5 (halve on throttle)
 /// - additive_increment: 300 req/s per success window
 /// - window_duration: 1 second
@@ -101,6 +101,26 @@ impl AimdConfig {
 
     /// Validate that the configuration values are sensible.
     pub fn validate(&self) -> Result<()> {
+        // Reject NaN and infinity first. The sign and ordering checks below
+        // compare with `<`/`>`, which are `false` for NaN and for a `+inf` on
+        // a field with no opposing bound, so a non-finite rate would otherwise
+        // slip through and silently disable throttling (a NaN rate makes the
+        // token bucket refill to full on every acquire) or, with a zero burst
+        // capacity, panic in `Duration::from_secs_f64`.
+        for (name, value) in [
+            ("initial_rate", self.initial_rate),
+            ("min_rate", self.min_rate),
+            ("max_rate", self.max_rate),
+            ("decrease_factor", self.decrease_factor),
+            ("additive_increment", self.additive_increment),
+            ("throttle_threshold", self.throttle_threshold),
+        ] {
+            if !value.is_finite() {
+                return Err(crate::Error::invalid_input(format!(
+                    "{name} must be finite, got {value}"
+                )));
+            }
+        }
         if self.initial_rate <= 0.0 {
             return Err(crate::Error::invalid_input(format!(
                 "initial_rate must be positive, got {}",
@@ -327,11 +347,47 @@ mod tests {
         AimdConfig::default().with_initial_rate(0.5).with_min_rate(1.0),
         "initial_rate (0.5) must not be below min_rate (1)"
     )]
+    #[case::nan_initial_rate(
+        AimdConfig::default().with_initial_rate(f64::NAN),
+        "initial_rate must be finite"
+    )]
+    #[case::inf_initial_rate(
+        AimdConfig::default().with_initial_rate(f64::INFINITY),
+        "initial_rate must be finite"
+    )]
+    #[case::nan_min_rate(
+        AimdConfig::default().with_min_rate(f64::NAN),
+        "min_rate must be finite"
+    )]
+    #[case::nan_max_rate(
+        AimdConfig::default().with_max_rate(f64::NAN),
+        "max_rate must be finite"
+    )]
+    #[case::inf_max_rate(
+        AimdConfig::default().with_max_rate(f64::INFINITY),
+        "max_rate must be finite"
+    )]
+    #[case::nan_decrease_factor(
+        AimdConfig::default().with_decrease_factor(f64::NAN),
+        "decrease_factor must be finite"
+    )]
+    #[case::nan_additive_increment(
+        AimdConfig::default().with_additive_increment(f64::NAN),
+        "additive_increment must be finite"
+    )]
+    #[case::nan_throttle_threshold(
+        AimdConfig::default().with_throttle_threshold(f64::NAN),
+        "throttle_threshold must be finite"
+    )]
     fn test_config_validation_rejects_invalid(
         #[case] config: AimdConfig,
         #[case] expected_msg: &str,
     ) {
         let err = config.validate().unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains(expected_msg),

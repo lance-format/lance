@@ -19,4 +19,13 @@ impl WrappingObjectStore for ThrottledStoreWrapper {
         let throttle_store = ThrottledStore::new(original, self.config);
         Arc::new(throttle_store)
     }
+
+    // Injects behaviour into every request, so a listing must not go around it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
 }

@@ -39,7 +39,6 @@ use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
 use futures::future::try_join_all;
-use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
@@ -50,7 +49,9 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
+use lance_io::object_store::ObjectStore;
 use lance_table::{
+    feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest},
     format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
@@ -60,23 +61,29 @@ use lance_table::{
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
+use prost::Message;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
+use tokio::sync::OnceCell;
 use tokio::time::{MissedTickBehavior, interval};
-use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument, warn};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    managed_blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    /// Stable-partition row-map ids (`_fri/<map_id>/`) referenced by tagged
+    /// fragment-reuse-index entries. Resolved from
+    /// [`CleanupInspection::frag_reuse_entries`] before deletion decisions.
+    frag_reuse_map_ids: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -87,6 +94,9 @@ pub struct RemovalStats {
     pub transaction_files_removed: u64,
     pub index_files_removed: u64,
     pub deletion_files_removed: u64,
+    /// Files that could not be deleted. They are not counted as removed; the next
+    /// cleanup finds them again by listing.
+    pub failed_deletes: u64,
 }
 
 /// A read-only explanation of what a cleanup operation would remove.
@@ -208,6 +218,7 @@ impl RemovalStats {
         self.transaction_files_removed += other.transaction_files_removed;
         self.index_files_removed += other.index_files_removed;
         self.deletion_files_removed += other.deletion_files_removed;
+        self.failed_deletes += other.failed_deletes;
     }
 }
 
@@ -289,6 +300,7 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
+    delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
     dataset: &'a Dataset,
     policy: CleanupPolicy,
     action: CleanupAction,
@@ -298,10 +310,37 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
 }
 
+/// The visible descriptor rows and base namespace used by one fragment scan.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ManagedScanKey {
+    store_prefix: String,
+    data_dir: Path,
+    bases: Vec<(u32, String, bool)>,
+    fragment: Vec<u8>,
+    fields: Vec<arrow_schema::Field>,
+    field_ids: Vec<i32>,
+    retained: bool,
+}
+
+/// A manifest that has aged out and is queued for deletion.
+#[derive(Clone, Debug)]
+struct ExpiredManifest {
+    version: u64,
+    /// Size from the manifest listing. `None` means it must be fetched before it can
+    /// be counted in `RemovalStats::bytes_removed`.
+    size_bytes: Option<u64>,
+}
+
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
-    old_manifests: HashMap<Path, u64>,
+    // Completed scans have already added their paths to the sets below. Keep
+    // only whether they found owner paths, not another copy of all references.
+    managed_scans: HashMap<ManagedScanKey, Arc<OnceCell<bool>>>,
+    old_manifests: HashMap<Path, ExpiredManifest>,
+    /// Store records to retire once their manifests are gone, by version;
+    /// see `CommitHandler::forget_version`.
+    retired_records: HashMap<u64, String>,
     /// Referenced files are part of our working set
     referenced_files: ReferencedFiles,
     /// Verified files may or may not be part of the working set but they are
@@ -310,6 +349,18 @@ struct CleanupInspection {
     verified_files: ReferencedFiles,
     /// Track tagged old versions in case we want to raise a `CleanupError`.
     tagged_old_versions: HashSet<u64>,
+    /// Tagged fragment-reuse-index entries seen across manifests, deduped by
+    /// entry uuid so each is decoded at most once; the flag records whether
+    /// some retained (working-set) manifest carries the entry.
+    frag_reuse_entries: HashMap<uuid::Uuid, (IndexMetadata, bool)>,
+    /// Tagged FRI entry uuids per manifest version, so a branch rescue that
+    /// retains a parent manifest can flip its entries into the working set
+    /// (their row maps become referenced instead of merely verified).
+    frag_reuse_entry_versions: HashMap<u64, Vec<uuid::Uuid>>,
+    /// Set when a branch manifest's FRI history could not be interpreted:
+    /// `_fri/` garbage collection is skipped for the run rather than risking
+    /// row maps the branch references invisibly.
+    skip_frag_reuse_gc: bool,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
@@ -343,8 +394,6 @@ impl CleanupInspection {
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
-const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
-const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
 
 /// Builder-style cleanup operation.
@@ -418,6 +467,8 @@ impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
         let track_removed_manifests = policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
+        let delete_limiter =
+            create_delete_limiter(policy.delete_rate_limit.filter(|_| action.deletes_files()));
         Self::new_with_ignored_manifests(
             dataset,
             policy,
@@ -425,6 +476,7 @@ impl<'a> CleanupTask<'a> {
             HashSet::new(),
             track_removed_manifests,
             include_referenced_branches,
+            delete_limiter,
         )
     }
 
@@ -435,8 +487,10 @@ impl<'a> CleanupTask<'a> {
         ignored_manifests: HashSet<Path>,
         track_removed_manifests: bool,
         include_referenced_branches: bool,
+        delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
     ) -> Self {
         Self {
+            delete_limiter,
             dataset,
             policy,
             action,
@@ -537,6 +591,95 @@ impl<'a> CleanupTask<'a> {
         Ok(inspection.into_inner().unwrap())
     }
 
+    async fn inspect_managed_blobs(
+        &self,
+        dataset: &Dataset,
+        retained: bool,
+        inspection: &Mutex<CleanupInspection>,
+    ) -> Result<bool> {
+        let names = dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| super::blob::field_contains_blob(field))
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(false);
+        }
+        let projection = dataset.schema().project(&names)?;
+        let fields = projection
+            .fields
+            .iter()
+            .map(arrow_schema::Field::from)
+            .collect::<Vec<_>>();
+        let field_ids = projection.field_ids();
+        let mut bases = dataset
+            .manifest
+            .base_paths
+            .iter()
+            .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
+            .collect::<Vec<_>>();
+        bases.sort_unstable();
+        let mut found = false;
+        // Manifests are already read concurrently. Scan their fragments in order
+        // to avoid multiplying concurrent descriptor buffers and path sets.
+        for fragment in dataset.get_fragments() {
+            let key = ManagedScanKey {
+                store_prefix: dataset.object_store.store_prefix.clone(),
+                data_dir: dataset.data_dir(),
+                bases: bases.clone(),
+                fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
+                    .encode_to_vec(),
+                fields: fields.clone(),
+                field_ids: field_ids.clone(),
+                retained,
+            };
+            let cell = inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .entry(key)
+                .or_default()
+                .clone();
+            let scanned = cell
+                .get_or_try_init(|| async {
+                    let paths =
+                        super::blob::managed_paths(dataset, self.dataset, fragment.scan()).await?;
+                    let found = !paths.is_empty();
+                    let mut inspection = inspection.lock().unwrap();
+                    for path in paths {
+                        let relative = remove_prefix(&path, &self.dataset.base);
+                        if retained {
+                            inspection
+                                .verified_files
+                                .managed_blob_paths
+                                .remove(&relative);
+                            inspection
+                                .referenced_files
+                                .managed_blob_paths
+                                .insert(relative);
+                        } else {
+                            inspection
+                                .verified_files
+                                .managed_blob_paths
+                                .insert(relative);
+                        }
+                    }
+                    Ok::<_, Error>(found)
+                })
+                .await;
+            match scanned {
+                Ok(has_paths) => found |= *has_paths,
+                // An expired descriptor can disappear during concurrent cleanup.
+                // Do not mark failed scans complete: retained reads must still fail.
+                Err(error) if !retained && error.is_not_found() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(found)
+    }
+
     async fn process_manifest_file(
         &self,
         location: ManifestLocation,
@@ -552,6 +695,8 @@ impl<'a> CleanupTask<'a> {
         let manifest_and_indexes = async {
             let manifest =
                 read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            ensure_can_read_manifest(&manifest)?;
+            ensure_can_write_manifest(&manifest)?;
             let indexes =
                 read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
             Ok::<_, Error>((manifest, indexes))
@@ -568,6 +713,14 @@ impl<'a> CleanupTask<'a> {
                     manifest_path = %location.path,
                     "Skipping old manifest removed by concurrent cleanup"
                 );
+                // Its record may still be there if that cleanup stopped early.
+                if let Some(identity) = location.identity {
+                    inspection
+                        .lock()
+                        .unwrap()
+                        .retired_records
+                        .insert(location.version, identity);
+                }
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -578,6 +731,14 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            self.inspect_managed_blobs(&snapshot, in_working_set, inspection)
+                .await?;
+        }
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
@@ -589,9 +750,20 @@ impl<'a> CleanupTask<'a> {
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         let commit_ts = manifest.timestamp();
         if !in_working_set {
-            inspection
-                .old_manifests
-                .insert(location.path.clone(), manifest.version);
+            inspection.old_manifests.insert(
+                location.path.clone(),
+                ExpiredManifest {
+                    version: manifest.version,
+                    // Carried from the listing so the delete phase need not HEAD
+                    // every manifest just to report bytes removed.
+                    size_bytes: location.size,
+                },
+            );
+            if let Some(identity) = location.identity.clone() {
+                inspection
+                    .retired_records
+                    .insert(manifest.version, identity);
+            }
             match inspection.latest_deleted_manifest_time {
                 Some(ts) if commit_ts <= ts => {}
                 _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
@@ -645,6 +817,26 @@ impl<'a> CleanupTask<'a> {
             let uuid_str = index.uuid.to_string();
             referenced_files.index_uuids.insert(uuid_str);
         }
+
+        // Tagged FRI entries are recorded for row-map reference resolution
+        // (their content is decoded later, once per unique entry). A v0 entry
+        // cannot reference row maps, so v0-only datasets record nothing.
+        for index in indexes {
+            if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+                && index.index_version != 0
+            {
+                let entry = inspection
+                    .frag_reuse_entries
+                    .entry(index.uuid)
+                    .or_insert_with(|| (index.clone(), false));
+                entry.1 |= in_working_set;
+                inspection
+                    .frag_reuse_entry_versions
+                    .entry(manifest.version)
+                    .or_default()
+                    .push(index.uuid);
+            }
+        }
         Ok(())
     }
 
@@ -660,10 +852,74 @@ impl<'a> CleanupTask<'a> {
             deletion_files_removed = tracing::field::Empty
         )
     )]
+    /// Resolve the row-map ids referenced by the recorded tagged FRI entries
+    /// into the inspection's referenced (retained manifests) and verified
+    /// (expiring manifests) sets. Returns false when some entry cannot be
+    /// interpreted, in which case `_fri/` garbage collection is skipped for
+    /// this run: an uninterpretable entry may reference maps invisibly.
+    async fn resolve_frag_reuse_map_ids(&self, inspection: &mut CleanupInspection) -> bool {
+        let entries = std::mem::take(&mut inspection.frag_reuse_entries);
+        for (uuid, (entry, in_working_set)) in entries.iter() {
+            let map_ids = async {
+                let content =
+                    crate::index::frag_reuse::load_raw_frag_reuse_content(self.dataset, entry)
+                        .await?;
+                let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
+                    entry.index_version,
+                    &content,
+                )
+                .await?;
+                if ledger.has_unsupported_transitions() {
+                    return Err(Error::not_supported(
+                        "the tagged FRI history carries transitions this client cannot interpret",
+                    ));
+                }
+                Ok::<Vec<String>, Error>(
+                    ledger
+                        .transitions()
+                        .iter()
+                        .filter_map(|transition| {
+                            match transition.mapping() {
+                            lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(
+                                partition,
+                            ) => Some(partition.map_id.clone()),
+                            _ => None,
+                        }
+                        })
+                        .collect(),
+                )
+            }
+            .await;
+            match map_ids {
+                Ok(map_ids) => {
+                    let target = if *in_working_set {
+                        &mut inspection.referenced_files
+                    } else {
+                        &mut inspection.verified_files
+                    };
+                    target.frag_reuse_map_ids.extend(map_ids);
+                }
+                Err(error) => {
+                    warn!(
+                        entry_uuid = %uuid,
+                        error = %error,
+                        "Cannot resolve the row-map references of a fragment reuse index \
+                         entry; skipping _fri garbage collection for this run"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     async fn delete_unreferenced_files(
         &self,
-        inspection: CleanupInspection,
+        mut inspection: CleanupInspection,
     ) -> Result<CleanupRunResult> {
+        let collect_frag_reuse_maps = !inspection.skip_frag_reuse_gc
+            && self.resolve_frag_reuse_map_ids(&mut inspection).await;
+        let inspection = inspection;
         let cleanup_result = Mutex::new(CleanupRunResult::default());
         let deletes_files = self.action.deletes_files();
         let removes_empty_dirs = matches!(
@@ -678,11 +934,14 @@ impl<'a> CleanupTask<'a> {
             .map(|uuid| indices_dir.clone().join(uuid.as_str()))
             .collect::<HashSet<_>>();
         let index_dirs_to_remove = Mutex::new(HashSet::new());
+        // Versions whose manifest could not be deleted. Their store records must
+        // survive with them: a record outliving its manifest is retired by the next
+        // cleanup, but a manifest outliving its record is a lost version.
+        let undeleted_manifest_versions = Mutex::new(HashSet::new());
         let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
-        let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path, unmodified_since| {
             let inspection_ref = &inspection;
@@ -692,7 +951,7 @@ impl<'a> CleanupTask<'a> {
                 .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
                 .or_else(|e| {
                     // If the directory doesn't exist then we can just return an empty stream.
-                    if is_not_found_err(&e) {
+                    if e.is_not_found() {
                         future::ready(Ok(stream::empty::<Result<ObjectMeta>>().boxed()))
                     } else {
                         future::ready(Err(e))
@@ -719,10 +978,23 @@ impl<'a> CleanupTask<'a> {
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
         let unmodified_since = inspection.listing_unmodified_since();
-        let streams = vec![
+        // Data files owned by no manifest can be newer than the retained
+        // manifest floor. List through the moving verification threshold so
+        // they become candidates once old enough, or list all data files when
+        // the caller explicitly permits deleting unverified files.
+        let data_unmodified_since = if self.policy.delete_unverified {
+            None
+        } else {
+            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+        };
+        let mut streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
+            build_listing_stream(
+                self.dataset.base.clone().join("_blobs"),
+                data_unmodified_since,
+            ),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -730,12 +1002,24 @@ impl<'a> CleanupTask<'a> {
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
+        if collect_frag_reuse_maps {
+            // Stable-partition row maps, referenced by map id from tagged FRI
+            // entries. Like `_indices/`, scanned without a cutoff: references
+            // from manifests removed by this pass are proof of deletability.
+            // A dataset without a `_fri/` directory yields an empty stream.
+            streams.push(build_listing_stream(
+                self.dataset.base.clone().join("_fri"),
+                None,
+            ));
+        }
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
         let old_manifests = inspection.old_manifests.clone();
         let manifest_files = stream::iter(old_manifests)
-            .map(|(path, _version)| async move {
-                let size_bytes = self.dataset.object_store.size(&path).await?;
+            .map(|(path, expired)| async move {
+                let size_bytes =
+                    expired_manifest_size(&self.dataset.object_store, &path, expired.size_bytes)
+                        .await?;
                 Ok::<CleanupFile, Error>(CleanupFile {
                     path,
                     kind: CleanupFileKind::Manifest,
@@ -747,7 +1031,7 @@ impl<'a> CleanupTask<'a> {
             .boxed();
 
         let all_files = stream::iter(vec![unreferenced_files, manifest_files]).flatten();
-        let all_paths_to_remove = all_files.map(|file| {
+        let all_files_to_remove = all_files.map(|file| -> Result<CleanupFile> {
             let file = file?;
             if deletes_files {
                 let mode = if file.unverified {
@@ -772,10 +1056,6 @@ impl<'a> CleanupTask<'a> {
                     CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest => {}
                 }
             }
-            cleanup_result
-                .lock()
-                .unwrap()
-                .record_file(&file, candidate_file_limit, self.track_removed_manifests);
             if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
                 let mut parent = file.path.parent();
                 let mut index_dirs = index_dirs_to_remove.lock().unwrap();
@@ -787,29 +1067,80 @@ impl<'a> CleanupTask<'a> {
                     parent = dir_path.parent();
                 }
             }
-            Ok(file.path)
+            Ok(file)
         });
 
         if deletes_files {
-            let paths_to_delete: BoxStream<Result<Path>> =
-                if let Some(rate) = self.policy.delete_rate_limit {
-                    let duration =
-                        calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
-                    let mut ticker = interval(duration);
-                    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                    IntervalStream::new(ticker)
-                        .zip(all_paths_to_remove)
-                        .map(|(_, path)| path)
-                        .boxed()
-                } else {
-                    all_paths_to_remove.boxed()
-                };
-
-            self.dataset
-                .object_store
-                .remove_stream(paths_to_delete)
-                .try_for_each(|_| future::ready(Ok(())))
+            // Deleting here rather than through `remove_stream` keeps each outcome
+            // attached to its file, which is what lets the stats below count what was
+            // actually removed instead of what was merely attempted.
+            let store = &self.dataset.object_store;
+            all_files_to_remove
+                .map(|file| async move {
+                    let file = file?;
+                    if let Some(limiter) = &self.delete_limiter {
+                        let mut ticker = limiter.lock().await;
+                        ticker.tick().await;
+                    }
+                    let outcome = match store.delete(&file.path).await {
+                        Ok(()) => Ok(()),
+                        // Cleanup lists first and deletes after, so a concurrent
+                        // writer or a second cleanup can remove a path in between.
+                        // Already gone is the outcome we wanted.
+                        Err(error) if error.is_not_found() => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    Ok::<_, Error>((file, outcome))
+                })
+                .buffer_unordered(self.dataset.object_store.io_parallelism())
+                .try_for_each(|(file, outcome)| {
+                    let mut result = cleanup_result.lock().unwrap();
+                    match outcome {
+                        Ok(()) => result.record_file(
+                            &file,
+                            candidate_file_limit,
+                            self.track_removed_manifests,
+                        ),
+                        // One transient failure must not discard a sweep over
+                        // millions of objects. The file stays, is not counted as
+                        // removed, and the next run finds it again by listing.
+                        Err(error) => {
+                            // Only the first is warned; a failing backend would
+                            // otherwise emit a line per object.
+                            if result.stats.failed_deletes == 0 {
+                                warn!(path = %file.path, error = %error,
+                                      "failed to delete file; continuing and counting it");
+                            } else {
+                                debug!(path = %file.path, error = %error, "failed to delete file");
+                            }
+                            result.stats.failed_deletes += 1;
+                            if matches!(file.kind, CleanupFileKind::Manifest)
+                                && let Some(expired) = inspection.old_manifests.get(&file.path)
+                            {
+                                undeleted_manifest_versions
+                                    .lock()
+                                    .unwrap()
+                                    .insert(expired.version);
+                            }
+                        }
+                    }
+                    future::ready(Ok(()))
+                })
                 .await?;
+
+            // Only after the objects are gone: a record that outlives its
+            // manifest is retired by the next cleanup, the reverse is a lost
+            // version.
+            let undeleted = undeleted_manifest_versions.into_inner().unwrap();
+            for (version, identity) in &inspection.retired_records {
+                if undeleted.contains(version) {
+                    continue;
+                }
+                self.dataset
+                    .commit_handler
+                    .forget_version(&self.dataset.base, *version, identity)
+                    .await?;
+            }
 
             if removes_empty_dirs
                 && let Err(error) = self
@@ -830,9 +1161,16 @@ impl<'a> CleanupTask<'a> {
                 );
             }
         } else {
-            // Drain the stream to populate stats, but do not call remove_stream.
-            all_paths_to_remove
-                .try_for_each(|_| future::ready(Ok(())))
+            // Nothing is deleted, so the stats describe what would be removed.
+            all_files_to_remove
+                .try_for_each(|file| {
+                    cleanup_result.lock().unwrap().record_file(
+                        &file,
+                        candidate_file_limit,
+                        self.track_removed_manifests,
+                    );
+                    future::ready(Ok(()))
+                })
                 .await?;
         }
 
@@ -884,6 +1222,39 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if relative_path.as_ref().starts_with("_fri") {
+            // Row maps are referenced by map id (`_fri/<map_id>/...`) from
+            // tagged FRI entries, resolved in `resolve_frag_reuse_map_ids`.
+            // The same lifecycle as `_indices/`: kept while some retained
+            // manifest references the map; deletable immediately when only
+            // expiring manifests reference it; an unreferenced map (a failed
+            // commit's orphan, or one released by an already-expired history)
+            // ages past the unverified-retention threshold first, which also
+            // protects a just-written map whose commit has not landed yet.
+            if let Some(map_id) = relative_path.parts().nth(1) {
+                if inspection
+                    .referenced_files
+                    .frag_reuse_map_ids
+                    .contains(map_id.as_ref())
+                {
+                    return Ok(None);
+                } else if !maybe_in_progress {
+                    return Ok(cleanup_file(path, CleanupFileKind::Index, true, size_bytes));
+                } else if inspection
+                    .verified_files
+                    .frag_reuse_map_ids
+                    .contains(map_id.as_ref())
+                {
+                    return Ok(cleanup_file(
+                        path,
+                        CleanupFileKind::Index,
+                        false,
+                        size_bytes,
+                    ));
+                }
+            }
+            return Ok(None);
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID
@@ -939,6 +1310,33 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             Some("blob") => {
+                if inspection
+                    .referenced_files
+                    .managed_blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
+                if relative_path
+                    .parts()
+                    .next()
+                    .is_some_and(|part| part.as_ref() == "_blobs")
+                {
+                    let verified = inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path);
+                    return if verified || !maybe_in_progress {
+                        Ok(cleanup_file(
+                            path,
+                            CleanupFileKind::Data,
+                            !verified,
+                            size_bytes,
+                        ))
+                    } else {
+                        Ok(None)
+                    };
+                }
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //
@@ -999,6 +1397,10 @@ impl<'a> CleanupTask<'a> {
                     .verified_files
                     .data_paths
                     .contains(&parent_data_path)
+                    || inspection
+                        .verified_files
+                        .managed_blob_paths
+                        .contains(&relative_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
@@ -1088,26 +1490,38 @@ impl<'a> CleanupTask<'a> {
                 let referenced_branches = &referenced_branches;
 
                 async move {
-                    let manifest_location = dataset
-                        .commit_handler
-                        .resolve_version_location(
-                            &dataset.base,
-                            *referenced_version,
-                            &dataset.object_store.inner,
+                    let manifest = async {
+                        let manifest_location = dataset
+                            .commit_handler
+                            .resolve_version_location(
+                                &dataset.base,
+                                *referenced_version,
+                                &dataset.object_store.inner,
+                            )
+                            .await?;
+
+                        read_manifest(
+                            &dataset.object_store,
+                            &manifest_location.path,
+                            manifest_location.size,
                         )
-                        .await?;
-
-                    let manifest = read_manifest(
-                        &dataset.object_store,
-                        &manifest_location.path,
-                        manifest_location.size,
-                    )
+                        .await
+                    }
                     .await;
-
-                    if let Ok(manifest) = manifest
-                        && policy.should_clean(&manifest)
-                    {
-                        referenced_branches.insert(branch_name.clone());
+                    match manifest {
+                        Ok(manifest) => {
+                            ensure_can_read_manifest(&manifest)?;
+                            ensure_can_write_manifest(&manifest)?;
+                            if policy.should_clean(&manifest) {
+                                referenced_branches.insert(branch_name.clone());
+                            }
+                        }
+                        Err(error) if error.is_not_found() => {
+                            // The source may be gone while descendants still use its files.
+                            // Scan their manifests before deleting any parent data.
+                            referenced_branches.insert(branch_name.clone());
+                        }
+                        Err(error) => return Err(error),
                     }
                     Ok::<(), Error>(())
                 }
@@ -1156,14 +1570,18 @@ impl<'a> CleanupTask<'a> {
                             .await?;
                         let ignored_manifests =
                             final_result.lock().unwrap().removed_manifests.clone();
-                        if let Some(result) = cleanup_cascade_branch_run(
-                            &branch_dataset,
-                            branch_dataset.manifest.as_ref(),
-                            action,
-                            ignored_manifests,
-                        )
-                        .await?
+                        if let Some(policy) =
+                            build_cleanup_policy(&branch_dataset, branch_dataset.manifest.as_ref())
+                                .await?
                         {
+                            let result = cleanup_cascade_branch_run(
+                                &branch_dataset,
+                                policy,
+                                action,
+                                ignored_manifests,
+                                self.delete_limiter.clone(),
+                            )
+                            .await?;
                             final_result
                                 .lock()
                                 .unwrap()
@@ -1200,6 +1618,7 @@ impl<'a> CleanupTask<'a> {
                 })
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
+                        &branch_location.path,
                         location,
                         *root_version_number,
                         &inspection,
@@ -1210,18 +1629,158 @@ impl<'a> CleanupTask<'a> {
         Ok(inspection.into_inner().unwrap())
     }
 
+    /// The `_fri/<map_id>/` row maps a branch manifest's tagged FRI entry
+    /// resolves into THIS dataset's base: stable-partition mappings whose
+    /// `base_id` names the parent (a branch clone's relocated entry keeps
+    /// reading the parent's row maps in place). The entry's own details are
+    /// read base-aware, exactly as a reader on the branch would.
+    async fn branch_frag_reuse_parent_map_ids(
+        &self,
+        branch_root: &Path,
+        manifest: &Manifest,
+        entry: &IndexMetadata,
+    ) -> Result<Vec<String>> {
+        use lance_table::system_index::frag_reuse::ledger::Mapping;
+
+        let details = entry
+            .index_details
+            .as_ref()
+            .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
+            .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
+        let content =
+            crate::index::frag_reuse::extract_raw_frag_reuse_content(details, |file| async move {
+                let end = file
+                    .offset
+                    .checked_add(file.size)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named("FRI details", "external FRI range overflow")
+                    })?;
+                let (store, indices_dir) = match entry.base_id {
+                    None => (None, branch_root.clone().join(crate::dataset::INDICES_DIR)),
+                    Some(id) => {
+                        let base_path = manifest.base_paths.get(&id).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "base_path id {} not found for index {}",
+                                id, entry.uuid
+                            ))
+                        })?;
+                        let path = base_path.extract_path(self.dataset.session.store_registry())?;
+                        let dir = if base_path.is_dataset_root {
+                            path.join(crate::dataset::INDICES_DIR)
+                        } else {
+                            path
+                        };
+                        let store = if base_path.path == self.dataset.uri {
+                            None
+                        } else {
+                            // Foreign bases are opened with default store
+                            // params; per-base credentials are not plumbed
+                            // through cleanup (see
+                            // <https://github.com/lance-format/lance/issues/6093>).
+                            Some(
+                                lance_io::object_store::ObjectStore::from_uri_and_params(
+                                    self.dataset.session.store_registry(),
+                                    &base_path.path,
+                                    &Default::default(),
+                                )
+                                .await?
+                                .0,
+                            )
+                        };
+                        (store, dir)
+                    }
+                };
+                let path = indices_dir
+                    .join(entry.uuid.to_string())
+                    .join(file.path.as_str());
+                let store = store.as_deref().unwrap_or(&self.dataset.object_store);
+                store
+                    .open(&path)
+                    .await?
+                    .get_range(file.offset as usize..end)
+                    .await
+                    .map_err(Error::from)
+            })
+            .await?;
+        let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
+            entry.index_version,
+            &content,
+        )
+        .await?;
+        if ledger.has_unsupported_transitions() {
+            return Err(Error::not_supported(
+                "the branch's tagged FRI history carries transitions this client cannot interpret",
+            ));
+        }
+        Ok(ledger
+            .transitions()
+            .iter()
+            .filter_map(|transition| match transition.mapping() {
+                Mapping::StablePartition(partition) => partition
+                    .base_id
+                    .and_then(|id| manifest.base_paths.get(&id))
+                    .filter(|base_path| base_path.path == self.dataset.uri)
+                    .map(|_| partition.map_id.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
     async fn process_branch_referenced_manifests(
         &self,
+        branch_root: &Path,
         location: ManifestLocation,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        ensure_can_read_manifest(&manifest)?;
+        ensure_can_write_manifest(&manifest)?;
+        let managed_referenced = if manifest.has_managed_blobs() {
+            let snapshot = self
+                .dataset
+                .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                .await?;
+            self.inspect_managed_blobs(&snapshot, true, inspection)
+                .await?
+        } else {
+            false
+        };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+
+        // Resolve tagged FRI references into the parent before taking the
+        // lock (content reads are async). A history this client cannot
+        // interpret disables `_fri/` GC for the whole run: it may reference
+        // parent row maps invisibly.
+        let mut branch_parent_map_ids: Vec<String> = Vec::new();
+        let mut fri_unresolvable = false;
+        for index in indexes.iter() {
+            if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+                && index.index_version != 0
+            {
+                match self
+                    .branch_frag_reuse_parent_map_ids(branch_root, &manifest, index)
+                    .await
+                {
+                    Ok(map_ids) => branch_parent_map_ids.extend(map_ids),
+                    Err(error) => {
+                        warn!(
+                            entry_uuid = %index.uuid,
+                            error = %error,
+                            "Cannot resolve the row-map references of a branch's fragment \
+                             reuse index entry; skipping _fri garbage collection for this run"
+                        );
+                        fri_unresolvable = true;
+                    }
+                }
+            }
+        }
+
         let mut inspection = inspection.lock().unwrap();
-        let mut is_referenced = false;
+        let mut is_referenced = managed_referenced;
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {
@@ -1284,33 +1843,92 @@ impl<'a> CleanupTask<'a> {
                 }
             }
         }
+        if fri_unresolvable {
+            inspection.skip_frag_reuse_gc = true;
+        }
+        // The branch's relocated FRI entry keeps translating through row
+        // maps that live in the parent's `_fri/`; those maps are part of the
+        // working set for as long as the branch's history references them.
+        for map_id in branch_parent_map_ids {
+            inspection.verified_files.frag_reuse_map_ids.remove(&map_id);
+            inspection
+                .referenced_files
+                .frag_reuse_map_ids
+                .insert(map_id);
+            is_referenced = true;
+        }
         if is_referenced {
             inspection
                 .old_manifests
-                .retain(|_path, version_number| *version_number != referenced_version);
+                .retain(|_path, expired| expired.version != referenced_version);
+            // Kept on disk, so its record stays too.
+            inspection.retired_records.remove(&referenced_version);
+            // The rescued parent manifest's own FRI entries join the working
+            // set with it: their row maps become referenced, not merely
+            // verified, when `resolve_frag_reuse_map_ids` decodes them.
+            if let Some(uuids) = inspection
+                .frag_reuse_entry_versions
+                .get(&referenced_version)
+            {
+                for uuid in uuids.clone() {
+                    if let Some(entry) = inspection.frag_reuse_entries.get_mut(&uuid) {
+                        entry.1 = true;
+                    }
+                }
+            }
         }
 
         Ok(())
     }
 }
 
-fn calculate_duration(scheme: String, rate: u64) -> Duration {
-    let batch_size = if scheme.to_lowercase().contains("s3") {
-        S3_DELETE_STREAM_BATCH_SIZE
-    } else if scheme.to_lowercase().contains("az") {
-        AZURE_DELETE_STREAM_BATCH_SIZE
-    } else {
-        1
-    };
+/// Size of an expired manifest, for `bytes_removed`.
+///
+/// `known` is what the listing reported. The HEAD fallback only runs when the listing did
+/// not say, because issuing it unconditionally costs a request per expired manifest.
+///
+/// A manifest that has already vanished counts as zero rather than failing. Cleanup lists
+/// first and acts after, so a concurrent cleanup can remove one in between — and that is
+/// the outcome this sweep wanted. Propagating `NotFound` here would abandon an entire
+/// sweep over a single file that is already in the desired state.
+async fn expired_manifest_size(
+    object_store: &ObjectStore,
+    path: &Path,
+    known: Option<u64>,
+) -> Result<u64> {
+    match known {
+        Some(size_bytes) => Ok(size_bytes),
+        None => match object_store.size(path).await {
+            Ok(size_bytes) => Ok(size_bytes),
+            Err(error) if error.is_not_found() => Ok(0),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn create_delete_limiter(
+    rate: Option<u64>,
+) -> Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>> {
+    rate.map(|rate| {
+        let mut ticker = interval(calculate_duration(rate));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Arc::new(tokio::sync::Mutex::new(ticker))
+    })
+}
+
+/// The interval between delete permits for a `delete_rate_limit` of `rate` requests/s.
+///
+/// One permit issues exactly one `delete`, so the interval is the reciprocal of the
+/// rate. Scaling it by a bulk-delete batch size would only be correct if a permit
+/// covered a whole batch; nothing coalesces paths into a single request, so doing so
+/// lets the limiter issue `batch_size` times the configured rate.
+fn calculate_duration(rate: u64) -> Duration {
     let effective_rate = rate.max(1);
-    let path_rate = effective_rate * batch_size;
     info!(
         "delete_rate_limit enabled: limit {} delete requests/sec",
         effective_rate
     );
-    // convert user given op/s to the rate of issuing paths
-    let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
-    Duration::from_nanos(duration_ns)
+    Duration::from_nanos(1_000_000_000u64.div_ceil(effective_rate).max(1))
 }
 
 #[derive(Clone, Debug)]
@@ -1319,6 +1937,8 @@ pub struct CleanupPolicy {
     pub before_timestamp: Option<DateTime<Utc>>,
     /// If not none, cleanup all versions before the specified version.
     pub before_version: Option<u64>,
+    /// If not none, cleanup only the specified versions.
+    pub versions: Option<HashSet<u64>>,
     /// If true, delete unverified data files even if they are recent
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
@@ -1327,9 +1947,12 @@ pub struct CleanupPolicy {
     pub clean_referenced_branches: bool,
     /// Maximum number of delete requests per second. If None, no rate limiting is applied.
     ///
-    /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
-    /// On stores with bulk delete, each request can include multiple paths.
-    /// For example, `Some(100)` limits deletions to 100 delete requests per second.
+    /// Use this to avoid hitting S3 (or other object store) request rate limits during
+    /// cleanup. Cleanup deletes one path per request, so this is also the number of
+    /// paths removed per second. For example, `Some(100)` limits deletions to 100
+    /// delete requests per second.
+    /// The budget is shared by this cleanup and all cascaded branches, ignoring
+    /// their own rate settings. `None` leaves the entire operation unthrottled.
     pub delete_rate_limit: Option<u64>,
 }
 
@@ -1342,6 +1965,9 @@ impl CleanupPolicy {
         if let Some(before_version) = self.before_version {
             should_clean &= manifest.version < before_version;
         }
+        if let Some(versions) = self.versions.as_ref() {
+            should_clean &= versions.contains(&manifest.version);
+        }
         should_clean
     }
 }
@@ -1351,6 +1977,7 @@ impl Default for CleanupPolicy {
         Self {
             before_timestamp: None,
             before_version: None,
+            versions: None,
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
@@ -1377,6 +2004,24 @@ impl CleanupPolicyBuilder {
         self
     }
 
+    /// Cleanup only the specified dataset versions.
+    ///
+    /// This is an exact-version filter. If other policy filters are also
+    /// configured, a manifest is removed only when it satisfies all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `versions` is empty.
+    pub fn versions(mut self, versions: Vec<u64>) -> Result<Self> {
+        if versions.is_empty() {
+            return Err(Error::invalid_input(
+                "versions must not be empty when specified",
+            ));
+        }
+        self.policy.versions = Some(versions.into_iter().collect());
+        Ok(self)
+    }
+
     /// Cleanup all versions except the last `n` versions of the dataset.
     ///
     /// # Errors
@@ -1388,7 +2033,7 @@ impl CleanupPolicyBuilder {
                 "retain_versions must be greater than 0, got {n}"
             )));
         }
-        let versions = dataset.versions().await?;
+        let versions = dataset.version_refs().await?;
         self.policy.before_version = if versions.len() <= n {
             Some(versions[0].version)
         } else {
@@ -1421,7 +2066,7 @@ impl CleanupPolicyBuilder {
     ///
     /// By default (None), deletions run at full speed. Set this to a positive value to
     /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
-    /// On backends with bulk delete APIs, effective path throughput scales with batch size.
+    /// The request budget is shared with all cascaded branches, overriding their rate settings.
     ///
     /// # Errors
     ///
@@ -1482,38 +2127,44 @@ pub async fn cleanup_cascade_branch(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    Ok(
-        cleanup_cascade_branch_run(dataset, manifest, CleanupAction::Execute, HashSet::new())
-            .await?
-            .map(|result| result.stats),
+    let Some(policy) = build_cleanup_policy(dataset, manifest).await? else {
+        return Ok(None);
+    };
+    let delete_limiter = create_delete_limiter(policy.delete_rate_limit);
+    let result = cleanup_cascade_branch_run(
+        dataset,
+        policy,
+        CleanupAction::Execute,
+        HashSet::new(),
+        delete_limiter,
     )
+    .await?;
+    Ok(Some(result.stats))
 }
 
 async fn cleanup_cascade_branch_run(
     dataset: &Dataset,
-    manifest: &Manifest,
+    mut policy: CleanupPolicy,
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
-) -> Result<Option<CleanupRunResult>> {
-    let policy = build_cleanup_policy(dataset, manifest).await?;
-    if let Some(mut policy) = policy {
-        policy.clean_referenced_branches = false;
-        policy.error_if_tagged_old_versions = false;
-        if action.deletes_files() {
-            info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
-        }
-        let cleanup = CleanupTask::new_with_ignored_manifests(
-            dataset,
-            policy,
-            action,
-            ignored_manifests,
-            true,
-            false,
-        );
-        Ok(Some(cleanup.run().await?))
-    } else {
-        Ok(None)
+    delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
+) -> Result<CleanupRunResult> {
+    policy.clean_referenced_branches = false;
+    policy.error_if_tagged_old_versions = false;
+    if action.deletes_files() {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&dataset.uri);
     }
+    CleanupTask::new_with_ignored_manifests(
+        dataset,
+        policy,
+        action,
+        ignored_manifests,
+        true,
+        false,
+        delete_limiter,
+    )
+    .run()
+    .await
 }
 
 pub async fn build_cleanup_policy(
@@ -1585,6 +2236,7 @@ pub async fn build_cleanup_policy(
         // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
     }
+
     if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
         let rate: u64 = match delete_rate_limit.parse() {
             Ok(r) => r,
@@ -1634,7 +2286,10 @@ fn tagged_old_versions_cleanup_error(
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -1662,6 +2317,7 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use object_store::ObjectStoreExt;
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -1678,6 +2334,15 @@ mod tests {
             original: Arc<dyn object_store::ObjectStore>,
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+        }
+
+        // Injects behaviour into every request, so a listing must not go around it.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
         }
     }
 
@@ -2104,6 +2769,328 @@ mod tests {
         ))
     }
 
+    // Tiny dedicated objects make individual row retention observable without
+    // large payloads or partially live packed objects masking a missing reference.
+    fn managed_blob_batch() -> RecordBatch {
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"first").unwrap();
+        blobs.push_bytes(b"second").unwrap();
+        let field = blob_field("blob", false).with_metadata(HashMap::from([
+            ("ARROW:extension:name".into(), "lance.blob.v2".into()),
+            (
+                "lance-encoding:blob-inline-size-threshold".into(),
+                "0".into(),
+            ),
+            (
+                "lance-encoding:blob-dedicated-size-threshold".into(),
+                "1".into(),
+            ),
+        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            field,
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::unprotected(None)]
+    #[case::tag(Some("tag"))]
+    #[case::branch(Some("branch"))]
+    #[tokio::test]
+    async fn managed_cleanup_preserves_protected_rows(#[case] protection: Option<&str>) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("before", "delete")]).await.unwrap();
+        let protected_version = dataset.version_id();
+        let protected = match protection {
+            Some("tag") => {
+                dataset
+                    .tags()
+                    .create("keep", protected_version)
+                    .await
+                    .unwrap();
+                Some(dataset.clone())
+            }
+            Some("branch") => Some(
+                fixture
+                    .create_branch_and_load(&mut dataset, "keep", protected_version)
+                    .await
+                    .unwrap(),
+            ),
+            _ => None,
+        };
+        dataset.delete("id = 0").await.unwrap();
+        dataset.update_config([("after", "delete")]).await.unwrap();
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.count_blob_files().await.unwrap(),
+            if protected.is_some() { 2 } else { 1 }
+        );
+        let values = Arc::new(dataset)
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"second"
+        );
+        if let Some(protected) = protected {
+            let values = Arc::new(protected)
+                .take_blobs_by_indices(&[0], "blob")
+                .await
+                .unwrap();
+            assert_eq!(
+                values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+                b"first"
+            );
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn managed_cleanup_distinguishes_column_projections(
+        #[values(false, true)] keep_old: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            batch.schema().field(0).clone(),
+            batch.schema().field(1).clone(),
+            batch.schema().field(1).clone().with_name("other"),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                batch.column(0).clone(),
+                batch.column(1).clone(),
+                batch.column(1).clone(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("before", "drop")]).await.unwrap();
+        let old = dataset.clone();
+        if keep_old {
+            dataset
+                .tags()
+                .create("keep", dataset.version_id())
+                .await
+                .unwrap();
+        }
+        dataset.drop_columns(&["other"]).await.unwrap();
+        dataset.update_config([("after", "drop")]).await.unwrap();
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 4);
+        if keep_old {
+            // Both views are retained and share the physical file. Scanning the
+            // narrower view first must not hide the old view's second column.
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let inspection = Mutex::new(CleanupInspection::default());
+            task.inspect_managed_blobs(&dataset, true, &inspection)
+                .await
+                .unwrap();
+            task.inspect_managed_blobs(&old, true, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(
+                inspection
+                    .lock()
+                    .unwrap()
+                    .referenced_files
+                    .managed_blob_paths
+                    .len(),
+                4
+            );
+        }
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                error_if_tagged_old_versions: false,
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.count_blob_files().await.unwrap(),
+            if keep_old { 4 } else { 2 }
+        );
+        let values = Arc::new(dataset)
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        for (value, expected) in values
+            .iter()
+            .zip([b"first".as_slice(), b"second".as_slice()])
+        {
+            assert_eq!(
+                value.as_ref().unwrap().read().await.unwrap().as_ref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_cleanup_deduplicates_reads_and_retries_failures() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("version", "2")]).await.unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_count = reads.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_descriptors",
+            Arc::new(move |op, path| {
+                if op.starts_with("get") && path.extension() == Some("lance") {
+                    read_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+        // Warm the session's file metadata cache, then measure one descriptor scan.
+        for _ in 0..2 {
+            reads.store(0, std::sync::atomic::Ordering::SeqCst);
+            task.inspect_managed_blobs(&dataset, false, &Mutex::new(CleanupInspection::default()))
+                .await
+                .unwrap();
+        }
+        let single_scan_reads = reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(single_scan_reads > 0);
+        let inspection = Mutex::new(CleanupInspection::default());
+        for retained in [false, true] {
+            let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+            let scans = (0..8).map(|_| task.inspect_managed_blobs(&dataset, retained, &inspection));
+            for result in futures::future::join_all(scans).await {
+                assert!(result.unwrap());
+            }
+            let after = reads.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(after - before, single_scan_reads);
+            task.inspect_managed_blobs(&dataset, retained, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), after);
+        }
+        assert_eq!(inspection.lock().unwrap().managed_scans.len(), 2);
+        assert_eq!(
+            inspection
+                .lock()
+                .unwrap()
+                .referenced_files
+                .managed_blob_paths
+                .len(),
+            2
+        );
+
+        let file = dataset
+            .data_dir()
+            .join(dataset.manifest.fragments[0].files[0].path.as_str());
+        let saved = dataset
+            .object_store
+            .inner
+            .get(&file)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        dataset.object_store.inner.delete(&file).await.unwrap();
+        let before = fixture.count_files().await.unwrap();
+        let result = dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await;
+        assert!(result.unwrap_err().is_not_found());
+        assert_eq!(fixture.count_files().await.unwrap(), before);
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
+
+        // A missing expired descriptor must not publish successful completion.
+        let inspection = Mutex::new(CleanupInspection::default());
+        assert!(
+            !task
+                .inspect_managed_blobs(&dataset, false, &inspection)
+                .await
+                .unwrap()
+        );
+        assert!(
+            inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .values()
+                .all(|cell| cell.get().is_none())
+        );
+        dataset
+            .object_store
+            .inner
+            .put(&file, saved.into())
+            .await
+            .unwrap();
+        assert!(
+            task.inspect_managed_blobs(&dataset, false, &inspection)
+                .await
+                .unwrap()
+        );
+        dataset
+            .cleanup(CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
+    }
+
     #[tokio::test]
     async fn cleanup_unreferenced_data_files() {
         // We should clean up data files that are only referenced
@@ -2224,6 +3211,36 @@ mod tests {
             explanation.stats.data_files_removed
         );
         assert_eq!(removed.bytes_removed, explanation.stats.bytes_removed);
+    }
+
+    #[tokio::test]
+    async fn every_removed_file_kind_contributes_its_bytes() {
+        // Each kind must contribute its size to `bytes_removed`, not merely increment its
+        // per-kind counter. Index files dominate some tables, so an undercount there makes
+        // cleanup look far less effective than it is; deletion and transaction files are
+        // individually small but numerous.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.create_some_index().await.unwrap();
+        // Produces a deletion file that the overwrite below then orphans. The only data
+        // column here is a vector, so delete on the row id instead.
+        fixture.delete_data("_rowid < 20").await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        // Overwrite drops the index and the old fragments, leaving all of it unreferenced.
+        fixture.overwrite_some_data().await.unwrap();
+
+        let before = fixture.count_files().await.unwrap();
+        let removed = fixture.run_cleanup(utc_now()).await.unwrap();
+        let after = fixture.count_files().await.unwrap();
+
+        assert_gt!(removed.index_files_removed, 0);
+        assert_gt!(removed.deletion_files_removed, 0);
+        assert_gt!(removed.transaction_files_removed, 0);
+        assert_gt!(removed.data_files_removed, 0);
+        assert_gt!(removed.old_versions, 0);
+        // The whole point: reported bytes match the storage delta exactly with every kind
+        // in the mix, so no kind is silently contributing zero.
+        assert_eq!(removed.bytes_removed, before.num_bytes - after.num_bytes);
     }
 
     #[tokio::test]
@@ -2349,8 +3366,11 @@ mod tests {
         assert_eq!(after_count.num_tx_files, 2);
     }
 
+    #[rstest]
+    #[case::version_number(false)]
+    #[case::raw_main_alias(true)]
     #[tokio::test]
-    async fn cleanup_error_when_tagged_old_versions() {
+    async fn cleanup_error_when_tagged_old_versions(#[case] use_main_alias: bool) {
         // We should not clean up old versions that are tagged.
         // This tests when `error_if_tagged_old_version=true`.
         // When `true`, no files should be cleaned and a `Error::CleanupError`
@@ -2362,8 +3382,31 @@ mod tests {
 
         let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags().create("old-tag", 1).await.unwrap();
-        dataset.tags().create("another-old-tag", 2).await.unwrap();
+        let reference = |version| {
+            if use_main_alias {
+                crate::dataset::refs::Ref::Version(Some("main".to_string()), Some(version))
+            } else {
+                crate::dataset::refs::Ref::VersionNumber(version)
+            }
+        };
+        dataset
+            .tags()
+            .create("old-tag", reference(1))
+            .await
+            .unwrap();
+        dataset
+            .tags()
+            .create("another-old-tag", reference(3))
+            .await
+            .unwrap();
+        dataset
+            .tags()
+            .update("another-old-tag", reference(2))
+            .await
+            .unwrap();
+        for tag in dataset.tags().list().await.unwrap().values() {
+            assert_eq!(tag.branch, None);
+        }
 
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
@@ -2673,6 +3716,13 @@ mod tests {
             fixture.create_some_data().await.unwrap();
             fixture.block_commits();
             assert!(fixture.append_some_data().await.is_err());
+            let dataset = fixture.open().await.unwrap();
+            let blob_path = dataset.base.clone().join("_blobs").join("orphan.blob");
+            dataset
+                .object_store
+                .put(&blob_path, b"orphan")
+                .await
+                .unwrap();
 
             let age = if old_files {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS + 1).unwrap()
@@ -2698,6 +3748,11 @@ mod tests {
             let should_delete = override_opt.unwrap_or(false) || old_files;
 
             let after_count = fixture.count_files().await.unwrap();
+            assert_eq!(
+                dataset.object_store.exists(&blob_path).await.unwrap(),
+                !should_delete,
+                "override={override_opt:?}, old_files={old_files}"
+            );
             assert_eq!(removed.old_versions, 0);
             assert_eq!(
                 removed.bytes_removed,
@@ -2710,6 +3765,80 @@ mod tests {
                 assert_eq!(removed.bytes_removed, 0);
             }
         }
+    }
+
+    #[rstest]
+    #[case::head_error(Some(0))]
+    #[case::read_error(Some(1))]
+    #[case::missing_source(None)]
+    #[tokio::test]
+    async fn cleanup_preserves_child_after_source_manifest_failure(
+        #[case] fail_request: Option<usize>,
+    ) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut parent = fixture.open().await.unwrap();
+        let source_manifest = parent.manifest_location.path.clone();
+        let child = fixture
+            .create_branch_and_load(&mut parent, "child", (None, None))
+            .await
+            .unwrap();
+        let expected = child.scan().try_into_batch().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        fixture.overwrite_some_data().await.unwrap();
+
+        let source_reads = Arc::new(AtomicUsize::new(0));
+        if let Some(fail_request) = fail_request {
+            let source_reads = source_reads.clone();
+            fixture.mock_store.policy.lock().unwrap().set_before_policy(
+                "fail_branch_source",
+                Arc::new(move |operation, path| {
+                    // get_opts serves both HEAD (first) and the subsequent range read.
+                    if operation == "get_opts"
+                        && path == &source_manifest
+                        && source_reads.fetch_add(1, Ordering::SeqCst) == fail_request
+                    {
+                        return Err(Error::internal("transient branch source read"));
+                    }
+                    Ok(())
+                }),
+            );
+        } else {
+            parent
+                .object_store
+                .inner
+                .delete(&source_manifest)
+                .await
+                .unwrap();
+        }
+        let before = fixture.count_files().await.unwrap();
+        let policy = CleanupPolicy {
+            before_version: Some(2),
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        };
+        let result = fixture.run_cleanup_with_policy(policy.clone()).await;
+        if let Some(fail_request) = fail_request {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            assert_contains!(error.to_string(), "transient branch source read");
+            assert_eq!(source_reads.load(Ordering::SeqCst), fail_request + 1);
+            let after = fixture.count_files().await.unwrap();
+            assert_eq!(after.num_data_files, before.num_data_files);
+            assert_eq!(after.num_manifest_files, before.num_manifest_files);
+            fixture
+                .mock_store
+                .policy
+                .lock()
+                .unwrap()
+                .clear_before_policy("fail_branch_source");
+            let retried = fixture.run_cleanup_with_policy(policy).await.unwrap();
+            assert_eq!(retried.data_files_removed, 0);
+        } else {
+            assert_eq!(result.unwrap().data_files_removed, 0);
+        }
+        assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
     }
 
     #[tokio::test]
@@ -2880,6 +4009,7 @@ mod tests {
             .await
             .unwrap();
 
+        let root_version = dataset.manifest.version;
         let branch = fixture
             .create_branch_and_load(&mut dataset, "child", (None, None))
             .await
@@ -2901,6 +4031,41 @@ mod tests {
             CleanupAction::Execute,
         );
         let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        // Queue the branch root for removal on both sides; rescuing the
+        // manifest must rescue its store record with it.
+        let inspection = Mutex::new(inspection);
+        {
+            let mut queued = inspection.lock().unwrap();
+            queued.old_manifests.insert(
+                Path::from("_versions/root.manifest"),
+                ExpiredManifest {
+                    version: root_version,
+                    size_bytes: None,
+                },
+            );
+            queued
+                .retired_records
+                .insert(root_version, "root-identity".to_string());
+        }
+        task.process_branch_referenced_manifests(
+            &branch.base,
+            branch.manifest_location.clone(),
+            root_version,
+            &inspection,
+        )
+        .await
+        .unwrap();
+        let inspection = inspection.into_inner().unwrap();
+        assert!(
+            !inspection
+                .old_manifests
+                .values()
+                .any(|expired| expired.version == root_version)
+        );
+        assert!(
+            !inspection.retired_records.contains_key(&root_version),
+            "a retained branch root must not be retired from authoritative history"
+        );
         let referenced_branches = task.find_referenced_branches().await.unwrap();
         let inspection = task
             .retain_branch_lineage_files(inspection, &referenced_branches, &HashSet::new())
@@ -3359,29 +4524,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::aged(false, 10)]
+    #[case::delete_unverified(true, 1)]
     #[tokio::test]
-    async fn cleanup_failed_commit_data_file() {
+    async fn cleanup_failed_commit_data_file(
+        #[case] delete_unverified: bool,
+        #[case] cleanup_day: i64,
+    ) {
         // We should clean up data files that are written but the commit failed
         // for whatever reason
 
+        MockClock::set_system_time(std::time::Duration::from_secs(0));
         let mut fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
+
+        // The failed write is newer than every manifest, so a retained-manifest
+        // listing cutoff must not hide it from the age and policy checks.
+        MockClock::set_system_time(TimeDelta::try_days(1).unwrap().to_std().unwrap());
         fixture.block_commits();
         assert!(fixture.append_some_data().await.is_err());
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
-        // This append will fail since the commit is blocked but it should have
-        // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 1);
         // Only 1 txn file: the failed commit's txn file was already cleaned up.
         assert_eq!(before_count.num_tx_files, 1);
 
-        // All of our manifests are newer than the threshold but temp files
-        // should still be deleted.
         let removed = fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(7).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
             .await
             .unwrap();
 
@@ -3445,18 +4621,20 @@ mod tests {
         assert_eq!(before_count.num_data_files, 2);
         assert_eq!(before_count.num_manifest_files, 2);
 
-        assert!(
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
-                .await
-                .is_err()
+        // A file that cannot be deleted is counted and skipped, not fatal: one
+        // transient failure must not discard a sweep over millions of objects.
+        let interrupted = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(interrupted.failed_deletes, 1);
+        assert_eq!(
+            interrupted.old_versions, 0,
+            "a manifest that failed to delete is not a removed version"
         );
 
-        // This test currently relies on us sending in manifest files after
-        // data files.  Also, the delete process is run in parallel.  However,
-        // it seems stable to stably delete the data file even though the manifest delete fails.
-        // My guess is that it is not possible to interrupt a task in flight and so it still
-        // has to finish the buffered tasks even if they are ignored.
+        // Every candidate is attempted, so the data file goes even though the
+        // manifest delete fails. This no longer depends on buffering order.
         let mid_count = fixture.count_files().await.unwrap();
         assert_eq!(mid_count.num_data_files, 1);
         assert_eq!(mid_count.num_manifest_files, 2);
@@ -3479,6 +4657,81 @@ mod tests {
         assert_eq!(after_count.num_manifest_files, 1);
     }
 
+    #[rstest]
+    #[case::missing(true, 0)]
+    #[case::permission_denied(false, 2)]
+    #[tokio::test]
+    async fn cleanup_handles_wrapped_delete_errors(
+        #[case] is_missing: bool,
+        #[case] expected_failed_deletes: u64,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 1.into())
+        };
+        fixture.create_with_data(data()).await.unwrap();
+        fixture.append_data(data()).await.unwrap();
+        fixture.overwrite_data(data()).await.unwrap();
+
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "concurrent_data_delete",
+            Arc::new(move |method, path| {
+                if method == "delete" && path.extension() == Some("lance") {
+                    if is_missing {
+                        // Simulate another cleanup removing the file after listing.
+                        std::fs::remove_file(lance_io::local::to_local_path(path))?;
+                        return Err(Error::not_found(path.to_string()));
+                    }
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "cleanup delete denied",
+                    )));
+                }
+                Ok(())
+            }),
+        );
+
+        let dataset = fixture.load().await.unwrap();
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let stats = dataset
+            .cleanup_with_policy(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, 2);
+        assert_eq!(stats.failed_deletes, expected_failed_deletes);
+        assert_eq!(stats.data_files_removed, if is_missing { 2 } else { 0 });
+        assert_eq!(
+            fixture.count_files().await.unwrap().num_data_files,
+            if is_missing { 1 } else { 3 }
+        );
+        assert_eq!(fixture.count_rows().await.unwrap(), 2);
+        let output = std::fs::read_to_string(logs.path()).unwrap();
+        assert_eq!(
+            output
+                .matches("failed to delete file; continuing and counting it")
+                .count(),
+            usize::from(!is_missing),
+            "missing files must be silent; other failures warn once per sweep: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_rejects_retain_zero_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
@@ -3497,6 +4750,26 @@ mod tests {
                 .contains("retain_versions must be greater than 0, got 0"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn retain_n_versions_does_not_read_manifests() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&dataset, 2)
+            .await
+            .unwrap()
+            .build();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+
+        assert_eq!(policy.before_version, Some(2));
+        assert_eq!(io_stats.read_bytes, 0);
     }
 
     #[tokio::test]
@@ -3544,6 +4817,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_specific_versions_only() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        let policy = CleanupPolicyBuilder::default()
+            .versions(vec![2])
+            .unwrap()
+            .build();
+        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+
+        let versions = fixture
+            .open()
+            .await
+            .unwrap()
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![1, 3]);
     }
 
     #[tokio::test]
@@ -4843,64 +6147,1322 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_index_files, 7);
     }
 
-    #[test]
-    fn test_calculate_duration_s3() {
-        // Normal case: duration is computed from S3 batch size and configured rate.
-        let normal_rate = 100;
-        let expected_duration_ns =
-            1_000_000_000u64.div_ceil(normal_rate * S3_DELETE_STREAM_BATCH_SIZE);
-        assert_eq!(
-            calculate_duration("s3".to_string(), normal_rate),
-            Duration::from_nanos(expected_duration_ns)
-        );
-
-        // Edge case: rate too small should be clamped to 1.
-        let min_rate_duration = calculate_duration("s3".to_string(), 1);
-        assert_eq!(calculate_duration("s3".to_string(), 0), min_rate_duration);
-
-        // Edge case: computed duration_ns too small should be clamped to at least 1ns.
-        let very_large_rate = 2_000_000;
-        assert_eq!(
-            calculate_duration("s3".to_string(), very_large_rate),
-            Duration::from_nanos(1)
-        );
-    }
-
+    #[rstest]
+    #[case::plain(false)]
+    #[case::wrapped(true)]
     #[tokio::test]
-    async fn test_cleanup_with_rate_limit() {
-        // Create multiple versions with data files that will be deleted.
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        // Create several old versions
-        for _ in 0..4 {
-            fixture.overwrite_some_data().await.unwrap();
+    async fn expired_manifest_size_tolerates_a_vanished_manifest(#[case] is_wrapped: bool) {
+        let wrapper = Arc::new(MockObjectStore::new());
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://",
+            &ObjectStoreParams {
+                object_store_wrapper: Some(wrapper.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let path = Path::from("_versions/1.manifest");
+        if is_wrapped {
+            wrapper.policy.lock().unwrap().set_before_policy(
+                "missing_manifest",
+                Arc::new(|_, path| Err(Error::not_found(path.to_string()))),
+            );
         }
 
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        // A size the listing already reported costs no request at all.
+        assert_eq!(
+            expired_manifest_size(&store, &path, Some(42))
+                .await
+                .unwrap(),
+            42
+        );
 
-        // Set rate limit to 1 ops/second so cleanup of several files must take at least ~1s
-        let policy = CleanupPolicyBuilder::default()
-            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
-            .delete_rate_limit(1)
+        // Unknown size and the object is gone: zero, not an error. A concurrent cleanup
+        // can remove a manifest between listing and here, and propagating NotFound would
+        // abandon the whole sweep over one file already in the state we wanted.
+        assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 0);
+
+        // A present object still reports its real size through the fallback.
+        wrapper
+            .policy
+            .lock()
+            .unwrap()
+            .clear_before_policy("missing_manifest");
+        store.put(&path, b"1234".as_slice()).await.unwrap();
+        assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 4);
+    }
+
+    #[test]
+    fn test_calculate_duration() {
+        // One permit is one delete request, so the interval is the reciprocal of the
+        // configured rate. Scaling by a bulk-delete batch size here would let the
+        // limiter issue batch_size times the rate the caller asked for: at 100
+        // requests/s an S3 multiplier of 1,000 would give 10us instead of 10ms.
+        assert_eq!(calculate_duration(100), Duration::from_millis(10));
+        assert_eq!(calculate_duration(1_000), Duration::from_millis(1));
+        assert_eq!(calculate_duration(1), Duration::from_secs(1));
+
+        // Edge case: rate too small is clamped to 1.
+        assert_eq!(calculate_duration(0), calculate_duration(1));
+
+        // Edge case: a rate finer than 1ns is clamped to 1ns.
+        assert_eq!(calculate_duration(2_000_000_000), Duration::from_nanos(1));
+    }
+
+    #[rstest]
+    #[case::single(Some(1), false, None, false)]
+    #[case::single_unlimited(None, false, None, false)]
+    #[case::cascade_missing(Some(1), true, None, false)]
+    #[case::cascade_different(Some(1), true, Some("100"), false)]
+    #[case::cascade_unlimited(None, true, Some("1"), false)]
+    #[case::cascade_invalid(Some(1), true, Some("invalid"), false)]
+    #[case::cascade_zero(Some(1), true, Some("0"), false)]
+    #[case::cascade_unlimited_invalid(None, true, Some("invalid"), false)]
+    #[case::standalone(Some(1), false, None, true)]
+    #[case::standalone_unlimited(None, false, None, true)]
+    #[tokio::test(start_paused = true)]
+    async fn test_cleanup_with_rate_limit(
+        #[case] rate: Option<u64>,
+        #[case] clean_referenced_branches: bool,
+        #[case] child_rate: Option<&str>,
+        #[case] standalone: bool,
+    ) {
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 1.into())
+        };
+        let mock_store = Arc::new(MockObjectStore::new());
+        let mut parent = Dataset::write(
+            data(),
+            "memory://cleanup",
+            Some(WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(mock_store.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut branch_bases = Vec::new();
+        // Cover sequential siblings and independently scheduled branch chains.
+        let branches: &[&str] = if clean_referenced_branches {
+            &["first", "sibling", "second"]
+        } else {
+            &[]
+        };
+        for &name in branches {
+            let mut child = parent
+                .create_branch(name, (None, None), None)
+                .await
+                .unwrap();
+            let mut updates = vec![
+                ("lance.auto_cleanup.interval", "1"),
+                ("lance.auto_cleanup.retain_versions", "1"),
+            ];
+            if let Some(value) = child_rate {
+                updates.push(("lance.auto_cleanup.delete_rate_limit", value));
+            }
+            child.update_config(updates).await.unwrap();
+            for _ in 0..2 {
+                child
+                    .append(
+                        data(),
+                        Some(WriteParams {
+                            skip_auto_cleanup: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(child.get_fragments().len() > 1);
+            branch_bases.push(child.base.clone());
+            if name != "first" {
+                parent.append(data(), None).await.unwrap();
+            }
+        }
+        // These versions are not branch sources, so the parent also has deletions.
+        for _ in 0..2 {
+            parent.append(data(), None).await.unwrap();
+        }
+        let mut policy = CleanupPolicyBuilder::default()
+            .clean_referenced_branches(clean_referenced_branches)
+            .retain_n_versions(&parent, 1)
+            .await
             .unwrap()
             .build();
-
-        let start = std::time::Instant::now();
-        let db = fixture.open().await.unwrap();
-        let stats = cleanup_old_versions(&db, policy).await.unwrap();
-        let elapsed = start.elapsed();
-
-        // We deleted old versions, so there should be removed files
-        assert!(
-            stats.old_versions > 0,
-            "expected some old versions to be removed"
+        policy.delete_rate_limit = rate;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        mock_store.policy.lock().unwrap().set_before_policy(
+            "record_deletes",
+            Arc::new(move |operation, path| {
+                if operation == "delete" {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((path.clone(), tokio::time::Instant::now()));
+                }
+                Ok(())
+            }),
         );
-        // With rate=1 and multiple files, it must take at least 2s
-        // (even just 2 deletions at 1/s means ≥2s)
+        let operation = parent.cleanup(policy);
+        let start = tokio::time::Instant::now();
+        if matches!(child_rate, Some("invalid" | "0")) {
+            let error = operation.execute().await.unwrap_err();
+            assert!(matches!(error, Error::Cleanup { .. }));
+            assert_contains!(error.to_string(), "delete_rate_limit");
+            assert!(requests.lock().unwrap().is_empty());
+            return;
+        }
+        let explanation = operation.explain().await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(requests.lock().unwrap().is_empty());
+        let stats = if standalone {
+            let mut manifest = parent.manifest.as_ref().clone();
+            manifest
+                .config
+                .insert("lance.auto_cleanup.interval".into(), "1".into());
+            manifest
+                .config
+                .insert("lance.auto_cleanup.retain_versions".into(), "1".into());
+            if let Some(rate) = rate {
+                manifest.config.insert(
+                    "lance.auto_cleanup.delete_rate_limit".into(),
+                    rate.to_string(),
+                );
+            }
+            cleanup_cascade_branch(&parent, &manifest)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            operation.execute().await.unwrap()
+        };
+        assert_eq!(stats, explanation.stats);
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() > 2);
+        for base in branch_bases {
+            assert!(requests.iter().any(|(path, _)| path.prefix_matches(&base)));
+        }
         assert!(
-            elapsed.as_millis() >= 2000,
-            "expected cleanup to be rate-limited (elapsed: {:?})",
-            elapsed
+            requests
+                .iter()
+                .any(|(path, _)| path.prefix_matches(&parent.versions_dir()))
         );
+        if rate.is_some() {
+            for pair in requests.windows(2) {
+                assert!(pair[1].1.duration_since(pair[0].1) >= Duration::from_secs(1));
+            }
+        } else {
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    use lance_table::io::commit::external_manifest::ExternalManifestStore;
+    use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+
+    /// `(path, size, identity)` per version.
+    #[derive(Debug, Default)]
+    struct IdentifiedStore {
+        rows: Mutex<HashMap<u64, (String, u64, String)>>,
+        next_identity: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalManifestStore for IdentifiedStore {
+        async fn get(&self, _base_uri: &str, version: u64) -> Result<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .map(|row| row.0.clone())
+                .ok_or_else(|| Error::not_found(format!("@{version}")))
+        }
+
+        async fn get_manifest_location(
+            &self,
+            _base_uri: &str,
+            version: u64,
+        ) -> Result<ManifestLocation> {
+            let row = self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .cloned()
+                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            Ok(ManifestLocation {
+                version,
+                path: Path::parse(&row.0).unwrap(),
+                size: Some(row.1),
+                naming_scheme: ManifestNamingScheme::V2,
+                e_tag: None,
+                identity: Some(row.2),
+            })
+        }
+
+        async fn get_latest_version(&self, _base_uri: &str) -> Result<Option<(u64, String)>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .max_by_key(|(version, _)| **version)
+                .map(|(version, row)| (*version, row.0.clone())))
+        }
+
+        async fn get_latest_manifest_location(
+            &self,
+            base_uri: &str,
+        ) -> Result<Option<ManifestLocation>> {
+            match self.get_latest_version(base_uri).await? {
+                Some((version, _)) => self
+                    .get_manifest_location(base_uri, version)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        }
+
+        async fn put_if_not_exists(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let identity = format!(
+                "identity-{}",
+                self.next_identity
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            let mut rows = self.rows.lock().unwrap();
+            if rows.contains_key(&version) {
+                return Err(Error::commit_conflict_source(version, "exists".into()));
+            }
+            rows.insert(version, (path.to_string(), size, identity));
+            Ok(())
+        }
+
+        async fn put_if_exists(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            path: &str,
+            size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .get_mut(&version)
+                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            row.0 = path.to_string();
+            row.1 = size;
+            Ok(())
+        }
+
+        fn supports_predecessor_condition(&self) -> bool {
+            true
+        }
+
+        async fn get_identity(&self, _base_uri: &str, version: u64) -> Result<Option<String>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&version)
+                .map(|row| row.2.clone()))
+        }
+
+        async fn list_versions(
+            &self,
+            base_uri: &str,
+            since: Option<u64>,
+        ) -> Result<Option<Vec<ManifestLocation>>> {
+            let versions: Vec<u64> = self.rows.lock().unwrap().keys().copied().collect();
+            let mut locations = Vec::new();
+            for version in versions {
+                if since.is_none_or(|since| version > since) {
+                    locations.push(self.get_manifest_location(base_uri, version).await?);
+                }
+            }
+            Ok(Some(locations))
+        }
+
+        async fn forget_version(
+            &self,
+            _base_uri: &str,
+            version: u64,
+            identity: &str,
+        ) -> Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            if rows.get(&version).is_some_and(|row| row.2 == identity) {
+                rows.remove(&version);
+            }
+            Ok(())
+        }
+    }
+
+    /// Cleanup retires the store record of every manifest it removes, one
+    /// whose object was already gone included, so store-backed history
+    /// matches what is on disk.
+    #[tokio::test]
+    async fn test_cleanup_forgets_removed_versions_in_the_external_store() {
+        use crate::dataset::{InsertBuilder, WriteDestination};
+        use lance_table::io::commit::CommitHandler;
+        use lance_table::io::commit::external_manifest::{
+            ExternalManifestCommitHandler, ExternalManifestStore,
+        };
+
+        let store = Arc::new(IdentifiedStore::default());
+        let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: store.clone(),
+        });
+        let uri = TempStrDir::default();
+        let batch = || arrow_array::record_batch!(("i", Int32, [1, 2, 3])).unwrap();
+        let mut dataset = InsertBuilder::new(uri.as_str())
+            .with_params(&WriteParams {
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            })
+            .execute(vec![batch()])
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    commit_handler: Some(handler.clone()),
+                    ..Default::default()
+                })
+                .execute(vec![batch()])
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.count_versions().await.unwrap(), 3);
+
+        // Version 1's object is already gone, as after a cleanup that stopped
+        // before retiring records.
+        let v1 = Path::parse(store.get("", 1).await.unwrap()).unwrap();
+        dataset.object_store.delete(&v1).await.unwrap();
+
+        cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(chrono::Utc::now())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
+        remaining.sort();
+        assert_eq!(remaining, vec![3]);
+        assert_eq!(dataset.count_versions().await.unwrap(), 1);
+        assert_eq!(dataset.versions().await.unwrap().len(), 1);
+    }
+
+    /// A manifest whose delete fails keeps its store record. A record outliving its
+    /// manifest is retired by the next cleanup; a manifest outliving its record is a
+    /// version nothing can find again.
+    #[tokio::test]
+    async fn test_a_manifest_that_fails_to_delete_keeps_its_record() {
+        use crate::dataset::{InsertBuilder, WriteDestination};
+        use lance_table::io::commit::CommitHandler;
+        use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+
+        let store = Arc::new(IdentifiedStore::default());
+        let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: store.clone(),
+        });
+        let mock_store = Arc::new(MockObjectStore::new());
+        let os_params = ObjectStoreParams {
+            object_store_wrapper: Some(mock_store.clone()),
+            ..Default::default()
+        };
+        let uri = TempStrDir::default();
+        let batch = || arrow_array::record_batch!(("i", Int32, [1, 2, 3])).unwrap();
+        let params = |mode| WriteParams {
+            mode,
+            commit_handler: Some(handler.clone()),
+            store_params: Some(os_params.clone()),
+            ..Default::default()
+        };
+        let mut dataset = InsertBuilder::new(uri.as_str())
+            .with_params(&params(WriteMode::Create))
+            .execute(vec![batch()])
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+                .with_params(&params(WriteMode::Append))
+                .execute(vec![batch()])
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.count_versions().await.unwrap(), 3);
+
+        mock_store.policy.lock().unwrap().set_before_policy(
+            "block_delete_manifest",
+            Arc::new(|op: &str, path: &Path| -> Result<()> {
+                if op.contains("delete") && path.extension() == Some("manifest") {
+                    Err(Error::internal("Delete manifest blocked".to_string()))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+
+        let stats = cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(chrono::Utc::now())
+                .build(),
+        )
+        .await
+        .expect("a blocked manifest delete must not fail the sweep");
+
+        assert!(
+            stats.failed_deletes > 0,
+            "the blocked manifests are counted"
+        );
+        assert_eq!(
+            stats.old_versions, 0,
+            "a manifest still on disk is not a removed version"
+        );
+        // Every record survives, because every manifest survives.
+        let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
+        remaining.sort();
+        assert_eq!(remaining, vec![1, 2, 3]);
+    }
+
+    /// D-rows: `_fri/` row-map garbage collection.
+    mod frag_reuse_map_gc {
+        use super::*;
+        use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+        use crate::dataset::write::CommitBuilder;
+        use crate::index::frag_reuse_reader::tests as reader_tests;
+        use arrow_array::types::Int32Type;
+        use chrono::TimeDelta;
+        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_table::format::Fragment;
+        use lance_table::format::IndexMetadata;
+        use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::transaction::RewriteGroup;
+        use prost::Message;
+
+        impl MockDatasetFixture {
+            /// The `_fri/<map_id>/` directories currently on disk.
+            async fn list_fri_map_dirs(&self) -> Vec<String> {
+                let registry = Arc::new(ObjectStoreRegistry::default());
+                let (os, path) = ObjectStore::from_uri_and_params(
+                    registry,
+                    &self.dataset_path,
+                    &self.os_params(),
+                )
+                .await
+                .unwrap();
+                let mut ids = std::collections::HashSet::new();
+                let mut stream = os.read_dir_all(&path.clone().join("_fri"), None);
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(meta)) => {
+                            let relative = remove_prefix(&meta.location, &path);
+                            if let Some(map_id) = relative.parts().nth(1) {
+                                ids.insert(map_id.as_ref().to_string());
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(Error::NotFound { .. }) => break,
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                let mut ids: Vec<String> = ids.into_iter().collect();
+                ids.sort();
+                ids
+            }
+        }
+
+        async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::ReserveFragments { num_fragments },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// A persisted dataset (mock store, recorded mtimes) with one
+        /// committed stable-partition rewrite; returns the map id of its
+        /// row map.
+        async fn make_tagged(fixture: &MockDatasetFixture) -> (Dataset, String) {
+            let data = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_reader_rows(
+                    lance_datagen::RowCount::from(4),
+                    lance_datagen::BatchCount::from(2),
+                );
+            Dataset::write(
+                data,
+                &fixture.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(fixture.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut dataset = *fixture.open().await.unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            reserve_fragments(&mut dataset, 20).await;
+            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+            let (transition, destinations) = reader_tests::prepare(&dataset).await;
+            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &transition.mapping
+            else {
+                unreachable!()
+            };
+            let map_id = mapping.map_id.clone();
+            let read_version = dataset.manifest.version;
+            let frag_reuse_index = Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap(),
+            );
+            let dataset = CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments,
+                            new_fragments: destinations,
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index,
+                    },
+                    None,
+                ))
+                .await
+                .unwrap();
+            (dataset, map_id)
+        }
+
+        /// D1: a map referenced by a retained manifest survives cleanup, no
+        /// matter how old it is.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn referenced_map_is_kept() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (_, map_id) = make_tagged(&fixture).await;
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+        }
+
+        /// D2: a map referenced only by expiring manifests goes away in the
+        /// same pass that removes them (the trim released it from the entry
+        /// first).
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn map_released_by_trim_is_collected_with_its_manifests() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+
+            // Drain the index onto the destinations, then trim: the entry is
+            // deleted, so only old manifests reference the map.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Young files referenced by expiring manifests still wait for the
+            // unverified retention window unless verified; the reference from
+            // the removed manifest is that verification.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+        }
+
+        /// D3 + D4: an unreferenced map (a failed commit's orphan) is kept
+        /// while young and collected once it ages past the unverified
+        /// retention threshold.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn orphan_map_ages_out() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (dataset, committed_map_id) = make_tagged(&fixture).await;
+
+            // A row map written at day 10 whose commit never lands.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            let (orphan_transition, _) = reader_tests::prepare(&dataset).await;
+            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) =
+                &orphan_transition.mapping
+            else {
+                unreachable!()
+            };
+            let orphan_map_id = mapping.map_id.clone();
+            let mut expected = vec![committed_map_id.clone(), orphan_map_id.clone()];
+            expected.sort();
+            assert_eq!(fixture.list_fri_map_dirs().await, expected);
+
+            // D3: unreferenced but young, kept.
+            fixture
+                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, expected);
+
+            // D4: unreferenced and old, collected; the referenced map stays.
+            MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![committed_map_id]);
+        }
+
+        /// D5: reference resolution decodes external entry content too. The
+        /// integration tests above cover inline entries; this drives the
+        /// resolver directly over an entry whose details live in an external
+        /// file.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn reference_resolution_reads_external_entries() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (dataset, _) = make_tagged(&fixture).await;
+
+            let map_id = Uuid::new_v4().to_string();
+            let digest = |id: u64| pb_fri::FragmentDigest {
+                id,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            };
+            let content = {
+                let mut content = Vec::new();
+                let transition = pb_fri::Transition {
+                    sources: vec![digest(100)],
+                    destinations: vec![digest(101)],
+                    mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                        pb_fri::StablePartition {
+                            map_id: map_id.clone(),
+                            map_size_bytes: 1,
+                            base_id: None,
+                        },
+                    )),
+                };
+                content.extend(reader_tests::field(2, &transition.encode_to_vec()));
+                content
+            };
+            let uuid = Uuid::new_v4();
+            let details_path = dataset
+                .indices_dir()
+                .join(uuid.to_string())
+                .join("frag_reuse_details.binpb");
+            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(&content).await.unwrap();
+            writer.shutdown().await.unwrap();
+            let entry = IndexMetadata {
+                uuid,
+                fields: vec![],
+                covering_fields: vec![],
+                name: FRAG_REUSE_INDEX_NAME.into(),
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: None,
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                    value: reader_tests::field(
+                        2,
+                        &lance_table::format::pb::ExternalFile {
+                            path: "frag_reuse_details.binpb".into(),
+                            offset: 0,
+                            size: content.len() as u64,
+                        }
+                        .encode_to_vec(),
+                    ),
+                })),
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+                files: None,
+            };
+
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let mut inspection = CleanupInspection::default();
+            inspection
+                .frag_reuse_entries
+                .insert(uuid, (entry.clone(), true));
+            assert!(task.resolve_frag_reuse_map_ids(&mut inspection).await);
+            assert!(
+                inspection
+                    .referenced_files
+                    .frag_reuse_map_ids
+                    .contains(&map_id)
+            );
+
+            // An uninterpretable entry (a future index_version) disables
+            // `_fri` collection for the whole run instead of guessing.
+            let future_entry = IndexMetadata {
+                index_version: 2,
+                ..entry.clone()
+            };
+            let mut inspection = CleanupInspection::default();
+            inspection
+                .frag_reuse_entries
+                .insert(uuid, (future_entry, true));
+            assert!(!task.resolve_frag_reuse_map_ids(&mut inspection).await);
+
+            // So does an unknown envelope-level record inside a supported
+            // index_version: it may reference row maps this build cannot
+            // see, so no map may be treated as unreferenced this run.
+            let mut unknown_content = content.clone();
+            unknown_content.extend(reader_tests::field(9, b"future envelope record"));
+            let unknown_entry = IndexMetadata {
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                    value: reader_tests::field(1, &unknown_content),
+                })),
+                ..entry
+            };
+            let mut inspection = CleanupInspection::default();
+            inspection
+                .frag_reuse_entries
+                .insert(uuid, (unknown_entry, true));
+            assert!(
+                !task.resolve_frag_reuse_map_ids(&mut inspection).await,
+                "an unknown envelope record must disable _fri collection"
+            );
+        }
+
+        /// E: the full lifecycle, asserting every stage. A stable-partition
+        /// commit installs the tagged entry and its row map; an index rebuild
+        /// over the destinations simulates the drain and drops the old
+        /// segment; the trim then deletes the fully drained entry; a young
+        /// cleanup keeps the map (still referenced by retained manifests);
+        /// an aged cleanup removes those manifests and the map with them,
+        /// leaving a working table.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn end_to_end_lifecycle() {
+            use crate::index::frag_reuse::decode_frag_reuse_ledger;
+            use lance_table::system_index::frag_reuse::ledger::Mapping;
+
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+
+            // Stage 1: the tagged entry holds one stable-partition
+            // transition referencing the on-disk row map, and the old index
+            // segment still hangs off the sources.
+            let entry = dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .expect("the stable-partition commit installs the entry");
+            assert_eq!(entry.index_version, 1);
+            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
+            assert_eq!(ledger.transitions().len(), 1);
+            let Mapping::StablePartition(partition) = ledger.transitions()[0].mapping() else {
+                panic!("expected a stable-partition transition");
+            };
+            assert_eq!(partition.map_id, map_id);
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
+            let old_segment = dataset
+                .load_index_by_name("i_idx")
+                .await
+                .unwrap()
+                .expect("fixture index");
+
+            // Stage 2: the trim retains the entry while the segment still
+            // derives from the sources.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            // Stage 3: drain -- rebuild the index over the destinations,
+            // dropping the old segment.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let rebuilt = dataset
+                .load_index_by_name("i_idx")
+                .await
+                .unwrap()
+                .expect("rebuilt index");
+            assert_ne!(rebuilt.uuid, old_segment.uuid);
+
+            // Stage 4: the trim now deletes the fully drained entry.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Stage 5: a young cleanup keeps the map -- the manifests that
+            // reference it are still retained.
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+
+            // Stage 6: once aged, the referencing manifests expire and the
+            // map goes with them; the table keeps working.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+            let reopened = fixture.open().await.unwrap();
+            assert_eq!(reopened.count_rows(None).await.unwrap(), 8);
+            assert_eq!(
+                reopened
+                    .count_rows(Some("i >= 4".to_string()))
+                    .await
+                    .unwrap(),
+                4
+            );
+        }
+
+        /// Commit a fresh `i_idx` delta segment built over the current
+        /// (translated) table state; `covered` optionally narrows the
+        /// committed bitmap to an under-claim.
+        async fn commit_delta_segment(dataset: &mut Dataset, covered: Option<&[u32]>) -> Uuid {
+            let params = ScalarIndexParams::default();
+            let mut delta =
+                crate::index::CreateIndexBuilder::new(dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx_delta".into())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            delta.name = "i_idx".into();
+            if let Some(covered) = covered {
+                delta.fragment_bitmap = Some(covered.iter().copied().collect());
+            }
+            let uuid = delta.uuid;
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![delta],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            uuid
+        }
+
+        async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
+            lance_table::io::manifest::read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == name)
+            .collect()
+        }
+
+        /// Draining through `optimize_indices` merge on a tagged table. A
+        /// provenance-only segment still owning translated coverage is opened
+        /// through the translating loader, so the merged file holds live
+        /// addresses. The merged segment commits the UNION of the selected
+        /// segments' stored bitmaps (provenance, retired sources included):
+        /// the tagged reader treats a segment's bitmap as provenance, stops
+        /// translating at a live fragment, and derives coverage of a
+        /// destination whenever every contributing source is present, so the
+        /// merged segment keeps the translated destination coverage instead
+        /// of degrading to scan fallback, and the transition it still names
+        /// stays retained.
+        ///
+        /// A provenance-only segment whose translated coverage is fully taken
+        /// over by siblings is excluded from the query listing by
+        /// direct-coverage-wins and cannot be selected for a merge; it is
+        /// dead weight that the prune step removes
+        /// (`delta_drain_stages_partial_then_full`).
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn merge_keeps_translated_coverage_on_tagged_tables() {
+            use lance_index::optimize::OptimizeOptions;
+
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, _map_id) = make_tagged(&fixture).await;
+            // A partial delta: the old segment keeps exclusive translated
+            // coverage of destination 11, so it stays openable.
+            commit_delta_segment(&mut dataset, Some(&[10])).await;
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+            let all_rows = dataset.count_rows(None).await.unwrap();
+            let scan_counts = counts_without_index(&dataset).await;
+
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(2))
+                .await
+                .unwrap();
+
+            // One merged segment; its stored bitmap is provenance: the retired
+            // sources of the old segment plus the delta's direct coverage.
+            let merged = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(merged.len(), 1, "{merged:?}");
+            let stored = merged[0].fragment_bitmap.clone().unwrap();
+            assert!(
+                stored.contains(0) && stored.contains(1) && stored.contains(10),
+                "{stored:?}"
+            );
+
+            // The reader derives coverage of BOTH destinations from that
+            // provenance, so nothing falls back to scan.
+            let derived = derived_coverage(&dataset, "i_idx").await;
+            assert_eq!(
+                derived,
+                dataset.fragment_bitmap.as_ref().clone(),
+                "the merged segment must answer for every live fragment"
+            );
+            assert_index_used(&dataset).await;
+            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
+            assert_eq!(counts_with_index(&dataset).await, scan_counts);
+
+            // Trim keeps the transition: the merged segment's provenance still
+            // names its sources and destination 11 has no direct coverage.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the merged segment still depends on the transition"
+            );
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 1);
+            assert_eq!(counts_with_index(&dataset).await, scan_counts);
+        }
+
+        /// A merge that selects only SOME of the segments contributing to a
+        /// destination must not strip the unselected sibling of its coverage.
+        /// Two per-fragment segments S1 (fragment 0) and S2 (fragment 1) both
+        /// contribute to destinations 10 and 11 after the recluster. Merging
+        /// S2 with newly appended data produces M whose provenance still names
+        /// fragment 1, so the reader keeps resolving 10 and 11 from {S1, M}.
+        /// With a `stored ∩ live` bitmap M would drop fragment 1 and S1 would
+        /// lose both destinations.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn merge_keeps_unselected_sibling_coverage_on_tagged_tables() {
+            use lance_index::optimize::OptimizeOptions;
+
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, _map_id) = make_tagged_per_fragment(&fixture).await;
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2);
+            let s1 = segments
+                .iter()
+                .find(|s| s.fragment_bitmap.as_ref().unwrap().contains(0))
+                .unwrap()
+                .uuid;
+
+            // New data so a one-segment merge has something to fold in.
+            let appended = arrow_array::record_batch!(("i", Int32, [8, 9, 10, 11])).unwrap();
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                    Some(WriteParams {
+                        store_params: Some(fixture.os_params()),
+                        commit_handler: Some(Arc::new(RenameCommitHandler)),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let all_rows = dataset.count_rows(None).await.unwrap();
+            let scan_counts = counts_without_index(&dataset).await;
+
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(1))
+                .await
+                .unwrap();
+
+            let after = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2, "{after:?}");
+            assert!(after.iter().any(|s| s.uuid == s1), "S1 was not selected");
+            // Both destinations are still derived for S1 and for the merged
+            // segment, and every live fragment is covered.
+            let derived = dataset.load_indices().await.unwrap();
+            for segment in derived.iter().filter(|s| s.name == "i_idx") {
+                let coverage = segment.fragment_bitmap.as_ref().unwrap();
+                assert!(
+                    coverage.contains(10) && coverage.contains(11),
+                    "segment {} lost translated coverage: {coverage:?}",
+                    segment.uuid
+                );
+            }
+            assert_eq!(
+                derived_coverage(&dataset, "i_idx").await,
+                dataset.fragment_bitmap.as_ref().clone()
+            );
+            assert_index_used(&dataset).await;
+            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
+            assert_eq!(counts_with_index(&dataset).await, scan_counts);
+        }
+
+        /// Sorted per-value row counts through the scalar index.
+        async fn counts_with_index(dataset: &Dataset) -> Vec<usize> {
+            let mut counts = Vec::new();
+            for value in 0..12 {
+                let mut scan = dataset.scan();
+                scan.filter(&format!("i = {value}")).unwrap();
+                counts.push(scan.try_into_batch().await.unwrap().num_rows());
+            }
+            counts
+        }
+
+        /// The same counts with the scalar index disabled: the ground truth.
+        async fn counts_without_index(dataset: &Dataset) -> Vec<usize> {
+            let mut counts = Vec::new();
+            for value in 0..12 {
+                let mut scan = dataset.scan();
+                scan.filter(&format!("i = {value}")).unwrap();
+                scan.use_scalar_index(false);
+                counts.push(scan.try_into_batch().await.unwrap().num_rows());
+            }
+            counts
+        }
+
+        /// Union of the coverage the tagged reader derives for `name`.
+        async fn derived_coverage(dataset: &Dataset, name: &str) -> roaring::RoaringBitmap {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|s| s.name == name)
+                .filter_map(|s| s.fragment_bitmap.clone())
+                .fold(roaring::RoaringBitmap::new(), |acc, b| acc | b)
+        }
+
+        /// A filtered scan plans through the scalar index (no scan fallback).
+        async fn assert_index_used(dataset: &Dataset) {
+            let mut scan = dataset.scan();
+            scan.filter("i >= 4").unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        }
+
+        /// `make_tagged` with `i_idx` built as one segment per source fragment.
+        async fn make_tagged_per_fragment(fixture: &MockDatasetFixture) -> (Dataset, String) {
+            let data = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_reader_rows(
+                    lance_datagen::RowCount::from(4),
+                    lance_datagen::BatchCount::from(2),
+                );
+            Dataset::write(
+                data,
+                &fixture.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(fixture.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut dataset = *fixture.open().await.unwrap();
+            let params = ScalarIndexParams::default();
+            let fragment_ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+            let mut segments = Vec::new();
+            for fragment in fragment_ids {
+                segments.push(
+                    crate::index::CreateIndexBuilder::new(
+                        &mut dataset,
+                        &["i"],
+                        IndexType::BTree,
+                        &params,
+                    )
+                    .name("i_idx".into())
+                    .fragments(vec![fragment])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+                );
+            }
+            dataset
+                .commit_existing_index_segments("i_idx", "i", segments)
+                .await
+                .unwrap();
+            reserve_fragments(&mut dataset, 20).await;
+            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+            let (transition, destinations) = reader_tests::prepare(&dataset).await;
+            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &transition.mapping
+            else {
+                unreachable!()
+            };
+            let map_id = mapping.map_id.clone();
+            let read_version = dataset.manifest.version;
+            let frag_reuse_index = Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap(),
+            );
+            let dataset = CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments,
+                            new_fragments: destinations,
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index,
+                    },
+                    None,
+                ))
+                .await
+                .unwrap();
+            (dataset, map_id)
+        }
+
+        /// The staged drain the merge tests were after, via delta segments:
+        /// partial direct coverage retains the transition; completing the
+        /// coverage lets one maintenance run prune the superseded segment,
+        /// release the transition, and (aged) collect the row map.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn delta_drain_stages_partial_then_full() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            let all_rows = dataset.count_rows(None).await.unwrap();
+
+            // Stage 1: only destination 10 gains direct coverage; the
+            // transition and the old segment must both stay.
+            commit_delta_segment(&mut dataset, Some(&[10])).await;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "destination 11 lacks direct coverage, so the transition stays"
+            );
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
+
+            // Stage 2: destination 11 gains direct coverage too. One
+            // maintenance run prunes the superseded old segment and releases
+            // the transition.
+            let second = commit_delta_segment(&mut dataset, Some(&[11])).await;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2, "the two deltas remain");
+            assert!(segments.iter().any(|s| s.uuid == second));
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "with the old segment pruned, nothing needs the transition"
+            );
+            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
+
+            // Stage 3: the released row map ages out with its manifests.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+            let reopened = fixture.open().await.unwrap();
+            assert_eq!(reopened.count_rows(None).await.unwrap(), all_rows);
+        }
+
+        /// D-guard: a v0 dataset records no tagged entries and has no `_fri`
+        /// directory; cleanup behaves exactly as before.
+        #[tokio::test]
+        async fn v0_dataset_is_untouched() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            fixture.create_some_data().await.unwrap();
+            fixture.overwrite_some_data().await.unwrap();
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            let removed = fixture
+                .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(removed.old_versions, 1);
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+        }
     }
 }

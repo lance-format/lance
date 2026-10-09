@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
+import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
@@ -54,6 +55,15 @@ public class JNITest {
         new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
     assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
 
+    Query nprobesQuery =
+        new Query.Builder()
+            .setColumn("column")
+            .setKey(new float[] {1.0f, 2.0f, 3.0f})
+            .setNprobes(20)
+            .build();
+    assertEquals(20, nprobesQuery.getMinimumNprobes());
+    assertEquals(Optional.of(20), nprobesQuery.getMaximumNprobes());
+
     JniTestHelper.parseQuery(
         Optional.of(
             new Query.Builder()
@@ -76,6 +86,11 @@ public class JNITest {
         IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfFlat(10, DistanceType.L2))
             .build());
+  }
+
+  @Test
+  public void testRqBuildParamsDefaultNumBits() {
+    assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
   }
 
   @Test

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod data_file_part;
 #[cfg(feature = "substrait")]
 mod dataset_aggregate;
 mod dataset_common;
 mod dataset_concurrency_store;
+mod dataset_fts_combined_fields;
 #[cfg(feature = "geo")]
 mod dataset_geo;
 mod dataset_index;
@@ -18,3 +20,4 @@ mod dataset_transactions;
 mod dataset_versioning;
 mod fragment_validate_tombstones;
 mod fragment_write_columns;
+mod merge_coverage;

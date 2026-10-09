@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::ScalarPredicate;
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// ExecutionPlan node that queries BTree index with visibility filtering.
@@ -30,7 +31,7 @@ pub struct BTreeIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     predicate: ScalarPredicate,
-    visible_count: usize,
+    readable_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -47,7 +48,7 @@ impl Debug for BTreeIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BTreeIndexExec")
             .field("predicate", &self.predicate)
-            .field("visible_count", &self.visible_count)
+            .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_address", &self.with_row_address)
             .field("column", &self.column)
@@ -63,7 +64,7 @@ impl BTreeIndexExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `indexes` - Index registry with BTree indexes
     /// * `predicate` - Scalar predicate to apply
-    /// * `visible_count` - MVCC visibility sequence number
+    /// * `readable_count` - Exclusive count of batch positions this scan may read
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `with_row_id` - Whether to include _rowid column (row position)
@@ -73,7 +74,7 @@ impl BTreeIndexExec {
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
         predicate: ScalarPredicate,
-        visible_count: usize,
+        readable_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         with_row_id: bool,
@@ -99,7 +100,7 @@ impl BTreeIndexExec {
             batch_store,
             indexes,
             predicate,
-            visible_count,
+            readable_count,
             projection,
             output_schema,
             properties,
@@ -110,22 +111,22 @@ impl BTreeIndexExec {
         })
     }
 
-    /// Compute the maximum visible row position based on visible_count.
-    /// Returns None if no batches are visible.
-    fn compute_max_visible_row(&self) -> Option<u64> {
-        let mut max_visible_row_exclusive: u64 = 0;
+    /// Last row position within `readable_count`, or None if nothing is
+    /// readable.
+    fn compute_max_readable_row(&self) -> Option<u64> {
+        let mut max_readable_row_exclusive: u64 = 0;
         let mut current_row: u64 = 0;
 
         for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
             let batch_end = current_row + stored_batch.num_rows as u64;
-            if batch_position < self.visible_count {
-                max_visible_row_exclusive = batch_end;
+            if batch_position < self.readable_count {
+                max_readable_row_exclusive = batch_end;
             }
             current_row = batch_end;
         }
 
-        if max_visible_row_exclusive > 0 {
-            Some(max_visible_row_exclusive - 1)
+        if max_readable_row_exclusive > 0 {
+            Some(max_readable_row_exclusive - 1)
         } else {
             None
         }
@@ -137,7 +138,7 @@ impl BTreeIndexExec {
             return vec![];
         };
 
-        let Some(max_visible_row) = self.compute_max_visible_row() else {
+        let Some(max_readable_row) = self.compute_max_readable_row() else {
             return vec![];
         };
 
@@ -149,7 +150,8 @@ impl BTreeIndexExec {
                 let mut results = Vec::new();
                 let snapshot = index.snapshot();
 
-                for (key, positions) in snapshot {
+                // Null keys sort first but are in no range.
+                for (key, positions) in snapshot.into_iter().filter(|(key, _)| !key.0.is_null()) {
                     let in_range = match (lower, upper) {
                         (Some(l), Some(u)) => &key.0 >= l && &key.0 < u,
                         (Some(l), None) => &key.0 >= l,
@@ -175,7 +177,7 @@ impl BTreeIndexExec {
         // Filter by visibility
         positions
             .into_iter()
-            .filter(|&pos| pos <= max_visible_row)
+            .filter(|&pos| pos <= max_readable_row)
             .collect()
     }
 
@@ -228,6 +230,7 @@ impl BTreeIndexExec {
         let mut results = Vec::new();
         for (batch_id, rows_with_positions) in batches_to_rows {
             if let Some(stored) = self.batch_store.get(batch_id) {
+                let data = scan_record_batch(&stored.data)?;
                 // Extract row indices and row positions
                 let row_indices: Vec<u32> = rows_with_positions
                     .iter()
@@ -241,24 +244,29 @@ impl BTreeIndexExec {
                 // Use take to select specific rows
                 let indices = arrow_array::UInt32Array::from(row_indices);
 
-                let columns: std::result::Result<Vec<_>, datafusion::error::DataFusionError> =
-                    stored
-                        .data
-                        .columns()
-                        .iter()
-                        .map(|col| {
-                            arrow_select::take::take(col.as_ref(), &indices, None).map_err(|e| {
-                                datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                            })
+                let columns: std::result::Result<Vec<_>, datafusion::error::DataFusionError> = data
+                    .columns()
+                    .iter()
+                    .map(|col| {
+                        arrow_select::take::take(col.as_ref(), &indices, None).map_err(|e| {
+                            datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
                         })
-                        .collect();
+                    })
+                    .collect();
 
                 let columns = columns?;
 
                 // Apply projection
+                let source_schema = data.schema();
                 let mut final_columns: Vec<Arc<dyn arrow_array::Array>> =
                     if let Some(ref proj_indices) = self.projection {
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect()
+                        take_projected_columns(
+                            &columns,
+                            source_schema.fields(),
+                            proj_indices,
+                            self.output_schema.as_ref(),
+                            row_positions.len(),
+                        )?
                     } else {
                         columns
                     };
@@ -355,7 +363,7 @@ impl ExecutionPlan for BTreeIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 
@@ -426,7 +434,7 @@ mod tests {
             batch_store,
             indexes,
             predicate,
-            1, // visible_count (batch at position 0)
+            1, // readable_count (batch at position 0)
             None,
             schema,
             false,
@@ -510,7 +518,7 @@ mod tests {
             value: ScalarValue::Int32(Some(15)),
         };
 
-        // Query with max_visible=0 should not see batch at position 1
+        // Query with max_readable=0 should not see batch at position 1
         let exec = BTreeIndexExec::new(
             batch_store.clone(),
             indexes.clone(),
@@ -530,7 +538,7 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 0);
 
-        // Query with max_visible=1 should see both batches
+        // Query with max_readable=1 should see both batches
         let exec = BTreeIndexExec::new(
             batch_store,
             indexes,

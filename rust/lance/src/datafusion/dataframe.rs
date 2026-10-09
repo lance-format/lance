@@ -147,26 +147,18 @@ impl TableProvider for LanceTableProvider {
             scan.batch_size_bytes(batch_size_bytes);
         }
 
-        match projection {
-            Some(projection) if projection.is_empty() => {
-                scan.empty_project()?;
-            }
-            Some(projection) => {
-                let mut columns = Vec::with_capacity(projection.len());
-                for field_idx in projection {
-                    if Some(*field_idx) == self.row_id_idx {
-                        scan.with_row_id();
-                    } else if Some(*field_idx) == self.row_addr_idx {
-                        scan.with_row_address();
-                    } else {
-                        columns.push(self.full_schema.field(*field_idx).name());
-                    }
-                }
-                if !columns.is_empty() {
-                    scan.project(&columns)?;
+        if let Some(projection) = projection {
+            let mut columns = Vec::with_capacity(projection.len());
+            for field_idx in projection {
+                if Some(*field_idx) == self.row_id_idx {
+                    scan.with_row_id();
+                } else if Some(*field_idx) == self.row_addr_idx {
+                    scan.with_row_address();
+                } else {
+                    columns.push(self.full_schema.field(*field_idx).name());
                 }
             }
-            _ => {}
+            scan.project(&columns)?;
         }
 
         let combined_filter = match filters.len() {
