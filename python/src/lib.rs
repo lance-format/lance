@@ -98,7 +98,7 @@ use crate::utils::KMeans;
 pub use dataset::Dataset;
 pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
-use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
+use fragment::{FileFragment, OverlayWriter, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
@@ -266,6 +266,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<OverlayWriter>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
     m.add_class::<PyRowIdSequence>()?;
