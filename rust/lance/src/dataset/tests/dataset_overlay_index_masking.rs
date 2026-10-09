@@ -51,7 +51,7 @@ async fn create_base_dataset() -> Dataset {
     create_base_dataset_with(false).await
 }
 
-async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
+pub(super) async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("age", DataType::Int32, true),
@@ -91,7 +91,7 @@ async fn build_age_index(dataset: &mut Dataset) {
 /// Write an overlay file covering `fields` of `fragment_id` with `coverage` and the given
 /// per-field value columns, then commit it as a `DataOverlay` transaction. `name` makes
 /// the overlay file unique.
-async fn commit_overlay(
+pub(super) async fn commit_overlay(
     dataset: Dataset,
     name: &str,
     fragment_id: u64,
@@ -163,7 +163,7 @@ async fn commit_overlay(
 }
 
 /// Sorted `id` values returned by a filtered scan.
-async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
+pub(super) async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
     ids_matching_opts(dataset, filter, false).await
 }
 
@@ -195,7 +195,7 @@ fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
         .collect()
 }
 
-fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
+pub(super) fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
     Arc::new(Int32Array::from_iter(values))
 }
 
