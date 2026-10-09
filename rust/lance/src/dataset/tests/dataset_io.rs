@@ -2086,6 +2086,7 @@ async fn append_dataset(
 async fn test_deep_clone(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
+    #[values(false, true)] local_fsync: bool,
 ) {
     // Setup source and target dirs
     let test_dir = TempStdDir::default();
@@ -2105,7 +2106,7 @@ async fn test_deep_clone(
         data_reader,
         test_uri,
         Some(WriteParams {
-            max_rows_per_file: 64,
+            max_rows_per_file: 32,
             max_rows_per_group: 16,
             data_storage_version: Some(data_storage_version),
             ..Default::default()
@@ -2141,8 +2142,17 @@ async fn test_deep_clone(
         .await
         .unwrap();
 
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+        ))),
+        ..Default::default()
+    };
     // Perform deep clone
-    let cloned_dataset = branch.deep_clone(cloned_uri, "tag", None).await.unwrap();
+    let cloned_dataset = branch
+        .deep_clone(cloned_uri, "tag", Some(store_params.clone()))
+        .await
+        .unwrap();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2208,7 +2218,11 @@ async fn test_deep_clone(
     let clone_dir = test_dir.join("clone_ds_old_ver");
     let cloned_ds = clone_dir.to_str().unwrap();
     let cloned_dataset = branch
-        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
+        .deep_clone(
+            cloned_ds,
+            ("branch", original_version - 1),
+            Some(store_params),
+        )
         .await
         .unwrap();
     let store = branch.object_store.as_ref();
@@ -2228,6 +2242,13 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+
+    std::fs::remove_dir_all(base_dir).unwrap();
+    for (uri, expected_rows) in [(cloned_uri, 54), (cloned_ds, 64)] {
+        let reopened = Dataset::open(uri).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+    }
 }
 
 #[tokio::test]
@@ -3759,6 +3780,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
     Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn test_open_empty_latest_manifest_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    let mut dataset = write_tiny_dataset(uri).await;
+    dataset.truncate_table().await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+
+    let manifest_path = dataset.manifest_location.path.clone();
+    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+
+    let error = Dataset::open(uri).await.unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains(manifest_path.as_ref()),
+        "{error}"
+    );
+    assert!(error.to_string().contains("0 bytes"), "{error}");
+}
+
+#[tokio::test]
+async fn test_read_empty_data_file_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    write_tiny_dataset(uri).await;
+
+    let data_path = std::fs::read_dir(test_dir.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&data_path, b"").unwrap();
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    let object_path = Path::from_absolute_path(&data_path).unwrap();
+    assert!(error.to_string().contains(object_path.as_ref()), "{error}");
+    assert!(error.to_string().contains("size 0 bytes"), "{error}");
 }
 
 /// `drop` deletes whatever path it is handed, so the guard must accept a real dataset
