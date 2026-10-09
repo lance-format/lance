@@ -353,10 +353,11 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// them.
     fn columns(&self) -> &[String];
 
-    /// Whether this index can answer `query`, asked while planning with the
-    /// query [`search`](Self::search) will receive. Only finding which
+    /// Whether this index can answer a ranked search, asked while planning with
+    /// the query [`search`](Self::search) will receive. Only finding which
     /// full-text granularities exist asks a probe instead. A full-text query's
-    /// search options must not decide the answer.
+    /// search options must not decide the answer. Filters are not asked: they
+    /// reach the index through [`MemIndexPlugin::query_parser`].
     fn can_answer(&self, query: &dyn MemQuery) -> bool;
 
     /// Index every row of `batch`. Row `n` occupies position `row_offset + n`.
@@ -376,12 +377,16 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
 
     /// Answer `query` with positions at or below
     /// [`SearchContext::max_visible`]; an empty answer means no row matches.
-    /// `None` declines a query [`can_answer`](Self::can_answer) rejects;
-    /// declining one it accepted is an error.
     ///
-    /// A filter is answered with [`MemMatches::Filter`], a search with
-    /// [`MemMatches::Ranked`], scored as every other source scores it: the
-    /// exact distance in the query's metric, or the built-in full-text score.
+    /// A filter is answered with [`MemMatches::Filter`]. `None` declines it,
+    /// as an index may when it matches more than
+    /// [`SearchContext::match_budget`]; the caller then reads every row.
+    ///
+    /// A search is answered with [`MemMatches::Ranked`], scored as every other
+    /// source scores it: the exact distance in the query's metric, or the
+    /// built-in full-text score. `None` declines a search
+    /// [`can_answer`](Self::can_answer) rejects; declining one it accepted is
+    /// an error.
     fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>>;
 
     /// Hand the flush what this index can save it. Called once, after the last
