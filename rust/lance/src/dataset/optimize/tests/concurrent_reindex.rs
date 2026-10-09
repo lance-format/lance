@@ -1002,3 +1002,52 @@ async fn test_index_on_a_packed_child_withdraws_a_rewritten_parent() {
         );
     }
 }
+
+/// The distributed index flow: a builder pinned to one version stages a
+/// segment per fragment, merges them at that version, and commits after
+/// another process ran deferred compactions.
+#[rstest]
+#[case::untouched(false)]
+#[case::updated_after_compaction(true)]
+#[tokio::test]
+async fn test_staged_index_commits_past_a_deferred_compaction(#[case] update: bool) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let table = indexed_table(uri, 4).await;
+    let pinned_version = table.manifest.version;
+    let mut builder = open_in_new_session(uri)
+        .await
+        .checkout_version(pinned_version)
+        .await
+        .unwrap();
+    let mut staged = Vec::new();
+    for fragment in 0..4 {
+        staged.push(
+            builder
+                .create_index_builder(&["val"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("val_idx".to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let merged = builder.merge_existing_index_segments(staged).await.unwrap();
+
+    let mut table = open_in_new_session(uri).await;
+    compact_files(&mut table, deferred_compaction(2), None)
+        .await
+        .unwrap();
+    if update {
+        update_in_place(table, vec![0], vec![999]).await;
+    }
+
+    builder
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+
+    assert_lookups_match_scan(uri, probes(24, [999])).await;
+    let expected = if update { Some(0) } else { None };
+    assert_covers_all_but_the_fragment_of(uri, expected).await;
+}
