@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Row-addressable persistent ex planes. Sign codes retain their transposed IPC body.
+//! Row-addressable persistent ex planes. Sign codes retain their transposed
+//! IPC body, and so do the bounds columns, which scans read whole.
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheRangeReader};
 use lance_core::{Error, Result};
 
-use super::layered::{PlaneBatch, plane_columns};
+use super::layered::{PlaneBatch, SignBounds, plane_columns};
 use super::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN};
 
 const HEADER_BYTES: usize = 13;
@@ -43,7 +44,8 @@ impl Header {
         self.width + 8
     }
     fn batch(&self, codes: Vec<u8>, adds: Vec<f32>, scales: Vec<f32>) -> Result<PlaneBatch> {
-        let names = plane_columns(self.plane);
+        // Ex planes hold the same columns under either bounds placement.
+        let names = plane_columns(self.plane, SignBounds::default());
         let codes = arrow_array::FixedSizeListArray::try_new_from_values(
             UInt8Array::from(codes),
             self.width as i32,
@@ -114,7 +116,7 @@ impl CacheCodecImpl for PlaneBatch {
         if plane == 0 {
             return writer.write_ipc(&self.0);
         }
-        let names = plane_columns(plane);
+        let names = plane_columns(plane, SignBounds::default());
         let codes = self.0[names[0]].as_fixed_size_list();
         let adds = self.0[names[1]].as_primitive::<arrow_array::types::Float32Type>();
         let scales = self.0[names[2]].as_primitive::<arrow_array::types::Float32Type>();
@@ -244,10 +246,58 @@ fn row_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::bq::layered::{PlaneKey, SIGN_BOUNDS_PLANE};
     use bytes::Bytes;
     use lance_arrow::RecordBatchExt;
-    use lance_core::cache::{CacheCodec, CacheDecode};
+    use lance_core::cache::{CacheCodec, CacheDecode, CacheKey};
     use std::cell::Cell;
+
+    /// Bounds plane entries keep an IPC body, as sign planes do: they round
+    /// trip whole and have no row directory, so a row read misses.
+    #[test]
+    fn bounds_plane_round_trips_through_ipc() {
+        const ROWS: usize = 70;
+        let names = plane_columns(SIGN_BOUNDS_PLANE, SignBounds::Lazy);
+        let bounds = |offset: f32| {
+            let values: Vec<f32> = (0..ROWS * 3).map(|v| v as f32 + offset).collect();
+            arrow_array::FixedSizeListArray::try_new_from_values(Float32Array::from(values), 3)
+                .unwrap()
+        };
+        let (high, full) = (bounds(0.5), bounds(0.25));
+        let original = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(names[0], high.data_type().clone(), true),
+                Field::new(names[1], full.data_type().clone(), true),
+            ])),
+            vec![Arc::new(high), Arc::new(full)],
+        )
+        .unwrap();
+        let codec = PlaneKey {
+            partition: 0,
+            plane: SIGN_BOUNDS_PLANE,
+            sign_bounds: SignBounds::Lazy,
+        }
+        .codec_for_key()
+        .unwrap();
+        let mut encoded = Vec::new();
+        codec
+            .serialize(
+                &(Arc::new(PlaneBatch(original.clone())) as Arc<dyn std::any::Any + Send + Sync>),
+                &mut encoded,
+            )
+            .unwrap();
+        let encoded = Bytes::from(encoded);
+        let CacheDecode::Hit(decoded) = codec.deserialize(&encoded) else {
+            panic!("bounds plane decode failed")
+        };
+        assert_eq!(decoded.downcast::<PlaneBatch>().unwrap().0, original);
+        let read = |range: Range<usize>| -> Result<Bytes> { Ok(encoded.slice(range)) };
+        assert!(matches!(
+            codec.deserialize_rows(&read, &[0, 5]),
+            CacheDecode::Miss(_)
+        ));
+        assert!(codec.plan_rows(&read, &[0, 5]).is_none());
+    }
 
     #[test]
     fn sparse_plane_cache_reads_match_full_decode() {

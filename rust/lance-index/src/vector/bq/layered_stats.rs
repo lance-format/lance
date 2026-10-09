@@ -5,7 +5,10 @@
 //!
 //! The counters only advance while a query runs the lazy scan (or is checked
 //! for it), so production queries with the scan disabled touch at most the
-//! `ineligible_disabled` counter. Readers take deltas with
+//! `ineligible_disabled` counter. The `resident_columns_*`,
+//! `resident_store_evictions` and `pinned_overflow` counters are the
+//! exception: they advance when an IVF_RQ index, layered or not, opens with
+//! or loads its resident columns. Readers take deltas with
 //! [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +167,18 @@ layered_lazy_counters! {
         /// Sparse gathers whose rows came from the origin file because the
         /// cache had no persistent entry for the plane.
         origin_row_reads,
+        /// Origin requests of those reads after coalescing within the lazy
+        /// origin gap (`LANCE_RQ_LAZY_ORIGIN_GAP_BYTES`) and splitting, which
+        /// are GETs on an object store. A load of the resident columns that
+        /// such a read starts is counted in `resident_columns_load_requests`
+        /// instead.
+        origin_sparse_requests,
+        /// Bytes those requests read, the gaps they span included.
+        origin_sparse_bytes,
+        /// Rows those reads gathered, which the gap does not change. Over one
+        /// plane, `origin_sparse_bytes / (origin_sparse_rows * row width)` is
+        /// the byte amplification of the gap.
+        origin_sparse_rows,
         /// Sum over gathered probes of probes still unscored at issue.
         staleness_sum,
         /// Issues deferred because the heap was not yet full at the gate.
@@ -213,6 +228,87 @@ layered_lazy_counters! {
         /// Bytes of planes loaded by promotions, resident afterwards or not,
         /// apart from critical-path reads.
         promotion_bytes,
+        /// Bytes of values each load of an index's resident columns keeps in
+        /// memory (see `LANCE_RQ_RESIDENT_COLUMNS`). An index loads them
+        /// once, so over every snapshot this sums to the store's size.
+        resident_columns_bytes,
+        /// Memory the arrays of those loads hold: the capacity of their
+        /// buffers, counted per column. It exceeds `resident_columns_bytes`
+        /// when an array keeps a buffer larger than its values.
+        resident_columns_alloc_bytes,
+        /// Origin requests of those loads after coalescing and splitting,
+        /// which are GETs on an object store.
+        resident_columns_load_requests,
+        /// Bytes those loads read from the origin.
+        resident_columns_load_bytes,
+        /// Time those loads took.
+        resident_columns_load_ns,
+        /// Classifying staged probes' ex planes by the cache tier that holds
+        /// them (only RAM residency on a low-latency origin).
+        tier_peek_ns,
+        /// Gathers issued beyond the ordinary window with a permit of their
+        /// index's pool, because their probe reads an ex plane from a
+        /// high-latency origin; see `LANCE_RQ_LAZY_FAR_WINDOW`.
+        far_early_issues,
+        /// Gathers beyond the ordinary window that found no free permit and
+        /// waited for one or for the ordinary window, whichever came first.
+        far_permit_waits,
+        /// Lazy scans that published the scoring of their first probe; see
+        /// `lazy_rank0_scored_ns`.
+        lazy_rank0_scored_queries,
+        /// Time from the start of each of those scans until it published the
+        /// scoring of its first probe (rank 0) to the gathers: once the probe
+        /// was scored or, earlier, once its rows filled the heap. No gather
+        /// that waits for the threshold or its turn is released before.
+        lazy_rank0_scored_ns,
+        /// Lazy scans that issued a gather of a probe that is not
+        /// `certain_dense`, whose issue waits on scoring progress; see
+        /// `lazy_first_gather_issue_ns`. Certain-dense gathers, the first
+        /// probe's always among them, are issued as soon as staged.
+        lazy_first_gather_issue_queries,
+        /// Time from the start of each of those scans until the first such
+        /// gather was issued, its gate waits and permit included.
+        lazy_first_gather_issue_ns,
+        /// Gathers whose probe was further ahead of scoring than their
+        /// staleness window (the far window for a probe that reads an ex
+        /// plane from a high-latency origin) when they reached the gate.
+        lazy_window_waits,
+        /// Time those gathers waited for scoring to bring their probe within
+        /// the window. Part of `gate_wait_ns`, as are
+        /// `lazy_release_wait_ns` and `far_permit_wait_ns`.
+        lazy_window_wait_ns,
+        /// Time the `deferred_issues` waited for the heap to fill, their turn
+        /// or, with eager-before-full, the scoring of the probes holding `k`
+        /// rows.
+        lazy_release_wait_ns,
+        /// Time the `far_permit_waits` waited for a permit or the ordinary
+        /// window.
+        far_permit_wait_ns,
+        /// Loads of an index file's resident store: one per store while the
+        /// index cache keeps it, and one more after it evicted the store idle.
+        resident_columns_loads,
+        /// Index opens that bound a resident store a live index of the file
+        /// had loaded, found through the process's weak registry of stores.
+        resident_columns_registry_reuses,
+        /// Index opens that bound a resident store charged in the index cache.
+        resident_columns_binds,
+        /// Loaded resident stores admitted to the index cache again by an
+        /// index open that found them gone: evicted while overflowed,
+        /// cleared, or refused at admission.
+        resident_columns_recharges,
+        /// Index opens whose resident store would take more of the index
+        /// cache's largest admissible entry than `auto` allows, so `auto`
+        /// kept the small columns in the file (`on` keeps them resident).
+        resident_columns_oversize,
+        /// Index opens that leased the cached resident store before their
+        /// first index-cache access.
+        resident_columns_preopen_leases,
+        /// Resident store entries the index cache dropped: evicted while
+        /// idle, cleared, or refused at admission.
+        resident_store_evictions,
+        /// Leases of a resident store that found no room under the index
+        /// cache's pinned cap, leaving the store evictable.
+        pinned_overflow,
     }
     ranked {
         /// Probes gathered lazily.
@@ -227,11 +323,18 @@ layered_lazy_counters! {
         empty,
         /// Probes of non-empty partitions whose ex planes were not both
         /// resident, predicted from `k` and the partition sizes to be
-        /// gathered whole, and so loaded and scored by the eager scan; see
-        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER`.
+        /// gathered whole, and so loaded and scored by the eager scan, as
+        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` routes them for their planes' tiers.
         dense_to_eager,
+        /// Probes of non-empty partitions with a high or low plane that no
+        /// cache tier held when they were staged, on an index whose origin
+        /// latency class is high: reading the plane is a request to the
+        /// origin, an object store such as S3. Counted whether the probe was
+        /// then gathered lazily or routed to the eager scan; always 0 on a
+        /// low-latency origin.
+        s3_bound_probes,
         /// Lazy probes issued at once because the rows of all earlier probes
-        /// cannot fill the heap. The probes of queries that
+        /// cannot fill the heap. The probes that
         /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` routes are counted in
         /// `dense_to_eager` instead.
         certain_dense,
@@ -266,6 +369,10 @@ layered_lazy_counters! {
     maxima {
         /// Largest number of probes still unscored at a gather's issue.
         staleness_max,
+        /// Most permits of one index's pool taken at once, observed as each
+        /// gather beyond the ordinary window takes one; at most
+        /// `LANCE_RQ_LAZY_FAR_INFLIGHT`.
+        far_in_flight_max,
     }
 }
 
