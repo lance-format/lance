@@ -34,6 +34,7 @@ use lance_file::{
 use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
+use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
@@ -48,12 +49,24 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::utils::SchemaAdapter;
 use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
 };
+
+/// Keep per-operation targets within the dataset's existing reader family.
+pub fn validate_write_version(
+    default_version: ConcreteFileVersion,
+    target: ConcreteFileVersion,
+) -> Result<()> {
+    if (default_version == ConcreteFileVersion::V1) != (target == ConcreteFileVersion::V1) {
+        return Err(Error::invalid_input(format!(
+            "Cannot write data files in version {target} to a dataset with default version {default_version}: V1 and V2 storage versions cannot be mixed"
+        )));
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_scan_stream(
@@ -112,9 +125,9 @@ fn create_current_file_writer(
     schema: Schema,
     filename: String,
     base_id: Option<u32>,
+    options: FileWriterOptions,
 ) -> Result<(FileWriter, DataFile)> {
-    let writer =
-        file_versions::create_writer(version, object_writer, schema, FileWriterOptions::default())?;
+    let writer = file_versions::create_writer(version, object_writer, schema, options)?;
     let mut data_file = DataFile::new_unstarted(filename, version);
     data_file.base_id = base_id;
     Ok((writer, data_file))
@@ -131,14 +144,28 @@ pub async fn write_fragments(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    // A writer that spills row lineage into the fragment's own data file
+    // carries the hidden columns in its stream. They are not dataset fields:
+    // set them aside before the schema is checked against the dataset's and
+    // put them back on the schema that is written. This has to come before
+    // the blob promotion, which gives every negative field id a new one.
+    let (normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    let normalized_schema = match version {
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            write::promote_legacy_blob_schema(&normalized_schema)?
+        }
+        _ => normalized_schema,
+    };
     let version_name = format!("{version:?}");
-    let schema = write::prepare_write_schema(
+    let mut schema = write::prepare_write_schema(
         dataset,
         normalized_schema,
         &params,
         schema_compare_options(version),
     )?;
+    schema.fields.extend(lineage_fields);
     match version {
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::validate_legacy_blob_write_schema(&schema, &version_name)?;
@@ -159,9 +186,45 @@ pub async fn write_fragments(
         target_bases_info,
         seed_writers,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await?;
     Ok((fragments, schema))
+}
+
+/// Take the hidden row lineage columns out of a write schema.
+///
+/// A hidden column is a top-level field that already carries the reserved id
+/// of its name, as the writers that spill lineage into a data file assign it.
+/// A user column that only shares the name has a non-negative id and stays a
+/// user column, to be checked against the dataset schema like any other.
+fn split_row_lineage_fields(schema: Schema) -> Result<(Schema, Vec<Field>)> {
+    let (lineage, user): (Vec<_>, Vec<_>) = schema
+        .fields
+        .into_iter()
+        .partition(|field| lance_core::row_lineage_field_id(&field.name) == Some(field.id));
+    // The readers decode these columns as non-nullable `UInt64`, whatever the
+    // written type, so any other type would only fail once read back.
+    if let Some(field) = lineage
+        .iter()
+        .find(|field| field.nullable || field.data_type() != DataType::UInt64)
+    {
+        return Err(Error::internal(format!(
+            "hidden row lineage column {} (field id {}) must be a non-nullable UInt64, got \
+             {} (nullable: {})",
+            field.name,
+            field.id,
+            field.data_type(),
+            field.nullable
+        )));
+    }
+    Ok((
+        Schema {
+            fields: user,
+            metadata: schema.metadata,
+        },
+        lineage,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -176,9 +239,8 @@ pub async fn write_fragments_direct(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>> {
-    let adapter = SchemaAdapter::new(data.schema());
-    let data = adapter.to_physical_stream(data);
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
         if file_row_counts.contains(&0) {
             return Err(Error::invalid_input(
@@ -240,13 +302,14 @@ pub async fn write_fragments_direct(
         target_bases_info,
         seed_writers,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await
 }
 
 fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
     for fragment in fragments {
-        for data_file in &fragment.files {
+        for data_file in fragment.referenced_lance_files() {
             if data_file.file_version()? != expected {
                 return Ok(false);
             }
@@ -303,80 +366,223 @@ pub async fn rewrite_files_binary_copy(
 }
 
 pub fn check_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
-    let version = manifest.data_storage_format.lance_file_format();
-    match version {
-        ConcreteFileVersion::V1 => repair_legacy_manifest_storage(manifest),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => validate_exact_manifest_storage(manifest, version),
-    }
+    check_manifest_storage_contract(manifest, StorageContractMode::Read)
 }
 
-pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
-    match manifest.data_storage_format.lance_file_format() {
-        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => Ok(()),
-        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            validate_leaf_column_indices(manifest)
+pub fn check_manifest_storage_version_for_commit(manifest: &mut Manifest) -> Result<()> {
+    check_manifest_storage_contract(manifest, StorageContractMode::Commit)
+}
+
+pub fn finalize_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
+    check_manifest_storage_contract(manifest, StorageContractMode::Finalize)
+}
+
+#[derive(Clone, Copy)]
+enum StorageContractMode {
+    Read,
+    Commit,
+    Finalize,
+}
+
+fn check_manifest_storage_contract(
+    manifest: &mut Manifest,
+    mode: StorageContractMode,
+) -> Result<()> {
+    let default_version = manifest.data_storage_format.lance_file_format();
+    let mixed_enabled = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0
+        && manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
+
+    if mixed_enabled && default_version == ConcreteFileVersion::V1 {
+        return Err(Error::invalid_input(
+            "Dataset has mixed data-file-version capability enabled, which requires a V2 default, but the manifest default is V1",
+        ));
+    }
+
+    let mut saw_v1 = false;
+    let mut saw_v2 = false;
+    let mut first_file_version = None;
+    let mut first_mismatch = None;
+    let mut first_non_default = None;
+    let fields_by_id = field_column_requirements(manifest);
+    let mut validated_lists = HashSet::new();
+
+    for fragment in manifest.fragments.iter() {
+        for data_file in fragment.referenced_lance_files() {
+            let file_version = data_file.file_version()?;
+            match file_version {
+                ConcreteFileVersion::V1 => saw_v1 = true,
+                ConcreteFileVersion::V2_0
+                | ConcreteFileVersion::V2_1
+                | ConcreteFileVersion::V2_2
+                | ConcreteFileVersion::V2_3 => saw_v2 = true,
+            }
+
+            match first_file_version {
+                None => first_file_version = Some(file_version),
+                Some(first_version)
+                    if first_version != file_version && first_mismatch.is_none() =>
+                {
+                    first_mismatch = Some((first_version, file_version));
+                }
+                Some(_) => {}
+            }
+
+            if !mixed_enabled && file_version != default_version && first_non_default.is_none() {
+                first_non_default = Some((data_file.path.clone(), fragment.id, file_version));
+            }
+
+            validate_file_column_indices(
+                &fields_by_id,
+                &mut validated_lists,
+                fragment.id,
+                data_file,
+                file_version,
+            )?;
         }
     }
+
+    // Released Lance 0.16 could persist a V1 default while referencing both V1
+    // and V2 files. Keep those snapshots readable, but never publish a new
+    // manifest with that state.
+    if matches!(mode, StorageContractMode::Read)
+        && default_version == ConcreteFileVersion::V1
+        && !mixed_enabled
+        && saw_v1
+        && saw_v2
+    {
+        return Ok(());
+    }
+
+    let mut effective_version = default_version;
+    if default_version == ConcreteFileVersion::V1 {
+        if let Some((first_version, other_version)) = first_mismatch {
+            return Err(Error::internal(format!(
+                "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: All data files must have the same version. Detected both {first_version} and {other_version}"
+            )));
+        }
+        if let Some(actual) = first_file_version
+            && actual != ConcreteFileVersion::V1
+        {
+            effective_version = actual;
+            first_non_default = None;
+            if matches!(mode, StorageContractMode::Finalize) {
+                log::warn!(
+                    "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
+                    default_version,
+                    actual
+                );
+                manifest.data_storage_format = DataStorageFormat::new(actual);
+            }
+        }
+    }
+
+    if saw_v1 && saw_v2 {
+        return Err(Error::invalid_input(
+            "Dataset snapshot mixes V1 and V2 data files",
+        ));
+    }
+
+    if mixed_enabled && saw_v1 {
+        return Err(Error::invalid_input(
+            "Dataset has mixed data-file-version capability enabled but references V1 data files",
+        ));
+    }
+    if let Some((path, fragment_id, file_version)) = first_non_default {
+        if file_version == ConcreteFileVersion::V1 || effective_version == ConcreteFileVersion::V1 {
+            return Err(Error::invalid_input(format!(
+                "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest default is {effective_version}; V1 and V2 storage versions cannot be mixed"
+            )));
+        }
+        match mode {
+            StorageContractMode::Read => {
+                return Err(Error::invalid_input(format!(
+                    "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest default is {effective_version} and mixed data-file-version capability is not enabled"
+                )));
+            }
+            StorageContractMode::Commit => {}
+            StorageContractMode::Finalize => {
+                manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+                manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+            }
+        }
+    }
+
+    Ok(())
 }
 
-fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
-    let mut fields_by_id: HashMap<i32, (&Field, bool)> = HashMap::new();
+#[cfg(test)]
+pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
+    let fields_by_id = field_column_requirements(manifest);
+    let mut validated_lists = HashSet::new();
+    for fragment in manifest.fragments.iter() {
+        for data_file in fragment.referenced_lance_files() {
+            validate_file_column_indices(
+                &fields_by_id,
+                &mut validated_lists,
+                fragment.id,
+                data_file,
+                data_file.file_version()?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn field_column_requirements(manifest: &Manifest) -> HashMap<i32, (&Field, bool)> {
+    let mut fields_by_id = HashMap::new();
     for field in manifest.schema.fields_pre_order() {
         let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
         fields_by_id
             .entry(field.id)
             .or_insert((field, needs_column));
     }
+    fields_by_id
+}
 
-    let mut validated_lists: HashSet<(usize, usize)> = HashSet::new();
-
-    for fragment in manifest.fragments.iter() {
-        for data_file in &fragment.files {
-            let file_version = data_file.file_version()?;
-            if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
-                continue;
-            }
-            if data_file.fields.len() != data_file.column_indices.len() {
-                return Err(Error::invalid_input(format!(
-                    "Data file '{}' (fragment {}) has {} field ids but {} column indices. These must be the same length.",
-                    data_file.path,
-                    fragment.id,
-                    data_file.fields.len(),
-                    data_file.column_indices.len()
-                )));
-            }
-            if file_version == ConcreteFileVersion::V2_0 {
-                continue;
-            }
-            let list_key = (
-                data_file.fields.as_ptr() as usize,
-                data_file.column_indices.as_ptr() as usize,
-            );
-            if !validated_lists.insert(list_key) {
-                continue;
-            }
-            for (field_id, column_index) in
-                data_file.fields.iter().zip(data_file.column_indices.iter())
-            {
-                let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
-                    continue;
-                };
-                if needs_column && *column_index == -1 {
-                    return Err(Error::invalid_input(format!(
-                        "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
-                        field.name, field_id, data_file.path, fragment.id
-                    )));
-                }
-                if !needs_column && *column_index != -1 {
-                    return Err(Error::invalid_input(format!(
-                        "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) has column_index={}, but non-leaf fields should have column_index=-1 in file format 2.1+.",
-                        field.name, field_id, data_file.path, fragment.id, column_index
-                    )));
-                }
-            }
+fn validate_file_column_indices(
+    fields_by_id: &HashMap<i32, (&Field, bool)>,
+    validated_lists: &mut HashSet<(usize, usize)>,
+    fragment_id: u64,
+    data_file: &DataFile,
+    file_version: ConcreteFileVersion,
+) -> Result<()> {
+    if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
+        return Ok(());
+    }
+    if data_file.fields.len() != data_file.column_indices.len() {
+        return Err(Error::invalid_input(format!(
+            "Data file '{}' (fragment {}) has {} field ids but {} column indices. These must be the same length.",
+            data_file.path,
+            fragment_id,
+            data_file.fields.len(),
+            data_file.column_indices.len()
+        )));
+    }
+    if file_version == ConcreteFileVersion::V2_0 {
+        return Ok(());
+    }
+    let list_key = (
+        data_file.fields.as_ptr() as usize,
+        data_file.column_indices.as_ptr() as usize,
+    );
+    if !validated_lists.insert(list_key) {
+        return Ok(());
+    }
+    for (field_id, column_index) in data_file.fields.iter().zip(data_file.column_indices.iter()) {
+        let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
+            continue;
+        };
+        if needs_column && *column_index == -1 {
+            return Err(Error::invalid_input(format!(
+                "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
+                field.name, field_id, data_file.path, fragment_id
+            )));
+        }
+        if !needs_column && *column_index != -1 {
+            return Err(Error::invalid_input(format!(
+                "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) has column_index={}, but non-leaf fields should have column_index=-1 in file format 2.1+.",
+                field.name, field_id, data_file.path, fragment_id, column_index
+            )));
         }
     }
     Ok(())
@@ -395,10 +601,18 @@ pub async fn write_fragment(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
+            let file_writer_options = builder.file_writer_options();
             builder
                 .write_current_impl(
                     move |object_writer, schema, filename| {
-                        create_current_file_writer(version, object_writer, schema, filename, None)
+                        create_current_file_writer(
+                            version,
+                            object_writer,
+                            schema,
+                            filename,
+                            None,
+                            file_writer_options,
+                        )
                     },
                     stream,
                     schema,
@@ -422,8 +636,15 @@ pub async fn open_writer(
         }
         ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::open_current_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
+                move |object_writer, schema, filename, base_id, options| {
+                    create_current_file_writer(
+                        version,
+                        object_writer,
+                        schema,
+                        filename,
+                        base_id,
+                        options,
+                    )
                 },
                 object_store,
                 schema,
@@ -433,16 +654,36 @@ pub async fn open_writer(
             .await
         }
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            write::open_current_blob_v2_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
-                },
-                object_store,
-                schema,
-                base_dir,
-                options,
-            )
-            .await
+            let create_file_writer = move |object_writer, schema, filename, base_id, options| {
+                create_current_file_writer(
+                    version,
+                    object_writer,
+                    schema,
+                    filename,
+                    base_id,
+                    options,
+                )
+            };
+            if schema.fields_pre_order().any(Field::is_blob_v2) {
+                write::open_current_blob_v2_writer(
+                    version,
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            } else {
+                write::open_current_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            }
         }
     }
 }
@@ -460,16 +701,17 @@ pub async fn open_update_writer(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    let options = WriterOptions::update(
+        dataset.session.store_registry(),
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    );
     open_writer(
         version,
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(
-            dataset.session.store_registry(),
-            external_base_resolver,
-            allow_external_blob_outside_bases,
-        ),
+        options,
     )
     .await
 }
@@ -482,9 +724,23 @@ pub async fn create_fragment_from_file(
     fragment_id: usize,
     physical_rows: Option<usize>,
 ) -> Result<Fragment> {
-    if file_version != dataset_version {
+    let same_family = matches!(
+        (file_version, dataset_version),
+        (ConcreteFileVersion::V1, ConcreteFileVersion::V1)
+            | (
+                ConcreteFileVersion::V2_0
+                    | ConcreteFileVersion::V2_1
+                    | ConcreteFileVersion::V2_2
+                    | ConcreteFileVersion::V2_3,
+                ConcreteFileVersion::V2_0
+                    | ConcreteFileVersion::V2_1
+                    | ConcreteFileVersion::V2_2
+                    | ConcreteFileVersion::V2_3
+            )
+    );
+    if !same_family {
         return Err(Error::invalid_input(format!(
-            "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
+            "File version family mismatch. Dataset default: {:?} Fragment version: {:?}",
             dataset_version, file_version
         )));
     }
@@ -624,6 +880,7 @@ fn is_upcast_downcast_impl(
 
 pub fn validate_nulls(
     version: ConcreteFileVersion,
+    column_name: &str,
     datatype: &DataType,
     has_nulls: bool,
 ) -> Result<()> {
@@ -642,8 +899,8 @@ pub fn validate_nulls(
     };
     if has_nulls && !supported {
         return Err(Error::invalid_input(format!(
-            "Join produced null values for type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
-            datatype, version
+            "Column '{}' has null values of type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
+            column_name, datatype, version
         )));
     }
     Ok(())
@@ -878,37 +1135,47 @@ pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
     }
 }
 
-fn repair_legacy_manifest_storage(manifest: &mut Manifest) -> Result<()> {
-    let declared = manifest.data_storage_format.lance_file_format();
-    if let Some(actual) = Fragment::try_infer_version(&manifest.fragments)
-        .map_err(|error| {
-            Error::internal(format!(
-                "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: {error}"
-            ))
-        })?
-        && actual != ConcreteFileVersion::V1
-    {
-        log::warn!(
-            "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
-            declared,
-            actual
-        );
-        manifest.data_storage_format = DataStorageFormat::new(actual);
-    }
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_ID_FIELD_ID};
+    use rstest::rstest;
 
-fn validate_exact_manifest_storage(
-    manifest: &Manifest,
-    expected: ConcreteFileVersion,
-) -> Result<()> {
-    if let Some(actual) = Fragment::try_infer_version(&manifest.fragments)?
-        && actual != expected
-    {
-        return Err(Error::internal(format!(
-            "The operation added files with version {}. However, the data storage version is {}.",
-            actual, expected
-        )));
+    fn lance_field(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+        let mut field = Field::try_from(&ArrowField::new(name, data_type, nullable)).unwrap();
+        field.id = id;
+        field
     }
-    Ok(())
+
+    #[rstest]
+    #[case::uint64(DataType::UInt64, false, true)]
+    #[case::not_uint64(DataType::Int64, false, false)]
+    #[case::nullable(DataType::UInt64, true, false)]
+    fn split_row_lineage_fields_keys_on_reserved_ids(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] valid: bool,
+    ) {
+        let key = lance_field("i", DataType::Int32, false, 0);
+        // A user column that only shares a lineage column's name keeps its own
+        // id, so it stays with the fields checked against the dataset schema.
+        let named_like_lineage = lance_field(ROW_CREATED_AT_VERSION, DataType::UInt64, true, 1);
+        let hidden = lance_field(ROW_ID, data_type, nullable, ROW_ID_FIELD_ID);
+        let schema = Schema {
+            fields: vec![key.clone(), named_like_lineage.clone(), hidden.clone()],
+            metadata: HashMap::new(),
+        };
+
+        let result = split_row_lineage_fields(schema);
+        if !valid {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Internal { .. }), "{error}");
+            assert!(error.to_string().contains("non-nullable UInt64"), "{error}");
+            return;
+        }
+        let (user, lineage) = result.unwrap();
+        assert_eq!(user.fields, vec![key, named_like_lineage]);
+        // Split out with its reserved id intact.
+        assert_eq!(lineage, vec![hidden]);
+    }
 }

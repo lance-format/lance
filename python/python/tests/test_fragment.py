@@ -21,7 +21,7 @@ from lance import (
     write_dataset,
 )
 from lance.debug import format_fragment
-from lance.file import LanceFileWriter
+from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -143,6 +143,75 @@ def test_write_fragments(tmp_path: Path):
     # progress hook was called for each fragment
     assert progress.begin_called == 2
     assert progress.complete_called == 2
+
+
+def _write_single_fragment(write_api, batches, uri, **kwargs):
+    schema = pa.schema([pa.field("a", pa.int64())])
+    reader = pa.RecordBatchReader.from_batches(
+        schema,
+        [pa.record_batch([pa.array(values)], schema=schema) for values in batches],
+    )
+    if write_api == "dataset":
+        dataset = write_dataset(reader, uri, **kwargs)
+        return dataset.get_fragments()[0].metadata
+    return write_fragments(reader, uri, **kwargs)[0]
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+@pytest.mark.parametrize(
+    "options,batches,expected_pages",
+    [
+        pytest.param(
+            {"data_cache_bytes": 1},
+            [[1, 2, 3], [4, 5, 6]],
+            2,
+            id="data-cache",
+        ),
+        pytest.param(
+            {"max_page_bytes": 1},
+            [[1, 2, 3]],
+            3,
+            id="max-page",
+        ),
+    ],
+)
+def test_write_page_options(
+    tmp_path: Path, write_api, options, batches, expected_pages
+):
+    fragment = _write_single_fragment(
+        write_api,
+        batches,
+        tmp_path,
+        data_storage_version="2.0",
+        **options,
+    )
+    data_file = tmp_path / "data" / fragment.files[0].path
+    metadata = LanceFileReader(str(data_file)).metadata()
+    assert len(metadata.columns[0].pages) == expected_pages
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+def test_write_rejects_zero_max_page_bytes(tmp_path: Path, write_api):
+    with pytest.raises(OSError, match="max_page_bytes must be greater than 0, got 0"):
+        _write_single_fragment(
+            write_api,
+            [[1, 2, 3]],
+            tmp_path,
+            data_storage_version="2.0",
+            max_page_bytes=0,
+        )
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+def test_write_page_options_ignored_for_legacy(tmp_path: Path, write_api):
+    fragment = _write_single_fragment(
+        write_api,
+        [[1, 2, 3]],
+        tmp_path,
+        data_storage_version="legacy",
+        max_page_bytes=0,
+    )
+    assert fragment.physical_rows == 3
 
 
 def test_write_fragments_schema_holes(tmp_path: Path):
@@ -323,7 +392,7 @@ def test_mixed_fragment_versions(tmp_path):
 
     # Attempt to commit
     operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
-    with pytest.raises(OSError, match="All data files must have the same version"):
+    with pytest.raises(OSError, match="Dataset snapshot mixes V1 and V2 data files"):
         lance.LanceDataset.commit(ds.uri, operation)
 
 
@@ -451,6 +520,22 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows() == 800
     assert fragments[0].count_rows("a < 200") == 200
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
+
+
+def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+    fragment = dataset.get_fragments()[0]
+    expression = pc.field("s") != "C:\\temp"
+
+    assert dataset.count_rows(filter=expression) == 2
+    assert fragment.count_rows(expression) == 1
+    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
+    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
+        "id"
+    ].to_pylist() == [0]
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
@@ -833,6 +918,54 @@ def test_fragment_update_columns_partial_update(tmp_path):
     assert result["city"] == ["NYC", "LA", "SF"]  # Unchanged
 
 
+def test_fragment_update_columns_with_offsets_rewrite_columns(tmp_path):
+    """update_columns(with_offsets=True) returns matched row offsets that a
+    rewrite_columns commit uses to refresh row version metadata for the
+    matched rows only."""
+    data = pa.table(
+        {
+            "id": list(range(8)),
+            "value": [i * 10 for i in range(8)],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_with_offsets"
+    dataset = lance.write_dataset(
+        data, dataset_uri, max_rows_per_file=4, enable_stable_row_ids=True
+    )
+    assert len(dataset.get_fragments()) == 2
+
+    # Update two rows of the second fragment, joining on a user column.
+    fragment = dataset.get_fragments()[1]
+    update_data = pa.table({"id": [5, 7], "value": [500, 700]})
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data, left_on="id", with_offsets=True
+    )
+    # Portable RoaringBitmap serialization of {1, 3}: ids 5 and 7 sit at those
+    # physical offsets within the second fragment.
+    assert matched_offsets == (
+        b"\x3a\x30\x00\x00\x01\x00\x00\x00\x00\x00\x01\x00"
+        b"\x10\x00\x00\x00\x01\x00\x03\x00"
+    )
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets={updated_fragment.id: matched_offsets},
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["id", "value", "_row_last_updated_at_version"]
+    ).sort_by("id")
+    assert result["value"].to_pylist() == [0, 10, 20, 30, 40, 500, 60, 700]
+    # Only the matched rows carry the commit's version.
+    versions = result["_row_last_updated_at_version"].to_pylist()
+    assert versions == [1, 1, 1, 1, 1, 2, 1, 2]
+
+
 def test_fragment_update_columns_no_match(tmp_path):
     """Test update when no rows match the join condition."""
     # Create initial dataset
@@ -857,7 +990,10 @@ def test_fragment_update_columns_no_match(tmp_path):
 
     # Get the fragment and update columns
     fragment = dataset.get_fragment(0)
-    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data, with_offsets=True
+    )
+    assert matched_offsets == b"\x3a\x30\x00\x00\x00\x00\x00\x00"
 
     # Commit the changes
 
@@ -1496,3 +1632,42 @@ def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
     small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
     assert len(small_budget) > len(default_batches)
     assert pa.Table.from_batches(small_budget) == fragment.to_table()
+
+
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_merge_commits_staged_new_fragments(
+    tmp_path: Path, enable_stable_row_ids: bool
+):
+    # Regression test for https://github.com/lance-format/lance/issues/7702: a
+    # Merge that introduces staged fragments must assign fresh fragment ids
+    # and, on stable row id datasets, row ids at commit time.
+    tab = pa.table({"id": [1, 2, 3, 4], "v": [10, 20, 30, 40]})
+    ds = write_dataset(
+        tab,
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    new_frags = write_fragments(pa.table({"id": [5, 6], "v": [50, 60]}), tmp_path)
+    assert all(f.id == 0 for f in new_frags)
+
+    if enable_stable_row_ids:
+        pre = ds.to_table(with_row_id=True)
+        pre_row_ids = dict(zip(pre["id"].to_pylist(), pre["_rowid"].to_pylist()))
+
+    all_frags = [f.metadata for f in ds.get_fragments()] + list(new_frags)
+    merge = lance.LanceOperation.Merge(all_frags, ds.lance_schema)
+    ds = lance.LanceDataset.commit(tmp_path, merge, read_version=ds.version)
+
+    frag_ids = [f.fragment_id for f in ds.get_fragments()]
+    assert frag_ids == [0, 1, 2]
+    table = ds.to_table(with_row_id=True)
+    assert sorted(table["id"].to_pylist()) == [1, 2, 3, 4, 5, 6]
+    row_ids = table["_rowid"].to_pylist()
+    assert len(set(row_ids)) == 6
+    if enable_stable_row_ids:
+        assert sorted(row_ids) == list(range(6))
+        assert all(f.metadata.row_id_meta is not None for f in ds.get_fragments())
+        # Pre-existing rows keep their exact row ids through the merge.
+        post_row_ids = dict(zip(table["id"].to_pylist(), row_ids))
+        assert {i: post_row_ids[i] for i in pre_row_ids} == pre_row_ids

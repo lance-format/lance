@@ -4,13 +4,12 @@
 //! Integrity checks for the stable row id invariants that the row id index and the write
 //! paths rely on. Reached through [`Dataset::validate`].
 
-use super::load_row_id_sequence;
+use super::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::FileFragment;
 use crate::{Error, Result};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
-use lance_table::format::RowDatasetVersionMeta;
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringTreemap;
 use std::sync::Arc;
@@ -75,14 +74,20 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
             )));
         }
 
-        for (name, meta) in [
-            ("created_at", &metadata.created_at_version_meta),
-            ("last_updated_at", &metadata.last_updated_at_version_meta),
+        for (name, kind) in [
+            ("created_at", RowVersionKind::CreatedAt),
+            ("last_updated_at", RowVersionKind::LastUpdatedAt),
         ] {
-            // Only inline version metadata can be read back; nothing writes the
-            // external form yet.
-            if let Some(meta @ RowDatasetVersionMeta::Inline(_)) = meta {
-                let versions = meta.load_sequence()?.len();
+            // The external form is a valid encoding nothing writes and nothing
+            // can read yet, so it is the one placement not checked here.
+            if let Some(versions) = load_row_version_sequence(dataset, metadata, kind)
+                .await
+                .or_else(|error| match error {
+                    Error::NotSupported { .. } => Ok(None),
+                    other => Err(other),
+                })?
+            {
+                let versions = versions.len();
                 if versions != physical_rows {
                     return Err(corrupt(format!(
                         "Fragment {} has {} {} versions, but {} physical rows, in dataset {:?}",
@@ -159,6 +164,7 @@ fn describe_first_live_slot(fragments: &[FragmentRowIds], row_id: u64) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_table::format::RowDatasetVersionMeta;
 
     // Shared with the row id tests next door, which cover the same operations.
     use super::super::test::{compact, delete};

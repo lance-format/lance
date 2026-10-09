@@ -1609,4 +1609,33 @@ mod tests {
             prop_assert!(error_message.contains(&expected_message));
         }
     }
+
+    #[test]
+    fn test_index_resolves_range_segments() {
+        let live: Vec<u64> = (1000..3000u64)
+            .filter(|v| !(1200..1900).contains(v))
+            .collect();
+        let mut runs_sequence = RowIdSequence::from(live.as_slice());
+        assert!(runs_sequence.use_range_segments());
+        let index = RowIdIndex::new(&[fragment(7, runs_sequence)]).unwrap();
+        for (position, &row_id) in live.iter().enumerate() {
+            assert_eq!(
+                index.get(row_id).unwrap(),
+                Some(RowAddress::new_from_parts(7, position as u32)),
+                "row id {row_id}"
+            );
+        }
+        assert_eq!(index.get(1500).unwrap(), None);
+        let addr = |position: u32| Some(RowAddress::new_from_parts(7, position));
+        assert_eq!(
+            index.get_many(&[2999, 1000, 1199, 1900, 1500]).unwrap(),
+            vec![
+                addr(live.len() as u32 - 1),
+                addr(0),
+                addr(199),
+                addr(200),
+                None
+            ]
+        );
+    }
 }

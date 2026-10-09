@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::VectorQuery;
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance column name in output.
@@ -228,6 +229,7 @@ impl VectorIndexExec {
 
         for (batch_id, rows_with_dist) in batches_data {
             if let Some(stored) = self.batch_store.get(batch_id) {
+                let data = scan_record_batch(&stored.data)?;
                 let rows: Vec<u32> = rows_with_dist.iter().map(|&(r, _, _)| r as u32).collect();
                 let distances: Vec<f32> = rows_with_dist.iter().map(|&(_, d, _)| d).collect();
                 let row_positions: Vec<u64> =
@@ -235,8 +237,7 @@ impl VectorIndexExec {
 
                 let indices = arrow_array::UInt32Array::from(rows);
 
-                let mut columns: Vec<Arc<dyn arrow_array::Array>> = stored
-                    .data
+                let mut columns: Vec<Arc<dyn arrow_array::Array>> = data
                     .columns()
                     .iter()
                     .map(|col| arrow_select::take::take(col.as_ref(), &indices, None).unwrap())
@@ -246,9 +247,15 @@ impl VectorIndexExec {
                 columns.push(Arc::new(Float32Array::from(distances)));
 
                 // Apply projection if needed (excluding distance column which is always included)
+                let source_schema = data.schema();
                 let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
+                    let mut projected: Vec<_> = take_projected_columns(
+                        &columns,
+                        source_schema.fields(),
+                        proj_indices,
+                        self.output_schema.as_ref(),
+                        row_positions.len(),
+                    )?;
                     // Always include distance as last column
                     projected.push(columns.last().unwrap().clone());
                     projected
@@ -349,7 +356,7 @@ impl ExecutionPlan for VectorIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 

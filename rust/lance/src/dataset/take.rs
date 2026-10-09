@@ -620,19 +620,23 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        Int32Array, LargeBinaryArray, ListArray, RecordBatchIterator, StringArray, StructArray,
+        Int32Array, LargeBinaryArray, ListArray, MapArray, RecordBatchIterator, StringArray,
+        StructArray,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
     use lance_arrow::ARROW_EXT_NAME_KEY;
-    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
 
-    use crate::dataset::{WriteParams, scanner::test_dataset::TestVectorDataset};
+    use crate::dataset::{
+        MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
+        scanner::test_dataset::TestVectorDataset,
+    };
 
     use super::*;
 
@@ -658,70 +662,127 @@ mod test {
         .unwrap()
     }
 
-    fn nested_arrow_json_batch() -> RecordBatch {
-        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, false));
-        let mut metadata = HashMap::new();
-        metadata.insert(
+    /// How a nested field carries one Arrow JSON document per row.
+    #[derive(Clone, Copy, Debug)]
+    enum NestedJson {
+        /// `struct<doc: json>`
+        Struct,
+        /// `list<struct<doc: json>>` with one element per row
+        ListOfStruct,
+        /// `map<string, json>` with one entry per row
+        Map,
+    }
+
+    fn arrow_json_field(name: &str) -> ArrowField {
+        ArrowField::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
             ARROW_EXT_NAME_KEY.to_string(),
             ARROW_JSON_EXT_NAME.to_string(),
-        );
-        let extra_field =
-            Arc::new(ArrowField::new("extra", DataType::Utf8, true).with_metadata(metadata));
-        let item_fields = Fields::from(vec![uri_field, extra_field]);
-        let values = StructArray::new(
-            item_fields.clone(),
+        )]))
+    }
+
+    fn nested_json_array(shape: NestedJson, docs: &[String]) -> ArrayRef {
+        let docs: ArrayRef = Arc::new(StringArray::from_iter_values(docs));
+        let one_per_row = || OffsetBuffer::from_lengths(std::iter::repeat_n(1, docs.len()));
+        let doc_struct = || {
+            StructArray::new(
+                Fields::from(vec![arrow_json_field("doc")]),
+                vec![docs.clone()],
+                None,
+            )
+        };
+        match shape {
+            NestedJson::Struct => Arc::new(doc_struct()),
+            NestedJson::ListOfStruct => {
+                let values = doc_struct();
+                let item = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+                Arc::new(ListArray::new(item, one_per_row(), Arc::new(values), None))
+            }
+            NestedJson::Map => {
+                let keys: ArrayRef = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "k",
+                    docs.len(),
+                )));
+                let entry_fields = Fields::from(vec![
+                    ArrowField::new("key", DataType::Utf8, false),
+                    arrow_json_field("value"),
+                ]);
+                let entries = StructArray::new(entry_fields, vec![keys, docs.clone()], None);
+                let entries_field = Arc::new(ArrowField::new(
+                    "entries",
+                    entries.data_type().clone(),
+                    false,
+                ));
+                Arc::new(MapArray::new(
+                    entries_field,
+                    one_per_row(),
+                    entries,
+                    None,
+                    false,
+                ))
+            }
+        }
+    }
+
+    /// The JSON leaf of `payload`, which a read must return as Arrow JSON.
+    fn nested_json_leaf(shape: NestedJson, payload: &ArrowField) -> ArrowField {
+        let child = |data_type: &DataType| match data_type {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("expected struct, got {other}"),
+        };
+        match (shape, payload.data_type()) {
+            (NestedJson::Struct, DataType::Struct(fields)) => fields[0].as_ref().clone(),
+            (NestedJson::ListOfStruct, DataType::List(item)) => {
+                child(item.data_type())[0].as_ref().clone()
+            }
+            (NestedJson::Map, DataType::Map(entries, _)) => {
+                child(entries.data_type())[1].as_ref().clone()
+            }
+            (shape, other) => panic!("unexpected {shape:?} payload type {other}"),
+        }
+    }
+
+    fn nested_json_doc(shape: NestedJson, payload: &ArrayRef, row: usize) -> String {
+        let docs = match shape {
+            NestedJson::Struct => payload.as_struct().column(0).clone(),
+            NestedJson::ListOfStruct => payload
+                .as_list::<i32>()
+                .value(row)
+                .as_struct()
+                .column(0)
+                .clone(),
+            NestedJson::Map => payload.as_map().value(row).column(1).clone(),
+        };
+        let row = if matches!(shape, NestedJson::Struct) {
+            row
+        } else {
+            0
+        };
+        docs.as_string::<i32>().value(row).to_string()
+    }
+
+    /// Rows `(id, label, payload)` whose payload holds `{"v":<version>}`.
+    fn nested_json_batch(shape: NestedJson, ids: &[i32], version: i32) -> RecordBatch {
+        let docs = ids
+            .iter()
+            .map(|id| format!(r#"{{"v":{}}}"#, version + id))
+            .collect::<Vec<_>>();
+        let payload = nested_json_array(shape, &docs);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("label", DataType::Utf8, true),
+            ArrowField::new("payload", payload.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
             vec![
-                Arc::new(StringArray::from(vec![Some("a.jpg"), Some("b.jpg")])) as ArrayRef,
-                Arc::new(StringArray::from(vec![
-                    Some(r#"{"codec":"h264"}"#),
-                    None::<&str>,
-                ])) as ArrayRef,
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from_iter_values(
+                    ids.iter().map(|_| "original"),
+                )),
+                payload,
             ],
-            None,
-        );
-        let item = Arc::new(ArrowField::new("item", DataType::Struct(item_fields), true));
-        let media = ListArray::new(
-            item,
-            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
-            Arc::new(values),
-            None,
-        );
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "media",
-            media.data_type().clone(),
-            true,
-        )]));
-
-        RecordBatch::try_new(schema, vec![Arc::new(media) as ArrayRef]).unwrap()
-    }
-
-    fn assert_nested_arrow_json_schema(batch: &RecordBatch) {
-        let schema = batch.schema();
-        let DataType::List(item) = schema.field(0).data_type() else {
-            panic!("expected list field");
-        };
-        let DataType::Struct(fields) = item.data_type() else {
-            panic!("expected struct item");
-        };
-        assert!(is_arrow_json_field(&fields[1]));
-    }
-
-    fn assert_first_nested_json_value(batch: &RecordBatch) {
-        let media: &ListArray = batch.column(0).as_list();
-        let values = media.values().as_struct();
-        let uri = values
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let extra = values
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-
-        assert_eq!(uri.value(0), "a.jpg");
-        assert!(extra.value(0).contains("h264"));
+        )
+        .unwrap()
     }
 
     #[rstest]
@@ -780,39 +841,109 @@ mod test {
         );
     }
 
+    /// Nested Arrow JSON must be stored as JSONB by every write path and read
+    /// back as Arrow JSON. Maps need file format 2.2.
     #[rstest]
+    #[case::struct_json(NestedJson::Struct)]
+    #[case::list_struct_json(NestedJson::ListOfStruct)]
+    #[case::map_string_json(NestedJson::Map)]
     #[tokio::test]
-    async fn test_take_nested_arrow_json_returns_logical_schema(
-        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+    async fn test_nested_arrow_json_write_paths(
+        #[case] shape: NestedJson,
+        #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
         data_storage_version: LanceFileVersion,
     ) {
-        let data = nested_arrow_json_batch();
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
-            enable_stable_row_ids: false,
             ..Default::default()
         };
-        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
-        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+        let created = nested_json_batch(shape, &[0, 1], 0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(created.clone())], created.schema()),
+            "memory://",
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        let appended = nested_json_batch(shape, &[2, 3], 0);
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+                Some(write_params),
+            )
             .await
             .unwrap();
-        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let stored_schema = ArrowSchema::from(dataset.schema());
+        assert!(is_json_field(&nested_json_leaf(
+            shape,
+            stored_schema.field_with_name("payload").unwrap()
+        )));
 
-        let values = dataset.take(&[0], projection.clone()).await.unwrap();
-        assert_nested_arrow_json_schema(&values);
-        assert_first_nested_json_value(&values);
+        // Rewrites the row with id 1, JSON payload included, into a new fragment.
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 1")
+            .unwrap()
+            .set("label", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
 
-        let empty = dataset.take(&[], projection.clone()).await.unwrap();
+        // A sub-schema source rewrites the payload column in place: every row of
+        // the appended fragment, and one row of the created fragment.
+        let source = nested_json_batch(shape, &[0, 2, 3], 100)
+            .project(&[0, 2])
+            .unwrap();
+        let mut merge = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let (dataset, stats) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 3);
+
+        let projection = Schema::try_from(created.schema().as_ref()).unwrap();
+        let values = dataset
+            .take(&[0, 1, 2, 3], projection.clone())
+            .await
+            .unwrap();
+        let values_schema = values.schema();
+        let payload_field = values_schema.field_with_name("payload").unwrap();
+        assert!(is_arrow_json_field(&nested_json_leaf(shape, payload_field)));
+        let ids = values["id"].as_primitive::<arrow_array::types::Int32Type>();
+        let labels = values["label"].as_string::<i32>();
+        let mut rows = (0..values.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row),
+                    labels.value(row).to_string(),
+                    nested_json_doc(shape, &values["payload"], row),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        let expected = [
+            (0, "original", r#"{"v":100}"#),
+            (1, "updated", r#"{"v":1}"#),
+            (2, "original", r#"{"v":102}"#),
+            (3, "original", r#"{"v":103}"#),
+        ]
+        .map(|(id, label, doc)| (id, label.to_string(), doc.to_string()));
+        assert_eq!(rows, expected);
+
+        let empty = dataset.take(&[], projection).await.unwrap();
         assert_eq!(empty.num_rows(), 0);
-        assert_nested_arrow_json_schema(&empty);
-
-        let values = dataset.take_rows(&[0], projection.clone()).await.unwrap();
-        assert_nested_arrow_json_schema(&values);
-        assert_first_nested_json_value(&values);
-
-        let empty = dataset.take_rows(&[], projection).await.unwrap();
-        assert_eq!(empty.num_rows(), 0);
-        assert_nested_arrow_json_schema(&empty);
+        assert_eq!(empty.schema(), values_schema);
     }
 
     #[tokio::test]
@@ -910,7 +1041,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_reject_legacy_blob_schema_on_v2_2() {
+    async fn test_take_legacy_blob_input_on_v2_2() {
         let mut metadata = HashMap::new();
         metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
 
@@ -931,12 +1062,16 @@ mod test {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(batch)], schema);
-        let err = Dataset::write(batches, "memory://", Some(write_params))
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Legacy blob columns"));
-        assert!(msg.contains("lance.blob.v2"));
+        let dataset = Arc::new(
+            Dataset::write(batches, "memory://", Some(write_params))
+                .await
+                .unwrap(),
+        );
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"hello"
+        );
     }
 
     #[tokio::test]

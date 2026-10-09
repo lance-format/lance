@@ -89,7 +89,11 @@ use std::sync::Arc;
 
 use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
-use super::rowids::load_row_id_sequences;
+use super::rowids::RowVersionKind;
+use super::rowids::{
+    RowLineage, RowLineagePlan, RowLineageSpill, inline_row_lineage_max_bytes,
+    load_row_id_sequences, load_row_version_sequence, place_row_lineage, plan_row_lineage_spill,
+};
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -101,9 +105,10 @@ use super::{
 };
 use crate::Dataset;
 use crate::Result;
+use crate::dataset::rowids::load_row_id_index_for_fragments;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
-use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
+use crate::index::{DatasetIndexInternalExt, index_is_usable, load_all_indices};
+use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
@@ -126,10 +131,16 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
+use lance_table::format::{
+    Fragment, IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionSequence,
+};
+use lance_table::rowids::RowIdSequence;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -306,6 +317,21 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
+    /// Exact data file version for compacted output.
+    ///
+    /// If omitted, use the dataset's default write version without changing it.
+    /// The planner resolves release selectors before distributing tasks.
+    /// Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::dataset::optimize::CompactionOptions;
+    /// # use lance_file::version::LanceFileVersion;
+    /// let options = CompactionOptions {
+    ///     data_storage_version: Some(LanceFileVersion::V2_2),
+    ///     ..Default::default()
+    /// };
+    /// ```
+    pub data_storage_version: Option<LanceFileVersion>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -339,6 +365,7 @@ impl Default for CompactionOptions {
             max_source_bytes: None,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
+            data_storage_version: None,
             transaction_properties: None,
         }
     }
@@ -368,6 +395,7 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
+    /// - `lance.compaction.data_storage_version`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -461,6 +489,14 @@ impl CompactionOptions {
                 }
                 "compaction_mode" => {
                     self.compaction_mode = Some(CompactionMode::try_from(value.as_str())?);
+                }
+                "data_storage_version" => {
+                    self.data_storage_version = Some(value.parse().map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}': {}",
+                            key, value, error
+                        ))
+                    })?);
                 }
                 "binary_copy_read_batch_bytes" => {
                     self.binary_copy_read_batch_bytes = Some(value.parse().map_err(|_| {
@@ -559,6 +595,12 @@ impl CompactionOptions {
         self.transaction_properties = Some(Arc::new(properties));
         self
     }
+
+    fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
+        self.data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+    }
 }
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
@@ -578,13 +620,28 @@ async fn can_use_binary_copy(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
-    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let version = options.write_version(dataset);
     versions::can_use_binary_copy(version, dataset, options, fragments)
         .await
         .unwrap_or_else(|err| {
             log::warn!("Binary copy disabled due to error: {}", err);
             false
         })
+}
+
+fn first_binary_copy_version_mismatch(
+    fragments: &[Fragment],
+    target: ConcreteFileVersion,
+) -> Result<Option<(String, ConcreteFileVersion)>> {
+    for fragment in fragments {
+        for data_file in fragment.referenced_lance_files() {
+            let actual = data_file.file_version()?;
+            if actual != target {
+                return Ok(Some((data_file.path.clone(), actual)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(super) async fn can_use_binary_copy_current(
@@ -635,6 +692,14 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
     for fragment in fragments {
+        // Binary copy only reads base files; overlays must be materialized by the scanner.
+        if !fragment.overlays.is_empty() {
+            log::debug!(
+                "Binary copy disabled: fragment {} has data overlays",
+                fragment.id
+            );
+            return Ok(false);
+        }
         if fragment.deletion_file.is_some() {
             log::debug!(
                 "Binary copy disabled: fragment {} has a deletion file",
@@ -751,14 +816,12 @@ impl DefaultCompactionPlanner {
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
-        if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
-            return Err(Error::invalid_input(
-                "defer_index_remap=true is not supported on datasets with stable row IDs: \
-                 stable row IDs do not require index remapping during compaction, so there \
-                 is nothing to defer."
-                    .to_string(),
-            ));
-        }
+        let write_version = self.options.write_version(dataset);
+        versions::validate_write_version(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            write_version,
+        )?;
+        reject_deferred_remap_with_row_id_indices(dataset, &self.options).await?;
 
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
@@ -820,6 +883,19 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 .collect::<Vec<_>>()
         };
 
+        let schema_field_ids = dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        // Only reencoding reclaims a lineage carrier whose user columns are
+        // gone: its fields are not the schema's, so binary copy never applies
+        // to it, and under `ForceBinaryCopy` its task would fail the whole run.
+        let is_binary_copy_only = matches!(
+            self.options.compaction_mode(),
+            CompactionMode::ForceBinaryCopy
+        );
+
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
         let mut i = 0;
@@ -844,6 +920,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             let candidacy = if over_overlay_limit {
                 // Too many overlays: fully compact this fragment on its own,
                 // regardless of its size or deletion count.
+                Some(CompactionCandidacy::CompactItself)
+            } else if !is_binary_copy_only
+                && pins_dead_user_columns_for_lineage(&fragment, &schema_field_ids)
+            {
+                // Only a rewrite moves the row lineage out of a file whose
+                // user columns are all gone and lets the file go.
                 Some(CompactionCandidacy::CompactItself)
             } else if self.options.materialize_deletions
                 && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
@@ -924,8 +1006,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        let mut compaction_plan =
-            CompactionPlan::new(dataset.manifest.version, self.options.clone());
+        let mut options = self.options.clone();
+        options.data_storage_version = Some(write_version.to_selector());
+        let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
         Ok(compaction_plan)
@@ -958,6 +1041,27 @@ pub async fn compact_files_with_planner(
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+
+    // A tagged FRI history is maintained by appending transitions to the
+    // tagged entry, which only the deferred-remap commit path does; eager
+    // remapping would rewrite provenance the tagged reader depends on.
+    // Checked before any file is rewritten (commit_compaction re-checks for
+    // callers that commit externally planned results).
+    if !compaction_plan.options.defer_index_remap
+        && dataset.manifest.writer_feature_flags
+            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
+            != 0
+        && crate::index::load_all_indices(dataset)
+            .await?
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    {
+        return Err(Error::not_supported(
+            "Compacting a table with a tagged fragment reuse history requires \
+             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
+             remaps tagged histories eagerly",
+        ));
+    }
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
@@ -1021,6 +1125,43 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     Ok(FragmentMetrics {
         physical_rows,
         num_deletions,
+    })
+}
+
+/// Whether one of `fragment`'s data files is referenced only for the row
+/// lineage columns it carries, while the user columns next to them have all
+/// been dropped or replaced. `schema_field_ids` holds the ids of the schema's
+/// fields.
+///
+/// Compaction writes spilled lineage into the data file of each fragment it
+/// writes. Once every user column in that file is dropped, cast or replaced,
+/// the lineage alone keeps the file, and its dead bytes, referenced: cleanup
+/// cannot remove it and nothing else rewrites it. A lineage-only file, which
+/// binary copy and update write, holds no dead user column and never matches;
+/// nor does any file compaction writes, so compacting a fragment that matches
+/// cannot leave one that matches again.
+fn pins_dead_user_columns_for_lineage(
+    fragment: &Fragment,
+    schema_field_ids: &HashSet<i32>,
+) -> bool {
+    fragment.files.iter().any(|file| {
+        let mut holds_dead_user_column = false;
+        let mut holds_lineage = false;
+        for field_id in file.fields.iter() {
+            if schema_field_ids.contains(field_id) {
+                return false;
+            }
+            match *field_id {
+                ROW_ID_FIELD_ID
+                | ROW_CREATED_AT_VERSION_FIELD_ID
+                | ROW_LAST_UPDATED_AT_VERSION_FIELD_ID => holds_lineage = true,
+                TOMBSTONE_FIELD_ID => holds_dead_user_column = true,
+                // A user field the schema no longer has: dropping a column
+                // leaves the ids of the files it keeps as they are.
+                other => holds_dead_user_column |= other >= 0,
+            }
+        }
+        holds_dead_user_column && holds_lineage
     })
 }
 
@@ -1500,7 +1641,11 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
-    fn try_new(field: &LanceField, input_field: &ArrowField) -> Result<Self> {
+    fn try_new(
+        field: &LanceField,
+        input_field: &ArrowField,
+        preserve_managed: bool,
+    ) -> Result<Self> {
         if !field_contains_blob_v2(field) {
             return Ok(Self::passthrough(input_field));
         }
@@ -1513,6 +1658,13 @@ impl BlobV2FieldRewritePlan {
                 ))
             })?;
             let ArrowDataType::Struct(input_children) = input_field.data_type() else {
+                // Legacy blob bytes: the writer converts them to Blob v2.
+                if matches!(
+                    input_field.data_type(),
+                    ArrowDataType::Binary | ArrowDataType::LargeBinary
+                ) {
+                    return Ok(Self::passthrough(input_field));
+                }
                 return Err(Error::invalid_input(format!(
                     "Blob v2 field '{}' has non-struct input type {:?}",
                     field.name,
@@ -1521,9 +1673,14 @@ impl BlobV2FieldRewritePlan {
             };
             let output_field = match BlobV2Layout::classify(input_children) {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
-                Some(BlobV2Layout::Descriptor) => {
-                    transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone())
-                }
+                Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
+                    field,
+                    if preserve_managed {
+                        lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone()
+                    } else {
+                        BLOB_V2_LOGICAL_TYPE.clone()
+                    },
+                ),
                 Some(actual) => {
                     return Err(Error::invalid_input(format!(
                         "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
@@ -1558,7 +1715,7 @@ impl BlobV2FieldRewritePlan {
                     .children
                     .iter()
                     .zip(input_children.iter())
-                    .map(|(child, input_child)| Self::try_new(child, input_child))
+                    .map(|(child, input_child)| Self::try_new(child, input_child, preserve_managed))
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()
@@ -1580,7 +1737,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, preserve_managed)?);
                 Ok(Self::List {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1597,7 +1754,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, preserve_managed)?);
                 Ok(Self::LargeList {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1636,12 +1793,15 @@ impl BlobV2FieldRewritePlan {
                 Self::Blob {
                     field_id,
                     field_name,
-                    ..
+                    output_field,
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
+                            if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
+                                return super::blob::preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                            }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
                             let classification =
@@ -1807,6 +1967,7 @@ impl BlobV2BatchRewritePlan {
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
+        preserve_managed: bool,
     ) -> Result<Self> {
         let row_addr_idx = input_schema
             .column_with_name(lance_core::ROW_ADDR)
@@ -1828,7 +1989,7 @@ impl BlobV2BatchRewritePlan {
                 continue;
             }
             let field_plan = if let Some(field) = schema.field(input_field.name()) {
-                BlobV2FieldRewritePlan::try_new(field, input_field)?
+                BlobV2FieldRewritePlan::try_new(field, input_field, preserve_managed)?
             } else {
                 BlobV2FieldRewritePlan::passthrough(input_field)
             };
@@ -1888,7 +2049,8 @@ pub(crate) async fn transform_blob_v2_batch(
     batch: RecordBatch,
     keep_row_addr: bool,
 ) -> Result<RecordBatch> {
-    let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
+    let plan =
+        BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr, false)?;
     plan.transform_batch(dataset, batch).await
 }
 
@@ -2189,6 +2351,41 @@ async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, R
     Ok(coverage)
 }
 
+/// Indexes that use the row ids instead of row addresses.
+///
+/// Row id indexes are a legacy we are migrating away from.  These are not compatible
+/// with stable row id and the fragment reuse index.
+async fn row_id_domain_indices(dataset: &Dataset) -> Result<Vec<String>> {
+    Ok(load_all_indices(dataset)
+        .await?
+        .iter()
+        .filter(|index| !is_system_index(index) && !index.results_are_row_addrs())
+        .map(|index| index.name.clone())
+        .collect())
+}
+
+/// Refuse a deferred remap that would strand a row-id-domain index under an FRI.
+async fn reject_deferred_remap_with_row_id_indices(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+) -> Result<()> {
+    if !options.defer_index_remap || !dataset.manifest.uses_stable_row_ids() {
+        return Ok(());
+    }
+    let blocked = row_id_domain_indices(dataset).await?;
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "defer_index_remap=true is not supported on a dataset with stable row IDs that carries \
+         index(es) {:?}: those report matches as row ids, which a rewrite leaves valid, while the \
+         fragment-reuse index a deferred remap writes remaps row addresses. Applying it to them \
+         would corrupt them. Compact without defer_index_remap, which keeps their row ids and \
+         costs only the coverage of any address-domain index.",
+        blocked,
+    )))
+}
+
 /// Refuse a plan that rewrites fragments an index this build cannot read covers.
 ///
 /// [`DefaultCompactionPlanner`] keeps those fragments out of the plan, but
@@ -2254,10 +2451,11 @@ pub struct RewriteResult {
     pub row_addrs: Option<Vec<u8>>,
 }
 
+/// Returns the version the reservation committed at; `dataset` is not moved to it.
 async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
-) -> Result<()> {
+) -> Result<u64> {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {
@@ -2273,7 +2471,7 @@ async fn reserve_fragment_ids(
         &transaction,
         &Default::default(),
         &Default::default(),
-        DEFAULT_COMMIT_RETRY_TIMEOUT,
+        default_commit_retry_timeout(),
         dataset.manifest_location.naming_scheme,
         None,
     )
@@ -2287,7 +2485,7 @@ async fn reserve_fragment_ids(
         fragment.id = new_id as u64;
     }
 
-    Ok(())
+    Ok(manifest.version)
 }
 
 /// Rewrite the files in a single task.
@@ -2299,6 +2497,11 @@ async fn rewrite_files(
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
+    let write_version = options.write_version(dataset.as_ref());
+    versions::validate_write_version(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        write_version,
+    )?;
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -2326,10 +2529,14 @@ async fn rewrite_files(
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
     // Capturing row addresses is only useful if something will consume them:
-    // an index to remap now, or a deferred remap through the FRI.
-    let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
-        && (options.defer_index_remap
-            || load_indices_for_remapping(dataset.as_ref())
+    // a deferred remap through the FRI, or an address-domain index to remap
+    // immediately. Stable row ids keep indices valid across the rewrite
+    // without an immediate remap (see `commit_compaction`'s `needs_remapping`),
+    // so an eager, non-deferred compaction on a stable-row-id dataset never
+    // uses the addresses and capturing them would be pure waste.
+    let capture_row_addrs = options.defer_index_remap
+        || (!dataset.manifest.uses_stable_row_ids()
+            && load_indices_for_remapping(dataset.as_ref())
                 .await?
                 .is_some());
     let mut new_fragments: Vec<Fragment>;
@@ -2343,6 +2550,15 @@ async fn rewrite_files(
     let mode = options.compaction_mode();
     let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
+        if let Some((path, actual)) = first_binary_copy_version_mismatch(&fragments, write_version)?
+        {
+            return Err(Error::not_supported_source(
+                format!(
+                    "compaction task {task_id}: binary copy target is {write_version}, but data file '{path}' uses {actual}"
+                )
+                .into(),
+            ));
+        }
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
         ));
@@ -2380,6 +2596,10 @@ async fn rewrite_files(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
+                matches!(
+                    write_version,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ),
             )?);
             let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
@@ -2459,6 +2679,7 @@ async fn rewrite_files(
         // (e.g. absolute file:// URIs with base_id == 0). Without this flag
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
+        data_storage_version: Some(write_version.to_selector()),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -2469,10 +2690,9 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    if can_binary_copy {
-        let version = dataset.manifest.data_storage_format.lance_file_format();
+    let lineage_plan = if can_binary_copy {
         new_fragments = versions::rewrite_files_binary_copy(
-            version,
+            write_version,
             dataset.as_ref(),
             &fragments,
             &params,
@@ -2504,52 +2724,110 @@ async fn rewrite_files(
             let _ = tx.send(captured);
             row_ids_rx = Some(rx);
         }
+        None
     } else {
+        let mut stream = reader.expect("reader must be prepared for non-binary-copy path");
+        let mut write_schema = dataset.schema().clone();
+        // On a table that can spill, the output fragments' lineage is computed
+        // before anything is written: the row ids and versions carry over from
+        // the inputs, so a sequence that leaves the manifest can ride along as
+        // a hidden column of the file being written rather than need a file of
+        // its own. Every other table carries its lineage over after the write,
+        // cut at the row counts actually written, and holds none of it while
+        // writing. Binary copy cannot add columns to the files it copies, so
+        // it always takes that path.
+        let spill_budget = if dataset.manifest.uses_stable_row_ids() {
+            inline_row_lineage_max_bytes(dataset.as_ref())?
+        } else {
+            None
+        };
+        let lineage_plan = match spill_budget {
+            Some(limit) => {
+                let planned_rows = file_row_counts
+                    .iter()
+                    .map(|rows| *rows as u64)
+                    .collect::<Vec<_>>();
+                let mut lineages =
+                    compute_row_lineage(dataset.as_ref(), &fragments, &planned_rows).await?;
+                let plan = plan_row_lineage_spill(limit, &lineages);
+                if let RowLineagePlan::InFile(spill) = plan
+                    && spill.any()
+                {
+                    let fields = spill.schema_fields()?;
+                    let columns = spill.take_columns(&mut lineages);
+                    stream = append_row_lineage_columns(stream, &fields, columns);
+                    // The writer stores only the columns its schema lists.
+                    write_schema.fields.extend(fields);
+                }
+                Some(PlannedRowLineage {
+                    lineages,
+                    planned_rows,
+                    plan,
+                })
+            }
+            None => None,
+        };
         let (frags, _) = write_fragments_internal_with_file_row_counts(
-            dataset.manifest.data_storage_format.lance_file_format(),
+            write_version,
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
             &dataset.base,
-            dataset.schema().clone(),
-            reader.expect("reader must be prepared for non-binary-copy path"),
+            write_schema,
+            stream,
             params,
             None,
             Some(file_row_counts),
         )
         .await?;
         new_fragments = frags;
-    }
+        lineage_plan
+    };
 
     log::info!("Compaction task {}: file written", task_id);
 
     // Wrap in an async block so `?` returns into `row_addrs_result` and we can
     // run cleanup before propagating the error.
     let row_addrs_result: Result<Option<Vec<u8>>> = async {
-        if let Some(row_ids_rx) = row_ids_rx {
-            let captured_ids = row_ids_rx
-                .try_recv()
-                .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let mut row_addrs = captured_ids.row_addrs(None)?.into_owned();
-            // Compaction reads whole fragments, so the captured addresses are
-            // dense per-fragment ranges; run containers (standard roaring
-            // format) shrink the persisted blob from O(rows) to O(runs) bytes.
-            row_addrs.optimize();
-            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
-            row_addrs.serialize_into(&mut serialized)?;
-            Ok(Some(serialized))
-        } else {
-            if dataset.manifest.uses_stable_row_ids() {
-                log::info!("Compaction task {}: rechunking stable row ids", task_id);
-                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-                recalc_versions_for_rewritten_fragments(
-                    dataset.as_ref(),
-                    &mut new_fragments,
-                    &fragments,
-                )
-                .await?;
+        // The new fragments need their own row-id sequences whether or not this
+        // task also captures addresses for the FRI.
+        if dataset.manifest.uses_stable_row_ids() {
+            log::info!("Compaction task {}: rechunking stable row ids", task_id);
+            match lineage_plan {
+                Some(planned) => {
+                    place_planned_row_lineage(dataset.as_ref(), &mut new_fragments, planned).await?
+                }
+                None => {
+                    rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &fragments).await?
+                }
             }
-            Ok(None)
         }
+
+        let Some(row_ids_rx) = row_ids_rx else {
+            return Ok(None);
+        };
+        let captured_ids = row_ids_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
+        // Stable row ids are captured as a sequence, and only the row-id index
+        // knows the address each one sat at before the rewrite. Every id that
+        // was captured was read from `fragments` (this task's own original
+        // fragments), so an index scoped to just those -- rather than
+        // `get_row_id_index`'s whole-dataset index -- has everything needed
+        // to look them up, without paying to index fragments this rewrite
+        // never touches.
+        let row_id_index = if dataset.manifest.uses_stable_row_ids() {
+            Some(load_row_id_index_for_fragments(dataset.as_ref(), &fragments).await?)
+        } else {
+            None
+        };
+        let mut row_addrs = captured_ids.row_addrs(row_id_index.as_ref())?.into_owned();
+        // Compaction reads whole fragments, so the captured addresses are
+        // dense per-fragment ranges; run containers (standard roaring
+        // format) shrink the persisted blob from O(rows) to O(runs) bytes.
+        row_addrs.optimize();
+        let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
+        row_addrs.serialize_into(&mut serialized)?;
+        Ok(Some(serialized))
     }
     .await;
 
@@ -2585,11 +2863,14 @@ async fn rewrite_files(
     })
 }
 
-async fn rechunk_stable_row_ids(
+/// Carry the stable row ids and per-row versions of `old_fragments` over to
+/// output fragments of `chunk_sizes` rows each, in order, which hold the same
+/// live rows in the same order.
+async fn compute_row_lineage(
     dataset: &Dataset,
-    new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
-) -> Result<()> {
+    chunk_sizes: &[u64],
+) -> Result<Vec<RowLineage>> {
     let mut old_sequences = load_row_id_sequences(dataset, old_fragments)
         .try_collect::<Vec<_>>()
         .await?;
@@ -2601,149 +2882,340 @@ async fn rechunk_stable_row_ids(
             .expect("Fragment not found")
     });
 
-    // Need to remove deleted rows
-    futures::stream::iter(old_sequences.iter_mut().zip(old_fragments.iter()))
-        .map(Ok)
-        .try_for_each(|((_, seq), frag)| async move {
-            if let Some(deletion_file) = &frag.deletion_file {
-                let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+    // Load old per-row version sequences, defaulting the way readers do:
+    // created-at to version 1, last-updated-at to created-at.
+    let mut old_created_at_sequences = Vec::with_capacity(old_fragments.len());
+    let mut old_last_updated_sequences = Vec::with_capacity(old_fragments.len());
+    for (frag, (_, row_ids)) in old_fragments.iter().zip(old_sequences.iter()) {
+        let created_at =
+            match load_row_version_sequence(dataset, frag, RowVersionKind::CreatedAt).await? {
+                Some(sequence) => sequence.as_ref().clone(),
+                None => RowDatasetVersionSequence::from_uniform_row_count(row_ids.len(), 1),
+            };
+        let last_updated_at =
+            match load_row_version_sequence(dataset, frag, RowVersionKind::LastUpdatedAt).await? {
+                Some(sequence) => sequence.as_ref().clone(),
+                None => created_at.clone(),
+            };
+        old_created_at_sequences.push(created_at);
+        old_last_updated_sequences.push(last_updated_at);
+    }
 
-                let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.to_sorted_iter())?;
-                *seq = Arc::new(new_seq);
-            }
-            Ok::<(), crate::Error>(())
-        })
-        .await?;
+    // Need to remove deleted rows
+    for (index, frag) in old_fragments.iter().enumerate() {
+        if let Some(deletion_file) = &frag.deletion_file {
+            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
+
+            let mut new_seq = old_sequences[index].1.as_ref().clone();
+            new_seq.mask(deletions.to_sorted_iter())?;
+            old_sequences[index].1 = Arc::new(new_seq);
+            old_created_at_sequences[index].mask(deletions.to_sorted_iter())?;
+            old_last_updated_sequences[index].mask(deletions.to_sorted_iter())?;
+        }
+    }
 
     debug_assert_eq!(
         { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
-        {
-            new_fragments
-                .iter()
-                .map(|frag| frag.physical_rows.unwrap() as u64)
-                .sum::<u64>()
-        },
+        { chunk_sizes.iter().sum::<u64>() },
         "{:?}",
         old_sequences
     );
 
-    let new_sequences = lance_table::rowids::rechunk_sequences(
+    let new_row_ids = lance_table::rowids::rechunk_sequences(
         old_sequences
             .into_iter()
             .map(|(_, seq)| seq.as_ref().clone()),
-        new_fragments
-            .iter()
-            .map(|frag| frag.physical_rows.unwrap() as u64),
+        chunk_sizes.iter().copied(),
+        false,
+    )?;
+    let new_created_at = lance_table::rowids::version::rechunk_version_sequences(
+        old_created_at_sequences,
+        chunk_sizes.iter().copied(),
+        false,
+    )?;
+    let new_last_updated_at = lance_table::rowids::version::rechunk_version_sequences(
+        old_last_updated_sequences,
+        chunk_sizes.iter().copied(),
         false,
     )?;
 
-    for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
-        // TODO: if large enough, serialize to separate file
-        let serialized = lance_table::rowids::write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
-    }
-
-    Ok(())
+    Ok(new_row_ids
+        .into_iter()
+        .zip(new_created_at)
+        .zip(new_last_updated_at)
+        .map(|((row_ids, created_at), last_updated_at)| RowLineage {
+            row_ids,
+            created_at,
+            last_updated_at,
+        })
+        .collect())
 }
 
-/// After row id rechunking, preserve per-row latest update versions by masking deletions and rechunking
-async fn recalc_versions_for_rewritten_fragments(
+/// Carry the lineage of `old_fragments` over to the already written
+/// `new_fragments` and place each one's sequences inline or in a separate
+/// lineage file, as the table's spill policy and their size call for. This is
+/// the path for tables that cannot spill, and for binary copy, whose output
+/// files cannot take the lineage as extra columns.
+async fn rechunk_row_lineage(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
 ) -> Result<()> {
-    // Load old per-row last_updated_at version sequences
-    let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
-        Vec::with_capacity(old_fragments.len());
-    // Load old per-row created_at version sequences
-    let mut old_created_at_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
-        Vec::with_capacity(old_fragments.len());
-
-    for frag in old_fragments.iter() {
-        let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
-            match row_id_meta {
-                RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
-                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
-            }
-        } else {
-            frag.physical_rows.unwrap_or(0) as u64
-        };
-
-        // Load created_at sequence (default to version 1 if missing)
-        let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
-            version_meta.load_sequence().map_err(|e| {
-                Error::internal(format!("Failed to load created_at version sequence: {}", e))
-            })?
-        } else {
-            // Default: treat all rows as created at version 1
-            lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(row_count, 1)
-        };
-
-        // Load last_updated_at sequence (default to same as created_at sequence)
-        let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
-            version_meta.load_sequence().map_err(|e| {
-                Error::internal(format!(
-                    "Failed to load last_updated_at version sequence: {}",
-                    e
-                ))
-            })?
-        } else {
-            created_at_seq.clone()
-        };
-
-        // Apply deletion mask if present (positions are local offsets)
-        if let Some(deletion_file) = &frag.deletion_file {
-            let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
-            last_updated_seq.mask(deletions.to_sorted_iter())?;
-            created_at_seq.mask(deletions.to_sorted_iter())?;
-        }
-
-        old_last_updated_sequences.push(last_updated_seq);
-        old_created_at_sequences.push(created_at_seq);
-    }
-
-    // Ensure row counts match new fragments total
-    let old_total: u64 = old_last_updated_sequences.iter().map(|s| s.len()).sum();
-    let new_total: u64 = new_fragments
-        .iter()
-        .map(|f| f.physical_rows.unwrap_or(0) as u64)
-        .sum();
-    debug_assert_eq!(old_total, new_total);
-
-    // Rechunk version runs aligned to new fragment sizes
     let chunk_sizes: Vec<u64> = new_fragments
         .iter()
-        .map(|f| f.physical_rows.unwrap_or(0) as u64)
+        .map(|frag| frag.physical_rows.unwrap() as u64)
         .collect();
+    let lineages = compute_row_lineage(dataset, old_fragments, &chunk_sizes).await?;
+    for (fragment, lineage) in new_fragments.iter_mut().zip(lineages) {
+        place_row_lineage(dataset, &lineage).await?.apply(fragment);
+    }
+    Ok(())
+}
 
-    let new_last_updated_sequences = lance_table::rowids::version::rechunk_version_sequences(
-        old_last_updated_sequences,
-        chunk_sizes.clone(),
-        false,
-    )?;
+/// The row lineage a compaction task computed for its planned output
+/// fragments before writing them, and how the task places it.
+struct PlannedRowLineage {
+    /// Each planned output fragment's lineage, in order. The sequences the
+    /// plan writes into the data files are empty: their values went into the
+    /// written columns.
+    lineages: Vec<RowLineage>,
+    /// Each planned output fragment's row count, which the writer only
+    /// follows until a byte limit closes a file early.
+    planned_rows: Vec<u64>,
+    plan: RowLineagePlan,
+}
 
-    let new_created_at_sequences = lance_table::rowids::version::rechunk_version_sequences(
-        old_created_at_sequences,
-        chunk_sizes,
-        false,
-    )?;
+/// Place the lineage compaction planned before the write on the fragments it
+/// wrote.
+async fn place_planned_row_lineage(
+    dataset: &Dataset,
+    new_fragments: &mut [Fragment],
+    planned: PlannedRowLineage,
+) -> Result<()> {
+    let PlannedRowLineage {
+        lineages,
+        planned_rows,
+        plan,
+    } = planned;
+    match plan {
+        RowLineagePlan::InFile(spill) => {
+            place_row_lineage_in_files(new_fragments, lineages, &planned_rows, spill)
+        }
+        RowLineagePlan::PerFragment => {
+            let lineages = fit_row_lineage_to_written(
+                new_fragments,
+                lineages,
+                &planned_rows,
+                RowLineageSpill::default(),
+            )?;
+            for (fragment, lineage) in new_fragments.iter_mut().zip(lineages) {
+                place_row_lineage(dataset, &lineage).await?.apply(fragment);
+            }
+            Ok(())
+        }
+    }
+}
 
-    // Set both version metadata on new fragments
-    for ((fragment, last_updated_seq), created_at_seq) in new_fragments
-        .iter_mut()
-        .zip(new_last_updated_sequences)
-        .zip(new_created_at_sequences)
-    {
-        fragment.last_updated_at_version_meta = Some(
-            lance_table::format::RowDatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),
-        );
-        fragment.created_at_version_meta = Some(
-            lance_table::format::RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
-        );
+/// Mark each written fragment's spilled sequences as living in its own data
+/// file, which was written with them as hidden columns, and place the rest
+/// inline.
+fn place_row_lineage_in_files(
+    new_fragments: &mut [Fragment],
+    lineages: Vec<RowLineage>,
+    planned_rows: &[u64],
+    spill: RowLineageSpill,
+) -> Result<()> {
+    let lineages = fit_row_lineage_to_written(new_fragments, lineages, planned_rows, spill)?;
+    for (fragment, lineage) in new_fragments.iter_mut().zip(&lineages) {
+        if spill.any() {
+            let [file] = fragment.files.as_slice() else {
+                return Err(Error::internal(format!(
+                    "compaction wrote {} data files for fragment {}; the row lineage columns \
+                     are in exactly one",
+                    fragment.files.len(),
+                    fragment.id
+                )));
+            };
+            let missing = spill
+                .field_ids()
+                .find(|field_id| !file.fields.contains(field_id));
+            if let Some(field_id) = missing {
+                return Err(Error::internal(format!(
+                    "compaction wrote fragment {}'s data file {} without row lineage field {}",
+                    fragment.id, file.path, field_id
+                )));
+            }
+        }
+        spill.place_in_file(lineage).apply(fragment);
+    }
+    Ok(())
+}
+
+/// Fit the lineage planned for output fragments of `planned_rows` rows each to
+/// the fragments the writer actually produced, one lineage per fragment.
+///
+/// A byte limit can close a file before its planned row count, after which the
+/// writer spreads the remaining rows over files of other sizes, so the
+/// sequences kept inline are cut again at the written row counts. The types
+/// `in_file` names need nothing: their columns were appended to the written
+/// rows one by one, so they follow any split, and their sequences are empty.
+///
+/// The in-file plan was made for the planned sizes. A written fragment is
+/// never larger than the largest planned one, but it can join the tail of one
+/// planned fragment to the head of the next, so a sequence that plan keeps
+/// inline can end up over the budget, up to about twice it. That is acceptable
+/// because the budget only bounds manifest growth and is not a format limit.
+/// The per-fragment plan decides again on the cut sequences.
+fn fit_row_lineage_to_written(
+    new_fragments: &[Fragment],
+    lineages: Vec<RowLineage>,
+    planned_rows: &[u64],
+    in_file: RowLineageSpill,
+) -> Result<Vec<RowLineage>> {
+    let written_rows = new_fragments
+        .iter()
+        .map(|fragment| match fragment.physical_rows {
+            Some(rows) => Ok(rows as u64),
+            None => Err(Error::internal(format!(
+                "compaction wrote fragment {} without a physical row count",
+                fragment.id
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let planned_total = planned_rows.iter().sum::<u64>();
+    let written_total = written_rows.iter().sum::<u64>();
+    if written_total != planned_total {
+        return Err(Error::internal(format!(
+            "compaction wrote {written_total} rows, in fragments of {written_rows:?} rows, \
+             but planned row lineage for {planned_total} rows, in fragments of \
+             {planned_rows:?} rows"
+        )));
     }
 
-    Ok(())
+    let lineages = if written_rows.as_slice() == planned_rows {
+        lineages
+    } else {
+        let cut_error = |error: Error| {
+            Error::internal(format!(
+                "compaction could not cut the row lineage planned for fragments of \
+                 {planned_rows:?} rows at the written fragments of {written_rows:?} rows: \
+                 {error}"
+            ))
+        };
+        let mut row_ids = Vec::with_capacity(lineages.len());
+        let mut created_at = Vec::with_capacity(lineages.len());
+        let mut last_updated_at = Vec::with_capacity(lineages.len());
+        for lineage in lineages {
+            row_ids.push(lineage.row_ids);
+            created_at.push(lineage.created_at);
+            last_updated_at.push(lineage.last_updated_at);
+        }
+        let fragment_count = written_rows.len();
+        let written = || written_rows.iter().copied();
+        let row_ids = if in_file.row_ids {
+            vec![RowIdSequence::new(); fragment_count]
+        } else {
+            lance_table::rowids::rechunk_sequences(row_ids, written(), false).map_err(cut_error)?
+        };
+        let created_at = if in_file.created_at {
+            vec![RowDatasetVersionSequence::new(); fragment_count]
+        } else {
+            lance_table::rowids::version::rechunk_version_sequences(created_at, written(), false)
+                .map_err(cut_error)?
+        };
+        let last_updated_at = if in_file.last_updated_at {
+            vec![RowDatasetVersionSequence::new(); fragment_count]
+        } else {
+            lance_table::rowids::version::rechunk_version_sequences(
+                last_updated_at,
+                written(),
+                false,
+            )
+            .map_err(cut_error)?
+        };
+        row_ids
+            .into_iter()
+            .zip(created_at)
+            .zip(last_updated_at)
+            .map(|((row_ids, created_at), last_updated_at)| RowLineage {
+                row_ids,
+                created_at,
+                last_updated_at,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if lineages.len() != new_fragments.len() {
+        return Err(Error::internal(format!(
+            "compaction has row lineage for {} fragments but wrote {}",
+            lineages.len(),
+            new_fragments.len()
+        )));
+    }
+    for ((fragment, &rows), lineage) in new_fragments.iter().zip(&written_rows).zip(&lineages) {
+        let inline_lengths = [
+            (in_file.row_ids, "row ids", lineage.row_ids.len()),
+            (
+                in_file.created_at,
+                "created-at versions",
+                lineage.created_at.len(),
+            ),
+            (
+                in_file.last_updated_at,
+                "last-updated-at versions",
+                lineage.last_updated_at.len(),
+            ),
+        ];
+        let mismatch = inline_lengths
+            .into_iter()
+            .find(|&(is_in_file, _, len)| !is_in_file && len != rows);
+        if let Some((_, sequence, len)) = mismatch {
+            return Err(Error::internal(format!(
+                "compaction has {len} inline {sequence} for fragment {} of {rows} physical rows",
+                fragment.id
+            )));
+        }
+    }
+    Ok(lineages)
+}
+
+/// Append the hidden row lineage columns, `fields` with the matching entry of
+/// `columns` as each one's values, to the batches of `stream`, in row order,
+/// so the file writer stores them next to the user columns.
+fn append_row_lineage_columns(
+    stream: SendableRecordBatchStream,
+    fields: &[LanceField],
+    columns: Vec<Vec<u64>>,
+) -> SendableRecordBatchStream {
+    let mut arrow_fields = stream.schema().fields().to_vec();
+    arrow_fields.extend(fields.iter().map(|field| Arc::new(ArrowField::from(field))));
+    let schema = Arc::new(ArrowSchema::new(arrow_fields));
+    let total_rows = columns.first().map_or(0, |values| values.len());
+    let batch_schema = schema.clone();
+    let mut offset = 0usize;
+    let batches = stream.map(move |batch| {
+        let batch = batch?;
+        let rows = batch.num_rows();
+        if offset + rows > total_rows {
+            return Err(datafusion::error::DataFusionError::External(Box::new(
+                Error::internal(format!(
+                    "compaction read more rows than its row lineage covers ({total_rows})"
+                )),
+            )));
+        }
+        let mut arrays = batch.columns().to_vec();
+        // Each batch gets a buffer of its own. A slice would share the whole
+        // task's buffer, and the writer, which sizes pages by the memory an
+        // array holds, would then cut a tiny page for every batch.
+        for values in &columns {
+            let batch_values = values[offset..offset + rows].to_vec();
+            arrays.push(Arc::new(arrow_array::UInt64Array::from(batch_values)) as ArrayRef);
+        }
+        offset += rows;
+        RecordBatch::try_new(batch_schema.clone(), arrays)
+            .map_err(datafusion::error::DataFusionError::from)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, batches))
 }
 
 /// Commit the results of file compaction.
@@ -2762,6 +3234,23 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
+    // A tagged FRI history stores row translation in the manifest entry and
+    // depends on index bitmaps keeping their retired provenance, so a
+    // compaction on a tagged table can only commit by appending transitions
+    // (the deferred path below). Refuse the eager path up front, before any
+    // remapping work runs into the commit gate.
+    let tagged_fri = load_all_indices(dataset)
+        .await?
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+    if tagged_fri && !options.defer_index_remap {
+        return Err(Error::not_supported(
+            "Compacting a table with a tagged fragment reuse history requires \
+             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
+             remaps tagged histories eagerly",
+        ));
+    }
+
     // Before anything is written or committed. The condition is the planner's,
     // not `has_address_style`: a dataset whose only index is one this build
     // cannot read captures no row addresses at all, which is exactly the plan
@@ -2769,6 +3258,7 @@ pub async fn commit_compaction(
     if !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap {
         reject_unremappable_rewrite(dataset, &completed_tasks).await?;
     }
+    reject_deferred_remap_with_row_id_indices(dataset, options).await?;
 
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     // Address-style results require immediate index remapping unless it is deferred.
@@ -2813,15 +3303,20 @@ pub async fn commit_compaction(
         .collect();
 
     // Single reserve_fragment_ids for all address-style tasks
+    let mut reserved_version = None;
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        if let Err(e) = reserve_fragment_ids(dataset, frags.into_iter()).await {
-            cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments).await;
-            return Err(e);
+        match reserve_fragment_ids(dataset, frags.into_iter()).await {
+            Ok(version) => reserved_version = Some(version),
+            Err(e) => {
+                cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments)
+                    .await;
+                return Err(e);
+            }
         }
     }
 
@@ -2840,15 +3335,24 @@ pub async fn commit_compaction(
     // compaction, never per group -- a partial FRI is unsound: a concurrent reindex
     // can make a skipped fragment indexed and the conflict resolver's FRI-present
     // path won't re-check it.
+    //
+    // The same rule applies on tagged tables: a transition for fragments no
+    // index covers and no lineage reaches would grow the history for rows no
+    // reader ever has to translate, with no trim to reclaim it; when nothing
+    // is covered the commit is a plain rewrite, which the tagged-table gate
+    // admits exactly for this uncovered shape.
     let indexed_frags: RoaringBitmap = if options.defer_index_remap {
         let mut covered = RoaringBitmap::new();
         for bm in load_index_fragmaps(dataset).await? {
             covered |= bm;
         }
-        if let Some(bm) = dataset
-            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        // The stored listing works for v0 and tagged entries alike (the
+        // filtered listing post-processes coverage on tagged tables).
+        if let Some(bm) = load_all_indices(dataset)
             .await?
-            .and_then(|fri| fri.fragment_bitmap)
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .and_then(|fri| fri.fragment_bitmap.clone())
         {
             covered |= bm;
         }
@@ -2860,8 +3364,17 @@ pub async fn commit_compaction(
 
     for task in completed_tasks {
         metrics += task.metrics;
+        // One source of truth: the deferred branch normalizes the source
+        // metadata (materialized physical and deleted row counts) and BOTH
+        // the rewrite group and the reuse digests are built from it, so the
+        // commit-side binding validation compares like with like.
+        let old_fragments = if index_remapper.is_none() && options.defer_index_remap {
+            normalize_source_fragments(dataset, &task.original_fragments).await?
+        } else {
+            task.original_fragments.clone()
+        };
         let rewrite_group = RewriteGroup {
-            old_fragments: task.original_fragments.clone(),
+            old_fragments: old_fragments.clone(),
             new_fragments: task.new_fragments.clone(),
         };
 
@@ -2925,11 +3438,12 @@ pub async fn commit_compaction(
                 }
             }
         } else if options.defer_index_remap {
-            // Record every group; track whether any touches indexed/chain data.
-            if task
-                .original_fragments
+            // Record every group; track whether any touches indexed/chain
+            // data. Ids beyond the row-address range cannot appear in any
+            // index bitmap, so they are uncovered by definition.
+            if old_fragments
                 .iter()
-                .any(|f| indexed_frags.contains(f.id as u32))
+                .any(|f| u32::try_from(f.id).is_ok_and(|id| indexed_frags.contains(id)))
             {
                 any_group_indexed = true;
             }
@@ -2938,15 +3452,52 @@ pub async fn commit_compaction(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
                 )
             })?;
+            // Digest construction must not panic on incomplete metadata (the
+            // tasks may be replayed results planned elsewhere); the counts
+            // were materialized by `normalize_source_fragments` above, from
+            // the same list the rewrite group carries.
+            let digest =
+                |frag: &Fragment| -> Result<lance_table::system_index::frag_reuse::FragDigest> {
+                    Ok(lance_table::system_index::frag_reuse::FragDigest {
+                        id: frag.id,
+                        physical_rows: frag.physical_rows.ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "fragment {} has no physical row count for the fragment reuse record",
+                                frag.id
+                            ))
+                        })?,
+                        num_deleted_rows: frag
+                            .deletion_file
+                            .as_ref()
+                            .map(|deletion| {
+                                deletion.num_deleted_rows.ok_or_else(|| {
+                                    Error::invalid_input(format!(
+                                        "fragment {} has a deletion file without a materialized row count",
+                                        frag.id
+                                    ))
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or(0),
+                    })
+                };
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs,
-                old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
-                new_frags: task.new_fragments.iter().map(|f| f.into()).collect(),
+                old_frags: old_fragments.iter().map(digest).collect::<Result<_>>()?,
+                new_frags: task
+                    .new_fragments
+                    .iter()
+                    .map(digest)
+                    .collect::<Result<_>>()?,
             });
-
-            task.new_fragments.iter().for_each(|frag| {
-                new_fragment_bitmap.insert(frag.id as u32);
-            });
+            for frag in task.new_fragments.iter() {
+                new_fragment_bitmap.insert(u32::try_from(frag.id).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "compacted fragment id {} is outside the row-address range",
+                        frag.id
+                    ))
+                })?);
+            }
         }
         rewrite_groups.push(rewrite_group);
     }
@@ -2989,13 +3540,120 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    // No indexed/chain data touched -> no FRI (all-or-nothing, see above).
+    // No indexed/chain data touched -> no record at all (all-or-nothing, see
+    // above); the commit is a plain rewrite the tagged gate admits for this
+    // uncovered shape. Otherwise the record's FORM -- a v0 entry, or tagged
+    // transitions riding the in-memory rewrite intent that
+    // `build_frag_reuse_rewrite_entry` assembles onto the entry at every
+    // commit attempt -- is decided HERE, at commit time, from the freshest
+    // state this handle has (the id reservations above do not advance it), not
+    // from a sample taken when the compaction started: another writer may
+    // have tagged the table in between. The record's BASE, however, is the
+    // snapshot at `tasks_read_version`: the commit path works out what the
+    // entry adds by diffing it against the entry at the transaction's read
+    // version, so an entry built from this later handle would fold every
+    // transition other writers appended in between into this rewrite's own
+    // additions and fail the commit for good instead of merging the
+    // histories (`rewrite_reuse_state` refuses such an entry outright). The
+    // read version itself stays at V: raising it to the latest version would
+    // skip the concurrency checks against the writes that landed in between.
+    // The remaining race onto the manifest CAS itself is handled by the
+    // rebase, which converts a v0-shaped intent into tagged transitions when
+    // the current entry turns out tagged (see `finish_rewrite`); the commit
+    // gate still rejects a v0 entry spliced by a writer without that
+    // conversion.
     let frag_reuse_index = if options.defer_index_remap && any_group_indexed {
-        Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
+        // Once a table is v1, it stays v1: the sticky
+        // FLAG_FRAGMENT_REUSE_INDEX is the final authority
+        // (`uses_tagged_fri`), never the entry's own index_version. With NO
+        // entry -- for example a fully drained history whose entry a trim
+        // deleted -- the flag alone decides, so a tagged table never
+        // restarts its history in the v0 format; with a v0 entry UNDER the
+        // flag (a legacy entry a concurrent upgrade left pending) the
+        // tagged assembly lifts that entry byte-verbatim instead of
+        // extending it in place. A table that never was tagged has neither
+        // flag nor tagged entry, and keeps creating the v0 entry byte
+        // identically.
+        let stored = load_all_indices(dataset).await?;
+        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+            &dataset.manifest,
+            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+        );
+        if tagged_at_commit {
+            // Materializing a data overlay breaks the reuse premise that a
+            // rewrite moves addresses, never values; on a tagged table the
+            // stale-index handling that v0 applies (dropping destination
+            // ids from swapped bitmaps) is a no-op because provenance never
+            // contains the destinations. Refuse rather than record a
+            // transition; see `build_frag_reuse_rewrite_entry` for the same
+            // rule on the stable-partition path.
+            if let Some(overlaid) = rewrite_groups
+                .iter()
+                .flat_map(|group| group.old_fragments.iter())
+                .find(|frag| !frag.overlays.is_empty())
+            {
+                return Err(Error::not_supported(format!(
+                    "source fragment {} carries data overlay files; deferred compaction on a \
+                     tagged fragment reuse table would materialize the overlaid values while \
+                     indices keep translated coverage over the old addresses. Compact the \
+                     overlays away or rebuild the covering indices eagerly first",
+                    overlaid.id
+                )));
+            }
+            use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+            let transitions = frag_reuse_groups
+                .into_iter()
+                .map(|group| pb_fri::Transition {
+                    sources: group
+                        .old_frags
+                        .iter()
+                        .map(pb_fri::FragmentDigest::from)
+                        .collect(),
+                    destinations: group
+                        .new_frags
+                        .iter()
+                        .map(pb_fri::FragmentDigest::from)
+                        .collect(),
+                    mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
+                        pb_fri::OrderedCompaction {
+                            changed_row_addrs: group.changed_row_addrs,
+                        },
+                    )),
+                })
+                .collect();
+            // The complete entry: the history at the read version plus this
+            // compaction's own transitions, built from the same snapshot the
+            // commit path diffs it against (see above). The commit path
+            // merges the additions onto the entry current at commit.
+            let read_snapshot = if dataset.manifest.version == tasks_read_version {
+                Cow::Borrowed(&*dataset)
+            } else {
+                // A cleaned-up read version fails here, explicitly, rather
+                // than guessing the base from a later snapshot.
+                Cow::Owned(dataset.checkout_version(tasks_read_version).await?)
+            };
+            Some(
+                crate::index::frag_reuse::frag_reuse_entry_appending(&read_snapshot, transitions)
+                    .await?,
+            )
+        } else {
+            // The rewrite publishes right after the reservation unless another commit
+            // lands in between, in which case `finish_rewrite` restamps it.
+            let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
+            Some(
+                build_new_frag_reuse_index(
+                    dataset,
+                    frag_reuse_groups,
+                    new_fragment_bitmap,
+                    dataset_version,
+                )
+                .await?,
+            )
+        }
     } else {
         if options.defer_index_remap {
             log::debug!(
-                "skipping fragment-reuse index: no rewritten fragments were covered by an index"
+                "skipping fragment reuse record: no rewritten fragments are covered by an index or the reuse lineage"
             );
         }
         None
@@ -3037,6 +3695,40 @@ pub async fn commit_compaction(
     Ok(metrics)
 }
 
+/// Materialize the counts the fragment reuse digests and conservation
+/// validation depend on, without changing the fragment list. Unlike
+/// [`migrate_fragments`], fully-deleted fragments are KEPT: the rewrite
+/// group must still remove them from the manifest and the recorded
+/// transition must still consume them (they contribute zero live rows), so
+/// a silently shortened list would desynchronize the digests, the group and
+/// the manifest.
+async fn normalize_source_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<Vec<Fragment>> {
+    let mut normalized = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let mut fragment = fragment.clone();
+        if fragment.physical_rows.is_none() {
+            let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
+            fragment.physical_rows = Some(file_fragment.physical_rows().await?);
+        }
+        if fragment
+            .deletion_file
+            .as_ref()
+            .is_some_and(|deletion| deletion.num_deleted_rows.is_none())
+        {
+            let deletion_file = fragment.deletion_file.as_ref().unwrap();
+            let count = read_dataset_deletion_file(dataset, fragment.id, deletion_file)
+                .await?
+                .len();
+            fragment.deletion_file.as_mut().unwrap().num_deleted_rows = Some(count);
+        }
+        normalized.push(fragment);
+    }
+    Ok(normalized)
+}
+
 /// Remove rewritten files after fragment-id reservation fails. Reservation
 /// commits do not reference the rewritten files, so they are still owned by
 /// this uncommitted compaction attempt and are safe to delete.
@@ -3057,11 +3749,18 @@ async fn cleanup_compaction_files_after_reservation_failure(
 mod tests {
 
     mod binary_copy;
+    mod concurrent_reindex;
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::dataset::rowids::read_spilled_row_ids;
+    use crate::dataset::rowids::{
+        INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+    };
+    use crate::dataset::scanner::ColumnOrdering;
+    use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -3076,6 +3775,7 @@ mod tests {
     use lance_arrow::BLOB_META_KEY;
     use lance_core::Error;
     use lance_core::ROW_ID;
+    use lance_core::ROW_ID_FIELD_ID;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
@@ -3088,8 +3788,17 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
+    use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::{DistanceType, MetricType};
+    use lance_table::format::Manifest;
+    use lance_table::format::RowIdMeta;
+    use lance_table::format::pb::transaction::Operation as PbOperation;
+    use lance_table::io::commit::{
+        CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+        ManifestNamingScheme, ManifestWriter,
+    };
     use lance_table::io::manifest::read_manifest_indexes;
+    use lance_table::rowids::read_row_ids;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use std::collections::HashSet;
@@ -3331,6 +4040,255 @@ mod tests {
         assert_eq!(dataset.manifest.version, 1);
     }
 
+    #[tokio::test]
+    async fn test_compact_v2_0_file_missing_evolved_struct_child() {
+        let old_child = Arc::new(Field::new("old", DataType::Int32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "values",
+                DataType::Struct(vec![old_child.clone()].into()),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StructArray::from(vec![(
+                    old_child,
+                    Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+                )])),
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Model a snapshot whose nullable struct retained its field ID while its
+        // old child was replaced by a later-added child. Existing V2.0 files
+        // still record the struct header and old child IDs.
+        let mut evolved_schema = dataset.schema().clone();
+        let parent_id = evolved_schema.fields[0].id;
+        let mut later_child = LanceField::new_arrow("later", DataType::Int32, true).unwrap();
+        later_child.id = evolved_schema.max_field_id().unwrap() + 1;
+        later_child.parent_id = parent_id;
+        evolved_schema.fields[0].children = vec![later_child];
+        let read_version = dataset.version().version;
+        dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::Project {
+                schema: evolved_schema,
+                preserves_nullability: true,
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(metrics.fragments_added, 1);
+
+        let compacted = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(compacted.num_rows(), 4);
+        assert_eq!(
+            compacted["id"].as_ref(),
+            &Int32Array::from(vec![0, 1, 2, 3])
+        );
+        let values = compacted["values"].as_struct();
+        assert_eq!(values.null_count(), 0);
+        assert_eq!(values.column_by_name("later").unwrap().null_count(), 4);
+    }
+
+    #[rstest]
+    #[case::default(None, LanceFileVersion::V2_0)]
+    #[case::stable(Some(LanceFileVersion::Stable), LanceFileVersion::V2_2)]
+    #[case::next(Some(LanceFileVersion::Next), LanceFileVersion::V2_3)]
+    #[tokio::test]
+    async fn plan_compaction_freezes_storage_version_selector(
+        #[case] selector: Option<LanceFileVersion>,
+        #[case] exact: LanceFileVersion,
+    ) {
+        let data = arrow_array::record_batch!(("id", Int32, [1, 2, 3, 4, 5, 6])).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            data_storage_version: selector,
+            excluded_fragment_ids: vec![2],
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+
+        assert_eq!(plan.options.data_storage_version, Some(exact));
+        let serialized = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            serialized["options"]["data_storage_version"],
+            exact.to_string()
+        );
+        assert_eq!(
+            serde_json::from_value::<CompactionPlan>(serialized).unwrap(),
+            plan
+        );
+        assert_eq!(plan.num_tasks(), 1);
+        let retained = dataset.manifest.fragments[2].clone();
+        let task = plan.compaction_tasks().next().unwrap();
+        let task: CompactionTask =
+            serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        let result = task.execute(&dataset).await.unwrap();
+        assert!(
+            result
+                .new_fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .all(|file| file.file_version().unwrap() == exact.resolve())
+        );
+        let result: RewriteResult =
+            serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .any(|fragment| fragment == &retained)
+        );
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        let actual = dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, data);
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn compaction_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(source),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            data_storage_version: Some(target),
+            ..Default::default()
+        };
+        let error = plan_compaction(&dataset, &options).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+        // Standalone distributed tasks also validate, independently of the planner.
+        let mut task = plan_compaction(&dataset, &CompactionOptions::default())
+            .await
+            .unwrap()
+            .compaction_tasks()
+            .next()
+            .unwrap();
+        task.options = options;
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+    }
+
+    #[rstest]
+    #[case("0.1", Some(LanceFileVersion::Legacy))]
+    #[case("2.0", Some(LanceFileVersion::V2_0))]
+    #[case("2.1", Some(LanceFileVersion::V2_1))]
+    #[case("2.2", Some(LanceFileVersion::V2_2))]
+    #[case("2.3", Some(LanceFileVersion::V2_3))]
+    #[case("stable", Some(LanceFileVersion::Stable))]
+    #[case("next", Some(LanceFileVersion::Next))]
+    #[case("invalid", None)]
+    fn compaction_storage_version_config(
+        #[case] value: &str,
+        #[case] expected: Option<LanceFileVersion>,
+    ) {
+        let config = HashMap::from([(
+            "lance.compaction.data_storage_version".to_string(),
+            value.to_string(),
+        )]);
+        let result = CompactionOptions::from_dataset_config(&config);
+        if let Some(expected) = expected {
+            let options = result.unwrap();
+            assert_eq!(options.data_storage_version, Some(expected));
+            let json = serde_json::to_value(&options).unwrap();
+            assert_eq!(json["data_storage_version"], value);
+            assert_eq!(
+                serde_json::from_value::<CompactionOptions>(json).unwrap(),
+                options
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("lance.compaction.data_storage_version")
+            );
+            assert!(error.to_string().contains(value));
+            let error =
+                serde_json::from_value::<LanceFileVersion>(serde_json::json!(value)).unwrap_err();
+            assert!(error.to_string().contains(value));
+        }
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_compact_all_good(
@@ -3403,6 +4361,127 @@ mod tests {
             .try_collect()
             .await
             .unwrap()
+    }
+
+    /// Distributed compaction on a tagged table: the tasks are planned at V,
+    /// another writer's disjoint deferred compaction lands at V+1, and the
+    /// driver commits the planned tasks from a fresh handle at the latest
+    /// version. The reuse entry is built from the snapshot at V (the
+    /// transaction's read version), so the two histories merge instead of
+    /// the other writer's transition being taken for this compaction's own.
+    #[tokio::test]
+    async fn distributed_deferred_compaction_merges_with_a_disjoint_concurrent_rewrite() {
+        use crate::index::DatasetIndexExt;
+        use arrow_array::cast::AsArray;
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let fresh = |uri: &str| {
+            crate::dataset::builder::DatasetBuilder::from_uri(uri)
+                .with_session(Arc::new(crate::session::Session::default()))
+                .load()
+        };
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(uri, FragmentCount::from(4), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Tag the table: the sticky flag decides the entry's form.
+        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        }
+        crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, indices).await;
+
+        // Planned and executed at V over fragments 0 and 1.
+        let ours = CompactionOptions {
+            target_rows_per_fragment: 16,
+            defer_index_remap: true,
+            excluded_fragment_ids: vec![2, 3],
+            ..Default::default()
+        };
+        let planned = fresh(uri).await.unwrap();
+        let read_version = planned.manifest.version;
+        let completed = execute_compaction_plan(&planned, &ours).await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].read_version, read_version);
+
+        // Another writer compacts fragments 2 and 3 at V+1.
+        let mut other = fresh(uri).await.unwrap();
+        let theirs = CompactionOptions {
+            target_rows_per_fragment: 16,
+            defer_index_remap: true,
+            excluded_fragment_ids: vec![0, 1],
+            ..Default::default()
+        };
+        compact_files(&mut other, theirs, None).await.unwrap();
+        // The other writer reserved ids and then committed its rewrite.
+        assert!(other.manifest.version > read_version);
+
+        // The driver commits from a handle at the latest version.
+        let mut driver = fresh(uri).await.unwrap();
+        commit_compaction(
+            &mut driver,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &ours,
+        )
+        .await
+        .unwrap();
+
+        let committed = fresh(uri).await.unwrap();
+        assert_eq!(committed.fragments().len(), 2);
+        let stored = crate::index::load_all_indices(&committed).await.unwrap();
+        let entry = stored
+            .iter()
+            .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .expect("both compactions recorded their transitions");
+        let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(&committed, entry)
+            .await
+            .unwrap();
+        assert_eq!(ledger.transitions().len(), 2);
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        let mut values: Vec<i32> = batch["i"]
+            .as_primitive::<Int32Type>()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, (0..32).collect::<Vec<_>>());
+        for predicate in ["i = 3", "i = 20", "i > 10"] {
+            let indexed = committed
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .use_scalar_index(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let scanned = committed
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .use_scalar_index(false)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(indexed, scanned, "{predicate}");
+        }
     }
 
     /// When the compaction commit's status is unknown (the commit errored and
@@ -3488,6 +4567,80 @@ mod tests {
         assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
         let scanned = ds.scan().try_into_batch().await.unwrap();
         assert_eq!(scanned.num_rows(), num_rows);
+    }
+
+    /// A deferred (v0 ReplaceEntry) compaction whose commit lands but reports
+    /// a conflict must be recognized as our own commit. The frag reuse
+    /// payload is intentionally not serialized, so commit-outcome
+    /// verification has to compare durable forms; comparing the in-memory
+    /// transaction would misclassify the landed commit as foreign, retry
+    /// against ourselves, and delete the landed commit's transaction file.
+    #[tokio::test]
+    async fn test_deferred_compaction_recognizes_ambiguous_commit_as_own() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(600),
+            "memory://test/deferred_ambiguous",
+            Some(WriteParams {
+                max_rows_per_file: 100, // 6 small files -> compaction has work
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Indexed data, so the deferred compaction carries a frag reuse
+        // (ReplaceEntry) payload on its Rewrite transaction.
+        create_scalar_index(&mut dataset, "i", false).await;
+        let fragments_before = dataset.get_fragments().len();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let completed = execute_compaction_plan(&dataset, &options).await;
+
+        // The commit lands, but the store reports a conflict.
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndConflict);
+        commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect("verification must recognize the landed compaction as our own commit");
+
+        assert!(
+            dataset.get_fragments().len() < fragments_before,
+            "the landed compaction must be visible"
+        );
+        let fri = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the deferred compaction installs the frag reuse entry");
+        assert_eq!(fri.index_version, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 600);
+
+        // The landed manifest references its transaction file; it must not
+        // have been deleted by the (spurious) conflict cleanup.
+        let transaction_file = dataset
+            .manifest
+            .transaction_file
+            .as_deref()
+            .expect("the landed manifest records its transaction file");
+        let path = dataset
+            .base
+            .clone()
+            .join(crate::dataset::TRANSACTIONS_DIR)
+            .join(transaction_file);
+        assert!(dataset.object_store.exists(&path).await.unwrap());
     }
 
     /// A failed ReserveFragments commit cannot reference the rewritten files,
@@ -3914,6 +5067,320 @@ mod tests {
         assert_eq!(second_metrics, CompactionMetrics::default());
     }
 
+    /// A byte limit can close a compaction output file before its planned row
+    /// count, and the writer then spreads the remaining rows over files of
+    /// other sizes. The lineage placed inline has to follow the written row
+    /// counts, and a written total that differs from the planned one is an
+    /// error rather than lineage shifted onto the wrong rows.
+    #[rstest]
+    #[case::extra_file(
+        &[10, 10],
+        &[9, 6, 5],
+        RowLineageSpill { row_ids: true, ..Default::default() },
+        None
+    )]
+    #[case::shifted(
+        &[101, 100, 100],
+        &[100, 101, 100],
+        RowLineageSpill { row_ids: true, ..Default::default() },
+        None
+    )]
+    #[case::shifted_all_inline(
+        &[101, 100, 100],
+        &[100, 101, 100],
+        RowLineageSpill::default(),
+        None
+    )]
+    #[case::mismatched_totals(
+        &[10, 10],
+        &[10, 9],
+        RowLineageSpill { row_ids: true, ..Default::default() },
+        Some("wrote 19 rows")
+    )]
+    fn place_row_lineage_in_files_follows_written_sizes(
+        #[case] planned_rows: &[u64],
+        #[case] written_rows: &[usize],
+        #[case] spill: RowLineageSpill,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let total_rows = planned_rows.iter().sum::<u64>();
+        // Every row has a version of its own, so a sequence cut at the wrong
+        // row cannot pass for the right one.
+        let versions = (1..=total_rows).collect::<Vec<_>>();
+        let mut lineages = Vec::with_capacity(planned_rows.len());
+        let mut start = 0_u64;
+        for rows in planned_rows {
+            let end = start + rows;
+            let created_at =
+                RowDatasetVersionSequence::from_versions(&versions[start as usize..end as usize]);
+            lineages.push(RowLineage {
+                row_ids: RowIdSequence::from(start..end),
+                last_updated_at: created_at.clone(),
+                created_at,
+            });
+            start = end;
+        }
+        let columns = spill.take_columns(&mut lineages);
+        if spill.row_ids {
+            assert_eq!(columns, vec![(0..total_rows).collect::<Vec<_>>()]);
+        } else {
+            assert!(columns.is_empty(), "{columns:?}");
+        }
+        // Each written file carries the user column and the spilled columns.
+        let fields = std::iter::once(0)
+            .chain(spill.field_ids())
+            .collect::<Vec<_>>();
+        let column_indices = (0..fields.len() as i32).collect::<Vec<_>>();
+        let mut fragments = written_rows
+            .iter()
+            .enumerate()
+            .map(|(id, rows)| {
+                Fragment::new(id as u64)
+                    .with_file(
+                        format!("{id}.lance"),
+                        fields.clone(),
+                        column_indices.clone(),
+                        ConcreteFileVersion::V2_0,
+                        None,
+                    )
+                    .with_physical_rows(*rows)
+            })
+            .collect::<Vec<_>>();
+
+        let placed = place_row_lineage_in_files(&mut fragments, lineages, planned_rows, spill);
+        if let Some(expected) = expected_error {
+            let error = placed.unwrap_err();
+            let Error::Internal { message, .. } = &error else {
+                panic!("expected an internal error, got {error}");
+            };
+            assert!(message.contains(expected), "{message}");
+            return;
+        }
+        placed.unwrap();
+        let mut placed_row_ids = Vec::with_capacity(versions.len());
+        let mut placed_created_at = Vec::with_capacity(versions.len());
+        let mut placed_last_updated_at = Vec::with_capacity(versions.len());
+        for fragment in &fragments {
+            let physical_rows = fragment.physical_rows.unwrap() as u64;
+            match &fragment.row_id_meta {
+                Some(RowIdMeta::Column) if spill.row_ids => {}
+                Some(RowIdMeta::Inline(bytes)) if !spill.row_ids => {
+                    let row_ids = read_row_ids(bytes).unwrap();
+                    assert_eq!(row_ids.len(), physical_rows);
+                    placed_row_ids.extend(row_ids.iter());
+                }
+                other => panic!(
+                    "fragment {} has row id meta {other:?} under {spill:?}",
+                    fragment.id
+                ),
+            }
+            for (meta, collected) in [
+                (&fragment.created_at_version_meta, &mut placed_created_at),
+                (
+                    &fragment.last_updated_at_version_meta,
+                    &mut placed_last_updated_at,
+                ),
+            ] {
+                let sequence = meta.as_ref().unwrap().load_sequence().unwrap();
+                assert_eq!(sequence.len(), physical_rows);
+                collected.extend(sequence.versions());
+            }
+        }
+        if !spill.row_ids {
+            assert_eq!(placed_row_ids, (0..total_rows).collect::<Vec<_>>());
+        }
+        assert_eq!(placed_created_at, versions);
+        assert_eq!(placed_last_updated_at, versions);
+    }
+
+    /// A sequence type over the budget in only some output fragments sends the
+    /// task down the per-fragment path: once the lineage is cut at the written
+    /// sizes, a fragment whose row ids fit keeps them inline, and only the ones
+    /// over the budget get a lineage file of their own.
+    #[tokio::test]
+    async fn per_fragment_plan_spills_only_the_fragments_over_budget() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "100"),
+            ])
+            .await
+            .unwrap();
+        // A range encodes to a few bytes at any length. The scattered ids, a
+        // permutation of 500..1000 with no runs, take about two bytes a row,
+        // so any 250 of them are well over the 100-byte budget.
+        let scattered = (0..500_u64)
+            .map(|i| 500 + (i * 7919) % 500)
+            .collect::<Vec<_>>();
+        let row_ids = [
+            RowIdSequence::from(0..500),
+            RowIdSequence::from(scattered.as_slice()),
+        ];
+        let lineages = row_ids
+            .into_iter()
+            .map(|row_ids| {
+                let created_at =
+                    RowDatasetVersionSequence::from_uniform_row_count(row_ids.len(), 1);
+                RowLineage {
+                    row_ids,
+                    last_updated_at: created_at.clone(),
+                    created_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        let plan = plan_row_lineage_spill(100, &lineages);
+        assert_eq!(plan, RowLineagePlan::PerFragment);
+        // Written as [250, 500, 250] rather than the planned [500, 500], so
+        // the middle fragment joins the tail of the range to the head of the
+        // scattered ids.
+        let mut fragments = [250, 500, 250]
+            .into_iter()
+            .enumerate()
+            .map(|(id, rows)| {
+                Fragment::new(id as u64)
+                    .with_file(
+                        format!("{id}.lance"),
+                        vec![0],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                    )
+                    .with_physical_rows(rows)
+            })
+            .collect::<Vec<_>>();
+
+        place_planned_row_lineage(
+            &dataset,
+            &mut fragments,
+            PlannedRowLineage {
+                lineages,
+                planned_rows: vec![500, 500],
+                plan,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(fragments[0].row_id_meta, Some(RowIdMeta::Inline(_))),
+            "a fragment whose row ids fit must keep them inline, got {:?}",
+            fragments[0].row_id_meta
+        );
+        assert_eq!(fragments[0].files.len(), 1);
+        for fragment in &fragments[1..] {
+            assert!(
+                matches!(fragment.row_id_meta, Some(RowIdMeta::Column)),
+                "fragment {}'s row ids are over the budget, got {:?}",
+                fragment.id,
+                fragment.row_id_meta
+            );
+            assert_eq!(fragment.files.len(), 2);
+            assert_eq!(fragment.files[1].fields.as_ref(), [ROW_ID_FIELD_ID]);
+        }
+        let mut placed_row_ids = Vec::with_capacity(1000);
+        for fragment in &fragments {
+            let row_ids = match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(bytes)) => read_row_ids(bytes).unwrap(),
+                _ => read_spilled_row_ids(&dataset, fragment).await.unwrap(),
+            };
+            placed_row_ids.extend(row_ids.iter());
+        }
+        assert_eq!(
+            placed_row_ids,
+            (0..500)
+                .chain(scattered.iter().copied())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A fragment compacts on its own when one of its files is kept only for
+    /// the row lineage it carries next to user columns that are gone. Neither
+    /// layout compaction writes may qualify, or every compaction would plan
+    /// another. Field -2 is the tombstone and -3..=-5 are the lineage columns;
+    /// the schema holds fields 0 and 1, and 5 and 6 were dropped.
+    #[rstest]
+    #[case::in_file_carrier(vec![vec![0, 1, -3, -4, -5]], false)]
+    #[case::lineage_only_file(vec![vec![0, 1], vec![-3, -4, -5]], false)]
+    #[case::tombstoned_carrier(vec![vec![-2, -2, -3, -4, -5], vec![0, 1]], true)]
+    #[case::carrier_of_dropped_columns(vec![vec![5, 6, -3, -4, -5], vec![0, 1]], true)]
+    #[case::dead_file_without_lineage(vec![vec![-2, 6], vec![0, 1]], false)]
+    fn compaction_reclaims_lineage_carriers_of_dead_user_columns(
+        #[case] files: Vec<Vec<i32>>,
+        #[case] expected: bool,
+    ) {
+        let mut fragment = Fragment::new(0);
+        for (index, fields) in files.into_iter().enumerate() {
+            let column_indices = (0..fields.len() as i32).collect();
+            fragment.add_file(
+                format!("{index}.lance"),
+                fields,
+                column_indices,
+                ConcreteFileVersion::V2_2,
+                None,
+            );
+        }
+        let schema_field_ids = HashSet::from([0, 1]);
+        assert_eq!(
+            pins_dead_user_columns_for_lineage(&fragment, &schema_field_ids),
+            expected
+        );
+    }
+
+    /// The writer sizes a column's pages by the memory its arrays hold, so a
+    /// lineage array sharing one buffer with the whole task would make it cut
+    /// a tiny page for every batch.
+    #[tokio::test]
+    async fn append_row_lineage_columns_gives_each_batch_its_own_buffer() {
+        let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
+        let schema = batch.schema();
+        let batches = vec![batch; 3]
+            .into_iter()
+            .map(Ok::<_, datafusion::error::DataFusionError>);
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ));
+        let spill = RowLineageSpill {
+            row_ids: true,
+            ..Default::default()
+        };
+        let fields = spill.schema_fields().unwrap();
+
+        let output = append_row_lineage_columns(input, &fields, vec![(0..12).collect()])
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(output.len(), 3);
+        for (index, batch) in output.iter().enumerate() {
+            let start = index as u64 * 4;
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            assert_eq!(
+                row_ids.values().to_vec(),
+                (start..start + 4).collect::<Vec<_>>()
+            );
+            assert!(
+                row_ids.get_buffer_memory_size() <= batch.num_rows() * 8,
+                "batch {index}'s row ids hold {} bytes for {} rows",
+                row_ids.get_buffer_memory_size(),
+                batch.num_rows()
+            );
+        }
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_compact_data_files(
@@ -4194,6 +5661,48 @@ mod tests {
             .unwrap();
             assert_eq!(dataset.get_fragments().len(), 1);
         }
+    }
+
+    /// Eager (non-deferred) compaction on a stable-row-id dataset never remaps
+    /// an index by address -- stable row ids keep an index's row ids valid
+    /// across the rewrite (see `commit_compaction`'s `needs_remapping`, which
+    /// is unconditionally false under stable row ids unless deferred) -- so it
+    /// must not pay to capture addresses that nothing will consume, even when
+    /// a remappable index is present.
+    #[tokio::test]
+    async fn test_stable_row_ids_eager_compaction_skips_row_addr_capture() {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        create_scalar_index(&mut dataset, "a", false).await;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9_000,
+            defer_index_remap: false,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        let result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+            .await
+            .unwrap();
+        assert!(
+            result.row_addrs.is_none(),
+            "eager stable-row-id compaction must not capture row addresses it will never use"
+        );
     }
 
     #[rstest::rstest]
@@ -4534,8 +6043,193 @@ mod tests {
             .expect("loading large frag reuse index details must not fail");
     }
 
+    /// A shallow clone stamps its index metadata with a `base_id`, and the
+    /// entry's external `details.binpb` stays in the SOURCE dataset's indices
+    /// directory. Loading the details on the clone must resolve the file
+    /// through the entry's base instead of the clone's own dataset root,
+    /// which never contained the file.
     #[tokio::test]
-    async fn test_defer_index_remap_rejected_with_stable_row_ids() {
+    async fn test_shallow_clone_loads_external_frag_reuse_details() {
+        // On disk: base-path resolution must reach the source dataset's
+        // store, which memory:// fixtures cannot demonstrate.
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let clone_uri = format!("{}/clone", clone_dir);
+
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use lance_index::frag_reuse::{FragDigest, FragReuseIndexDetails, FragReuseVersion};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef],
+                )
+                .unwrap())],
+                schema.clone(),
+            ),
+            &source_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // An FRI entry whose details spill to the external file: real
+        // compactions produce run-compressed bitmaps far below the
+        // 204800-byte inline threshold, so synthesize enough reuse versions
+        // to cross it.
+        let digest = |id: u64| FragDigest {
+            id,
+            physical_rows: 4,
+            num_deleted_rows: 0,
+        };
+        let mut versions = Vec::new();
+        for i in 0..3500u64 {
+            let old_id = 1_000 + i;
+            let mut addrs = RoaringTreemap::new();
+            for offset in 0..4u64 {
+                addrs.insert((old_id << 32) + offset);
+            }
+            let mut serialized = Vec::new();
+            addrs.serialize_into(&mut serialized).unwrap();
+            versions.push(FragReuseVersion {
+                dataset_version: i + 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialized,
+                    old_frags: vec![digest(old_id)],
+                    new_frags: vec![digest(100_000 + i)],
+                }],
+            });
+        }
+        let details = FragReuseIndexDetails { versions };
+        let bitmap: RoaringBitmap = (0..3500u32).map(|i| 100_000 + i).collect();
+        let entry = build_frag_reuse_index_metadata(&dataset, None, details, bitmap)
+            .await
+            .unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![entry],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let source_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("fragment reuse index must exist");
+        // Sanity: the details actually went external.
+        let proto = source_meta
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+            .unwrap();
+        assert!(matches!(
+            proto.content,
+            Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(_))
+        ));
+        let source_details = load_frag_reuse_index_details(&dataset, &source_meta)
+            .await
+            .unwrap();
+        assert_eq!(source_details.versions.len(), 3500);
+
+        let version = dataset.manifest.version;
+        let clone = dataset
+            .shallow_clone(clone_uri.as_str(), version, None)
+            .await
+            .unwrap();
+        let clone_meta = clone
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the clone must carry the fragment reuse index");
+        assert!(clone_meta.base_id.is_some());
+
+        // Before the fix this failed with a not-found error: the loader
+        // looked for details.binpb under the clone's own indices dir.
+        let clone_details = load_frag_reuse_index_details(&clone, &clone_meta)
+            .await
+            .expect("the clone must load external FRI details through its base");
+        assert_eq!(clone_details, source_details);
+
+        // The dataset-level open path goes through the same loader.
+        let index = clone
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .expect("the clone must open the fragment reuse index");
+        assert_eq!(index.details.versions, source_details.versions);
+
+        // Cached by the source's file: one read, then none, unless the cache is off.
+        let dir_name = |dir: &str| {
+            std::path::Path::new(dir)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (source_name, clone_name) =
+            (dir_name(source_dir.as_str()), dir_name(clone_dir.as_str()));
+        for cached in [true, false] {
+            let session = if cached {
+                crate::session::Session::default()
+            } else {
+                crate::session::Session::with_index_cache_backend(
+                    Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                    128 * 1024 * 1024,
+                    Default::default(),
+                )
+            };
+            let fresh = crate::dataset::builder::DatasetBuilder::from_uri(clone_uri.as_str())
+                .with_session(Arc::new(session))
+                .load()
+                .await
+                .unwrap();
+            let store = fresh.object_store(clone_meta.base_id).await.unwrap();
+            store.io_stats_incremental();
+            for load in 0..2 {
+                let details = load_frag_reuse_index_details(&fresh, &clone_meta)
+                    .await
+                    .unwrap();
+                assert_eq!(details, source_details);
+                let reads: Vec<String> = store
+                    .io_stats_incremental()
+                    .requests
+                    .iter()
+                    .map(|request| request.path.to_string())
+                    .filter(|path| {
+                        path.ends_with(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+                    })
+                    .collect();
+                if cached && load > 0 {
+                    assert!(reads.is_empty(), "{reads:?}");
+                } else {
+                    assert_eq!(reads.len(), 1, "{reads:?}");
+                    assert!(
+                        reads[0].contains(&source_name) && !reads[0].contains(&clone_name),
+                        "{reads:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_defer_index_remap_with_stable_row_ids_writes_no_pointless_fri() {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -4553,6 +6247,7 @@ mod tests {
         .await
         .unwrap();
         assert!(dataset.manifest.uses_stable_row_ids());
+        let rows_before = dataset.count_rows(None).await.unwrap();
 
         let options = CompactionOptions {
             target_rows_per_fragment: 3_000,
@@ -4560,21 +6255,25 @@ mod tests {
             ..Default::default()
         };
 
-        // Fails at planning time, before any fragment is rewritten.
-        let plan_err = plan_compaction(&dataset, &options).await.unwrap_err();
-        assert!(matches!(plan_err, Error::InvalidInput { .. }));
-        let msg = plan_err.to_string();
-        assert!(msg.contains("defer_index_remap"));
-        assert!(msg.contains("stable row IDs"));
+        // Stable row ids no longer refuse a deferred remap: an address-domain
+        // index needs one even here.
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 3);
 
-        // The full compact_files entry point fails the same way and leaves the
-        // dataset untouched (no new manifest version, no orphaned data files).
-        let version_before = dataset.manifest.version;
-        let compact_err = compact_files(&mut dataset, options, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(compact_err, Error::InvalidInput { .. }));
-        assert_eq!(dataset.manifest.version, version_before);
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(metrics.fragments_removed, 9);
+        assert_eq!(metrics.fragments_added, 3);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), rows_before);
+
+        // This dataset has no index at all, so nothing would ever drain an FRI
+        // and none is written.
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4890,7 +6589,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut compact_read_versions = Vec::new();
+        let mut prepublish_versions = Vec::new();
         for i in 0..10 {
             dataset
                 .delete(&format!("i < {}", 500 * (i + 1)))
@@ -4901,9 +6600,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Record the read version for verification if compaction has happened
             if dataset.manifest.version > read_version {
-                compact_read_versions.push(read_version);
+                prepublish_versions.push(dataset.manifest.version - 1);
             }
 
             // Load and verify the fragment reuse index content
@@ -4931,7 +6629,7 @@ mod tests {
                     .iter()
                     .map(|v| v.dataset_version)
                     .collect::<Vec<_>>(),
-                compact_read_versions
+                prepublish_versions
             );
         }
     }
@@ -5405,7 +7103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_cleanup_and_compaction_rebase_cleanup() {
+    async fn test_cleanup_after_a_stale_remap_keeps_later_compactions() {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
@@ -5515,10 +7213,8 @@ mod tests {
             .unwrap();
         let new_frags3 = frag_reuse_details3.versions.last().unwrap().new_frag_ids();
 
-        // Concurrently commit a frag_reuse_index cleanup operation. dataset_clone
-        // only knows the first reuse version; catch its index up so the cleanup
-        // removes that version. After rebase onto the other compactions it should
-        // contain the new compaction versions.
+        // dataset_clone only knows the first reuse version. Its remap commits at the
+        // latest version, so the cleanup trims only that version.
         remapping::remap_column_index(&mut dataset_clone, &["i"], Some("scalar".into()))
             .await
             .unwrap();
@@ -5666,72 +7362,1053 @@ mod tests {
         assert!(new_frags2.iter().all(|id| *id != 0));
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum CatchUp {
+        Remap,
+        MergeSegments,
+    }
+
+    async fn catch_up_index(dataset: &mut Dataset, name: &str, catch_up: CatchUp) {
+        match catch_up {
+            CatchUp::Remap => {
+                remapping::remap_column_index(dataset, &["i"], Some(name.into()))
+                    .await
+                    .unwrap();
+            }
+            CatchUp::MergeSegments => {
+                let merged = dataset
+                    .merge_existing_index_segments(
+                        dataset.load_indices_by_name(name).await.unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                dataset
+                    .commit_existing_index_segments(name, "i", vec![merged])
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn frag_reuse_watermarks(dataset: &Dataset) -> Vec<u64> {
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .map(|index| {
+                index
+                    .details
+                    .versions
+                    .iter()
+                    .map(|version| version.dataset_version)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn stored_index(dataset: &Dataset, name: &str) -> IndexMetadata {
+        read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|index| index.name == name)
+        .unwrap()
+    }
+
+    async fn rows_found_through_index(dataset: &Dataset) -> usize {
+        dataset
+            .count_rows(Some("i < 10 OR i = 70".to_owned()))
+            .await
+            .unwrap()
+    }
+
+    #[rstest]
     #[tokio::test]
-    async fn test_concurrent_compactions_with_defer_index_remap() {
-        let mut dataset = lance_datagen::gen_batch()
-            .col(
-                "vec",
-                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
-            )
-            .col("i", lance_datagen::array::step::<Int32Type>())
-            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
-            .await
-            .unwrap();
-
-        // Index "i" so the deferred compaction touches indexed data and writes an FRI.
-        create_scalar_index(&mut dataset, "i", false).await;
-
-        let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
-            defer_index_remap: true,
-            ..Default::default()
-        };
-
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
-        let tasks = plan.tasks();
-
-        let mut dataset_clone = dataset.clone();
-
-        // Only compact the first task, record the state of the dataset
-        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
-            .await
-            .unwrap();
-
-        commit_compaction(
-            &mut dataset,
-            Vec::from([rewrite_result]),
-            Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
+    async fn test_index_built_before_the_rewrite_publishes_is_retained_and_caught_up(
+        #[values(CatchUp::Remap, CatchUp::MergeSegments)] catch_up: CatchUp,
+        #[values(false, true)] is_built_after_an_append: bool,
+    ) {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(500),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
+        dataset.delete("i >= 10 AND i < 60").await.unwrap();
+        // An existing index makes the compaction record an FRI.
+        create_scalar_index(&mut dataset, "i", false).await;
+        let mut stale = dataset.clone();
+        if is_built_after_an_append {
+            dataset.append(data_gen.batch(100), None).await.unwrap();
+        }
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("second".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut stale,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        dataset.drop_index("scalar").await.unwrap();
 
-        // Load and verify the fragment reuse index content
-        let Some(frag_reuse_index_meta) = dataset
+        let frag_reuse = dataset.frag_reuse_index().await.unwrap().unwrap();
+        let watermark = frag_reuse.details.versions[0].dataset_version;
+        let second = stored_index(&dataset, "second").await;
+        assert!(second.dataset_version < watermark);
+        let coverage = second.fragment_bitmap.as_ref().unwrap();
+        for new_frag in frag_reuse.details.versions[0].new_frag_ids() {
+            assert!(coverage.contains(new_frag as u32));
+        }
+        for old_frag in frag_reuse.details.versions[0].old_frag_ids() {
+            assert!(!coverage.contains(old_frag as u32));
+        }
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&dataset).await, vec![watermark]);
+        assert_eq!(rows_found_through_index(&dataset).await, 11);
+
+        catch_up_index(&mut dataset, "second", catch_up).await;
+        let caught_up = dataset.load_index_by_name("second").await.unwrap().unwrap();
+        assert_ne!(caught_up.uuid, second.uuid);
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert!(frag_reuse_watermarks(&dataset).await.is_empty());
+        assert_eq!(rows_found_through_index(&dataset).await, 11);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Race {
+        Append,
+        BuildIndex,
+        /// From another session, so the rebase reads its rewrite from the transaction file.
+        CompactElsewhere {
+            excluded: &'static [u32],
+        },
+    }
+
+    #[derive(Debug, Default)]
+    struct RaceBeforeRewrite {
+        races: std::sync::Mutex<Vec<Race>>,
+        handle: std::sync::Mutex<Option<Dataset>>,
+        built: std::sync::Mutex<Option<(Dataset, IndexMetadata)>>,
+    }
+
+    impl RaceBeforeRewrite {
+        fn arm(&self, handle: &Dataset, races: Vec<Race>) {
+            *self.handle.lock().unwrap() = Some(handle.clone());
+            *self.races.lock().unwrap() = races.into_iter().rev().collect();
+        }
+    }
+
+    #[async_trait]
+    impl CommitHandler for RaceBeforeRewrite {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let is_rewrite = transaction
+                .as_ref()
+                .and_then(|transaction| transaction.as_pb().operation.as_ref())
+                .is_some_and(|operation| matches!(operation, PbOperation::Rewrite(_)));
+            let race = if is_rewrite {
+                self.races.lock().unwrap().pop()
+            } else {
+                None
+            };
+            if let Some(race) = race {
+                let mut handle = self.handle.lock().unwrap().clone().unwrap();
+                handle.checkout_latest().await.unwrap();
+                match race {
+                    Race::Append => {
+                        let batch = arrow_array::record_batch!(("i", Int32, [9000, 9001])).unwrap();
+                        handle
+                            .append(
+                                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    Race::BuildIndex => {
+                        let index = handle
+                            .create_index_builder(
+                                &["i"],
+                                IndexType::BTree,
+                                &ScalarIndexParams::default(),
+                            )
+                            .name("second".into())
+                            .execute_uncommitted()
+                            .await
+                            .unwrap();
+                        *self.built.lock().unwrap() = Some((handle, index));
+                    }
+                    Race::CompactElsewhere { excluded } => {
+                        let mut elsewhere = Dataset::open(handle.uri()).await.unwrap();
+                        compact_files(
+                            &mut elsewhere,
+                            deferred_compaction_excluding(excluded),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+            ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    async fn racing_dataset(uri: &str, handler: Arc<RaceBeforeRewrite>) -> Dataset {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(500),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                commit_handler: Some(handler),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i >= 10 AND i < 60").await.unwrap();
+        create_scalar_index(&mut dataset, "i", false).await;
+        dataset
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Boundary {
+        AtWatermark,
+        AfterWatermark,
+    }
+
+    #[rstest]
+    #[case::at_watermark_remap(Boundary::AtWatermark, CatchUp::Remap)]
+    #[case::at_watermark_merge(Boundary::AtWatermark, CatchUp::MergeSegments)]
+    #[case::after_watermark(Boundary::AfterWatermark, CatchUp::Remap)]
+    #[tokio::test]
+    async fn test_index_at_the_watermark_boundary(
+        #[case] boundary: Boundary,
+        #[case] catch_up: CatchUp,
+    ) {
+        let dir = TempStrDir::default();
+        let handler = Arc::new(RaceBeforeRewrite::default());
+        let mut dataset = racing_dataset(dir.as_str(), handler.clone()).await;
+        if matches!(boundary, Boundary::AtWatermark) {
+            handler.arm(&dataset, vec![Race::BuildIndex]);
+        }
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let watermark = frag_reuse_watermarks(&dataset).await[0];
+        assert_eq!(watermark, dataset.manifest.version - 1);
+
+        match boundary {
+            Boundary::AtWatermark => {
+                let (mut handle, index) = handler.built.lock().unwrap().take().unwrap();
+                let read_version = index.dataset_version;
+                handle
+                    .apply_commit(
+                        Transaction::new(
+                            read_version,
+                            Operation::CreateIndex {
+                                new_indices: vec![index],
+                                removed_indices: vec![],
+                            },
+                            None,
+                        ),
+                        &Default::default(),
+                        &Default::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            Boundary::AfterWatermark => {
+                dataset
+                    .create_index(
+                        &["i"],
+                        IndexType::BTree,
+                        Some("second".into()),
+                        &ScalarIndexParams::default(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        dataset.checkout_latest().await.unwrap();
+        dataset.drop_index("scalar").await.unwrap();
+        let second = stored_index(&dataset, "second").await;
+        let is_at_watermark = matches!(boundary, Boundary::AtWatermark);
+        assert_eq!(
+            second.dataset_version,
+            watermark + u64::from(!is_at_watermark)
+        );
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&dataset).await.len(),
+            usize::from(is_at_watermark)
+        );
+        assert_eq!(rows_found_through_index(&dataset).await, 11);
+        if is_at_watermark {
+            catch_up_index(&mut dataset, "second", catch_up).await;
+            let caught_up = dataset.load_index_by_name("second").await.unwrap().unwrap();
+            assert_ne!(caught_up.uuid, second.uuid);
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(frag_reuse_watermarks(&dataset).await.is_empty());
+            assert_eq!(rows_found_through_index(&dataset).await, 11);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Publication {
+        Direct,
+        AfterRetries,
+        OverAConcurrentCleanup,
+    }
+
+    #[rstest]
+    #[case::direct(Publication::Direct)]
+    #[case::after_repeated_retries(Publication::AfterRetries)]
+    #[case::over_a_concurrent_cleanup(Publication::OverAConcurrentCleanup)]
+    #[tokio::test]
+    async fn test_reuse_version_is_stamped_just_before_its_rewrite_publishes(
+        #[case] publication: Publication,
+    ) {
+        let dir = TempStrDir::default();
+        let handler = Arc::new(RaceBeforeRewrite::default());
+        let mut dataset = racing_dataset(dir.as_str(), handler.clone()).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        let earlier = frag_reuse_watermarks(&dataset).await;
+        assert_eq!(earlier, vec![dataset.manifest.version - 1]);
+
+        dataset.delete("i >= 210 AND i < 260").await.unwrap();
+        let rows = dataset.count_rows(None).await.unwrap();
+        match publication {
+            Publication::Direct => {
+                compact_files(&mut dataset, options, None).await.unwrap();
+            }
+            Publication::AfterRetries => {
+                handler.arm(&dataset, vec![Race::Append, Race::Append]);
+                compact_files(&mut dataset, options, None).await.unwrap();
+                assert!(handler.races.lock().unwrap().is_empty());
+            }
+            Publication::OverAConcurrentCleanup => {
+                let completed = execute_compaction_plan(&dataset, &options).await;
+                let mut cleaner = dataset.clone();
+                remapping::remap_column_index(&mut cleaner, &["i"], Some("scalar".into()))
+                    .await
+                    .unwrap();
+                cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+                assert!(frag_reuse_watermarks(&cleaner).await.is_empty());
+                commit_compaction(
+                    &mut dataset,
+                    completed,
+                    Arc::new(DatasetIndexRemapperOptions::default()),
+                    &options,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let retained = match publication {
+            Publication::OverAConcurrentCleanup => vec![],
+            _ => earlier,
+        };
+        assert_eq!(
+            frag_reuse_watermarks(&dataset).await,
+            [retained, vec![dataset.manifest.version - 1]].concat()
+        );
+        let appended = match publication {
+            Publication::AfterRetries => 4,
+            _ => 0,
+        };
+        assert_eq!(dataset.count_rows(None).await.unwrap(), rows + appended);
+    }
+
+    fn stores_reuse_details_externally(entry: &IndexMetadata) -> bool {
+        let proto = entry
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+            .unwrap();
+        matches!(
+            proto.content,
+            Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(_))
+        )
+    }
+
+    /// The index directories holding a reuse details file.
+    fn reuse_details_dirs(uri: &str) -> HashSet<String> {
+        std::fs::read_dir(format!("{uri}/_indices"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|dir| {
+                dir.join(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+                    .exists()
+            })
+            .map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn reuse_details_requests(
+        stats: &lance_io::utils::tracking_store::IoStats,
+        method: &str,
+    ) -> usize {
+        stats
+            .requests
+            .iter()
+            .filter(|request| {
+                request.method.starts_with(method)
+                    && request
+                        .path
+                        .as_ref()
+                        .ends_with(lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME)
+            })
+            .count()
+    }
+
+    /// Two external entries of the same size each load their own details from one session.
+    #[tokio::test]
+    async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+        let dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                dir.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        let count = inline_padding_capacity() as u64 + 1;
+        let mut entries = Vec::new();
+        for stamp in [1, 2] {
+            let mut versions = padding_reuse_versions(count);
+            for version in &mut versions {
+                version.dataset_version = stamp;
+            }
+            let details = lance_index::frag_reuse::FragReuseIndexDetails { versions };
+            let entry = build_frag_reuse_index_metadata(
+                &dataset,
+                None,
+                details.clone(),
+                RoaringBitmap::new(),
+            )
+            .await
+            .unwrap();
+            entries.push((entry, details));
+        }
+        let sizes: Vec<_> =
+            entries
+                .iter()
+                .map(|(entry, _)| {
+                    match entry
+                    .index_details
+                    .as_ref()
+                    .unwrap()
+                    .to_msg::<lance_table::format::pb::FragmentReuseIndexDetails>()
+                    .unwrap()
+                    .content
+                {
+                    Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(
+                        file,
+                    )) => file.size,
+                    other => panic!("expected external details, got {other:?}"),
+                }
+                })
+                .collect();
+        assert_eq!(sizes[0], sizes[1]);
+        for (entry, details) in &entries {
+            let loaded = load_frag_reuse_index_details(&dataset, entry)
+                .await
+                .unwrap();
+            assert_eq!(loaded.as_ref(), details);
+        }
+    }
+
+    /// Versions written out of stamp order load from memory as a read of the file decodes them.
+    #[tokio::test]
+    async fn test_reuse_details_cache_holds_what_a_read_decodes() {
+        use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+        use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+        let dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                dir.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        let mut versions = padding_reuse_versions(inline_padding_capacity() as u64 + 1);
+        let count = versions.len() as u64;
+        for (i, version) in versions.iter_mut().enumerate() {
+            version.dataset_version = count - i as u64;
+        }
+        let entry = build_frag_reuse_index_metadata(
+            &dataset,
+            None,
+            lance_index::frag_reuse::FragReuseIndexDetails { versions },
+            RoaringBitmap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(stores_reuse_details_externally(&entry));
+
+        let cached = load_frag_reuse_index_details(&dataset, &entry)
+            .await
+            .unwrap();
+        let uncached = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(crate::session::Session::with_index_cache_backend(
+                Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                128 * 1024 * 1024,
+                Default::default(),
+            )))
+            .load()
+            .await
+            .unwrap();
+        let read = load_frag_reuse_index_details(&uncached, &entry)
+            .await
+            .unwrap();
+        assert_eq!(cached, read);
+        assert!(
+            cached
+                .versions
+                .is_sorted_by_key(|version| version.dataset_version)
+        );
+    }
+
+    /// An uncontended commit publishes right after its reservation, so its reuse
+    /// details are written once and no provisional copy is left behind. With a
+    /// cache, the history check reads nothing back; without one it reads the files
+    /// and reaches the same outcome.
+    #[rstest]
+    #[tokio::test]
+    async fn test_deferred_compaction_writes_reuse_details_once(
+        #[values(true, false)] external_before: bool,
+        #[values(true, false)] cached: bool,
+    ) {
+        use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
+        let dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        create_scalar_index(&mut dataset, "i", false).await;
+        // Scattered deletions make the compaction's own version larger than a padding one.
+        dataset.delete("i % 3 = 1").await.unwrap();
+        let capacity = inline_padding_capacity();
+        let history = commit_padding_reuse_history(
+            &mut dataset,
+            if external_before {
+                capacity + 1
+            } else {
+                capacity
+            },
+        )
+        .await;
+        assert_eq!(stores_reuse_details_externally(&history), external_before);
+
+        let session = if cached {
+            crate::session::Session::default()
+        } else {
+            crate::session::Session::with_index_cache_backend(
+                Arc::new(lance_core::cache::MokaCacheBackend::no_cache()),
+                128 * 1024 * 1024,
+                Default::default(),
+            )
+        };
+        let options = CompactionOptions {
+            target_rows_per_fragment: 200,
+            defer_index_remap: true,
+            excluded_fragment_ids: fragments_except(&dataset, &[0, 1]),
+            ..Default::default()
+        };
+        let result = plan_one_task(&dataset, &options).await;
+        // Committed through a session that has read nothing yet.
+        let mut dataset = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap();
+        let dirs_before = reuse_details_dirs(dir.as_str());
+        dataset.object_store.io_stats_incremental();
+        commit_one(&mut dataset, result, &options).await.unwrap();
+        let stats = dataset.object_store.io_stats_incremental();
+
+        assert_eq!(reuse_details_requests(&stats, "put"), 1);
+        // With a cache, only the stored history is read, once.
+        let reads = reuse_details_requests(&stats, "get");
+        if cached {
+            assert_eq!(reads, usize::from(external_before));
+        } else {
+            assert!(reads > usize::from(external_before));
+        }
+        let entry = dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
             .await
             .unwrap()
-        else {
-            panic!("Fragment reuse index must be available");
-        };
-        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .unwrap();
+        assert!(stores_reuse_details_externally(&entry));
+        let written: Vec<_> = reuse_details_dirs(dir.as_str())
+            .difference(&dirs_before)
+            .cloned()
+            .collect();
+        assert_eq!(written, vec![entry.uuid.to_string()]);
+        let details = load_frag_reuse_index_details(&dataset, &entry)
             .await
             .unwrap();
-        assert_eq!(frag_reuse_details.versions.len(), 1);
+        assert_eq!(entry.fragment_bitmap, Some(details.new_frag_bitmap()));
+        let watermark = dataset.manifest.version - 1;
+        assert_eq!(entry.dataset_version, watermark);
+        assert_eq!(
+            frag_reuse_watermarks(&dataset).await.last(),
+            Some(&watermark)
+        );
+    }
 
-        // Concurrently commit a rewrite should fail
-        let rewrite_result2 =
-            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
+    /// The deletions sit at non-zero offsets, so a mistranslated address loses rows.
+    async fn indexed_dataset(uri: &str, index: BuiltinIndexType) -> Dataset {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index_builder(
+                &["i"],
+                IndexType::Scalar,
+                &ScalarIndexParams::for_builtin(index),
+            )
+            .name("i_idx".into())
+            .await
+            .unwrap();
+        dataset.delete("i IN (3, 24, 45)").await.unwrap();
+        dataset
+    }
+
+    fn deferred_compaction_excluding(excluded_fragment_ids: &[u32]) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: 20,
+            defer_index_remap: true,
+            excluded_fragment_ids: excluded_fragment_ids.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    async fn plan_one_task(dataset: &Dataset, options: &CompactionOptions) -> RewriteResult {
+        let plan = plan_compaction(dataset, options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        plan.compaction_tasks()
+            .next()
+            .unwrap()
+            .execute(dataset)
+            .await
+            .unwrap()
+    }
+
+    async fn commit_one(
+        dataset: &mut Dataset,
+        result: RewriteResult,
+        options: &CompactionOptions,
+    ) -> Result<()> {
+        commit_compaction(
+            dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            options,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn values_by_address(dataset: &Dataset) -> HashMap<u64, i32> {
+        let batch = dataset
+            .scan()
+            .project(&["i"])
+            .unwrap()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let addrs = batch[lance_core::ROW_ADDR]
+            .as_primitive::<UInt64Type>()
+            .values();
+        let values = batch["i"].as_primitive::<Int32Type>().values();
+        addrs.iter().copied().zip(values.iter().copied()).collect()
+    }
+
+    async fn values_matching(
+        dataset: &Dataset,
+        column: &str,
+        filter: &str,
+        use_scalar_index: bool,
+    ) -> Vec<i32> {
+        let mut scanner = dataset.scan();
+        scanner.filter(filter).unwrap();
+        scanner.project(&[column]).unwrap();
+        scanner.use_scalar_index(use_scalar_index);
+        let mut values = scanner.try_into_batch().await.unwrap()[column]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+        values
+    }
+
+    async fn assert_index_is_used(dataset: &Dataset, filter: &str, index_name: &str) {
+        let mut scanner = dataset.scan();
+        scanner.filter(filter).unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains(&format!("@{index_name}(")),
+            "{filter}: {plan}"
+        );
+    }
+
+    async fn assert_index_answers_like_a_scan(dataset: &Dataset) {
+        for filter in ["i < 15", "i >= 20 AND i < 35", "i > 40"] {
+            assert_eq!(
+                values_matching(dataset, "i", filter, true).await,
+                values_matching(dataset, "i", filter, false).await,
+                "{filter}"
+            );
+            assert_index_is_used(dataset, filter, "i_idx").await;
+        }
+    }
+
+    async fn assert_mappings_intact(uri: &str, before: &HashMap<u64, i32>) {
+        let dataset = Dataset::open(uri).await.unwrap();
+        let frag_reuse = dataset.frag_reuse_index().await.unwrap();
+        let after = values_by_address(&dataset).await;
+        assert_eq!(after.len(), before.len());
+        for (old_addr, value) in before {
+            let new_addr = frag_reuse
+                .as_ref()
+                .map_or(Some(*old_addr), |index| index.remap_row_id(*old_addr))
+                .unwrap_or_else(|| panic!("live row {value} at {old_addr} maps to a deletion"));
+            assert_eq!(after.get(&new_addr), Some(value), "moved from {old_addr}");
+        }
+        assert_index_answers_like_a_scan(&dataset).await;
+    }
+
+    fn fragments_except(dataset: &Dataset, compacted: &[u32]) -> Vec<u32> {
+        dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .filter(|id| !compacted.contains(id))
+            .collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReuseHistoryChange {
+        Created,
+        Replaced,
+        Removed,
+    }
+
+    /// The second commit must conflict whether or not its session saw the first.
+    #[rstest]
+    #[tokio::test]
+    async fn test_concurrent_compactions_with_defer_index_remap(
+        #[values(
+            ReuseHistoryChange::Created,
+            ReuseHistoryChange::Replaced,
+            ReuseHistoryChange::Removed
+        )]
+        change: ReuseHistoryChange,
+        #[values(false, true)] separate_session: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::ZoneMap).await;
+        if !matches!(change, ReuseHistoryChange::Created) {
+            compact_files(
+                &mut dataset,
+                deferred_compaction_excluding(&[0, 1, 2, 3]),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let untouched: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .filter(|id| *id > 3)
+            .collect();
+        let options_a = deferred_compaction_excluding(&[&[2, 3], untouched.as_slice()].concat());
+        let options_b = deferred_compaction_excluding(&[&[0, 1], untouched.as_slice()].concat());
+        let before = values_by_address(&dataset).await;
+        let result_a = plan_one_task(&dataset, &options_a).await;
+        let result_b = plan_one_task(&dataset, &options_b).await;
+        let open = async || {
+            if separate_session {
+                Dataset::open(dir.as_str()).await.unwrap()
+            } else {
+                dataset.clone()
+            }
+        };
+        let mut committer_a = open().await;
+        let mut committer_b = open().await;
+
+        if matches!(change, ReuseHistoryChange::Removed) {
+            committer_a.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap();
+        } else {
+            commit_one(&mut committer_a, result_a, &options_a)
                 .await
                 .unwrap();
-        let result = commit_compaction(
-            &mut dataset_clone,
-            Vec::from([rewrite_result2]),
-            Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
-        )
-        .await;
-        assert!(matches!(result, Err(Error::RetryableCommitConflict { .. })));
+        }
+        let error = commit_one(&mut committer_b, result_b.clone(), &options_b)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        let expected_versions = match change {
+            ReuseHistoryChange::Created => 1,
+            ReuseHistoryChange::Replaced => 2,
+            ReuseHistoryChange::Removed => 0,
+        };
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await.len(),
+            expected_versions
+        );
+        if !matches!(change, ReuseHistoryChange::Removed) {
+            assert_mappings_intact(dir.as_str(), &before).await;
+        }
+
+        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
+        commit_one(&mut recommitter, result_b, &options_b)
+            .await
+            .unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await.len(),
+            expected_versions + 1
+        );
+        if !matches!(change, ReuseHistoryChange::Removed) {
+            assert_mappings_intact(dir.as_str(), &before).await;
+        }
+    }
+
+    /// The race lands after the first attempt's check, so only the retry can catch it.
+    #[tokio::test]
+    async fn test_deferred_compaction_rechecks_the_reuse_history_on_every_attempt() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::ZoneMap).await;
+        let handler = Arc::new(RaceBeforeRewrite::default());
+        dataset.commit_handler = handler.clone();
+        let before = values_by_address(&dataset).await;
+        let options = deferred_compaction_excluding(&[2, 3, 4, 5]);
+        let result = plan_one_task(&dataset, &options).await;
+
+        handler.arm(&dataset, vec![Race::CompactElsewhere { excluded: &[0, 1] }]);
+        let error = commit_one(&mut dataset, result.clone(), &options)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(handler.races.lock().unwrap().is_empty());
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 1);
+        assert_mappings_intact(dir.as_str(), &before).await;
+
+        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
+        commit_one(&mut recommitter, result, &options)
+            .await
+            .unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 2);
+        assert_mappings_intact(dir.as_str(), &before).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cleanup_racing_a_deferred_compaction_keeps_its_mappings(
+        #[values(false, true)] separate_session: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::BTree).await;
+        let before = values_by_address(&dataset).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[0, 1]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        let mut cleaner = if separate_session {
+            Dataset::open(dir.as_str()).await.unwrap()
+        } else {
+            dataset.clone()
+        };
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[2, 3]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let error = cleanup_frag_reuse_index(&mut cleaner).await.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 2);
+        assert_mappings_intact(dir.as_str(), &before).await;
+
+        cleaner.checkout_latest().await.unwrap();
+        cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await,
+            frag_reuse_watermarks(&dataset).await[1..]
+        );
+        assert_index_answers_like_a_scan(&latest).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_deferred_compaction_over_a_partial_cleanup_keeps_the_remaining_mappings(
+        #[values(false, true)] separate_session: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::BTree).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[0, 1]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        let before = values_by_address(&dataset).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[2, 3]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let history = frag_reuse_watermarks(&dataset).await;
+        assert_eq!(history.len(), 2);
+        let open = async || {
+            if separate_session {
+                Dataset::open(dir.as_str()).await.unwrap()
+            } else {
+                dataset.clone()
+            }
+        };
+        let mut stale = open().await;
+        let options = deferred_compaction_excluding(&fragments_except(&stale, &[4, 5]));
+        let result = plan_one_task(&stale, &options).await;
+
+        let mut cleaner = open().await;
+        cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&cleaner).await, history[1..]);
+        commit_one(&mut stale, result, &options).await.unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(
+            frag_reuse_watermarks(&latest).await,
+            vec![history[1], latest.manifest.version - 1]
+        );
+        assert_mappings_intact(dir.as_str(), &before).await;
+    }
+
+    #[tokio::test]
+    async fn test_distributed_deferred_compaction_keeps_mappings_recorded_before_its_handle() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), BuiltinIndexType::BTree).await;
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[0, 1]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let before = values_by_address(&dataset).await;
+        let options_b = deferred_compaction_excluding(&fragments_except(&dataset, &[4, 5]));
+        let result_b = plan_one_task(&dataset, &options_b).await;
+
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert!(frag_reuse_watermarks(&dataset).await.is_empty());
+        let options = deferred_compaction_excluding(&fragments_except(&dataset, &[2, 3]));
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let mut driver = Dataset::open(dir.as_str()).await.unwrap();
+        commit_one(&mut driver, result_b, &options_b).await.unwrap();
+        let latest = Dataset::open(dir.as_str()).await.unwrap();
+        assert_eq!(frag_reuse_watermarks(&latest).await.len(), 2);
+        assert_mappings_intact(dir.as_str(), &before).await;
     }
 
     #[tokio::test]
@@ -5878,6 +8555,522 @@ mod tests {
         assert!(
             plan.contains("ScalarIndexQuery: query=[id = 2]@id_idx(BloomFilter)"),
             "Expected BloomFilter index query in plan: {plan}"
+        );
+    }
+
+    /// A zone map is built over `_rowaddr`, so a rewrite invalidates every
+    /// address it stores. Stable row ids do not save it: they spare the
+    /// row-id-domain indices a remap, not this one.
+    ///
+    /// Without a deferred remap there is nothing to repair those addresses with,
+    /// so the rewritten fragments are dropped from its coverage and the scanner
+    /// falls back to a full scan. Answers stay correct; the index stops earning
+    /// its keep.
+    #[tokio::test]
+    async fn test_zonemap_loses_coverage_compacting_stable_row_ids() {
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "an eager compaction writes no fragment-reuse index"
+        );
+        assert!(
+            zonemap_coverage(&dataset).await.is_empty(),
+            "coverage should have been dropped rather than followed"
+        );
+        assert_zonemap_answers_match_scan(&dataset).await;
+    }
+
+    /// The same compaction with `defer_index_remap` keeps the zone map covering
+    /// its data: the FRI records the address moves and the index applies them on
+    /// load, then bakes them in when the segments are merged.
+    #[tokio::test]
+    async fn test_defer_index_remap_zonemap_with_stable_row_ids() {
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+        let coverage_before = zonemap_coverage(&dataset).await;
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 3);
+        assert_eq!(metrics.fragments_added, 1);
+
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "a deferred compaction over an address-domain index must write an FRI"
+        );
+
+        let coverage_after = zonemap_coverage(&dataset).await;
+        assert_ne!(coverage_after, coverage_before);
+        assert_eq!(
+            coverage_after.len(),
+            1,
+            "coverage followed to the new fragment"
+        );
+        assert_zonemap_answers_match_scan(&dataset).await;
+        assert_zonemap_is_used(&dataset).await;
+
+        // Draining the FRI into the index must not change any answer.
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("value_idx").await.unwrap())
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![merged])
+            .await
+            .unwrap();
+
+        assert_zonemap_answers_match_scan(&dataset).await;
+        assert_zonemap_is_used(&dataset).await;
+    }
+
+    /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
+    /// dataset: the FRI is applied to every index on load, and a stable row id
+    /// is numerically indistinguishable from an address into fragment 0, so it
+    /// would silently rewrite the btree's valid row ids.
+    ///
+    /// Compaction refuses to create that pair, at the plan boundary and again at
+    /// the commit boundary.
+    #[tokio::test]
+    async fn test_defer_index_remap_rejected_while_row_id_index_present() {
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 512,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        let plan_err = plan_compaction(&dataset, &options).await.unwrap_err();
+        assert!(matches!(plan_err, Error::InvalidInput { .. }));
+        let msg = plan_err.to_string();
+        assert!(msg.contains("defer_index_remap"), "{msg}");
+        assert!(msg.contains("id_idx"), "{msg}");
+
+        // Nothing is rewritten, and the zone map keeps the coverage it had.
+        let version_before = dataset.manifest.version;
+        let compact_err = compact_files(&mut dataset, options, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(compact_err, Error::InvalidInput { .. }));
+        assert_eq!(dataset.manifest.version, version_before);
+        assert_eq!(zonemap_coverage(&dataset).await.len(), 3);
+    }
+
+    /// The mirror image: once an FRI is live, a row-id-domain index cannot be
+    /// added, because the FRI would be applied to it on load.
+    #[tokio::test]
+    async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let err = dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("fragment reuse index"), "{msg}");
+
+        // An address-domain index is still allowed: the FRI repairs it.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BloomFilter,
+                Some("id_bloom".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_zonemap_answers_match_scan(&dataset).await;
+    }
+
+    /// Index creation and a deferred compaction race, and each one's guard looks
+    /// at a snapshot taken before the other committed.
+    ///
+    /// The compaction plans and rewrites while no row-id-domain index exists, so
+    /// its plan-time guard passes. A btree is then created and commits: no FRI
+    /// exists yet, so its guard passes too. The compaction finally commits from
+    /// the handle it planned on, which still cannot see the btree, and the
+    /// rewrite rebases on top of the `CreateIndex`.
+    ///
+    /// The result is the combination both guards exist to prevent: stable row
+    /// ids, an FRI, and a row-id-domain index whose row ids the FRI will rewrite
+    /// on load.
+    ///
+    /// Fails two ways, both real. In a debug build the invariant's
+    /// `debug_assert` in `manifest_build` trips first. In a release build there
+    /// is nothing to stop it: the commit returns `Ok` and the invalid
+    /// combination is durably committed, which the final assertion here catches.
+    #[tokio::test]
+    async fn test_defer_index_remap_racing_row_id_index_creation() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = zonemap_stable_row_id_dataset(test_uri).await;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 512,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Plan and rewrite against a dataset that carries no row-id-domain index.
+        let completed = execute_compaction_plan(&dataset, &options).await;
+
+        // A concurrent writer adds one and commits first. No FRI exists yet, so
+        // nothing refuses it.
+        let mut concurrent = Dataset::open(test_uri).await.unwrap();
+        concurrent
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(concurrent.manifest.version > dataset.manifest.version);
+
+        // The compaction commits from its own, now-stale handle.
+        let commit_result = commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await;
+
+        // Only the rebase can see both sides, so it is what must refuse.
+        let commit_err = commit_result.expect_err(
+            "the rewrite must conflict with the concurrently created row-id-domain index",
+        );
+        assert!(
+            matches!(commit_err, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got: {commit_err:?}"
+        );
+
+        // And the invalid combination must not be on disk.
+        let after = Dataset::open(test_uri).await.unwrap();
+        assert!(after.manifest.uses_stable_row_ids());
+        let has_frag_reuse = after
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        let row_id_indices = row_id_domain_indices(&after).await.unwrap();
+        assert!(
+            !has_frag_reuse || row_id_indices.is_empty(),
+            "committed the invalid combination: stable row ids + fragment reuse index + \
+             row-id-domain index(es) {row_id_indices:?}"
+        );
+        assert_btree_answers_every_row(&after).await;
+    }
+
+    /// The mirror ordering: the rewrite commits its FRI first, and the index
+    /// creation -- planned against a version with no FRI -- rebases on top of it.
+    /// The rebase is again the only place that sees both.
+    #[tokio::test]
+    async fn test_row_id_index_creation_racing_defer_index_remap() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = zonemap_stable_row_id_dataset(test_uri).await;
+
+        // A second handle pinned to the pre-compaction version.
+        let mut concurrent = Dataset::open(test_uri).await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // `create_index` sees no FRI at its own version, so its guard passes and
+        // the transaction reaches the rebase.
+        let err = concurrent
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .expect_err("creating a row-id-domain index must conflict with the committed FRI");
+        assert!(
+            matches!(
+                err,
+                Error::RetryableCommitConflict { .. } | Error::InvalidInput { .. }
+            ),
+            "expected a conflict or a refusal, got: {err:?}"
+        );
+
+        let after = Dataset::open(test_uri).await.unwrap();
+        assert!(
+            row_id_domain_indices(&after).await.unwrap().is_empty(),
+            "a row-id-domain index landed alongside the fragment reuse index"
+        );
+        assert_zonemap_answers_match_scan(&after).await;
+    }
+
+    /// The mirror ordering only conflicts today by accident: the rebase rejects
+    /// a `CreateIndex` whose coverage overlaps the rewritten fragments. An index
+    /// built over fragments the compaction left alone does not overlap, so
+    /// nothing stops it -- and the `Rewrite` transaction read back from its file
+    /// reports no fragment-reuse index at all, because the proto has no field
+    /// for one, so the rebase cannot even tell an FRI landed.
+    #[tokio::test]
+    async fn test_row_id_index_creation_racing_defer_index_remap_disjoint_coverage() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = zonemap_stable_row_id_dataset(test_uri).await;
+
+        let concurrent = Dataset::open(test_uri).await.unwrap();
+
+        // Compact only fragments 0 and 1, leaving 2 untouched.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                excluded_fragment_ids: vec![2],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A btree over only the untouched fragment. Its coverage is disjoint from
+        // the rewrite, so the incidental overlap rule does not fire.
+        let mut concurrent = concurrent;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let result = crate::index::CreateIndexBuilder::new(
+            &mut concurrent,
+            &["id"],
+            IndexType::BTree,
+            &params,
+        )
+        .name("id_idx".into())
+        .fragments(vec![2])
+        .await;
+
+        let after = Dataset::open(test_uri).await.unwrap();
+        let has_frag_reuse = after
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        let row_id_indices = row_id_domain_indices(&after).await.unwrap();
+        assert!(
+            !has_frag_reuse || row_id_indices.is_empty(),
+            "committed the invalid combination: stable row ids + fragment reuse index + \
+             row-id-domain index(es) {row_id_indices:?} (create returned {result:?})"
+        );
+    }
+
+    /// Every row must be reachable through the btree, whose row ids no FRI may
+    /// have rewritten.
+    async fn assert_btree_answers_every_row(dataset: &Dataset) {
+        if !dataset
+            .load_indices_by_name("id_idx")
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            for id in 0..12i32 {
+                let mut scanner = dataset.scan();
+                scanner.filter(&format!("id = {id}")).unwrap();
+                scanner.project(&["id"]).unwrap();
+                scanner.use_scalar_index(true);
+                let found = scanner.try_into_batch().await.unwrap()["id"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec();
+                assert_eq!(found, vec![id], "btree lost row {id}");
+            }
+        }
+    }
+
+    /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
+    async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            (
+                "value",
+                Int64,
+                [
+                    Some(0),
+                    None,
+                    Some(20),
+                    Some(30),
+                    Some(40),
+                    None,
+                    Some(60),
+                    Some(70),
+                    Some(80),
+                    None,
+                    Some(100),
+                    Some(110)
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                max_rows_per_group: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::ZoneMap,
+                Some("value_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_zonemap_answers_match_scan(&dataset).await;
+        dataset
+    }
+
+    async fn zonemap_coverage(dataset: &Dataset) -> RoaringBitmap {
+        dataset
+            .load_indices_by_name("value_idx")
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|idx| idx.fragment_bitmap.clone())
+            .fold(RoaringBitmap::new(), |mut acc, bm| {
+                acc |= bm;
+                acc
+            })
+    }
+
+    /// The index path and a full scan must agree, for a value predicate, a range
+    /// predicate and the null bitmap.
+    async fn assert_zonemap_answers_match_scan(dataset: &Dataset) {
+        async fn scan_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner.filter(filter).unwrap();
+            scanner.project(&["id"]).unwrap();
+            scanner.use_scalar_index(use_scalar_index);
+            scanner.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        }
+
+        for (filter, expected) in [
+            ("value IS NULL", vec![1, 5, 9]),
+            ("value = 20", vec![2]),
+            ("value > 90", vec![10, 11]),
+        ] {
+            assert_eq!(scan_ids(dataset, filter, false).await, expected, "{filter}");
+            assert_eq!(scan_ids(dataset, filter, true).await, expected, "{filter}");
+        }
+    }
+
+    async fn assert_zonemap_is_used(dataset: &Dataset) {
+        let mut scanner = dataset.scan();
+        scanner.filter("value IS NULL").unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[value IS NULL]@value_idx(ZoneMap)"),
+            "Expected ZoneMap index query in plan: {plan}"
         );
     }
 
@@ -7380,7 +10573,14 @@ mod tests {
     async fn test_ivf_flat_defer_compaction_with_deletions() {
         let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, small_ivf());
         // Flat storage is scanned linearly; dropping deleted rows is exact.
-        check_vector_defer_compaction(params, Some("id < 1500"), 10, 10).await;
+        // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+        Box::pin(check_vector_defer_compaction(
+            params,
+            Some("id < 1500"),
+            10,
+            10,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -7393,7 +10593,8 @@ mod tests {
             SQBuildParams::default(),
         );
         // No deletions: storage positions are stable, so the graph stays aligned.
-        check_vector_defer_compaction(params, None, 10, 9).await;
+        // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+        Box::pin(check_vector_defer_compaction(params, None, 10, 9)).await;
     }
 
     // NOTE: IVF_HNSW_* under materialized deletions is a known gap (lance#3993,
@@ -7414,7 +10615,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        check_vector_defer_compaction(params, Some("id < 1500"), 10, 8).await;
+        // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+        Box::pin(check_vector_defer_compaction(
+            params,
+            Some("id < 1500"),
+            10,
+            8,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -7425,7 +10633,14 @@ mod tests {
             small_ivf(),
             SQBuildParams::default(),
         );
-        check_vector_defer_compaction(params, Some("id < 1500"), 10, 8).await;
+        // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+        Box::pin(check_vector_defer_compaction(
+            params,
+            Some("id < 1500"),
+            10,
+            8,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -7436,7 +10651,14 @@ mod tests {
             small_ivf(),
             RQBuildParams::new(1),
         );
-        check_vector_defer_compaction(params, Some("id < 1500"), 10, 8).await;
+        // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+        Box::pin(check_vector_defer_compaction(
+            params,
+            Some("id < 1500"),
+            10,
+            8,
+        ))
+        .await;
     }
 
     /// Merge-only deferred compaction, then a PHYSICAL remap + FRI trim. Asserts
@@ -7591,7 +10813,8 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_flat_remap_and_trim() {
         let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, small_ivf());
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     // Regression: PQ storage used to remap its codes through the frag-reuse
@@ -7612,7 +10835,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     #[tokio::test]
@@ -7623,7 +10847,8 @@ mod tests {
             small_ivf(),
             SQBuildParams::default(),
         );
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     #[tokio::test]
@@ -7634,7 +10859,8 @@ mod tests {
             small_ivf(),
             RQBuildParams::new(1),
         );
-        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
     }
 
     #[tokio::test]
@@ -7647,7 +10873,8 @@ mod tests {
             SQBuildParams::default(),
         );
         // Physical remap rebuilds the HNSW graph, so use a recall-tolerant overlap.
-        check_vector_remap_and_trim(params, 10, 7, None).await;
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 7, None)).await;
     }
 
     #[tokio::test]
@@ -7668,7 +10895,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        check_vector_remap_and_trim(params, 10, 7, None).await;
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 7, None)).await;
     }
 
     // Scalar index correctness across deferred compaction WITH materialized
@@ -8851,8 +12079,8 @@ mod tests {
         input_schema.fields[0].unload_blobs_recursive();
         let input_field = Field::from(&input_schema.fields[0]);
 
-        let plan =
-            BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field).unwrap();
+        let plan = BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field, false)
+            .unwrap();
         let BlobV2FieldRewritePlan::Struct { children, .. } = &plan else {
             panic!("nested blob field should produce a struct rewrite plan");
         };
@@ -10105,6 +13333,91 @@ mod tests {
         out
     }
 
+    #[rstest]
+    #[case::default_target(LanceFileVersion::V2_2, None)]
+    #[case::explicit_target(LanceFileVersion::V2_2, Some(LanceFileVersion::V2_2))]
+    #[case::non_default_target(LanceFileVersion::V2_0, Some(LanceFileVersion::V2_2))]
+    #[tokio::test]
+    async fn test_compaction_target_preserves_overlays(
+        #[case] default_version: LanceFileVersion,
+        #[case] target: Option<LanceFileVersion>,
+        #[values(
+            CompactionMode::Reencode,
+            CompactionMode::TryBinaryCopy,
+            CompactionMode::ForceBinaryCopy
+        )]
+        mode: CompactionMode,
+    ) {
+        let batch = record_batch!(
+            ("id", Int32, [0, 1, 2, 3]),
+            ("val", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(RecordBatch::new_empty(batch.schema()))], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(default_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // The first fragment is clean; eligibility must inspect every fragment.
+        let mut dataset = commit_overlay(
+            dataset,
+            1,
+            &[1],
+            OverlayCoverage::dense(bitmap([0, 1])),
+            vec![i32_array([Some(999), None])],
+        )
+        .await;
+        let expected = BTreeMap::from([(0, Some(10)), (1, Some(20)), (2, Some(999)), (3, None)]);
+        assert_eq!(id_val_map(&dataset).await, expected);
+        let manifest = dataset.manifest.clone();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4,
+            data_storage_version: target,
+            compaction_mode: Some(mode),
+            ..Default::default()
+        };
+        let result = compact_files(&mut dataset, options, None).await;
+        if mode == CompactionMode::ForceBinaryCopy {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("binary copy is not supported"));
+            assert_eq!(dataset.manifest, manifest);
+        } else {
+            let metrics = result.unwrap();
+            assert_eq!(metrics.fragments_removed, 2);
+            assert_eq!(metrics.fragments_added, 1);
+            assert!(dataset.manifest.fragments[0].overlays.is_empty());
+            assert_eq!(
+                dataset.manifest.fragments[0].files[0]
+                    .file_version()
+                    .unwrap(),
+                ConcreteFileVersion::V2_2
+            );
+        }
+        assert_eq!(id_val_map(&dataset).await, expected);
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            default_version.resolve()
+        );
+        dataset.validate().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_max_overlays_triggers_full_compaction() {
         // Fragment 0 gets 3 overlays; fragment 1 stays clean.
@@ -10274,5 +13587,43 @@ mod tests {
         scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
+    }
+
+    /// Round 6: unlike `migrate_fragments`, the reuse-record normalization
+    /// must keep a fully-deleted fragment: the rewrite group still removes
+    /// it from the manifest and the transition still consumes it (zero live
+    /// rows), so a silently shortened source list would desynchronize the
+    /// digests, the group and the manifest.
+    #[tokio::test]
+    async fn test_normalize_source_fragments_keeps_fully_deleted() {
+        use lance_table::format::{DeletionFile, DeletionFileType};
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let mut fragment = Fragment::new(7);
+        fragment.physical_rows = Some(4);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(4),
+            base_id: None,
+        });
+        let normalized = normalize_source_fragments(&dataset, &[fragment])
+            .await
+            .unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, 7);
+        assert_eq!(normalized[0].physical_rows, Some(4));
+        assert_eq!(
+            normalized[0]
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(4)
+        );
     }
 }

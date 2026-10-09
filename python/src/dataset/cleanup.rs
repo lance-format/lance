@@ -23,6 +23,8 @@ pub struct CleanupStats {
     pub transaction_files_removed: u64,
     pub index_files_removed: u64,
     pub deletion_files_removed: u64,
+    /// Files that could not be deleted; not counted as removed.
+    pub failed_deletes: u64,
 }
 
 #[pymethods]

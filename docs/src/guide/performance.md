@@ -4,10 +4,11 @@ This guide provides tips and tricks for optimizing the performance of your Lance
 
 ## Logging
 
-Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
-library you are using. For rust, you will need to configure a logging subscriber. For more details
-ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
-logging subscriber that logs to stderr.
+Lance emits log messages through the `log` crate and structured events through the `tracing` crate.
+Rust applications configure their own logger and tracing subscriber, including filtering and output
+destinations; the Rust library does not install either globally. See the
+[log](https://docs.rs/log/latest/log/) and [tracing](https://docs.rs/tracing/latest/tracing/) docs.
+The Python and Java clients configure a default logger that logs to stderr.
 
 The Python/Java logger can be configured with several environment variables:
 
@@ -322,6 +323,14 @@ To enable the FRI, set `defer_index_remap=True` when compacting:
 ```python
 dataset.optimize.compact_files(defer_index_remap=True)
 ```
+
+Rust callers can open the FRI for the dataset version they have loaded with
+`Dataset::frag_reuse_index()`, which returns `None` when that version has no FRI. The returned
+index exposes the raw remap: a physical row address is either unmapped, deleted by a recorded
+compaction, or mapped to the last address reached through the retained mappings. Neither outcome
+is validated against the loaded manifest. Unmapped addresses may still have moved in a compaction
+whose history was trimmed, and mapped destinations may since have been removed, so callers that
+need a complete translation must verify coverage and destinations themselves.
 
 For details on the index format and usage patterns, see the
 [Fragment Reuse Index specification](../format/index/system/frag_reuse.md).

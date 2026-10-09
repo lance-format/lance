@@ -86,6 +86,12 @@ fn parse_compaction_options(
                 opts.excluded_fragment_ids =
                     value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
             }
+            "data_storage_version" => {
+                let version: Option<String> = value.extract()?;
+                if let Some(version) = version {
+                    opts.data_storage_version = Some(version.parse().infer_error()?);
+                }
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
