@@ -4825,14 +4825,14 @@ impl MemTableFlushHandler {
             // behind the batch store. The generation's vector index would then
             // be short of rows its own SSTable holds, and SSTable vector search
             // is index-only -- `fast_search`, no brute-force scan -- so those
-            // rows stop answering once the frozen memtable retires.
+            // rows stop answering once the frozen memtable retires. The primary
+            // key index alone needs the wait too: the key file is written from
+            // it, and a table with no other index still has one.
             //
             // `batch_count` is fixed at freeze, so this waits for a target that
             // cannot move, and the watcher surfaces a poisoned writer rather
             // than blocking on a cursor that will never arrive.
-            if !index_configs.is_empty()
-                && let Some(indexes) = memtable.indexes_arc()
-            {
+            if let Some(indexes) = memtable.indexes_arc() {
                 let target_indexed = memtable.batch_count();
                 self.wal_flusher
                     .track_batch(Some(indexes), target_indexed, 0)
@@ -6543,6 +6543,115 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
+    }
+
+    /// A key-only table seals a memtable whose key index is still behind its
+    /// rows, then flushes it once the key index covers them: the generation's
+    /// key file must hold the rewritten key, or reads of the table fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_key_only_table_flushes_after_its_key_index_catches_up() {
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
+        use crate::dataset::mem_wal::wal::TriggerIndexApply;
+        use arrow_array::FixedSizeListArray;
+
+        const DIM: i32 = 32;
+        // Enough vectors that indexing them outlasts the flush of one row.
+        const BUSY_ROWS: usize = 20_000;
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                flush_test_config(shard_id),
+                schema.clone(),
+                vec![],
+            )
+        };
+        let writer = open().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        // Keep the index task, which applies every memtable's indexes in turn,
+        // busy with a large vector index of another store.
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let vectors = FixedSizeListArray::try_new(
+            item.clone(),
+            DIM,
+            Arc::new(arrow_array::Float32Array::from_iter_values(
+                (0..BUSY_ROWS * DIM as usize).map(|i| (i % 997) as f32),
+            )),
+            None,
+        )
+        .unwrap();
+        let busy_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(item, DIM),
+            true,
+        )]));
+        let busy_rows = Arc::new(BatchStore::with_capacity(1));
+        busy_rows
+            .append(RecordBatch::try_new(busy_schema, vec![Arc::new(vectors)]).unwrap())
+            .unwrap();
+        let mut busy_indexes = IndexStore::new();
+        busy_indexes.add_hnsw(
+            "busy".to_string(),
+            0,
+            "v".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            BUSY_ROWS,
+            1,
+        );
+        let WriterMode::MemTable { writer_state, .. } = &writer.mode else {
+            panic!("a memtable writer");
+        };
+        writer_state
+            .index_apply_tx
+            .send(TriggerIndexApply {
+                batch_store: busy_rows,
+                indexes: Arc::new(busy_indexes),
+                end_batch_position: 1,
+            })
+            .unwrap();
+
+        // Rewrite id 1 and seal before its key is indexed.
+        let renamed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["renamed"])),
+            ],
+        )
+        .unwrap();
+        let (_, _unawaited) = writer.put_no_wait(vec![renamed]).await.unwrap();
+        writer
+            .force_seal_active()
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let writer = open().await.unwrap();
+        for (filter, expected) in [
+            (None, vec![0, 1, 2, 3, 4]),
+            (Some("name = 'name_1'"), vec![]),
+            (Some("name = 'renamed'"), vec![1]),
+        ] {
+            let ids =
+                read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, filter)
+                    .await;
+            assert_eq!(ids, expected, "{filter:?}");
+        }
+        writer.close().await.unwrap();
     }
 
     /// Delete a key, then flush: the tombstone and the live row land in the
