@@ -936,6 +936,12 @@ pub fn try_raw_block(data: &DataBlock) -> Option<Box<dyn BlockCompressor>> {
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Number of payload buffers consumed by each independently decoded chunk.
+    /// Decoders with multiple buffers must override the single-buffer default.
+    fn num_buffers(&self) -> usize {
+        1
+    }
+
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
@@ -1035,9 +1041,23 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Error::invalid_input("Mini-block encoding is missing its compression variant")
         })?;
         match compression {
-            Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
+            Compression::Flat(flat) => {
+                if flat.bits_per_value == 0 || flat.data.is_some() {
+                    return Err(Error::invalid_input(
+                        "Flat mini-block requires a positive bit width and no leaf compression",
+                    ));
+                }
+                Ok(Box::new(ValueDecompressor::from_flat(flat)))
+            }
             #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(description) => {
+                if !matches!(description.uncompressed_bits_per_value, 8 | 16 | 32 | 64)
+                    || description.values.is_some()
+                {
+                    return Err(Error::invalid_input(
+                        "Inline bitpacking requires an 8, 16, 32, or 64-bit width and no leaf compression",
+                    ));
+                }
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
             #[cfg(not(feature = "bitpacking"))]
@@ -1048,6 +1068,19 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 BinaryMiniBlockDecompressor::from_variable(variable)?,
             )),
             Compression::Fsst(description) => {
+                if description.symbol_table.is_empty()
+                    || !matches!(
+                        description
+                            .values
+                            .as_deref()
+                            .and_then(|v| v.compression.as_ref()),
+                        Some(Compression::Variable(_))
+                    )
+                {
+                    return Err(Error::invalid_input(
+                        "FSST requires a symbol table and Variable values",
+                    ));
+                }
                 let inner_decompressor = decompression_strategy.create_miniblock_decompressor(
                     description.values.as_ref().ok_or_else(|| {
                         Error::invalid_input("FSST mini-block encoding is missing its values codec")
@@ -1060,7 +1093,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 )))
             }
             Compression::PackedStruct(description) => Ok(Box::new(
-                PackedStructFixedWidthMiniBlockDecompressor::new(description),
+                PackedStructFixedWidthMiniBlockDecompressor::try_new(description)?,
             )),
             Compression::VariablePackedStruct(_) => Err(Error::not_supported_source(
                 "variable packed struct decoding is not yet implemented".into(),
@@ -1088,6 +1121,11 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                         "ByteStreamSplit compression only supports Flat values",
                     ));
                 };
+                if !matches!(values.bits_per_value, 32 | 64) || values.data.is_some() {
+                    return Err(Error::invalid_input(
+                        "ByteStreamSplit requires plain 32 or 64-bit Flat values",
+                    ));
+                }
                 Ok(Box::new(ByteStreamSplitDecompressor::new(
                     values.bits_per_value as usize,
                 )))
@@ -1395,7 +1433,7 @@ pub(crate) fn infer_fixed_width_block_bits(description: &CompressiveEncoding) ->
 ///
 /// This is intentionally separate from [`DecompressionStrategy::create_block_decompressor`]:
 /// stable 2.1/2.2 block readers keep their existing grammar and framing, while
-/// the 2.3 offset container opts into this typed grammar explicitly.
+/// the 2.3 offset and sparse containers opt into this typed grammar explicitly.
 pub(crate) fn create_fixed_width_block_decompressor(
     description: &CompressiveEncoding,
     expected_bits_per_value: u64,
@@ -1406,6 +1444,23 @@ pub(crate) fn create_fixed_width_block_decompressor(
         )));
     }
     create_fixed_width_block_decompressor_inner(description, expected_bits_per_value, true)
+}
+
+/// Validates a generic unsigned block descriptor with its container-owned cardinality.
+///
+/// This grammar is for unstable 2.3 containers. Empty sequences require a Constant
+/// with no scalar. Payload framing and decoded values are checked when the block is read.
+pub fn validate_fixed_width_block_sequence(
+    description: &CompressiveEncoding,
+    bits_per_value: u64,
+    num_values: u64,
+) -> Result<()> {
+    crate::encodings::physical::sequence::SequenceDecoder::try_new(
+        description,
+        bits_per_value,
+        num_values,
+    )
+    .map(|_| ())
 }
 
 fn create_fixed_width_block_decompressor_inner(
@@ -1433,7 +1488,11 @@ fn create_fixed_width_block_decompressor_inner(
             Ok(Box::new(ValueDecompressor::from_flat(flat)))
         }
         Compression::Constant(constant) => {
-            let value = decode_fixed_width_constant(constant, expected_bits_per_value)?;
+            let value = constant
+                .value
+                .as_ref()
+                .map(|_| decode_fixed_width_constant(constant, expected_bits_per_value))
+                .transpose()?;
             Ok(Box::new(ConstantBlockDecompressor::new(
                 expected_bits_per_value,
                 value,
@@ -1875,11 +1934,57 @@ mod tests {
     use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
+    use crate::format::ProtobufUtils21;
     use crate::statistics::ComputeStat;
     use crate::testing::{TestEncoding, extract_array_encoding_chain, test_compression_strategy};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 
+    #[rstest::rstest]
+    #[case(ProtobufUtils21::flat(0, None), "positive bit width")]
+    #[case(
+        ProtobufUtils21::fsl(0, false, ProtobufUtils21::flat(32, None)),
+        "dimension must be positive"
+    )]
+    #[case(
+        ProtobufUtils21::fsl(u64::MAX, false, ProtobufUtils21::flat(32, None)),
+        "overflows"
+    )]
+    #[case(ProtobufUtils21::packed_struct(ProtobufUtils21::flat(32, None), vec![16]), "must match")]
+    #[case(ProtobufUtils21::packed_struct(ProtobufUtils21::flat(1, None), vec![1]), "positive byte widths")]
+    fn mini_block_descriptor_errors_are_owned_by_codecs(
+        #[case] encoding: CompressiveEncoding,
+        #[case] message: &str,
+    ) {
+        let strategy = DefaultDecompressionStrategy::default();
+        let error = strategy
+            .create_miniblock_decompressor(&encoding, &strategy)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[case(ProtobufUtils21::flat(32, None), vec![], 1, "buffers")]
+    #[case(ProtobufUtils21::flat(32, None), vec![vec![0; 3]], 1, "expected 4")]
+    #[case(ProtobufUtils21::fsl(2, true, ProtobufUtils21::flat(32, None)), vec![vec![], vec![0; 8]], 1, "expected 1")]
+    #[case(ProtobufUtils21::fsl(2, false, ProtobufUtils21::flat(32, None)), vec![vec![]], u64::MAX, "overflows")]
+    fn mini_block_payload_errors_are_owned_by_codecs(
+        #[case] encoding: CompressiveEncoding,
+        #[case] buffers: Vec<Vec<u8>>,
+        #[case] count: u64,
+        #[case] message: &str,
+    ) {
+        let strategy = DefaultDecompressionStrategy::default();
+        let decoder = strategy
+            .create_miniblock_decompressor(&encoding, &strategy)
+            .unwrap();
+        let error = decoder
+            .decompress(buffers.into_iter().map(LanceBuffer::from).collect(), count)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
     fn strategy(encoding: TestEncoding, params: CompressionParams) -> Arc<dyn CompressionStrategy> {
         test_compression_strategy(encoding, params)
     }

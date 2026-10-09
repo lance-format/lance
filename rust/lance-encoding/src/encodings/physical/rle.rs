@@ -1633,6 +1633,10 @@ impl RleDecompressor {
 }
 
 impl MiniBlockDecompressor for RleDecompressor {
+    fn num_buffers(&self) -> usize {
+        2
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         self.decode_data(data, num_values, true)
     }

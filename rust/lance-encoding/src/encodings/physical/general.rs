@@ -202,7 +202,18 @@ impl GeneralMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
+    fn num_buffers(&self) -> usize {
+        self.inner.num_buffers()
+    }
+
     fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        if data.len() != self.num_buffers() || data.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "General mini-block has {} buffers, expected {}",
+                data.len(),
+                self.num_buffers()
+            )));
+        }
         let mut decompressed_buffer = Vec::new();
 
         let decompressor = GeneralBufferCompressor::get_compressor(self.compression)?;

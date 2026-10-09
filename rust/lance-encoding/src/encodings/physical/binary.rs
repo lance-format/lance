@@ -34,9 +34,7 @@ use crate::format::{ProtobufUtils21, pb21};
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
 
-mod offsets;
-
-use offsets::{BlockCost, OffsetBlockCodec, select_offset_block_codec};
+use super::sequence::{BlockCost, SequenceBlockCodec, select_block_codec};
 
 #[derive(Debug)]
 pub struct BinaryMiniBlockEncoder {
@@ -315,7 +313,7 @@ fn build_generic_chunks<N: OffsetSizeTrait>(
     data: &VariableWidthBlock,
     offsets: &[N],
     ranges: &[BinaryChunkRange],
-    codec: &OffsetBlockCodec,
+    codec: &SequenceBlockCodec,
 ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
     let bytes_per_offset = (data.bits_per_offset / 8) as usize;
     let mut offset_data = Vec::new();
@@ -485,11 +483,12 @@ impl BinaryMiniBlockEncoder {
         let extra_payload_header = context
             .chunk_header_bytes(2)
             .saturating_sub(context.chunk_header_bytes(1));
-        let codec = select_offset_block_codec(
+        let codec = select_block_codec(
             &offsets_block,
             &member_ranges,
             field_params,
             BlockCost::new(extra_payload_header, 8),
+            true,
         )?;
         if matches!(
             codec.expected_encoding().compression.as_ref(),
@@ -723,6 +722,16 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
+    fn num_buffers(&self) -> usize {
+        match self.layout {
+            BinaryMiniBlockLayout::Legacy { .. } => 1,
+            BinaryMiniBlockLayout::Generic {
+                offsets_have_payload,
+                ..
+            } => 1 + usize::from(offsets_have_payload),
+        }
+    }
+
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure

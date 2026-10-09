@@ -371,8 +371,12 @@ impl BlockCompressor for InlineBitpacking {
 
 impl MiniBlockDecompressor for InlineBitpacking {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
-        assert_eq!(data.len(), 1);
-        let data = data.into_iter().next().unwrap();
+        let [data] = <[LanceBuffer; 1]>::try_from(data).map_err(|data| {
+            Error::invalid_input(format!(
+                "Inline bitpacking expects one buffer, got {}",
+                data.len()
+            ))
+        })?;
         if num_values == 0 {
             // Empty mini-blocks have no inline bit-width header to decode.
             return Ok(self.empty_block());

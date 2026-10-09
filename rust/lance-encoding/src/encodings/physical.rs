@@ -19,6 +19,7 @@ pub mod general;
 pub mod packed;
 pub mod range;
 pub mod rle;
+pub(crate) mod sequence;
 pub mod value;
 
 pub(crate) fn try_vec_with_capacity<T>(num_values: u64, label: &str) -> Result<Vec<T>> {

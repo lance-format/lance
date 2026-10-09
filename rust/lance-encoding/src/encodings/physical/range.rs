@@ -3,7 +3,7 @@
 
 //! Metadata-only arithmetic range encoding for unsigned block sequences.
 
-use super::{checked_fixed_values, try_vec_with_capacity};
+use super::{checked_fixed_values, constant::ConstantEncoder, try_vec_with_capacity};
 use crate::{
     buffer::LanceBuffer,
     compression::{BlockCompressor, BlockDecompressor, require_no_block_payload},
@@ -67,6 +67,20 @@ impl RangeEncoder {
             step,
         }
     }
+
+    /// Describes a known arithmetic sequence without materializing its values.
+    /// Empty and singleton sequences use Constant; longer ranges are overflow-checked.
+    pub(crate) fn encoding(&self, num_values: u64) -> Result<CompressiveEncoding> {
+        if num_values < 2 {
+            return ConstantEncoder::new(self.bits_per_value, self.start).encoding(num_values);
+        }
+        checked_range_last(self.bits_per_value, self.start, self.step, num_values)?;
+        Ok(ProtobufUtils21::range(
+            self.bits_per_value,
+            self.start,
+            self.step,
+        ))
+    }
 }
 
 impl BlockCompressor for RangeEncoder {
@@ -82,7 +96,7 @@ impl BlockCompressor for RangeEncoder {
                 self.bits_per_value, data.bits_per_value
             )));
         }
-        checked_range_last(self.bits_per_value, self.start, self.step, data.num_values)?;
+        let encoding = self.encoding(data.num_values)?;
 
         match self.bits_per_value {
             32 => validate_values(
@@ -101,10 +115,7 @@ impl BlockCompressor for RangeEncoder {
             )?,
             _ => unreachable!("range width was validated above"),
         }
-        Ok((
-            None,
-            ProtobufUtils21::range(self.bits_per_value, self.start, self.step),
-        ))
+        Ok((None, encoding))
     }
 }
 
@@ -199,6 +210,61 @@ fn materialize_range(
 mod tests {
     use super::*;
 
+    #[rstest::rstest]
+    #[case(32)]
+    #[case(64)]
+    fn range_metadata_normalizes_short_sequences(#[case] bits: u64) {
+        let encoder = RangeEncoder::new(bits, 3, 5);
+        for count in 0..=2 {
+            let data = if bits == 32 {
+                LanceBuffer::reinterpret_vec(
+                    (0..count).map(|i| (3 + 5 * i) as u32).collect::<Vec<_>>(),
+                )
+            } else {
+                LanceBuffer::reinterpret_vec((0..count).map(|i| 3 + 5 * i).collect::<Vec<u64>>())
+            };
+            let (payload, encoding) = encoder
+                .compress(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: data.clone(),
+                    bits_per_value: bits,
+                    num_values: count,
+                    block_info: Default::default(),
+                }))
+                .unwrap();
+            assert!(payload.is_none());
+            let decoder = crate::encodings::physical::sequence::SequenceDecoder::try_new(
+                &encoding, bits, count,
+            )
+            .unwrap();
+            let decoded = decoder.decode(payload).unwrap().as_fixed_width().unwrap();
+            assert_eq!(decoded.num_values, count);
+            assert_eq!(decoded.data.as_ref(), data.as_ref());
+        }
+    }
+
+    #[test]
+    fn range_metadata_checks_bounds_without_materializing() {
+        let count = 1_000_000_000_000;
+        let encoding = RangeEncoder::new(64, 3, 5).encoding(count).unwrap();
+        let decoder =
+            crate::encodings::physical::sequence::SequenceDecoder::try_new(&encoding, 64, count)
+                .unwrap();
+        assert_eq!(
+            decoder.metadata(),
+            Some(
+                crate::encodings::physical::sequence::SequenceMetadata::Range { start: 3, step: 5 }
+            )
+        );
+        for encoder in [
+            RangeEncoder::new(32, u32::MAX as u64, 1),
+            RangeEncoder::new(64, u64::MAX, 1),
+            RangeEncoder::new(64, 0, 0),
+        ] {
+            let error = encoder.encoding(2).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("Range"));
+        }
+    }
     #[test]
     fn range_round_trip_u32() {
         let input = DataBlock::FixedWidth(FixedWidthDataBlock {

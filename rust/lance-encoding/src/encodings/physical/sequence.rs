@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Private codec selection for independently decoded offset chunks.
+//! Shared bounded codec selection for unsigned block sequences.
 
 use std::{ops::Range, str::FromStr, sync::Arc};
 
@@ -34,13 +34,16 @@ use crate::encodings::physical::bitpacking::{
     OutOfLineBitpacking, out_of_line_payload_byte_lengths,
 };
 
+mod decoder;
 mod statistics;
+
+pub use decoder::{SequenceDecoder, SequenceMetadata};
 
 use statistics::{FamilyStats, SequenceStats, analyze_family, combine};
 
 /// Container-specific serialized cost applied to every optional payload.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct BlockCost {
+pub struct BlockCost {
     buffer_overhead_bytes: u64,
     alignment: u64,
 }
@@ -52,10 +55,10 @@ impl Default for BlockCost {
 }
 
 impl BlockCost {
-    pub(super) fn new(buffer_overhead_bytes: u64, alignment: u64) -> Self {
+    pub(crate) const fn new(buffer_overhead_bytes: u64, alignment: u64) -> Self {
         Self {
             buffer_overhead_bytes,
-            alignment: alignment.max(1),
+            alignment: if alignment == 0 { 1 } else { alignment },
         }
     }
 
@@ -72,36 +75,41 @@ impl BlockCost {
     }
 }
 
-/// One concrete codec reused across every offset chunk in a page.
+/// One concrete codec reused across independently decoded sequence chunks.
 #[derive(Debug)]
-pub(super) struct OffsetBlockCodec {
+pub struct SequenceBlockCodec {
     compressor: Box<dyn BlockCompressor>,
     expected_encoding: CompressiveEncoding,
     has_payload: bool,
+    estimated_wire_bytes: u64,
 }
 
-impl OffsetBlockCodec {
-    pub(super) fn expected_encoding(&self) -> &CompressiveEncoding {
+impl SequenceBlockCodec {
+    pub(crate) fn estimated_wire_bytes(&self) -> u64 {
+        self.estimated_wire_bytes
+    }
+
+    pub(crate) fn expected_encoding(&self) -> &CompressiveEncoding {
         &self.expected_encoding
     }
 
-    pub(super) fn has_payload(&self) -> bool {
+    pub(crate) fn has_payload(&self) -> bool {
         self.has_payload
     }
 
-    pub(super) fn compress(
+    pub(crate) fn compress(
         &self,
         data: FixedWidthDataBlock,
     ) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
         let (payload, encoding) = self.compressor.compress(DataBlock::FixedWidth(data))?;
         if encoding != self.expected_encoding {
             return Err(Error::internal(
-                "Offset block codec produced a different descriptor after selection".to_string(),
+                "Sequence block codec produced a different descriptor after selection".to_string(),
             ));
         }
         if payload.is_some() != self.has_payload {
             return Err(Error::internal(
-                "Offset block codec changed its payload arity after selection".to_string(),
+                "Sequence block codec changed its payload arity after selection".to_string(),
             ));
         }
         Ok((payload, encoding))
@@ -135,13 +143,18 @@ impl Candidate {
         )
     }
 
-    fn finish(self) -> OffsetBlockCodec {
-        OffsetBlockCodec {
-            compressor: Box::new(NormalizedOffsetEncoder {
-                child: self.compressor,
-            }),
+    fn finish(self, normalize: bool) -> SequenceBlockCodec {
+        SequenceBlockCodec {
+            compressor: if normalize {
+                Box::new(NormalizedOffsetEncoder {
+                    child: self.compressor,
+                })
+            } else {
+                self.compressor
+            },
             expected_encoding: self.encoding,
             has_payload: self.has_payload,
+            estimated_wire_bytes: self.wire_bytes,
         }
     }
 }
@@ -164,42 +177,76 @@ impl BlockCompressor for NormalizedOffsetEncoder {
 }
 
 /// Selects one bounded unsigned codec for all independently framed chunks.
-pub(super) fn select_offset_block_codec(
+pub fn select_block_codec(
     data: &FixedWidthDataBlock,
     ranges: &[Range<usize>],
     field_params: &CompressionFieldParams,
     cost: BlockCost,
-) -> Result<OffsetBlockCodec> {
+    normalize: bool,
+) -> Result<SequenceBlockCodec> {
     let collect_general_sample =
         !matches!(field_params.compression.as_deref(), Some("none" | "fsst"));
-    let analysis = analyze_family(data, ranges, collect_general_sample)?;
+    let analysis = analyze_family(data, ranges, collect_general_sample, normalize)?;
+    select_analyzed_codec(analysis, data.bits_per_value, field_params, cost, normalize)
+}
+
+/// Select a codec for generated u64 values without allocating the input sequence.
+pub fn select_u64_sequence_codec(
+    values: impl Iterator<Item = u64>,
+    field_params: &CompressionFieldParams,
+    cost: BlockCost,
+) -> Result<SequenceBlockCodec> {
+    let collect_sample = !matches!(field_params.compression.as_deref(), Some("none" | "fsst"));
+    let analysis = statistics::analyze_sequence(values, collect_sample)?;
+    select_analyzed_codec(analysis, 64, field_params, cost, false)
+}
+
+fn select_analyzed_codec(
+    analysis: FamilyStats,
+    bits: u64,
+    field_params: &CompressionFieldParams,
+    cost: BlockCost,
+    normalize: bool,
+) -> Result<SequenceBlockCodec> {
     let value_stats = analysis
         .members
         .iter()
         .map(|member| &member.values)
         .collect::<Vec<_>>();
 
+    if value_stats.iter().any(|stats| stats.len == 0) {
+        if value_stats.iter().any(|stats| stats.len != 0) {
+            return Err(Error::invalid_input(
+                "Empty and non-empty sequences cannot share one block descriptor",
+            ));
+        }
+        return Ok(
+            metadata_candidate(bits, 0, MetadataCodec::Constant, &value_stats, cost, 0)?
+                .finish(false),
+        );
+    }
+
     if let Some(value) = common_constant(&value_stats) {
         return Ok(metadata_candidate(
-            data.bits_per_value,
+            bits,
             value,
             MetadataCodec::Constant,
-            ranges.len(),
+            &value_stats,
             cost,
             0,
-        )
-        .finish());
+        )?
+        .finish(normalize));
     }
     if let Some((start, step)) = common_range(&value_stats) {
         return Ok(metadata_candidate(
-            data.bits_per_value,
+            bits,
             start,
             MetadataCodec::Range(step),
-            ranges.len(),
+            &value_stats,
             cost,
             1,
-        )
-        .finish());
+        )?
+        .finish(normalize));
     }
 
     let mut candidates = direct_candidates(&value_stats, field_params, cost, true)?;
@@ -222,8 +269,8 @@ pub(super) fn select_offset_block_codec(
                 best
             }
         })
-        .map(Candidate::finish)
-        .ok_or_else(|| Error::internal("No offset block codec candidate".to_string()))
+        .map(|candidate| candidate.finish(normalize))
+        .ok_or_else(|| Error::internal("No unsigned block codec candidate".to_string()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -236,22 +283,25 @@ fn metadata_candidate(
     bits_per_value: u64,
     value: u64,
     codec: MetadataCodec,
-    num_members: usize,
+    stats: &[&SequenceStats],
     cost: BlockCost,
     stable_rank: u8,
-) -> Candidate {
+) -> Result<Candidate> {
+    let num_values = stats[0].len;
     let (compressor, encoding): (Box<dyn BlockCompressor>, _) = match codec {
-        MetadataCodec::Constant => (
-            Box::new(ConstantEncoder::new(bits_per_value, value)),
-            ProtobufUtils21::constant(Some(encode_scalar(bits_per_value, value))),
-        ),
-        MetadataCodec::Range(step) => (
-            Box::new(RangeEncoder::new(bits_per_value, value, step)),
-            ProtobufUtils21::range(bits_per_value, value, step),
-        ),
+        MetadataCodec::Constant => {
+            let encoder = ConstantEncoder::new(bits_per_value, value);
+            let encoding = encoder.encoding(num_values)?;
+            (Box::new(encoder), encoding)
+        }
+        MetadataCodec::Range(step) => {
+            let encoder = RangeEncoder::new(bits_per_value, value, step);
+            let encoding = encoder.encoding(num_values)?;
+            (Box::new(encoder), encoding)
+        }
     };
-    let payload_bytes = vec![0; num_members];
-    Candidate {
+    let payload_bytes = vec![0; stats.len()];
+    Ok(Candidate {
         wire_bytes: wire_bytes(&encoding, false, &payload_bytes, cost),
         compressor,
         encoding,
@@ -260,7 +310,7 @@ fn metadata_candidate(
         transform_depth: 0,
         decode_cpu_rank: 0,
         stable_rank,
-    }
+    })
 }
 
 fn direct_candidates(
@@ -347,24 +397,24 @@ fn leaf_candidate(
 ) -> Result<Candidate> {
     let bits_per_value = stats[0].bits_per_value;
     if let Some(value) = common_constant(stats) {
-        return Ok(metadata_candidate(
+        return metadata_candidate(
             bits_per_value,
             value,
             MetadataCodec::Constant,
-            stats.len(),
+            stats,
             BlockCost::default(),
             0,
-        ));
+        );
     }
     if let Some((start, step)) = common_range(stats) {
-        return Ok(metadata_candidate(
+        return metadata_candidate(
             bits_per_value,
             start,
             MetadataCodec::Range(step),
-            stats.len(),
+            stats,
             BlockCost::default(),
             1,
-        ));
+        );
     }
     direct_candidates(stats, field_params, BlockCost::default(), false)?
         .into_iter()
@@ -390,6 +440,17 @@ fn delta_candidate(
     {
         return Ok(None);
     }
+    let base = analysis.members[0]
+        .values
+        .first
+        .expect("non-empty sequence");
+    if analysis
+        .members
+        .iter()
+        .any(|member| member.values.first != Some(base))
+    {
+        return Ok(None);
+    }
     let stats = analysis
         .members
         .iter()
@@ -397,10 +458,10 @@ fn delta_candidate(
         .collect::<Vec<_>>();
     let child = leaf_candidate(&stats, field_params)?;
     let bits_per_value = analysis.members[0].values.bits_per_value;
-    let encoding = ProtobufUtils21::delta(bits_per_value, 0, child.encoding);
+    let encoding = ProtobufUtils21::delta(bits_per_value, base, child.encoding);
     Ok(Some(Candidate {
         wire_bytes: wire_bytes(&encoding, child.has_payload, &child.payload_bytes, cost),
-        compressor: Box::new(DeltaEncoder::new(bits_per_value, 0, child.compressor)),
+        compressor: Box::new(DeltaEncoder::new(bits_per_value, base, child.compressor)),
         encoding,
         has_payload: child.has_payload,
         payload_bytes: child.payload_bytes,
@@ -697,14 +758,6 @@ fn wire_bytes(
     )
 }
 
-fn encode_scalar(bits_per_value: u64, value: u64) -> bytes::Bytes {
-    match bits_per_value {
-        32 => bytes::Bytes::copy_from_slice(&(value as u32).to_le_bytes()),
-        64 => bytes::Bytes::copy_from_slice(&value.to_le_bytes()),
-        _ => unreachable!("offset width was validated during analysis"),
-    }
-}
-
 fn is_flat(encoding: &CompressiveEncoding) -> bool {
     matches!(
         encoding.compression.as_ref(),
@@ -775,6 +828,67 @@ mod tests {
         format::pb21::compressive_encoding::Compression,
     };
 
+    #[rstest::rstest]
+    #[case(32)]
+    #[case(64)]
+    fn empty_sequences_share_one_encoding_contract(#[case] bits: u64) {
+        let block = FixedWidthDataBlock {
+            bits_per_value: bits,
+            data: LanceBuffer::empty(),
+            num_values: 0,
+            block_info: BlockInfo::default(),
+        };
+        for normalize in [false, true] {
+            let codec = select_block_codec(
+                &block,
+                std::slice::from_ref(&(0..0)),
+                &Default::default(),
+                BlockCost::default(),
+                normalize,
+            )
+            .unwrap();
+            let (payload, encoding) = codec.compress(block.clone()).unwrap();
+            assert!(payload.is_none());
+            assert_eq!(encoding, ConstantEncoder::new(bits, 0).encoding(0).unwrap());
+            let decoder = SequenceDecoder::try_new(&encoding, bits, 0).unwrap();
+            assert_eq!(decoder.metadata(), Some(SequenceMetadata::Empty));
+            assert_eq!(decoder.decode(payload).unwrap().num_values(), 0);
+            let block_decoder = create_fixed_width_block_decompressor(&encoding, bits).unwrap();
+            assert_eq!(block_decoder.decompress(None, 0).unwrap().num_values(), 0);
+            let error = block_decoder.decompress(None, 1).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("cardinality is zero"));
+        }
+        let codec = select_u64_sequence_codec(
+            std::iter::empty(),
+            &Default::default(),
+            BlockCost::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            codec.expected_encoding(),
+            &ConstantEncoder::new(64, 0).encoding(0).unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_and_non_empty_chunks_require_separate_descriptors() {
+        let error = select_block_codec(
+            &fixed_u64(&[1]),
+            &[0..0, 0..1],
+            &Default::default(),
+            BlockCost::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot share one block descriptor")
+        );
+    }
+
     fn fixed_u32(values: &[u32]) -> FixedWidthDataBlock {
         FixedWidthDataBlock {
             bits_per_value: 32,
@@ -806,7 +920,7 @@ mod tests {
     }
 
     fn round_trip(
-        codec: &OffsetBlockCodec,
+        codec: &SequenceBlockCodec,
         data: &FixedWidthDataBlock,
         range: Range<usize>,
     ) -> Vec<u64> {
@@ -831,11 +945,12 @@ mod tests {
     #[test]
     fn selects_shared_metadata_codecs() {
         let constant = fixed_u32(&[5, 5, 5, 10, 10, 10]);
-        let codec = select_offset_block_codec(
+        let codec = select_block_codec(
             &constant,
             &[0..3, 3..6],
             &CompressionFieldParams::default(),
             BlockCost::new(0, 1),
+            true,
         )
         .unwrap();
         assert!(matches!(
@@ -846,11 +961,12 @@ mod tests {
         assert_eq!(round_trip(&codec, &constant, 3..6), vec![0, 0, 0]);
 
         let range = fixed_u32(&[5, 7, 9, 11, 10, 12, 14, 16]);
-        let codec = select_offset_block_codec(
+        let codec = select_block_codec(
             &range,
             &[0..4, 4..8],
             &CompressionFieldParams::default(),
             BlockCost::new(0, 1),
+            true,
         )
         .unwrap();
         assert!(matches!(
@@ -863,7 +979,7 @@ mod tests {
     #[test]
     fn selects_delta_and_round_trips() {
         let data = fixed_u32(&[0, 2, 5, 9, 14]);
-        let codec = select_offset_block_codec(
+        let codec = select_block_codec(
             &data,
             &[0..5],
             &CompressionFieldParams {
@@ -871,6 +987,7 @@ mod tests {
                 ..Default::default()
             },
             BlockCost::new(0, 1),
+            true,
         )
         .unwrap();
         assert!(matches!(
@@ -881,6 +998,32 @@ mod tests {
     }
 
     #[test]
+    fn absolute_sequences_preserve_bases_and_accept_non_monotonic_counts() {
+        let sequences = [
+            vec![9, 9, 9],
+            vec![13, 20, 27, 34],
+            (0..256).map(|i| 1_000_000 + i * i).collect(),
+            (0..512).map(|i| [1, 1000, 2, 9000][i % 4]).collect(),
+            (0..32)
+                .flat_map(|i| std::iter::repeat_n(if i % 2 == 0 { 300 } else { 1 }, 16))
+                .collect(),
+        ];
+        for values in sequences {
+            let data = fixed_u64(&values);
+            let codec = select_block_codec(
+                &data,
+                &[0..values.len()],
+                &CompressionFieldParams::default(),
+                BlockCost::new(16, 8),
+                false,
+            )
+            .unwrap();
+            let decoded = round_trip(&codec, &data, 0..values.len());
+            assert_eq!(decoded, values);
+        }
+    }
+
+    #[test]
     fn selects_rle_and_dictionary_candidates() {
         let rle_member = (0..32_u64)
             .flat_map(|value| std::iter::repeat_n(value, 8))
@@ -888,11 +1031,12 @@ mod tests {
         let mut rle_values = rle_member.clone();
         rle_values.extend_from_slice(&rle_member);
         let rle_data = fixed_u64(&rle_values);
-        let codec = select_offset_block_codec(
+        let codec = select_block_codec(
             &rle_data,
             &[0..rle_member.len(), rle_member.len()..rle_values.len()],
             &CompressionFieldParams::default(),
             BlockCost::new(0, 1),
+            true,
         )
         .unwrap();
         assert!(matches!(
@@ -910,7 +1054,7 @@ mod tests {
             .collect::<Vec<_>>();
         let dictionary_data = fixed_u64(&dictionary_values);
         let analysis =
-            analyze_family(&dictionary_data, &[0..dictionary_values.len()], false).unwrap();
+            analyze_family(&dictionary_data, &[0..dictionary_values.len()], false, true).unwrap();
         let codec = dictionary_candidate(
             &analysis,
             &CompressionFieldParams {
@@ -921,7 +1065,7 @@ mod tests {
         )
         .unwrap()
         .unwrap()
-        .finish();
+        .finish(true);
         assert!(matches!(
             codec.expected_encoding().compression,
             Some(Compression::Dictionary(_))
@@ -937,7 +1081,7 @@ mod tests {
             .collect::<Vec<_>>();
         let dictionary_data = fixed_u32(&dictionary_values);
         let analysis =
-            analyze_family(&dictionary_data, &[0..dictionary_values.len()], false).unwrap();
+            analyze_family(&dictionary_data, &[0..dictionary_values.len()], false, true).unwrap();
         let codec = dictionary_candidate(
             &analysis,
             &CompressionFieldParams {
@@ -948,7 +1092,7 @@ mod tests {
         )
         .unwrap()
         .unwrap()
-        .finish();
+        .finish(true);
         assert!(matches!(
             codec.expected_encoding().compression,
             Some(Compression::Dictionary(_))
@@ -964,11 +1108,12 @@ mod tests {
 
     #[test]
     fn rejects_decreasing_member() {
-        let error = select_offset_block_codec(
+        let error = select_block_codec(
             &fixed_u32(&[0, 2, 1]),
             &[0..3],
             &CompressionFieldParams::default(),
             BlockCost::new(0, 1),
+            true,
         )
         .unwrap_err();
         assert!(error.to_string().contains("non-decreasing"));

@@ -168,66 +168,46 @@ message FullZipLayout {
 message SparseLayout {
   // Description of the compression of values.
   CompressiveEncoding value_compression = 1;
-  // Number of value buffers in each mini-block chunk. This does not include structural buffers.
-  uint64 num_buffers = 2;
-  /* Number of entries in the equivalent dense repetition / definition stream. This equals
-   * num_visible_items plus one structural placeholder for every list slot without children.
-   * Null leaf slots count as visible items because they still occupy positions in Arrow's
-   * leaf value buffer. For example, a nullable primitive with 100 slots, 30 of them null,
-   * has num_items = num_visible_items = 100.
-   */
-  uint64 num_items = 3;
-  // Number of leaf value slots encoded in the value chunks, including null leaf slots.
-  uint64 num_visible_items = 4;
-  // If true, chunk-local value buffer sizes use u32. Otherwise they use u16.
-  bool has_large_chunk = 5;
   /* Structural layers ordered from outer-most to inner-most. This may be empty for a flat,
-   * non-nullable leaf page whose scheduling domain equals num_visible_items.
+   * non-nullable leaf page. The terminal domain gives the leaf slot count, including nulls.
    */
-  repeated SparseStructuralLayer structural_layers = 6;
+  repeated SparseStructuralLayer structural_layers = 2;
 }
 
-/* A domain is a layer-local integer coordinate space [0, num_slots). A slot is one
+/* A domain is a layer-local integer coordinate space [0, size). A slot is one
  * element in that space. The outer-most domain is the page's top-level rows; each
  * layer's child domain is the next layer's parent domain, and the terminal child
- * domain contains num_visible_items leaf value slots.
+ * domain contains the leaf value slots. Parent sizes are derived from the page row count
+ * and preceding layers, not stored in each layer. The outer size is the page row count
+ * divided exactly by the product of all fixed-size-list dimensions, including those below lists.
  */
 message SparseStructuralLayer {
   // Exactly one layer kind is required.
   oneof layer {
-    SparseValidityLayer validity = 1;
+    SparseValiditySet validity = 1;
     SparseListLayer list = 2;
     SparseFixedSizeListLayer fixed_size_list = 3;
   }
 }
 
-message SparseValidityLayer {
-  // Number of nullable item or struct slots in this layer's parent and child domain.
-  uint64 num_slots = 1;
-  // Validity for the slots in this layer.
-  SparseValiditySet validity = 2;
-}
-
 message SparseListLayer {
-  // Number of list, large-list, or map slots in this layer's parent domain.
-  uint64 num_slots = 1;
-  // Number of slots in this layer's child domain.
-  uint64 num_child_slots = 2;
+  // Child-domain size, equal to the sum of counts; available before reading count payloads.
+  uint64 num_child_slots = 1;
   // Non-empty parent slots. Valid parent slots absent from this set are empty lists.
-  SparsePositionSet non_empty_positions = 3;
+  CompressiveEncoding non_empty_positions = 2;
+  // Cardinality of both non_empty_positions and counts.
+  uint64 num_non_empty_positions = 3;
   // Positive child counts corresponding one-for-one with non_empty_positions.
-  SparseCountSet counts = 4;
+  CompressiveEncoding counts = 4;
   // Validity for the parent slots in this layer.
   SparseValiditySet validity = 5;
 }
 
 message SparseFixedSizeListLayer {
-  // Number of fixed-size-list slots in this layer's parent domain.
-  uint64 num_slots = 1;
-  // Number of children per parent slot. The child domain has num_slots * dimension slots.
-  uint64 dimension = 2;
+  // Positive number of children per parent slot. The child-domain size is parent size * dimension.
+  uint64 dimension = 1;
   // Validity for the parent slots in this layer.
-  SparseValiditySet validity = 3;
+  SparseValiditySet validity = 2;
 }
 
 message SparseValiditySet {
@@ -240,49 +220,16 @@ message SparseValiditySet {
   }
 
   Meaning meaning = 1;
-  SparsePositionSet positions = 2;
-}
-
-message SparsePositionEmpty {}
-
-message SparsePositionAll {}
-
-message SparsePositionRange {
-  uint64 start = 1;
-  uint64 length = 2;
-}
-
-message SparsePositionSet {
-  oneof positions {
-    // Delta-compressed u64 positions. Cardinality is num_positions.
-    CompressiveEncoding explicit = 1;
-    // One contiguous, non-empty range.
-    SparsePositionRange range = 2;
-    // Every position in the domain.
-    SparsePositionAll all = 3;
-    // No positions in the domain.
-    SparsePositionEmpty empty = 4;
-  }
-  // Semantic cardinality of this set.
-  uint64 num_positions = 5;
-}
-
-message SparseCountEmpty {}
-
-message SparseCountConstant {
-  // Child count shared by every non-empty list slot.
-  uint64 value = 1;
-}
-
-message SparseCountSet {
-  oneof counts {
-    // Compressed u64 child counts. Cardinality comes from the containing position set.
-    CompressiveEncoding explicit = 1;
-    // One positive child count shared by every non-empty list slot.
-    SparseCountConstant constant = 2;
-    // No counts; valid only when there are no non-empty list slots.
-    SparseCountEmpty empty = 3;
-  }
+  /* Required unsigned u64 block encoding of strictly increasing absolute positions.
+   * The cardinality is num_positions. All values must be below the owning domain's
+   * derived size. This descriptor is required even when the sequence is empty.
+   *
+   * Positions and list counts follow the generic unsigned block contract,
+   * including empty sequences and payload framing. Counts need not be increasing.
+   */
+  CompressiveEncoding positions = 2;
+  // Semantic cardinality of the stored positions.
+  uint64 num_positions = 3;
 }
 
 /* A layout used for pages where all (visible) values are the same scalar value.

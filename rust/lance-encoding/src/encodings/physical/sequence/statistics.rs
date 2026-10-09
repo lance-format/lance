@@ -58,7 +58,6 @@ struct SequenceStatsBuilder {
     min: u64,
     max: u64,
     arithmetic_step: Option<u64>,
-    is_arithmetic: bool,
     run_count: u64,
     sample: Vec<u8>,
     sample_limit: usize,
@@ -74,7 +73,6 @@ impl SequenceStatsBuilder {
             min: u64::MAX,
             max: 0,
             arithmetic_step: None,
-            is_arithmetic: true,
             run_count: 0,
             sample: Vec::new(),
             sample_limit,
@@ -91,10 +89,10 @@ impl SequenceStatsBuilder {
                 self.run_count += 1;
             }
             let step = value.checked_sub(previous);
-            match (self.arithmetic_step, step, self.len) {
-                (None, Some(step), 1) => self.arithmetic_step = Some(step),
-                (Some(expected), Some(actual), _) if expected == actual => {}
-                _ => self.is_arithmetic = false,
+            if self.len == 1 {
+                self.arithmetic_step = step;
+            } else if self.arithmetic_step != step {
+                self.arithmetic_step = None;
             }
         }
         self.previous = Some(value);
@@ -118,9 +116,7 @@ impl SequenceStatsBuilder {
             first: self.first,
             min: if self.len == 0 { 0 } else { self.min },
             max: self.max,
-            arithmetic_step: (self.len >= 2 && self.is_arithmetic)
-                .then_some(self.arithmetic_step)
-                .flatten(),
+            arithmetic_step: self.arithmetic_step,
             run_count: self.run_count,
             sample: Arc::from(self.sample),
         }
@@ -131,6 +127,7 @@ pub(super) fn analyze_family(
     data: &FixedWidthDataBlock,
     ranges: &[Range<usize>],
     collect_general_sample: bool,
+    normalize: bool,
 ) -> Result<FamilyStats> {
     if ranges.is_empty() {
         return Err(Error::invalid_input(
@@ -145,13 +142,27 @@ pub(super) fn analyze_family(
     match data.bits_per_value {
         32 => {
             let values = checked_fixed_values::<u32>(data, "Offset family")?;
-            analyze_typed_family(&values, ranges, 32, sample_limit, true, |value| {
-                u64::from(value)
-            })
+            analyze_typed_family(
+                &values,
+                ranges,
+                32,
+                sample_limit,
+                true,
+                normalize,
+                u64::from,
+            )
         }
         64 => {
             let values = checked_fixed_values::<u64>(data, "Offset family")?;
-            analyze_typed_family(&values, ranges, 64, sample_limit, true, |value| value)
+            analyze_typed_family(
+                &values,
+                ranges,
+                64,
+                sample_limit,
+                true,
+                normalize,
+                |value| value,
+            )
         }
         bits_per_value => Err(Error::invalid_input(format!(
             "Offset compression only supports 32 or 64-bit values, got {bits_per_value}"
@@ -165,80 +176,119 @@ fn analyze_typed_family<T: Copy + Eq>(
     bits_per_value: u64,
     sample_limit: usize,
     collect_dictionary: bool,
+    normalize: bool,
     to_u64: impl Fn(T) -> u64 + Copy,
 ) -> Result<FamilyStats> {
     let mut dictionary = collect_dictionary.then(BoundedDistinct::default);
     let members = ranges
         .iter()
-        .enumerate()
-        .map(|(member_index, range)| {
+        .map(|range| {
             let member = values.get(range.clone()).ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "Offset chunk {member_index} range {}..{} exceeds {} values",
+                    "Sequence range {}..{} exceeds {} values",
                     range.start,
                     range.end,
                     values.len()
                 ))
             })?;
-            let base = member.first().copied().map(to_u64).ok_or_else(|| {
-                Error::invalid_input(format!("Offset chunk {member_index} is empty"))
-            })?;
-            let mut value_stats = SequenceStatsBuilder::new(bits_per_value, sample_limit);
-            let mut delta_stats = SequenceStatsBuilder::new(bits_per_value, 0);
-            let mut run_value_stats = SequenceStatsBuilder::new(bits_per_value, 0);
-            let mut run_length_stats = SequenceStatsBuilder::new(32, 0);
-            let mut previous = None;
-            let mut run_value = None;
-            let mut run_length = 0_u64;
-
-            for raw_value in member.iter().copied().map(to_u64) {
-                let value = raw_value.checked_sub(base).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Offset chunk {member_index} contains a value below its first offset"
-                    ))
-                })?;
-                if let Some(previous) = previous {
-                    let delta = value.checked_sub(previous).ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "Offset chunk {member_index} must be non-decreasing"
-                        ))
-                    })?;
-                    delta_stats.push(delta);
-                }
-                previous = Some(value);
-                value_stats.push(value);
-                if let Some(dictionary) = dictionary.as_mut() {
-                    dictionary.push(value);
-                }
-
-                match run_value {
-                    Some(current) if current == value => run_length += 1,
-                    Some(current) => {
-                        run_value_stats.push(current);
-                        run_length_stats.push(run_length);
-                        run_value = Some(value);
-                        run_length = 1;
-                    }
-                    None => {
-                        run_value = Some(value);
-                        run_length = 1;
-                    }
-                }
-            }
-            run_value_stats.push(run_value.expect("non-empty offset chunk has one run"));
-            run_length_stats.push(run_length);
-            let values = value_stats.finish();
-            Ok(MemberStats {
-                deltas: (values.len >= 2).then(|| delta_stats.finish()),
-                values,
-                run_values: run_value_stats.finish(),
-                run_lengths: run_length_stats.finish(),
-            })
+            analyze_member(
+                member.iter().copied().map(to_u64),
+                bits_per_value,
+                sample_limit,
+                normalize,
+                &mut dictionary,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(FamilyStats {
         members,
         dictionary_items: dictionary.and_then(BoundedDistinct::finish),
+    })
+}
+
+/// Analyze a generated sequence without allocating its values.
+pub(super) fn analyze_sequence(
+    values: impl Iterator<Item = u64>,
+    collect_general_sample: bool,
+) -> Result<FamilyStats> {
+    let mut dictionary = Some(BoundedDistinct::default());
+    let member = analyze_member(
+        values,
+        64,
+        if collect_general_sample {
+            GENERAL_SAMPLE_BYTES
+        } else {
+            0
+        },
+        false,
+        &mut dictionary,
+    )?;
+    Ok(FamilyStats {
+        members: vec![member],
+        dictionary_items: dictionary.and_then(BoundedDistinct::finish),
+    })
+}
+
+fn analyze_member(
+    values: impl Iterator<Item = u64>,
+    bits: u64,
+    sample_limit: usize,
+    normalize: bool,
+    dictionary: &mut Option<BoundedDistinct>,
+) -> Result<MemberStats> {
+    let mut values = values.peekable();
+    let first = values.peek().copied().unwrap_or(0);
+    let base = if normalize { first } else { 0 };
+    let mut monotonic = true;
+    let mut value_stats = SequenceStatsBuilder::new(bits, sample_limit);
+    let mut delta_stats = SequenceStatsBuilder::new(bits, 0);
+    let mut run_value_stats = SequenceStatsBuilder::new(bits, 0);
+    let mut run_length_stats = SequenceStatsBuilder::new(32, 0);
+    let mut previous = None;
+    let mut run_value = None;
+    let mut run_length = 0;
+    for raw_value in values {
+        let value = raw_value.checked_sub(base).ok_or_else(|| {
+            Error::invalid_input("Offset chunk contains a value below its first offset")
+        })?;
+        if let Some(previous) = previous {
+            if let Some(delta) = value.checked_sub(previous) {
+                delta_stats.push(delta);
+            } else if normalize {
+                return Err(Error::invalid_input("Offset chunk must be non-decreasing"));
+            } else {
+                monotonic = false;
+            }
+        }
+        previous = Some(value);
+        value_stats.push(value);
+        if let Some(dictionary) = dictionary.as_mut() {
+            dictionary.push(value);
+        }
+        match run_value {
+            Some(current) if current == value => run_length += 1,
+            Some(current) => {
+                run_value_stats.push(current);
+                run_length_stats.push(run_length);
+                run_value = Some(value);
+                run_length = 1;
+            }
+            None => {
+                run_value = Some(value);
+                run_length = 1;
+            }
+        }
+    }
+    if let Some(run_value) = run_value {
+        run_value_stats.push(run_value);
+        run_length_stats.push(run_length);
+    }
+    let values = value_stats.finish();
+    Ok(MemberStats {
+        deltas: (values.len >= 2 && monotonic).then(|| delta_stats.finish()),
+        values,
+        run_values: run_value_stats.finish(),
+        run_lengths: run_length_stats.finish(),
     })
 }
 

@@ -7845,7 +7845,6 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                     ctx.field,
                     self.compression.as_ref(),
                     data,
-                    MiniblockChunkSize::U32,
                 ) {
                     Ok(prepared_values) => prepared_values,
                     Err(error) => {
@@ -7920,7 +7919,6 @@ impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
                 plan,
                 row_number,
                 num_rows,
-                MiniblockChunkSize::U32,
             )?,
         ))
     }

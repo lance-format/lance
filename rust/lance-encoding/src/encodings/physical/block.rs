@@ -409,7 +409,9 @@ mod lz4 {
             // When prepend_size is true, LZ4 stores the uncompressed size in the first 4 bytes
             // We can read this to know exactly how much space we need
             if input_buf.len() < 4 {
-                return Err(Error::internal("LZ4 compressed data too short".to_string()));
+                return Err(Error::invalid_input(
+                    "LZ4 buffer is missing its length prefix",
+                ));
             }
 
             // Read the uncompressed size from the first 4 bytes (little-endian)
