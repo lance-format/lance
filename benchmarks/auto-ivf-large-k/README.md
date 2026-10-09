@@ -6,8 +6,9 @@ calibration; [RESULTS.md](RESULTS.md) has the measurements and the decisions
 they support.
 
 Run all Python commands from `python/` after `make install`, on a benchmark VM
-with enough memory to cache one complete IVF_FLAT index (256 GiB for these
-corpora). Build the native extension with the `release-with-debug` profile.
+with enough memory to cache both baseline and candidate copies of the largest
+IVF_FLAT index (256 GiB host memory for this campaign). Build the native extension
+with the `release-with-debug` profile.
 
 Keep a copy of the baseline `lance` package, including its native library, at
 `$BASELINE_RUNTIME/lance` before rebuilding. Record its SHA256 in
@@ -26,7 +27,7 @@ Lay out every corpus as `$STUDY/data/<name>/{base,queries}.lance` plus a
 corpora are the OSS-2221 archives with their frozen indices:
 
 ```bash
-uv run python ../benchmarks/auto-ivf-large-k/import_archive.py "$STUDY" "$INPUTS" dino-10m
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/import_archive.py "$STUDY" "$INPUTS" dino-10m
 ```
 
 `$INPUTS` is the `reproduction-inputs` directory of the OSS-2221 campaign
@@ -37,8 +38,8 @@ corpora are pinned HF snapshots of `lance-format/wiki-cohere-35m` and
 ```bash
 export LANCE_CPU_THREADS=32 RAYON_NUM_THREADS=32
 export OPENBLAS_NUM_THREADS=32 OMP_NUM_THREADS=32
-uv run python ../benchmarks/auto-ivf-large-k/prepare.py "$STUDY" dino-10m
-uv run python ../benchmarks/auto-ivf-large-k/calibrate.py "$STUDY"
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/prepare.py "$STUDY" dino-10m
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/calibrate.py "$STUDY"
 ```
 
 `prepare.py` builds (or adopts) a frozen IVF_FLAT index, computes exact float64
@@ -47,6 +48,12 @@ saves sorted centroid distances, ground-truth partition ranks and cumulative
 scanned rows. `calibrate.py` reads only calibration queries; it selects
 profiles for k anchors 200, 500 and 1000, records the 2000 and 5000 optima, and
 simulates the candidate bucket structures.
+
+The published run uses [calibration-frozen.json](calibration-frozen.json). To
+replay its policies, place that exact file at `$STUDY/calibration.json` after
+restoring the matching frozen indices and prepared inputs. Freshly trained
+indices define a new experiment. Source, binary and prepared-array hashes are
+recorded in [run-integrity.json](run-integrity.json).
 
 Verify the baseline first with `measure.py --limit 8` on main's binary: main's
 Auto must match the candidate's bounded legacy arm for k > 100. Then install a
@@ -64,3 +71,10 @@ order; all remaining held-out queries contribute recall and scan counts with
 eight workers. CSVs keep every returned ID, timing, scan count and routing
 prediction. These are empirical profiles for Float32 IVF_FLAT with about 4096
 rows per partition, not recall guarantees for other indices or data.
+
+`audit.py` writes `audited-results.json` before enforcing the recall gate. The
+published run passes all integrity checks and all 20 newly supported unfiltered
+groups, but exits with status 1 because the unchanged FineWeb k=100 control has
+94.97875% mean recall against the preregistered 95% target. The target and frozen
+parameters were not changed after evaluation. See [RESULTS.md](RESULTS.md) for
+the full distributions, paired baseline comparisons and filtered limitations.
