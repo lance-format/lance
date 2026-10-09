@@ -947,6 +947,7 @@ impl Field {
             (&self_type, &other_type),
             (DataType::Struct(_), DataType::Struct(_))
                 | (DataType::List(_), DataType::List(_))
+                | (DataType::LargeList(_), DataType::LargeList(_))
                 | (DataType::Map(_, _), DataType::Map(_, _))
         ) {
             // Blob v2 uses a struct logical type for descriptors, which differs from the logical
@@ -968,6 +969,22 @@ impl Field {
                     }
                 })
                 .collect::<Vec<_>>();
+            // A list or map with no surviving children cannot be materialized:
+            // `data_type()` indexes children[0] for these logical types, so
+            // returning the field here would panic at the next type access. A
+            // child is dropped either because the other field has no child of
+            // that name or because the recursive intersection failed.
+            if children.is_empty()
+                && matches!(
+                    self_type,
+                    DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+                )
+            {
+                return Err(Error::arrow(format!(
+                    "Attempt to intersect fields whose children do not intersect: ({}, {}) and ({}, {})",
+                    self.name, self_type, other.name, other_type
+                )));
+            }
             let f = Self {
                 name: self.name.clone(),
                 id: if self.id >= 0 { self.id } else { other.id },
@@ -1354,6 +1371,7 @@ mod tests {
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
@@ -1773,6 +1791,93 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    /// A struct is exempt from the no-children guard on purpose: `data_type()`
+    /// maps over the children, so `Struct([])` is representable.
+    #[test]
+    fn test_struct_field_intersection_without_shared_children() {
+        let f1: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "b",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let f2: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        let actual = f1.intersection(&f2).unwrap();
+        assert!(actual.children.is_empty());
+        assert_eq!(actual.data_type(), DataType::Struct(Fields::empty()));
+    }
+
+    fn map_entries(name: &str) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new(
+            name,
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("key", DataType::Int32, false),
+                ArrowField::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ))
+    }
+
+    /// Arrow does not fix the name of a list's item child or a map's entries
+    /// child, so two fields can describe compatible data and still share no
+    /// child by name. `data_type()` indexes `children[0]` for these logical
+    /// types, so an intersection with no surviving child has to error rather
+    /// than return a field that panics on the next type access.
+    #[rstest]
+    #[case::list_item_name(
+        DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::List(Arc::new(ArrowField::new("element", DataType::Int32, true)))
+    )]
+    #[case::large_list_item_name(
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::LargeList(Arc::new(ArrowField::new("element", DataType::Int32, true)))
+    )]
+    // Names match but the item types conflict, so the recursive intersection
+    // errors and `.ok()?` drops the child: same zero-children result.
+    #[case::large_list_item_type(
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Utf8, true)))
+    )]
+    #[case::map_entries_name(
+        DataType::Map(map_entries("entries"), false),
+        DataType::Map(map_entries("pairs"), false)
+    )]
+    fn test_list_field_intersection_without_shared_children(
+        #[case] self_type: DataType,
+        #[case] other_type: DataType,
+    ) {
+        let f1: Field = ArrowField::new("a", self_type, true).try_into().unwrap();
+        let f2: Field = ArrowField::new("a", other_type, true).try_into().unwrap();
+
+        let err = f1
+            .intersection(&f2)
+            .expect_err("a list or map with no shared child cannot be materialized");
+        assert!(
+            matches!(err, Error::Arrow { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("children do not intersect"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
