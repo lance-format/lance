@@ -604,6 +604,20 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
+    /// Resumes where an earlier commit attempt saw deferred compactions move
+    /// the index's rows.
+    pub(crate) fn resume_untagged_carried(&mut self, carried: Option<HashMap<u32, RoaringBitmap>>) {
+        if let (Some(reuse), Some(carried)) = (self.untagged_reuse.as_mut(), carried) {
+            reuse.carried = carried;
+        }
+    }
+
+    pub(crate) fn untagged_carried(&self) -> Option<HashMap<u32, RoaringBitmap>> {
+        self.untagged_reuse
+            .as_ref()
+            .map(|reuse| reuse.carried.clone())
+    }
+
     /// Whether this CreateIndex covers rows a recorded deferred compaction
     /// moved, which needs every version since its read version to follow.
     pub(crate) fn relies_on_untagged_reuse(&self) -> bool {

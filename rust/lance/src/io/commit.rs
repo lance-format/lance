@@ -1692,11 +1692,10 @@ pub(crate) async fn commit_transaction(
         indices: read_version_indices.as_slice(),
     });
 
-    // An index commit re-checks everything since its read version on every
-    // attempt, so no rebase state has to survive a lost commit race.
-    let replay_from_read_version = matches!(transaction.operation, Operation::CreateIndex { .. });
-    let read_transaction = transaction;
     let mut transaction = transaction.clone();
+    // Where earlier attempts saw deferred compactions move an index's rows:
+    // each attempt checks only the versions committed since the previous one.
+    let mut untagged_carried = None;
     // What a rewrite on a tagged fragment reuse history assembled for the
     // attempt; handed to the manifest build, never written back into
     // `transaction`.
@@ -1727,12 +1726,8 @@ pub(crate) async fn commit_transaction(
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
         if !strict_overwrite {
-            let checked_since = if replay_from_read_version {
-                &read_version_dataset
-            } else {
-                &dataset
-            };
-            (dataset, other_transactions) = load_and_sort_new_transactions(checked_since).await?;
+            let checked_since = dataset.manifest.version;
+            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             ensure_can_write_manifest(&dataset.manifest)?;
 
@@ -1741,32 +1736,29 @@ pub(crate) async fn commit_transaction(
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
 
-            if replay_from_read_version {
-                transaction = read_transaction.clone();
-            }
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
-            if replay_from_read_version && rebase.relies_on_untagged_reuse() {
-                let complete = other_transactions
-                    .iter()
-                    .map(|(version, _)| *version)
-                    .eq(read_version + 1..=dataset.manifest.version);
-                if !complete {
-                    return Err(Error::retryable_commit_conflict_source(
-                        dataset.manifest.version,
-                        format!(
-                            "versions since {read_version} were cleaned up, so this index cannot \
-                             be carried through deferred compactions; rebuild it"
-                        )
-                        .into(),
-                    ));
-                }
+            rebase.resume_untagged_carried(untagged_carried.take());
+            let complete = other_transactions
+                .iter()
+                .map(|(version, _)| *version)
+                .eq(checked_since + 1..=dataset.manifest.version);
+            if !complete && rebase.relies_on_untagged_reuse() {
+                return Err(Error::retryable_commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "versions since {checked_since} were cleaned up, so this index cannot be \
+                         carried through deferred compactions; rebuild it"
+                    )
+                    .into(),
+                ));
             }
 
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;
             }
+            untagged_carried = rebase.untagged_carried();
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;

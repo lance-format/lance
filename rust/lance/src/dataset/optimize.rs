@@ -13845,6 +13845,8 @@ mod tests {
         FoldOverlay,
         /// Updates in place, then cleans up the compaction's version.
         UpdateAndCleanUpCompaction,
+        /// Changes config, then cleans up the version before it.
+        ConfigAndCleanUpPrevious,
     }
 
     /// Makes a change the first time an index commit is attempted, so that
@@ -13895,6 +13897,14 @@ mod tests {
                                 .unwrap();
                         }
                         RacingChange::UpdateInPlace => update_val_in_place(dataset).await,
+                        RacingChange::ConfigAndCleanUpPrevious => {
+                            dataset.update_config([("racing", "true")]).await.unwrap();
+                            let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+                                .versions(vec![compaction])
+                                .unwrap()
+                                .build();
+                            dataset.cleanup_with_policy(policy).await.unwrap();
+                        }
                         RacingChange::UpdateAndCleanUpCompaction => {
                             update_val_in_place(dataset).await;
                             let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
@@ -14006,13 +14016,57 @@ mod tests {
         assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
     }
 
-    /// A retry that cannot see a compaction it relies on, because cleanup
-    /// removed that version, refuses to commit.
+    /// A retry keeps the coverage an earlier attempt pruned for an update,
+    /// even once cleanup removes the update's version.
     #[tokio::test]
-    async fn test_reindex_retry_refuses_a_cleaned_up_compaction() {
+    async fn test_reindex_retry_keeps_pruning_from_the_first_attempt() {
         let dir = TempStrDir::default();
-        let (mut builder, _) =
-            racing_index_builder(dir.as_str(), RacingChange::UpdateAndCleanUpCompaction).await;
+        let dataset = indexed_three_column_dataset(dir.as_str()).await;
+        dataset
+            .tags()
+            .create("index-build", dataset.manifest.version)
+            .await
+            .unwrap();
+        let race = Arc::new(ChangeBeforeIndexCommit {
+            change: RacingChange::ConfigAndCleanUpPrevious,
+            ..Default::default()
+        });
+        let mut builder = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(crate::session::Session::default()))
+            .with_commit_handler(race.clone())
+            .load()
+            .await
+            .unwrap();
+        update_val_in_place(dataset).await;
+        *race.pending.lock().unwrap() = Some(open_in_new_session(dir.as_str()).await);
+
+        assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
+        assert_eq!(race.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A gap hiding a compaction that moved the index's rows refuses the
+    /// commit: an update to its output could not be pruned.
+    #[tokio::test]
+    async fn test_reindex_refuses_a_gap_hiding_a_compaction_it_covers() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_three_column_dataset(dir.as_str()).await;
+        let read_version = dataset.manifest.version;
+        dataset
+            .tags()
+            .create("index-build", read_version)
+            .await
+            .unwrap();
+        let mut builder = open_in_new_session(dir.as_str()).await;
+        compact_files(&mut dataset, compact_into_one(false), None)
+            .await
+            .unwrap();
+        update_val_in_place(dataset).await;
+        let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+            .versions(vec![read_version + 1])
+            .unwrap()
+            .build();
+        let latest = open_in_new_session(dir.as_str()).await;
+        latest.cleanup_with_policy(policy).await.unwrap();
 
         assert_retryable_conflict(
             builder
@@ -14026,14 +14080,18 @@ mod tests {
                 .await
                 .map(|_| ()),
         );
-        let latest = open_in_new_session(dir.as_str()).await;
-        assert!(
-            latest
-                .load_index_by_name("val_idx")
-                .await
-                .unwrap()
-                .is_none()
-        );
+    }
+
+    /// A compaction an earlier attempt saw stays carried after cleanup removes
+    /// its version, so an update to its output is still pruned.
+    #[tokio::test]
+    async fn test_reindex_retry_carries_a_cleaned_up_compaction() {
+        let dir = TempStrDir::default();
+        let (mut builder, race) =
+            racing_index_builder(dir.as_str(), RacingChange::UpdateAndCleanUpCompaction).await;
+
+        assert_val_idx_sees_update(&mut builder, dir.as_str()).await;
+        assert_eq!(race.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14044,8 +14102,6 @@ mod tests {
         Compact,
         /// Coalition's remap job: remap the committed index, then trim.
         RemapAndTrim,
-        /// Cleans up versions between the build's and the latest.
-        CleanUpVersions,
     }
 
     async fn build_val_idx(dataset: &mut Dataset, replace: bool) -> Result<()> {
@@ -14061,19 +14117,156 @@ mod tests {
             .map(|_| ())
     }
 
-    /// Runs `ops` from a writer while a rebuild of `val_idx` built from the
-    /// version before them commits from another process. Returns the commit's
+    /// Writes from another process against the table at `uri`. Appended ids
+    /// count up from 240 with `val = id * 10`; updates set `val` above 1_000_000.
+    #[derive(Debug)]
+    struct Workload {
+        uri: String,
+        rng: std::sync::Mutex<u64>,
+        next_id: std::sync::atomic::AtomicI32,
+        updates: std::sync::atomic::AtomicI32,
+    }
+
+    impl Workload {
+        fn next(&self, bound: u64) -> u64 {
+            let mut rng = self.rng.lock().unwrap();
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng % bound
+        }
+
+        async fn run(&self, ops: &[WorkloadOp]) {
+            use std::sync::atomic::Ordering::SeqCst;
+            for op in ops {
+                let mut writer = open_in_new_session(&self.uri).await;
+                match op {
+                    WorkloadOp::Append => {
+                        let first = self.next_id.fetch_add(20, SeqCst);
+                        let ids = (first..first + 20).collect::<Vec<_>>();
+                        let batch = record_batch!(
+                            ("id", Int32, ids.clone()),
+                            ("val", Int32, ids.iter().map(|v| v * 10).collect::<Vec<_>>()),
+                            ("spare", Int32, vec![42; 20])
+                        )
+                        .unwrap();
+                        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+                        writer.append(reader, None).await.unwrap();
+                    }
+                    WorkloadOp::Delete => {
+                        let filter = format!("id % 11 = {}", self.next(11));
+                        writer.delete(&filter).await.unwrap();
+                    }
+                    WorkloadOp::Update => {
+                        use crate::dataset::{
+                            MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+                        };
+                        let mut ids = Vec::new();
+                        while ids.len() < 3 {
+                            let id = self.next(self.next_id.load(SeqCst) as u64) as i32;
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                        let vals = ids
+                            .iter()
+                            .map(|_| 1_000_000 + self.updates.fetch_add(1, SeqCst) + 1)
+                            .collect::<Vec<_>>();
+                        let patch =
+                            record_batch!(("id", Int32, ids), ("val", Int32, vals)).unwrap();
+                        let schema = patch.schema();
+                        let mut merge =
+                            MergeInsertBuilder::try_new(Arc::new(writer), vec!["id".into()])
+                                .unwrap();
+                        merge
+                            .when_matched(WhenMatched::UpdateAll)
+                            .when_not_matched(WhenNotMatched::DoNothing)
+                            .write_mode(MergeInsertWriteMode::RewriteColumns);
+                        merge
+                            .try_build()
+                            .unwrap()
+                            .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+                            .await
+                            .unwrap();
+                    }
+                    WorkloadOp::Compact => {
+                        let options = CompactionOptions {
+                            target_rows_per_fragment: 60,
+                            defer_index_remap: true,
+                            ..Default::default()
+                        };
+                        compact_files(&mut writer, options, None).await.unwrap();
+                    }
+                    WorkloadOp::RemapAndTrim => {
+                        if writer.frag_reuse_index().await.unwrap().is_some() {
+                            remapping::remap_column_index(
+                                &mut writer,
+                                &["val"],
+                                Some("val_idx".into()),
+                            )
+                            .await
+                            .unwrap();
+                            cleanup_frag_reuse_index(&mut writer).await.unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs a workload the first time an index commit is attempted.
+    #[derive(Debug, Default)]
+    struct WorkloadDuringIndexCommit {
+        pending: std::sync::Mutex<Option<(Arc<Workload>, Vec<WorkloadOp>)>>,
+    }
+
+    #[async_trait]
+    impl CommitHandler for WorkloadDuringIndexCommit {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let is_index = transaction
+                .as_ref()
+                .and_then(|transaction| transaction.as_pb().operation.as_ref())
+                .is_some_and(|operation| matches!(operation, PbOperation::CreateIndex(_)));
+            let pending = is_index
+                .then(|| self.pending.lock().unwrap().take())
+                .flatten();
+            if let Some((workload, ops)) = pending {
+                Box::pin(workload.run(&ops)).await;
+            }
+            ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    /// Runs `before` from a writer while a rebuild of `val_idx` built from the
+    /// version before them is in progress in another process, and `during` while
+    /// the rebuild's first commit attempt is in flight. Returns the commit's
     /// error, if any; on success every lookup must match a scan.
-    async fn rebuild_under_workload(seed: u64, ops: &[WorkloadOp]) -> Option<Error> {
+    async fn rebuild_under_workload(
+        seed: u64,
+        before: &[WorkloadOp],
+        during: &[WorkloadOp],
+    ) -> Option<Error> {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut next = move |bound: u64| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng % bound
-        };
         let batch = record_batch!(
             ("id", Int32, (0..240).collect::<Vec<_>>()),
             ("val", Int32, (0..240).map(|v| v * 10).collect::<Vec<_>>()),
@@ -14087,137 +14280,62 @@ mod tests {
             ..Default::default()
         };
         let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-        let mut writer = Dataset::write(reader, uri, Some(params.clone()))
+        let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
+        build_val_idx(&mut dataset, false).await.unwrap();
+        let workload = Arc::new(Workload {
+            uri: uri.to_string(),
+            rng: std::sync::Mutex::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+            next_id: 240.into(),
+            updates: 0.into(),
+        });
+        let race = Arc::new(WorkloadDuringIndexCommit {
+            pending: std::sync::Mutex::new(Some((workload.clone(), during.to_vec()))),
+        });
+        let mut builder = crate::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_session(Arc::new(crate::session::Session::default()))
+            .with_commit_handler(race)
+            .load()
             .await
             .unwrap();
-        build_val_idx(&mut writer, false).await.unwrap();
-        let read_version = writer.manifest.version;
-        writer.tags().create("rebuild", read_version).await.unwrap();
-        let mut builder = open_in_new_session(uri).await;
 
-        let mut next_id = 240;
-        let mut updates = 0;
-        for op in ops {
-            writer.checkout_latest().await.unwrap();
-            match op {
-                WorkloadOp::Append => {
-                    let ids = (next_id..next_id + 20).collect::<Vec<_>>();
-                    next_id += 20;
-                    let batch = record_batch!(
-                        ("id", Int32, ids.clone()),
-                        ("val", Int32, ids.iter().map(|v| v * 10).collect::<Vec<_>>()),
-                        ("spare", Int32, vec![42; 20])
-                    )
-                    .unwrap();
-                    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-                    writer.append(reader, None).await.unwrap();
-                }
-                WorkloadOp::Delete => {
-                    let filter = format!("id % 11 = {}", next(11));
-                    writer.delete(&filter).await.unwrap();
-                }
-                WorkloadOp::Update => {
-                    use crate::dataset::{
-                        MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
-                    };
-                    let mut ids = Vec::new();
-                    while ids.len() < 3 {
-                        let id = next(next_id as u64) as i32;
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
-                    let vals = ids
-                        .iter()
-                        .map(|_| {
-                            updates += 1;
-                            1_000_000 + updates
-                        })
-                        .collect::<Vec<_>>();
-                    let patch = record_batch!(("id", Int32, ids), ("val", Int32, vals)).unwrap();
-                    let schema = patch.schema();
-                    let mut merge =
-                        MergeInsertBuilder::try_new(Arc::new(writer.clone()), vec!["id".into()])
-                            .unwrap();
-                    merge
-                        .when_matched(WhenMatched::UpdateAll)
-                        .when_not_matched(WhenNotMatched::DoNothing)
-                        .write_mode(MergeInsertWriteMode::RewriteColumns);
-                    merge
-                        .try_build()
-                        .unwrap()
-                        .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
-                        .await
-                        .unwrap();
-                }
-                WorkloadOp::Compact => {
-                    let options = CompactionOptions {
-                        target_rows_per_fragment: 60,
-                        defer_index_remap: true,
-                        ..Default::default()
-                    };
-                    compact_files(&mut writer, options, None).await.unwrap();
-                }
-                WorkloadOp::RemapAndTrim => {
-                    if writer.frag_reuse_index().await.unwrap().is_some() {
-                        remapping::remap_column_index(
-                            &mut writer,
-                            &["val"],
-                            Some("val_idx".into()),
-                        )
-                        .await
-                        .unwrap();
-                        cleanup_frag_reuse_index(&mut writer).await.unwrap();
-                    }
-                }
-                WorkloadOp::CleanUpVersions => {
-                    let latest = open_in_new_session(uri).await;
-                    let gone = (read_version + 1..latest.manifest.version)
-                        .filter(|_| next(2) == 0)
-                        .collect::<Vec<_>>();
-                    if !gone.is_empty() {
-                        let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
-                            .versions(gone)
-                            .unwrap()
-                            .build();
-                        latest.cleanup_with_policy(policy).await.unwrap();
-                    }
-                }
-            }
-        }
-
+        Box::pin(workload.run(before)).await;
         if let Err(error) = build_val_idx(&mut builder, true).await {
             return Some(error);
         }
+
         let latest = open_in_new_session(uri).await;
         let mut scan = latest.scan();
         scan.use_scalar_index(false).project(&["val"]).unwrap();
-        let mut expected = HashMap::<i32, usize>::new();
         let batch = scan.try_into_batch().await.unwrap();
+        let mut expected = HashMap::<i32, usize>::new();
         for val in batch["val"].as_primitive::<Int32Type>().values() {
             *expected.entry(*val).or_default() += 1;
         }
+        let next_id = workload.next_id.load(std::sync::atomic::Ordering::SeqCst);
+        let updates = workload.updates.load(std::sync::atomic::Ordering::SeqCst);
         let probes = (0..next_id)
             .map(|id| id * 10)
-            .chain((1..=updates).map(|n| 1_000_000 + n))
-            .collect::<Vec<_>>();
+            .chain((1..=updates).map(|n| 1_000_000 + n));
         for value in probes {
             let found = latest
                 .count_rows(Some(format!("val = {value}")))
                 .await
                 .unwrap();
             let want = expected.get(&value).copied().unwrap_or(0);
-            assert_eq!(found, want, "seed {seed} ops {ops:?}: val = {value}");
+            assert_eq!(
+                found, want,
+                "seed {seed} {before:?} {during:?}: val = {value}"
+            );
         }
         for bound in [0, 500, 1_200, 2_400, 1_000_010] {
             let filter = format!("val < {bound}");
             let found = latest.count_rows(Some(filter.clone())).await.unwrap();
             let want = expected
                 .iter()
-                .filter(|(v, _)| **v < bound)
-                .map(|(_, n)| n)
+                .filter(|(value, _)| **value < bound)
+                .map(|(_, count)| count)
                 .sum::<usize>();
-            assert_eq!(found, want, "seed {seed} ops {ops:?}: {filter}");
+            assert_eq!(found, want, "seed {seed} {before:?} {during:?}: {filter}");
         }
         None
     }
@@ -14236,39 +14354,35 @@ mod tests {
     }
 
     /// Coalition's workload: writes and deferred compactions from other
-    /// processes during a full rebuild. The rebuild must commit, and every
-    /// lookup must match a scan.
+    /// processes during a full rebuild and its commit. The rebuild must commit,
+    /// and every lookup must match a scan.
     #[tokio::test]
     async fn test_rebuild_commits_under_writes_and_deferred_compactions() {
         use WorkloadOp::*;
+        let kinds = [Append, Delete, Update, Compact, Compact];
         for seed in 0..12 {
-            let ops = workload(seed, &[Append, Delete, Update, Compact, Compact], 8);
-            if let Some(error) = Box::pin(rebuild_under_workload(seed, &ops)).await {
-                panic!("seed {seed} ops {ops:?}: rebuild refused: {error}");
+            let before = workload(seed, &kinds, 6);
+            let during = workload(seed + 100, &kinds, 3);
+            if let Some(error) = Box::pin(rebuild_under_workload(seed, &before, &during)).await {
+                panic!("seed {seed} {before:?} {during:?}: rebuild refused: {error}");
             }
         }
     }
 
-    /// With the remap job and version cleanup in the mix, a rebuild may be
-    /// refused with a retryable conflict, but a commit is always correct.
+    /// With the remap job in the mix, before or during the commit, a rebuild
+    /// may retry but a commit is always correct. Version cleanup is left out:
+    /// one that hides an update from any index build is #3719.
     #[tokio::test]
-    async fn test_rebuild_under_remap_and_cleanup_is_correct_or_retries() {
+    async fn test_rebuild_under_the_remap_job_is_correct_or_retries() {
         use WorkloadOp::*;
-        for seed in 0..12 {
-            let kinds = [
-                Append,
-                Delete,
-                Update,
-                Compact,
-                Compact,
-                RemapAndTrim,
-                CleanUpVersions,
-            ];
-            let ops = workload(seed, &kinds, 8);
-            if let Some(error) = Box::pin(rebuild_under_workload(seed, &ops)).await {
+        let kinds = [Append, Delete, Update, Compact, Compact, RemapAndTrim];
+        for seed in 0..24 {
+            let before = workload(seed, &kinds, 6);
+            let during = workload(seed + 100, &kinds, 3);
+            if let Some(error) = Box::pin(rebuild_under_workload(seed, &before, &during)).await {
                 assert!(
                     matches!(error, Error::RetryableCommitConflict { .. }),
-                    "seed {seed} ops {ops:?}: {error}"
+                    "seed {seed} {before:?} {during:?}: {error}"
                 );
             }
         }
