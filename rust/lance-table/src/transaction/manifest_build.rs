@@ -484,7 +484,7 @@ impl Transaction {
             current_manifest,
             &current_indices,
             &frag_reuse,
-            config.migration_next_row_id,
+            config.activation_next_row_id(),
         )?;
         let mut prepared = current_indices.clone();
         if let Some(manifest) = current_manifest {
@@ -519,6 +519,81 @@ impl Transaction {
             prepared,
             frag_reuse,
         ))
+    }
+
+    /// Checks run against the latest manifest on every attempt of a
+    /// [`StableRowIdTransition::Deactivate`](crate::format::StableRowIdTransition)
+    /// commit, so a concurrent change cannot slip past them through a rebase.
+    fn validate_stable_row_id_deactivation(
+        &self,
+        current_manifest: Option<&Manifest>,
+        current_indices: &[IndexMetadata],
+    ) -> Result<()> {
+        let Some(current_manifest) = current_manifest.filter(|m| m.uses_stable_row_ids()) else {
+            return Err(Error::invalid_input(
+                "Cannot turn off stable row ids: the dataset does not use them",
+            ));
+        };
+        let Operation::Merge { fragments, .. } = &self.operation else {
+            return Err(Error::internal(format!(
+                "Turning off stable row ids requires a Merge, not {}",
+                self.operation.name()
+            )));
+        };
+
+        let blocking_indices = row_id_domain_index_names(current_indices);
+        if !blocking_indices.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "Cannot turn off stable row ids while indices that store stable row ids \
+                 exist on the dataset. Drop the following indices first, then re-run, and \
+                 recreate them afterwards: {}",
+                blocking_indices.join(", ")
+            )));
+        }
+
+        // Spilled lineage lives in hidden data file columns, which stripping
+        // the fragment metadata would orphan.
+        if let Some(fragment) = current_manifest
+            .fragments
+            .iter()
+            .find(|f| f.has_spilled_row_lineage())
+        {
+            return Err(Error::not_supported(format!(
+                "Cannot turn off stable row ids: fragment {} stores its row lineage in a \
+                 data file column",
+                fragment.id
+            )));
+        }
+
+        let current_ids: HashSet<u64> = current_manifest.fragments.iter().map(|f| f.id).collect();
+        let merged_ids: HashSet<u64> = fragments.iter().map(|f| f.id).collect();
+        if current_ids != merged_ids || fragments.len() != current_ids.len() {
+            return Err(Error::invalid_input(
+                "Turning off stable row ids must keep exactly the dataset's current fragments",
+            ));
+        }
+        if let Some(fragment) = fragments.iter().find(|f| {
+            f.row_id_meta.is_some()
+                || f.created_at_version_meta.is_some()
+                || f.last_updated_at_version_meta.is_some()
+        }) {
+            return Err(Error::invalid_input(format!(
+                "Turning off stable row ids must strip row lineage from every fragment, \
+                 but fragment {} still carries it",
+                fragment.id
+            )));
+        }
+
+        let first_clear_id = first_fragment_id_clear_of_row_ids(current_manifest.next_row_id);
+        if let Some(fragment) = fragments.iter().find(|f| f.id < first_clear_id) {
+            return Err(Error::invalid_input(format!(
+                "Cannot turn off stable row ids: the row addresses of fragment {} overlap \
+                 the stable row ids already issued (below {}). Rewrite fragments with ids \
+                 below {first_clear_id} first",
+                fragment.id, current_manifest.next_row_id
+            )));
+        }
+        Ok(())
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -606,11 +681,11 @@ impl Transaction {
             current_manifest,
             prepared.original(),
             prepared.frag_reuse_update(),
-            config.migration_next_row_id,
+            config.activation_next_row_id(),
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
         if config.use_stable_row_ids
-            && config.migration_next_row_id.is_none()
+            && config.activation_next_row_id().is_none()
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
@@ -632,13 +707,26 @@ impl Transaction {
             .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
             .map(|idx| idx.name.as_str())
             .collect();
-        if config.migration_next_row_id.is_some() && !blocking_indices.is_empty() {
+        if config.activation_next_row_id().is_some() && !blocking_indices.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Cannot migrate to stable row IDs while indexes exist on the dataset. \
                  Drop the following indexes first, then re-run the migration, and \
                  recreate them afterwards: {}",
                 blocking_indices.join(", ")
             )));
+        }
+        if config.deactivates_stable_row_ids() {
+            self.validate_stable_row_id_deactivation(current_manifest, &original_indices)?;
+        } else if let (Some(manifest), Operation::Merge { fragments, .. }) =
+            (current_manifest, &self.operation)
+            && manifest.uses_stable_row_ids()
+            && !manifest.fragments.is_empty()
+            && fragments.iter().all(|f| f.row_id_meta.is_none())
+        {
+            return Err(Error::invalid_input(
+                "Merge operation strips row id metadata from every fragment of a dataset \
+                 that uses stable row ids. Use `migrate_off_stable_row_ids` to turn them off",
+            ));
         }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
@@ -702,7 +790,7 @@ impl Transaction {
         // Release builds refuse to publish a stable-row-id dataset with a fragment
         // reuse index, and nothing needs it: compaction rejects deferred index
         // remap there.
-        if config.migration_next_row_id.is_some() {
+        if config.activation_next_row_id().is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
 
@@ -721,6 +809,9 @@ impl Transaction {
             // Only use row ids if the feature flag is set already, or this is
             // a migration activation that explicitly provides the next_row_id.
             match (current_manifest, config.use_stable_row_ids) {
+                // The manifest keeps the previous `next_row_id` as a
+                // high-water mark; nothing in this commit is assigned one.
+                _ if config.deactivates_stable_row_ids() => None,
                 (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
                 }
@@ -728,7 +819,7 @@ impl Transaction {
                 (_, false) => None,
                 (Some(_), true) => {
                     // Migration activation: use the provided next_row_id.
-                    if let Some(migration_nri) = config.migration_next_row_id {
+                    if let Some(migration_nri) = config.activation_next_row_id() {
                         Some(migration_nri)
                     } else {
                         return Err(Error::not_supported_source(
@@ -1760,9 +1851,10 @@ impl Transaction {
             // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
             // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
-            let inherited = current_manifest
-                .map(|m| m.uses_stable_row_ids())
-                .unwrap_or(false);
+            let inherited = !config.deactivates_stable_row_ids()
+                && current_manifest
+                    .map(|m| m.uses_stable_row_ids())
+                    .unwrap_or(false);
             let use_stable_row_ids = config.use_stable_row_ids || inherited;
             apply_feature_flags(
                 &mut manifest,
@@ -1799,6 +1891,20 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
+        if config.deactivates_stable_row_ids() {
+            // Every future fragment must start clear of the stable ids already
+            // handed out, or its row addresses would equal some of them.
+            let first_clear_id = first_fragment_id_clear_of_row_ids(manifest.next_row_id);
+            if let Some(floor) = first_clear_id.checked_sub(1) {
+                let floor = u32::try_from(floor).map_err(|_| {
+                    Error::internal(format!(
+                        "next_row_id {} exceeds the fragment id range",
+                        manifest.next_row_id
+                    ))
+                })?;
+                manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0).max(floor));
+            }
+        }
 
         match &self.operation {
             Operation::Overwrite {
@@ -2036,6 +2142,25 @@ impl Transaction {
     }
 }
 
+/// The lowest fragment id whose row addresses lie at or above `next_row_id`.
+///
+/// Stable row ids are issued from `[0, next_row_id)`, and fragment `f`'s row
+/// addresses start at `f << 32`, so only fragments below this id can have a
+/// row address equal to an issued stable row id.
+pub fn first_fragment_id_clear_of_row_ids(next_row_id: u64) -> u64 {
+    next_row_id.div_ceil(1 << 32)
+}
+
+/// Names of the indices that store stable row ids rather than row addresses,
+/// which would be misread once a dataset stops using stable row ids.
+pub fn row_id_domain_index_names(indices: &[IndexMetadata]) -> Vec<&str> {
+    indices
+        .iter()
+        .filter(|idx| !idx.results_are_row_addrs())
+        .map(|idx| idx.name.as_str())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,7 +2169,7 @@ mod tests {
     use crate::format::{
         DeletionFile, DeletionFileType, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
         ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
-        RowIdMeta,
+        RowIdMeta, StableRowIdTransition,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
@@ -2170,7 +2295,7 @@ mod tests {
             None,
         );
         let config = ManifestBuildConfig {
-            migration_next_row_id: Some(100),
+            stable_row_id_transition: Some(StableRowIdTransition::Activate { next_row_id: 100 }),
             ..default_build_config()
         };
         let error = transaction
@@ -4415,6 +4540,83 @@ mod tests {
         let tx = Transaction::new(manifest.version, operation, None);
         let (out, _) = tx.build_manifest(Some(manifest), vec![], "txn", &default_build_config())?;
         Ok(out)
+    }
+
+    fn build_deactivation(manifest: &Manifest, fragments: Vec<Fragment>) -> Result<Manifest> {
+        let operation = Operation::Merge {
+            fragments,
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_operation(Some(manifest), &operation)?;
+        let tx = Transaction::new(manifest.version, operation, None);
+        let config = ManifestBuildConfig {
+            stable_row_id_transition: Some(StableRowIdTransition::Deactivate),
+            ..default_build_config()
+        };
+        let (out, _) = tx.build_manifest(Some(manifest), vec![], "txn", &config)?;
+        Ok(out)
+    }
+
+    #[rstest::rstest]
+    #[case::clear(100, 1, None)]
+    #[case::fragment_0_overlaps(100, 0, Some("fragment 0"))]
+    #[case::fragment_2_overlaps((2 << 32) + 1, 2, Some("fragment 2"))]
+    fn merge_deactivating_stable_row_ids_refuses_overlapping_fragments(
+        #[case] next_row_id: u64,
+        #[case] fragment_id: u64,
+        #[case] refused: Option<&str>,
+    ) {
+        let (mut manifest, _) = merge_test_manifest(
+            vec![frag_with_row_ids(fragment_id, "frag.lance", &[0, 1])],
+            true,
+        );
+        manifest.next_row_id = next_row_id;
+        let stripped = vec![frag_without_row_ids(fragment_id, "frag.lance", 2)];
+
+        let result = build_deactivation(&manifest, stripped);
+
+        match refused {
+            Some(fragment) => {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains(fragment), "{error}");
+            }
+            None => {
+                let out = result.unwrap();
+                assert!(!out.uses_stable_row_ids());
+                assert_eq!(out.next_row_id, next_row_id);
+            }
+        }
+    }
+
+    #[test]
+    fn merge_deactivating_stable_row_ids_raises_max_fragment_id_past_issued_ids() {
+        let (mut manifest, _) = merge_test_manifest(vec![], true);
+        manifest.next_row_id = (3 << 32) + 1;
+
+        let out = build_deactivation(&manifest, vec![]).unwrap();
+
+        // The next fragment, 4, starts at 4 << 32, past every issued id.
+        assert_eq!(out.max_fragment_id, Some(3));
+        assert_eq!(out.next_row_id, (3 << 32) + 1);
+    }
+
+    #[test]
+    fn merge_stripping_row_ids_without_deactivation_is_refused() {
+        let (manifest, schema) =
+            merge_test_manifest(vec![frag_with_row_ids(1, "frag.lance", &[0, 1])], true);
+
+        let error = build_merge(
+            &manifest,
+            schema,
+            vec![frag_without_row_ids(1, "frag.lance", 2)],
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("migrate_off_stable_row_ids"),
+            "{error}"
+        );
     }
 
     #[rstest::rstest]

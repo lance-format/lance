@@ -20,7 +20,7 @@ pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files
 
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,
-    SelfDescribingFileReader, WriterVersion, is_detached_version,
+    SelfDescribingFileReader, StableRowIdTransition, WriterVersion, is_detached_version,
     populate_manifest_schema_dictionaries,
 };
 pub use row_ids::{

@@ -40,7 +40,8 @@ use lance_io::utils::{
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
-    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
+    ManifestBuildConfig, RowIdMeta, StableRowIdTransition, pb,
+    populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -124,6 +125,8 @@ pub(crate) use take::row_offsets_to_row_addresses;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
+use self::index::DatasetIndexRemapperOptions;
+use self::optimize::{CompactionOptions, CompactionTask, TaskData, commit_compaction};
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
@@ -156,6 +159,7 @@ use lance_table::feature_flags::{
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+use lance_table::transaction::{first_fragment_id_clear_of_row_ids, row_id_domain_index_names};
 pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -3222,9 +3226,8 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them,
-    /// contiguously from `start`, and return the resulting `next_row_id`
-    /// high-water mark.
+    /// Assign stable row ID sequences to every fragment, contiguously from
+    /// `start`, and return the resulting `next_row_id` high-water mark.
     fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
         let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
@@ -3289,6 +3292,118 @@ impl Dataset {
         let new_ds = CommitBuilder::new(Arc::new(self.clone()))
             .with_max_retries(0)
             .with_stable_row_id_migration_activation(next_row_id)
+            .execute(transaction)
+            .await?;
+
+        *self = new_ds;
+        Ok(())
+    }
+
+    /// Stop using stable row IDs, so `_rowid` reverts to the row address.
+    ///
+    /// This reverses [`Self::migrate_to_stable_row_ids`] (or creating the
+    /// dataset with stable row IDs). Afterwards no row address equals a stable
+    /// row ID this dataset already issued, so an ID held from before resolves
+    /// either to its own row or to nothing, never to a different row:
+    ///
+    /// 1. Fragments whose row addresses overlap the issued IDs (for a dataset
+    ///    that issued fewer than 2^32 IDs, only fragment 0) are compacted into
+    ///    new fragments. That commit is an ordinary compaction and keeps the
+    ///    stable IDs.
+    /// 2. A single Merge commit strips the row ID and row version metadata
+    ///    from every fragment and clears the stable row ID feature flag.
+    ///    `next_row_id` is kept as a high-water mark, so migrating back later
+    ///    never reissues an ID.
+    ///
+    /// Indices that store stable row IDs (BTree, bitmap, inverted, vector, and
+    /// others) would be misread afterwards, so this refuses while any exists
+    /// and names them; drop them first and recreate them afterwards. Indices
+    /// that store row addresses (zone map, bloom filter, FM) are kept.
+    ///
+    /// **No retries are attempted** for the final commit, and an index build
+    /// that started before it and commits after it is rejected by Lance
+    /// writers from this version on, but not by older ones. Callers should
+    /// quiesce concurrent writes and index builds first.
+    ///
+    /// This method is idempotent: if the table does not use stable row IDs,
+    /// it returns `Ok(())` immediately.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.migrate_off_stable_row_ids().await?;
+    /// assert!(!dataset.manifest().uses_stable_row_ids());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn migrate_off_stable_row_ids(&mut self) -> Result<()> {
+        if !self.manifest.uses_stable_row_ids() {
+            return Ok(());
+        }
+
+        // Checked again inside the final commit; refusing here first avoids a
+        // compaction commit that the refusal would leave behind for nothing.
+        let indices = crate::index::DatasetIndexExt::load_indices(self).await?;
+        let blocking_indices = row_id_domain_index_names(&indices);
+        if !blocking_indices.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "Cannot turn off stable row ids while indices that store stable row ids \
+                 exist on the dataset. Drop the following indices first, then re-run, and \
+                 recreate them afterwards: {}",
+                blocking_indices.join(", ")
+            )));
+        }
+
+        let first_clear_id = first_fragment_id_clear_of_row_ids(self.manifest.next_row_id);
+        let overlapping: Vec<Fragment> = self
+            .manifest
+            .fragments
+            .iter()
+            .filter(|f| f.id < first_clear_id)
+            .cloned()
+            .collect();
+        if !overlapping.is_empty() {
+            let options = CompactionOptions::default();
+            let task = CompactionTask {
+                task: TaskData {
+                    fragments: overlapping,
+                },
+                read_version: self.manifest.version,
+                options: options.clone(),
+            };
+            let rewritten = task.execute(self).await?;
+            commit_compaction(
+                self,
+                vec![rewritten],
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &options,
+            )
+            .await?;
+        }
+
+        let fragments = self
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| Fragment {
+                row_id_meta: None,
+                created_at_version_meta: None,
+                last_updated_at_version_meta: None,
+                ..fragment.clone()
+            })
+            .collect();
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
+                fragments,
+                schema: self.manifest.schema.clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_stable_row_id_deactivation()
             .execute(transaction)
             .await?;
 
@@ -4197,10 +4312,9 @@ pub(crate) struct ManifestWriteConfig {
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
     disable_transaction_file: bool,            // default false
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
-    /// sets `manifest.next_row_id` to the provided value before activating the flag.
-    migration_next_row_id: Option<u64>, // default None
+    /// When `Some`, this commit turns stable row ids on or off; see
+    /// [`StableRowIdTransition`].
+    stable_row_id_transition: Option<StableRowIdTransition>, // default None
     /// This commit is a tagged fragment-reuse-index trim derived by
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
@@ -4216,7 +4330,7 @@ impl Default for ManifestWriteConfig {
             disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
-            migration_next_row_id: None,
+            stable_row_id_transition: None,
             tagged_frag_reuse_trim: false,
         }
     }
@@ -4258,7 +4372,7 @@ impl ManifestWriteConfig {
             use_legacy_format: self.use_legacy_format,
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
-            migration_next_row_id: self.migration_next_row_id,
+            stable_row_id_transition: self.stable_row_id_transition,
             spilled_row_lineage: Default::default(),
         }
     }

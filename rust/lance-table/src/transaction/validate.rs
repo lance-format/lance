@@ -270,8 +270,14 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
                 )));
             }
             // A previous-id fragment without row id metadata on a stable
-            // dataset is most likely a staged fragment listed too early.
-            if manifest.uses_stable_row_ids() && new_fragment.row_id_meta.is_none() {
+            // dataset is most likely a staged fragment listed too early. When
+            // no fragment carries any, this is instead a request to turn
+            // stable row ids off, which `build_manifest` refuses unless the
+            // commit is configured for it.
+            if manifest.uses_stable_row_ids()
+                && new_fragment.row_id_meta.is_none()
+                && new_fragments.iter().any(|f| f.row_id_meta.is_some())
+            {
                 return Err(Error::invalid_input(format!(
                     "Merge operation dropped row id metadata for existing fragment {}. \
                      New fragments (id 0) must be listed after the existing fragments; \

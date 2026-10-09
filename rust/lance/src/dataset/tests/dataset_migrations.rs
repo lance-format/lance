@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::InsertBuilder;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
-use crate::{Dataset, Result};
+use crate::{Dataset, Error, Result};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int64Type, UInt64Type};
+use itertools::Itertools;
+use lance_core::ROW_ID;
+use lance_core::utils::tempfile::TempStrDir;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::scalar::BuiltinIndexType;
 use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
@@ -1149,4 +1157,219 @@ fn test_migration_allocates_from_the_given_mark(
         .collect();
     let expected: Vec<Vec<u64>> = expected.into_iter().map(|r| r.collect()).collect();
     assert_eq!(sequences, expected);
+}
+
+async fn make_stable_row_id_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+async fn ids_by_row_id(dataset: &Dataset) -> HashMap<u64, i64> {
+    let batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .unwrap()
+        .as_primitive::<UInt64Type>();
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    row_ids
+        .values()
+        .iter()
+        .copied()
+        .zip(ids.values().iter().copied())
+        .collect()
+}
+
+#[rstest]
+// Compaction reserves its fragment ids in a commit of its own.
+#[case::fragment_0_live(false, 3)]
+#[case::fragment_0_deleted(true, 1)]
+#[tokio::test]
+async fn test_migrate_off_stable_row_ids(
+    #[case] delete_fragment_0: bool,
+    #[case] expected_commits: u64,
+) {
+    let mut dataset = make_stable_row_id_dataset("memory://migrate_off").await;
+    if delete_fragment_0 {
+        dataset.delete("id < 5").await.unwrap();
+    }
+    let held = ids_by_row_id(&dataset).await;
+    let version_before = dataset.manifest.version;
+
+    dataset.migrate_off_stable_row_ids().await.unwrap();
+
+    assert_eq!(dataset.manifest.version, version_before + expected_commits);
+    assert!(!dataset.manifest.uses_stable_row_ids());
+    assert_eq!(
+        (dataset.manifest.reader_feature_flags | dataset.manifest.writer_feature_flags)
+            & FLAG_STABLE_ROW_IDS,
+        0
+    );
+    assert_eq!(dataset.manifest.next_row_id, 10);
+    for fragment in dataset.manifest.fragments.iter() {
+        assert_ne!(fragment.id, 0, "fragment 0's addresses overlap issued ids");
+        assert!(fragment.row_id_meta.is_none());
+        assert!(fragment.created_at_version_meta.is_none());
+        assert!(fragment.last_updated_at_version_meta.is_none());
+    }
+    let now = ids_by_row_id(&dataset).await;
+    let mut ids: Vec<i64> = now.values().copied().collect();
+    ids.sort();
+    assert_eq!(ids, held.values().copied().sorted().collect::<Vec<_>>());
+    for (row_id, id) in &now {
+        if let Some(held_id) = held.get(row_id) {
+            assert_eq!(
+                held_id, id,
+                "held stable id {row_id} resolves to another row"
+            );
+        }
+    }
+    dataset.validate().await.unwrap();
+
+    // Migrating back allocates above every id issued before.
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+    let reissued = ids_by_row_id(&dataset).await;
+    assert!(reissued.keys().all(|row_id| *row_id >= 10), "{reissued:?}");
+}
+
+#[tokio::test]
+async fn test_migrate_off_stable_row_ids_noop_without_stable_row_ids() {
+    let mut dataset = make_simple_dataset("memory://migrate_off_noop", 5).await;
+    let version_before = dataset.manifest.version;
+    dataset.migrate_off_stable_row_ids().await.unwrap();
+    assert_eq!(dataset.manifest.version, version_before);
+}
+
+#[rstest]
+#[case::btree(IndexType::BTree, BuiltinIndexType::BTree, false)]
+#[case::zone_map(IndexType::ZoneMap, BuiltinIndexType::ZoneMap, true)]
+#[tokio::test]
+async fn test_migrate_off_stable_row_ids_index_domain(
+    #[case] index_type: IndexType,
+    #[case] builtin: BuiltinIndexType,
+    #[case] allowed: bool,
+) {
+    let mut dataset = make_stable_row_id_dataset("memory://migrate_off_indices").await;
+    dataset
+        .create_index(
+            &["id"],
+            index_type,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::for_builtin(builtin),
+            false,
+        )
+        .await
+        .unwrap();
+    let version_before = dataset.manifest.version;
+
+    let result = dataset.migrate_off_stable_row_ids().await;
+
+    if allowed {
+        result.unwrap();
+        let names: Vec<String> = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        assert_eq!(names, vec!["id_idx".to_string()]);
+        let matched = dataset
+            .scan()
+            .filter("id = 2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(matched, 1);
+    } else {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("id_idx"), "{error}");
+        // Refused before the compaction, so nothing was committed.
+        assert_eq!(dataset.manifest.version, version_before);
+        assert!(dataset.manifest.uses_stable_row_ids());
+    }
+}
+
+/// An index built from a snapshot taken before the row id mode changed holds
+/// the other kind of identifier, so it must not land after the change.
+#[rstest]
+#[case::off_btree(true, BuiltinIndexType::BTree, false)]
+#[case::off_zone_map(true, BuiltinIndexType::ZoneMap, true)]
+#[case::on_btree(false, BuiltinIndexType::BTree, false)]
+#[tokio::test]
+async fn test_index_build_racing_row_id_mode_change(
+    #[case] start_stable: bool,
+    #[case] builtin: BuiltinIndexType,
+    #[case] commits: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = if start_stable {
+        let mut dataset = make_stable_row_id_dataset(dir.as_str()).await;
+        // Without fragment 0 the disable is the Merge alone.
+        dataset.delete("id < 5").await.unwrap();
+        dataset
+    } else {
+        make_simple_dataset(dir.as_str(), 10).await
+    };
+    let mut other = Dataset::open(dir.as_str()).await.unwrap();
+    let index = other
+        .create_index_builder(
+            &["id"],
+            IndexType::Scalar,
+            &ScalarIndexParams::for_builtin(builtin),
+        )
+        .name("id_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    if start_stable {
+        dataset.migrate_off_stable_row_ids().await.unwrap();
+    } else {
+        dataset.migrate_to_stable_row_ids().await.unwrap();
+    }
+
+    let transaction = TransactionBuilder::new(
+        other.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![index],
+            removed_indices: vec![],
+        },
+    )
+    .build();
+    let result = other
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await;
+    if commits {
+        result.unwrap();
+    } else {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+    }
 }

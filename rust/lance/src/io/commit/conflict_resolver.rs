@@ -1259,6 +1259,22 @@ impl<'a> TransactionRebase<'a> {
                     if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
+                    // A merge that turned stable row ids on or off changed
+                    // what `_rowid` means, so an index storing row ids read
+                    // before it holds the wrong kind of identifier. A merge
+                    // must keep every fragment, so a read version with
+                    // fragments tells the mode apart; without any, the index
+                    // is empty.
+                    let uses_row_ids = |fragments: &[Fragment]| {
+                        fragments.iter().any(|f| f.row_id_meta.is_some())
+                    };
+                    if let Some(read_fragments) = self.read_fragments.as_ref()
+                        && !read_fragments.is_empty()
+                        && uses_row_ids(read_fragments) != uses_row_ids(fragments)
+                        && new_indices.iter().any(|idx| !idx.results_are_row_addrs())
+                    {
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
+                    }
                     // A merge that removed or retyped a field our index keys
                     // on (an `alter_columns` cast rewrites the column under a
                     // new field id) leaves the index describing a column that

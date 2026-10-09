@@ -770,10 +770,9 @@ pub struct ManifestBuildConfig {
     pub storage_format: Option<DataStorageFormat>,
     /// Skip writing a detached transaction file for this commit.
     pub disable_transaction_file: bool,
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
-    /// sets `manifest.next_row_id` to the provided value before activating the flag.
-    pub migration_next_row_id: Option<u64>,
+    /// When `Some`, this commit turns the stable row id feature on or off for
+    /// an existing dataset.
+    pub stable_row_id_transition: Option<StableRowIdTransition>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
@@ -781,6 +780,34 @@ pub struct ManifestBuildConfig {
     /// last-updated-at versions; the build cannot read a data file itself. Only
     /// consulted for fragments whose sequences are spilled.
     pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
+}
+
+impl ManifestBuildConfig {
+    /// The `next_row_id` supplied by a [`StableRowIdTransition::Activate`] commit.
+    pub fn activation_next_row_id(&self) -> Option<u64> {
+        match self.stable_row_id_transition {
+            Some(StableRowIdTransition::Activate { next_row_id }) => Some(next_row_id),
+            _ => None,
+        }
+    }
+
+    pub fn deactivates_stable_row_ids(&self) -> bool {
+        self.stable_row_id_transition == Some(StableRowIdTransition::Deactivate)
+    }
+}
+
+/// A change to an existing dataset's stable row id mode, made by a `Merge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StableRowIdTransition {
+    /// The commit of `migrate_to_stable_row_ids`. It bypasses the "cannot
+    /// enable stable row ids on existing dataset" guard and sets
+    /// `manifest.next_row_id` to `next_row_id` before activating the flag.
+    Activate { next_row_id: u64 },
+    /// The final commit of `migrate_off_stable_row_ids`. Its fragments carry no
+    /// row lineage, and the flag is cleared instead of inherited.
+    /// `manifest.next_row_id` is kept as a high-water mark so a later
+    /// activation never reissues an id.
+    Deactivate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

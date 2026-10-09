@@ -9,7 +9,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
-    format::{DataStorageFormat, is_detached_version},
+    format::{DataStorageFormat, StableRowIdTransition, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
@@ -52,8 +52,8 @@ pub struct CommitBuilder<'a> {
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    migration_next_row_id: Option<u64>,
+    /// When `Some`, this commit turns stable row ids on or off.
+    stable_row_id_transition: Option<StableRowIdTransition>,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
 }
@@ -79,7 +79,7 @@ impl<'a> CommitBuilder<'a> {
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
-            migration_next_row_id: None,
+            stable_row_id_transition: None,
             deep_clone_files_copied: false,
         }
     }
@@ -276,7 +276,16 @@ impl<'a> CommitBuilder<'a> {
     /// "cannot enable stable row IDs on an existing dataset" check so that the
     /// flag can be activated without creating the dataset from scratch.
     pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
-        self.migration_next_row_id = Some(next_row_id);
+        self.stable_row_id_transition = Some(StableRowIdTransition::Activate { next_row_id });
+        self
+    }
+
+    /// Configure this commit as the final step of
+    /// [`Dataset::migrate_off_stable_row_ids`]: a `Merge` whose fragments
+    /// carry no row lineage, which clears the stable row id feature flag
+    /// instead of inheriting it.
+    pub(crate) fn with_stable_row_id_deactivation(mut self) -> Self {
+        self.stable_row_id_transition = Some(StableRowIdTransition::Deactivate);
         self
     }
 
@@ -440,10 +449,8 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
-            // Migration activation always enables stable row IDs regardless of
-            // the current dataset state.
-            true
+        let use_stable_row_ids = if let Some(transition) = self.stable_row_id_transition {
+            matches!(transition, StableRowIdTransition::Activate { .. })
         } else if let Some(ds) = dest.dataset() {
             ds.manifest.uses_stable_row_ids()
         } else {
@@ -453,7 +460,7 @@ impl<'a> CommitBuilder<'a> {
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
-            migration_next_row_id: self.migration_next_row_id,
+            stable_row_id_transition: self.stable_row_id_transition,
             ..Default::default()
         };
 

@@ -42,7 +42,9 @@ mod validate;
 pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
-pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
+pub use manifest_build::{
+    RANGE_SEGMENTS_CONFIG_KEY, first_fragment_id_clear_of_row_ids, row_id_domain_index_names,
+};
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex,
     TaggedRewriteAssembly, UpdateMode, UpdatedFragmentOffsets, reordered_sources,
