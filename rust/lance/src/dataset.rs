@@ -4349,8 +4349,8 @@ pub(crate) async fn write_manifest_file(
             indices.as_deref().unwrap_or_default(),
         );
     }
-    // After the flag reset, which restores the stable-row-id flag a shallow clone
-    // masks. Here rather than in `build_manifest`, which restore and clone bypass.
+    // After the flag reset, so it judges the flags being published. Here rather
+    // than in `build_manifest`, which restore and clone bypass.
     crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
         manifest,
         indices.as_deref().unwrap_or_default(),

@@ -22,6 +22,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
@@ -389,6 +390,99 @@ async fn test_restore_preserves_row_id_high_water_mark() {
         ids.iter().filter(|id| **id >= mark).count(),
         10,
         "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EmptyTableCopy {
+    ShallowClone,
+    Branch,
+    DeepClone,
+}
+
+/// Once every row is deleted no fragment is left to show that the table uses
+/// stable row ids, so only the flag records it. A copy that lost the flag would
+/// hand out row addresses from the namespace the source has already issued ids
+/// from.
+#[rstest]
+#[case::shallow_clone(EmptyTableCopy::ShallowClone)]
+#[case::branch(EmptyTableCopy::Branch)]
+#[case::deep_clone(EmptyTableCopy::DeepClone)]
+#[tokio::test]
+async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTableCopy) {
+    let test_dir = TempStrDir::default();
+    let source_uri = format!("{}/source", test_dir.as_str());
+    let copy_uri = format!("{}/copy", test_dir.as_str());
+    let batch = u32_batch(0..20);
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source.delete("i >= 0").await.unwrap();
+    assert!(source.manifest.fragments.is_empty());
+    assert!(source.manifest.uses_stable_row_ids());
+    let next_row_id = source.manifest.next_row_id;
+    assert_eq!(next_row_id, 20);
+
+    let version = source.version().version;
+    match copy {
+        EmptyTableCopy::ShallowClone => {
+            source
+                .shallow_clone(&copy_uri, version, None)
+                .await
+                .unwrap();
+        }
+        EmptyTableCopy::Branch => {
+            source.create_branch("copy", version, None).await.unwrap();
+        }
+        EmptyTableCopy::DeepClone => {
+            source.deep_clone(&copy_uri, version, None).await.unwrap();
+        }
+    }
+    let open_copy = async || match copy {
+        EmptyTableCopy::Branch => Dataset::open(&source_uri)
+            .await
+            .unwrap()
+            .checkout_branch("copy")
+            .await
+            .unwrap(),
+        EmptyTableCopy::ShallowClone | EmptyTableCopy::DeepClone => {
+            Dataset::open(&copy_uri).await.unwrap()
+        }
+    };
+    let mut copied = open_copy().await;
+    assert!(copied.manifest.fragments.is_empty());
+    assert!(
+        copied.manifest.uses_stable_row_ids(),
+        "the copy lost stable row ids: reader flags {}",
+        copied.manifest.reader_feature_flags
+    );
+    assert_ne!(
+        copied.manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS,
+        0,
+        "the copy lost stable row ids: writer flags {}",
+        copied.manifest.writer_feature_flags
+    );
+    assert_eq!(copied.manifest.next_row_id, next_row_id);
+
+    let batch = u32_batch(20..25);
+    copied
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_row_ids(&open_copy().await).await,
+        (next_row_id..next_row_id + 5).collect::<Vec<_>>()
     );
 }
 
