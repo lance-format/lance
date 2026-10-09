@@ -18,13 +18,16 @@ import com.google.common.base.MoreObjects;
 /** Parameters for building a Rabit Quantizer (RQ) index stage. Defaults to 5 bits per dimension. */
 public class RQBuildParams {
   private final byte numBits;
+  private final boolean layered;
 
   private RQBuildParams(Builder builder) {
     this.numBits = builder.numBits;
+    this.layered = builder.layered;
   }
 
   public static class Builder {
     private byte numBits = 5;
+    private boolean layered = false;
 
     public Builder() {}
 
@@ -37,9 +40,19 @@ public class RQBuildParams {
       return this;
     }
 
+    /** Opt into prefix planes (5, 7 or 9 bits); requires a layered-capable reader. */
+    public Builder setLayered(boolean layered) {
+      this.layered = layered;
+      return this;
+    }
+
     public RQBuildParams build() {
       return new RQBuildParams(this);
     }
+  }
+
+  public boolean getLayered() {
+    return layered;
   }
 
   public byte getNumBits() {
