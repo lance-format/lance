@@ -126,7 +126,6 @@ impl ObjectStoreProvider for FileStoreProvider {
         let local_dir_operations = None;
 
         Ok(ObjectStore {
-            put_if_absent_supported: Default::default(),
             inner: Arc::new(inner),
             local_dir_operations,
             scheme: base_path.scheme().to_owned(),
@@ -194,7 +193,6 @@ mod tests {
         });
         ObjectStore {
             inner: Arc::new(inner),
-            put_if_absent_supported: Default::default(),
             local_dir_operations: Some(local_dir_operations),
             scheme: "file".to_owned(),
             block_size: DEFAULT_LOCAL_BLOCK_SIZE,

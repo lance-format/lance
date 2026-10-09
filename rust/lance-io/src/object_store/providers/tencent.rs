@@ -90,7 +90,6 @@ impl ObjectStoreProvider for TencentStoreProvider {
         }
 
         Ok(ObjectStore {
-            put_if_absent_supported: Default::default(),
             scheme: "cos".to_string(),
             inner: opendal_store,
             local_dir_operations: None,

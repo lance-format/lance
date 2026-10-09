@@ -220,7 +220,6 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             };
 
         Ok(ObjectStore {
-            put_if_absent_supported: Default::default(),
             scheme: "hf".to_string(),
             inner,
             local_dir_operations: None,

@@ -483,7 +483,6 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         let opendal_store = Arc::new(OpendalStore::new(operator));
 
         Ok(ObjectStore {
-            put_if_absent_supported: Default::default(),
             scheme: "goosefs".to_string(),
             inner: opendal_store,
             local_dir_operations: None,

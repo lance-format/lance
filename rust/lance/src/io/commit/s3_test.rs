@@ -258,18 +258,9 @@ async fn test_concurrent_writers() {
         .execute(transaction)
         .await
         .unwrap();
-    // First commit: transaction, manifest, and the probe's two PUTs and DELETE.
+    // Commit: 2 IOPs. 1 for transaction file, 1 for manifest file
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    assert_io_eq!(io_stats, write_iops, 5);
-    assert_eq!(
-        io_stats
-            .requests
-            .iter()
-            .filter(|request| request.path.as_ref().contains(".lance-conditional-put-"))
-            .map(|request| request.method)
-            .collect::<Vec<_>>(),
-        ["put_opts", "put_opts", "delete"]
-    );
+    assert_io_eq!(io_stats, write_iops, 2);
     let dataset = Arc::new(dataset);
     let old_version = dataset.manifest().version;
 
@@ -291,15 +282,6 @@ async fn test_concurrent_writers() {
         tasks.push(task);
     }
     try_join_all(tasks).await.unwrap();
-
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    assert!(
-        io_stats
-            .requests
-            .iter()
-            .all(|request| !request.path.as_ref().contains(".lance-conditional-put-")),
-        "concurrent commits must reuse the cached probe: {io_stats}"
-    );
 
     let mut dataset = dataset.as_ref().clone();
     dataset.checkout_latest().await.unwrap();
