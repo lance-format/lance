@@ -2557,10 +2557,83 @@ async fn test_defer_index_remap_zonemap_with_stable_row_ids() {
     assert_zonemap_answers_match_scan(&dataset).await;
     assert_zonemap_is_used(&dataset).await;
 }
+/// NGram stores row addresses too, so -- like the zone map above -- it
+/// coexists with the FRI a deferred compaction writes on a stable-row-id
+/// dataset, answering through it on load and after it is drained.
+#[tokio::test]
+async fn test_defer_index_remap_ngram_with_stable_row_ids() {
+    async fn assert_ngram_answers(dataset: &Dataset) {
+        let filter = "contains(cat, 'cat-1')";
+        for use_scalar_index in [false, true] {
+            let mut scanner = dataset.scan();
+            scanner.filter(filter).unwrap();
+            scanner.project(&["id"]).unwrap();
+            scanner.use_scalar_index(use_scalar_index);
+            let mut ids = scanner.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![1, 10, 11], "use_scalar_index={use_scalar_index}");
+        }
+        let mut scanner = dataset.scan();
+        scanner.filter(filter).unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("cat_idx(NGram)"),
+            "Expected NGram index query in plan: {plan}"
+        );
+    }
+
+    let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["cat"],
+            IndexType::NGram,
+            Some("cat_idx".into()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_ngram_answers(&dataset).await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 512,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some(),
+        "a deferred compaction over an address-domain index must write an FRI"
+    );
+    assert_ngram_answers(&dataset).await;
+
+    // Draining the FRI into the index must not change any answer.
+    let merged = dataset
+        .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("cat_idx", "cat", vec![merged])
+        .await
+        .unwrap();
+    assert_ngram_answers(&dataset).await;
+}
 /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
 /// dataset: the FRI is applied to every index on load, and a stable row id
 /// is numerically indistinguishable from an address into fragment 0, so it
-/// would silently rewrite the NGram index's valid row ids.
+/// would silently rewrite the Inverted index's valid row ids.
 ///
 /// Compaction refuses to create that pair, at the plan boundary and again at
 /// the commit boundary.
@@ -2570,9 +2643,9 @@ async fn test_defer_index_remap_rejected_while_row_id_index_present() {
     dataset
         .create_index(
             &["cat"],
-            IndexType::NGram,
+            IndexType::Inverted,
             Some("id_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             false,
         )
         .await
@@ -2626,9 +2699,9 @@ async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
     let err = dataset
         .create_index(
             &["cat"],
-            IndexType::NGram,
+            IndexType::Inverted,
             Some("id_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             false,
         )
         .await
@@ -2665,9 +2738,9 @@ async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
 /// at a snapshot taken before the other committed.
 ///
 /// The compaction plans and rewrites while no row-id-domain index exists, so
-/// its plan-time guard passes. An NGram index is then created and commits: no
+/// its plan-time guard passes. An Inverted index is then created and commits: no
 /// FRI exists yet, so its guard passes too. The compaction finally commits
-/// from the handle it planned on, which still cannot see the NGram index,
+/// from the handle it planned on, which still cannot see the Inverted index,
 /// and the rewrite rebases on top of the `CreateIndex`.
 ///
 /// The result is the combination both guards exist to prevent: stable row
@@ -2699,9 +2772,9 @@ async fn test_defer_index_remap_racing_row_id_index_creation() {
     concurrent
         .create_index(
             &["cat"],
-            IndexType::NGram,
+            IndexType::Inverted,
             Some("id_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
             false,
         )
         .await
@@ -2775,10 +2848,13 @@ async fn test_row_id_index_creation_racing_defer_index_remap() {
     // `create_index` sees no FRI at its own version, so its guard passes and
     // the transaction reaches the rebase.
     //
-    // NGram, not BTree/Bitmap: both now always create an address-domain
-    // segment on a stable-row-id dataset (safe alongside an FRI by
-    // construction), so neither can illustrate this race any longer.
-    // NGram still stores row ids directly here.
+    // NGram: now address-domain like BTree/Bitmap, so this no longer
+    // illustrates a row-id-domain index racing an FRI. It still conflicts
+    // here, though, through a narrower check: `conflict_resolver.rs`'s
+    // deferred-remap branch carries an extra, NGram-specific coverage check
+    // (mirroring `ngram_requires_rebuild` in append.rs) that retries whenever
+    // a new NGram index's coverage overlaps fragments a concurrent
+    // deferred-remap rewrite just consumed, regardless of domain.
     let err = concurrent
         .create_index(
             &["cat"],
@@ -2867,11 +2943,10 @@ async fn test_row_id_index_creation_racing_defer_index_remap_disjoint_coverage()
 #[rstest]
 #[tokio::test]
 async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
-    // NGram, not Bitmap: Bitmap now always creates an address-domain
-    // segment on a stable-row-id dataset (safe alongside an FRI by
-    // construction), so it can no longer illustrate this race. NGram
-    // still stores row ids directly here.
-    #[values(IndexType::NGram, IndexType::ZoneMap)] index_type: IndexType,
+    // Inverted: every other scalar index type now always creates an
+    // address-domain segment on a stable-row-id dataset (safe alongside an
+    // FRI by construction), so only Inverted still illustrates this race.
+    #[values(IndexType::Inverted, IndexType::ZoneMap)] index_type: IndexType,
     #[values(false, true)] index_commits_first: bool,
     #[values(false, true)] is_disjoint: bool,
     #[values(
@@ -2885,23 +2960,9 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
     let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
     // How the rebase sees the compaction does not matter: an index rebasing
     // past it finds the moves recorded in the latest manifest's reuse index.
-    //
-    // This is a real, NGram-specific rebase difference, not an artifact of
-    // swapping out Bitmap: `check_create_index_txn`'s deferred-remap branch
-    // in conflict_resolver.rs carries an extra check solely for a new
-    // NGram index (`ngram_coverage`, mirroring `ngram_requires_rebuild` in
-    // append.rs) -- unlike every other index type, it cannot simply keep
-    // covering a fragment a concurrent deferred-remap rewrite just
-    // consumed, so overlapping coverage (`is_disjoint = false`) always
-    // retries there, regardless of commit order. That is exactly the raw
-    // retryable conflict the `index_commits_first = true` order already
-    // handles below; `false` with overlapping coverage now needs the same
-    // one extra manual retry to reach the domain rejection.
-    let ngram_overlap_retries = index_type == IndexType::NGram && !is_disjoint;
     let expected = match (index_type, index_commits_first) {
-        (IndexType::NGram, true) => RaceOutcome::ConflictThenRejected,
-        (IndexType::NGram, false) if ngram_overlap_retries => RaceOutcome::ConflictThenRejected,
-        (IndexType::NGram, false) => RaceOutcome::Rejected,
+        (IndexType::Inverted, true) => RaceOutcome::ConflictThenRejected,
+        (IndexType::Inverted, false) => RaceOutcome::Rejected,
         _ => RaceOutcome::Committed,
     };
     let dir = TempStrDir::default();
@@ -2922,14 +2983,14 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
         excluded_fragment_ids: if is_disjoint { vec![2] } else { vec![] },
         ..Default::default()
     };
-    let params = ScalarIndexParams::for_builtin(if index_type == IndexType::NGram {
-        BuiltinIndexType::NGram
+    let params = ScalarIndexParams::for_builtin(if index_type == IndexType::Inverted {
+        BuiltinIndexType::Inverted
     } else {
         BuiltinIndexType::ZoneMap
     });
-    // NGram only applies to the text `cat` column; ZoneMap stays on the
+    // Inverted only applies to the text `cat` column; ZoneMap stays on the
     // numeric `i` column the filters below query.
-    let index_column = if index_type == IndexType::NGram {
+    let index_column = if index_type == IndexType::Inverted {
         "cat"
     } else {
         "i"

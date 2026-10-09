@@ -2880,9 +2880,11 @@ mod tests {
             .search(&json_query, &NoOpMetricsCollector)
             .await
             .unwrap();
+        // Row 2's address is fragment 1, offset 0 (`RowAddress::new_from_parts(1, 0)`),
+        // not the row index 2: `needs_row_addrs` test data is address-domain.
         assert_eq!(
             result,
-            SearchResult::at_most(RowAddrTreeMap::from_iter([2u64])),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([1u64 << 32])),
         );
     }
 }

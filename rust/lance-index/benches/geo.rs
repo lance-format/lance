@@ -13,7 +13,7 @@ use geoarrow_array::GeoArrowArray;
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_schema::Dimension;
 use lance_core::cache::LanceCache;
-use lance_core::{Error, ROW_ID};
+use lance_core::{Error, ROW_ADDR};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::BasicTrainer;
 use lance_index::scalar::rtree::{BoundingBox, RTreeIndex, RTreeIndexPlugin, RTreeTrainingRequest};
@@ -50,7 +50,7 @@ fn generate_geo_data(num_rects: usize, seed: u64) -> Vec<BoundingBox> {
 async fn create_record_batch(geo_data: &[BoundingBox]) -> RecordBatch {
     let rect_type = geoarrow_schema::RectType::new(Dimension::XY, Default::default());
     let bbox_field = rect_type.to_field("bbox", false);
-    let rowid_field = Field::new(ROW_ID, DataType::UInt64, false);
+    let rowid_field = Field::new(ROW_ADDR, DataType::UInt64, false);
 
     let mut rect_builder = RectBuilder::new(rect_type);
     for rect in geo_data {

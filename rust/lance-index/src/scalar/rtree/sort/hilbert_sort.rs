@@ -266,7 +266,7 @@ mod tests {
     use geoarrow_array::array::PointArray;
     use geoarrow_array::builder::PointBuilder;
     use geoarrow_schema::{Dimension, PointType};
-    use lance_core::ROW_ID;
+    use lance_core::ROW_ADDR;
     use lance_geo::bbox::total_bounds;
     use rand::Rng;
     use std::sync::Arc;
@@ -276,7 +276,7 @@ mod tests {
         let point_type = PointType::new(Dimension::XY, Default::default());
         let schema = Arc::new(Schema::new(vec![
             point_type.to_field("bbox", true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let num_points = 100;
