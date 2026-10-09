@@ -101,6 +101,19 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     ) -> Option<Arc<dyn EncodingsIo>> {
         None
     }
+
+    /// Returns a version of this I/O service that merges the ranges of a
+    /// request that are at most `gap` bytes apart into one read, in place of
+    /// its own coalescing rule. Every range still receives exactly its bytes,
+    /// so decoded data is unchanged; only the number and size of the reads
+    /// differ.
+    ///
+    /// Returns `None` if this implementation does not coalesce requests (e.g.
+    /// in-memory or test schedulers), in which case the caller should fall
+    /// back to using self.
+    fn with_coalesce_gap(&self, _gap: u64) -> Option<Arc<dyn EncodingsIo>> {
+        None
+    }
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer
