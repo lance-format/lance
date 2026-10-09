@@ -1458,6 +1458,7 @@ async fn replay_memtable_from_wal(
     let mut position = start_position;
 
     let mut active = make_memtable(base_generation, 0, None)?;
+    let mut last_replayed_generation: Option<u64> = None;
 
     loop {
         match tailer.read_entry(position).await? {
@@ -1479,9 +1480,26 @@ async fn replay_memtable_from_wal(
                         position, entry.writer_epoch, target.creator_epoch
                     )));
                 }
+                // An entry recorded under a generation replay starts past is
+                // already in that generation's SSTable. A manifest can point
+                // replay at it when the flush that wrote the SSTable recorded
+                // a covered position one entry short.
+                let already_flushed = entry
+                    .generation
+                    .is_some_and(|generation| generation < base_generation);
+                if let (Some(generation), Some(last)) = (entry.generation, last_replayed_generation)
+                    && !already_flushed
+                    && generation < last
+                {
+                    return Err(Error::io(format!(
+                        "WAL entry at position {} has generation {} below the generation {} \
+                         replayed before it",
+                        position, generation, last
+                    )));
+                }
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
-                if !entry.batches.is_empty() {
+                if !entry.batches.is_empty() && !already_flushed {
                     // Start a new memtable where the entry's recorded generation
                     // changes. Entries with no generation use the size rule below.
                     if let Some(generation) = entry.generation
@@ -1622,6 +1640,9 @@ async fn replay_memtable_from_wal(
                     }
 
                     active.insert_batches_only(batches).await?;
+                    if entry.generation.is_some() {
+                        last_replayed_generation = entry.generation;
+                    }
                 }
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
@@ -4801,22 +4822,19 @@ impl MemTableFlushHandler {
             // strict ordering of WAL entries. If the freeze didn't trigger a
             // flush (no pending WAL range), there's no completion cell and the
             // memtable was already WAL-flushed by an earlier put.
-            let wal_flushed_position =
-                if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
-                    match completion_reader.await_value().await {
-                        Some(Ok(flush_result)) => flush_result.entry.map(|e| e.position),
-                        // Rebuild the typed error so a fence/poison reason
-                        // propagates to the memtable-flush caller too.
-                        Some(Err(e)) => return Err(e.into_error()),
-                        None => {
-                            return Err(Error::io(
-                                "WAL flush handler exited before reporting completion",
-                            ));
-                        }
+            if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
+                match completion_reader.await_value().await {
+                    Some(Ok(_)) => {}
+                    // Rebuild the typed error so a fence/poison reason
+                    // propagates to the memtable-flush caller too.
+                    Some(Err(e)) => return Err(e.into_error()),
+                    None => {
+                        return Err(Error::io(
+                            "WAL flush handler exited before reporting completion",
+                        ));
                     }
-                } else {
-                    None
-                };
+                }
+            }
 
             // Step 1b: Wait until index application covers this whole memtable.
             //
@@ -4841,14 +4859,17 @@ impl MemTableFlushHandler {
             }
 
             // Step 2: Flush the memtable to Lance storage. The covered WAL
-            // entry position is either the one we just appended (per-memtable,
-            // from the completion cell — authoritative even when concurrent
-            // flushes have raced ahead in `state.last_flushed_wal_entry_position`)
-            // or, when no flush was triggered at freeze time, the memtable's
-            // frozen-at marker captured at freeze. Stamping this into the
+            // entry position is the last entry holding this memtable's
+            // batches, recorded on its store by the append itself. The
+            // freeze-time marker can lag it: an append can land before the
+            // writer state records its position, and a freeze in that gap
+            // triggers no append of its own. The marker is only the fallback
+            // for a memtable nothing was appended for. Stamping this into the
             // manifest is what lets replay-on-reopen skip entries this
             // generation covers.
-            let covered_wal_entry_position = wal_flushed_position
+            let covered_wal_entry_position = memtable
+                .batch_store()
+                .last_wal_entry_position()
                 .or_else(|| memtable.frozen_at_wal_entry_position())
                 .unwrap_or(0);
             // Rebuild secondary indexes on the SSTable so later
@@ -9958,6 +9979,251 @@ mod tests {
         );
         assert_eq!(stats.batch_count, 0);
         writer_b.close().await.unwrap();
+    }
+
+    const COVERED_TEST_ROW_CAP: usize = 16;
+
+    /// Config for the covered-position tests: appends happen only when a test
+    /// drives them, and a memtable holds at most `COVERED_TEST_ROW_CAP` rows.
+    fn covered_position_test_config(shard_id: Uuid) -> ShardWriterConfig {
+        ShardWriterConfig {
+            durable_write: false,
+            max_wal_flush_interval: None,
+            max_memtable_rows: COVERED_TEST_ROW_CAP,
+            ..memtable_config_with_pk(shard_id)
+        }
+    }
+
+    /// Append the active memtable's un-appended batches to the WAL without
+    /// going through the flush handler, so the writer state does not learn the
+    /// new entry position: the window between an append and its bookkeeping.
+    async fn append_active_without_state_update(writer: &ShardWriter) {
+        let batch_store = writer
+            .memtable_state_lock()
+            .unwrap()
+            .read()
+            .await
+            .memtable
+            .batch_store();
+        let end = batch_store.len();
+        let result = writer
+            .wal_flusher
+            .flush(&WalFlushSource::BatchStore { batch_store }, end)
+            .await
+            .unwrap();
+        assert!(result.entry.is_some(), "the append must write an entry");
+    }
+
+    /// A memtable frozen after its batches were appended, but before the
+    /// writer state recorded that append, must still record the append's WAL
+    /// position as covered. Otherwise reopen replays that entry into the next
+    /// generation: its rows come back twice, and with the next generation
+    /// near its row cap the open fails outright.
+    #[tokio::test]
+    async fn test_flush_covers_append_not_yet_recorded_in_writer_state() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            covered_position_test_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 4)])
+            .await
+            .unwrap();
+        append_active_without_state_update(&writer_a).await;
+        // The freeze finds nothing left to append, so it triggers no append
+        // whose position it could take.
+        writer_a.force_seal_active().await.unwrap();
+        writer_a.wait_for_flush_drain().await.unwrap();
+
+        let manifest = writer_a.manifest().await.unwrap().unwrap();
+        assert_eq!(
+            manifest.replay_after_wal_entry_position, 1,
+            "the flushed generation's rows are in WAL entry 1"
+        );
+
+        // Fill the next generation to just under the cap, then crash.
+        writer_a
+            .put(vec![create_test_batch(&schema, 100, 14)])
+            .await
+            .unwrap();
+        append_active_without_state_update(&writer_a).await;
+        writer_a.abort().await.unwrap();
+        drop(writer_a);
+
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            covered_position_test_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .expect("a shard reopened with the config it was written under must open");
+
+        assert_eq!(
+            writer_b.memtable_stats().await.unwrap().row_count,
+            14,
+            "replay must restore only the unflushed generation"
+        );
+        assert_eq!(
+            read_sstable_ids_via_lsm(&writer_b, schema, &base_uri, shard_id, None).await,
+            (0..4).collect::<Vec<_>>()
+        );
+        writer_b.close().await.unwrap();
+    }
+
+    /// A manifest whose replay cursor points one entry too early, at an entry
+    /// of a generation already flushed, must still open: replay skips that
+    /// entry instead of loading it into the next generation's memtable.
+    #[tokio::test]
+    async fn test_replay_skips_entry_of_already_flushed_generation() {
+        use crate::dataset::mem_wal::ShardManifestStore;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig {
+            max_memtable_rows: COVERED_TEST_ROW_CAP,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 0, 4)])
+                .await
+                .unwrap();
+            writer_a.force_seal_active().await.unwrap();
+            writer_a.wait_for_flush_drain().await.unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 100, 14)])
+                .await
+                .unwrap();
+            writer_a.abort().await.unwrap();
+        }
+
+        // Point the replay cursor back at the flushed generation's entry.
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let current = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(current.replay_after_wal_entry_position, 1);
+        let (epoch, _) = manifest_store
+            .claim_epoch(current.shard_spec_id)
+            .await
+            .unwrap();
+        manifest_store
+            .commit_update(epoch, |current| ShardManifest {
+                version: current.next_version(),
+                replay_after_wal_entry_position: 0,
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .expect("an entry of an already flushed generation must not fail the open");
+
+        assert_eq!(
+            writer_b.memtable_stats().await.unwrap().row_count,
+            14,
+            "the flushed generation's entry must not be replayed again"
+        );
+        assert_eq!(
+            read_sstable_ids_via_lsm(&writer_b, schema, &base_uri, shard_id, None).await,
+            (0..4).collect::<Vec<_>>()
+        );
+        writer_b.close().await.unwrap();
+    }
+
+    /// Past the generation replay starts from, WAL generations only move
+    /// forward. An entry going backwards is corruption, not data to load into
+    /// whichever memtable is active.
+    #[tokio::test]
+    async fn test_replay_rejects_backwards_generation() {
+        use crate::dataset::mem_wal::ShardManifestStore;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        let config = covered_position_test_config(shard_id);
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let manifest = writer_a.manifest().await.unwrap().unwrap();
+        let base_generation = manifest.current_generation;
+        let epoch = writer_a.epoch;
+        writer_a.abort().await.unwrap();
+        drop(writer_a);
+
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let appender = WalAppender::with_claimed_epoch(
+            store.clone(),
+            base_path.clone(),
+            shard_id,
+            manifest_store,
+            epoch,
+            0,
+            WalRetryConfig::default(),
+        );
+        for (start_id, generation) in [(0, base_generation + 1), (10, base_generation)] {
+            appender
+                .append_for_target(
+                    vec![create_test_batch(&schema, start_id, 2)],
+                    None,
+                    Some(generation),
+                )
+                .await
+                .unwrap();
+        }
+
+        let err = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .map(|_| ())
+            .expect_err("a WAL generation going backwards must fail the open");
+        assert!(
+            err.to_string().contains("below the generation"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Replay aborts the open with a clear fence error if it encounters a
