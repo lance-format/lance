@@ -14,7 +14,7 @@ async fn test_posting_cache_conflict_across_partitions() {
 
     // Create first partition with one token and posting list length 1
     let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder1.tokens.add("test".to_owned());
+    builder1.tokens.get_or_add("test");
     builder1.posting_lists.push(PostingListBuilder::new(false));
     builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder1.docs.append(100, 1); // row_id=100, num_tokens=1
@@ -22,7 +22,7 @@ async fn test_posting_cache_conflict_across_partitions() {
 
     // Create second partition with one token and posting list length 4
     let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
-    builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
+    builder2.tokens.get_or_add("test"); // Use same token to test cache prefix fix
     builder2.posting_lists.push(PostingListBuilder::new(false));
     builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
     builder2.posting_lists[0].add(1, PositionRecorder::Count(1));
@@ -138,8 +138,8 @@ async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -272,7 +272,7 @@ async fn test_packed_prewarm_groups_do_not_retain_the_full_chunk() {
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token_id in 0..4u32 {
-        builder.tokens.add(format!("t{token_id}"));
+        builder.tokens.get_or_add(&format!("t{token_id}"));
         let mut posting = PostingListBuilder::new(false);
         posting.add(token_id, PositionRecorder::Count(1));
         builder.posting_lists.push(posting);
@@ -426,7 +426,7 @@ async fn test_prewarm_streams_in_chunks_preserves_content(
     let mut expected: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut doc_id = 0u64;
     for t in 0..num_tokens {
-        builder.tokens.add(format!("tok_{t:03}"));
+        builder.tokens.get_or_add(&format!("tok_{t:03}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
             posting_tail_codec,
@@ -562,7 +562,7 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
     let mut expected: Vec<Vec<(u32, u32, Vec<u32>)>> = Vec::new();
     let mut doc_id = 0u64;
     for t in 0..num_tokens {
-        builder.tokens.add(format!("tok_{t:03}"));
+        builder.tokens.get_or_add(&format!("tok_{t:03}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec);
         let mut docs = Vec::new();
         for _ in 0..DOCS_PER_TOKEN {
@@ -693,7 +693,7 @@ async fn test_strict_modern_prewarm_fails_when_index_cache_cannot_hold_all_parti
             format_version,
             params.posting_block_size(),
         );
-        builder.tokens.add(format!("token_{partition_id}"));
+        builder.tokens.get_or_add(&format!("token_{partition_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
             format_version.posting_tail_codec(),

@@ -21,9 +21,10 @@ public class RemovalStats {
   private final long transactionFilesRemoved;
   private final long indexFilesRemoved;
   private final long deletionFilesRemoved;
+  private final long failedDeletes;
 
   public RemovalStats(long bytesRemoved, long oldVersions) {
-    this(bytesRemoved, oldVersions, 0L, 0L, 0L, 0L);
+    this(bytesRemoved, oldVersions, 0L, 0L, 0L, 0L, 0L);
   }
 
   public RemovalStats(
@@ -33,12 +34,31 @@ public class RemovalStats {
       long transactionFilesRemoved,
       long indexFilesRemoved,
       long deletionFilesRemoved) {
+    this(
+        bytesRemoved,
+        oldVersions,
+        dataFilesRemoved,
+        transactionFilesRemoved,
+        indexFilesRemoved,
+        deletionFilesRemoved,
+        0L);
+  }
+
+  public RemovalStats(
+      long bytesRemoved,
+      long oldVersions,
+      long dataFilesRemoved,
+      long transactionFilesRemoved,
+      long indexFilesRemoved,
+      long deletionFilesRemoved,
+      long failedDeletes) {
     this.bytesRemoved = bytesRemoved;
     this.oldVersions = oldVersions;
     this.dataFilesRemoved = dataFilesRemoved;
     this.transactionFilesRemoved = transactionFilesRemoved;
     this.indexFilesRemoved = indexFilesRemoved;
     this.deletionFilesRemoved = deletionFilesRemoved;
+    this.failedDeletes = failedDeletes;
   }
 
   public long getBytesRemoved() {
@@ -63,5 +83,17 @@ public class RemovalStats {
 
   public long getDeletionFilesRemoved() {
     return deletionFilesRemoved;
+  }
+
+  /**
+   * Number of objects cleanup tried and failed to delete.
+   *
+   * <p>Cleanup is best effort: a failed delete is counted here and the sweep continues, so a
+   * non-zero value means the cleanup completed but did not remove everything it identified. The
+   * files it could not remove are still unreferenced and a later cleanup will retry them. Callers
+   * that treat cleanup as all-or-nothing should check this rather than rely on the call throwing.
+   */
+  public long getFailedDeletes() {
+    return failedDeletes;
   }
 }

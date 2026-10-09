@@ -62,6 +62,15 @@ struct FsstPageDecoder {
 }
 
 impl PrimitivePageDecoder for FsstPageDecoder {
+    fn variable_width_bytes(&self, rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        // FSST decompression expands by at most 8x, so the inner (compressed)
+        // byte count times 8 is a safe upper bound on the decoded size.
+        Ok(self
+            .inner_decoder
+            .variable_width_bytes(rows_to_skip, num_rows)?
+            .map(|compressed_bytes| compressed_bytes.saturating_mul(8)))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let compressed_data = self.inner_decoder.decode(rows_to_skip, num_rows)?;
         let (string_data, nulls) = match compressed_data {

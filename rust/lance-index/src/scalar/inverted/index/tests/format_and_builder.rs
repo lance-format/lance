@@ -3,6 +3,243 @@
 
 use super::super::posting_prewarm::ChunkPostingMode;
 use super::*;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+
+#[derive(Debug)]
+struct ControlledPostingReads {
+    started: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
+    gates: Vec<tokio::sync::Semaphore>,
+    completed: std::sync::Mutex<Vec<usize>>,
+    changed: tokio::sync::Notify,
+}
+
+impl ControlledPostingReads {
+    fn new(token_count: usize) -> Self {
+        Self {
+            started: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+            gates: (0..token_count)
+                .map(|_| tokio::sync::Semaphore::new(0))
+                .collect(),
+            completed: std::sync::Mutex::new(Vec::with_capacity(token_count)),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_for_started(&self, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.started.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for controlled posting reads to start");
+    }
+
+    async fn release_and_wait(&self, token_id: usize, expected_completed: usize) {
+        self.gates[token_id].add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if self
+                    .completed
+                    .lock()
+                    .expect("controlled posting completion lock poisoned")
+                    .len()
+                    >= expected_completed
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for controlled posting read to complete");
+    }
+}
+
+struct ControlledPostingReader {
+    inner: Arc<dyn IndexReader>,
+    control: Arc<ControlledPostingReads>,
+    fail_token: Option<usize>,
+}
+
+#[async_trait]
+impl IndexReader for ControlledPostingReader {
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+        self.inner.read_record_batch(n, batch_size).await
+    }
+
+    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+        self.inner.read_global_buffer(index).await
+    }
+
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let is_singleton_position_read = range.end == range.start + 1
+            && projection.is_some_and(|columns| {
+                columns.contains(&POSTING_COL) && columns.contains(&POSITION_COL)
+            });
+        if !is_singleton_position_read {
+            return self.inner.read_range(range, projection).await;
+        }
+
+        let token_id = range.start;
+        self.control
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let active = self
+            .control
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.control
+            .max_active
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        self.control.changed.notify_waiters();
+
+        let permit = self.control.gates[token_id]
+            .acquire()
+            .await
+            .map_err(|err| Error::internal(format!("controlled posting gate closed: {err}")))?;
+        permit.forget();
+        let result = if self.fail_token == Some(token_id) {
+            Err(Error::io(format!(
+                "injected singleton posting read failure for token {token_id}"
+            )))
+        } else {
+            self.inner.read_range(range, projection).await
+        };
+
+        self.control
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.control
+            .completed
+            .lock()
+            .expect("controlled posting completion lock poisoned")
+            .push(token_id);
+        self.control.changed.notify_waiters();
+        result
+    }
+
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        self.inner.num_batches(batch_size).await
+    }
+
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        self.inner.schema()
+    }
+
+    fn file_size_bytes(&self) -> Option<u64> {
+        self.inner.file_size_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct ControlledMergeStore {
+    inner: Arc<dyn IndexStore>,
+    posting_file: String,
+    io_parallelism: usize,
+    control: Arc<ControlledPostingReads>,
+    fail_token: Option<usize>,
+}
+
+impl DeepSizeOf for ControlledMergeStore {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+#[async_trait]
+impl IndexStore for ControlledMergeStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn clone_arc(&self) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            posting_file: self.posting_file.clone(),
+            io_parallelism: self.io_parallelism,
+            control: self.control.clone(),
+            fail_token: self.fail_token,
+        })
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.io_parallelism
+    }
+
+    async fn new_index_file(
+        &self,
+        name: &str,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+        self.inner.new_index_file(name, schema).await
+    }
+
+    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+        let reader = self.inner.open_index_file(name).await?;
+        if name == self.posting_file {
+            Ok(Arc::new(ControlledPostingReader {
+                inner: reader,
+                control: self.control.clone(),
+                fail_token: self.fail_token,
+            }))
+        } else {
+            Ok(reader)
+        }
+    }
+
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_priority(io_priority),
+            posting_file: self.posting_file.clone(),
+            io_parallelism: self.io_parallelism,
+            control: self.control.clone(),
+            fail_token: self.fail_token,
+        })
+    }
+
+    async fn copy_index_file(
+        &self,
+        name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.copy_index_file(name, dest_store).await
+    }
+
+    async fn rename_index_file(
+        &self,
+        name: &str,
+        new_name: &str,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.rename_index_file(name, new_name).await
+    }
+
+    async fn delete_index_file(&self, name: &str) -> Result<()> {
+        self.inner.delete_index_file(name).await
+    }
+
+    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+        self.inner.list_files_with_sizes().await
+    }
+}
 
 #[test]
 fn address_read_concurrency_respects_payload_budget() {
@@ -222,6 +459,67 @@ fn test_cached_num_tokens_uses_supplied_total_and_full_stays_owned() {
 }
 
 #[test]
+fn test_combined_fields_append_invalidates_row_ids_ascending_cache() {
+    let row_ids = UInt64Array::from(vec![10, 20, 30]);
+    let num_tokens = UInt32Array::from(vec![1, 1, 1]);
+    let mut docs = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+
+    // Memoize the ascending answer for the current (sorted) row_ids.
+    assert!(docs.row_ids_strictly_ascending());
+
+    // Appending a smaller row_id breaks the invariant; the cached answer
+    // must be dropped so the recomputed value reflects the mutation.
+    docs.append(5, 1);
+    assert!(!docs.row_ids_strictly_ascending());
+
+    // The element-document append is the same mutation and owes the same
+    // invalidation. A set built by `with_coordinate_rank` is shared by its
+    // clones, so a stale answer would outlive the builder that produced it.
+    let mut docs = DocSet::with_coordinate_rank(1);
+    for (doc_id, row_id) in [10u64, 20, 30].into_iter().enumerate() {
+        assert_eq!(
+            docs.append_with_doc_index(row_id, 1, &[doc_id as u32])
+                .unwrap(),
+            doc_id as u32
+        );
+    }
+    assert!(docs.row_ids_strictly_ascending());
+
+    docs.append_with_doc_index(5, 1, &[0]).unwrap();
+    assert!(!docs.row_ids_strictly_ascending());
+}
+
+#[test]
+fn test_doc_length_by_row_id_matches_scan() {
+    // Compressed layout: row ids are stored in doc-id order and resolved
+    // through `inv`. The targeted lookup must equal an `iter()` scan that
+    // sums the matching row's lengths, and return 0 for an absent row.
+    let row_ids = UInt64Array::from(vec![30, 10, 20]);
+    let num_tokens = UInt32Array::from(vec![8, 3, 5]);
+    let docs = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+    for target in [10u64, 20, 30, 99] {
+        let expected: u64 = docs
+            .iter()
+            .filter(|(id, _)| **id == target)
+            .map(|(_, nt)| *nt as u64)
+            .sum();
+        assert_eq!(docs.doc_length_by_row_id(target), expected, "row {target}");
+    }
+    assert_eq!(docs.doc_length_by_row_id(10), 3);
+    assert_eq!(docs.doc_length_by_row_id(99), 0);
+
+    // Legacy layout: row id == doc id, row ids are sorted, and a row indexed
+    // as several list documents forms a contiguous run whose lengths sum.
+    let legacy_row_ids = UInt64Array::from(vec![10, 10, 20]);
+    let legacy_num_tokens = UInt32Array::from(vec![3, 4, 5]);
+    let legacy = DocSet::from_columns(&legacy_row_ids, &legacy_num_tokens, true, None).unwrap();
+    assert!(legacy.inv.is_empty());
+    assert_eq!(legacy.doc_length_by_row_id(10), 7);
+    assert_eq!(legacy.doc_length_by_row_id(20), 5);
+    assert_eq!(legacy.doc_length_by_row_id(99), 0);
+}
+
+#[test]
 fn test_posting_builder_writes_impacts_for_supported_block_sizes() {
     for block_size in [128, 256] {
         let format_version = default_fts_format_version_for_block_size(block_size).unwrap();
@@ -293,7 +591,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
         format_version,
         block_size,
     );
-    builder.tokens.add("needle".to_owned());
+    builder.tokens.get_or_add("needle");
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),
@@ -350,6 +648,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
 
 #[rstest::rstest]
 #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE, 514, 7)]
+#[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE, 8, 4)]
 #[case::v3(InvertedListFormatVersion::V3, 256, 6, 4)]
 #[tokio::test]
 async fn test_into_builder_chunks_postings_by_list_children(
@@ -378,7 +677,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
         block_size,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             true,
             format_version.posting_tail_codec(),
@@ -424,7 +723,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
             .all(|posting| posting.len() == NUM_DOCS && posting.has_positions())
     );
 
-    // Rewriting the chunk-built builder verifies that V3 positions survived
+    // Rewriting the chunk-built builder verifies that positions survived
     // conversion and that impact data can be regenerated from every posting.
     let dest_dir = TempObjDir::default();
     let dest_store = Arc::new(LanceIndexStore::new(
@@ -465,6 +764,173 @@ async fn test_into_builder_chunks_postings_by_list_children(
 }
 
 #[tokio::test]
+async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
+    const NUM_TOKENS: usize = 10;
+    const NUM_DOCS: usize = 3;
+    const EXPECTED_CONCURRENCY: usize = 8;
+
+    let source_dir = TempObjDir::default();
+    let source_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        source_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let mut source = InnerBuilder::new_with_format_version_and_block_size(
+        0,
+        true,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+        LEGACY_BLOCK_SIZE,
+    );
+    for token_id in 0..NUM_TOKENS {
+        source.tokens.get_or_add(&format!("token_{token_id}"));
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            true,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+            LEGACY_BLOCK_SIZE,
+        );
+        for doc_id in 0..NUM_DOCS {
+            posting.add(
+                doc_id as u32,
+                PositionRecorder::Position(vec![token_id as u32, token_id as u32 + 100].into()),
+            );
+        }
+        source.posting_lists.push(posting);
+    }
+    for doc_id in 0..NUM_DOCS {
+        source
+            .docs
+            .append(1_000 + doc_id as u64, (NUM_TOKENS * 2) as u32);
+    }
+    source.write(source_store.as_ref()).await.unwrap();
+
+    let control = Arc::new(ControlledPostingReads::new(NUM_TOKENS));
+    let controlled_store: Arc<dyn IndexStore> = Arc::new(ControlledMergeStore {
+        inner: source_store.clone(),
+        posting_file: posting_file_path(0),
+        io_parallelism: 64,
+        control: control.clone(),
+        fail_token: None,
+    });
+    let source_partition = InvertedPartition::load(
+        controlled_store,
+        0,
+        None,
+        &LanceCache::no_cache(),
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+
+    let merge_task = tokio::spawn(async move {
+        source_partition
+            .into_builder_with_chunk_limits(NUM_TOKENS, u64::MAX)
+            .await
+    });
+    control.wait_for_started(EXPECTED_CONCURRENCY).await;
+    assert_eq!(
+        control.active.load(std::sync::atomic::Ordering::SeqCst),
+        EXPECTED_CONCURRENCY
+    );
+    assert_eq!(
+        control.max_active.load(std::sync::atomic::Ordering::SeqCst),
+        EXPECTED_CONCURRENCY,
+        "store I/O parallelism must be capped"
+    );
+
+    let mut completed_count = 0;
+    for token_id in (1..EXPECTED_CONCURRENCY).rev() {
+        completed_count += 1;
+        control.release_and_wait(token_id, completed_count).await;
+    }
+    assert_eq!(
+        control.started.load(std::sync::atomic::Ordering::SeqCst),
+        EXPECTED_CONCURRENCY,
+        "completed chunks behind token 0 must remain inside the bounded ordered window"
+    );
+    completed_count += 1;
+    control.release_and_wait(0, completed_count).await;
+    control.wait_for_started(NUM_TOKENS).await;
+    for token_id in (EXPECTED_CONCURRENCY..NUM_TOKENS).rev() {
+        completed_count += 1;
+        control.release_and_wait(token_id, completed_count).await;
+    }
+
+    let (merged, chunk_count) = tokio::time::timeout(std::time::Duration::from_secs(5), merge_task)
+        .await
+        .expect("timed out waiting for controlled V1 position merge")
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk_count, NUM_TOKENS);
+    assert!(
+        control.max_active.load(std::sync::atomic::Ordering::SeqCst) <= EXPECTED_CONCURRENCY,
+        "singleton posting reads exceeded the bounded concurrency cap"
+    );
+    assert_eq!(
+        *control
+            .completed
+            .lock()
+            .expect("controlled posting completion lock poisoned"),
+        vec![7, 6, 5, 4, 3, 2, 1, 0, 9, 8],
+        "test reads must complete out of token order"
+    );
+    assert_eq!(merged.posting_lists.len(), NUM_TOKENS);
+    for (token_id, posting) in merged.posting_lists.iter().enumerate() {
+        let entries = posting.iter().collect::<Vec<_>>();
+        assert_eq!(entries.len(), NUM_DOCS);
+        for (expected_doc_id, (doc_id, frequency, positions)) in entries.into_iter().enumerate() {
+            assert_eq!(frequency, 2);
+            assert_eq!(doc_id as usize, expected_doc_id);
+            assert_eq!(
+                positions.unwrap(),
+                vec![token_id as u32, token_id as u32 + 100],
+                "posting positions must remain aligned with token order"
+            );
+        }
+    }
+
+    let error_control = Arc::new(ControlledPostingReads::new(NUM_TOKENS));
+    let error_store: Arc<dyn IndexStore> = Arc::new(ControlledMergeStore {
+        inner: source_store,
+        posting_file: posting_file_path(0),
+        io_parallelism: 64,
+        control: error_control.clone(),
+        fail_token: Some(1),
+    });
+    let error_partition = InvertedPartition::load(
+        error_store,
+        0,
+        None,
+        &LanceCache::no_cache(),
+        TokenSetFormat::default(),
+    )
+    .await
+    .unwrap();
+    let error_task = tokio::spawn(async move {
+        error_partition
+            .into_builder_with_chunk_limits(NUM_TOKENS, u64::MAX)
+            .await
+    });
+    error_control.wait_for_started(EXPECTED_CONCURRENCY).await;
+    for (completed_count, token_id) in (0..EXPECTED_CONCURRENCY).rev().enumerate() {
+        error_control
+            .release_and_wait(token_id, completed_count + 1)
+            .await;
+    }
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), error_task)
+        .await
+        .expect("timed out waiting for injected V1 position merge failure")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, Error::IO { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("injected singleton posting read failure for token 1")
+    );
+}
+
+#[tokio::test]
 async fn test_chunk_posting_mode_controls_buffer_sharing() {
     const NUM_TOKENS: usize = 2;
     const NUM_DOCS: usize = 257;
@@ -483,7 +949,7 @@ async fn test_chunk_posting_mode_controls_buffer_sharing() {
         MAX_POSTING_BLOCK_SIZE,
     );
     for token_id in 0..NUM_TOKENS {
-        source.tokens.add(format!("token_{token_id}"));
+        source.tokens.get_or_add(&format!("token_{token_id}"));
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
             PostingTailCodec::VarintDelta,
@@ -595,34 +1061,114 @@ async fn test_posting_builder_remap() {
     );
 }
 
-#[test]
-fn test_posting_builder_size_tracking_matches_structure() {
-    fn tracked_memory_size(builder: &PostingListBuilder) -> u64 {
-        let encoded_blocks_size = builder
-            .encoded_blocks
-            .iter()
-            .map(|encoded_blocks| std::mem::size_of::<EncodedBlocks>() + encoded_blocks.size())
-            .sum::<usize>();
-        let encoded_positions_size = builder
-            .encoded_position_blocks
-            .as_ref()
-            .map(|positions| std::mem::size_of::<EncodedPositionBlocks>() + positions.size())
-            .unwrap_or(0usize);
-        (encoded_blocks_size
-            + builder.tail_entries.capacity() * std::mem::size_of::<RawDocInfo>()
-            + builder.tail_positions.size()
-            + encoded_positions_size) as u64
+/// Doc id gaps and frequencies that exercise one- to five-byte varints in the
+/// builder's tail encoding.
+fn varied_postings(len: usize) -> (Vec<u32>, Vec<u32>) {
+    let gaps = [1_u32, 7, 130, 20_000, 3_000_000];
+    let frequencies = [1_u32, 2, 127, 128, 70_000];
+    let mut doc_id = 5u32;
+    let mut doc_ids = Vec::with_capacity(len);
+    for index in 0..len {
+        doc_ids.push(doc_id);
+        doc_id += if index == 1 {
+            300_000_000
+        } else {
+            gaps[index % gaps.len()]
+        };
     }
+    let freqs = (0..len)
+        .map(|index| frequencies[index % frequencies.len()])
+        .collect();
+    (doc_ids, freqs)
+}
 
-    let mut builder = PostingListBuilder::new(true);
-    for doc_id in 0..(BLOCK_SIZE + 5) as u32 {
-        builder.add(
-            doc_id,
-            PositionRecorder::Position(smallvec::smallvec![1, 3, 5]),
+#[rstest::rstest]
+#[case::legacy_fixed32_tail(PostingTailCodec::Fixed32, LEGACY_BLOCK_SIZE)]
+#[case::varint_tail_128(PostingTailCodec::VarintDelta, LEGACY_BLOCK_SIZE)]
+#[case::varint_tail_256(PostingTailCodec::VarintDelta, 256)]
+fn test_posting_builder_matches_reference_encoding(
+    #[case] posting_tail_codec: PostingTailCodec,
+    #[case] block_size: usize,
+) {
+    for len in [
+        1,
+        3,
+        block_size - 1,
+        block_size,
+        block_size + 1,
+        3 * block_size + 5,
+    ] {
+        let (doc_ids, frequencies) = varied_postings(len);
+        let mut builder = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            posting_tail_codec,
+            block_size,
         );
-    }
+        for (&doc_id, &frequency) in doc_ids.iter().zip(&frequencies) {
+            builder.add(doc_id, PositionRecorder::Count(frequency));
+        }
+        assert_eq!(builder.len(), doc_ids.len(), "len {len}");
+        let expected_entries = doc_ids
+            .iter()
+            .zip(&frequencies)
+            .map(|(&doc_id, &frequency)| (doc_id, frequency, None))
+            .collect::<Vec<_>>();
+        assert_eq!(builder.iter().collect::<Vec<_>>(), expected_entries);
 
-    assert_eq!(builder.size(), tracked_memory_size(&builder));
+        let block_max_scores = (0..doc_ids.len().div_ceil(block_size))
+            .map(|block| block as f32 + 0.5)
+            .collect::<Vec<_>>();
+        let expected = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            block_max_scores.iter().copied(),
+            posting_tail_codec,
+            block_size,
+        )
+        .unwrap();
+        let batch = builder.to_batch(block_max_scores).unwrap();
+        let actual = batch[POSTING_COL].as_list::<i32>().value(0);
+        assert_eq!(actual.as_binary::<i64>(), &expected, "len {len}");
+    }
+}
+
+#[test]
+fn test_posting_builder_short_lists_stay_inline() {
+    let mut builder = PostingListBuilder::new_with_block_size(false, 256);
+    // Most tokens of a corpus occur in only a few documents; they must not
+    // pay for a heap allocation.
+    for doc_id in [9_000, 90_000, 900_000] {
+        builder.add(doc_id, PositionRecorder::Count(1));
+    }
+    assert_eq!(builder.size(), 0);
+
+    for doc_id in 900_001..900_100 {
+        builder.add(doc_id, PositionRecorder::Count(3));
+    }
+    assert!(builder.size() as usize >= builder.tail.len());
+    assert_eq!(builder.len(), 102);
+}
+
+#[rstest::rstest]
+#[case::added(false)]
+#[case::streamed(true)]
+fn test_posting_builder_short_positional_lists_skip_block_storage(#[case] streamed: bool) {
+    let mut builder = PostingListBuilder::new_with_block_size(true, 256);
+    if streamed {
+        builder.add_occurrence(9_000, 4).unwrap();
+        builder.finish_open_doc(9_000).unwrap();
+    } else {
+        builder.add(9_000, PositionRecorder::Position(smallvec::smallvec![4]));
+    }
+    // Every token of a positional build needs position state from its first
+    // posting, but only lists that fill a block need block storage. One
+    // posting costs the position state box plus its first position buffer.
+    assert!(builder.size() <= 96, "{}", builder.size());
+    assert_eq!(
+        builder.iter().collect::<Vec<_>>(),
+        vec![(9_000_u32, 1_u32, Some(vec![4_u32]))]
+    );
 }
 
 #[test]
@@ -633,23 +1179,9 @@ fn test_posting_builder_flush_releases_tail_position_capacity() {
         builder.add(doc_id, PositionRecorder::Position(positions.clone()));
     }
 
-    assert_eq!(builder.tail_positions.size(), 0);
-    assert_eq!(builder.size(), {
-        let encoded_blocks_size = builder
-            .encoded_blocks
-            .iter()
-            .map(|encoded_blocks| std::mem::size_of::<EncodedBlocks>() + encoded_blocks.size())
-            .sum::<usize>();
-        let encoded_positions_size = builder
-            .encoded_position_blocks
-            .as_ref()
-            .map(|positions| std::mem::size_of::<EncodedPositionBlocks>() + positions.size())
-            .unwrap_or(0usize);
-        (encoded_blocks_size
-            + builder.tail_entries.capacity() * std::mem::size_of::<RawDocInfo>()
-            + builder.tail_positions.size()
-            + encoded_positions_size) as u64
-    });
+    let overflow = builder.overflow.as_deref().unwrap();
+    assert_eq!(overflow.tail_positions.size(), 0);
+    assert!(builder.tail.is_empty());
 }
 
 #[test]
@@ -670,6 +1202,30 @@ fn test_posting_builder_streamed_positions_roundtrip() {
             (0_u32, 3_u32, Some(vec![1_u32, 4_u32, 9_u32])),
             (2_u32, 1_u32, Some(vec![3_u32])),
         ]
+    );
+
+    // Streaming across block boundaries must build the same posting list as
+    // adding whole documents.
+    let mut streamed = PostingListBuilder::new(true);
+    let mut added = PostingListBuilder::new(true);
+    let mut expected = Vec::new();
+    for doc_id in (0..(2 * BLOCK_SIZE + 3) as u32).map(|doc| doc * 3 + 1) {
+        let positions = (0..doc_id % 4 + 1)
+            .map(|index| index * 5 + doc_id % 7)
+            .collect::<Vec<_>>();
+        for &position in &positions {
+            streamed.add_occurrence(doc_id, position).unwrap();
+        }
+        streamed.finish_open_doc(doc_id).unwrap();
+        added.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+        expected.push((doc_id, positions.len() as u32, Some(positions)));
+    }
+    assert_eq!(streamed.len(), expected.len());
+    assert_eq!(streamed.iter().collect::<Vec<_>>(), expected);
+    let block_max_scores = vec![1.0; expected.len().div_ceil(BLOCK_SIZE)];
+    assert_eq!(
+        streamed.to_batch(block_max_scores.clone()).unwrap(),
+        added.to_batch(block_max_scores).unwrap()
     );
 }
 
@@ -1047,8 +1603,8 @@ async fn test_remap_to_empty_posting_list() {
     // 0: lance
     // 1: lake lake
     // 2: lake lake lake
-    builder.tokens.add("lance".to_owned());
-    builder.tokens.add("lake".to_owned());
+    builder.tokens.get_or_add("lance");
+    builder.tokens.get_or_add("lake");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -1113,4 +1669,125 @@ fn test_docset_remap_preserves_element_coordinates() {
     assert_eq!(docs.row_id(1), 20);
     assert_eq!(docs.doc_index(0), vec![0]);
     assert_eq!(docs.doc_index(1), vec![3]);
+}
+
+/// `contains_each` has to agree with a full decode for probes in every block,
+/// before the first doc and past the last, for both tail codecs and both block
+/// sizes, and for a list that is only a tail or has no tail at all.
+#[rstest::rstest]
+#[case::fixed32_128(PostingTailCodec::Fixed32, 128, 2 * 128 + 128 / 3)]
+#[case::varint_256(PostingTailCodec::VarintDelta, 256, 2 * 256 + 256 / 3)]
+#[case::tail_only(PostingTailCodec::VarintDelta, 128, 128 / 3)]
+#[case::no_tail(PostingTailCodec::Fixed32, 128, 2 * 128)]
+fn test_compressed_posting_contains_each_matches_full_decode(
+    #[case] tail_codec: PostingTailCodec,
+    #[case] block_size: usize,
+    #[case] length: usize,
+) {
+    // Every third doc id from 5 on.
+    let doc_ids: Vec<u32> = (0..length as u32).map(|i| 5 + 3 * i).collect();
+    let freqs = vec![1u32; length];
+    let blocks =
+        crate::scalar::inverted::encoding::compress_posting_list_with_tail_codec_and_block_size(
+            length,
+            doc_ids.iter(),
+            freqs.iter(),
+            std::iter::repeat(0.0f32),
+            tail_codec,
+            block_size,
+        )
+        .unwrap();
+    let posting = CompressedPostingList::new(
+        blocks,
+        1.0,
+        length as u32,
+        tail_codec,
+        block_size,
+        None,
+        None,
+    );
+
+    let last = *doc_ids.last().unwrap();
+    let mut probes: Vec<u32> = vec![0, 4, 5, 6, 8, last, last + 1, last + 3];
+    for block_start in (0..length).step_by(block_size) {
+        let first = doc_ids[block_start];
+        probes.extend([first - 1, first, first + 3]);
+    }
+    probes.sort_unstable();
+    probes.dedup();
+    let expected: Vec<bool> = probes
+        .iter()
+        .map(|probe| doc_ids.binary_search(probe).is_ok())
+        .collect();
+    assert!(expected.iter().any(|found| *found) && expected.iter().any(|found| !*found));
+    assert_eq!(posting.contains_each(&probes), expected);
+    assert!(posting.contains_each(&[]).is_empty());
+}
+
+fn dictionary_test_tokens() -> Vec<String> {
+    let mut tokens = ["b", "a", "ab", "abc", "a b", "z", "é", "日本語"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    tokens.extend((0..1000).map(|index| format!("tok{index:04}")));
+    tokens
+}
+
+#[rstest::rstest]
+#[case::arrow(TokenSetFormat::Arrow)]
+#[case::fst(TokenSetFormat::Fst)]
+fn test_token_dictionary_writes_same_batch_as_token_set(#[case] format: TokenSetFormat) {
+    let mut expected = TokenSet::default();
+    let mut dictionary = TokenDictionary::default();
+    for token in dictionary_test_tokens() {
+        let token_id = dictionary.get_or_add(&token);
+        assert_eq!(dictionary.get_or_add(&token), token_id);
+        assert_eq!(expected.add(token), token_id);
+    }
+    assert_eq!(dictionary.len(), expected.len());
+    assert_eq!(
+        dictionary.to_batch(format).unwrap(),
+        expected.to_batch(format).unwrap()
+    );
+}
+
+#[rstest::rstest]
+#[case::arrow(TokenSetFormat::Arrow)]
+#[case::fst(TokenSetFormat::Fst)]
+#[tokio::test]
+async fn test_token_dictionary_keeps_loaded_token_ids(#[case] format: TokenSetFormat) {
+    let tmpdir = TempObjDir::default();
+    let store = LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    );
+    let mut written = TokenSet::default();
+    for token in dictionary_test_tokens() {
+        written.add(token);
+    }
+    let batch = written.clone().to_batch(format).unwrap();
+    let mut writer = store
+        .new_index_file("tokens.lance", batch.schema())
+        .await
+        .unwrap();
+    writer.write_record_batch(batch).await.unwrap();
+    writer.finish().await.unwrap();
+    let reader = store.open_index_file("tokens.lance").await.unwrap();
+    let loaded = TokenSet::load(reader, format).await.unwrap();
+
+    let mut dictionary = TokenDictionary::try_from_token_set(loaded).unwrap();
+    assert_eq!(dictionary.len(), written.len());
+    for token in dictionary_test_tokens() {
+        assert_eq!(dictionary.get(&token), written.get(&token), "{token}");
+    }
+    assert_eq!(dictionary.get_or_add("new token"), written.len() as u32);
+}
+
+#[test]
+fn test_token_dictionary_rejects_sparse_token_ids() {
+    let mut tokens = TokenSet::default();
+    tokens.tokens = TokenMap::HashMap(HashMap::from([("a".to_owned(), 0), ("b".to_owned(), 5)]));
+    let err = TokenDictionary::try_from_token_set(tokens).unwrap_err();
+    assert!(err.to_string().contains("distinct ids below 2"), "{err}");
 }

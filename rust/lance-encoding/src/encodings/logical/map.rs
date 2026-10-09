@@ -112,10 +112,13 @@ impl StructuralFieldScheduler for StructuralMapScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        // Like lists, the child (entries) column is scheduled with the same
+        // top-level row ranges, so forward them unchanged.
+        self.child.initialize(requested_ranges, filter, context)
     }
 }
 

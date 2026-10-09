@@ -36,6 +36,7 @@ use datafusion::prelude::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::scanner::exec::compute_pk_hash;
 use crate::dataset::mem_wal::write::BatchStore;
 
@@ -43,7 +44,7 @@ use crate::dataset::mem_wal::write::BatchStore;
 /// that satisfy the (optional) predicate. See the module doc.
 pub struct MemTableDedupScanExec {
     batch_store: Arc<BatchStore>,
-    visible_count: usize,
+    readable_count: usize,
     /// Column indices to project (into the source schema).
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
@@ -61,7 +62,7 @@ pub struct MemTableDedupScanExec {
 impl Debug for MemTableDedupScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemTableDedupScanExec")
-            .field("visible_count", &self.visible_count)
+            .field("readable_count", &self.readable_count)
             .field("projection", &self.projection)
             .field("pk_indices", &self.pk_indices)
             .field("with_row_address", &self.with_row_address)
@@ -75,7 +76,7 @@ impl MemTableDedupScanExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
-        visible_count: usize,
+        readable_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         pk_indices: Vec<usize>,
@@ -93,7 +94,7 @@ impl MemTableDedupScanExec {
 
         Self {
             batch_store,
-            visible_count,
+            readable_count,
             projection,
             output_schema,
             pk_indices,
@@ -180,7 +181,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
         // back-to-front below.
         let mut batches = self
             .batch_store
-            .visible_batches_with_offsets(self.visible_count);
+            .visible_batches_with_offsets(self.readable_count);
         batches.reverse();
 
         let projection = self.projection.clone();
@@ -196,6 +197,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
         let mut out: Vec<DataFusionResult<RecordBatch>> = Vec::with_capacity(batches.len());
 
         for (batch, row_offset) in batches {
+            let batch = scan_record_batch(&batch)?;
             let n = batch.num_rows();
             if n == 0 {
                 continue;
@@ -247,8 +249,21 @@ impl ExecutionPlan for MemTableDedupScanExec {
                 vec![]
             };
 
+            let emitted_schema = emitted.schema();
             let mut columns: Vec<Arc<dyn Array>> = if let Some(ref indices) = projection {
-                indices.iter().map(|&i| emitted.column(i).clone()).collect()
+                match take_projected_columns(
+                    emitted.columns(),
+                    emitted_schema.fields(),
+                    indices,
+                    schema.as_ref(),
+                    emitted.num_rows(),
+                ) {
+                    Ok(cols) => cols,
+                    Err(e) => {
+                        out.push(Err(e));
+                        continue;
+                    }
+                }
             } else {
                 emitted.columns().to_vec()
             };
@@ -276,7 +291,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 
@@ -339,7 +354,7 @@ mod tests {
     /// Run the exec and collect (id -> (value, rowaddr)).
     async fn run(
         store: Arc<BatchStore>,
-        visible_count: usize,
+        readable_count: usize,
         filter: Option<Expr>,
     ) -> HashMap<i32, (Option<i32>, u64)> {
         let filter_predicate = filter.map(|expr| {
@@ -350,7 +365,7 @@ mod tests {
         let filter_expr = None;
         let exec = MemTableDedupScanExec::new(
             store,
-            visible_count,
+            readable_count,
             None,
             output_schema(),
             vec![0],

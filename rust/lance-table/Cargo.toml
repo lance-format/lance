@@ -75,5 +75,13 @@ harness = false
 name = "manifest_intern"
 harness = false
 
+[[bench]]
+name = "system_columns"
+harness = false
+
+[[bench]]
+name = "version_columns"
+harness = false
+
 [lints]
 workspace = true

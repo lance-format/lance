@@ -237,6 +237,12 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
 /// Reconstruct `VectorIndexParams` from a stored `VectorIndexDetails` proto.
 ///
 /// Returns `None` for legacy indices (empty details) or if the proto is malformed.
+/// The rows-per-partition target the index was created with, if it was recorded.
+pub fn target_partition_size_from_details(details: &prost_types::Any) -> Option<usize> {
+    let details = details.to_msg::<VectorIndexDetails>().ok()?;
+    (details.target_partition_size > 0).then_some(details.target_partition_size as usize)
+}
+
 /// Runtime hints are applied on top of the reconstructed spec.
 // TODO: wire into a general `Dataset::rebuild_index` method so users can
 // regenerate an index from its stored details (e.g. after file corruption).

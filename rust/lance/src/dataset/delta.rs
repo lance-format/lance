@@ -783,6 +783,19 @@ fn segment_ids<'a>(
             let (base, start) = (range.start, next_value.max(range.start));
             Box::new((start..range.end).filter(move |&v| bitmap.get((v - base) as usize)))
         }
+        U64Segment::Ranges { range, runs } => {
+            let (base, start) = (range.start, next_value.max(range.start));
+            // Walk the present ranges, clipping the one the resume point falls in.
+            Box::new(
+                runs.present_ranges()
+                    .filter_map(move |present| {
+                        let first = (base + present.start as u64).max(start);
+                        let end = base + present.end as u64;
+                        (first < end).then_some(first..end)
+                    })
+                    .flatten(),
+            )
+        }
         U64Segment::SortedArray(array) | U64Segment::Array(array) => {
             Box::new((consumed..array.len()).filter_map(move |i| array.get(i)))
         }
@@ -2072,10 +2085,10 @@ mod tests {
         use lance_datafusion::exec::LanceExecutionOptions;
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone()]));
-        // ~16 MB of candidates against a 2 MB pool: the sorts must spill,
+        // ~8 MB of candidates against a 2 MB pool: the sorts must spill,
         // and the pool still clears DataFusion's fixed merge reservations.
-        let candidate_ids: Vec<u64> = (0..2_000_000).collect();
-        let live_ids: Vec<u64> = (0..2_000_000).filter(|id| id % 3 == 0).collect();
+        let candidate_ids: Vec<u64> = (0..1_000_000).collect();
+        let live_ids: Vec<u64> = (0..1_000_000).filter(|id| id % 3 == 0).collect();
         let expected = candidate_ids.len() - live_ids.len();
         let as_stream = |ids: Vec<u64>| -> datafusion::physical_plan::SendableRecordBatchStream {
             let batches: Vec<_> = ids
@@ -2098,7 +2111,7 @@ mod tests {
             as_stream(live_ids),
             LanceExecutionOptions {
                 use_spilling: true,
-                mem_pool_size: Some(4 * 1024 * 1024),
+                mem_pool_size: Some(2 * 1024 * 1024),
                 ..Default::default()
             },
         )

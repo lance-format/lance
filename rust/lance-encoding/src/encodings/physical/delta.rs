@@ -6,7 +6,7 @@
 use super::{checked_fixed_values, try_vec_with_capacity};
 use crate::{
     buffer::LanceBuffer,
-    compression::{BlockCompressor, BlockDecompressor},
+    compression::{BlockCompressor, BlockDecompressor, validate_delta_child_encoding},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
 };
@@ -46,6 +46,7 @@ impl BlockCompressor for DeltaEncoder {
         }
         let deltas = encode_deltas(data, self.base)?;
         let (payload, child_encoding) = self.child.compress(DataBlock::FixedWidth(deltas))?;
+        validate_delta_child_encoding(&child_encoding, self.bits_per_value)?;
         Ok((
             payload,
             ProtobufUtils21::delta(self.bits_per_value, self.base, child_encoding),
@@ -236,8 +237,8 @@ fn reconstruct_deltas(
 
 #[cfg(test)]
 mod tests {
-    use crate::compression::DecompressionStrategy;
-    use crate::encodings::physical::{range::RangeEncoder, value::ValueEncoder};
+    use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
+    use crate::encodings::physical::{range::RangeEncoder, rle::RleEncoder, value::ValueEncoder};
 
     use super::*;
 
@@ -307,5 +308,40 @@ mod tests {
         };
         let error = encode_deltas(input, 2).unwrap_err();
         assert!(error.to_string().contains("decreases"));
+    }
+
+    #[test]
+    fn delta_rejects_unsupported_rle_child_before_emitting_encoding() {
+        let input = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(vec![10_u32, 10, 12, 12, 15]),
+            num_values: 5,
+            block_info: BlockInfo::default(),
+        });
+        let encoder = DeltaEncoder::new(32, 10, Box::new(RleEncoder::new()));
+
+        let error = encoder.compress(input).unwrap_err();
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("does not support a rle child"));
+    }
+
+    #[test]
+    fn range_and_delta_return_errors_in_miniblock_positions() {
+        let range = ProtobufUtils21::range(32, 0, 1);
+        let delta = ProtobufUtils21::delta(32, 0, range.clone());
+        let strategy = DefaultDecompressionStrategy::default();
+
+        for encoding in [&range, &delta] {
+            let Err(error) = strategy.create_miniblock_decompressor(encoding, &strategy) else {
+                panic!("expected block-only encoding to be rejected in a mini-block position");
+            };
+            assert!(matches!(&error, Error::NotSupported { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("only supported in block positions")
+            );
+        }
     }
 }
