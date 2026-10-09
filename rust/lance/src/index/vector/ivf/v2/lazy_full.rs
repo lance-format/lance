@@ -27,7 +27,12 @@
 //!   waiting would not save reads (`LANCE_RQ_LAZY_EAGER_BEFORE_FULL`): then
 //!   it is gathered at once with `T` = +inf, selecting every accepted row as
 //!   the eager load does;
-//! - the query task scores ready probes on one heap and publishes progress.
+//! - the query task scores ready probes on one heap and publishes progress
+//!   once each probe is scored whole. With `LANCE_RQ_LAZY_PARTIAL_PUBLISH=on`,
+//!   a lazy probe whose survivors first fill the heap publishes the heap's
+//!   top as soon as they do, partway through the probe; that threshold is
+//!   looser than the probe's final one, so the gathers it releases read more
+//!   rows.
 //!
 //! Every staging and gather step runs as its own task, so it makes progress
 //! whether or not the producer is polling the buffer that holds it; see
@@ -121,6 +126,48 @@ struct LazyProgress {
     full: bool,
     /// The heap's top when `full`, otherwise +inf.
     threshold: f32,
+    /// Whether `threshold` was published partway through scoring the probe
+    /// after the `scored` ones, when its survivors first filled the heap:
+    /// the `k`-th best of the rows scored so far. Cleared once that probe is
+    /// scored whole; only set while `full`.
+    partial: bool,
+}
+
+impl LazyProgress {
+    /// No probe scored and the heap empty.
+    fn start() -> Self {
+        Self {
+            scored: 0,
+            full: false,
+            threshold: f32::INFINITY,
+            partial: false,
+        }
+    }
+
+    /// The `scored`-th probe was scored whole; `top` is the heap's top if
+    /// the heap holds `k` rows.
+    fn probe_scored(&mut self, scored: usize, top: Option<f32>) {
+        self.scored = scored;
+        self.partial = false;
+        if let Some(top) = top {
+            self.full = true;
+            self.threshold = top;
+        }
+    }
+
+    /// The survivors of the probe being scored first filled the heap, whose
+    /// top is then `threshold`.
+    fn filled_mid_probe(&mut self, threshold: f32) {
+        self.full = true;
+        self.threshold = threshold;
+        self.partial = true;
+    }
+
+    /// Whether a gather issued at this progress selects its survivors
+    /// against a threshold published partway through a probe.
+    fn partial_threshold(&self) -> bool {
+        self.full && self.partial
+    }
 }
 
 /// A probe after its sign stage.
@@ -332,15 +379,20 @@ struct LazyScorer {
     scratch_pool: Arc<QueryScratchPool>,
     metrics: Arc<dyn MetricsCollector>,
     progress: Arc<watch::Sender<LazyProgress>>,
+    /// Whether a lazy probe whose survivors fill the heap publishes the
+    /// threshold then, before it is scored whole; see
+    /// `LANCE_RQ_LAZY_PARTIAL_PUBLISH`.
+    partial_publish: bool,
     /// When the scan started, which its chain timings count from.
     started: Instant,
 }
 
 impl LazyScorer {
     /// Publish scoring progress to the gathers. The scan's first publish
-    /// comes from its first probe, once scored or once its rows fill the
-    /// heap, and is the earliest a gather waiting for the threshold or its
-    /// turn can be released; it is timed before any gather can see it.
+    /// comes from its first probe, once scored or, with partial publishes,
+    /// once its rows fill the heap, and is the earliest a gather waiting for
+    /// the threshold or its turn can be released; it is timed before any
+    /// gather can see it.
     fn publish(&self, update: impl FnOnce(&mut LazyProgress)) {
         self.progress.send_modify(|progress| {
             if progress.scored == 0 && !progress.full {
@@ -535,11 +587,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             pre_filter.is_empty() && query.upper_bound.is_none(),
             &config,
         );
-        let (progress_tx, progress_rx) = watch::channel(LazyProgress {
-            scored: 0,
-            full: false,
-            threshold: f32::INFINITY,
-        });
+        let (progress_tx, progress_rx) = watch::channel(LazyProgress::start());
         let scorer = LazyScorer {
             key: query.key.clone(),
             heap_capacity,
@@ -554,6 +602,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             scratch_pool: self.scratch_pool.clone(),
             metrics: metrics.clone(),
             progress: Arc::new(progress_tx),
+            partial_publish: config.partial_publish,
             started,
         };
         let far = match config.active_far_window(self.origin_latency) {
@@ -1038,6 +1087,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             &mut survivors,
             &mut stage1,
         );
+        if issue.partial_threshold() {
+            stats.partial_threshold_issues.incr(rank);
+            stats
+                .partial_threshold_rows
+                .add(rank, survivors.len() as u64);
+        }
         stats.stage1_candidates.add(rank, stage1.candidates as u64);
         stats
             .stage1_pruned_ub
@@ -1136,7 +1191,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
     }
 
     /// Score `batch` in probe order into `heap`, publishing progress after
-    /// every whole probe, matching the native scan threshold boundary.
+    /// every probe, and the threshold as soon as the heap fills when partial
+    /// publishes are on.
     fn score_lazy_batch(
         scorer: &LazyScorer,
         batch: Vec<LazyProbe<S, Q>>,
@@ -1165,13 +1221,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 .then(|| heap.peek().map(|node| node.dist.0))
                 .flatten();
             let scored = *scored;
-            scorer.publish(|progress| {
-                progress.scored = scored;
-                if let Some(top) = top {
-                    progress.full = true;
-                    progress.threshold = top;
-                }
-            });
+            scorer.publish(|progress| progress.probe_scored(scored, top));
             Ok(())
         });
         stats.stage2_cpu_ns.add_elapsed(scoring);
@@ -1277,7 +1327,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 &rows,
                 stage1,
                 heap,
-                |_threshold| {},
+                |threshold| {
+                    if scorer.partial_publish {
+                        stats.mid_probe_full_publishes.incr(rank);
+                        scorer.publish(|progress| progress.filled_mid_probe(threshold));
+                    }
+                },
             ))
         })?;
         stats.stage2_exact.add(rank, counters.exact as u64);
@@ -1466,9 +1521,9 @@ mod tests {
             permits: LazyFarPermits::try_new(1).unwrap(),
         };
         let (progress_tx, mut progress) = watch::channel(LazyProgress {
-            scored: 0,
             full: true,
             threshold: 1.0,
+            ..LazyProgress::start()
         });
         let held = far.permits.try_acquire().unwrap();
 
@@ -1497,6 +1552,41 @@ mod tests {
             assert_eq!(far.permits.in_flight(), 1);
         }
         assert_eq!(far.permits.in_flight(), 0);
+    }
+
+    /// A gather parked on the threshold is released by a mid-probe publish
+    /// and, issued then, takes that threshold as partial. Once the probe is
+    /// scored whole the published threshold is its final one, no longer
+    /// partial, and the heap stays full whatever later probes publish.
+    #[tokio::test]
+    async fn mid_probe_threshold_stays_partial_until_its_probe_is_scored() {
+        let start = LazyProgress::start();
+        assert!(!start.full && !start.partial_threshold());
+        assert_eq!(start.threshold, f32::INFINITY);
+        let (progress_tx, mut progress) = watch::channel(start);
+        // Probe 0 is scored without filling the heap.
+        progress_tx.send_modify(|progress| progress.probe_scored(1, None));
+        assert!(!progress.borrow().full);
+
+        {
+            let released = |progress: &LazyProgress| progress.full || progress.scored >= 3;
+            let waiting = progress.wait_for(released);
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            progress_tx.send_modify(|progress| progress.filled_mid_probe(2.0));
+            let issue = *waiting.await.unwrap();
+            assert_eq!((issue.scored, issue.full, issue.threshold), (1, true, 2.0));
+            assert!(issue.partial_threshold());
+        }
+
+        progress_tx.send_modify(|progress| progress.probe_scored(2, Some(1.5)));
+        let issue = *progress.borrow();
+        assert_eq!((issue.scored, issue.full, issue.threshold), (2, true, 1.5));
+        assert!(!issue.partial_threshold());
+        progress_tx.send_modify(|progress| progress.probe_scored(3, Some(1.0)));
+        let issue = *progress.borrow();
+        assert_eq!((issue.scored, issue.full, issue.threshold), (3, true, 1.0));
+        assert!(!issue.partial_threshold());
     }
 
     #[test]

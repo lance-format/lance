@@ -21,8 +21,10 @@ use crate::{
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::vector::bq::RQRowLayout;
 use lance_index::{
-    IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex,
+    IndexParams, IndexType, ivf_rq_index_version, registry::plugin_name_from_details_url,
+    scalar::CreatedIndex,
 };
 use lance_index::{
     metrics::NoOpMetricsCollector,
@@ -64,6 +66,22 @@ fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexP
 
 fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
     Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
+}
+
+/// The index version a vector index built with `params` is committed with:
+/// an IVF_RQ index's follows the row layout it is written in, as does any
+/// index whose RaBitQ storage is in plane rows (see [`ivf_rq_index_version`]);
+/// any other index's is its type's.
+pub fn vector_index_version(params: &VectorIndexParams) -> u32 {
+    match params.stages.last() {
+        Some(StageParams::RQ(rq))
+            if params.index_type() == IndexType::IvfRq
+                || rq.row_layout == RQRowLayout::PlaneRows =>
+        {
+            ivf_rq_index_version(rq.row_layout) as u32
+        }
+        _ => params.index_type().version() as u32,
+    }
 }
 
 pub struct CreateIndexBuilder<'a> {
@@ -482,7 +500,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     .ok_or_else(|| {
                         Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
-                let index_version = vec_params.index_type().version() as u32;
+                let index_version = vector_index_version(vec_params);
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
@@ -3704,8 +3722,26 @@ mod tests {
         );
     }
 
+    /// An IVF_RQ index is committed with the version of the row layout it
+    /// is written in: the column layout keeps version 2, which readers
+    /// without plane-row support accept, and plane rows take version 3, the
+    /// highest this build reads. A version above that is left out of the
+    /// usable indexes.
+    #[rstest]
+    #[case::columns(RQRowLayout::Columns, false)]
+    #[case::plane_rows_native(RQRowLayout::PlaneRows, false)]
+    #[case::plane_rows_layered(RQRowLayout::PlaneRows, true)]
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version() {
+    async fn test_create_index_ivf_rq_version_follows_row_layout(
+        #[case] row_layout: RQRowLayout,
+        #[case] layered: bool,
+    ) {
+        use crate::dataset::transaction::Transaction;
+        use lance_index::pb::VectorIndexDetails;
+        use lance_index::pb::vector_index_details::{Compression, rabit_quantization};
+        use lance_index::vector::bq::RQBuildParams;
+        use lance_index::{IVF_RQ_COLUMNS_INDEX_VERSION, IVF_RQ_INDEX_VERSION};
+
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -3721,18 +3757,79 @@ mod tests {
             );
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
+        let num_bits = if layered { 7 } else { 1 };
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            RQBuildParams::new(num_bits)
+                .with_layered(layered)
+                .with_row_layout(row_layout),
+        );
+        let expected = match row_layout {
+            RQRowLayout::Columns => IVF_RQ_COLUMNS_INDEX_VERSION as i32,
+            RQRowLayout::PlaneRows => IVF_RQ_INDEX_VERSION as i32,
+        };
+        assert_eq!(vector_index_version(&params) as i32, expected);
+        assert_eq!(ivf_rq_index_version(row_layout), expected);
 
         let committed = dataset
             .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
             .await
             .unwrap();
-
-        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+        assert_eq!(committed.index_version, expected);
 
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+        assert_eq!(loaded[0].index_version, expected);
+        let details = loaded[0]
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+        let Some(Compression::Rq(rq)) = details.compression else {
+            panic!("expected RQ details, got {details:?}");
+        };
+        let expected_layout = match row_layout {
+            RQRowLayout::Columns => rabit_quantization::RowLayout::Columns,
+            RQRowLayout::PlaneRows => rabit_quantization::RowLayout::PlaneRows,
+        };
+        assert_eq!(rq.row_layout(), expected_layout);
+        assert_eq!(rq.layered, layered);
+
+        // The index answers queries.
+        let query = arrow_array::Float32Array::from(vec![0.5f32; 16]);
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 5);
+
+        // A version above what this build reads is left out.
+        let mut unreadable = loaded.clone();
+        unreadable[0].index_version = IndexType::IvfRq.version() + 1;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: unreadable,
+                removed_indices: loaded,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name(&committed.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
