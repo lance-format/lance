@@ -2985,7 +2985,7 @@ impl RequestBatch {
         }
         let batched: SharedRead = inner
             .submit_request(ranges, priority)
-            .map(|result| result.map(Arc::new).map_err(CloneableError))
+            .map(|result| result.map(Arc::new).map_err(CloneableError::new))
             .boxed()
             .shared();
         for (read, read_positions) in pending.into_iter().zip(positions) {
@@ -3040,7 +3040,7 @@ impl EncodingsIo for RequestBatch {
             match submitted {
                 SubmittedRead::Alone(request) => request.await,
                 SubmittedRead::Shared(batched, positions) => {
-                    let bytes = batched.await.map_err(|err| err.0)?;
+                    let bytes = batched.await.map_err(|err| err.into_inner())?;
                     Ok(positions
                         .into_iter()
                         .map(|position| bytes[position].clone())

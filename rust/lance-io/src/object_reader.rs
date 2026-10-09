@@ -296,7 +296,7 @@ impl std::fmt::Debug for SmallReaderState {
                 write!(f, "Finished({} bytes)", data.len())
             }
             Self::Finished(Err(err)) => {
-                write!(f, "Finished({})", err.0)
+                write!(f, "Finished({})", err.inner())
             }
         }
     }
@@ -314,11 +314,11 @@ impl SmallReader {
             Box::pin(async move {
                 let object_reader =
                     CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
-                        .map_err(CloneableError)?;
+                        .map_err(CloneableError::new)?;
                 object_reader
                     .get_all()
                     .await
-                    .map_err(|err| CloneableError(Error::from(err)))
+                    .map_err(|err| CloneableError::new(Error::from(err)))
             })
             .boxed()
             .shared(),
@@ -340,13 +340,13 @@ impl SmallReaderInner {
             match &*state {
                 SmallReaderState::Loading(future) => future.clone(),
                 SmallReaderState::Finished(result) => {
-                    return result.clone().map_err(|err| err.0.into());
+                    return result.clone().map_err(|err| err.into_inner().into());
                 }
             }
         };
 
         let result = future.await;
-        let result_to_return = result.clone().map_err(|err| err.0.into());
+        let result_to_return = result.clone().map_err(|err| err.into_inner().into());
         let mut state = self.state.lock().unwrap();
         if matches!(*state, SmallReaderState::Loading(_)) {
             *state = SmallReaderState::Finished(result);
