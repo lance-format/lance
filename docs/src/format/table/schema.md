@@ -192,7 +192,7 @@ The `json` logical type stores each value as JSONB in an Arrow `LargeBinary`
 field with `ARROW:extension:name = "lance.json"`. Its text-facing Arrow extension
 is `arrow.json`. JSONB is a value encoding and does not itself request external
 blob storage. See the [JSONB Format Specification](jsonb.md) for the logical value
-model, Arrow mapping, upstream encoding, numeric behavior, and compatibility
+model, Arrow mapping, binary encoding, numeric behavior, and compatibility
 requirements.
 
 #### BFloat16 Type
