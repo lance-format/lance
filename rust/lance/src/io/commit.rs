@@ -1805,7 +1805,8 @@ pub(crate) async fn commit_transaction(
         // Each attempt remaps its own copy of the
         // staged files, so a retry never mistakes a provisional ID for a field
         // introduced by a concurrent commit.
-        let mut attempt_transaction = transaction.clone();
+        // Keep the per-attempt copy out of the commit future's inline state.
+        let mut attempt_transaction = Box::new(transaction.clone());
         canonicalize_non_reusable_field_ids(
             Some(&dataset.manifest),
             &mut attempt_transaction.operation,
@@ -1815,7 +1816,7 @@ pub(crate) async fn commit_transaction(
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
-        let pb_transaction = pb::Transaction::try_from(&attempt_transaction)?;
+        let pb_transaction = pb::Transaction::try_from(attempt_transaction.as_ref())?;
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
         // Classified from the operation itself. Reading it back off the inline
         // copy would tie the verdict to the payload size instead.
