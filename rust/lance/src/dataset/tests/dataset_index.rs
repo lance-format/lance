@@ -6595,6 +6595,14 @@ async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
         .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
         .collect::<HashSet<_>>();
     assert_eq!(indexed_fragments, HashSet::from([0, 1, 2]));
+    // Without stable row ids a row id and a row address coincide, so the
+    // segments keep the pre-migration version older builds can read.
+    for index in dataset.load_indices_by_name("json_idx").await.unwrap() {
+        assert_eq!(
+            index.index_version,
+            lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION as i32
+        );
+    }
 
     let result = dataset
         .scan()
@@ -6604,6 +6612,165 @@ async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
         .await
         .unwrap();
     assert_eq!(result.num_rows(), 2);
+}
+
+fn json_val_batch(values: std::ops::Range<i64>) -> RecordBatch {
+    let docs = values
+        .map(|val| format!(r#"{{"val": {val}}}"#))
+        .collect::<Vec<_>>();
+    json_batch(docs.iter().map(String::as_str).collect())
+}
+
+/// 12 rows over 3 fragments with stable row ids, so row ids and row addresses
+/// differ from the second fragment on.
+async fn stable_row_id_json_dataset(uri: &str) -> Dataset {
+    let batch = json_val_batch(0..12);
+    let schema = batch.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+fn json_index_params(target_index_type: &str) -> ScalarIndexParams {
+    ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": target_index_type,
+        "path": "val",
+    }))
+}
+
+/// Asserts the JSON index answers `json_get_int(json, 'val') = {val}` for each
+/// of `vals` exactly like a scan that ignores it.
+async fn assert_json_index_matches_scan(dataset: &Dataset, vals: &[i64]) {
+    for val in vals {
+        let predicate = format!("json_get_int(json, 'val') = {val}");
+        let indexed = dataset
+            .scan()
+            .filter(&predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(&predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed, baseline, "{predicate}");
+    }
+}
+
+/// On a stable-row-id dataset a JSON index over a BTree or Bitmap stores row
+/// addresses, and keeps doing so through a delete, an append, and an optimize
+/// that updates the one existing segment in place. That update must filter the
+/// old segment's data by fragment: a row-id filter would treat every address
+/// past the first fragment as a deleted row and drop it.
+#[rstest]
+#[case::btree("btree")]
+#[case::bitmap("bitmap")]
+#[tokio::test]
+async fn test_json_index_row_addr_domain_with_stable_row_ids(#[case] target_index_type: &str) {
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &json_index_params(target_index_type),
+            false,
+        )
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].index_version,
+        lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION as i32
+    );
+    assert!(segments[0].results_are_row_addrs());
+
+    dataset
+        .delete("json_get_int(json, 'val') = 5")
+        .await
+        .unwrap();
+    let appended = json_val_batch(12..16);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    assert!(segments[0].results_are_row_addrs());
+    assert_json_index_matches_scan(&dataset, &[1, 5, 6, 9, 14]).await;
+}
+
+/// A JSON segment written before its target moved to row addresses stores row
+/// ids. Optimizing must rebuild it rather than leave it beside (or merge it
+/// with) address-domain data, even in append mode, which selects no segment to
+/// merge.
+#[tokio::test]
+async fn test_optimize_rebuilds_legacy_json_btree_segment_with_stable_row_ids() {
+    use lance_table::format::IndexMetadata;
+    use prost::Message;
+
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    let segment = dataset
+        .create_index_builder(&["json"], IndexType::Scalar, &json_index_params("btree"))
+        .name("json_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert!(segment.results_are_row_addrs());
+
+    // A legacy segment differs from a fresh one only in its versions: the target
+    // loads in whichever domain its recorded version names.
+    let mut details = lance_index::pb::JsonIndexDetails::decode(
+        segment.index_details.as_ref().unwrap().value.as_slice(),
+    )
+    .unwrap();
+    details.target_index_version = None;
+    let legacy_segment = IndexMetadata {
+        index_version: lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION as i32,
+        index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+        ..segment
+    };
+    assert!(!legacy_segment.results_are_row_addrs());
+    dataset
+        .commit_existing_index_segments("json_idx", "json", vec![legacy_segment])
+        .await
+        .unwrap();
+
+    let appended = json_val_batch(12..16);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    assert!(segments[0].results_are_row_addrs());
+    assert_json_index_matches_scan(&dataset, &[1, 6, 9, 14]).await;
 }
 
 #[tokio::test]

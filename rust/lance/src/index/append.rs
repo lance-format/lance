@@ -16,6 +16,7 @@ use lance_index::{
     scalar::{
         CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
         inverted::InvertedIndex,
+        json,
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
@@ -584,25 +585,33 @@ async fn merge_scalar_indices<'a>(
         return Ok(None);
     }
 
+    // Whether a segment's type moved from row ids to row addresses, so that it
+    // may predate that move: BTree, Bitmap, LabelList, and a JSON index over a
+    // BTree or Bitmap.
+    let migrated_to_row_addrs = |segment: &IndexMetadata| match index_type {
+        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList => true,
+        _ => segment
+            .index_details
+            .as_deref()
+            .is_some_and(json::wraps_row_addr_migrated_target),
+    };
+
     // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
     // segments (plus any deletion-affected one); with `num_indices_to_merge: Some(0)`
-    // (append mode) it selects none at all. A row-id-domain BTree, Bitmap, or
-    // LabelList segment left outside that selection would otherwise survive
-    // untouched beside the freshly built address-domain segment this call is
-    // about to create. `LogicalScalarIndex` takes the whole named index's
+    // (append mode) it selects none at all. A row-id-domain segment of such a
+    // type left outside that selection would otherwise survive untouched
+    // beside the freshly built address-domain segment this call is about to
+    // create. `LogicalScalarIndex` takes the whole named index's
     // result domain from its first segment alone, so that mix makes every
     // match the new segment finds look like a row id needing resolution, and
     // matching rows silently vanish when that resolution misses. Fold every
     // such segment into this rebuild, regardless of which ones the
     // trailing-window heuristic already picked, so the named index never
     // ends up straddling both domains.
-    if matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
-    ) && dataset.manifest.uses_stable_row_ids()
-    {
+    if dataset.manifest.uses_stable_row_ids() {
         for idx in old_indices {
-            if !idx.results_are_row_addrs()
+            if migrated_to_row_addrs(idx)
+                && !idx.results_are_row_addrs()
                 && !selected_old_indices
                     .iter()
                     .any(|selected| selected.uuid == idx.uuid)
@@ -658,20 +667,17 @@ async fn merge_scalar_indices<'a>(
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
 
-    // A BTree, Bitmap, or LabelList segment persisted before address-domain
-    // support stores row ids directly. Merging it with newly scanned
-    // address-domain data on a stable-row-id dataset would silently combine
-    // two different domains in the same postings column, so such a segment
-    // must be rebuilt from scratch (a full rescan, never touching its stale
-    // page data) rather than merged. Harmless elsewhere: without stable row
-    // ids the two domains coincide.
-    let legacy_domain_mismatch = matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
-    ) && dataset.manifest.uses_stable_row_ids()
+    // A segment of a migrated type persisted before address-domain support
+    // stores row ids directly. Merging it with newly scanned address-domain
+    // data on a stable-row-id dataset would silently combine two different
+    // domains in the same postings column, so such a segment must be rebuilt
+    // from scratch (a full rescan, never touching its stale page data) rather
+    // than merged. Harmless elsewhere: without stable row ids the two domains
+    // coincide.
+    let legacy_domain_mismatch = dataset.manifest.uses_stable_row_ids()
         && selected_old_indices
             .iter()
-            .any(|segment| !segment.results_are_row_addrs());
+            .any(|segment| migrated_to_row_addrs(segment) && !segment.results_are_row_addrs());
 
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
@@ -841,11 +847,17 @@ async fn merge_scalar_indices<'a>(
                         .await?
                 }
                 _ => {
+                    // A JSON index over an address-domain target stores row
+                    // addresses, which a row-id filter would wrongly prune.
+                    let address_domain = reference_index
+                        .as_any()
+                        .downcast_ref::<json::JsonIndex>()
+                        .is_some_and(|index| index.results_are_row_addresses());
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
                         &effective_old_frags,
                         &deleted_old_frags,
-                        false,
+                        address_domain,
                     )
                     .await?;
                     reference_index
