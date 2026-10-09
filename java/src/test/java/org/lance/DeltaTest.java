@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.delta.DatasetDelta;
+import org.lance.delta.DatasetDeltaBuilder;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -234,6 +235,51 @@ public class DeltaTest {
             total += outRoot.getRowCount();
           }
           Assertions.assertEquals(1, total, "exactly one row was deleted");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testBuilderRejectsInvalidVersionSelection(@TempDir Path tempDir) throws IOException {
+    // build() must enforce the class contract up front: comparedAgainstVersion
+    // paired with a range is silently dropped by nativeBuild, and a half-set
+    // range only fails deep in the native layer.
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String uri = tempDir.resolve("delta_validation").toString();
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.notNullable(
+                      "id", new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)),
+                  Field.nullable(
+                      "val", org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE)));
+      byte[] batch = writeBatch(allocator, schema, new int[] {1, 2}, new String[] {"a", "b"});
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch), allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+        try (Dataset ds =
+            Dataset.write().stream(stream).uri(uri).mode(WriteParams.WriteMode.CREATE).execute()) {
+          IllegalArgumentException exclusive =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () ->
+                      new DatasetDeltaBuilder(ds)
+                          .comparedAgainstVersion(1L)
+                          .withBeginVersion(1L)
+                          .build());
+          Assertions.assertTrue(exclusive.getMessage().contains("mutually exclusive"));
+          IllegalArgumentException beginOnly =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new DatasetDeltaBuilder(ds).withBeginVersion(1L).build());
+          Assertions.assertTrue(beginOnly.getMessage().contains("must be set together"));
+          IllegalArgumentException endOnly =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new DatasetDeltaBuilder(ds).withEndVersion(2L).build());
+          Assertions.assertTrue(endOnly.getMessage().contains("must be set together"));
         }
       }
     }
