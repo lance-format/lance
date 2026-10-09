@@ -30,7 +30,9 @@ use crate::{
 };
 
 #[cfg(feature = "bitpacking")]
-use crate::encodings::physical::bitpacking::{OutOfLineBitpacking, out_of_line_payload_bytes};
+use crate::encodings::physical::bitpacking::{
+    OutOfLineBitpacking, out_of_line_payload_byte_lengths,
+};
 
 mod statistics;
 
@@ -295,7 +297,10 @@ fn direct_candidates(
         );
         let payload_bytes = stats
             .iter()
-            .map(|stats| out_of_line_payload_bytes(stats.len, bits_per_value, compressed_bits))
+            .map(|stats| {
+                out_of_line_payload_byte_lengths(stats.len, bits_per_value, compressed_bits)
+                    .map(|[raw, padded]| raw.min(padded))
+            })
             .collect::<Result<Vec<_>>>()?;
         candidates.push(Candidate {
             wire_bytes: wire_bytes(&encoding, true, &payload_bytes, cost),
