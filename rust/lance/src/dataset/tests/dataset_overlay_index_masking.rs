@@ -14,6 +14,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Int32Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
@@ -35,6 +36,7 @@ use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+use crate::dataset::scanner::RowAddrTreeMap;
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
@@ -49,7 +51,7 @@ async fn create_base_dataset() -> Dataset {
     create_base_dataset_with(false).await
 }
 
-async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
+pub(super) async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("age", DataType::Int32, true),
@@ -89,7 +91,7 @@ async fn build_age_index(dataset: &mut Dataset) {
 /// Write an overlay file covering `fields` of `fragment_id` with `coverage` and the given
 /// per-field value columns, then commit it as a `DataOverlay` transaction. `name` makes
 /// the overlay file unique.
-async fn commit_overlay(
+pub(super) async fn commit_overlay(
     dataset: Dataset,
     name: &str,
     fragment_id: u64,
@@ -161,7 +163,7 @@ async fn commit_overlay(
 }
 
 /// Sorted `id` values returned by a filtered scan.
-async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
+pub(super) async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
     ids_matching_opts(dataset, filter, false).await
 }
 
@@ -193,7 +195,7 @@ fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
         .collect()
 }
 
-fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
+pub(super) fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
     Arc::new(Int32Array::from_iter(values))
 }
 
@@ -253,6 +255,50 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
     // An untouched indexed value is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
+/// The scalar-index stale-row replay is a second read branch. A physical row selection must
+/// constrain it too, otherwise an overlaid row outside the requested slice can be reintroduced.
+#[rstest]
+#[tokio::test]
+async fn test_overlay_matches_respect_physical_row_selection(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_physical_selection",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    let unselected_row_addr = u64::from(RowAddress::new_from_parts(0, 2));
+    let mut scanner = dataset.scan();
+    scanner
+        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([unselected_row_addr]))
+        .filter("age = 999")
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let updated_row_addr = u64::from(RowAddress::new_from_parts(0, 1));
+    let mut scanner = dataset.scan();
+    scanner
+        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([updated_row_addr]))
+        .filter("age = 999")
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    assert_eq!(
+        ids_from_batches(&[scanner.try_into_batch().await.unwrap()]),
+        vec![1]
+    );
 }
 
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is

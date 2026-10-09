@@ -491,7 +491,7 @@ pub enum TrainingOrdering {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingCriteria {
     pub ordering: TrainingOrdering,
     pub needs_row_ids: bool,

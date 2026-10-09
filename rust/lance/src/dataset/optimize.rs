@@ -3749,6 +3749,7 @@ async fn cleanup_compaction_files_after_reservation_failure(
 mod tests {
 
     mod binary_copy;
+    mod concurrent_reindex;
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::WriteDestination;

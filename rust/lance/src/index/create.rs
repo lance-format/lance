@@ -41,6 +41,9 @@ use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_datafusion::utils::reader_to_stream;
+use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 /// Generate default index name from field path.
 ///
 /// Joins field names with `.` to create the base index name.
@@ -80,7 +83,7 @@ pub struct CreateIndexBuilder<'a> {
     train: bool,
     fragments: Option<Vec<u32>>,
     index_uuid: Option<Uuid>,
-    preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
+    preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
@@ -134,11 +137,23 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    pub fn preprocessed_data(
+    /// Train from rows already in the B-tree's shape: sorted by value, each
+    /// with its row id. An index that trains from another shape is refused.
+    pub fn preprocessed_data(self, reader: Box<dyn RecordBatchReader + Send + 'static>) -> Self {
+        self.preprocessed_stream(
+            reader_to_stream(reader),
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        )
+    }
+
+    /// Train a scalar index from rows already prepared in the shape `criteria`
+    /// describes. An index that trains from another shape is refused.
+    pub(crate) fn preprocessed_stream(
         mut self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        stream: SendableRecordBatchStream,
+        criteria: TrainingCriteria,
     ) -> Self {
-        self.preprocessed_data = Some(stream);
+        self.preprocessed_data = Some((stream, criteria));
         self
     }
 
@@ -402,10 +417,6 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::MinHashLsh,
                 LANCE_SCALAR_INDEX,
             ) => {
-                assert!(
-                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
-                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
-                );
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
                 // If custom params were provided, extract the params JSON and apply it
@@ -431,17 +442,14 @@ impl<'a> CreateIndexBuilder<'a> {
                     params = scalar_params_from_inverted(inverted_params)?;
                 }
 
-                let preprocesssed_data = self
-                    .preprocessed_data
-                    .take()
-                    .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
+                let preprocessed_data = self.preprocessed_data.take();
                 if self.index_type == IndexType::Bitmap && self.fragments.is_some() {
                     if !train {
                         return Err(Error::invalid_input(
                             "canonical bitmap segment build requires train=true".to_string(),
                         ));
                     }
-                    if preprocesssed_data.is_some() {
+                    if preprocessed_data.is_some() {
                         return Err(Error::invalid_input(
                             "canonical bitmap segment build does not accept preprocessed data"
                                 .to_string(),
@@ -468,7 +476,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         &params,
                         train,
                         self.fragments.clone(),
-                        preprocesssed_data,
+                        preprocessed_data,
                         self.progress.clone(),
                     )
                     .await?
@@ -2137,6 +2145,35 @@ mod tests {
         assert!(
             plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
             "expected LabelList scalar index query in plan: {plan}"
+        );
+    }
+
+    /// B-tree training rows handed to an index that trains from another shape
+    /// are refused, not trained.
+    #[tokio::test]
+    async fn test_preprocessed_data_for_another_index_type_is_refused() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap);
+        let error = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::ZoneMap, &params)
+            .preprocessed_data(Box::new(RecordBatchIterator::new(vec![], schema)))
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("preprocessed data for index type 'zonemap'"),
+            "{error}"
         );
     }
 

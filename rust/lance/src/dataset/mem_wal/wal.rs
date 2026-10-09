@@ -2762,7 +2762,7 @@ mod tests {
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
 
         // An HNSW index on `id`, which is an Int32 and not a vector, so every
-        // insert of this batch fails deterministically. `validate_index_configs`
+        // insert of this batch fails deterministically. `validate_index_specs`
         // rejects this at shard open — that is what makes poison-and-replay
         // terminating — so the store has to be built by hand to reach it at all.
         let mut idx = IndexStore::new();

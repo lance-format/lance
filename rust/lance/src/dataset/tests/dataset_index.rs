@@ -6266,10 +6266,6 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
 
 #[tokio::test]
 async fn test_fts_phrase_query_with_removed_stop_words() {
-    let tmpdir = TempStrDir::default();
-    let uri = tmpdir.to_owned();
-    drop(tmpdir);
-
     let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
         "want the apple",
         "want an apple",
@@ -6288,7 +6284,7 @@ async fn test_fts_phrase_query_with_removed_stop_words() {
     .unwrap();
     let schema = batch.schema();
     let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    let mut dataset = Dataset::write(batches, "memory://", None).await.unwrap();
 
     dataset
         .create_index(

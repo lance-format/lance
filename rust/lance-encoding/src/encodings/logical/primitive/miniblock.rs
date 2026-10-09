@@ -75,6 +75,18 @@ impl MiniBlockCompressionContext {
             allow_generic_offsets,
         }
     }
+
+    pub(crate) fn chunk_header_bytes(self, value_buffers: u64) -> u64 {
+        let value_buffer_size_bytes = if self.support_large_chunk { 4 } else { 2 };
+        2_u64
+            .saturating_add(self.common_chunk_buffers.saturating_mul(2))
+            .saturating_add(value_buffers.saturating_mul(value_buffer_size_bytes))
+            .next_multiple_of(8)
+    }
+
+    pub(crate) fn allows_generic_offsets(self) -> bool {
+        self.allow_generic_offsets
+    }
 }
 
 /// Describes the size of a mini-block chunk of data

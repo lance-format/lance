@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! BTreeIndexExec - BTree index queries with MVCC visibility.
+//! BTreeIndexExec - a scalar filter answered by a memtable index, with MVCC
+//! visibility.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
@@ -18,15 +20,17 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::ScalarPredicate;
+use crate::dataset::mem_wal::index::{MemMatches, SearchContext};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
-/// ExecutionPlan node that queries BTree index with visibility filtering.
+/// ExecutionPlan node that answers a scalar filter from a memtable index, with
+/// visibility filtering.
 pub struct BTreeIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
@@ -42,6 +46,9 @@ pub struct BTreeIndexExec {
     with_row_id: bool,
     /// Whether to include _rowaddr column (same as row position) in output.
     with_row_address: bool,
+    /// The filter the predicate came from, to re-check rows an inexact answer
+    /// returns.
+    recheck: Option<PhysicalExprRef>,
 }
 
 impl Debug for BTreeIndexExec {
@@ -62,7 +69,7 @@ impl BTreeIndexExec {
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing data
-    /// * `indexes` - Index registry with BTree indexes
+    /// * `indexes` - The memtable's indexes, one of which answers `predicate`
     /// * `predicate` - Scalar predicate to apply
     /// * `readable_count` - Exclusive count of batch positions this scan may read
     /// * `projection` - Optional column indices to project
@@ -80,12 +87,10 @@ impl BTreeIndexExec {
         with_row_id: bool,
         with_row_address: bool,
     ) -> Result<Self> {
-        // Verify the index exists for this column
         let column = predicate.column().to_string();
-        if indexes.get_btree_by_column(&column).is_none() {
+        if indexes.index_answering(&column, &predicate).is_none() {
             return Err(Error::invalid_input(format!(
-                "No BTree index found for column '{}'",
-                column
+                "no index on column '{column}' answers {predicate:?}"
             )));
         }
 
@@ -108,7 +113,14 @@ impl BTreeIndexExec {
             column,
             with_row_id,
             with_row_address,
+            recheck: None,
         })
+    }
+
+    /// Re-check rows against `filter` when the index answers with candidates.
+    pub fn with_recheck(mut self, filter: PhysicalExprRef) -> Self {
+        self.recheck = Some(filter);
+        self
     }
 
     /// Last row position within `readable_count`, or None if nothing is
@@ -132,52 +144,33 @@ impl BTreeIndexExec {
         }
     }
 
-    /// Query the index and return matching row positions filtered by visibility.
-    fn query_index(&self) -> Vec<u64> {
-        let Some(index) = self.indexes.get_btree_by_column(&self.column) else {
-            return vec![];
-        };
-
+    /// The visible positions the index answers with, and whether the answer is
+    /// exact. Planning chose an index that accepted this predicate, so none now,
+    /// or a decline, is an error.
+    fn query_index(&self) -> Result<(Vec<u64>, bool)> {
         let Some(max_readable_row) = self.compute_max_readable_row() else {
-            return vec![];
+            return Ok((vec![], true));
         };
-
-        let positions = match &self.predicate {
-            ScalarPredicate::Eq { value, .. } => index.get(value),
-            ScalarPredicate::Range { lower, upper, .. } => {
-                // For range queries, use a range scan approach
-                // This is simplified - in production we'd need proper range iteration
-                let mut results = Vec::new();
-                let snapshot = index.snapshot();
-
-                for (key, positions) in snapshot {
-                    let in_range = match (lower, upper) {
-                        (Some(l), Some(u)) => &key.0 >= l && &key.0 < u,
-                        (Some(l), None) => &key.0 >= l,
-                        (None, Some(u)) => &key.0 < u,
-                        (None, None) => true,
-                    };
-
-                    if in_range {
-                        results.extend(positions);
-                    }
-                }
-                results
+        let index = self
+            .indexes
+            .index_answering(&self.column, &self.predicate)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "no index on '{}' answers the filter planning routed to it",
+                    self.column
+                ))
+            })?;
+        match index.search(&self.predicate, &SearchContext::new(max_readable_row))? {
+            Some(MemMatches::Filter(result)) => {
+                // A row past the readable count may still fail its append.
+                let result = result.truncate_to(max_readable_row);
+                Ok((result.at_most.iter().collect(), result.is_exact()))
             }
-            ScalarPredicate::In { values, .. } => {
-                let mut results = Vec::new();
-                for value in values {
-                    results.extend(index.get(value));
-                }
-                results
-            }
-        };
-
-        // Filter by visibility
-        positions
-            .into_iter()
-            .filter(|&pos| pos <= max_readable_row)
-            .collect()
+            _ => Err(Error::internal(format!(
+                "the index on '{}' accepted a filter, then did not answer it",
+                self.column
+            ))),
+        }
     }
 
     /// Convert row positions to batch_id, row_within_batch, and original row_position tuples.
@@ -211,6 +204,7 @@ impl BTreeIndexExec {
     fn materialize_rows(
         &self,
         batch_rows: &[(usize, usize, u64)],
+        recheck: Option<&PhysicalExprRef>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
         if batch_rows.is_empty() {
             return Ok(vec![]);
@@ -235,7 +229,7 @@ impl BTreeIndexExec {
                     .iter()
                     .map(|&(row_in_batch, _)| row_in_batch as u32)
                     .collect();
-                let row_positions: Vec<u64> = rows_with_positions
+                let mut row_positions: Vec<u64> = rows_with_positions
                     .iter()
                     .map(|&(_, row_position)| row_position)
                     .collect();
@@ -253,10 +247,26 @@ impl BTreeIndexExec {
                     })
                     .collect();
 
-                let columns = columns?;
+                let mut columns = columns?;
+                let source_schema = data.schema();
+                if let Some(filter) = recheck {
+                    let taken = RecordBatch::try_new(source_schema.clone(), columns)?;
+                    let keep = filter
+                        .evaluate(&taken)?
+                        .into_array(taken.num_rows())?
+                        .as_boolean()
+                        .clone();
+                    columns = arrow_select::filter::filter_record_batch(&taken, &keep)?
+                        .columns()
+                        .to_vec();
+                    row_positions = row_positions
+                        .into_iter()
+                        .zip(keep.iter())
+                        .filter_map(|(position, keep)| keep.unwrap_or(false).then_some(position))
+                        .collect();
+                }
 
                 // Apply projection
-                let source_schema = data.schema();
                 let mut final_columns: Vec<Arc<dyn arrow_array::Array>> =
                     if let Some(ref proj_indices) = self.projection {
                         take_projected_columns(
@@ -340,14 +350,21 @@ impl ExecutionPlan for BTreeIndexExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        // Query the index
-        let positions = self.query_index();
-
-        // Convert positions to batch/row pairs with visibility filtering
+        let (positions, exact) = self.query_index()?;
+        let recheck = match (exact, &self.recheck) {
+            (true, _) => None,
+            (false, Some(filter)) => Some(filter),
+            (false, None) => {
+                return Err(Error::internal(format!(
+                    "the index on '{}' answered with candidates, and this plan has no filter \
+                     to re-check them",
+                    self.column
+                ))
+                .into());
+            }
+        };
         let batch_rows = self.positions_to_batch_rows(&positions);
-
-        // Materialize the rows
-        let batches = self.materialize_rows(&batch_rows)?;
+        let batches = self.materialize_rows(&batch_rows, recheck)?;
 
         let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
 
@@ -362,7 +379,7 @@ impl ExecutionPlan for BTreeIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 

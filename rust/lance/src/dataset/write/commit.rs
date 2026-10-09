@@ -28,7 +28,6 @@ use crate::{
 
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
@@ -54,6 +53,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Whether this commit atomically activates non-reusable field IDs.
+    activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
 }
@@ -80,6 +81,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
         }
     }
@@ -280,6 +282,11 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub(crate) fn with_non_reusable_field_id_migration_activation(mut self) -> Self {
+        self.activate_non_reusable_field_ids = true;
+        self
+    }
+
     /// Mark this commit as the last step of [`Dataset::deep_clone`], which has
     /// already copied the source's data, deletion and index files to the
     /// destination.
@@ -416,14 +423,6 @@ impl<'a> CommitBuilder<'a> {
             ));
         }
 
-        // Validate the operation before proceeding with the commit
-        // This ensures that operations like Merge have proper validation for data integrity
-        if let Some(dataset) = dest.dataset() {
-            validate_operation(Some(&dataset.manifest), &transaction.operation)?;
-        } else {
-            validate_operation(None, &transaction.operation)?;
-        }
-
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
             WriteDestination::Uri(uri) => (
@@ -454,6 +453,7 @@ impl<'a> CommitBuilder<'a> {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
+            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             ..Default::default()
         };
 
@@ -624,6 +624,7 @@ pub struct BatchCommitResult {
 #[cfg(test)]
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
+    use arrow_array::record_batch;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
     use lance_core::utils::tempfile::TempStrDir;
@@ -633,6 +634,7 @@ mod tests {
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
     use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
+    use lance_table::transaction::resolve_arrow_field_ids;
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -642,6 +644,86 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
 
     use super::*;
+
+    #[tokio::test]
+    async fn raw_arrow_new_dataset_preserves_user_metadata() {
+        let mut field =
+            lance_core::datatypes::Field::new_arrow("a", DataType::Int32, false).unwrap();
+        field.id = 42;
+        let metadata = HashMap::from([("source".to_string(), "user metadata".to_string())]);
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field],
+            metadata: metadata.clone(),
+        };
+        let mut transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                schema,
+                fragments: vec![],
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        resolve_arrow_field_ids(None, &mut transaction.operation).unwrap();
+        let dataset = CommitBuilder::new("memory://")
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(dataset.schema().field("a").unwrap().id, 0);
+        assert_eq!(dataset.schema().metadata, metadata);
+        let committed = dataset.read_transaction().await.unwrap().unwrap();
+        let Operation::Overwrite { schema, .. } = committed.operation else {
+            panic!("expected Overwrite");
+        };
+        assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.metadata, metadata);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn raw_arrow_merge_resolved_before_commit(#[values(false, true)] detached: bool) {
+        let batch = record_batch!(("a", Int32, [1, 2]), ("b", Int32, [3, 4])).unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            })
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        dataset.migrate_to_non_reusable_field_ids().await.unwrap();
+        let mut raw_schema = dataset.schema().clone();
+        for field in &mut raw_schema.fields {
+            field.id += 10;
+        }
+        let mut transaction = Transaction::new(
+            dataset.version().version,
+            Operation::Merge {
+                schema: raw_schema,
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                preserves_nullability: true,
+            },
+            None,
+        );
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut transaction.operation).unwrap();
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_detached(detached)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(is_detached_version(committed.version().version), detached);
+        assert_eq!(committed.schema(), dataset.schema());
+        assert_eq!(committed.manifest.fragments.len(), 2);
+        assert_eq!(committed.manifest.fragments, dataset.manifest.fragments);
+        assert_eq!(committed.scan().try_into_batch().await.unwrap(), batch);
+        let persisted = committed.read_transaction().await.unwrap().unwrap();
+        let Operation::Merge { schema, .. } = persisted.operation else {
+            panic!("expected Merge");
+        };
+        assert_eq!(&schema, dataset.schema());
+        assert_eq!(schema.metadata, dataset.schema().metadata);
+    }
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =
