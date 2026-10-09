@@ -752,54 +752,48 @@ impl Transaction {
         groups: &[RewriteGroup],
         fragment_id: &mut u64,
         version: u64,
-        _next_row_id: Option<&u64>,
     ) -> Result<()> {
         for group in groups {
-            // If the old fragments are contiguous, find the range
-            let replace_range = {
-                let start = final_fragments
-                    .iter()
-                    .enumerate()
-                    .find(|(_, f)| f.id == group.old_fragments[0].id)
-                    .ok_or_else(|| {
-                        Error::commit_conflict_source(
-                            version,
-                            format!(
-                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
-                                group.old_fragments[0].id
-                            )
-                            .into(),
-                        )
-                    })?
-                    .0;
+            let first = group.old_fragments.first().ok_or_else(|| {
+                Error::invalid_input("Rewrite groups must contain at least one old fragment")
+            })?;
+            let replace_range = final_fragments
+                .iter()
+                .position(|fragment| fragment.id == first.id)
+                .map(|start| start..start + group.old_fragments.len())
+                .filter(|range| {
+                    final_fragments.get(range.clone()).is_some_and(|fragments| {
+                        fragments
+                            .iter()
+                            .zip(&group.old_fragments)
+                            .all(|(current, old)| current.id == old.id)
+                    })
+                });
 
-                // Verify old_fragments matches contiguous range
-                let mut i = 1;
-                loop {
-                    if i == group.old_fragments.len() {
-                        break Some(start..start + i);
-                    }
-                    if final_fragments[start + i].id != group.old_fragments[i].id {
-                        break None;
-                    }
-                    i += 1;
-                }
-            };
-
+            // Compaction supplies the rewritten fragments' version metadata.
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
                 .collect::<Vec<_>>();
-
-            // Version metadata for rewritten fragments is handled by the compaction code
-            // (recalc_versions_for_rewritten_fragments) which preserves version information
-            // from the original fragments. We don't modify it here.
-
             if let Some(replace_range) = replace_range {
-                // Efficiently path using slice
                 final_fragments.splice(replace_range, new_fragments);
             } else {
-                // Slower path for non-contiguous ranges
-                for fragment in group.old_fragments.iter() {
-                    final_fragments.retain(|f| f.id != fragment.id);
+                let mut old_ids: HashMap<_, _> = group
+                    .old_fragments
+                    .iter()
+                    .map(|fragment| (fragment.id, false))
+                    .collect();
+                final_fragments.retain(|fragment| {
+                    if let Some(found) = old_ids.get_mut(&fragment.id) {
+                        *found = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some((missing, _)) = old_ids.into_iter().find(|(_, found)| !found) {
+                    return Err(Error::commit_conflict_source(
+                        version,
+                        format!("Rewrite targets fragment {missing}, which does not exist").into(),
+                    ));
                 }
                 final_fragments.extend(new_fragments);
             }
@@ -811,6 +805,8 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+    use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::overlay_with_field;
     use uuid::Uuid;
 
@@ -858,7 +854,7 @@ mod tests {
         let existing_fragments: Vec<Fragment> = (0..10).map(Fragment::new).collect();
 
         let mut final_fragments = existing_fragments;
-        let rewrite_groups = vec![
+        let mut rewrite_groups = vec![
             // Since these are contiguous, they will be put in the same location
             // as 1 and 2.
             RewriteGroup {
@@ -875,33 +871,81 @@ mod tests {
             },
         ];
 
-        let mut fragment_id = 20;
-        let version = 0;
+        for (index, fragment) in rewrite_groups
+            .iter_mut()
+            .flat_map(|group| &mut group.new_fragments)
+            .enumerate()
+        {
+            let first_row_id = 40 + 2 * index as u64;
+            fragment.physical_rows = Some(2);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(
+                write_row_ids(&RowIdSequence::from(first_row_id..first_row_id + 2)).into(),
+            ));
+            fragment.created_at_version_meta = Some(
+                RowDatasetVersionMeta::from_sequence(
+                    &RowDatasetVersionSequence::from_uniform_row_count(2, 3),
+                )
+                .unwrap(),
+            );
+            fragment.last_updated_at_version_meta = fragment.created_at_version_meta.clone();
+        }
 
+        let mut fragment_id = 20;
         Transaction::handle_rewrite_fragments(
             &mut final_fragments,
             &rewrite_groups,
             &mut fragment_id,
-            version,
-            None,
+            0,
         )
         .unwrap();
 
         assert_eq!(fragment_id, 21);
 
-        let expected_fragments: Vec<Fragment> = vec![
+        let mut appended = rewrite_groups[1].new_fragments[0].clone();
+        appended.id = 20;
+        let expected_fragments = vec![
             Fragment::new(0),
-            Fragment::new(15),
-            Fragment::new(16),
+            rewrite_groups[0].new_fragments[0].clone(),
+            rewrite_groups[0].new_fragments[1].clone(),
             Fragment::new(3),
             Fragment::new(4),
             Fragment::new(6),
             Fragment::new(7),
             Fragment::new(9),
-            Fragment::new(20),
+            appended,
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[rstest::rstest]
+    #[case::empty(&[], None)]
+    #[case::missing_first(&[9], Some(9))]
+    #[case::missing_after_first(&[0, 9], Some(9))]
+    #[case::truncated_range(&[2, 3], Some(3))]
+    fn test_rewrite_rejects_invalid_sources(
+        #[case] old_ids: &[u64],
+        #[case] missing_id: Option<u64>,
+    ) {
+        let mut fragments = (0..3).map(Fragment::new).collect();
+        let mut next_id = 3;
+        let error = Transaction::handle_rewrite_fragments(
+            &mut fragments,
+            &[RewriteGroup {
+                old_fragments: old_ids.iter().copied().map(Fragment::new).collect(),
+                new_fragments: vec![Fragment::new(0)],
+            }],
+            &mut next_id,
+            1,
+        )
+        .unwrap_err();
+        if let Some(id) = missing_id {
+            assert!(matches!(error, Error::CommitConflict { .. }));
+            assert!(error.to_string().contains(&format!("fragment {id}")));
+        } else {
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("at least one old fragment"));
+        }
     }
 
     #[test]

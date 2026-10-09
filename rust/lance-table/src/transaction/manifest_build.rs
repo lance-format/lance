@@ -1056,7 +1056,6 @@ impl Transaction {
                     groups,
                     &mut fragment_id,
                     current_version,
-                    next_row_id.as_ref(),
                 )?;
 
                 // Groups covered by the stable-partition transitions
