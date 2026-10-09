@@ -179,8 +179,17 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// Returning `true` requires overriding
     /// [`load_index_with_remapping`](Self::load_index_with_remapping).
+    /// A wrapper plugin whose answer depends on the segment's target cannot
+    /// promise anything here; callers holding the segment's details use
+    /// [`supports_batch_row_id_remapping_for`](Self::supports_batch_row_id_remapping_for).
     fn supports_batch_row_id_remapping(&self) -> bool {
         false
+    }
+
+    /// [`supports_batch_row_id_remapping`](Self::supports_batch_row_id_remapping)
+    /// for the segment described by `index_details`.
+    fn supports_batch_row_id_remapping_for(&self, _index_details: &prost_types::Any) -> bool {
+        self.supports_batch_row_id_remapping()
     }
 
     /// Load under a mapping whose payload may require asynchronous reads.

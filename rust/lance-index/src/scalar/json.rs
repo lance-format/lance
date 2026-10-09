@@ -40,8 +40,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
-        SearchResult, UpdateCriteria,
+        AnyQuery, BatchRowIdRemapper, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex,
+        SearchOptions, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -509,6 +509,18 @@ impl std::fmt::Debug for JsonIndexPlugin {
 impl JsonIndexPlugin {
     fn registry(&self) -> Result<Arc<IndexPluginRegistry>> {
         Ok(self.registry.lock().unwrap().as_ref().expect_ok()?.clone())
+    }
+
+    /// The target index this wrapper's `index_details` describe.
+    fn target(&self, index_details: &prost_types::Any) -> Result<JsonTarget> {
+        let registry = self.registry()?;
+        let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
+        let details = json_details.target_details.expect_ok()?;
+        Ok(JsonTarget {
+            registry,
+            path: json_details.path,
+            details,
+        })
     }
 
     /// Present the indexed JSON column as JSONB, the encoding the JSON path
@@ -1050,6 +1062,20 @@ impl BasicTrainer for JsonIndexPlugin {
     }
 }
 
+/// The target index a JSON wrapper's details describe: the path indexed,
+/// the target's own details and the registry its plugin comes from.
+struct JsonTarget {
+    registry: Arc<IndexPluginRegistry>,
+    path: String,
+    details: prost_types::Any,
+}
+
+impl JsonTarget {
+    fn plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
+        self.registry.get_plugin_by_details(&self.details)
+    }
+}
+
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
@@ -1080,11 +1106,8 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
         // TODO: Allow return Result here
-        let registry = self.registry().unwrap();
-        let json_details =
-            crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
-        let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        let target = self.target(index_details).unwrap();
+        let target_plugin = target.plugin().unwrap();
         // Older JSON-wrapped inverted indexes were never routable. Current training rejects this
         // combination, so keep legacy metadata inert instead of enabling only part of its
         // unsupported query path.
@@ -1092,11 +1115,9 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             return None;
         }
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
-        Some(Box::new(JsonQueryParser::new(
-            json_details.path.clone(),
-            target_parser,
-        )) as Box<dyn ScalarQueryParser>)
+        let target_parser = target_plugin.new_query_parser(index_name, &target.details)?;
+        Some(Box::new(JsonQueryParser::new(target.path, target_parser))
+            as Box<dyn ScalarQueryParser>)
     }
 
     async fn load_index(
@@ -1107,10 +1128,8 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let registry = self.registry().unwrap();
-        let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
-        let target_details = json_details.target_details.as_ref().expect_ok()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        let target = self.target(index_details)?;
+        let target_plugin = target.plugin()?;
         // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
         // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
         // the target's; `JsonIndexDetails` does not yet record the target's own
@@ -1121,23 +1140,68 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let target_index = target_plugin
             .load_index(
                 index_store,
-                target_details,
+                &target.details,
                 target_plugin.version(),
                 frag_reuse_index,
                 cache,
             )
             .await?;
-        Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
+        Ok(Arc::new(JsonIndex::new(target_index, target.path)))
+    }
+
+    /// The wrapper itself stores no row id: translation is the target's,
+    /// and a target (FM, for one) may not support it. Without the details
+    /// the target is unknown, so the wrapper promises nothing.
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        false
+    }
+
+    /// The target plugin's answer; `false` for details this plugin cannot
+    /// resolve.
+    fn supports_batch_row_id_remapping_for(&self, index_details: &prost_types::Any) -> bool {
+        self.target(index_details).is_ok_and(|target| {
+            target
+                .plugin()
+                .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping_for(&target.details))
+        })
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let target = self.target(index_details)?;
+        let target_plugin = target.plugin()?;
+        if remapping.is_some()
+            && !target_plugin.supports_batch_row_id_remapping_for(&target.details)
+        {
+            return Err(Error::not_supported(format!(
+                "JSON index target {} does not support asynchronous row-ID remapping",
+                target_plugin.name()
+            )));
+        }
+        // The target's version stands in for the wrapper's, as in `load_index`.
+        let target_index = target_plugin
+            .load_index_with_remapping(
+                index_store,
+                &target.details,
+                target_plugin.version(),
+                remapping,
+                cache,
+            )
+            .await?;
+        Ok(Arc::new(JsonIndex::new(target_index, target.path)))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
-        let registry = self.registry().unwrap();
-        let json_details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;
-        let target_details = json_details.target_details.as_ref().expect_ok()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        let target_details_json = target_plugin.details_as_json(target_details)?;
+        let target = self.target(details)?;
+        let target_details_json = target.plugin()?.details_as_json(&target.details)?;
         Ok(serde_json::json!({
-            "path": json_details.path,
+            "path": target.path,
             "target_details": target_details_json,
         }))
     }

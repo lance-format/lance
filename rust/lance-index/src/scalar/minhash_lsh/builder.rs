@@ -88,22 +88,18 @@ impl RowIdTransform<'_> {
     /// The row id each input row keeps, or `None` for rows to drop.
     ///
     /// Stored row ids predate any deferred compaction the segment was opened
-    /// with, so `frag_reuse_index` first brings them into the current address
-    /// space, which is the space the filter or mapping is expressed in. A
-    /// remap translates one batch at a time through the translator.
+    /// with, so `frag_reuse_index` or `batch_remapper` (whichever the segment
+    /// was opened with) first brings them into the current address space,
+    /// which is the space the filter or mapping is expressed in. A remap
+    /// translates one batch at a time through the translator.
     async fn apply(
         &self,
         row_ids: &UInt64Array,
         frag_reuse_index: Option<&dyn RowIdRemapper>,
+        batch_remapper: Option<&dyn BatchRowIdRemapper>,
     ) -> Result<Vec<Option<u64>>> {
-        let mut row_ids: Vec<Option<u64>> = row_ids
-            .values()
-            .iter()
-            .map(|&row_id| match frag_reuse_index {
-                Some(remapper) => remapper.remap_row_id(row_id),
-                None => Some(row_id),
-            })
-            .collect();
+        let mut row_ids =
+            translate_stored_row_ids(row_ids.values(), frag_reuse_index, batch_remapper).await?;
         match self {
             Self::Keep => {}
             Self::Filter(filter) => {
@@ -129,9 +125,10 @@ impl RowIdTransform<'_> {
 pub(super) struct SignatureSource<'a> {
     pub reader: Arc<dyn IndexReader>,
     pub num_docs: usize,
-    /// The deferred compactions the segment was opened with; see
-    /// [`RowIdTransform::apply`].
+    /// The deferred compactions the segment was opened with, in one of the
+    /// two forms the loader hands out; see [`RowIdTransform::apply`].
     pub frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    pub batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     pub transform: RowIdTransform<'a>,
 }
 
@@ -148,6 +145,7 @@ impl SignatureSource<'_> {
         );
         let transform = &self.transform;
         let frag_reuse_index = self.frag_reuse_index.as_deref();
+        let batch_remapper = self.batch_remapper.as_deref();
         let stream = batches
             .map(move |batch| {
                 let generator = generator.clone();
@@ -157,7 +155,9 @@ impl SignatureSource<'_> {
                     // into the CPU task, so it runs here, one batch at a time;
                     // band keys are computed there.
                     let (row_ids, _) = signature_columns(&batch, num_hashes)?;
-                    let kept = transform.apply(row_ids, frag_reuse_index).await?;
+                    let kept = transform
+                        .apply(row_ids, frag_reuse_index, batch_remapper)
+                        .await?;
                     spawn_cpu(move || resign_batch(generator, batch, kept)).await
                 }
             })

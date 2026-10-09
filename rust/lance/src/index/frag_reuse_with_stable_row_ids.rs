@@ -73,7 +73,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     }
     let applies_frag_reuse = details
         .get_plugin()
-        .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping());
+        .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping_for(details.0.as_ref()));
     if !applies_frag_reuse {
         return Some(format!(
             "a {display_type} index, which does not apply the fragment reuse index"

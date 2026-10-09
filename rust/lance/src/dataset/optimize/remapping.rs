@@ -4619,6 +4619,479 @@ mod tests {
             let reopened = fresh(uri).await;
             assert_index_matches_scan(&reopened, all_values.iter().copied()).await;
         }
+
+        /// Two four-row fragments of `i` and `text`, `text_idx` a MinHash LSH
+        /// index over both. Row 1 is the near duplicate of row 0; every
+        /// other text shares no word with any other.
+        async fn minhash_dataset() -> Dataset {
+            use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
+            use lance_index::scalar::BuiltinIndexType;
+            let batch = arrow_array::RecordBatch::try_from_iter([
+                (
+                    "i",
+                    Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef,
+                ),
+                (
+                    "text",
+                    Arc::new(StringArray::from(MINHASH_TEXTS.to_vec())) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh).with_params(
+                &serde_json::json!({"num_hashes": 32, "num_bands": 8, "shingle_size": 1}),
+            );
+            dataset
+                .create_index(
+                    &["text"],
+                    IndexType::MinHashLsh,
+                    Some("text_idx".into()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+            dataset
+        }
+
+        const MINHASH_TEXTS: [&str; 8] = [
+            "apple banana cherry",
+            "apple banana cherry date",
+            "mango sorbet bowl",
+            "pear tart slice",
+            "lemon curd jar",
+            "peach cobbler dish",
+            "plum pudding cup",
+            "fig newton bar",
+        ];
+
+        /// `i` of the `limit` rows a MinHash search for `text` ranks first.
+        async fn minhash_hits(dataset: &Dataset, text: &str, limit: i64) -> Vec<i32> {
+            use lance_index::scalar::minhash_lsh::MinHashQuery;
+            let mut scan = dataset.scan();
+            scan.minhash_search(MinHashQuery::new(text, "text"))
+                .unwrap()
+                .limit(Some(limit), None)
+                .unwrap()
+                .project(&["i"])
+                .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            batch["i"].as_primitive::<Int32Type>().values().to_vec()
+        }
+
+        /// Every surviving text ranks its own row first; the deleted near
+        /// duplicate's text ranks row 0 first and never surfaces row 1.
+        async fn assert_minhash_answers(dataset: &Dataset) {
+            for (i, text) in MINHASH_TEXTS.iter().enumerate() {
+                if i == 1 {
+                    continue;
+                }
+                assert_eq!(
+                    minhash_hits(dataset, text, 1).await,
+                    vec![i as i32],
+                    "{text}"
+                );
+            }
+            let hits = minhash_hits(dataset, MINHASH_TEXTS[1], 3).await;
+            assert_eq!(hits.first(), Some(&0), "{hits:?}");
+            assert!(!hits.contains(&1), "deleted row surfaced: {hits:?}");
+        }
+
+        /// A MinHash LSH segment stays listed with derived coverage after a
+        /// stable-partition rewrite of its fragments: its stored row ids are
+        /// translated per candidate batch at query time (deleted sources
+        /// dropped), the maintenance remap rewrites the signature table onto
+        /// the destinations, and the drained history is released.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn minhash_segment_translates_and_remaps_through_a_stable_partition() {
+            use lance_index::metrics::NoOpMetricsCollector;
+            use lance_index::scalar::minhash_lsh::MinHashLshIndex;
+            use lance_index::vector::graph::OrderedFloat;
+            use lance_select::RowAddrMask;
+
+            let mut dataset = minhash_dataset().await;
+            dataset.delete("i = 1").await.unwrap();
+            assert_minhash_answers(&dataset).await;
+
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let before = stored_index(&dataset, "text_idx").await;
+            assert_eq!(
+                before.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0, 1])
+            );
+            let listed = dataset
+                .load_index_by_name("text_idx")
+                .await
+                .unwrap()
+                .expect("the MinHash segment must stay listed under the tagged history");
+            assert_eq!(
+                listed.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10, 11]),
+                "coverage derived onto the destinations"
+            );
+            assert_minhash_answers(&dataset).await;
+
+            remap_column_index(&mut dataset, &["text"], Some("text_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "text_idx").await;
+            assert_ne!(after.uuid, before.uuid, "the segment was remapped");
+            assert!(after.dataset_version > before.dataset_version);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10, 11])
+            );
+            // The rewritten signature table holds destination addresses and
+            // no entry for the deleted row.
+            let index = dataset
+                .open_scalar_index("text", &after.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let index = index
+                .as_any()
+                .downcast_ref::<MinHashLshIndex>()
+                .expect("a MinHash LSH segment");
+            assert_eq!(index.num_docs(), 7, "the deleted row is dropped");
+            for text in MINHASH_TEXTS {
+                let hits = index
+                    .search_text(text, 2, &RowAddrMask::all_rows(), &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                assert!(!hits.is_empty(), "{text}");
+                for hit in &hits {
+                    let fragment = RowAddress::from(hit.row_id).fragment_id();
+                    assert!(
+                        fragment == 10 || fragment == 11,
+                        "{text}: {hit:?} is not a destination address"
+                    );
+                }
+                if text == MINHASH_TEXTS[1] {
+                    assert!(
+                        hits.iter().all(|hit| hit.distance > OrderedFloat(0.0)),
+                        "the deleted row's own signature must be gone: {hits:?}"
+                    );
+                }
+            }
+            assert_minhash_answers(&dataset).await;
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let remaining = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .count();
+            assert_eq!(remaining, 0, "the drained history is trimmed away");
+            assert_minhash_answers(&dataset).await;
+        }
+
+        /// Two four-row fragments of `i` and a JSON column whose `val` is
+        /// `100 * i`, indexed by `json_idx` (a JSON-path index over a BTree).
+        async fn json_dataset() -> Dataset {
+            use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
+            use lance_arrow::ARROW_EXT_NAME_KEY;
+            use lance_arrow::json::ARROW_JSON_EXT_NAME;
+            let docs: Vec<String> = (0..8)
+                .map(|i| format!(r#"{{"val": {}}}"#, i * 100))
+                .collect();
+            let schema = Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("json", arrow_schema::DataType::Utf8, false)
+                    .with_metadata(HashMap::from([(
+                        ARROW_EXT_NAME_KEY.to_string(),
+                        ARROW_JSON_EXT_NAME.to_string(),
+                    )])),
+            ]));
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef,
+                    Arc::new(StringArray::from(docs)) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let params =
+                ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+                    "target_index_type": "btree",
+                    "path": "val",
+                }));
+            dataset
+                .create_index(
+                    &["json"],
+                    IndexType::Scalar,
+                    Some("json_idx".into()),
+                    &params,
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+        }
+
+        /// Every `val` answered through the JSON index equals the plain
+        /// scan, and the index is what answers.
+        async fn assert_json_matches_scan(dataset: &Dataset) {
+            let mut scan = dataset.scan();
+            scan.filter("json_get_int(json, 'val') = 200").unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+            for i in 0..8 {
+                let predicate = format!("json_get_int(json, 'val') = {}", i * 100);
+                let expected: Vec<i32> = if i == 1 { vec![] } else { vec![i] };
+                assert_eq!(
+                    values_with(dataset, &predicate, false).await,
+                    expected,
+                    "scan for {predicate}"
+                );
+                assert_eq!(
+                    values_with(dataset, &predicate, true).await,
+                    expected,
+                    "indexed result for {predicate}"
+                );
+            }
+        }
+
+        /// A JSON-path segment (BTree target) stays listed after a
+        /// stable-partition rewrite, answers through the wrapper's batch
+        /// translation, remaps through its target, and releases the history.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn json_segment_translates_and_remaps_through_a_stable_partition() {
+            use datafusion::scalar::ScalarValue;
+            use lance_index::metrics::NoOpMetricsCollector;
+            use lance_index::scalar::json::JsonQuery;
+            use lance_index::scalar::{SargableQuery, SearchResult};
+
+            let mut dataset = json_dataset().await;
+            dataset.delete("i = 1").await.unwrap();
+            assert_json_matches_scan(&dataset).await;
+
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let before = stored_index(&dataset, "json_idx").await;
+            let listed = dataset
+                .load_index_by_name("json_idx")
+                .await
+                .unwrap()
+                .expect("the JSON segment must stay listed under the tagged history");
+            assert_eq!(
+                listed.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10, 11]),
+                "coverage derived onto the destinations"
+            );
+            assert_json_matches_scan(&dataset).await;
+
+            remap_column_index(&mut dataset, &["json"], Some("json_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "json_idx").await;
+            assert_ne!(after.uuid, before.uuid, "the segment was remapped");
+            assert!(after.dataset_version > before.dataset_version);
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([10, 11])
+            );
+            // The rewritten target holds destination addresses and no entry
+            // for the deleted row.
+            let index = dataset
+                .open_scalar_index("json", &after.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            for i in 0..8i64 {
+                let query = JsonQuery::new(
+                    Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(i * 100)))),
+                    "val".to_string(),
+                );
+                let SearchResult::Exact(rows) =
+                    index.search(&query, &NoOpMetricsCollector).await.unwrap()
+                else {
+                    panic!("expected an exact result");
+                };
+                let addrs: Vec<u64> = rows
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                if i == 1 {
+                    assert!(addrs.is_empty(), "the deleted row is dropped: {addrs:?}");
+                    continue;
+                }
+                assert_eq!(addrs.len(), 1, "val = {}: {addrs:?}", i * 100);
+                let fragment = RowAddress::from(addrs[0]).fragment_id();
+                assert!(
+                    fragment == 10 || fragment == 11,
+                    "val = {}: {addrs:?} is not a destination address",
+                    i * 100
+                );
+            }
+            assert_json_matches_scan(&dataset).await;
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let remaining = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .count();
+            assert_eq!(remaining, 0, "the drained history is trimmed away");
+            assert_json_matches_scan(&dataset).await;
+        }
+
+        const JSON_FM_WORDS: [&str; 8] = [
+            "apple", "mango", "pear", "lemon", "peach", "plum", "fig", "kiwi",
+        ];
+
+        /// Two four-row fragments of `i` and a JSON column whose `val` is
+        /// `JSON_FM_WORDS[i]`, indexed by `json_idx` (a JSON-path index over
+        /// an FM index, which has no batch remapper).
+        async fn json_over_fm_dataset() -> Dataset {
+            use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
+            use lance_arrow::ARROW_EXT_NAME_KEY;
+            use lance_arrow::json::ARROW_JSON_EXT_NAME;
+            let docs: Vec<String> = JSON_FM_WORDS
+                .iter()
+                .map(|word| format!(r#"{{"val": "{word}"}}"#))
+                .collect();
+            let schema = Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("json", arrow_schema::DataType::Utf8, false)
+                    .with_metadata(HashMap::from([(
+                        ARROW_EXT_NAME_KEY.to_string(),
+                        ARROW_JSON_EXT_NAME.to_string(),
+                    )])),
+            ]));
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef,
+                    Arc::new(StringArray::from(docs)) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let params =
+                ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+                    "target_index_type": "fm",
+                    "path": "val",
+                }));
+            dataset
+                .create_index(
+                    &["json"],
+                    IndexType::Scalar,
+                    Some("json_idx".into()),
+                    &params,
+                    false,
+                )
+                .await
+                .unwrap();
+            dataset
+        }
+
+        /// Every word answered with the JSON index enabled equals the plain
+        /// scan, and the plan uses the index exactly when `indexed`.
+        async fn assert_json_over_fm_matches_scan(dataset: &Dataset, indexed: bool) {
+            let mut scan = dataset.scan();
+            scan.filter("contains(json_get_string(json, 'val'), 'pear')")
+                .unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert_eq!(plan.contains("ScalarIndexQuery"), indexed, "{plan}");
+            for (i, word) in JSON_FM_WORDS.iter().enumerate() {
+                let predicate = format!("contains(json_get_string(json, 'val'), '{word}')");
+                let expected: Vec<i32> = if i == 1 { vec![] } else { vec![i as i32] };
+                assert_eq!(
+                    values_with(dataset, &predicate, false).await,
+                    expected,
+                    "scan for {predicate}"
+                );
+                assert_eq!(
+                    values_with(dataset, &predicate, true).await,
+                    expected,
+                    "indexed result for {predicate}"
+                );
+            }
+        }
+
+        /// A JSON-path segment whose FM target cannot translate in batches is
+        /// excluded from a tagged history rather than granted coverage the
+        /// loader would refuse: queries scan, and remap skips it.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn json_segment_over_fm_target_is_excluded_under_a_tagged_history() {
+            use crate::index::frag_reuse::{MissingCoverageReason, segment_coverage_reason};
+
+            let mut dataset = json_over_fm_dataset().await;
+            dataset.delete("i = 1").await.unwrap();
+            assert_json_over_fm_matches_scan(&dataset, true).await;
+
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let before = stored_index(&dataset, "json_idx").await;
+            assert_eq!(
+                segment_coverage_reason(&dataset, &before).await.unwrap(),
+                Some(MissingCoverageReason::Unsupported)
+            );
+            assert!(
+                dataset
+                    .load_index_by_name("json_idx")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "an untranslatable segment is not listed"
+            );
+            assert_json_over_fm_matches_scan(&dataset, false).await;
+
+            let version = dataset.version().version;
+            remap_column_index(&mut dataset, &["json"], Some("json_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset.version().version,
+                version,
+                "remap skips the segment"
+            );
+            let after = stored_index(&dataset, "json_idx").await;
+            assert_eq!(after.uuid, before.uuid);
+            assert_json_over_fm_matches_scan(&dataset, false).await;
+        }
     }
 
     #[test]

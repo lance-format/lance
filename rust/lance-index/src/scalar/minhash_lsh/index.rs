@@ -76,6 +76,12 @@ pub(super) struct SignatureChunk {
     signatures: Vec<SignatureValue>,
 }
 
+impl SignatureChunk {
+    fn signature(&self, offset: usize, num_hashes: usize) -> &[SignatureValue] {
+        &self.signatures[offset * num_hashes..(offset + 1) * num_hashes]
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SignatureChunkKey {
     chunk: u32,
@@ -120,7 +126,11 @@ pub struct MinHashLshIndex {
     /// buckets not yet walked to their end.
     pub(super) window_pages: usize,
     cache: WeakLanceCache,
+    /// Legacy synchronous remapper (v0 histories). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
 impl std::fmt::Debug for MinHashLshIndex {
@@ -191,6 +201,34 @@ impl MinHashLshIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        Self::open(store, details, frag_reuse_index, None, cache).await
+    }
+
+    /// Open a segment whose stored row ids are translated through
+    /// `batch_remapper` (a tagged history) as they are read: per candidate
+    /// batch when a search scores them, per signature batch when a rebuild
+    /// carries them into a new segment.
+    pub async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        details: &prost_types::Any,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        Self::open(store, details, None, batch_remapper, cache).await
+    }
+
+    async fn open(
+        store: Arc<dyn IndexStore>,
+        details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        if frag_reuse_index.is_some() && batch_remapper.is_some() {
+            return Err(Error::internal(
+                "MinHash LSH segment opened with both a legacy and a batch row id remapper",
+            ));
+        }
         let params = MinHashLshIndexParams::from_details_any(details)?;
         let (bands, signatures) = futures::try_join!(
             store.open_index_file(BANDS_FILENAME),
@@ -265,6 +303,7 @@ impl MinHashLshIndex {
             window_pages: (rows_per_batch(BAND_ROW_BYTES) / page_rows).max(1),
             cache: WeakLanceCache::from(cache),
             frag_reuse_index,
+            batch_remapper,
         }))
     }
 
@@ -282,6 +321,7 @@ impl MinHashLshIndex {
             reader: self.signatures.clone(),
             num_docs: self.num_docs,
             frag_reuse_index: self.frag_reuse_index.clone(),
+            batch_remapper: self.batch_remapper.clone(),
             transform,
         }
     }
@@ -685,6 +725,7 @@ impl MinHashLshIndex {
             query,
             mask,
             remapper: self.frag_reuse_index.as_deref(),
+            batch_remapper: self.batch_remapper.as_deref(),
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
         let missing = scorer.hits.missing();
@@ -831,6 +872,9 @@ impl MinHashLshIndex {
         let num_hashes = self.params.num_hashes as usize;
         let chunk_docs = self.signature_chunk_docs;
         metrics.record_comparisons(doc_ids.len());
+        // Under a remapper, resident rows wait for one translation of the batch.
+        let mut resident_rows: Vec<(Arc<SignatureChunk>, Vec<usize>)> = Vec::new();
+        let mut stored: Vec<u64> = Vec::new();
         let mut pending: Vec<u32> = Vec::new();
         let mut start = 0;
         while start < doc_ids.len() {
@@ -853,18 +897,34 @@ impl MinHashLshIndex {
             };
             metrics.record_index_cache_hit();
             let first_doc = chunk * chunk_docs;
+            let mut offsets = Vec::new();
             for &doc_id in group {
                 let offset = doc_id as usize - first_doc;
-                let Some(row_id) = resident.row_ids.get(offset) else {
+                let Some(&row_id) = resident.row_ids.get(offset) else {
                     return Err(Error::corrupt_file_named(
                         SIGNATURES_FILENAME,
                         format!("resident signature chunk {chunk} has no doc {doc_id}"),
                     ));
                 };
-                scorer.score(
-                    *row_id,
-                    &resident.signatures[offset * num_hashes..(offset + 1) * num_hashes],
-                );
+                if scorer.translates() {
+                    stored.push(row_id);
+                    offsets.push(offset);
+                } else {
+                    scorer.score(row_id, resident.signature(offset, num_hashes));
+                }
+            }
+            if !offsets.is_empty() {
+                resident_rows.push((resident, offsets));
+            }
+        }
+        if !stored.is_empty() {
+            let mut translated = scorer.translate(&stored).await?.into_iter();
+            for (resident, offsets) in &resident_rows {
+                for &offset in offsets {
+                    if let Some(row_id) = translated.next().flatten() {
+                        scorer.score(row_id, resident.signature(offset, num_hashes));
+                    }
+                }
             }
         }
         if pending.is_empty() {
@@ -890,14 +950,9 @@ impl MinHashLshIndex {
             ));
         }
         let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
-        for (row_id, signature) in row_ids
-            .values()
-            .iter()
-            .zip(signatures.chunks_exact(num_hashes))
-        {
-            scorer.score(*row_id, signature);
-        }
-        Ok(())
+        scorer
+            .score_stored(row_ids.values(), signatures.chunks_exact(num_hashes))
+            .await
     }
 
     /// Score the rest of level `shared` by walking the buckets and the
@@ -932,24 +987,41 @@ impl MinHashLshIndex {
         while let Some(batch) = stream.try_next().await? {
             let end_row = first_row + batch.num_rows();
             let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
+            let signature =
+                |offset: usize| &signatures[offset * num_hashes..(offset + 1) * num_hashes];
+            // Under a remapper the batch is scored after the walk, between stop checks.
+            let mut offsets = Vec::new();
             let mut scored = 0;
+            let mut level_exhausted = false;
             while (pending as usize) < end_row {
                 let offset = pending as usize - first_row;
-                scorer.score(
-                    row_ids.value(offset),
-                    &signatures[offset * num_hashes..(offset + 1) * num_hashes],
-                );
+                if scorer.translates() {
+                    offsets.push(offset);
+                } else {
+                    scorer.score(row_ids.value(offset), signature(offset));
+                }
                 scored += 1;
                 match self.next_in_level(scan, shared, metrics).await? {
                     Some(doc_id) => pending = doc_id,
                     None => {
-                        metrics.record_comparisons(scored);
-                        return Ok(());
+                        level_exhausted = true;
+                        break;
+                    }
+                }
+            }
+            if !offsets.is_empty() {
+                let stored: Vec<u64> = offsets
+                    .iter()
+                    .map(|&offset| row_ids.value(offset))
+                    .collect();
+                for (&offset, row_id) in offsets.iter().zip(scorer.translate(&stored).await?) {
+                    if let Some(row_id) = row_id {
+                        scorer.score(row_id, signature(offset));
                     }
                 }
             }
             metrics.record_comparisons(scored);
-            if scorer.done(floor) {
+            if level_exhausted || scorer.done(floor) {
                 return Ok(());
             }
             first_row = end_row;
@@ -1049,17 +1121,46 @@ struct Scorer<'a> {
     query: &'a [SignatureValue],
     mask: &'a RowAddrMask,
     remapper: Option<&'a dyn RowIdRemapper>,
+    batch_remapper: Option<&'a dyn BatchRowIdRemapper>,
 }
 
 impl Scorer<'_> {
+    /// Whether stored row ids must be translated before they are scored.
+    fn translates(&self) -> bool {
+        self.remapper.is_some() || self.batch_remapper.is_some()
+    }
+
+    /// The current row id of each stored candidate row id, `None` for a
+    /// row the deferred compactions deleted: see
+    /// [`translate_stored_row_ids`]. Only called when [`Self::translates`].
+    async fn translate(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        translate_stored_row_ids(row_ids, self.remapper, self.batch_remapper).await
+    }
+
+    /// Score `stored` row ids paired with `signatures`: as they are without
+    /// a remapper, otherwise after one translation of them all.
+    async fn score_stored<'s>(
+        &mut self,
+        stored: &[u64],
+        signatures: impl Iterator<Item = &'s [SignatureValue]>,
+    ) -> Result<()> {
+        if !self.translates() {
+            for (&row_id, signature) in stored.iter().zip(signatures) {
+                self.score(row_id, signature);
+            }
+            return Ok(());
+        }
+        for (row_id, signature) in self.translate(stored).await?.into_iter().zip(signatures) {
+            if let Some(row_id) = row_id {
+                self.score(row_id, signature);
+            }
+        }
+        Ok(())
+    }
+
+    /// Score one candidate by its current row id; a row the mask does not
+    /// select is skipped.
     fn score(&mut self, row_id: u64, signature: &[SignatureValue]) {
-        let row_id = match self.remapper {
-            Some(remapper) => match remapper.remap_row_id(row_id) {
-                Some(row_id) => row_id,
-                None => return,
-            },
-            None => row_id,
-        };
         if !self.mask.selected(row_id) {
             return;
         }

@@ -146,7 +146,7 @@ pub(super) async fn segment_supports_batch_remapping(
     Ok(super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
         .get_plugin_by_details(details)
         .ok()
-        .map(|plugin| plugin.supports_batch_row_id_remapping()))
+        .map(|plugin| plugin.supports_batch_row_id_remapping_for(details)))
 }
 
 /// One segment's derived query-time inputs from the coverage backtrack.
