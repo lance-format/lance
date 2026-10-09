@@ -805,12 +805,20 @@ impl DatasetBuilder {
             (base_path, table_uri)
         };
 
+        // A delayed checkout resolves (branch, version) against the right chain
+        // afterwards, so the uri's chain only needs its latest version here: the
+        // requested version number may not exist on that chain at all.
+        let load_version = if need_delay_checkout {
+            None
+        } else {
+            version_number
+        };
         let dataset = Self::load_by_uri(
             session,
             manifest,
             file_reader_options,
             table_uri,
-            version_number,
+            load_version,
             object_store,
             base_path,
             commit_handler,
@@ -840,7 +848,10 @@ impl DatasetBuilder {
                 version_number = Some(tag_content.version);
             }
 
-            if branch.as_deref() != dataset.manifest.branch.as_deref() {
+            let branch_differs = branch.as_deref() != dataset.manifest.branch.as_deref();
+            let version_differs =
+                version_number.is_some() && version_number != Some(dataset.manifest.version);
+            if branch_differs || version_differs {
                 return dataset
                     .checkout_version((branch.as_deref(), version_number))
                     .await;

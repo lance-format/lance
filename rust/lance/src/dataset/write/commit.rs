@@ -13,7 +13,7 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
+use crate::io::commit::default_commit_retry_timeout;
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -54,6 +54,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Set only by `Dataset::deep_clone`, after it has copied the source files.
+    deep_clone_files_copied: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -73,11 +75,12 @@ impl<'a> CommitBuilder<'a> {
             session: None,
             detached: false,
             commit_config: Default::default(),
-            retry_timeout: DEFAULT_COMMIT_RETRY_TIMEOUT,
+            retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            deep_clone_files_copied: false,
         }
     }
 
@@ -277,6 +280,17 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Mark this commit as the last step of [`Dataset::deep_clone`], which has
+    /// already copied the source's data, deletion and index files to the
+    /// destination.
+    ///
+    /// A deep `Operation::Clone` points every file at the destination but the
+    /// commit itself copies nothing, so it is rejected unless this is set.
+    pub(crate) fn with_deep_clone_files_copied(mut self) -> Self {
+        self.deep_clone_files_copied = true;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -304,6 +318,21 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        if matches!(
+            transaction.operation,
+            Operation::Clone {
+                is_shallow: false,
+                ..
+            }
+        ) && !self.deep_clone_files_copied
+        {
+            return Err(Error::invalid_input(
+                "A deep Clone cannot be committed directly: the commit does not copy the \
+                 source files, so the new dataset would reference files that do not exist. \
+                 Use deep_clone instead.",
+            ));
+        }
+
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -468,13 +497,14 @@ impl<'a> CommitBuilder<'a> {
             commit_new_dataset(
                 object_store.as_ref(),
                 source_store.as_deref(),
-                commit_handler.as_ref(),
+                &commit_handler,
                 &base_path,
+                &dest.uri(),
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
-                session.store_registry(),
+                session.clone(),
             )
             .await?
         };
@@ -596,6 +626,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
     use lance_table::format::{
@@ -608,7 +639,7 @@ mod tests {
 
     use crate::utils::test::ThrottledStoreWrapper;
 
-    use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
 
     use super::*;
 
@@ -889,8 +920,11 @@ mod tests {
     #[test]
     fn test_commit_retry_timeout_default_is_thirty_seconds() {
         let builder = CommitBuilder::new("memory://default-retry-timeout");
-        assert_eq!(builder.retry_timeout, DEFAULT_COMMIT_RETRY_TIMEOUT);
-        assert_eq!(DEFAULT_COMMIT_RETRY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(builder.retry_timeout, default_commit_retry_timeout());
+        assert_eq!(
+            crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT,
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]
@@ -918,6 +952,61 @@ mod tests {
         assert!(
             matches!(res, Err(Error::InvalidInput { .. })),
             "got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_deep_clone_requires_deep_clone_api() {
+        let source_dir = TempStrDir::default();
+        let source = InsertBuilder::new(source_dir.as_str())
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let clone_txn = |is_shallow| {
+            Transaction::new(
+                source.manifest.version,
+                Operation::Clone {
+                    is_shallow,
+                    ref_name: None,
+                    ref_version: source.manifest.version,
+                    ref_path: source.uri().to_string(),
+                    branch_name: None,
+                },
+                None,
+            )
+        };
+
+        // Committed directly, a deep clone would reference files never copied
+        // to the destination.
+        let deep_dir = TempStrDir::default();
+        let res = CommitBuilder::new(deep_dir.as_str())
+            .execute(clone_txn(false))
+            .await;
+        assert!(
+            matches!(res, Err(Error::InvalidInput { .. })),
+            "got {res:?}"
+        );
+        assert!(Dataset::open(deep_dir.as_str()).await.is_err());
+
+        // A shallow clone reads the source files in place, so it stays allowed.
+        let shallow_dir = TempStrDir::default();
+        let shallow = CommitBuilder::new(shallow_dir.as_str())
+            .execute(clone_txn(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            shallow.scan().try_into_batch().await.unwrap().num_rows(),
+            10
         );
     }
 
@@ -1073,6 +1162,119 @@ mod tests {
             matches!(&error, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
             "got {error:?}"
         );
+    }
+
+    /// Loses the first commit race without writing anything, then commits
+    /// through the wrapped handler.
+    #[derive(Debug)]
+    struct ConflictOnceCommitHandler {
+        inner: Arc<dyn CommitHandler>,
+        conflicted: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for ConflictOnceCommitHandler {
+        fn is_version_not_found_definitive(&self) -> bool {
+            self.inner.is_version_not_found_definitive()
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<TableTransaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            if !self
+                .conflicted
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CommitError::CommitConflict);
+            }
+            self.inner
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    /// A commit that starts far behind the latest version must not spend its
+    /// conflict-retry budget catching up. Every listing is slow here, so
+    /// catching up alone outlasts `retry_timeout`; the first attempt then
+    /// loses a race, and the retry must still get to run and succeed.
+    #[tokio::test]
+    async fn test_commit_retry_timeout_excludes_initial_catch_up() {
+        let catch_up_latency = Duration::from_millis(400);
+        let retry_timeout = Duration::from_millis(300);
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: catch_up_latency,
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = || {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+            )
+            .unwrap()
+        };
+        let stale = Arc::new(
+            InsertBuilder::new("memory://retry-after-catch-up")
+                .with_params(&write_params)
+                .execute(vec![batch()])
+                .await
+                .unwrap(),
+        );
+        // Versions committed by another writer after `stale` was read.
+        let mut latest = stale.clone();
+        for _ in 0..3 {
+            latest = Arc::new(
+                InsertBuilder::new(latest.clone())
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Append,
+                        ..write_params.clone()
+                    })
+                    .execute(vec![batch()])
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(latest.manifest.version, 4);
+
+        let committed = CommitBuilder::new(stale.clone())
+            .with_commit_handler(Arc::new(ConflictOnceCommitHandler {
+                inner: stale.commit_handler.clone(),
+                conflicted: std::sync::atomic::AtomicBool::new(false),
+            }))
+            .with_retry_timeout(retry_timeout)
+            .with_timeout(None)
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(committed.manifest.version, 5);
     }
 
     #[tokio::test]

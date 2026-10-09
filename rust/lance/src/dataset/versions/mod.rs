@@ -49,12 +49,24 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::utils::SchemaAdapter;
 use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
 };
+
+/// Keep per-operation targets within the dataset's existing reader family.
+pub fn validate_write_version(
+    default_version: ConcreteFileVersion,
+    target: ConcreteFileVersion,
+) -> Result<()> {
+    if (default_version == ConcreteFileVersion::V1) != (target == ConcreteFileVersion::V1) {
+        return Err(Error::invalid_input(format!(
+            "Cannot write data files in version {target} to a dataset with default version {default_version}: V1 and V2 storage versions cannot be mixed"
+        )));
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_scan_stream(
@@ -113,9 +125,9 @@ fn create_current_file_writer(
     schema: Schema,
     filename: String,
     base_id: Option<u32>,
+    options: FileWriterOptions,
 ) -> Result<(FileWriter, DataFile)> {
-    let writer =
-        file_versions::create_writer(version, object_writer, schema, FileWriterOptions::default())?;
+    let writer = file_versions::create_writer(version, object_writer, schema, options)?;
     let mut data_file = DataFile::new_unstarted(filename, version);
     data_file.base_id = base_id;
     Ok((writer, data_file))
@@ -132,14 +144,28 @@ pub async fn write_fragments(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    // A writer that spills row lineage into the fragment's own data file
+    // carries the hidden columns in its stream. They are not dataset fields:
+    // set them aside before the schema is checked against the dataset's and
+    // put them back on the schema that is written. This has to come before
+    // the blob promotion, which gives every negative field id a new one.
+    let (normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    let normalized_schema = match version {
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            write::promote_legacy_blob_schema(&normalized_schema)?
+        }
+        _ => normalized_schema,
+    };
     let version_name = format!("{version:?}");
-    let schema = write::prepare_write_schema(
+    let mut schema = write::prepare_write_schema(
         dataset,
         normalized_schema,
         &params,
         schema_compare_options(version),
     )?;
+    schema.fields.extend(lineage_fields);
     match version {
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::validate_legacy_blob_write_schema(&schema, &version_name)?;
@@ -160,9 +186,45 @@ pub async fn write_fragments(
         target_bases_info,
         seed_writers,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await?;
     Ok((fragments, schema))
+}
+
+/// Take the hidden row lineage columns out of a write schema.
+///
+/// A hidden column is a top-level field that already carries the reserved id
+/// of its name, as the writers that spill lineage into a data file assign it.
+/// A user column that only shares the name has a non-negative id and stays a
+/// user column, to be checked against the dataset schema like any other.
+fn split_row_lineage_fields(schema: Schema) -> Result<(Schema, Vec<Field>)> {
+    let (lineage, user): (Vec<_>, Vec<_>) = schema
+        .fields
+        .into_iter()
+        .partition(|field| lance_core::row_lineage_field_id(&field.name) == Some(field.id));
+    // The readers decode these columns as non-nullable `UInt64`, whatever the
+    // written type, so any other type would only fail once read back.
+    if let Some(field) = lineage
+        .iter()
+        .find(|field| field.nullable || field.data_type() != DataType::UInt64)
+    {
+        return Err(Error::internal(format!(
+            "hidden row lineage column {} (field id {}) must be a non-nullable UInt64, got \
+             {} (nullable: {})",
+            field.name,
+            field.id,
+            field.data_type(),
+            field.nullable
+        )));
+    }
+    Ok((
+        Schema {
+            fields: user,
+            metadata: schema.metadata,
+        },
+        lineage,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,9 +239,8 @@ pub async fn write_fragments_direct(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>> {
-    let adapter = SchemaAdapter::new(data.schema());
-    let data = adapter.to_physical_stream(data);
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
         if file_row_counts.contains(&0) {
             return Err(Error::invalid_input(
@@ -241,13 +302,14 @@ pub async fn write_fragments_direct(
         target_bases_info,
         seed_writers,
         file_row_counts,
+        preassigned_data_file_name,
     )
     .await
 }
 
 fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
     for fragment in fragments {
-        for data_file in &fragment.files {
+        for data_file in fragment.referenced_lance_files() {
             if data_file.file_version()? != expected {
                 return Ok(false);
             }
@@ -539,10 +601,18 @@ pub async fn write_fragment(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
+            let file_writer_options = builder.file_writer_options();
             builder
                 .write_current_impl(
                     move |object_writer, schema, filename| {
-                        create_current_file_writer(version, object_writer, schema, filename, None)
+                        create_current_file_writer(
+                            version,
+                            object_writer,
+                            schema,
+                            filename,
+                            None,
+                            file_writer_options,
+                        )
                     },
                     stream,
                     schema,
@@ -566,8 +636,15 @@ pub async fn open_writer(
         }
         ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::open_current_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
+                move |object_writer, schema, filename, base_id, options| {
+                    create_current_file_writer(
+                        version,
+                        object_writer,
+                        schema,
+                        filename,
+                        base_id,
+                        options,
+                    )
                 },
                 object_store,
                 schema,
@@ -577,16 +654,36 @@ pub async fn open_writer(
             .await
         }
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            write::open_current_blob_v2_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
-                },
-                object_store,
-                schema,
-                base_dir,
-                options,
-            )
-            .await
+            let create_file_writer = move |object_writer, schema, filename, base_id, options| {
+                create_current_file_writer(
+                    version,
+                    object_writer,
+                    schema,
+                    filename,
+                    base_id,
+                    options,
+                )
+            };
+            if schema.fields_pre_order().any(Field::is_blob_v2) {
+                write::open_current_blob_v2_writer(
+                    version,
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            } else {
+                write::open_current_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            }
         }
     }
 }
@@ -604,16 +701,17 @@ pub async fn open_update_writer(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    let options = WriterOptions::update(
+        dataset.session.store_registry(),
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    );
     open_writer(
         version,
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(
-            dataset.session.store_registry(),
-            external_base_resolver,
-            allow_external_blob_outside_bases,
-        ),
+        options,
     )
     .await
 }
@@ -782,6 +880,7 @@ fn is_upcast_downcast_impl(
 
 pub fn validate_nulls(
     version: ConcreteFileVersion,
+    column_name: &str,
     datatype: &DataType,
     has_nulls: bool,
 ) -> Result<()> {
@@ -800,8 +899,8 @@ pub fn validate_nulls(
     };
     if has_nulls && !supported {
         return Err(Error::invalid_input(format!(
-            "Join produced null values for type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
-            datatype, version
+            "Column '{}' has null values of type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
+            column_name, datatype, version
         )));
     }
     Ok(())
@@ -1033,5 +1132,50 @@ pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_ID_FIELD_ID};
+    use rstest::rstest;
+
+    fn lance_field(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+        let mut field = Field::try_from(&ArrowField::new(name, data_type, nullable)).unwrap();
+        field.id = id;
+        field
+    }
+
+    #[rstest]
+    #[case::uint64(DataType::UInt64, false, true)]
+    #[case::not_uint64(DataType::Int64, false, false)]
+    #[case::nullable(DataType::UInt64, true, false)]
+    fn split_row_lineage_fields_keys_on_reserved_ids(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] valid: bool,
+    ) {
+        let key = lance_field("i", DataType::Int32, false, 0);
+        // A user column that only shares a lineage column's name keeps its own
+        // id, so it stays with the fields checked against the dataset schema.
+        let named_like_lineage = lance_field(ROW_CREATED_AT_VERSION, DataType::UInt64, true, 1);
+        let hidden = lance_field(ROW_ID, data_type, nullable, ROW_ID_FIELD_ID);
+        let schema = Schema {
+            fields: vec![key.clone(), named_like_lineage.clone(), hidden.clone()],
+            metadata: HashMap::new(),
+        };
+
+        let result = split_row_lineage_fields(schema);
+        if !valid {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Internal { .. }), "{error}");
+            assert!(error.to_string().contains("non-nullable UInt64"), "{error}");
+            return;
+        }
+        let (user, lineage) = result.unwrap();
+        assert_eq!(user.fields, vec![key, named_like_lineage]);
+        // Split out with its reserved id intact.
+        assert_eq!(lineage, vec![hidden]);
     }
 }

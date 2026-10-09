@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::ScalarPredicate;
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// ExecutionPlan node that queries BTree index with visibility filtering.
@@ -149,7 +150,8 @@ impl BTreeIndexExec {
                 let mut results = Vec::new();
                 let snapshot = index.snapshot();
 
-                for (key, positions) in snapshot {
+                // Null keys sort first but are in no range.
+                for (key, positions) in snapshot.into_iter().filter(|(key, _)| !key.0.is_null()) {
                     let in_range = match (lower, upper) {
                         (Some(l), Some(u)) => &key.0 >= l && &key.0 < u,
                         (Some(l), None) => &key.0 >= l,
@@ -228,6 +230,7 @@ impl BTreeIndexExec {
         let mut results = Vec::new();
         for (batch_id, rows_with_positions) in batches_to_rows {
             if let Some(stored) = self.batch_store.get(batch_id) {
+                let data = scan_record_batch(&stored.data)?;
                 // Extract row indices and row positions
                 let row_indices: Vec<u32> = rows_with_positions
                     .iter()
@@ -241,24 +244,29 @@ impl BTreeIndexExec {
                 // Use take to select specific rows
                 let indices = arrow_array::UInt32Array::from(row_indices);
 
-                let columns: std::result::Result<Vec<_>, datafusion::error::DataFusionError> =
-                    stored
-                        .data
-                        .columns()
-                        .iter()
-                        .map(|col| {
-                            arrow_select::take::take(col.as_ref(), &indices, None).map_err(|e| {
-                                datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                            })
+                let columns: std::result::Result<Vec<_>, datafusion::error::DataFusionError> = data
+                    .columns()
+                    .iter()
+                    .map(|col| {
+                        arrow_select::take::take(col.as_ref(), &indices, None).map_err(|e| {
+                            datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
                         })
-                        .collect();
+                    })
+                    .collect();
 
                 let columns = columns?;
 
                 // Apply projection
+                let source_schema = data.schema();
                 let mut final_columns: Vec<Arc<dyn arrow_array::Array>> =
                     if let Some(ref proj_indices) = self.projection {
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect()
+                        take_projected_columns(
+                            &columns,
+                            source_schema.fields(),
+                            proj_indices,
+                            self.output_schema.as_ref(),
+                            row_positions.len(),
+                        )?
                     } else {
                         columns
                     };
@@ -355,7 +363,7 @@ impl ExecutionPlan for BTreeIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 

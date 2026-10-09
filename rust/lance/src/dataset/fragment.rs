@@ -48,10 +48,10 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
@@ -65,13 +65,14 @@ use roaring::RoaringBitmap;
 use self::write::FragmentCreateBuilder;
 
 use super::hash_joiner::HashJoiner;
-use super::rowids::load_row_id_sequence;
+use super::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
 use super::scanner::Scanner;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
+use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
@@ -307,9 +308,121 @@ impl GenericFileReader for V1Reader {
 }
 
 mod v2_adapter {
+    use arrow_array::{ArrayRef, GenericListArray, OffsetSizeTrait, cast::AsArray};
+    use lance_core::datatypes::{
+        BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_FIELDS, BlobKind, Field as LanceField,
+    };
     use lance_encoding::decoder::FilterExpression;
 
     use super::*;
+
+    /// Request the original descriptor layout from an older file. Adaptation belongs at
+    /// the dataset boundary so the released file readers retain their original behavior.
+    pub(super) fn legacy_blob_read_schema(schema: &Schema) -> Schema {
+        fn adapt(field: &mut LanceField) {
+            if field.is_blob_v2() {
+                field.metadata.remove(lance_arrow::ARROW_EXT_NAME_KEY);
+                field
+                    .metadata
+                    .insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+                field.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+                field.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            } else {
+                for child in &mut field.children {
+                    adapt(child);
+                }
+            }
+        }
+        let mut schema = schema.clone();
+        for field in &mut schema.fields {
+            adapt(field);
+        }
+        schema
+    }
+
+    /// A legacy payload is an Inline Blob v2 extent in the same data file. Normalize
+    /// before batches from different file versions are concatenated or materialized.
+    fn normalize_legacy_blob_batch(batch: RecordBatch, schema: &Schema) -> Result<RecordBatch> {
+        fn adapt(array: &ArrayRef, field: &LanceField) -> Result<ArrayRef> {
+            if field.is_blob_v2() {
+                let descriptors = array.as_struct();
+                let positions = descriptors.column(0).as_primitive::<UInt64Type>();
+                let sizes = descriptors.column(1).as_primitive::<UInt64Type>();
+                let valid = (0..array.len())
+                    .map(|i| {
+                        descriptors.is_valid(i)
+                            && positions.is_valid(i)
+                            && sizes.is_valid(i)
+                            && !(sizes.value(i) == 0 && positions.value(i) != 0)
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Arc::new(StructArray::try_new(
+                    BLOB_V2_DESC_FIELDS.clone(),
+                    vec![
+                        Arc::new(arrow_array::UInt8Array::from(vec![
+                            BlobKind::Inline as u8;
+                            array.len()
+                        ])),
+                        Arc::new(arrow_array::UInt64Array::new(
+                            positions.values().clone(),
+                            None,
+                        )),
+                        Arc::new(arrow_array::UInt64Array::new(sizes.values().clone(), None)),
+                        Arc::new(arrow_array::UInt32Array::from(vec![0; array.len()])),
+                        Arc::new(arrow_array::StringArray::from(vec![""; array.len()])),
+                    ],
+                    Some(arrow_buffer::NullBuffer::from(valid)),
+                )?));
+            }
+            match field.data_type() {
+                DataType::Struct(_) => {
+                    let values = array.as_struct();
+                    let columns = values
+                        .columns()
+                        .iter()
+                        .zip(&field.children)
+                        .map(|(array, field)| adapt(array, field))
+                        .collect::<Result<Vec<_>>>()?;
+                    let fields = field
+                        .children
+                        .iter()
+                        .map(ArrowField::from)
+                        .collect::<Vec<_>>();
+                    Ok(Arc::new(StructArray::try_new(
+                        fields.into(),
+                        columns,
+                        values.nulls().cloned(),
+                    )?))
+                }
+                DataType::List(_) => adapt_list::<i32>(array, field),
+                DataType::LargeList(_) => adapt_list::<i64>(array, field),
+                _ => Ok(array.clone()),
+            }
+        }
+        fn adapt_list<O: OffsetSizeTrait>(
+            array: &ArrayRef,
+            field: &LanceField,
+        ) -> Result<ArrayRef> {
+            let list = array.as_list::<O>();
+            let child = &field.children[0];
+            Ok(Arc::new(GenericListArray::<O>::try_new(
+                Arc::new(ArrowField::from(child)),
+                list.offsets().clone(),
+                adapt(list.values(), child)?,
+                list.nulls().cloned(),
+            )?))
+        }
+        let columns = batch
+            .columns()
+            .iter()
+            .zip(&schema.fields)
+            .map(|(array, field)| adapt(array, field))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(
+            Arc::new(ArrowSchema::from(schema)),
+            columns,
+        )?)
+    }
 
     #[derive(Debug, Clone)]
     pub struct Reader {
@@ -336,37 +449,69 @@ mod v2_adapter {
                 file_scheduler,
             }
         }
+        async fn read_tasks(
+            &self,
+            reader: &ProjectedFileReader,
+            params: ReadBatchParams,
+            batch_size: u32,
+            output_schema: Arc<Schema>,
+        ) -> Result<ReadBatchTaskStream> {
+            let has_legacy_blobs = matches!(
+                reader.version(),
+                ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
+            ) && output_schema
+                .fields_pre_order()
+                .any(|field| field.is_blob_v2());
+            let physical_schema = if has_legacy_blobs {
+                legacy_blob_read_schema(&output_schema)
+            } else {
+                output_schema.as_ref().clone()
+            };
+            let projection = file_versions::reader_projection_from_field_ids(
+                reader.version(),
+                &physical_schema,
+                self.field_id_to_column_idx.as_ref(),
+            )?;
+            Ok(reader
+                .read_tasks(
+                    params,
+                    batch_size,
+                    Some(projection),
+                    FilterExpression::no_filter(),
+                )
+                .await?
+                .map(move |task| {
+                    let output_schema = output_schema.clone();
+                    ReadBatchTask {
+                        task: async move {
+                            let batch = task.task.await?;
+                            if has_legacy_blobs {
+                                normalize_legacy_blob_batch(batch, &output_schema)
+                            } else {
+                                Ok(batch)
+                            }
+                        }
+                        .boxed(),
+                        num_rows: task.num_rows,
+                    }
+                })
+                .boxed())
+        }
     }
 
     impl GenericFileReader for Reader {
-        /// Reads the requested range of rows from the file, returning as a stream
         fn read_range_tasks(
             &self,
             range: Range<u64>,
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-            async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-                Ok(self
-                    .reader
-                    .read_tasks(
-                        ReadBatchParams::Range(range.start as usize..range.end as usize),
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
-            }
+            self.read_tasks(
+                &self.reader,
+                ReadBatchParams::Range(range.start as usize..range.end as usize),
+                batch_size,
+                projection,
+            )
             .boxed()
         }
 
@@ -376,27 +521,12 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-            async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-                Ok(self
-                    .reader
-                    .read_tasks(
-                        ReadBatchParams::Ranges(ranges),
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
-            }
+            self.read_tasks(
+                &self.reader,
+                ReadBatchParams::Ranges(ranges),
+                batch_size,
+                projection,
+            )
             .boxed()
         }
 
@@ -405,27 +535,12 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-            async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-                Ok(self
-                    .reader
-                    .read_tasks(
-                        ReadBatchParams::RangeFull,
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
-            }
+            self.read_tasks(
+                &self.reader,
+                ReadBatchParams::RangeFull,
+                batch_size,
+                projection,
+            )
             .boxed()
         }
 
@@ -438,12 +553,6 @@ mod v2_adapter {
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
             async move {
-                let projection = file_versions::reader_projection_from_field_ids(
-                    self.reader.version(),
-                    projection.as_ref(),
-                    self.field_id_to_column_idx.as_ref(),
-                )?;
-
                 let reader = if let Some(take_priority) = take_priority {
                     let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
                     let scheduler = self.file_scheduler.with_priority(op_priority);
@@ -454,20 +563,13 @@ mod v2_adapter {
                 } else {
                     self.reader.clone()
                 };
-
-                Ok(reader
-                    .read_tasks(
-                        ReadBatchParams::Indices(indices),
-                        batch_size,
-                        Some(projection),
-                        FilterExpression::no_filter(),
-                    )
-                    .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
-                    })
-                    .boxed())
+                self.read_tasks(
+                    &reader,
+                    ReadBatchParams::Indices(indices),
+                    batch_size,
+                    projection,
+                )
+                .await
             }
             .boxed()
         }
@@ -523,6 +625,23 @@ impl NullReader {
         Self { schema, num_rows }
     }
 
+    /// The Arrow schema of the placeholder batches for `projection`.
+    ///
+    /// When a nested child is added to an existing parent, the parent lands
+    /// here as well (all-null) even though the dataset schema may declare it
+    /// NOT NULL; the later merge with the data files rebuilds it from the
+    /// parent's real data. Mark the placeholder fields nullable so the batch
+    /// is not rejected for violating a constraint the merged result satisfies.
+    fn nullable_schema(projection: &Schema) -> Arc<ArrowSchema> {
+        let schema = ArrowSchema::from(projection);
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>();
+        Arc::new(ArrowSchema::new_with_metadata(fields, schema.metadata))
+    }
+
     fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> RecordBatch {
         let columns = projection
             .fields()
@@ -550,7 +669,7 @@ impl GenericFileReader for NullReader {
         projection: Arc<Schema>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
+        let projection = Self::nullable_schema(projection.as_ref());
 
         let task_iter = std::iter::from_fn(move || {
             if remaining_rows == 0 {
@@ -607,6 +726,76 @@ impl GenericFileReader for NullReader {
     }
 }
 
+/// A per-scan cache of `ScanScheduler`s for non-default bases.
+///
+/// Files that live on an additional base (e.g. shallow clones) each need a
+/// scheduler for their base's object store. Without this cache every opened
+/// base file builds its own scheduler, so the scheduler back-pressure budget
+/// scales with the number of files opened and can exhaust memory. Sharing one
+/// scheduler per base for the lifetime of a scan bounds that budget by the
+/// number of bases instead.
+///
+/// The cache lives on [`FragReadConfig`], so it shares the scan's lifetime and
+/// its `io_buffer_size` — matching the primary scheduler threaded in through
+/// [`FragReadConfig::scan_scheduler`] rather than a longer, dataset-wide scope.
+#[derive(Clone)]
+pub struct BaseSchedulers {
+    /// `None` sizes each scheduler for the max bandwidth of its base's store.
+    io_buffer_size: Option<u64>,
+    schedulers: Arc<std::sync::Mutex<HashMap<u32, Arc<ScanScheduler>>>>,
+}
+
+impl std::fmt::Debug for BaseSchedulers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseSchedulers")
+            .field("io_buffer_size", &self.io_buffer_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BaseSchedulers {
+    /// Create an empty cache whose schedulers will use `io_buffer_size`, the
+    /// same budget as the scan's primary scheduler.
+    pub fn new(io_buffer_size: u64) -> Self {
+        Self {
+            io_buffer_size: Some(io_buffer_size),
+            schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create an empty cache whose schedulers are sized for the max bandwidth
+    /// of their base's object store, for scans whose primary scheduler uses
+    /// [`SchedulerConfig::max_bandwidth`].
+    pub fn max_bandwidth() -> Self {
+        Self {
+            io_buffer_size: None,
+            schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Return the scheduler for `base_id`, building it once from `object_store`
+    /// and reusing it for every later file read from the same base.
+    fn get_or_create(&self, base_id: u32, object_store: Arc<ObjectStore>) -> Arc<ScanScheduler> {
+        let mut schedulers = self.schedulers.lock().unwrap();
+        schedulers
+            .entry(base_id)
+            .or_insert_with(|| {
+                let config = match self.io_buffer_size {
+                    Some(io_buffer_size) => SchedulerConfig::new(io_buffer_size),
+                    None => SchedulerConfig::max_bandwidth(&object_store),
+                };
+                ScanScheduler::new(object_store, config)
+            })
+            .clone()
+    }
+
+    /// Number of distinct bases a scheduler has been built for.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.schedulers.lock().unwrap().len()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FragReadConfig {
     // Add the row id column
@@ -632,6 +821,11 @@ pub struct FragReadConfig {
     pub reader_priority: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
+    /// Per-scan cache of schedulers for non-default bases.
+    ///
+    /// The scan sets this so every base file it opens shares one scheduler per
+    /// base. When absent, a base file falls back to building its own scheduler.
+    pub base_schedulers: Option<BaseSchedulers>,
 }
 
 impl FragReadConfig {
@@ -676,6 +870,11 @@ impl FragReadConfig {
         self.file_reader_options = Some(value);
         self
     }
+
+    pub fn with_base_schedulers(mut self, value: BaseSchedulers) -> Self {
+        self.base_schedulers = Some(value);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,7 +886,7 @@ pub(crate) enum MetadataMode {
 /// The first path in `fields` that names a sibling twice. Projection picks
 /// children by name, so a duplicate makes that choice arbitrary, and the
 /// name-set comparison the schema check uses cannot see one at all.
-fn duplicate_field_path(fields: &ArrowFields, path: &str) -> Option<String> {
+pub(crate) fn duplicate_field_path(fields: &ArrowFields, path: &str) -> Option<String> {
     let mut seen = HashSet::new();
     for field in fields {
         let qualified = if path.is_empty() {
@@ -718,10 +917,29 @@ fn duplicate_nested_path(data_type: &DataType, path: &str) -> Option<String> {
     }
 }
 
+/// Remove a staged file that will not be committed. Best effort: it is
+/// unreachable either way, and must not mask the error that caused it.
+pub(crate) async fn discard_staged_file(dataset: &Dataset, path: &Path) {
+    // Blob v2 spills sidecars into data/<file-stem>/ beside the file, and
+    // those are the large ones; leaving them is what makes a routine
+    // rejection expensive.
+    if let Some(stem) = path
+        .filename()
+        .and_then(|name| name.strip_suffix(".lance"))
+        .map(|stem| dataset.data_dir().join(stem))
+        && let Err(delete_error) = dataset.object_store.remove_dir_all(stem.clone()).await
+    {
+        log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
+    }
+    if let Err(delete_error) = dataset.object_store.delete(path).await {
+        log::warn!("failed to delete staged column file '{path}': {delete_error}");
+    }
+}
+
 /// `field` with nullability dropped at every level: the projector rebuilds
 /// arrays against its target and panics rather than reports on a constraint,
 /// so it gets a shape that cannot fail and the writer objects instead.
-fn relax_nullability(field: &ArrowField) -> ArrowField {
+pub(crate) fn relax_nullability(field: &ArrowField) -> ArrowField {
     let relax = |field: &Arc<ArrowField>| Arc::new(relax_nullability(field));
     let data_type = match field.data_type() {
         DataType::Struct(children) => DataType::Struct(children.iter().map(relax).collect()),
@@ -954,11 +1172,44 @@ impl FileFragment {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
 
-        let (opened_files, deletion_vec, row_id_sequence) =
-            join!(open_files, deletion_vec_load, row_id_load);
+        let version_load = |kind: RowVersionKind, wanted: bool| {
+            if wanted {
+                futures::future::Either::Left(load_row_version_sequence(
+                    &self.dataset,
+                    &self.metadata,
+                    kind,
+                ))
+            } else {
+                futures::future::Either::Right(futures::future::ready(Ok(None)))
+            }
+        };
+        let last_updated_at_load = version_load(
+            RowVersionKind::LastUpdatedAt,
+            read_config.with_row_last_updated_at_version,
+        );
+        let created_at_load = version_load(
+            RowVersionKind::CreatedAt,
+            read_config.with_row_created_at_version,
+        );
+
+        let (
+            opened_files,
+            deletion_vec,
+            row_id_sequence,
+            last_updated_at_sequence,
+            created_at_sequence,
+        ) = join!(
+            open_files,
+            deletion_vec_load,
+            row_id_load,
+            last_updated_at_load,
+            created_at_load
+        );
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
+        let last_updated_at_sequence = last_updated_at_sequence?;
+        let created_at_sequence = created_at_sequence?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -1001,10 +1252,10 @@ impl FileFragment {
             reader.with_row_address();
         }
         if read_config.with_row_last_updated_at_version {
-            reader.with_row_last_updated_at_version();
+            reader.with_row_last_updated_at_version(last_updated_at_sequence);
         }
         if read_config.with_row_created_at_version {
-            reader.with_row_created_at_version();
+            reader.with_row_created_at_version(created_at_sequence);
         }
 
         Ok(reader)
@@ -1171,13 +1422,19 @@ impl FileFragment {
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
         let (store_scheduler, reader_priority) = if let Some(base_id) = data_file.base_id {
-            // TODO: reuse the same scan scheduler for non-default bases
             let object_store = self.dataset.object_store(Some(base_id)).await?;
-            let config = SchedulerConfig::max_bandwidth(&object_store);
-            (
-                ScanScheduler::new(object_store, config),
-                read_config.reader_priority.unwrap_or(0),
-            )
+            // Reuse one scheduler per base for the scan's lifetime so the
+            // scheduler budget scales with the number of bases, not files. When
+            // there is no scan cache (a one-off read), fall back to a dedicated
+            // scheduler for this file.
+            let scheduler = match read_config.base_schedulers.as_ref() {
+                Some(cache) => cache.get_or_create(base_id, object_store),
+                None => ScanScheduler::new(
+                    object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&object_store),
+                ),
+            };
+            (scheduler, read_config.reader_priority.unwrap_or(0))
         } else if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
             (
                 scan_scheduler.clone(),
@@ -1208,9 +1465,17 @@ impl FileFragment {
                 }),
         ));
         let file_version = data_file.file_version()?;
+        let physical_schema = if matches!(
+            file_version,
+            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
+        ) {
+            v2_adapter::legacy_blob_read_schema(&schema_per_file)
+        } else {
+            schema_per_file.as_ref().clone()
+        };
         let reader_projection = file_versions::reader_projection_from_field_ids(
             file_version,
-            schema_per_file.as_ref(),
+            &physical_schema,
             field_id_to_column_idx.as_ref(),
         )?;
         let file_reader_options = read_config
@@ -1309,12 +1574,15 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
-            let mut opened_files = vec![];
-            for data_file in &self.metadata.files {
-                let reader = match metadata_mode {
+            // Each open is at least one object-store round trip for the file's
+            // metadata; a fragment with several data files (one per
+            // `add_columns` / merge) would otherwise pay them back to back.
+            // `try_join_all` keeps the readers in data-file order.
+            let opens = self.metadata.files.iter().map(|data_file| async move {
+                match metadata_mode {
                     MetadataMode::LazyAllowed => {
                         self.open_reader(data_file, Some(projection), read_config)
-                            .await?
+                            .await
                     }
                     MetadataMode::Full => {
                         self.open_reader_with_full_metadata(
@@ -1322,13 +1590,12 @@ impl FileFragment {
                             Some(projection),
                             read_config,
                         )
-                        .await?
+                        .await
                     }
-                };
-                if let Some(reader) = reader {
-                    opened_files.push(reader);
                 }
-            }
+            });
+            let mut opened_files: Vec<Box<dyn GenericFileReader>> =
+                try_join_all(opens).await?.into_iter().flatten().collect();
 
             // This should return immediately on modern datasets.  Need to use physical_rows because
             // deletions will be applied later
@@ -1487,7 +1754,10 @@ impl FileFragment {
     /// Verifies:
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
-    /// * All data files exist and have the same length
+    /// * All data files holding user data exist and have the same length. A
+    ///   file kept only for the spilled row lineage it carries is not opened;
+    ///   [`Dataset::validate`] reads that lineage back, which checks its
+    ///   length.
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
@@ -1497,9 +1767,11 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             let last = -1;
             for field_id in data_file.fields.iter() {
-                // A tombstone marks a field superseded by a later data file.
-                // It is not a field id: it has no ordering and can repeat.
-                if *field_id == TOMBSTONE_FIELD_ID {
+                // Negative ids are not schema fields: the tombstone marks a
+                // field superseded by a later data file, and the others are
+                // hidden system columns such as spilled row lineage. None has
+                // an ordering, and a tombstone can repeat.
+                if *field_id < 0 {
                     continue;
                 }
                 if *field_id <= last {
@@ -1552,7 +1824,29 @@ impl FileFragment {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
-        let get_lengths = self.metadata.files.iter().map(|data_file| async move {
+        // A file that holds no field of the dataset schema is not opened when
+        // it holds no user field at all, or when the fragment keeps it for a
+        // spilled row lineage sequence it carries -- a data file whose user
+        // columns were all dropped or replaced after compaction wrote the
+        // lineage next to them. The sequences it carries are checked against
+        // `physical_rows` when they are validated. Any other file is opened,
+        // so a file listing only user fields the schema does not have is
+        // still reported.
+        let schema_field_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        let spilled_field_ids = self.metadata.spilled_row_lineage_field_ids();
+        let user_data_files = self.metadata.files.iter().filter(|data_file| {
+            let fields = &data_file.fields;
+            let holds_schema_field = fields.iter().any(|id| schema_field_ids.contains(id));
+            let holds_user_field = fields.iter().any(|id| *id >= 0);
+            let holds_spilled_lineage = fields.iter().any(|id| spilled_field_ids.contains(id));
+            holds_schema_field || (holds_user_field && !holds_spilled_lineage)
+        });
+        let get_lengths = user_data_files.clone().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
                 .open_reader(data_file, None, &FragReadConfig::default())
@@ -1573,7 +1867,7 @@ impl FileFragment {
 
         let get_lengths = get_lengths?;
         let expected_length = get_lengths.first().unwrap_or(&0);
-        for (length, data_file) in get_lengths.iter().zip(self.metadata.files.iter()) {
+        for (length, data_file) in get_lengths.iter().zip(user_data_files) {
             if length != expected_length {
                 let path = self
                     .dataset
@@ -1781,6 +2075,7 @@ impl FileFragment {
                 projection,
                 stream.schema().as_ref(),
                 false,
+                false,
             )?);
             Ok(stream
                 .map(move |batch_result| {
@@ -1947,6 +2242,23 @@ impl FileFragment {
         batch_size: Option<u32>,
         blob_handling: Option<BlobHandling>,
     ) -> Result<Updater> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        self.updater_with_version(columns, schemas, batch_size, blob_handling, write_version)
+            .await
+    }
+
+    pub(crate) async fn updater_with_version<T: AsRef<str>>(
+        &self,
+        columns: Option<&[T]>,
+        schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
+        blob_handling: Option<BlobHandling>,
+        write_version: ConcreteFileVersion,
+    ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
@@ -1987,7 +2299,15 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size).await
+        Updater::try_new(
+            self.clone(),
+            reader,
+            deletion_vector,
+            schemas,
+            batch_size,
+            write_version,
+        )
+        .await
     }
 
     pub async fn merge_columns(
@@ -1995,7 +2315,6 @@ impl FileFragment {
         stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-        max_field_id: i32,
     ) -> Result<(Fragment, Schema)> {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
@@ -2030,7 +2349,8 @@ impl FileFragment {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(max_field_id));
+        // Use the same starting id as the updater so schema and data file ids match.
+        new_schema.set_field_id(Some(self.dataset.manifest.max_field_id()));
 
         let new_fragment = self
             .clone()
@@ -2095,7 +2415,7 @@ impl FileFragment {
         for field in write_schema.fields() {
             if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
                 return Err(Error::invalid_input(format!(
-                    "Column {} is a reversed metadata column and cannot be updated",
+                    "Column {} is a reserved metadata column and cannot be updated",
                     field.name()
                 )));
             }
@@ -2275,25 +2595,6 @@ impl FileFragment {
         ))
     }
 
-    /// Remove a staged file that will not be returned. Best effort: it is
-    /// unreachable either way, and must not mask the error that caused it.
-    async fn discard_staged_file(&self, path: &Path) {
-        // Blob v2 spills sidecars into data/<file-stem>/ beside the file, and
-        // those are the large ones; leaving them is what makes a routine
-        // rejection expensive.
-        if let Some(stem) = path
-            .filename()
-            .and_then(|name| name.strip_suffix(".lance"))
-            .map(|stem| self.dataset.data_dir().join(stem))
-            && let Err(delete_error) = self.dataset.object_store.remove_dir_all(stem.clone()).await
-        {
-            log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
-        }
-        if let Err(delete_error) = self.dataset.object_store.delete(path).await {
-            log::warn!("failed to delete staged column file '{path}': {delete_error}");
-        }
-    }
-
     /// Write new data for columns of this fragment as a standalone data file,
     /// without committing it, and return the
     /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup)
@@ -2325,74 +2626,51 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        self.write_column_with_version(data, schema, write_version)
+            .await
+    }
+
+    /// Write replacement column data using an exact V2 data file version.
+    ///
+    /// The input and commit requirements are the same as [`Self::write_columns`].
+    /// V1 targets and legacy datasets are not supported.
+    /// When the version differs from the manifest default, the commit that
+    /// publishes the returned replacement group derives the mixed-version
+    /// capability from its final manifest.
+    ///
+    /// ```
+    /// # use lance::{dataset::fragment::FileFragment, Result};
+    /// # use lance_core::datatypes::Schema;
+    /// # use lance_file::version::ConcreteFileVersion;
+    /// # async fn example(fragment: &FileFragment, batch: arrow_array::RecordBatch, schema: &Schema) -> Result<()> {
+    /// let replacement = fragment.write_column_with_version(
+    ///     futures::stream::iter([Ok(batch)]), schema, ConcreteFileVersion::V2_2,
+    /// ).await?;
+    /// // Commit the replacement with Operation::DataReplacement.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_column_with_version(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        write_version: ConcreteFileVersion,
+    ) -> Result<super::transaction::DataReplacementGroup> {
+        versions::validate_write_version(
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            write_version,
+        )?;
         let expected_rows = self.physical_rows().await? as u64;
 
-        // Readers take everything but the field id from the manifest, so a
-        // staged field reusing an id is decoded as the manifest's version rather
-        // than rejected. Compare full identity, not just the storage type.
-        let compare_options = SchemaCompareOptions {
-            compare_field_ids: true,
-            ..Default::default()
-        };
-        // Top-level requests match top-level manifest fields only: resolving an
-        // id from anywhere lets a caller reuse a field at a path the dataset
-        // never gave it, staging a file covering the borrowed field. Layout then
-        // comes from the manifest, since the metadata the identity check ignores
-        // -- packed structs, blob encoding -- decides physical field coverage.
-        let dataset_schema = self.dataset.schema();
-        let mut writer_fields = Vec::with_capacity(schema.fields.len());
-        let mut requested = HashSet::with_capacity(schema.fields.len());
-        for field in &schema.fields {
-            // The per-field identity check cannot see the request naming an
-            // id twice, and the set-based batch comparison downstream would
-            // match one batch column against both copies.
-            if !requested.insert(field.id) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names field id {} ('{}') more than once",
-                    self.id(),
-                    field.id,
-                    field.name
-                )));
-            }
-            if lance_core::is_system_column(&field.name) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names reserved column '{}'",
-                    self.id(),
-                    field.name
-                )));
-            }
-            let Some(existing) = dataset_schema
-                .fields
-                .iter()
-                .find(|existing| existing.id == field.id)
-            else {
-                // The commit path publishes data files, never schema, so a
-                // field the manifest does not define would commit as a file no
-                // live field answers for -- and a concurrent schema change
-                // could never be checked against it.
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names field id {} ('{}') that the dataset schema \
-                     does not define; declare the column with add_columns before staging its data",
-                    self.id(),
-                    field.id,
-                    field.name
-                )));
-            };
-            // `explain_difference` recurses, covering the whole subtree.
-            if let Some(difference) = field.explain_difference(existing, &compare_options) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} does not match dataset field id {}: {}",
-                    self.id(),
-                    field.id,
-                    difference
-                )));
-            }
-            writer_fields.push(existing.clone());
-        }
-        let writer_schema = Schema {
-            fields: writer_fields,
-            metadata: schema.metadata.clone(),
-        };
+        let writer_schema = self.resolve_writer_schema(schema)?;
         let batch_schema = ArrowSchema::from(&writer_schema);
         let projection_schema = ArrowSchema::new(
             batch_schema
@@ -2402,13 +2680,7 @@ impl FileFragment {
                 .collect::<Vec<_>>(),
         );
 
-        let file_version = self
-            .dataset
-            .manifest
-            .data_storage_format
-            .lance_file_format();
-
-        if file_version == ConcreteFileVersion::V1 {
+        if write_version == ConcreteFileVersion::V1 {
             // The legacy reader pairs a fragment's files by batch boundary, so a
             // staged file chunked to the caller's batches leaves the fragment
             // unreadable. Rechunking is the legacy update path's job, not this
@@ -2428,7 +2700,7 @@ impl FileFragment {
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
         let mut writer = versions::open_update_writer(
-            file_version,
+            write_version,
             self.dataset.as_ref(),
             &writer_schema,
             has_blob_v2,
@@ -2495,10 +2767,147 @@ impl FileFragment {
                 // The writer may still hold the file open (a buffered upload,
                 // an unflushed local handle); release it before deleting.
                 drop(writer);
-                self.discard_staged_file(&staged_path).await;
+                discard_staged_file(self.dataset.as_ref(), &staged_path).await;
                 Err(err)
             }
         }
+    }
+
+    /// Resolve the fields a staged file will carry against the manifest.
+    ///
+    /// Shared by [`Self::write_columns`] and [`Self::write_overlay`]: both stage
+    /// a data file that the commit path publishes without publishing schema, so
+    /// both need the same guarantee that every field is one the dataset already
+    /// defines, exactly as it defines it. Returns the manifest's own fields, so
+    /// physical layout comes from the manifest rather than from the request.
+    pub(crate) fn resolve_writer_schema(&self, schema: &Schema) -> Result<Schema> {
+        // Readers take everything but the field id from the manifest, so a
+        // staged field reusing an id is decoded as the manifest's version rather
+        // than rejected. Compare full identity, not just the storage type.
+        let compare_options = SchemaCompareOptions {
+            compare_field_ids: true,
+            ..Default::default()
+        };
+        // Top-level requests match top-level manifest fields only: resolving an
+        // id from anywhere lets a caller reuse a field at a path the dataset
+        // never gave it, staging a file covering the borrowed field. Layout then
+        // comes from the manifest, since the metadata the identity check ignores
+        // -- packed structs, blob encoding -- decides physical field coverage.
+        let dataset_schema = self.dataset.schema();
+        let mut writer_fields = Vec::with_capacity(schema.fields.len());
+        let mut requested = HashSet::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            // The per-field identity check cannot see the request naming an
+            // id twice, and the set-based batch comparison downstream would
+            // match one batch column against both copies.
+            if !requested.insert(field.id) {
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} names field id {} ('{}') more than once",
+                    self.id(),
+                    field.id,
+                    field.name
+                )));
+            }
+            if lance_core::is_system_column(&field.name) {
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} names reserved column '{}'",
+                    self.id(),
+                    field.name
+                )));
+            }
+            let Some(existing) = dataset_schema
+                .fields
+                .iter()
+                .find(|existing| existing.id == field.id)
+            else {
+                // The commit path publishes data files, never schema, so a
+                // field the manifest does not define would commit as a file no
+                // live field answers for -- and a concurrent schema change
+                // could never be checked against it.
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} names field id {} ('{}') that the dataset schema \
+                     does not define; declare the column with add_columns before staging its data",
+                    self.id(),
+                    field.id,
+                    field.name
+                )));
+            };
+            // `explain_difference` recurses, covering the whole subtree.
+            if let Some(difference) = field.explain_difference(existing, &compare_options) {
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} does not match dataset field id {}: {}",
+                    self.id(),
+                    field.id,
+                    difference
+                )));
+            }
+            writer_fields.push(existing.clone());
+        }
+        Ok(Schema {
+            fields: writer_fields,
+            metadata: schema.metadata.clone(),
+        })
+    }
+
+    /// Stage a data overlay supplying new values for a subset of this fragment's
+    /// cells, without rewriting its base data files.
+    ///
+    /// `schema` declares the fields the overlay may supply, by the dataset's own
+    /// field ids, exactly as [`Self::write_columns`] does. Values are then fed to
+    /// the returned writer keyed by `_rowaddr`; see [`OverlayWriter`] for the
+    /// ordering and coverage rules it enforces, and for how to finish or discard
+    /// what it stages.
+    ///
+    /// An overlay is the cheap way to fill a small fraction of a column: write
+    /// cost is proportional to the cells supplied, rows keep their addresses, and
+    /// no existing values are re-read to carry them forward. It costs a merge on
+    /// every later read of the cells it covers, so a dense fill of a whole column
+    /// is better served by [`Self::write_columns`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::RecordBatch;
+    /// # use futures::TryStreamExt;
+    /// # use lance::Dataset;
+    /// # use lance::dataset::transaction::Operation;
+    /// # use lance::dataset::WriteDestination;
+    /// # use lance_core::Result;
+    /// # async fn backfill(
+    /// #     dataset: Arc<Dataset>,
+    /// #     mut values: impl futures::TryStream<Ok = RecordBatch, Error = lance_core::Error> + Unpin,
+    /// #     field_id: i32,
+    /// # ) -> Result<()> {
+    /// let read_version = dataset.version().version;
+    /// let fragment = dataset.get_fragment(0).expect("fragment 0 exists");
+    /// let schema = dataset.schema().project_by_ids(&[field_id], true);
+    ///
+    /// let mut overlay = fragment.write_overlay(&schema).await?;
+    /// // Each batch carries `_rowaddr` plus the fields being filled, for the
+    /// // rows it has values for. Addresses must strictly ascend per field.
+    /// while let Some(batch) = values.try_next().await? {
+    ///     overlay.write_batch(&batch).await?;
+    /// }
+    ///
+    /// if let Some(group) = overlay.finish().await? {
+    ///     Dataset::commit(
+    ///         WriteDestination::Dataset(dataset),
+    ///         Operation::DataOverlay { groups: vec![group] },
+    ///         Some(read_version),
+    ///         None,
+    ///         None,
+    ///         Arc::new(Default::default()),
+    ///         false,
+    ///     )
+    ///     .await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_overlay(
+        &self,
+        schema: &Schema,
+    ) -> std::result::Result<OverlayWriter, WriteOverlayError> {
+        OverlayWriter::open(self.dataset.clone(), self, schema).await
     }
 
     /// Delete rows from the fragment.
@@ -3092,17 +3501,15 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+    /// Emit the `_row_last_updated_at_version` column, served from `sequence`;
+    /// `None` means the fragment has no version metadata and every row reads
+    /// as version 1.
+    pub(crate) fn with_row_last_updated_at_version(
+        &mut self,
+        sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_last_updated_at_version = true;
-
-        // Load the version sequence if not already loaded
-        if self.last_updated_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.last_updated_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.last_updated_at_sequence = Some(Arc::new(sequence));
-        }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        self.last_updated_at_sequence = sequence;
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -3113,17 +3520,15 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
+    /// Emit the `_row_created_at_version` column, served from `sequence`;
+    /// `None` means the fragment has no version metadata and every row reads
+    /// as version 1.
+    pub(crate) fn with_row_created_at_version(
+        &mut self,
+        sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_created_at_version = true;
-
-        // Load the version sequence if not already loaded
-        if self.created_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.created_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.created_at_sequence = Some(Arc::new(sequence));
-        }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        self.created_at_sequence = sequence;
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -3607,7 +4012,8 @@ mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+        ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatchIterator,
+        StringArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
@@ -5454,6 +5860,77 @@ mod tests {
         );
     }
 
+    /// The dataset declares `payload` non-nullable, so the blank restored for the
+    /// deleted row cannot be a null no matter how the update stream marks the field.
+    /// `test_write_schema_controls_blank_nullability` in `updater.rs` pins the value
+    /// itself; what matters here is that the rewritten data file still accounts for
+    /// every physical row, which is what `validate` checks.
+    #[tokio::test]
+    async fn test_update_columns_respects_dataset_nullability() {
+        let dataset_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            dataset_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(BinaryArray::from(vec![&b"a"[..], &b"b"[..], &b"c"[..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], dataset_schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 2").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Update streams commonly carry nullable Arrow fields even when the dataset
+        // field is non-nullable.
+        let right_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, true),
+        ]));
+        let right = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(BinaryArray::from(vec![&b"A"[..], &b"C"[..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut fragment = dataset.get_fragments().pop().unwrap();
+        let (updated, _) = fragment
+            .update_columns(
+                RecordBatchIterator::new([Ok(right)], right_schema),
+                "id",
+                "id",
+            )
+            .await
+            .unwrap();
+
+        // `payload` moved to a new file, leaving a tombstone behind in the old one.
+        let layout = updated
+            .files
+            .iter()
+            .map(|file| file.fields.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(layout, vec![vec![0, -2], vec![1]]);
+        FileFragment::new(dataset, updated)
+            .validate()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_fragment_update() {
         let test_dir = TempStrDir::default();
@@ -6510,6 +6987,116 @@ mod tests {
         );
     }
 
+    /// Stopping early is diagnosed as unread input, not as unmaterialized deletions:
+    /// the caller's remedy is to keep polling, not to run compaction. `finish` probes the
+    /// stream before consulting the restorer for exactly that reason -- otherwise which
+    /// message a caller saw would depend only on where the deletions happened to fall.
+    #[tokio::test]
+    async fn test_updater_finish_rejects_stopping_early() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        dataset.delete("i >= 5 AND i < 40").await?;
+
+        let fragment_id = dataset.manifest.fragments[0].id;
+        let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, Some(5), None).await?;
+
+        let num_rows = updater.next().await?.unwrap().num_rows();
+        assert_eq!(num_rows, 5);
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )]));
+        updater
+            .update(RecordBatch::try_new(
+                new_schema,
+                vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+            )?)
+            .await?;
+
+        let err = updater.finish().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("cannot finish"), "{message}");
+        assert!(message.contains("unread input batches"), "{message}");
+        assert!(
+            !message.contains("run compaction"),
+            "stopping early is not a compaction problem: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_updater_rejects_unpaired_and_unread_batches() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        let fragment = dataset.get_fragment(0).unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, Some(5), None).await?;
+
+        let num_rows = updater.next().await?.unwrap().num_rows();
+        assert_eq!(num_rows, 5);
+
+        let error = updater.next().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("previous input batch"),
+            "{error}"
+        );
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            false,
+        )]));
+        let output = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )?;
+        updater.update(output.clone()).await?;
+
+        let error = updater.update(output).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("no input data"), "{error}");
+
+        let error = updater.finish().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("unread input batches"),
+            "{error}"
+        );
+
+        // Probing must not consume a batch. In particular, repeatedly calling
+        // `finish` cannot walk the stream to its end and commit a short file.
+        let repeated = updater.finish().await.unwrap_err();
+        assert!(
+            repeated.to_string().contains("unread input batches"),
+            "{repeated}"
+        );
+
+        let mut rows_written = num_rows;
+        while let Some(input) = updater.next().await? {
+            if rows_written == num_rows {
+                let values = arrow_array::cast::as_primitive_array::<arrow_array::types::Int32Type>(
+                    input.column_by_name("i").unwrap().as_ref(),
+                );
+                assert_eq!(values.value(0), 5);
+            }
+            let rows = input.num_rows();
+            updater
+                .update(RecordBatch::try_new(
+                    output_schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..rows as i32))],
+                )?)
+                .await?;
+            rows_written += rows;
+        }
+        assert_eq!(rows_written, 40);
+        let updated = updater.finish().await?;
+        assert_eq!(updated.files.len(), 2);
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_merge_fragment(
@@ -6572,6 +7159,66 @@ mod tests {
             row_id += 1;
             i += 1;
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_columns_field_ids_match_data_file() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        // The dropped column's id stays in the data files, so the manifest's
+        // max field id is larger than the schema's.
+        dataset.drop_columns(&["s"]).await.unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("double_i", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter_values((0..400).step_by(2))),
+            ],
+        )
+        .unwrap();
+        let fragments = dataset.get_fragments();
+        let mut merged_fragments = Vec::with_capacity(fragments.len());
+        let mut merged_schema = dataset.schema().clone();
+        for mut frag in fragments {
+            let stream = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+            let (new_frag, new_schema) = frag.merge_columns(stream, "i", "i").await.unwrap();
+            let new_field_id = new_schema.field("double_i").unwrap().id;
+            assert_eq!(new_field_id, dataset.manifest.max_field_id() + 1);
+            assert_eq!(
+                new_frag.files.last().unwrap().fields.as_ref(),
+                &[new_field_id]
+            );
+            merged_fragments.push(new_frag);
+            merged_schema = new_schema;
+        }
+
+        let dataset = Dataset::commit(
+            &test_dir,
+            Operation::Merge {
+                fragments: merged_fragments,
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let actual = dataset
+            .scan()
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, batch);
     }
 
     #[tokio::test]
@@ -7155,5 +7802,36 @@ mod tests {
         // Verify the operation produced valid results
         assert!(!fields_modified.is_empty());
         assert!(!updated_fragment.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_base_schedulers_shares_one_per_base() {
+        let cache = BaseSchedulers::new(4 * 1024 * 1024);
+        let store = Arc::new(ObjectStore::local());
+
+        // Repeated resolutions of the same base reuse one scheduler, so opening
+        // many files from a base does not multiply scheduler budgets.
+        let first = cache.get_or_create(1, store.clone());
+        let second = cache.get_or_create(1, store.clone());
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same base must reuse one scheduler"
+        );
+
+        // A different base gets its own scheduler.
+        let other = cache.get_or_create(2, store.clone());
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "different bases must not share a scheduler"
+        );
+
+        // Clones of the cache (as threaded per fragment) share the same map.
+        let cloned = cache.clone();
+        let via_clone = cloned.get_or_create(1, store);
+        assert!(
+            Arc::ptr_eq(&first, &via_clone),
+            "cache clones must share the per-scan scheduler map"
+        );
+        assert_eq!(cache.len(), 2);
     }
 }

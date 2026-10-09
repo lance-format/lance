@@ -43,7 +43,7 @@ from lance.log import LOGGER
 # Imported at runtime, not only for the annotations below: importing it here
 # is what registers `Bitmap` as a `collections.abc.MutableSet`.
 from .bitmap import Bitmap  # noqa: TC001
-from .blob import BlobFile
+from .blob import DEFAULT_BLOB_BUFFER_SIZE, BlobFile, _validate_buffer_size
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
@@ -77,7 +77,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .query import DocumentGranularity, FullTextQuery
+from .query import DocumentGranularity, FullTextQuery, MinHashQuery
 from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -249,7 +249,7 @@ def _is_null_blob_description(description: Any) -> bool:
     return False
 
 
-def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
+def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[Dict[str, Any]]]:
     segments = _parse_field_path(path)
     values = table.column(segments[0]).to_pylist()
 
@@ -260,10 +260,10 @@ def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
 
 
 def _replace_value_at_path(
-    parent: Optional[dict],
+    parent: Optional[Dict[str, Any]],
     segments: list[str],
     value: Any,
-) -> Optional[dict]:
+) -> Optional[Dict[str, Any]]:
     if parent is None:
         return None
 
@@ -526,6 +526,21 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         The default is 30 seconds.
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
+
+    def data_storage_version(self, version: str) -> "MergeInsertBuilder":
+        """Set the exact data storage version for files written by this operation.
+
+        If omitted, use the dataset's default write version without changing it.
+        Accepts "2.0", "2.1", "2.2", "2.3", "stable", or "next" for V2
+        datasets. Release selectors are resolved by the engine; V1/V2
+        cross-family targets are rejected.
+
+        Examples
+        --------
+        ``dataset.merge_insert("id").data_storage_version("2.2")`` selects V2.2
+        for the files written when the builder executes.
+        """
+        return super(MergeInsertBuilder, self).data_storage_version(version)
 
     def use_index(self, use_index: bool) -> "MergeInsertBuilder":
         """
@@ -1108,12 +1123,14 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         branch: str
-            Name of the branch to create.
+            Name of the branch to create. ``"main"`` is reserved for the
+            default branch and cannot be used as a new branch name.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -1207,11 +1224,11 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[
-            Union[str, pa.compute.Expression, FullTextQuery, VectorSearchQuery, dict]
+            Union[str, Expression, FullTextQuery, VectorSearchQuery, Dict[str, Any]]
         ] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1219,7 +1236,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -1296,8 +1313,13 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
-        nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors. Example:
+        nearest: dict or MinHashQuery, default None
+            Get the rows corresponding to the K most similar vectors, or, when a
+            :class:`~lance.query.MinHashQuery` is given, the ``limit`` rows most
+            similar to its text under the column's MinHash LSH index (adds a
+            ``_distance`` column equal to ``1 - estimated Jaccard similarity``;
+            unindexed rows are scored on the fly unless ``fast_search`` is set).
+            Vector search example:
 
             .. code-block:: python
 
@@ -1536,7 +1558,10 @@ class LanceDataset(pa.dataset.Dataset):
             elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
-            builder = builder.nearest(**nearest)
+            if isinstance(nearest, MinHashQuery):
+                builder = builder.minhash_search(nearest)
+            else:
+                builder = builder.nearest(**nearest)
         return builder.to_scanner()
 
     @property
@@ -1559,7 +1584,9 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def data_storage_version(self) -> str:
         """
-        The version of the data storage format this dataset is using
+        The default data file version for writes that omit ``data_storage_version``.
+        Existing files may use other V2 versions; this is not a snapshot version
+        summary.
         """
         return self._ds.data_storage_version
 
@@ -1583,10 +1610,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1598,7 +1625,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -1623,8 +1650,13 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
-        nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors. Example:
+        nearest: dict or MinHashQuery, default None
+            Get the rows corresponding to the K most similar vectors, or, when a
+            :class:`~lance.query.MinHashQuery` is given, the ``limit`` rows most
+            similar to its text under the column's MinHash LSH index (adds a
+            ``_distance`` column equal to ``1 - estimated Jaccard similarity``;
+            unindexed rows are scored on the fly unless ``fast_search`` is set).
+            Vector search example:
 
             .. code-block:: python
 
@@ -1740,10 +1772,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
@@ -1754,7 +1786,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
@@ -2157,10 +2189,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_batches(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[Dict[str, Any], MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -2171,7 +2203,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any]]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -2316,6 +2348,8 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
+        *,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
     ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
@@ -2327,6 +2361,9 @@ class LanceDataset(pa.dataset.Dataset):
         If you plan to read each selected blob completely with ``read()`` or
         ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
         payloads with Lance's planned batched reader.
+
+        ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+        do not change the sequential cursor.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -2340,6 +2377,8 @@ class LanceDataset(pa.dataset.Dataset):
             The (unstable) row addresses to select in the dataset.
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
+        buffer_size : int, default 512 KiB
+            Sequential read-ahead size in bytes. ``0`` disables read-ahead.
 
         Returns
         -------
@@ -2347,6 +2386,7 @@ class LanceDataset(pa.dataset.Dataset):
             One element per selected row. Null blob values return ``None``;
             valid empty blobs return a ``BlobFile`` with size zero.
         """
+        buffer_size = _validate_buffer_size(buffer_size)
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
         )
@@ -2362,7 +2402,9 @@ class LanceDataset(pa.dataset.Dataset):
                 selection_values, blob_column
             )
         return [
-            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            BlobFile(lance_blob_file, buffer_size=buffer_size)
+            if lance_blob_file is not None
+            else None
             for lance_blob_file in lance_blob_files
         ]
 
@@ -2556,7 +2598,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
 
     def count_rows(
-        self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
+        self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
         """Count rows matching the scanner filter.
 
@@ -2853,7 +2895,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def delete(
         self,
-        predicate: Union[str, pa.compute.Expression],
+        predicate: Union[str, Expression],
         *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
@@ -2893,9 +2935,12 @@ class LanceDataset(pa.dataset.Dataset):
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
         {'num_deleted_rows': 2}
         """
-        if isinstance(predicate, pa.compute.Expression):
-            predicate = str(predicate)
-        return self._ds.delete(predicate, conflict_retries, retry_timeout)
+        encoded_predicate = (
+            _serialize_expression(predicate, self._ds.schema)
+            if isinstance(predicate, pa.compute.Expression)
+            else predicate
+        )
+        return self._ds.delete(encoded_predicate, conflict_retries, retry_timeout)
 
     def truncate_table(self) -> None:
         """
@@ -3052,9 +3097,10 @@ class LanceDataset(pa.dataset.Dataset):
     def update(
         self,
         updates: Dict[str, str],
-        where: Optional[str] = None,
+        where: Optional[Union[str, Expression]] = None,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
@@ -3063,8 +3109,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         updates : dict of str to str
             A mapping of column names to a SQL expression.
-        where : str, optional
-            A SQL predicate indicating which rows should be updated.
+        where : str or pa.compute.Expression, optional
+            A SQL predicate or pyarrow Expression indicating which rows should
+            be updated.
         conflict_retries : int, optional
             Number of times to retry the operation if there is contention.
             Default is 10.
@@ -3073,6 +3120,10 @@ class LanceDataset(pa.dataset.Dataset):
             the operation before giving up. At least one attempt will be made,
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
+        data_storage_version : str, optional
+            Output data file version, such as "2.2", "stable", or "next". If
+            omitted, use the dataset's default write version without changing it.
+            V1/V2 cross-family targets are rejected.
 
         Returns
         -------
@@ -3093,9 +3144,18 @@ class LanceDataset(pa.dataset.Dataset):
         1  4  b
         2  5  c
         """
-        if isinstance(where, pa.compute.Expression):
-            where = str(where)
-        return self._ds.update(updates, where, conflict_retries, retry_timeout)
+        encoded_where = (
+            _serialize_expression(where, self._ds.schema)
+            if isinstance(where, pa.compute.Expression)
+            else where
+        )
+        return self._ds.update(
+            updates,
+            encoded_where,
+            conflict_retries,
+            retry_timeout,
+            data_storage_version,
+        )
 
     def versions(self) -> List[Version]:
         """
@@ -3103,14 +3163,33 @@ class LanceDataset(pa.dataset.Dataset):
         """
         versions = self._ds.versions()
         for v in versions:
-            # TODO: python datetime supports only microsecond precision. When a
-            # separate Version object is implemented, expose the precise timestamp
-            # (ns) to python.
-            ts_nanos = v["timestamp"]
-            v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
-                microseconds=(ts_nanos % 1e9) // 1e3
-            )
+            _convert_version_timestamp(v)
         return versions
+
+    def get_version(self) -> Version:
+        """
+        Return the currently checked out version, with its timestamp and the
+        summary of its manifest.
+
+        The summary is in ``metadata``. It counts the fragments, data files,
+        deletion files, rows and bytes of the version, and is computed from the
+        manifest that is already loaded, so nothing is read from storage.
+
+        Use :attr:`version` instead when only the version number is needed.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://get_version")
+        >>> version = dataset.get_version()
+        >>> version["version"]
+        1
+        >>> version["metadata"]["total_rows"]
+        '3'
+        """
+        return _convert_version_timestamp(self._ds.current_version())
 
     def version_refs(self) -> List[VersionRef]:
         """
@@ -3216,7 +3295,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
 
         Returns
         -------
@@ -3234,6 +3314,47 @@ class LanceDataset(pa.dataset.Dataset):
         This creates a new commit.
         """
         self._ds.restore()
+
+    def base_paths(self) -> Dict[int, DatasetBasePath]:
+        """Return the base paths registered in the current dataset snapshot.
+
+        The returned dictionary maps each base path ID to an independent
+        :class:`DatasetBasePath` object. It includes registered bases that are not
+        referenced by any data files. The primary dataset storage is not added to
+        the result unless it was explicitly registered as a base path.
+
+        This method does not refresh the dataset to the latest version. Modifying
+        the returned dictionary does not modify the dataset, and previously
+        returned values do not change when the dataset is updated or checked out
+        at another version. The dictionary iteration order is unspecified.
+
+        Returns
+        -------
+        Dict[int, DatasetBasePath]
+            Registered base paths keyed by base path ID. Each value exposes
+            ``id``, ``name``, ``path``, and ``is_dataset_root`` as read-only
+            attributes. ``is_dataset_root`` describes the base's path layout; it
+            does not identify the dataset's current primary storage. Runtime
+            storage options are not included.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"x": [1]}),
+        ...     "memory://base-paths-example",
+        ...     initial_bases=[
+        ...         lance.DatasetBasePath(
+        ...             "memory://base-paths-data", name="data"
+        ...         )
+        ...     ],
+        ... )
+        >>> base_paths = dataset.base_paths()
+        >>> all(base_id == base.id for base_id, base in base_paths.items())
+        True
+        """
+        return self._ds.base_paths()
 
     def add_bases(
         self, new_bases: list, transaction_properties: Optional[Dict[str, str]] = None
@@ -3576,8 +3697,8 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
         document_granularity: DocumentGranularity = DocumentGranularity.ROW,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -3642,9 +3763,21 @@ class LanceDataset(pa.dataset.Dataset):
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
 
-        Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
-        bypass spilling to disk. Setting this to true can avoid memory exhaustion
-        issues (see https://github.com/apache/datafusion/issues/10073 for more info).
+        Index training sorts can spill to disk under memory pressure.
+        ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
+        on the process's total memory usage. Spilling still requires memory for
+        individual input batches and for sorting and merging them, so large
+        batches or a small pool can cause memory reservation failures.
+
+        Setting ``LANCE_BYPASS_SPILLING`` to any value (including ``0`` or
+        ``false``) bypasses the bounded memory pool for these sorts. Sorting then
+        stays in memory, ignoring ``LANCE_MEM_POOL_SIZE``. This can avoid pool
+        reservation failures but increases memory use and can exhaust system
+        memory; use it only when the sort fits in available memory. The historical
+        SortExec allocation issues in
+        https://github.com/apache/datafusion/issues/10073 were fixed upstream by
+        https://github.com/apache/datafusion/pull/14644; that fix does not remove
+        the batch-size and memory-pool constraints above.
 
         **Experimental API**
 
@@ -3906,6 +4039,17 @@ class LanceDataset(pa.dataset.Dataset):
                     f"got {field.type.value_type}"
                 )
 
+        if index_cache_size is not None:
+            # The parameter has never reached Rust: index building does not use
+            # the index cache, and the cache is sized on the dataset or session.
+            warnings.warn(
+                "The 'index_cache_size' parameter of create_index is ignored. "
+                "The index cache is sized on the dataset, via "
+                "lance.dataset(..., index_cache_size_bytes=...) or a Session.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
             "cosine",
@@ -4107,13 +4251,25 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(ivf_centroids) and isinstance(
                     ivf_centroids, np.ndarray
                 ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
+                    if len(ivf_centroids.shape) != 2:
                         raise ValueError(
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.shape[0] == 0:
+                        # num_partitions was derived from shape[0] above, and
+                        # zero partitions panics in the Rust residual step.
+                        raise ValueError(
+                            "Ivf centroids must have at least one cluster, "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if (
+                        num_partitions is not None
+                        and ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids has {ivf_centroids.shape[0]} clusters, "
+                            f"but num_partitions={num_partitions}"
                         )
                     if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
@@ -4267,8 +4423,9 @@ class LanceDataset(pa.dataset.Dataset):
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
             :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_partitions x dimension`` array of existing K-mean centroids
-            for IVF clustering. If not provided, a new KMeans model will be trained.
+            A ``num_clusters x dimension`` array of existing K-mean centroids
+            for IVF clustering. The row count determines the number of IVF
+            partitions. If not provided, a new KMeans model will be trained.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
@@ -4283,7 +4440,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
         index_cache_size : int, optional
-            The size of the index cache in number of entries. Default value is 256.
+            Deprecated and ignored. Index building does not read the index cache;
+            size it on the dataset with
+            ``lance.dataset(..., index_cache_size_bytes=...)`` or on a ``Session``.
         shuffle_partition_batches : int, optional
             The number of batches, using the row group size of the dataset, to include
             in each shuffle partition. Default value is 10240.
@@ -5116,7 +5275,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -5137,6 +5297,47 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.shallow_clone(target_uri, reference, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
+        return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
+
+    def deep_clone(
+        self,
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
+        storage_options: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> "LanceDataset":
+        """
+        Deep clone the specified version into a new dataset at target_path.
+
+        This operation copies the data, deletion, and index files referenced by
+        the selected version before committing the destination dataset.
+
+        Parameters
+        ----------
+        target_path : str or Path
+            The URI or filesystem path to clone the dataset into.
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch.
+        storage_options : dict, optional
+            Object store configuration for the destination dataset. If omitted,
+            the source dataset's storage options are used.
+
+        Returns
+        -------
+        LanceDataset
+            The deep-cloned dataset.
+        """
+        if isinstance(target_path, Path):
+            target_uri = os.fspath(target_path)
+        else:
+            target_uri = target_path
+
+        if storage_options is None:
+            storage_options = self._storage_options
+        self._ds.deep_clone(target_uri, reference, storage_options)
+
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
 
     def migrate_manifest_paths_v2(self):
@@ -5472,6 +5673,8 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+            Omitted (the default) keeps every index on the table updated,
+            including ones created later; an empty list keeps none.
         hnsw_params : dict, optional
             Per-index HNSW build-parameter overrides recorded as writer-config
             defaults, keyed by maintained vector index name. Each value is a dict
@@ -5518,7 +5721,7 @@ class LanceDataset(pa.dataset.Dataset):
             hnsw_params=hnsw_params,
         )
 
-    def mem_wal_index_details(self) -> Optional[dict]:
+    def mem_wal_index_details(self) -> Optional[Dict[str, Any]]:
         """Return the MemWAL index details, or ``None`` if not initialized.
 
         Returns
@@ -5927,6 +6130,17 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+def _convert_version_timestamp(version: Version) -> Version:
+    # TODO: python datetime supports only microsecond precision. When a
+    # separate Version object is implemented, expose the precise timestamp
+    # (ns) to python.
+    ts_nanos = version["timestamp"]
+    version["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
+        microseconds=(ts_nanos % 1e9) // 1e3
+    )
+    return version
+
+
 class VersionRef(TypedDict):
     version: int
 
@@ -6332,6 +6546,38 @@ class LanceOperation:
         version: int
 
     @dataclass
+    class Clone(BaseOperation):
+        """Operation that creates a clone or branch from a dataset reference.
+
+        This operation is created internally by clone and branch APIs. It is
+        exposed so transactions returned by :meth:`LanceDataset.get_transactions`
+        can represent clone metadata without losing information.
+
+        Only a shallow clone can be committed directly. A deep clone must copy
+        the source files first, so committing one raises ``OSError``; use
+        :meth:`LanceDataset.deep_clone` instead.
+
+        Attributes
+        ----------
+        is_shallow: bool
+            Whether data files are shared with the source dataset.
+        ref_name: str, optional
+            Source branch name, or ``None`` for the main branch.
+        ref_version: int
+            Source dataset version.
+        ref_path: str
+            Source dataset URI.
+        branch_name: str, optional
+            Destination branch name, when the clone creates a branch.
+        """
+
+        is_shallow: bool
+        ref_name: Optional[str]
+        ref_version: int
+        ref_path: str
+        branch_name: Optional[str]
+
+    @dataclass
     class RewriteGroup:
         """
         Collection of rewritten files
@@ -6611,6 +6857,34 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     return False
 
 
+def _serialize_expression(
+    expression: pa.compute.Expression, schema: pa.Schema
+) -> bytes:
+    from pyarrow.substrait import serialize_expressions
+
+    # Keep each field's position so Substrait references still resolve against
+    # the stored schema when PyArrow cannot serialize an unrelated field's type.
+    scalar_schema = pa.schema(
+        [
+            (
+                pa.field(f"__unlikely_name_placeholder_{i}", pa.int8())
+                if _needs_substrait_placeholder(field.type)
+                else field
+            )
+            for i, field in enumerate(schema)
+        ]
+    )
+    serialized = serialize_expressions([expression], ["my_filter"], scalar_schema)
+    if isinstance(serialized, memoryview):
+        return serialized.tobytes()
+    try:
+        return serialized.to_pybytes()
+    except AttributeError:
+        raise TypeError(
+            f"serialize_expressions returned unexpected type {type(serialized)}"
+        )
+
+
 def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
     """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
 
@@ -6639,6 +6913,7 @@ class ScannerBuilder:
         self._columns = None
         self._columns_with_transform = None
         self._nearest = None
+        self._minhash_query: Optional[Dict[str, str]] = None
         self._batch_size: Optional[int] = None
         self._batch_size_bytes: Optional[int] = None
         self._io_buffer_size: Optional[int] = None
@@ -6796,49 +7071,7 @@ class ScannerBuilder:
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
-            try:
-                from pyarrow.substrait import serialize_expressions
-
-                fields_without_lists = []
-                counter = 0
-                # Pyarrow cannot handle certain types when converting to
-                # Substrait (e.g. fixed_size_list at any nesting depth, or
-                # struct fields with non-None metadata left by extension types
-                # after a lance round-trip).  We replace any top-level field
-                # whose type tree contains such a type with an int8 placeholder
-                # so that ordinal field references in the filter remain correct.
-                # Filters are evaluated against the stored dataset fields.  The
-                # public schema may also contain scan-time fields such as _rowid.
-                for field in self.ds._ds.schema:
-                    if _needs_substrait_placeholder(field.type):
-                        pos = counter
-                        counter += 1
-                        fields_without_lists.append(
-                            pa.field(f"__unlikely_name_placeholder_{pos}", pa.int8())
-                        )
-                    else:
-                        fields_without_lists.append(field)
-                        # Serialize the pyarrow compute expression toSubstrait and use
-                        # that as a filter.
-                        counter += 1
-                scalar_schema = pa.schema(fields_without_lists)
-                substrait_filter = serialize_expressions(
-                    [filter], ["my_filter"], scalar_schema
-                )
-                if isinstance(substrait_filter, memoryview):
-                    self._substrait_filter = substrait_filter.tobytes()
-                else:
-                    try:
-                        self._substrait_filter = substrait_filter.to_pybytes()
-                    except AttributeError:
-                        raise TypeError(
-                            "serialize_expressions returned unexpected"
-                            f"type {type(substrait_filter)}"
-                        )
-            except ImportError:
-                # serialize_expressions was introduced in pyarrow 14.  Fallback to
-                # stringifying the expression if pyarrow is too old
-                self._filter = str(filter)
+            self._substrait_filter = _serialize_expression(filter, self.ds._ds.schema)
         else:
             expr_filter = filter.get("expr_filter")
             if expr_filter is not None:
@@ -7066,6 +7299,33 @@ class ScannerBuilder:
             }
         return self
 
+    def minhash_search(self, query: MinHashQuery) -> ScannerBuilder:
+        """
+        Find the rows most similar to ``query.text`` using the MinHash LSH index
+        on ``query.column``.
+
+        The number of rows comes from :meth:`limit` (default 10). Results carry
+        a ``_distance`` column equal to ``1 - estimated Jaccard similarity`` and
+        are ordered by ascending distance. Cannot be combined with
+        :meth:`nearest` or :meth:`full_text_search`.
+
+        Rows the index does not cover (fragments appended after the index was
+        built, or rows changed by a data overlay) are scored on the fly, which
+        costs a scan of those rows per query; run ``optimize_indices`` to index
+        them, or enable :meth:`fast_search` to search only the indexed rows.
+
+        Parameters
+        ----------
+        query : MinHashQuery
+            The query text and the column to search.
+        """
+        if not isinstance(query, MinHashQuery):
+            raise TypeError(
+                f"minhash_search expects a MinHashQuery, got {type(query).__name__}"
+            )
+        self._minhash_query = {"column": query.column, "text": query.text}
+        return self
+
     def scan_stats_callback(
         self, callback: Callable[[ScanStatistics], None]
     ) -> ScannerBuilder:
@@ -7163,6 +7423,7 @@ class ScannerBuilder:
             self._substrait_aggregate,
             self._row_addr_allowlist,
             self._row_addr_blocklist,
+            self._minhash_query,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 
@@ -7388,6 +7649,7 @@ class DatasetOptimizer:
         max_source_rows: Optional[int] = None,
         max_source_bytes: Optional[int] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
+        data_storage_version: Optional[str] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7421,7 +7683,8 @@ class DatasetOptimizer:
         ``lance.compaction.binary_copy_read_batch_bytes``,
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
-        ``lance.compaction.max_source_bytes``.
+        ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.data_storage_version``.
 
         Parameters
         ----------
@@ -7497,6 +7760,11 @@ class DatasetOptimizer:
             fragments remain unchanged and act as boundaries, so fragments
             on opposite sides are not combined into the same compaction task.
             Duplicate and unknown IDs are ignored.
+        data_storage_version: str, optional
+            Output data file version, such as "2.2", "stable", or "next".
+            Uses the compaction config target when set, otherwise the dataset's
+            default write version. Does not change that default or the versions
+            of unselected files. V1/V2 cross-family targets are rejected.
 
         Returns
         -------
@@ -7524,6 +7792,7 @@ class DatasetOptimizer:
                 max_source_rows=max_source_rows,
                 max_source_bytes=max_source_bytes,
                 excluded_fragment_ids=excluded_fragment_ids,
+                data_storage_version=data_storage_version,
             ).items()
             if v is not None
         }
@@ -7663,7 +7932,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.create_tag(tag, reference)
 
@@ -7695,7 +7965,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.update_tag(tag, reference)
 
@@ -7816,6 +8087,8 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    data_cache_bytes: Optional[int] = None,
+    max_page_bytes: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -7869,6 +8142,13 @@ def write_dataset(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    data_cache_bytes : int, optional
+        Total bytes to buffer for column data before writing pages. The budget
+        is divided evenly across top-level columns. If not set, the current
+        file writer uses 8 MiB per column. Ignored for legacy V1 files.
+    max_page_bytes : int, optional
+        Best-effort maximum page size in bytes. If not set, the current file
+        writer uses its configured default. Ignored for legacy V1 files.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -7888,8 +8168,10 @@ def write_dataset(
         shared.
     data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default (None)
-        will use the latest stable version.  See the user guide for more details.
+        efficient but require newer versions of lance to read. For create and
+        overwrite, None uses the latest stable version. For append, None uses
+        the dataset's default write version; an explicit V2 version applies
+        only to new files and does not change that default.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
@@ -8083,6 +8365,8 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
+        "data_cache_bytes": data_cache_bytes,
+        "max_page_bytes": max_page_bytes,
         "progress": progress,
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
@@ -8225,8 +8509,7 @@ def _build_vector_search_query(
     metric: str, optional
         The distance metric to use (e.g., "L2", "cosine", "dot", "hamming").
     nprobes: int, optional
-        The number of partitions to search. Sets both minimum_nprobes and
-        maximum_nprobes to the same value.
+        The number of partitions to search, setting both the minimum and maximum.
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
@@ -8296,15 +8579,6 @@ def _build_vector_search_query(
     if maximum_nprobes is not None and int(maximum_nprobes) < 0:
         raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
 
-    if nprobes is not None:
-        if minimum_nprobes is not None or maximum_nprobes is not None:
-            raise ValueError(
-                "nprobes cannot be set in combination with minimum_nprobes or "
-                "maximum_nprobes"
-            )
-        else:
-            minimum_nprobes = nprobes
-            maximum_nprobes = nprobes
     if (
         minimum_nprobes is not None
         and maximum_nprobes is not None
@@ -8340,6 +8614,7 @@ def _build_vector_search_query(
         "q": q,
         "k": k,
         "metric": metric,
+        "nprobes": nprobes,
         "minimum_nprobes": minimum_nprobes,
         "maximum_nprobes": maximum_nprobes,
         "refine_factor": refine_factor,
