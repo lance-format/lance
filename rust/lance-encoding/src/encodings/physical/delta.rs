@@ -238,7 +238,9 @@ fn reconstruct_deltas(
 #[cfg(test)]
 mod tests {
     use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
-    use crate::encodings::physical::{range::RangeEncoder, rle::RleEncoder, value::ValueEncoder};
+    use crate::encodings::physical::{
+        constant::ConstantEncoder, range::RangeEncoder, rle::RleEncoder, value::ValueEncoder,
+    };
 
     use super::*;
 
@@ -271,15 +273,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delta_propagates_metadata_only_child() {
+    #[rstest::rstest]
+    #[case::range(vec![0_u32, 1, 3, 6], Box::new(RangeEncoder::new(32, 1, 1)))]
+    #[case::constant(vec![0_u32, 3, 6, 9], Box::new(ConstantEncoder::new(32, 3)))]
+    fn delta_propagates_metadata_only_child(
+        #[case] values: Vec<u32>,
+        #[case] child: Box<dyn BlockCompressor>,
+    ) {
         let input = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 32,
-            data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 3, 6]),
+            data: LanceBuffer::reinterpret_vec(values.clone()),
             num_values: 4,
             block_info: BlockInfo::default(),
         });
-        let encoder = DeltaEncoder::new(32, 0, Box::new(RangeEncoder::new(32, 1, 1)));
+        let encoder = DeltaEncoder::new(32, 0, child);
         let (payload, encoding) = encoder.compress(input).unwrap();
         assert!(payload.is_none());
 
@@ -294,7 +301,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             decoded.data.borrow_to_typed_slice::<u32>().as_ref(),
-            &[0, 1, 3, 6]
+            values.as_slice()
         );
     }
 
