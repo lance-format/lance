@@ -544,7 +544,10 @@ pub(crate) async fn indexed_fts_document_granularities(
     let mut by_name = BTreeMap::new();
 
     for index in dataset.load_indices().await?.iter() {
-        if index.fields.as_slice() != [resolved.final_field_id] {
+        // A covered FTS index still answers for its keyed column; only the
+        // keyed prefix decides whether this index matches, not the full
+        // `fields` vector including carried columns.
+        if index.keyed_field() != Some(resolved.final_field_id) {
             continue;
         }
         let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
@@ -577,6 +580,53 @@ pub(crate) async fn indexed_fts_document_granularities(
     }
 
     Ok(by_name.into_iter().collect())
+}
+
+/// The effective [`InvertedIndexParams`] of every persisted FTS index on
+/// `column`, paired with the document granularity it was built for.
+///
+/// The analyzer and positional settings are part of the query contract, not an
+/// implementation detail: a phrase query needs positions, and a stemming or
+/// n-gram tokenizer changes which terms a document produces. Anything that
+/// evaluates the same query over rows an index does not cover — an unindexed
+/// fragment, or a MemWAL active memtable — has to analyze them the same way or
+/// the two disagree about what matches.
+///
+/// Keyed by granularity rather than flattened, because row and list-element
+/// indexes may coexist on one column with *different* settings, and
+/// `load_segments` selects between them by the query's resolved granularity.
+/// Picking the first match instead would rebuild against the wrong contract —
+/// a list-element phrase query could be analyzed with the row index's
+/// positionless settings and silently match nothing.
+pub(crate) async fn indexed_fts_index_params(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Vec<(DocumentGranularity, InvertedIndexParams)>> {
+    let resolved = resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    let mut found = Vec::new();
+    for index in dataset.load_indices().await?.iter() {
+        if index.keyed_field() != Some(resolved.final_field_id) {
+            continue;
+        }
+        let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
+        if !details_any.type_url.ends_with("InvertedIndexDetails") {
+            continue;
+        }
+        let details =
+            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+                Error::corrupt_file(
+                    dataset.indices_dir().join(index.uuid.to_string()),
+                    format!(
+                        "failed to decode InvertedIndexDetails for FTS index '{}': {error}",
+                        index.name
+                    ),
+                )
+            })?;
+        let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let params = InvertedIndexParams::try_from(&details)?;
+        found.push((document_granularity, params));
+    }
+    Ok(found)
 }
 
 /// Resolve an optional query granularity against persisted FTS index metadata.
@@ -633,6 +683,45 @@ pub(crate) async fn resolve_query_document_granularity(
     Ok(resolved)
 }
 
+/// Check that one `combined_fields` target column can take part in a BM25F
+/// blend, and resolve its path.
+///
+/// Cross-field scoring joins the target columns on the row address and sums their
+/// per-row term frequencies and document lengths, so it needs row documents. A
+/// column indexed only at list-element granularity cannot supply them: that index
+/// stores several documents per row, identified by element coordinates a
+/// cross-column scan cannot pair up between columns and the combined result schema
+/// cannot report. A column carrying both granularities is fine; the row index is
+/// the one used.
+///
+/// Any field shape a row-document index accepts is allowed, list nesting included:
+/// the flat sibling scan reaches such a leaf through
+/// [`flatten_fts_document_column`], which uses the same traversal a single-column
+/// match drives through [`FtsDocument`].
+pub(crate) async fn validate_combined_fields_target_column(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<()> {
+    let indices = indexed_fts_document_granularities(dataset, column).await?;
+    if !indices.is_empty()
+        && indices
+            .iter()
+            .all(|(_, granularity)| granularity.is_list_element())
+    {
+        let indexed = indices
+            .iter()
+            .map(|(name, granularity)| format!("'{name}' ({granularity:?})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::not_supported(format!(
+            "combined_fields (BM25F) scores whole rows and needs a Row document granularity FTS \
+             index on every target column, but '{column}' only has: {indexed}"
+        )));
+    }
+    resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    Ok(())
+}
+
 pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {
     let mut fields = vec![
         ArrowField::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
@@ -643,6 +732,71 @@ pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {
             .map(|rank| ArrowField::new(doc_index_storage_column(rank), DataType::UInt32, false)),
     );
     Arc::new(ArrowSchema::new(fields))
+}
+
+/// Add (or replace) a flat `Utf8` column holding each row's document text for a
+/// list-bearing FTS field path, leaving every other column and row untouched.
+///
+/// A Lance projection cannot address a field that continues past a `List`, so a
+/// scan that needs `docs.content` has to project the `docs` root instead. This
+/// walks the traversal down to the leaf per row, joining the elements exactly the
+/// way the index builder does at row granularity.
+///
+/// Row granularity yields one document per input row, in row order, keeping several
+/// such columns aligned for a cross-field blend. Not valid for list-element
+/// granularity, where a row expands to several documents.
+pub(crate) fn flatten_fts_document_column(
+    input: SendableRecordBatchStream,
+    resolved: ResolvedFtsField,
+) -> Result<SendableRecordBatchStream> {
+    if resolved.document_granularity.is_list_element() {
+        return Err(Error::internal(
+            "flatten_fts_document_column needs row documents to keep one output row per input row"
+                .to_string(),
+        ));
+    }
+    let input_schema = input.schema();
+    if input_schema
+        .column_with_name(&resolved.root_column)
+        .is_none()
+    {
+        return Err(Error::internal(format!(
+            "FTS document input must contain the root source column '{}'",
+            resolved.root_column
+        )));
+    }
+    let text_field = ArrowField::new(&resolved.canonical_path, DataType::Utf8, false);
+    let replaced = input_schema.column_with_name(&resolved.canonical_path);
+    let mut fields = input_schema.fields().to_vec();
+    match replaced {
+        Some((index, _)) => fields[index] = Arc::new(text_field),
+        None => fields.push(Arc::new(text_field)),
+    }
+    let replaced = replaced.map(|(index, _)| index);
+    let output_schema = Arc::new(ArrowSchema::new(fields));
+    let stream_schema = output_schema.clone();
+    let stream = input.map(move |batch| {
+        let batch = batch?;
+        let source = batch
+            .column_by_name(&resolved.root_column)
+            .expect("FTS document input schema was validated");
+        let documents = resolved
+            .documents_from_array(source, batch.num_rows())
+            .map_err(DataFusionError::from)?;
+        let texts = Arc::new(StringArray::from_iter_values(
+            documents.iter().map(|document| document.text.as_str()),
+        )) as ArrayRef;
+        let mut columns = batch.columns().to_vec();
+        match replaced {
+            Some(index) => columns[index] = texts,
+            None => columns.push(texts),
+        }
+        RecordBatch::try_new(stream_schema.clone(), columns).map_err(DataFusionError::from)
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        output_schema,
+        stream,
+    )))
 }
 
 pub(crate) fn transform_fts_document_stream(
@@ -778,6 +932,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
 pub(crate) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -821,10 +976,12 @@ pub(crate) async fn merge_segments(
                 segments[0].name
             )));
         }
-        let scalar_index = super::open_scalar_index(
+        let scalar_index = super::open_scalar_index_with_plan(
             dataset,
             &resolved.canonical_path,
             segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
             &NoOpMetricsCollector,
         )
         .await?;
@@ -854,7 +1011,6 @@ pub(crate) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
@@ -908,6 +1064,32 @@ pub async fn load_segments(
     Ok(Some(indices))
 }
 
+/// Return the fragment coverage for the logical FTS index selected by `column`
+/// and `document_granularity`.
+///
+/// Returns `None` when no FTS index is available or when any physical segment
+/// has unknown coverage. In either case, callers must not use the result for
+/// pruning.
+pub(crate) async fn fts_index_fragment_bitmap(
+    dataset: &Dataset,
+    column: &str,
+    document_granularity: DocumentGranularity,
+) -> Result<Option<RoaringBitmap>> {
+    let Some(segments) = load_segments(dataset, column, document_granularity).await? else {
+        return Ok(None);
+    };
+
+    let fragment_bitmap =
+        segments
+            .iter()
+            .try_fold(RoaringBitmap::new(), |mut coverage, segment| {
+                coverage |= segment.fragment_bitmap.as_ref()?.clone();
+                Some(coverage)
+            });
+
+    Ok(fragment_bitmap)
+}
+
 /// Load and validate the shared [`InvertedIndexDetails`] across committed
 /// segments returned by [`load_segments`].
 ///
@@ -915,8 +1097,10 @@ pub async fn load_segments(
 /// payload (tokenizer, position settings, etc.); inconsistent
 /// segments return an error. Details are canonicalized before comparison so
 /// legacy segments that omit default fields remain compatible with newly
-/// written text FTS segments. Returns the canonical details that may be used
-/// when constructing a tokenizer or running a query against the index.
+/// written text FTS segments. `posting_format_version` is a physical
+/// per-segment property and may differ when a legacy FTS v1 segment is
+/// combined with a newly written one. Returns the first segment's
+/// canonicalized details for tokenizer construction and query planning.
 pub async fn load_segment_details(
     dataset: &Dataset,
     column: &str,
@@ -933,7 +1117,7 @@ pub async fn load_segment_details(
             })?;
         let details = canonicalize_inverted_index_details(details)?;
         match &expected_details {
-            Some(expected) if expected != &details => {
+            Some(expected) if !inverted_index_details_semantically_equal(expected, &details) => {
                 return Err(Error::invalid_input(format!(
                     "FTS index {} has inconsistent inverted index details across segments",
                     meta.name
@@ -958,6 +1142,22 @@ fn canonicalize_inverted_index_details(
     InvertedIndexDetails::try_from(&params)
 }
 
+/// Compare canonicalized inverted-index details for shared semantic configuration.
+///
+/// `posting_format_version` records how a single segment physically stores
+/// postings, so mixed-version FTS segments may disagree on it without being
+/// incompatible. Every other field remains part of the equality check.
+fn inverted_index_details_semantically_equal(
+    left: &InvertedIndexDetails,
+    right: &InvertedIndexDetails,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.posting_format_version = None;
+    right.posting_format_version = None;
+    left == right
+}
+
 /// Read one segment's [`InvertedIndexParams`]
 pub async fn load_segment_params(
     dataset: &Dataset,
@@ -970,6 +1170,74 @@ pub async fn load_segment_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A covered FTS index (`fields=[tags, id]`, `id` carried) must still be
+    /// recognized by `indexed_fts_document_granularities`: matching on
+    /// `idx.fields` as a whole (rather than its keyed prefix) would leave
+    /// `available` empty and silently fall back to the `Row` default even
+    /// though a `ListElement` index exists.
+    #[tokio::test]
+    async fn test_resolve_query_document_granularity_recognizes_covered_index() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use arrow_array::{Int32Array, RecordBatchIterator};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::IndexType;
+
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        for tag in ["alpha", "beta", "gamma", "delta"] {
+            tags_builder.values().append_value(tag);
+            tags_builder.append(true);
+        }
+        let tags: ArrayRef = Arc::new(tags_builder.finish());
+        let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(0..4));
+        let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+        let schema = batch.schema();
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            test_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tags_field_id = dataset.schema().field("tags").unwrap().id;
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+
+        let params =
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
+        let segment = dataset
+            .create_index_builder(&["tags"], IndexType::Inverted, &params)
+            .name("tags_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        // Nothing writes a covering declaration yet, and read plumbing never
+        // touches covered-column storage, so declaring the uninvolved `id`
+        // column as carried is a faithful stand-in for a genuinely covered
+        // FTS segment.
+        let covered = IndexMetadata {
+            fields: vec![tags_field_id, id_field_id],
+            covering_fields: vec![id_field_id],
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("tags_idx", "tags", vec![covered])
+            .await
+            .unwrap();
+
+        let resolved = resolve_query_document_granularity(&dataset, "tags", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            DocumentGranularity::ListElement,
+            "a covered ListElement FTS index must still be recognized, not silently \
+             skipped in favor of the Row default"
+        );
+    }
 
     fn fts_test_schema() -> Schema {
         let schema = ArrowSchema::new(vec![
@@ -1016,6 +1284,7 @@ mod tests {
         let metadata = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![1],
+            covering_fields: vec![],
             name: "tags_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1039,6 +1308,7 @@ mod tests {
         let metadata = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![1],
+            covering_fields: vec![],
             name: "tags_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -1065,5 +1335,30 @@ mod tests {
             canonicalize_inverted_index_details(legacy).unwrap(),
             canonicalize_inverted_index_details(current).unwrap()
         );
+    }
+
+    #[test]
+    fn inverted_details_equal_when_only_posting_format_version_differs() {
+        let left = canonicalize_inverted_index_details(
+            InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap(),
+        )
+        .unwrap();
+        let mut right = left.clone();
+        right.posting_format_version = Some(1);
+
+        assert_ne!(left, right);
+        assert!(inverted_index_details_semantically_equal(&left, &right));
+    }
+
+    #[test]
+    fn inverted_details_reject_with_position_mismatch() {
+        let left = canonicalize_inverted_index_details(
+            InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap(),
+        )
+        .unwrap();
+        let mut right = left.clone();
+        right.with_position = !left.with_position;
+
+        assert!(!inverted_index_details_semantically_equal(&left, &right));
     }
 }

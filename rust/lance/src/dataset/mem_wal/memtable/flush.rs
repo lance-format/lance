@@ -33,6 +33,7 @@ use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::dataset::write::InsertBuilder;
 use crate::index::vector::details::vector_index_details_default;
 use crate::session::Session;
 
@@ -82,6 +83,45 @@ pub struct MemTableFlusher {
     /// Session for those opens, sharing the base's store registry. `None` opens
     /// with a fresh session.
     session: Option<Arc<Session>>,
+}
+
+/// What a flushed generation holds, for the manifest entry recording it.
+///
+/// Read off the memtable being flushed, which is frozen. That matters: an
+/// appending store bumps these counters before it publishes the batch, so only
+/// a sealed one agrees with what a scan of it will see.
+#[derive(Clone, Copy)]
+struct FlushedSize {
+    in_memory_bytes: Option<u64>,
+    physical_rows: Option<u64>,
+    primary_key_bytes: Option<u64>,
+}
+
+impl FlushedSize {
+    /// Zero reads as unmeasured. An empty memtable is refused before a flush
+    /// gets here, so a flushed generation always holds rows and a zero can only
+    /// mean the accounting failed.
+    fn of(memtable: &MemTable) -> Self {
+        Self {
+            // `row_bytes`, not the store's retained heap: the window being
+            // written is what a reader of this generation gets back.
+            in_memory_bytes: Some(memtable.batch_store().row_bytes() as u64).filter(|b| *b > 0),
+            physical_rows: Some(memtable.row_count() as u64).filter(|r| *r > 0),
+            // Zero means the table has no primary key, which is not a
+            // measurement of one.
+            primary_key_bytes: Some(memtable.pk_bytes() as u64).filter(|b| *b > 0),
+        }
+    }
+
+    fn sstable(self, generation: u64, path: String) -> SsTable {
+        SsTable {
+            generation,
+            path,
+            in_memory_bytes: self.in_memory_bytes,
+            physical_rows: self.physical_rows,
+            primary_key_bytes: self.primary_key_bytes,
+        }
+    }
 }
 
 impl MemTableFlusher {
@@ -187,20 +227,45 @@ impl MemTableFlusher {
         }
     }
 
+    fn generation_target(&self, memtable: &MemTable) -> Result<(String, Path, Option<String>)> {
+        let generation = memtable.generation();
+        if let Some(target) = memtable.target() {
+            if target.generation != generation {
+                return Err(Error::internal(format!(
+                    "memtable generation {} carries data target generation {}",
+                    generation, target.generation
+                )));
+            }
+            return Ok((
+                target.generation_dir.clone(),
+                target.generation_path(&self.base_path, &self.shard_id),
+                Some(target.data_file_name.clone()),
+            ));
+        }
+
+        // Blob-free memtables do not reserve a storage identity during puts.
+        // Preserve the existing flush-time random generation and file naming
+        // for that path.
+        let random_hash = generate_random_hash();
+        Ok((
+            format!("{}_gen_{}", random_hash, generation),
+            sstable_path(&self.base_path, &self.shard_id, &random_hash, generation),
+            None,
+        ))
+    }
+
     /// Storage file version of the shard's base dataset. SSTables
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
     ///
-    /// Falls back to [`LanceFileVersion::default`] when no base dataset exists at
+    /// Falls back to the default selector's exact version when no base dataset exists at
     /// `base_uri` (e.g. flusher unit tests that run without a committed base).
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
-    async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
+    async fn base_storage_version(&self) -> Result<lance_file::version::ConcreteFileVersion> {
         match self.open_base().await {
-            Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
-            Err(Error::DatasetNotFound { .. }) => {
-                Ok(lance_file::version::LanceFileVersion::default())
-            }
+            Ok(dataset) => Ok(dataset.manifest().data_storage_format.lance_file_format()),
+            Err(Error::DatasetNotFound { .. }) => Ok(lance_file::version::stable_file_version()),
             Err(e) => Err(e),
         }
     }
@@ -232,10 +297,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
         let generation = memtable.generation();
-        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let size = FlushedSize::of(memtable);
+        let (gen_folder_name, gen_path, preassigned_data_file_name) =
+            self.generation_target(memtable)?;
 
         info!(
             "Flushing MemTable generation {} to {} ({} rows, {} batches)",
@@ -245,7 +310,9 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
-        let (rows_flushed, deleted) = self.write_data_file(&gen_path, memtable).await?;
+        let (rows_flushed, deleted) = self
+            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .await?;
 
         // Persist the within-generation deletion vector so the
         // SSTable exposes newest-per-PK on every read path.
@@ -275,6 +342,7 @@ impl MemTableFlusher {
                 generation,
                 &gen_folder_name,
                 covered_wal_entry_position,
+                size,
             )
             .await?;
 
@@ -284,10 +352,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: SsTable {
-                generation,
-                path: gen_folder_name,
-            },
+            sstable: size.sstable(generation, gen_folder_name),
             rows_flushed,
             covered_wal_entry_position,
         })
@@ -305,6 +370,7 @@ impl MemTableFlusher {
         &self,
         path: &Path,
         memtable: &MemTable,
+        preassigned_data_file_name: Option<&str>,
     ) -> Result<(usize, RoaringBitmap)> {
         use arrow_array::RecordBatchIterator;
 
@@ -350,6 +416,30 @@ impl MemTableFlusher {
         };
 
         let uri = self.path_to_uri(path);
+        if let Some(preassigned_data_file_name) = preassigned_data_file_name {
+            match self.open_generation(&uri).await {
+                Ok(dataset) => {
+                    let fragments = dataset.get_fragments();
+                    let is_expected = fragments.len() == 1
+                        && fragments[0].metadata().physical_rows == Some(total_rows)
+                        && fragments[0]
+                            .metadata()
+                            .files
+                            .iter()
+                            .any(|file| file.path == preassigned_data_file_name);
+                    if is_expected {
+                        return Ok((total_rows, deleted));
+                    }
+                    return Err(Error::io(format!(
+                        "generation {} already exists but does not describe the expected file {} and {} rows",
+                        path, preassigned_data_file_name, total_rows
+                    )));
+                }
+                Err(Error::DatasetNotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
@@ -359,7 +449,7 @@ impl MemTableFlusher {
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
-            data_storage_version: Some(self.base_storage_version().await?),
+            data_storage_version: Some(self.base_storage_version().await?.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -368,7 +458,11 @@ impl MemTableFlusher {
             session: self.session.clone(),
             ..Default::default()
         };
-        Dataset::write(reader, &uri, Some(write_params)).await?;
+        let mut builder = InsertBuilder::new(uri.as_str()).with_params(&write_params);
+        if let Some(preassigned_data_file_name) = preassigned_data_file_name {
+            builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
+        }
+        builder.execute_stream(reader).await?;
 
         Ok((total_rows, deleted))
     }
@@ -465,10 +559,10 @@ impl MemTableFlusher {
             ));
         }
 
-        let random_hash = generate_random_hash();
         let generation = memtable.generation();
-        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let size = FlushedSize::of(memtable);
+        let (gen_folder_name, gen_path, preassigned_data_file_name) =
+            self.generation_target(memtable)?;
 
         info!(
             "Flushing MemTable generation {} with indexes to {} ({} rows, {} batches)",
@@ -478,7 +572,9 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
-        let (total_rows, deleted) = self.write_data_file(&gen_path, memtable).await?;
+        let (total_rows, deleted) = self
+            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .await?;
 
         // Open the dataset once for all index building. Dataset::write already
         // created a v1 manifest with the fragment data.
@@ -579,6 +675,7 @@ impl MemTableFlusher {
                 generation,
                 &gen_folder_name,
                 covered_wal_entry_position,
+                size,
             )
             .await?;
 
@@ -588,10 +685,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: SsTable {
-                generation,
-                path: gen_folder_name,
-            },
+            sstable: size.sstable(generation, gen_folder_name),
             rows_flushed: memtable.row_count(),
             covered_wal_entry_position,
         })
@@ -780,6 +874,7 @@ impl MemTableFlusher {
                 uuid: index_uuid,
                 name: fts_cfg.name.clone(),
                 fields: vec![field_idx],
+                covering_fields: vec![],
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
@@ -902,6 +997,7 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
+        use lance_file::versions as file_versions;
         use lance_file::writer::FileWriterOptions;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
@@ -921,7 +1017,8 @@ impl MemTableFlusher {
 
         // Write the index files at the base dataset's storage version (matches
         // the flushed data fragments; 2.2 avoids the v2.1 miniblock chunk cap).
-        let storage_version = self.base_storage_version().await?;
+        let storage_version =
+            crate::dataset::versions::index_file_version(self.base_storage_version().await?);
 
         let index_uuid = uuid::Uuid::new_v4();
         let index_dir = gen_path
@@ -993,8 +1090,8 @@ impl MemTableFlusher {
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut storage_writer = lance_file::versions::create_writer(
-            lance_file::version::ConcreteFileVersion::from(storage_version),
+        let mut storage_writer = file_versions::create_writer(
+            storage_version,
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
             FileWriterOptions::default(),
@@ -1066,8 +1163,8 @@ impl MemTableFlusher {
             ArrowSchema::new(fields)
         };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-        let mut index_writer = lance_file::versions::create_writer(
-            lance_file::version::ConcreteFileVersion::from(storage_version),
+        let mut index_writer = file_versions::create_writer(
+            storage_version,
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
             FileWriterOptions::default(),
@@ -1108,6 +1205,7 @@ impl MemTableFlusher {
             uuid: index_uuid,
             name: config.name.clone(),
             fields: vec![0], // updated by caller
+            covering_fields: vec![],
             dataset_version: 0,
             fragment_bitmap: None,
             index_details,
@@ -1127,19 +1225,17 @@ impl MemTableFlusher {
         generation: u64,
         gen_path: &str,
         covered_wal_entry_position: u64,
+        size: FlushedSize,
     ) -> Result<ShardManifest> {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
             .commit_update(epoch, |current| {
                 let mut sstables = current.sstables.clone();
-                sstables.push(SsTable {
-                    generation,
-                    path: gen_path.clone(),
-                });
+                sstables.push(size.sstable(generation, gen_path.clone()));
 
                 ShardManifest {
-                    version: current.version + 1,
+                    version: current.next_version(),
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
@@ -1159,23 +1255,28 @@ pub enum TriggerMemTableFlush {
     Flush {
         /// The frozen memtable to flush.
         memtable: Arc<MemTable>,
+        /// The indexes the memtable was built with. Not read from the writer,
+        /// whose set changes with the schema while this memtable keeps the old one.
+        index_configs: Arc<[MemIndexConfig]>,
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
-    /// Periodic tick: evict frozen memtables whose post-flush grace has elapsed.
-    SweepExpired,
 }
 
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flush { memtable, done } => f
+            Self::Flush {
+                memtable,
+                index_configs,
+                done,
+            } => f
                 .debug_struct("TriggerMemTableFlush::Flush")
                 .field("memtable_gen", &memtable.generation())
                 .field("memtable_rows", &memtable.row_count())
+                .field("index_count", &index_configs.len())
                 .field("has_done", &done.is_some())
                 .finish(),
-            Self::SweepExpired => f.write_str("TriggerMemTableFlush::SweepExpired"),
         }
     }
 }
@@ -1194,6 +1295,60 @@ mod tests {
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
+    }
+
+    /// A local store with one claimed shard and a flusher over it.
+    ///
+    /// Every flush test in this module repeats this setup.
+    struct FlushFixture {
+        manifest_store: Arc<ShardManifestStore>,
+        flusher: MemTableFlusher,
+        epoch: u64,
+        _temp_dir: TempDir,
+    }
+
+    impl FlushFixture {
+        async fn new() -> Self {
+            let (store, base_path, base_uri, temp_dir) = create_local_store().await;
+            let shard_id = Uuid::new_v4();
+            let manifest_store = Arc::new(ShardManifestStore::new(
+                store.clone(),
+                &base_path,
+                shard_id,
+                2,
+            ));
+            let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
+            let flusher =
+                MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store.clone());
+            Self {
+                manifest_store,
+                flusher,
+                epoch,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        /// Flush `memtable` and read the entry it wrote back **off storage**.
+        ///
+        /// Through `read_version`, not `latest`: the store caches the manifest
+        /// it just wrote, so `latest` returns that same Rust value and would
+        /// pass even for a field that never reached the protobuf.
+        async fn flush_and_read_back(&self, memtable: &MemTable, durable: usize) -> SsTable {
+            let result = self
+                .flusher
+                .flush(memtable, self.epoch, 1, durable)
+                .await
+                .unwrap();
+            let version = self.manifest_store.latest().await.unwrap().unwrap().version;
+            self.manifest_store
+                .read_version(version)
+                .await
+                .unwrap()
+                .sstables
+                .into_iter()
+                .find(|sstable| sstable.generation == result.sstable.generation)
+                .expect("the flush recorded its generation")
+        }
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1331,11 +1486,75 @@ mod tests {
         assert_eq!(result.covered_wal_entry_position, 1);
 
         // Verify manifest was updated
-        let updated_manifest = manifest_store.read_latest().await.unwrap().unwrap();
+        let updated_manifest = manifest_store.latest().await.unwrap().unwrap();
         assert_eq!(updated_manifest.version, 2);
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.sstables.len(), 1);
+    }
+
+    /// A flushed generation records what it holds, read back off storage.
+    ///
+    /// The read goes through the persisted protobuf on purpose: a consumer
+    /// decides whether to open a generation from these numbers, so a field that
+    /// never reached storage is the failure worth catching.
+    #[tokio::test]
+    async fn flushed_sstable_records_what_it_holds() {
+        let fixture = FlushFixture::new().await;
+        let schema = create_test_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let rows = 10;
+        let frag_id = memtable
+            .insert(create_test_batch(&schema, rows))
+            .await
+            .unwrap();
+        let accounted = memtable.batch_store().row_bytes() as u64;
+
+        let entry = fixture.flush_and_read_back(&memtable, frag_id + 1).await;
+
+        assert_eq!(entry.physical_rows, Some(rows as u64));
+        assert_eq!(entry.in_memory_bytes, Some(accounted));
+        // The MemTable's own accounting, so above the raw payload (4 bytes per
+        // `id`) and not the encoded file size.
+        let payload = rows as u64 * std::mem::size_of::<i32>() as u64;
+        assert!(
+            entry.in_memory_bytes.unwrap() > payload,
+            "recorded {:?} should exceed the raw payload {payload}",
+            entry.in_memory_bytes
+        );
+        // No primary key here: absent, not zero, which a consumer would read as
+        // costing nothing.
+        assert_eq!(entry.primary_key_bytes, None);
+    }
+
+    /// With a primary key, its size is recorded too -- the term neither of the
+    /// others carries, since a narrow key over many rows and a wide key over
+    /// few weigh the same in `in_memory_bytes`.
+    #[tokio::test]
+    async fn flushed_sstable_records_its_primary_key_size() {
+        let fixture = FlushFixture::new().await;
+        let schema = create_pk_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let rows = 10;
+        let frag_id = memtable
+            .insert(create_test_batch(&schema, rows))
+            .await
+            .unwrap();
+
+        let entry = fixture.flush_and_read_back(&memtable, frag_id + 1).await;
+
+        // `id` is a non-nullable Int32, so the key columns hold at least four
+        // bytes a row and cannot reach the whole MemTable's size.
+        let key_bytes = entry.primary_key_bytes.expect("a keyed table records it");
+        assert!(
+            key_bytes >= rows as u64 * std::mem::size_of::<i32>() as u64,
+            "recorded {key_bytes} is below the raw key payload"
+        );
+        assert!(
+            key_bytes < entry.in_memory_bytes.unwrap(),
+            "keys ({key_bytes}) cannot outweigh the whole MemTable ({:?})",
+            entry.in_memory_bytes
+        );
     }
 
     /// A `SsTableWarmer` that counts calls and optionally fails.
@@ -1403,7 +1622,7 @@ mod tests {
             1,
             "pre-commit warm fires exactly once"
         );
-        let updated = manifest_store.read_latest().await.unwrap().unwrap();
+        let updated = manifest_store.latest().await.unwrap().unwrap();
         assert_eq!(
             updated.sstables.len(),
             1,
@@ -1572,7 +1791,7 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1669,7 +1888,7 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
 

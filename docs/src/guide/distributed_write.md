@@ -263,3 +263,114 @@ Output:
 6   7  Gracie     88
 7   8   Henry     82
 ```
+
+### Handling stable row id
+
+On a dataset created with `enable_stable_row_ids=True`, each row keeps the same
+`_rowid` for its lifetime, even when an update rewrites it into a different
+fragment. Lance cannot infer which new row replaces which old one, so when you
+assemble the transaction yourself, carrying those ids across is your job: read
+the rows you are rewriting with `with_row_id=True` and attach their ids to the
+new fragment with `lance.fragment.RowIdSequence`.
+
+Rows you leave without an id are treated as newly inserted. That is not an error,
+so a fragment written without `row_id_meta` commits successfully while silently
+giving every rewritten row a fresh identity, breaking `_rowid` for anything
+downstream that relies on it.
+
+You do **not** need to supply `created_at_version_meta` or
+`last_updated_at_version_meta`. Leave them as `None`. Lance derives both while
+building the manifest: `last_updated_at_version_meta` becomes the version being
+committed, and `created_at_version_meta` is copied from whichever existing row
+carries the same stable row id, so a rewritten row keeps the version it first
+appeared in.
+
+#### Mixing updated and new rows
+
+A single fragment may hold both rewritten rows and brand new ones. Order it so
+that **the rewritten rows come first and the new rows last**, then pass only the
+row ids of the rewritten rows. The row ids bind to the leading rows in fragment
+order, and the commit generates new ids for the remaining rows.
+
+Do not generate ids for the new rows yourself. Row ids are handed out from a counter
+in the manifest, and a commit that loses a race is retried against the version
+that won, which may have consumed the very ids you picked. Only the commit knows
+which values are free, so it assigns them after conflict resolution has settled.
+Supplying more row ids than the fragment has rows is rejected.
+
+```python
+import lance
+import pyarrow as pa
+import pyarrow.compute as pc
+from lance.fragment import RowIdSequence, write_fragments
+
+schema = pa.schema([("id", pa.int64()), ("score", pa.int64())])
+dataset_uri = "./stable_row_ids.lance"
+dataset = lance.write_dataset(
+    pa.table({"id": [1, 2, 3, 4], "score": [85, 90, 75, 80]}, schema=schema),
+    dataset_uri,
+    enable_stable_row_ids=True,
+)
+
+# On a worker: read the rows to rewrite, keeping their stable row ids.
+rows = dataset.to_table(columns=["id", "score"], with_row_id=True)
+rewritten = rows.filter(pc.field("id").isin([2, 3]))
+
+# Rewritten rows first, then the row that did not exist before.
+new_data = pa.table(
+    {
+        "id": rewritten["id"].to_pylist() + [5],
+        "score": [95, 70, 60],
+    },
+    schema=schema,
+)
+fragments = write_fragments(new_data, dataset_uri, schema=schema)
+assert len(fragments) == 1
+
+# Only the rewritten rows have ids. The trailing row gets one at commit time.
+fragments[0].row_id_meta = RowIdSequence(rewritten["_rowid"]).to_inline_metadata()
+
+# On the committing worker: tombstone the old copies of the rewritten rows.
+updated_fragment = dataset.get_fragments()[0].delete("id in (2, 3)")
+
+op = lance.LanceOperation.Update(
+    updated_fragments=[updated_fragment],
+    new_fragments=fragments,
+)
+dataset = lance.LanceDataset.commit(dataset_uri, op, read_version=dataset.version)
+
+print(dataset.to_table(with_row_id=True).to_pandas())
+```
+
+Output:
+```
+   id  score  _rowid
+0   1     85       0
+1   4     80       3
+2   2     95       1
+3   3     70       2
+4   5     60       4
+```
+
+Row ids 1 and 2 followed their rows into the new fragment, and the inserted row
+received the next unused id. Reading the lineage columns shows that the rewritten
+rows kept their original creation version while the inserted row is stamped with
+the version that added it:
+
+```python
+print(
+    dataset.to_table(
+        columns=["id", "_row_created_at_version", "_row_last_updated_at_version"]
+    ).to_pandas()
+)
+```
+
+Output:
+```
+   id  _row_created_at_version  _row_last_updated_at_version
+0   1                        1                             1
+1   4                        1                             1
+2   2                        1                             2
+3   3                        1                             2
+4   5                        2                             2
+```

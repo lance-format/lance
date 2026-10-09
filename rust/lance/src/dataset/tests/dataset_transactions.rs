@@ -6,20 +6,37 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{ManifestWriteConfig, TRANSACTIONS_DIR, write_manifest_file};
+use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
+use crate::dataset::{
+    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR,
+    write_manifest_file,
+};
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
+use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+use lance_table::format::IndexMetadata;
 use lance_table::io::commit::ManifestNamingScheme;
+use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow_array::Array;
 use arrow_array::RecordBatch;
-use arrow_array::{Int32Array, RecordBatchIterator, StringArray, types::Int32Type};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use arrow_array::{
+    Int32Array, RecordBatchIterator, StringArray, StructArray,
+    types::{Int32Type, Int64Type},
+};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+use lance_core::Error;
+use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
+use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datagen::{BatchCount, RowCount, array};
 
 use crate::datafusion::LanceTableProvider;
@@ -208,6 +225,229 @@ async fn test_session_store_registry() {
     assert_eq!(registry.active_stores().len(), 0);
 }
 
+#[test]
+fn test_decode_inline_transaction_tolerates_unknown_operations() {
+    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // A transaction written by a newer version of Lance may carry an operation
+    // this version cannot decode; prost surfaces it as a missing oneof. It
+    // decodes as `Operation::Unknown` rather than failing.
+    let unknown_operation = pb::Transaction {
+        read_version: 1,
+        uuid: "test".to_string(),
+        ..Default::default()
+    };
+    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
+
+    // Corrupt bytes are likewise tolerated.
+    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
+
+    // A decodable transaction is returned.
+    let known = pb::Transaction::try_from(&Transaction::new(
+        1,
+        Operation::Append { fragments: vec![] },
+        None,
+    ))
+    .unwrap();
+    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Append { .. }));
+}
+
+/// A transaction as a future Lance might write it: the `operation` oneof holds
+/// a field number this version does not know. 199 is the top of the reserved
+/// operation range, the number least likely to be assigned; if it ever is, the
+/// `Unknown` assertions in these tests fail and a new number must be picked.
+#[derive(Clone, PartialEq, prost::Message)]
+struct FutureTransaction {
+    #[prost(uint64, tag = "1")]
+    read_version: u64,
+    #[prost(string, tag = "2")]
+    uuid: String,
+    #[prost(message, optional, tag = "199")]
+    future_operation: Option<()>,
+}
+
+fn future_transaction(uuid: &str) -> FutureTransaction {
+    FutureTransaction {
+        read_version: 1,
+        uuid: uuid.to_string(),
+        future_operation: Some(()),
+    }
+}
+
+/// Rewrite the latest manifest of `dataset` in place so its inline transaction
+/// section holds `inline_tx`, stored in the deprecated field 21 if
+/// `deprecated_field` is set and in field 23 otherwise.
+async fn rewrite_inline_transaction(
+    dataset: &Dataset,
+    inline_tx: &impl prost::Message,
+    deprecated_field: bool,
+) {
+    use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+    use lance_io::object_writer::ObjectWriter;
+    use lance_io::traits::{WriteExt, Writer};
+    use lance_table::format::pb;
+
+    assert!(dataset.manifest.index_section.is_none());
+    let path = &dataset.manifest_location().path;
+    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+        .await
+        .unwrap();
+    let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
+    let mut manifest = pb::Manifest::from(dataset.manifest.as_ref());
+    if deprecated_field {
+        manifest.transaction_section = None;
+        manifest.transaction_section_deprecated = Some(tx_pos);
+    } else {
+        manifest.transaction_section = Some(tx_pos);
+        manifest.transaction_section_deprecated = None;
+    }
+    let pos = writer.write_protobuf(&manifest).await.unwrap();
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await
+        .unwrap();
+    Writer::shutdown(&mut writer).await.unwrap();
+}
+
+async fn two_version_dataset(uri: &str) -> Dataset {
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    let dataset = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_dataset(uri, FragmentCount::from(1), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    let batch = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_open_version_with_unknown_operation() {
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    rewrite_inline_transaction(&dataset, &future_transaction("future"), false).await;
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert!(matches!(tx.operation, Operation::Unknown { .. }));
+    assert_eq!(tx.uuid, "future");
+
+    // It can be neither re-encoded nor committed.
+    assert!(lance_table::format::pb::Transaction::try_from(&tx).is_err());
+    assert!(
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(tx)
+            .await
+            .is_err()
+    );
+
+    // A concurrent writer cannot tell what the unknown operation touched, so
+    // it must not commit over it.
+    let stale = dataset.checkout_version(1).await.unwrap();
+    let append = Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+    let err = CommitBuilder::new(Arc::new(stale))
+        .execute(append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::IncompatibleTransaction { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_inline_transaction_written_to_new_field() {
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // Lance v1.0-v11.0 fail to open a version whose field 21 holds an
+    // operation they don't know, so it must never be written again.
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    let bytes = dataset
+        .object_store
+        .read_one_all(&dataset.manifest_location().path)
+        .await
+        .unwrap();
+    let footer = &bytes[bytes.len() - 16..];
+    let pos = u64::from_le_bytes(footer[..8].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    let manifest = pb::Manifest::decode(&bytes[pos + 4..pos + 4 + len]).unwrap();
+    assert!(manifest.transaction_section_deprecated.is_none());
+    assert!(manifest.transaction_section.is_some());
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_deprecated_field() {
+    use lance_table::format::pb;
+
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    let expected = dataset.read_transaction().await.unwrap().unwrap();
+    rewrite_inline_transaction(
+        &dataset,
+        &pb::Transaction::try_from(&expected).unwrap(),
+        true,
+    )
+    .await;
+    // Remove the external copy so only field 21 can supply the transaction.
+    let tx_path = dataset
+        .base
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(dataset.manifest.transaction_file.as_deref().unwrap());
+    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    assert_eq!(dataset.read_transaction().await.unwrap().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_released_deprecated_field() {
+    use crate::utils::test::copy_test_data_to_tmp;
+
+    // Written by Lance v1.0.1, which stores the inline transaction in field 21.
+    let test_dir = copy_test_data_to_tmp("v1.0.1/list_struct_reorder.lance").unwrap();
+    // Remove the external copies so only field 21 can supply the transactions.
+    std::fs::remove_dir_all(test_dir.std_path().join(TRANSACTIONS_DIR)).unwrap();
+
+    let dataset = Dataset::open(test_dir.path_str().as_str()).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert_eq!(tx.uuid, "87766aea-beb2-4942-8830-df51d2f17492");
+    assert_eq!(tx.read_version, 1);
+}
+
+#[test]
+fn test_distinct_unknown_transactions_are_not_equal() {
+    use crate::dataset::decode_inline_transaction;
+    use prost::Message;
+
+    // Commit-outcome detection compares transactions for equality; two
+    // unknown operations must not be mistaken for the same commit.
+    let decode = |uuid: &str| {
+        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+    };
+    assert_eq!(decode("a"), decode("a"));
+    assert_ne!(decode("a"), decode("b"));
+}
+
 #[tokio::test]
 async fn test_migrate_v2_manifest_paths() {
     let test_uri = TempStrDir::default();
@@ -385,7 +625,7 @@ async fn test_inline_transaction() {
     let tx_file = crate::io::commit::write_transaction_file(
         ds.object_store.as_ref(),
         &ds.base,
-        &lance_table::format::pb::Transaction::from(&tx),
+        &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
     )
     .await
     .unwrap();
@@ -394,7 +634,7 @@ async fn test_inline_transaction() {
             Some(ds.manifest.as_ref()),
             ds.load_indices().await.unwrap().as_ref().clone(),
             &tx_file,
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .unwrap();
     let location = write_manifest_file(
@@ -410,6 +650,8 @@ async fn test_inline_transaction() {
         &ManifestWriteConfig::default(),
         ds.manifest_location.naming_scheme,
         None,
+        // Previously classified from a None inline copy, which validated.
+        true,
     )
     .await
     .unwrap();
@@ -672,6 +914,16 @@ async fn test_list_detached_manifests() {
     // Now there should be one detached manifest
     let detached = dataset.list_detached_manifests().await.unwrap();
     assert_eq!(detached.len(), 1);
+    assert_eq!(
+        dataset
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
 
     // The detached version should have the high bit set
     let detached_version = detached[0].version;
@@ -879,7 +1131,9 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     .transaction_properties(large_props("payload"))
     .build();
     let clone_uri = TempStrDir::default();
+    // Only the manifest is checked here, so skipping the file copy is fine.
     CommitBuilder::new(&clone_uri)
+        .with_deep_clone_files_copied()
         .execute(clone_tx.clone())
         .await
         .unwrap();
@@ -887,4 +1141,781 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     assert!(cloned.manifest.transaction_section.is_none());
     assert_ne!(cloned.manifest.transaction_file, source_tx_file);
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
+}
+
+/// Partial RewriteColumns refresh in `build_manifest`: only matched physical
+/// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
+/// untouched fragments keep both version sequences.
+#[tokio::test]
+async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch0 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader0 = RecordBatchIterator::new(vec![Ok(batch0)], schema.clone());
+    let write_params = WriteParams {
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::Stable),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader0, uri, Some(write_params))
+        .await
+        .unwrap();
+
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(100..108)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader1 = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+    dataset.append(reader1, None).await.unwrap();
+
+    let frags = dataset.get_fragments();
+    assert_eq!(
+        frags.len(),
+        2,
+        "expected two fragments (append creates a new fragment)"
+    );
+
+    async fn scan_row_versions(ds: &Dataset) -> HashMap<(u32, u32), (u64, u64)> {
+        let mut scanner = ds.scan();
+        scanner
+            .project(&[
+                ROW_ADDR,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION,
+            ])
+            .unwrap();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut out = HashMap::new();
+        for batch in batches {
+            let addrs = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let last = batch
+                .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let created = batch
+                .column_by_name(ROW_CREATED_AT_VERSION)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            for row in 0..batch.num_rows() {
+                let addr = RowAddress::from(addrs.value(row));
+                out.insert(
+                    (addr.fragment_id(), addr.row_offset()),
+                    (last.value(row), created.value(row)),
+                );
+            }
+        }
+        out
+    }
+
+    let before = scan_row_versions(&dataset).await;
+    assert_eq!(before.len(), 16);
+
+    // Update only rows i in {2, 4, 6} within fragment 0 (physical offsets 2, 4, 6).
+    let update_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let update_batch = RecordBatch::try_new(
+        update_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![2, 4, 6])),
+            Arc::new(Int32Array::from(vec![99, 99, 99])),
+        ],
+    )
+    .unwrap();
+    let right: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+        vec![Ok(update_batch)].into_iter(),
+        update_schema,
+    ));
+
+    let mut frag0 = dataset.get_fragment(0).unwrap();
+    let u = frag0
+        .update_columns_with_offsets(right, "i", "i")
+        .await
+        .unwrap();
+    assert_eq!(u.matched_offsets.iter().count(), 3);
+    for off in [2_u32, 4, 6] {
+        assert!(u.matched_offsets.contains(off));
+    }
+
+    let updated_fragment_offsets = Some(UpdatedFragmentOffsets(HashMap::from([(
+        u.fragment.id,
+        u.matched_offsets,
+    )])));
+
+    let op = Operation::Update {
+        removed_fragment_ids: vec![],
+        updated_fragments: vec![u.fragment],
+        new_fragments: vec![],
+        fields_modified: u.fields_modified,
+        compacted_sstables: Vec::new(),
+        fields_for_preserving_frag_bitmap: vec![],
+        update_mode: Some(UpdateMode::RewriteColumns),
+        inserted_rows_filter: None,
+        updated_fragment_offsets,
+    };
+
+    let read_v = dataset.version().version;
+    let dataset = Dataset::commit(
+        uri,
+        op,
+        Some(read_v),
+        None,
+        None,
+        Arc::new(Session::default()),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let new_v = dataset.version().version;
+    assert_eq!(new_v, read_v + 1);
+
+    let after = scan_row_versions(&dataset).await;
+    for off in 0..8_u32 {
+        let key = (0, off);
+        let (last_before, created_before) = before[&key];
+        let (last_after, created_after) = after[&key];
+        assert_eq!(created_after, created_before);
+        if off == 2 || off == 4 || off == 6 {
+            assert_eq!(
+                last_after, new_v,
+                "matched row offset {off} should advance last_updated to new version"
+            );
+        } else {
+            assert_eq!(
+                last_after, last_before,
+                "unmatched row offset {off} in fragment 0 should keep last_updated"
+            );
+        }
+    }
+
+    for off in 0..8_u32 {
+        let key = (1, off);
+        assert_eq!(
+            after[&key], before[&key],
+            "fragment 1 row offset {off}: both version columns unchanged"
+        );
+    }
+}
+
+/// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
+/// dropped id stays referenced by the data files and max_field_id stays 3.
+async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("b", DataType::Int32, true),
+        ArrowField::new("c", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+    dataset.drop_columns(&[dropped]).await.unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
+    let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
+    expected_ids.push(3);
+    assert_eq!(dataset.schema().field_ids(), expected_ids);
+    assert_eq!(dataset.manifest.max_field_id(), 3);
+    dataset
+}
+
+/// Expected values of every column surviving `dropped`, plus d.
+fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
+    [
+        ("a", [1, 2]),
+        ("b", [10, 20]),
+        ("c", [100, 200]),
+        ("d", [5, 5]),
+    ]
+    .into_iter()
+    .filter(|(name, _)| *name != dropped)
+    .collect()
+}
+
+fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
+    for (name, expected) in cols {
+        let col = &batch[*name];
+        assert_eq!(
+            col.as_primitive::<Int32Type>().values(),
+            expected,
+            "column {}",
+            name
+        );
+    }
+}
+
+async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
+    let fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|f| f.metadata().clone())
+        .collect();
+    Dataset::commit(
+        Arc::new(dataset.clone()),
+        Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability: true,
+        },
+        Some(dataset.manifest.version),
+        None,
+        None,
+        dataset.session(),
+        false,
+    )
+    .await
+}
+
+// Which clause rejects the lossy round-trip depends on the hole's
+// position: a hole before the last field remaps a shared id, while a
+// hole at the end reuses the dropped id for the new field.
+#[rstest::rstest]
+#[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
+#[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
+#[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
+#[tokio::test]
+async fn test_merge_rejects_renumbered_field_ids(#[case] dropped: &str, #[case] expected: &str) {
+    let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+    let arrow_schema = ArrowSchema::from(dataset.schema());
+    let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+    assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+    let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(message.contains(expected), "unexpected error: {}", message);
+}
+
+#[tokio::test]
+async fn test_merge_rejects_dropped_field_id_reuse() {
+    // Deliberate reuse of a tombstoned id, as opposed to the renumbering
+    // accident covered above.
+    let dataset = dataset_with_dropped_column("memory://", "b").await;
+
+    let mut schema = dataset.schema().clone();
+    let mut field = LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+    field.id = 1;
+    schema.fields.push(field);
+
+    let err = commit_merge(&dataset, schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains("assigns id 1 to new field \"e\"")
+            && message.contains("must use ids of at least 4"),
+        "unexpected error: {}",
+        message
+    );
+}
+
+#[tokio::test]
+async fn test_merge_rejects_renumbered_nested_field_ids() {
+    // A hole inside a struct shifts a nested leaf's id onto a field
+    // outside the struct on renumbering; the full-path comparison must
+    // catch the cross-parent remap.
+    let struct_fields = Fields::from(vec![
+        ArrowField::new("x", DataType::Int32, true),
+        ArrowField::new("y", DataType::Int32, true),
+    ]);
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+        ArrowField::new("z", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(StructArray::new(
+                struct_fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int32Array::from(vec![10, 20])),
+                ],
+                None,
+            )),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset.drop_columns(&["s.x"]).await.unwrap();
+    assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
+
+    let arrow_schema = ArrowSchema::from(dataset.schema());
+    let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+    assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+    let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains("remaps field id 2 from \"s.y\" to \"z\""),
+        "unexpected error: {}",
+        message
+    );
+}
+
+#[rstest::rstest]
+#[case::drop_a("a")]
+#[case::drop_b("b")]
+#[case::drop_c("c")]
+#[tokio::test]
+async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
+    let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+    let survivors = surviving_columns(dropped);
+    let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+    let mut schema = dataset.schema().clone();
+    schema
+        .mut_field_by_id(first_id)
+        .unwrap()
+        .metadata
+        .insert("wm".into(), "42".into());
+
+    let dataset = commit_merge(&dataset, schema).await.unwrap();
+    assert_eq!(
+        dataset
+            .schema()
+            .field(survivors[0].0)
+            .unwrap()
+            .metadata
+            .get("wm"),
+        Some(&"42".to_string())
+    );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_columns(&batch, &survivors);
+}
+
+#[rstest::rstest]
+#[case::drop_a("a")]
+#[case::drop_b("b")]
+#[case::drop_c("c")]
+#[tokio::test]
+async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
+    let dataset = dataset_with_dropped_column("memory://", dropped).await;
+
+    let mut survivors = surviving_columns(dropped);
+    let omitted = survivors.remove(0);
+    let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+    let schema = dataset.schema().project(&names).unwrap();
+
+    let dataset = commit_merge(&dataset, schema).await.unwrap();
+    assert!(dataset.schema().field(omitted.0).is_none());
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_columns(&batch, &survivors);
+}
+
+#[tokio::test]
+async fn test_merge_rejects_schema_only_path_remap() {
+    let dataset = dataset_with_dropped_column("memory://", "c").await;
+    let prior_id = dataset.schema().field("a").unwrap().id;
+    let fresh_id = dataset.manifest.max_field_id() + 1;
+
+    let mut schema = dataset.schema().clone();
+    schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
+
+    let err = commit_merge(&dataset, schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!(
+            "remaps existing field \"a\" from id {} to id {}",
+            prior_id, fresh_id
+        )) && message.contains("base data file"),
+        "unexpected error: {}",
+        message
+    );
+}
+
+#[rstest::rstest]
+#[case::logical_type(DataType::Float32, true, "logical type")]
+#[case::nullability(DataType::Int32, false, "nullable")]
+#[tokio::test]
+async fn test_merge_rejects_shared_id_type_or_nullability_change(
+    #[case] data_type: DataType,
+    #[case] nullable: bool,
+    #[case] expected: &str,
+) {
+    let dataset = dataset_with_dropped_column("memory://", "c").await;
+    let field_id = dataset.schema().field("a").unwrap().id;
+
+    let mut schema = dataset.schema().clone();
+    let field = schema.mut_field_by_id(field_id).unwrap();
+    field.logical_type = LogicalType::try_from(&data_type).unwrap();
+    field.nullable = nullable;
+
+    let err = commit_merge(&dataset, schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("changes field id {} (\"a\")", field_id))
+            && message.contains(expected),
+        "unexpected error: {}",
+        message
+    );
+}
+
+/// The pure schema/fragment-shape half of this check lives in
+/// `lance_table::transaction`'s `test_merge_allows_rewritten_fresh_field_id`;
+/// this covers the `Dataset`-level effect of a rewrite that assigns a fresh
+/// field id.
+#[tokio::test]
+async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
+    let mut dataset = dataset_with_dropped_column("memory://", "c").await;
+    let prior_id = dataset.schema().field("a").unwrap().id;
+    dataset
+        .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
+        .await
+        .unwrap();
+    let new_id = dataset.schema().field("a").unwrap().id;
+    assert_ne!(new_id, prior_id);
+    assert!(
+        dataset.get_fragments().iter().all(|fragment| {
+            fragment
+                .metadata()
+                .files
+                .iter()
+                .any(|file| file.fields.contains(&new_id))
+        }),
+        "alter_columns must materialize the fresh id in every fragment base file"
+    );
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+}
+
+/// A covering declaration that is not a suffix of `fields` must be refused
+/// at commit, not silently accepted and later misread as a keyed column.
+#[tokio::test]
+async fn test_create_index_rejects_non_suffix_covering_fields() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    // fields = [0, 1] with covering = [0]: field 0 is the leading entry,
+    // not the trailing one, so this claims the keyed column is covered.
+    let bad_index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "bad_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![0],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![bad_index],
+            removed_indices: vec![],
+        },
+        None,
+    );
+
+    let err = dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .expect_err("a non-suffix covering declaration must not commit");
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("must come last"),
+        "unexpected message: {err}"
+    );
+}
+
+/// A shallow clone copies the index metadata wholesale, `covering_fields`
+/// included, but `Manifest::shallow_clone` builds the new manifest directly --
+/// `Operation::Clone` is refused by `build_manifest` -- so the fence is not
+/// recomputed there and has to be carried explicitly. Without that, a clone of
+/// a covered table comes back unfenced and a build predating covering can open
+/// it and read carried columns as keyed ones.
+#[tokio::test]
+async fn test_shallow_clone_preserves_the_covering_fence() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+    let index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "covered_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![1],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "precondition: the source table is fenced"
+    );
+
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // The clone really does carry the covering declaration, so it really does
+    // need the fence -- assert that first, or the flag check below could pass
+    // for a clone that simply dropped the index.
+    let cloned_indices = cloned.load_indices().await.unwrap();
+    assert_eq!(
+        cloned_indices
+            .iter()
+            .find(|i| i.name == "covered_idx")
+            .map(|i| i.covering_fields.clone()),
+        Some(vec![1]),
+        "precondition: the clone carries the covering declaration"
+    );
+    assert_ne!(
+        cloned.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a clone of a covered table must stay fenced for readers"
+    );
+    assert_ne!(
+        cloned.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a clone of a covered table must stay fenced for writers"
+    );
+}
+
+/// Covering redefines what `fields` means, so a build that predates it would
+/// select a vector index by membership of `fields` and answer a query on a
+/// merely-carried column with an index keyed on a different one. The fence is
+/// the feature flag: a covering commit must set it in both words so such a
+/// build refuses the table outright, and dropping the last covering index
+/// must clear it again rather than fence the table forever.
+#[tokio::test]
+async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "precondition: a plain dataset carries no covering fence"
+    );
+
+    let index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "covered_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![1],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+    let uuid = index.uuid;
+
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index.clone()],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // Both words: a reader would select the wrong index, a writer would
+    // mismaintain it.
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a covering commit must fence readers"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a covering commit must fence writers"
+    );
+
+    // The flag has to survive the reload, not just the in-memory manifest:
+    // `apply_feature_flags` runs a second time in `write_manifest_file` and
+    // resets both words.
+    let reopened = Dataset::open(uri).await.unwrap();
+    assert_ne!(
+        reopened.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "the fence must be persisted, not only set in memory"
+    );
+
+    // An ordinary commit that has nothing to do with indices must not drop the
+    // fence. `Manifest::new_from_previous` zeroes both flag words, so the bit
+    // survives only because `build_manifest` re-derives it from the surviving
+    // index list on every commit rather than inheriting it -- an append is the
+    // cheapest way to pin that.
+    let mut dataset = reopened;
+    let more = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(8..16)),
+            Arc::new(Int32Array::from(vec![1_i32; 8])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(more)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "an ordinary append must not lift the covering fence"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "an ordinary append must not lift the writer half of the fence"
+    );
+
+    // Dropping the last covering index lifts the fence. Nothing clears the bit
+    // explicitly -- the words start zeroed and it is simply not set again -- so
+    // this is the pin against someone making the fence sticky via an inherit
+    // step, the way MemWAL catch-up is.
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![],
+                    removed_indices: vec![IndexMetadata { uuid, ..index }],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "dropping the last covering index must clear the fence"
+    );
 }

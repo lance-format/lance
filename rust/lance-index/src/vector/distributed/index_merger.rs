@@ -9,16 +9,17 @@ use crate::vector::shared::partition_merger::{
 };
 use arrow::{compute::concat_batches, datatypes::Float32Type};
 use arrow_array::cast::AsArray;
-use arrow_array::types::UInt8Type;
+use arrow_array::types::{UInt8Type, UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use futures::StreamExt as _;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::{Error, ROW_ID_FIELD, Result};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
+use crate::scalar::OldIndexDataFilter;
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
     pack_codes, rabit_binary_code_field, rabit_ex_code_field,
@@ -41,7 +42,6 @@ use bytes::Bytes;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::writer::{FileWriter as V2Writer, FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -256,7 +256,7 @@ pub async fn init_writer_for_flat(
     d0: usize,
     item_type: &DataType,
     dt: DistanceType,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let arrow_schema = ArrowSchema::new(vec![
         (*ROW_ID_FIELD).clone(),
@@ -271,7 +271,7 @@ pub async fn init_writer_for_flat(
     ]);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
-        ConcreteFileVersion::from(format_version),
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
         FileWriterOptions::default(),
@@ -290,7 +290,7 @@ pub async fn init_writer_for_pq(
     aux_out: &object_store::path::Path,
     dt: DistanceType,
     pm: &ProductQuantizationMetadata,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let num_bytes = if pm.nbits == 4 {
         pm.num_sub_vectors / 2
@@ -310,7 +310,7 @@ pub async fn init_writer_for_pq(
     ]);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
-        ConcreteFileVersion::from(format_version),
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
         FileWriterOptions::default(),
@@ -335,7 +335,7 @@ pub async fn init_writer_for_sq(
     aux_out: &object_store::path::Path,
     dt: DistanceType,
     sq_meta: &ScalarQuantizationMetadata,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let d0 = sq_meta.dim;
     let arrow_schema = ArrowSchema::new(vec![
@@ -351,7 +351,7 @@ pub async fn init_writer_for_sq(
     ]);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
-        ConcreteFileVersion::from(format_version),
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
         FileWriterOptions::default(),
@@ -367,7 +367,7 @@ pub async fn init_writer_for_rq(
     aux_out: &object_store::path::Path,
     dt: DistanceType,
     rq_meta: &RabitQuantizationMetadata,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
     let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
@@ -386,7 +386,7 @@ pub async fn init_writer_for_rq(
     let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
-        ConcreteFileVersion::from(format_version),
+        format_version,
         writer,
         LanceSchema::try_from(&arrow_schema)?,
         FileWriterOptions::default(),
@@ -426,6 +426,35 @@ pub async fn write_partition_rows(
         w.write_batch(&rb).await?;
     }
     Ok(())
+}
+
+/// Stream a partition range, retain its owned rows, and return the number written.
+async fn write_filtered_partition_rows(
+    reader: &V2Reader,
+    w: &mut FileWriter,
+    range: Range<usize>,
+    row_filter: &OldIndexDataFilter,
+) -> Result<usize> {
+    let mut stream = reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(range),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
+    let mut written_rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = filter_batch_to_owned_rows(&batch?, row_filter)?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        written_rows = written_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+            Error::index("Filtered partition row count exceeds usize capacity".to_string())
+        })?;
+        w.write_batch(&batch).await?;
+    }
+    Ok(written_rows)
 }
 
 /// Transpose the PQ code column for a batch and write it to the unified writer.
@@ -525,6 +554,7 @@ struct ShardInfo {
     lengths: Vec<u32>,
     partition_offsets: Vec<usize>,
     total_rows: usize,
+    row_filter: Option<Arc<OldIndexDataFilter>>,
 }
 
 #[derive(Debug)]
@@ -534,6 +564,7 @@ struct ShardWindowReadJob {
     window_total_rows: usize,
     start_offset: usize,
     end_offset: usize,
+    row_filter: Option<Arc<OldIndexDataFilter>>,
 }
 
 #[derive(Debug)]
@@ -652,6 +683,7 @@ async fn read_partition_window(
                 window_total_rows,
                 start_offset,
                 end_offset,
+                row_filter: shard.row_filter.clone(),
             }
         })
         .collect();
@@ -739,7 +771,13 @@ async fn read_shard_window_partitions(
             }
 
             let to_take = std::cmp::min(remaining, rb.num_rows() - consumed);
-            per_partition_batches[rel_partition].push(rb.slice(consumed, to_take));
+            let mut partition_batch = rb.slice(consumed, to_take);
+            if let Some(row_filter) = shard_job.row_filter.as_deref() {
+                partition_batch = filter_batch_to_owned_rows(&partition_batch, row_filter)?;
+            }
+            if partition_batch.num_rows() > 0 {
+                per_partition_batches[rel_partition].push(partition_batch);
+            }
             consumed += to_take;
             remaining -= to_take;
         }
@@ -762,6 +800,19 @@ async fn read_shard_window_partitions(
     Ok(per_partition_batches)
 }
 
+fn filter_batch_to_owned_rows(
+    batch: &RecordBatch,
+    row_filter: &OldIndexDataFilter,
+) -> Result<RecordBatch> {
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::index(format!("Column {ROW_ID} missing in auxiliary shard")))?
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| Error::index(format!("Column {ROW_ID} is not UInt64 in auxiliary shard")))?;
+    let keep = row_filter.filter_row_ids(row_ids);
+    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
+}
+
 /// Merge the selected segment auxiliary files into `target_dir`.
 ///
 /// This is the storage merge kernel for vector segment build. Callers choose
@@ -779,6 +830,42 @@ pub async fn merge_partial_vector_auxiliary_files(
     target_dir: &object_store::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<lance_table::format::IndexFile> {
+    merge_partial_vector_auxiliary_files_inner(object_store, aux_paths, target_dir, None, progress)
+        .await
+}
+
+/// Merge auxiliary files while retaining only rows owned by each source segment.
+pub async fn merge_partial_vector_auxiliary_files_with_row_filters(
+    object_store: &lance_io::object_store::ObjectStore,
+    aux_paths: &[object_store::path::Path],
+    target_dir: &object_store::path::Path,
+    row_filters: &[OldIndexDataFilter],
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<lance_table::format::IndexFile> {
+    if aux_paths.len() != row_filters.len() {
+        return Err(Error::invalid_input(format!(
+            "Expected one row filter per auxiliary file, got {} files and {} filters",
+            aux_paths.len(),
+            row_filters.len()
+        )));
+    }
+    merge_partial_vector_auxiliary_files_inner(
+        object_store,
+        aux_paths,
+        target_dir,
+        Some(row_filters),
+        progress,
+    )
+    .await
+}
+
+async fn merge_partial_vector_auxiliary_files_inner(
+    object_store: &lance_io::object_store::ObjectStore,
+    aux_paths: &[object_store::path::Path],
+    target_dir: &object_store::path::Path,
+    row_filters: Option<&[OldIndexDataFilter]>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<lance_table::format::IndexFile> {
     if aux_paths.is_empty() {
         return Err(Error::index(
             "No partial auxiliary files were selected for merge".to_string(),
@@ -793,7 +880,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut dim: Option<usize> = None;
     let mut detected_index_type: Option<SupportedIvfIndexType> = None;
     // Inherit file format version from the first shard (set on first iteration)
-    let mut format_version: Option<LanceFileVersion> = None;
+    let mut format_version: Option<ConcreteFileVersion> = None;
 
     // Prepare output path; we'll create writer once when we know schema
     let aux_out = target_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
@@ -845,7 +932,7 @@ pub async fn merge_partial_vector_auxiliary_files(
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
-            format_version = Some(meta.version().into());
+            format_version = Some(meta.version());
         }
 
         // Read distance type
@@ -954,8 +1041,8 @@ pub async fn merge_partial_vector_auxiliary_files(
         let idx_type = detected_index_type
             .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
 
-        // Compute format version once; defaults to V2_0 if no shards processed yet
-        let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
+        // Preserve the historical fallback while keeping the writer boundary exact.
+        let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
@@ -1454,6 +1541,7 @@ pub async fn merge_partial_vector_auxiliary_files(
             lengths,
             partition_offsets,
             total_rows: running_offset,
+            row_filter: row_filters.map(|filters| Arc::new(filters[idx].clone())),
         });
         progress
             .stage_progress("read_shard_metadata", idx as u64 + 1)
@@ -1480,6 +1568,7 @@ pub async fn merge_partial_vector_auxiliary_files(
         .stage_start("merge_partitions", Some(total_rows), "rows")
         .await?;
     let mut merged_rows = 0u64;
+    let mut merged_lengths = vec![0u32; nlist];
 
     match idx_type_final {
         SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
@@ -1495,14 +1584,9 @@ pub async fn merge_partial_vector_auxiliary_files(
             );
 
             while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
-                if accumulated_lengths[pid] == 0 {
+                let partition_len = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                if partition_len == 0 {
                     continue;
-                }
-                if batches.is_empty() {
-                    return Err(Error::index(format!(
-                        "No merged batches found for non-empty partition {}",
-                        pid
-                    )));
                 }
 
                 let schema = batches[0].schema();
@@ -1510,7 +1594,10 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_pq_transposed(w, partition_batch).await?;
                 }
-                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                merged_lengths[pid] = u32::try_from(partition_len).map_err(|_| {
+                    Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
+                })?;
+                merged_rows = merged_rows.saturating_add(partition_len as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
@@ -1527,14 +1614,9 @@ pub async fn merge_partial_vector_auxiliary_files(
             );
 
             while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
-                if accumulated_lengths[pid] == 0 {
+                let partition_len = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                if partition_len == 0 {
                     continue;
-                }
-                if batches.is_empty() {
-                    return Err(Error::index(format!(
-                        "No merged batches found for non-empty partition {}",
-                        pid
-                    )));
                 }
 
                 // Shards written by older lance versions carry sequential ex
@@ -1561,30 +1643,58 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(w) = v2w_opt.as_mut() {
                     write_partition_rows_rq_packed(w, partition_batch).await?;
                 }
-                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
+                merged_lengths[pid] = u32::try_from(partition_len).map_err(|_| {
+                    Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
+                })?;
+                merged_rows = merged_rows.saturating_add(partition_len as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
             }
         }
         _ => {
-            for (pid, total_part_len) in accumulated_lengths.iter().copied().enumerate().take(nlist)
-            {
-                for shard in shard_infos.iter() {
-                    let part_len = shard.lengths[pid] as usize;
-                    if part_len == 0 {
+            // FLAT, SQ, and their HNSW variants do not need whole-partition
+            // transforms. Stream one shard partition at a time so filtering
+            // never materializes a multi-partition window in memory.
+            for (pid, merged_length) in merged_lengths.iter_mut().enumerate() {
+                let mut partition_len = 0usize;
+                for shard in &shard_infos {
+                    let source_len = shard.lengths[pid] as usize;
+                    if source_len == 0 {
                         continue;
                     }
                     let offset = shard.partition_offsets[pid];
-                    if let Some(w) = v2w_opt.as_mut() {
-                        write_partition_rows(shard.reader.as_ref(), w, offset..offset + part_len)
-                            .await?;
-                    }
+                    let writer = v2w_opt.as_mut().ok_or_else(|| {
+                        Error::index("Failed to initialize unified writer".to_string())
+                    })?;
+                    let written = if let Some(row_filter) = shard.row_filter.as_deref() {
+                        write_filtered_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                            row_filter,
+                        )
+                        .await?
+                    } else {
+                        write_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                        )
+                        .await?;
+                        source_len
+                    };
+                    partition_len = partition_len.checked_add(written).ok_or_else(|| {
+                        Error::index(format!("Merged partition {pid} exceeds usize row capacity"))
+                    })?;
                 }
-                if total_part_len == 0 {
+                if partition_len == 0 {
                     continue;
                 }
-                merged_rows = merged_rows.saturating_add(total_part_len as u64);
+                *merged_length = u32::try_from(partition_len).map_err(|_| {
+                    Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
+                })?;
+                merged_rows = merged_rows.saturating_add(partition_len as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
@@ -1603,7 +1713,7 @@ pub async fn merge_partial_vector_auxiliary_files(
         } else {
             IvfStorageModel::empty()
         };
-        for len in accumulated_lengths.iter() {
+        for len in merged_lengths.iter() {
             ivf_model.add_partition(*len);
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
@@ -1683,6 +1793,7 @@ mod tests {
         lengths: &[u32],
         base_row_id: u64,
         distance_type: DistanceType,
+        file_version: ConcreteFileVersion,
     ) -> Result<usize> {
         let arrow_schema = ArrowSchema::new(vec![
             (*ROW_ID_FIELD).clone(),
@@ -1694,7 +1805,8 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = versions::v2_1::create_writer(
+        let mut v2w = versions::create_writer(
+            file_version,
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -1825,12 +1937,28 @@ mod tests {
         let lengths1 = vec![1_u32, 2_u32];
         let dim = 2_i32;
 
-        write_flat_partial_aux(&object_store, &aux0, dim, &lengths0, 0, DistanceType::L2)
-            .await
-            .unwrap();
-        write_flat_partial_aux(&object_store, &aux1, dim, &lengths1, 100, DistanceType::L2)
-            .await
-            .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            dim,
+            &lengths0,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_2,
+        )
+        .await
+        .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux1,
+            dim,
+            &lengths1,
+            100,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
 
         let progress = Arc::new(RecordingProgress::default());
         merge_partial_vector_auxiliary_files(
@@ -1934,6 +2062,7 @@ mod tests {
         .await
         .unwrap();
         let meta = reader.metadata();
+        assert_eq!(meta.version(), ConcreteFileVersion::V2_2);
 
         // Validate IVF lengths aggregation.
         let ivf_idx: u32 = meta
@@ -1981,6 +2110,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_ivf_flat_filters_each_source_by_ownership() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid");
+        let aux0 = index_dir
+            .clone()
+            .join("stale")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = index_dir
+            .clone()
+            .join("fresh")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let lengths = vec![2_u32, 1_u32];
+
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            2,
+            &lengths,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux1,
+            2,
+            &lengths,
+            100,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
+
+        merge_partial_vector_auxiliary_files_with_row_filters(
+            &object_store,
+            &[aux0, aux1],
+            &index_dir,
+            &[
+                OldIndexDataFilter::Fragments {
+                    to_keep: roaring::RoaringBitmap::new(),
+                    to_remove: roaring::RoaringBitmap::new(),
+                },
+                OldIndexDataFilter::RowIds(lance_select::RowAddrTreeMap::from_iter(100_u64..103)),
+            ],
+            Arc::new(RecordingProgress::default()),
+        )
+        .await
+        .unwrap();
+
+        let aux_out = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
+        let sched = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let reader = V2Reader::try_open(
+            sched
+                .open_file(&aux_out, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let merged_ivf = try_read_ivf_proto(&reader).await.unwrap().unwrap();
+        assert_eq!(merged_ivf.lengths, lengths);
+
+        let mut total_rows = 0;
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                4,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            total_rows += batch.unwrap().num_rows();
+        }
+        assert_eq!(total_rows, 3, "stale source rows must not be copied");
+    }
+
+    #[tokio::test]
     async fn test_merge_distance_type_mismatch() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
@@ -1993,9 +2211,17 @@ mod tests {
         let lengths = vec![2_u32, 2_u32];
         let dim = 2_i32;
 
-        write_flat_partial_aux(&object_store, &aux0, dim, &lengths, 0, DistanceType::L2)
-            .await
-            .unwrap();
+        write_flat_partial_aux(
+            &object_store,
+            &aux0,
+            dim,
+            &lengths,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
         write_flat_partial_aux(
             &object_store,
             &aux1,
@@ -2003,6 +2229,7 @@ mod tests {
             &lengths,
             100,
             DistanceType::Cosine,
+            ConcreteFileVersion::V2_1,
         )
         .await
         .unwrap();

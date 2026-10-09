@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use datafusion::{execution::TaskContext, logical_expr::Expr};
+use datafusion::{catalog::Session, execution::TaskContext, logical_expr::Expr};
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     Statistics, filter::FilterExec, metrics::MetricsSet,
@@ -31,6 +31,24 @@ impl LanceFilterExec {
     pub fn try_new(expr: Expr, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
         let planner = Planner::new(input.schema());
         let predicate = planner.create_physical_expr(&expr)?;
+        Self::try_new_with_predicate(expr, predicate, input)
+    }
+
+    pub fn try_new_with_session(
+        expr: Expr,
+        input: Arc<dyn ExecutionPlan>,
+        session: &dyn Session,
+    ) -> Result<Self> {
+        let planner = Planner::new(input.schema());
+        let predicate = planner.create_physical_expr_with_session(&expr, session)?;
+        Self::try_new_with_predicate(expr, predicate, input)
+    }
+
+    fn try_new_with_predicate(
+        expr: Expr,
+        predicate: Arc<dyn datafusion_physical_plan::PhysicalExpr>,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Self> {
         let filter_exec = FilterExec::try_new(predicate.clone(), input)?;
         Ok(Self {
             expr,

@@ -1,37 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::{
+    get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
+};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
-use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
-use lance_datafusion::expr::safe_coerce_scalar;
+use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
+use lance_table::rowids::version::rechunk_version_sequences;
+use lance_table::rowids::{RowIdSequence, rechunk_sequences, write_row_ids};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
@@ -79,6 +83,7 @@ pub struct UpdateBuilder {
     conflict_retries: u32,
     /// Total timeout for retries.
     retry_timeout: Duration,
+    data_storage_version: Option<LanceFileVersion>,
 }
 
 impl UpdateBuilder {
@@ -89,6 +94,7 @@ impl UpdateBuilder {
             updates: HashMap::new(),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
+            data_storage_version: None,
         }
     }
 
@@ -104,13 +110,35 @@ impl UpdateBuilder {
         (&merged).into()
     }
 
-    pub fn update_where(mut self, filter: &str) -> Result<Self> {
+    pub fn update_where(self, filter: &str) -> Result<Self> {
         let filter_schema = Self::filterable_schema(self.dataset.schema());
         let planner = Planner::new(Arc::new(filter_schema));
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
+        self.update_where_expr(expr)
+    }
+
+    /// Set the row filter from a DataFusion expression.
+    ///
+    /// This is equivalent to [`Self::update_where`] for callers that already
+    /// have an expression instead of a SQL string.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::UpdateBuilder;
+    /// # use datafusion::prelude::{col, lit};
+    /// # use std::sync::Arc;
+    /// # fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let builder = UpdateBuilder::new(dataset)
+    ///     .update_where_expr(col("region_id").eq(lit(10)))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_where_expr(mut self, expr: Expr) -> Result<Self> {
+        let filter_schema = Self::filterable_schema(self.dataset.schema());
+        let planner = Planner::new(Arc::new(filter_schema));
         self.condition = Some(
             planner
                 .optimize_expr(expr)
@@ -132,6 +160,16 @@ impl UpdateBuilder {
                     self.dataset.schema()
                 ))
             })?;
+
+        if crate::dataset::optimize::field_contains_blob_v2(field) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Direct updates to column '{}' containing blob v2 values are not supported",
+                    column.as_ref()
+                )
+                .into(),
+            ));
+        }
 
         // TODO: support nested column references. This is mostly blocked on the
         // ability to insert them into the RecordBatch properly.
@@ -159,29 +197,20 @@ impl UpdateBuilder {
             .get_type(&df_schema)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
-        if dest_type != src_type {
-            expr = match expr {
-                // TODO: remove this branch once DataFusion supports casting List to FSL
-                // This should happen in Arrow 51.0.0
-                Expr::Literal(value @ ScalarValue::List(_), metadata)
-                    if matches!(dest_type, DataType::FixedSizeList(_, _)) =>
-                {
-                    Expr::Literal(
-                        safe_coerce_scalar(&value, &dest_type).ok_or_else(|| {
-                            ArrowError::CastError(format!(
-                                "Failed to cast {} to {} during planning",
-                                value.data_type(),
-                                dest_type
-                            ))
-                        })?,
-                        metadata,
-                    )
-                }
-                _ => expr
-                    .cast_to(&dest_type, &df_schema)
-                    .map_err(box_error)
-                    .context(InvalidInputSnafu {})?,
-            };
+        // A string assigned to a JSON field is logical JSON, not its LargeBinary storage.
+        // Keep it as UTF-8 here so `apply_updates` can validate and encode it as JSONB.
+        let is_json_string = schema
+            .field_with_name(column.as_ref())
+            .is_ok_and(is_json_field)
+            && matches!(
+                &src_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            );
+        if dest_type != src_type && !is_json_string {
+            expr = expr
+                .cast_to(&dest_type, &df_schema)
+                .map_err(box_error)
+                .context(InvalidInputSnafu {})?;
         }
 
         // Optimize the expression. For example, this might apply the cast on
@@ -212,10 +241,42 @@ impl UpdateBuilder {
         self
     }
 
+    /// Set the exact V2 data file version for rewritten rows.
+    ///
+    /// If omitted, the dataset's default write version is used. The default
+    /// remains unchanged. Targets cannot cross the V1/V2 boundary.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::UpdateBuilder};
+    /// # use lance_file::version::LanceFileVersion;
+    /// # use std::sync::Arc;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let result = UpdateBuilder::new(dataset)
+    ///     .set("value", "value + 1")?
+    ///     .data_storage_version(LanceFileVersion::V2_2)
+    ///     .build()?.execute().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn data_storage_version(mut self, version: LanceFileVersion) -> Self {
+        self.data_storage_version = Some(version);
+        self
+    }
+
     // TODO: set write params
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
+        let default_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        let write_version = self
+            .data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or(default_version);
+        super::super::versions::validate_write_version(default_version, write_version)?;
         let mut updates = HashMap::new();
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
@@ -237,6 +298,7 @@ impl UpdateBuilder {
             updates,
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
+            write_version,
         })
     }
 }
@@ -265,6 +327,7 @@ pub struct UpdateJob {
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     conflict_retries: u32,
     retry_timeout: Duration,
+    write_version: ConcreteFileVersion,
 }
 
 impl UpdateJob {
@@ -279,9 +342,51 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        // Resolved before any IO, so a malformed budget fails the update
+        // before it rewrites the rows rather than after. Only a table with
+        // stable row ids carries lineage over, so no other table depends on
+        // the setting.
+        let spill_budget = if self.dataset.manifest.uses_stable_row_ids() {
+            inline_row_lineage_max_bytes(&self.dataset)?
+        } else {
+            None
+        };
         let mut scanner = self.dataset.scan();
+        let legacy_blob_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .filter_map(|field| u32::try_from(field.id).ok())
+            .collect::<HashSet<_>>();
+        if !legacy_blob_ids.is_empty() {
+            scanner.blob_handling(BlobHandling::SomeBlobsBinary(legacy_blob_ids));
+        }
+        let has_blob_v2_columns = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+        if has_blob_v2_columns {
+            scanner.with_row_address();
+        }
         scanner.with_row_id();
-        scanner.blob_handling(BlobHandling::AllBinary);
+        // The rewritten rows keep their created-at versions. On a table that
+        // may spill, read them here, where the source rows are in hand: once
+        // their row ids spill the commit can no longer look them up. Elsewhere
+        // the commit looks them up from the inline row ids, and reading them
+        // would only build a column for every scanned row.
+        if spill_budget.is_some() {
+            let columns = self
+                .dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .chain([ROW_CREATED_AT_VERSION])
+                .collect::<Vec<_>>();
+            scanner.project(&columns)?;
+        }
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -296,15 +401,77 @@ impl UpdateJob {
         let (stream, row_id_rx) =
             make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
-        let schema = stream.schema();
-
-        let expected_schema = self.dataset.schema().into();
-        if schema.as_ref() != &expected_schema {
+        let scan_schema = stream.schema();
+        let expected_schema: ArrowSchema = self.dataset.schema().into();
+        if !has_blob_v2_columns && scan_schema.as_ref() != &expected_schema {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
-                expected_schema, schema
+                expected_schema, scan_schema
             )));
         }
+
+        let stream = if has_blob_v2_columns {
+            let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+                self.dataset.schema(),
+                scan_schema.as_ref(),
+                false,
+                false,
+            )?);
+            let output_schema = rewrite_plan.output_schema().clone();
+            let dataset = self.dataset.clone();
+            let transformed = stream.then(move |batch_result| {
+                let dataset = dataset.clone();
+                let rewrite_plan = rewrite_plan.clone();
+                async move {
+                    let batch = batch_result?;
+                    rewrite_plan
+                        .transform_batch(&dataset, batch)
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                }
+            });
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, transformed))
+                as SendableRecordBatchStream
+        } else {
+            stream
+        };
+        let schema = stream.schema();
+
+        let updated_blob_columns = self
+            .updates
+            .keys()
+            .filter(|column_name| {
+                self.dataset
+                    .schema()
+                    .field(column_name)
+                    .is_some_and(crate::dataset::optimize::field_contains_blob_v2)
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let updated_blob_column_indices = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(column_idx, field)| {
+                updated_blob_columns
+                    .contains(field.name())
+                    .then_some(column_idx)
+            })
+            .collect::<Vec<_>>();
+        let write_params = WriteParams {
+            allow_external_blob_outside_bases: has_blob_v2_columns,
+            ..Default::default()
+        };
+        let external_base_resolver = if updated_blob_column_indices.is_empty() {
+            None
+        } else {
+            super::blob_v2_external_base_resolver(
+                Some(self.dataset.as_ref()),
+                &write_params,
+                self.dataset.schema(),
+            )
+            .await?
+        };
 
         let updates_ref = self.updates.clone();
         let stream = stream
@@ -317,20 +484,36 @@ impl UpdateJob {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
                 Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
+            })
+            .then(move |batch_result| {
+                let external_base_resolver = external_base_resolver.clone();
+                let updated_blob_column_indices = updated_blob_column_indices.clone();
+                async move {
+                    let batch = batch_result?;
+                    if let Some(resolver) = external_base_resolver.as_deref() {
+                        let updated_blob_batch = batch.project(&updated_blob_column_indices)?;
+                        let selected_rows = vec![true; batch.num_rows()];
+                        crate::dataset::blob::validate_external_blob_references(
+                            resolver,
+                            &updated_blob_batch,
+                            &selected_rows,
+                        )
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                    }
+                    Ok(batch)
+                }
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let (mut new_fragments, _) = write_fragments_internal(
-            self.dataset
-                .manifest
-                .data_storage_format
-                .lance_file_format(),
+            self.write_version,
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
-            WriteParams::default(),
+            write_params,
             None, // TODO: support multiple bases for update
         )
         .await?;
@@ -340,29 +523,29 @@ impl UpdateJob {
             .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
 
         if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
-            let fragment_sizes = new_fragments
-                .iter()
-                .map(|f| f.physical_rows.unwrap() as u64);
-            let sequences = lance_table::rowids::rechunk_sequences(
-                [row_id_sequence.clone()],
-                fragment_sizes,
-                false,
-            )
-            .map_err(|e| {
-                Error::internal(format!(
-                    "Captured row ids not equal to number of rows written: {}",
-                    e
-                ))
-            })?;
-            for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                let serialized = lance_table::rowids::write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+            let placed = self
+                .place_rewritten_lineage(
+                    &mut new_fragments,
+                    row_id_sequence,
+                    removed_row_ids.created_at_sequence(),
+                    spill_budget,
+                )
+                .await;
+            if let Err(e) = placed {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    None,
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
             }
         }
 
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
@@ -391,6 +574,56 @@ impl UpdateJob {
             affected_rows,
             num_updated_rows,
         })
+    }
+
+    /// Give each new fragment the row ids its rows carried before the rewrite
+    /// and, where the lineage spills under `spill_budget`, their created-at
+    /// versions too; see [`place_carried_row_lineage`]. The last-updated-at
+    /// version is the commit's to stamp.
+    ///
+    /// `created_at` is `None` when the scan did not read the created-at
+    /// versions, which it only does when the table may spill.
+    async fn place_rewritten_lineage(
+        &self,
+        new_fragments: &mut [Fragment],
+        row_ids: &RowIdSequence,
+        created_at: Option<&RowDatasetVersionSequence>,
+        spill_budget: Option<usize>,
+    ) -> Result<()> {
+        let fragment_sizes = new_fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap() as u64)
+            .collect::<Vec<_>>();
+        let row_ids = rechunk_sequences([row_ids.clone()], fragment_sizes.iter().copied(), false)
+            .map_err(|e| {
+            Error::internal(format!(
+                "Captured row ids not equal to number of rows written: {}",
+                e
+            ))
+        })?;
+        let (Some(limit), Some(created_at)) = (spill_budget, created_at) else {
+            // Nothing can spill: the row ids stay inline and the commit
+            // resolves the created-at versions from them, as it always has.
+            for (fragment, row_ids) in new_fragments.iter_mut().zip(row_ids) {
+                fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+            }
+            return Ok(());
+        };
+        let created_at =
+            rechunk_version_sequences([created_at.clone()], fragment_sizes.iter().copied(), false)
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "Captured created-at versions not equal to number of rows written: {e}"
+                    ))
+                })?;
+        for ((fragment, row_ids), created_at) in
+            new_fragments.iter_mut().zip(row_ids).zip(created_at)
+        {
+            place_carried_row_lineage(&self.dataset, limit, &row_ids, &created_at)
+                .await?
+                .apply(fragment);
+        }
+        Ok(())
     }
 
     async fn commit_impl(
@@ -444,6 +677,34 @@ impl UpdateJob {
     ) -> DFResult<RecordBatch> {
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            let schema = batch.schema();
+            let new_values: ArrayRef = if schema.field_with_name(column).is_ok_and(is_json_field)
+                && matches!(
+                    new_values.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) {
+                let new_values = if new_values.data_type() == &DataType::Utf8View {
+                    arrow_cast::cast(new_values.as_ref(), &DataType::Utf8).map_err(|error| {
+                        DataFusionError::ArrowError(
+                            Box::new(error),
+                            Some(format!(
+                                "convert Utf8View update for JSON column '{column}'"
+                            )),
+                        )
+                    })?
+                } else {
+                    new_values
+                };
+                let json_array = JsonArray::try_from(new_values).map_err(|error| {
+                    DataFusionError::ArrowError(
+                        Box::new(error),
+                        Some(format!("encode update for JSON column '{column}'")),
+                    )
+                })?;
+                Arc::new(json_array.into_inner())
+            } else {
+                new_values
+            };
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
         }
         Ok(batch)
@@ -529,21 +790,28 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::rowids::{
+        INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+        read_spilled_row_ids, read_spilled_versions,
+    };
     use crate::dataset::{WriteDestination, WriteMode};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow::{
         array::AsArray,
         datatypes::{Int64Type, UInt32Type},
     };
+    use arrow_array::record_batch;
     use arrow_array::types::{Float32Type, Int32Type};
-    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
+    use arrow_array::{
+        Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+    };
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{TryStreamExt, future::try_join_all};
     use lance_arrow::ARROW_EXT_NAME_KEY;
-    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{Dimension, RowCount};
@@ -552,6 +820,8 @@ mod tests {
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    use lance_table::format::ROW_CREATED_AT_VERSION_FIELD_ID;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
@@ -598,6 +868,144 @@ mod tests {
         (Arc::new(ds), test_dir)
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn update_uses_explicit_exact_version(
+        #[values(
+            None,
+            Some(LanceFileVersion::V2_1),
+            Some(LanceFileVersion::V2_2),
+            Some(LanceFileVersion::V2_3)
+        )]
+        target: Option<LanceFileVersion>,
+    ) {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let mut builder = UpdateBuilder::new(dataset)
+            .update_where("id < 10")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap();
+        if let Some(target) = target {
+            builder = builder.data_storage_version(target);
+        }
+        let result = builder.build().unwrap().execute().await.unwrap();
+
+        assert_eq!(
+            result
+                .new_dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V2_0
+        );
+        assert!(
+            result
+                .new_dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .any(|file| file.file_version().unwrap()
+                    == target.unwrap_or(LanceFileVersion::V2_0).resolve())
+        );
+        assert_eq!(
+            result.new_dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0,
+            target.is_some()
+        );
+        assert_eq!(
+            result
+                .new_dataset
+                .count_rows(Some("name = 'bar'".to_string()))
+                .await
+                .unwrap(),
+            10
+        );
+
+        let result = UpdateBuilder::new(result.new_dataset)
+            .update_where("name = 'bar'")
+            .unwrap()
+            .set("name", "'baz'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 10);
+        assert!(
+            result
+                .new_dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .all(|file| file.file_version().unwrap() == ConcreteFileVersion::V2_0)
+        );
+        assert_eq!(
+            result
+                .new_dataset
+                .count_rows(Some("name = 'baz'".to_string()))
+                .await
+                .unwrap(),
+            10
+        );
+    }
+
+    #[rstest]
+    #[case(LanceFileVersion::Legacy, LanceFileVersion::V2_0)]
+    #[case(LanceFileVersion::V2_0, LanceFileVersion::Legacy)]
+    #[tokio::test]
+    async fn update_rejects_cross_family_target(
+        #[case] source: LanceFileVersion,
+        #[case] target: LanceFileVersion,
+    ) {
+        let (dataset, _dir) = make_test_dataset(source, false).await;
+        let error = UpdateBuilder::new(dataset)
+            .set("name", "'bar'")
+            .unwrap()
+            .data_storage_version(target)
+            .build()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("V1 and V2 storage versions cannot be mixed")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_update_ignores_explicit_exact_version() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id < 0")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .data_storage_version(LanceFileVersion::V2_1)
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows_updated, 0);
+        assert_eq!(
+            result
+                .new_dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V2_0
+        );
+        assert_eq!(
+            result.new_dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn test_update_validation() {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
@@ -632,6 +1040,63 @@ mod tests {
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
+    }
+
+    #[rstest]
+    #[case::integers("[3, 4]", Some(vec![Some(3.0), Some(4.0)]), None)]
+    #[case::floats("[3.5, 4.5]", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::strings("['3.5', '4.5']", Some(vec![Some(3.5), Some(4.5)]), None)]
+    #[case::invalid_element("['invalid', '4.5']", None, Some("Cannot cast string"))]
+    #[case::all_null_elements("[NULL, NULL]", Some(vec![None, None]), None)]
+    #[case::null_list("NULL", None, None)]
+    #[case::short_list("[3]", None, Some("has length 1"))]
+    #[case::long_list("[3, 4, 5]", None, Some("has length 3"))]
+    #[tokio::test]
+    async fn test_update_vector_literal(
+        #[case] expression: &str,
+        #[case] expected: Option<Vec<Option<f32>>>,
+        #[case] cast_error: Option<&str>,
+    ) {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(2)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let dataset = Arc::new(dataset);
+        let original = dataset.scan().try_into_batch().await.unwrap();
+        let result = async {
+            UpdateBuilder::new(dataset.clone())
+                .set("vector", expression)?
+                .build()?
+                .execute()
+                .await
+        }
+        .await;
+        if let Some(message) = cast_error {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains(message), "{error}");
+            let mut reopened = dataset.as_ref().clone();
+            reopened.checkout_latest().await.unwrap();
+            assert_eq!(reopened.version().version, dataset.version().version);
+            assert_eq!(reopened.scan().try_into_batch().await.unwrap(), original);
+            return;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.rows_updated, 2);
+        let batch = result.new_dataset.scan().try_into_batch().await.unwrap();
+        let actual = batch["vector"].as_fixed_size_list();
+        let expected = arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            [expected.clone(), expected],
+            2,
+        );
+        assert_eq!(actual, &expected);
     }
 
     #[rstest]
@@ -759,8 +1224,11 @@ mod tests {
         assert_eq!(fragments[2].metadata.physical_rows, Some(15));
     }
 
+    #[rstest]
+    #[case::utf8(r#"'{"after": true, "n": 2}'"#)]
+    #[case::utf8_view(r#"arrow_cast('{"after": true, "n": 2}', 'Utf8View')"#)]
     #[tokio::test]
-    async fn test_update_json_and_regular_columns() {
+    async fn test_update_json_and_regular_columns(#[case] json_expression: &str) {
         let mut metadata = HashMap::new();
         metadata.insert(
             ARROW_EXT_NAME_KEY.to_string(),
@@ -803,7 +1271,7 @@ mod tests {
             .unwrap()
             .set("name", "'updated'")
             .unwrap()
-            .set("meta", r#"jsonb '{"after":true,"n":2}'"#)
+            .set("meta", json_expression)
             .unwrap()
             .build()
             .unwrap()
@@ -832,6 +1300,16 @@ mod tests {
 
         assert_eq!(names.value(updated_row_idx), "updated");
         assert_eq!(metas.value(updated_row_idx), r#"{"after":true,"n":2}"#);
+
+        let filtered_batch = updated_dataset
+            .scan()
+            .filter("json_extract(meta, '$.n') = '2'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered_batch.num_rows(), 1);
+        assert_eq!(filtered_batch["id"].as_primitive::<Int64Type>().value(0), 2);
     }
 
     #[rstest]
@@ -951,8 +1429,8 @@ mod tests {
         // Increase likelihood of contention by throttling the store
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_list_per_call: Duration::from_millis(10),
-                wait_get_per_call: Duration::from_millis(10),
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
                 ..Default::default()
             },
         });
@@ -1284,17 +1762,30 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
-    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::fm(
+        BuiltinIndexType::Fm,
+        IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        50
+    )]
     #[tokio::test]
     async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
-        #[case] index_type: BuiltinIndexType,
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+        #[case] indexed_column: &str,
         #[case] query: &str,
         #[case] expected_rows: usize,
     ) {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .col("category", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_ram_dataset_with_params(
                 FragmentCount::from(1),
                 FragmentRowCount::from(100),
@@ -1309,10 +1800,10 @@ mod tests {
 
         dataset
             .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("i_idx".to_string()),
-                &ScalarIndexParams::for_builtin(index_type),
+                &[indexed_column],
+                index_type,
+                Some("addr_idx".to_string()),
+                &ScalarIndexParams::for_builtin(builtin),
                 true,
             )
             .await
@@ -1340,7 +1831,10 @@ mod tests {
             .new_dataset;
 
         let indices = dataset.load_indices().await.unwrap();
-        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "addr_idx")
+            .unwrap();
         assert_eq!(
             index
                 .fragment_bitmap
@@ -1876,6 +2370,159 @@ mod tests {
         );
     }
 
+    /// On a table that cannot spill, or when nothing an update carries over
+    /// exceeds the inline budget, the new fragments carry only inline row ids:
+    /// the commit resolves their created-at versions, as it always has.
+    #[rstest]
+    #[case::not_opted_in(false)]
+    #[case::under_budget(true)]
+    #[tokio::test]
+    async fn update_leaves_inline_created_at_to_the_commit(#[case] opted_in: bool) {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+        let mut dataset = dataset.as_ref().clone();
+        if opted_in {
+            dataset
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "true")])
+                .await
+                .unwrap();
+        }
+        let update_data = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 15")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute_impl()
+            .await
+            .unwrap();
+
+        assert!(!update_data.new_fragments.is_empty());
+        for fragment in &update_data.new_fragments {
+            assert!(
+                matches!(fragment.row_id_meta, Some(RowIdMeta::Inline(_))),
+                "{fragment:?}"
+            );
+            assert_eq!(fragment.created_at_version_meta, None);
+            assert_eq!(fragment.last_updated_at_version_meta, None);
+            assert_eq!(fragment.files.len(), 1, "no lineage file: {fragment:?}");
+        }
+    }
+
+    /// A malformed inline budget fails the update before it writes anything.
+    /// Every write to the data directory fails here, so an update that
+    /// rewrote the rows first would report that failure instead.
+    #[tokio::test]
+    async fn update_rejects_malformed_inline_max_bytes_before_writing() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+        let batch = record_batch!(("id", Int64, [0, 1, 2, 3, 4, 5])).unwrap();
+        let schema = batch.schema();
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &routed_uri, Some(write_params))
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "200KB"),
+            ])
+            .await
+            .unwrap();
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("put", "/data/", "injected data write failure");
+        failing.fail_when("put_multipart", "/data/", "injected data write failure");
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let error = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 3")
+            .unwrap()
+            .set("id", "id + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY),
+            "{error}"
+        );
+    }
+
+    /// The captured lineage is split across the new fragments by their row
+    /// counts, and a created-at capture that does not cover every written row
+    /// is an error rather than a silent fallback to the commit.
+    #[tokio::test]
+    async fn place_rewritten_lineage_splits_lineage_by_output_fragment() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+        let job = UpdateBuilder::new(dataset)
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap();
+        let output_fragments = || {
+            [(1, 3), (2, 2)].map(|(id, rows)| {
+                let mut fragment = Fragment::new(id);
+                fragment.physical_rows = Some(rows);
+                fragment
+            })
+        };
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 20, 21].as_slice());
+
+        // A zero budget spills everything, so each fragment's share is read
+        // back from its own lineage file.
+        let mut fragments = output_fragments();
+        let created_at = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3, 3]);
+        job.place_rewritten_lineage(&mut fragments, &row_ids, Some(&created_at), Some(0))
+            .await
+            .unwrap();
+        let mut placed = Vec::new();
+        for fragment in &fragments {
+            let ids = read_spilled_row_ids(&job.dataset, fragment).await.unwrap();
+            let versions =
+                read_spilled_versions(&job.dataset, fragment, ROW_CREATED_AT_VERSION_FIELD_ID)
+                    .await
+                    .unwrap();
+            placed.push((
+                ids.iter().collect::<Vec<_>>(),
+                versions.versions().collect::<Vec<_>>(),
+            ));
+        }
+        assert_eq!(placed[0], (vec![10, 11, 12], vec![1, 1, 2]));
+        assert_eq!(placed[1], (vec![20, 21], vec![3, 3]));
+
+        let mut fragments = output_fragments();
+        let too_few = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3]);
+        let error = job
+            .place_rewritten_lineage(&mut fragments, &row_ids, Some(&too_few), Some(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }), "{error:?}");
+    }
+
     #[tokio::test]
     async fn test_update_with_blob() {
         use arrow_array::LargeBinaryArray;
@@ -1944,5 +2591,105 @@ mod tests {
 
         let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
         assert_eq!(blobs.value(idx_foo), b"foo");
+    }
+
+    #[rstest]
+    #[case::non_empty(0)]
+    #[case::empty(1)]
+    #[case::null(2)]
+    #[tokio::test]
+    async fn test_update_preserves_blob_v2(#[case] selected_id: i64) {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        let make_blobs = || {
+            let mut builder = BlobArrayBuilder::new(3);
+            builder.push_bytes(b"one").unwrap();
+            builder.push_bytes(b"").unwrap();
+            builder.push_null().unwrap();
+            builder.finish().unwrap()
+        };
+        let nested_fields = vec![blob_field("blob", true)];
+        let nested: Arc<StructArray> = Arc::new(
+            StructArray::try_new(nested_fields.clone().into(), vec![make_blobs()], None).unwrap(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            blob_field("payload", true),
+            Field::new("info", DataType::Struct(nested_fields.into()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["body-0", "body-1", "body-2"])),
+                make_blobs(),
+                nested,
+            ],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        for column in ["payload", "info"] {
+            let error = UpdateBuilder::new(dataset.clone())
+                .set(column, column)
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(
+                error.to_string().contains(&format!(
+                    "Direct updates to column '{column}' containing blob v2 values are not supported"
+                )),
+                "unexpected error: {error}"
+            );
+        }
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where(&format!("id = {selected_id}"))
+            .unwrap()
+            .set("body", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 1);
+
+        let mut scanner = result.new_dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int64Type>();
+        let bodies = batch["body"].as_string::<i32>();
+        let payloads = batch["payload"].as_binary::<i64>();
+        let nested = batch["info"]
+            .as_struct()
+            .column_by_name("blob")
+            .unwrap()
+            .as_binary::<i64>();
+        let expected = [Some(b"one".as_slice()), Some(b"".as_slice()), None];
+
+        for row_idx in 0..batch.num_rows() {
+            let id = ids.value(row_idx) as usize;
+            let expected_body = if id as i64 == selected_id {
+                "updated"
+            } else {
+                ["body-0", "body-1", "body-2"][id]
+            };
+            assert_eq!(bodies.value(row_idx), expected_body);
+            assert_eq!(payloads.iter().nth(row_idx).unwrap(), expected[id]);
+            assert_eq!(nested.iter().nth(row_idx).unwrap(), expected[id]);
+        }
     }
 }

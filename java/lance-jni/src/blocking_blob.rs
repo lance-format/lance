@@ -7,14 +7,19 @@ use crate::traits::{FromJString, IntoJava};
 use crate::{JNIEnvExt, block_on};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JObject, JString, JValueGen};
-use jni::sys::{jbyteArray, jint, jlong};
+use jni::sys::{jbyte, jbyteArray, jint, jlong};
 use lance::dataset::BlobFile;
-use std::mem::transmute;
 use std::sync::Arc;
 
 const BLOB_FILE_CLASS: &str = "org/lance/BlobFile";
 const BLOB_FILE_CTOR_SIG: &str = "()V";
 const NATIVE_BLOB: &str = "nativeBlobHandle";
+
+fn as_jbytes(bytes: &[u8]) -> &[jbyte] {
+    // SAFETY: jbyte is i8; u8 and i8 have identical size and alignment, and
+    // both permit every bit pattern. The returned slice retains the input lifetime.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) }
+}
 
 pub struct BlockingBlobFile {
     pub(crate) inner: BlobFile,
@@ -141,10 +146,7 @@ fn inner_blob_read<'local>(env: &mut JNIEnv<'local>, jblob: JObject) -> Result<J
         block_on(blob.inner.read())?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;
-    let u8_slice: &[u8] = bytes.as_ref();
-    let i8_slice: &[i8] = unsafe { transmute(u8_slice) };
-
-    env.set_byte_array_region(&arr, 0, i8_slice)?;
+    env.set_byte_array_region(&arr, 0, as_jbytes(bytes.as_ref()))?;
     Ok(arr)
 }
 
@@ -171,10 +173,7 @@ fn inner_blob_read_up_to<'local>(
         block_on(blob.inner.read_up_to(len as usize))?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;
-    let u8_slice: &[u8] = bytes.as_ref();
-    let i8_slice: &[i8] = unsafe { transmute(u8_slice) };
-
-    env.set_byte_array_region(&arr, 0, i8_slice)?;
+    env.set_byte_array_region(&arr, 0, as_jbytes(bytes.as_ref()))?;
     Ok(arr)
 }
 
@@ -206,10 +205,7 @@ fn inner_blob_read_range<'local>(
         block_on(blob.inner.read_range(offset as u64..end))?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;
-    let u8_slice: &[u8] = bytes.as_ref();
-    let i8_slice: &[i8] = unsafe { transmute(u8_slice) };
-
-    env.set_byte_array_region(&arr, 0, i8_slice)?;
+    env.set_byte_array_region(&arr, 0, as_jbytes(bytes.as_ref()))?;
     Ok(arr)
 }
 
@@ -225,6 +221,33 @@ pub extern "system" fn Java_org_lance_BlobFile_nativeSeek(
 fn inner_blob_seek(env: &mut JNIEnv, jblob: JObject, new_cursor: jlong) -> Result<()> {
     let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
     block_on(blob.inner.seek(new_cursor as u64))?;
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeSetReadBufferSize(
+    mut env: JNIEnv,
+    jblob: JObject,
+    buffer_size: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_blob_set_read_buffer_size(&mut env, jblob, buffer_size)
+    );
+}
+
+fn inner_blob_set_read_buffer_size(
+    env: &mut JNIEnv,
+    jblob: JObject,
+    buffer_size: jlong,
+) -> Result<()> {
+    if buffer_size < 0 {
+        return Err(
+            lance::Error::invalid_input("bufferSize must be non-negative".to_string()).into(),
+        );
+    }
+    let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
+    block_on(blob.inner.set_buffer_size(buffer_size as usize))?;
     Ok(())
 }
 
@@ -263,4 +286,15 @@ fn inner_blob_close(env: &mut JNIEnv, jblob: JObject) -> Result<()> {
     let blob = unsafe { env.take_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB)? };
     block_on(blob.inner.close())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::as_jbytes;
+
+    #[test]
+    fn byte_slice_cast_preserves_bits() {
+        assert_eq!(as_jbytes(&[0, 127, 128, 255]), &[0, 127, -128, -1]);
+        assert!(as_jbytes(&[]).is_empty());
+    }
 }

@@ -21,6 +21,37 @@ use pyo3::{
 
 use lance::Error as LanceError;
 
+/// Return the `retryable` flag for a commit-conflict error.
+///
+/// Mirrors the Rust conflict contract: `RetryableCommitConflict` and
+/// `CommitConflict` (commit-step retries exhausted, safe to retry) are
+/// retryable; `IncompatibleTransaction` (a conflict retrying cannot fix) is not.
+fn commit_conflict_retryable(err: &LanceError) -> bool {
+    match err {
+        LanceError::RetryableCommitConflict { .. } | LanceError::CommitConflict { .. } => true,
+        LanceError::IncompatibleTransaction { .. } => false,
+        _ => false,
+    }
+}
+
+/// Convert a commit-conflict `LanceError` to the Python `CommitConflictError`.
+///
+/// The `retryable` flag is carried as a typed attribute on the exception so
+/// clients can drive retry loops without string-matching the message.
+fn commit_conflict_error(py: Python<'_>, err: &LanceError, retryable: bool) -> PyErr {
+    let message = err.to_string();
+    match PyModule::import(py, "lance.commit") {
+        Ok(module) => match module.getattr("CommitConflictError") {
+            Ok(conflict_type) => match conflict_type.call1((message.clone(), retryable)) {
+                Ok(instance) => PyErr::from_value(instance),
+                Err(_) => PyIOError::new_err(message),
+            },
+            Err(_) => PyIOError::new_err(message),
+        },
+        Err(_) => PyIOError::new_err(message),
+    }
+}
+
 /// Try to convert a NamespaceError to the corresponding Python exception.
 /// Returns the appropriate Python exception from lance_namespace.errors module.
 fn namespace_error_to_pyerr(py: Python<'_>, ns_err: &NamespaceError) -> PyErr {
@@ -73,6 +104,11 @@ pub trait PythonErrorExt<T> {
     /// Used by call sites that historically mapped every `lance::Error` to
     /// PyIoError but should surface timeouts distinctly.
     fn io_or_timeout_error(self) -> PyResult<T>;
+    /// Convert commit conflicts to `CommitConflictError`, otherwise PyIoError.
+    ///
+    /// Used by call sites that historically mapped every `lance::Error` to
+    /// PyIoError but should surface commit conflicts distinctly.
+    fn io_or_commit_conflict_error(self) -> PyResult<T>;
 }
 
 impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
@@ -87,6 +123,12 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
                 LanceError::NotFound { .. } => self.value_error(),
                 LanceError::RefNotFound { .. } => self.value_error(),
                 LanceError::VersionNotFound { .. } => self.value_error(),
+                LanceError::RetryableCommitConflict { .. }
+                | LanceError::CommitConflict { .. }
+                | LanceError::IncompatibleTransaction { .. } => {
+                    let retryable = commit_conflict_retryable(err);
+                    Python::attach(|py| Err(commit_conflict_error(py, err, retryable)))
+                }
                 LanceError::Namespace { source, .. } => {
                     // Try to downcast to NamespaceError and convert to proper Python exception
                     if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
@@ -128,6 +170,28 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     fn io_or_timeout_error(self) -> PyResult<T> {
         match &self {
             Err(LanceError::Timeout { .. }) => self.timeout_error(),
+            Err(
+                err @ (LanceError::RetryableCommitConflict { .. }
+                | LanceError::CommitConflict { .. }
+                | LanceError::IncompatibleTransaction { .. }),
+            ) => {
+                let retryable = commit_conflict_retryable(err);
+                Python::attach(|py| Err(commit_conflict_error(py, err, retryable)))
+            }
+            _ => self.io_error(),
+        }
+    }
+
+    fn io_or_commit_conflict_error(self) -> PyResult<T> {
+        match &self {
+            Err(
+                err @ (LanceError::RetryableCommitConflict { .. }
+                | LanceError::CommitConflict { .. }
+                | LanceError::IncompatibleTransaction { .. }),
+            ) => {
+                let retryable = commit_conflict_retryable(err);
+                Python::attach(|py| Err(commit_conflict_error(py, err, retryable)))
+            }
             _ => self.io_error(),
         }
     }

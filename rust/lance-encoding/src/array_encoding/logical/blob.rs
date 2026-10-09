@@ -430,10 +430,22 @@ mod tests {
             .collect::<HashMap<_, _>>()
     });
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_basic_blob() {
+    async fn test_basic_blob(
+        #[values(TestEncoding::Array, TestEncoding::StructuralU16)] encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_specific_random(field, TestCases::basic().with_array_and_u16_encodings()).await;
+        check_specific_random(
+            field,
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]

@@ -31,22 +31,11 @@ Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](pyth
 * Use `release-with-debug` for benchmarks and profiling so optimized builds keep debug symbols without a rebuild.
 * Use `release-no-lto` only for local debugging, IO-bound benchmarks, or compile-time-sensitive performance investigation where LTO would not affect the measured bottleneck.
 
-### Python / Java
-
-See [python/AGENTS.md](python/AGENTS.md) and [java/AGENTS.md](java/AGENTS.md).
-
 ## Language-Specific Environment Contract
 
 - For language-specific tasks, always follow the environment and command rules in the corresponding subdirectory guide before running build, test, lint, format, or tooling commands.
 - Do not substitute a different environment manager or toolchain just because a command appears missing, unavailable, or slow.
 - If a language-specific command fails outside the documented workflow, treat that as an environment usage mistake first. Fix the environment usage, rerun with the prescribed commands, and only then conclude that a dependency or tool is unavailable.
-
-### Integration Testing
-
-```bash
-cd test_data && docker compose up -d
-AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.py
-```
 
 ## Coding Standards
 
@@ -56,7 +45,6 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Code is for readability, not just execution. Only add meaningful comments and tests.
 - Comments should explain non-obvious "why" reasoning, not restate what the code does.
 - Remove debug prints (`println!`, `dbg!`, `print()`) before merging — use `tracing` or logging frameworks.
-- Extract logic repeated in 2+ places into a shared helper; inline single-use logic at its call site.
 - Think carefully before adding a helper: only introduce one when it materially reduces cognitive load or eliminates substantial duplication, and do not add thin wrappers that only rename or forward existing calls.
 - Keep PRs focused — no drive-by refactors, reformatting, or cosmetic changes.
 - Be mindful of memory use: avoid collecting streams of `RecordBatch` into memory; use `RoaringBitmap` instead of `HashSet<u32>`.
@@ -92,6 +80,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 ## Testing Standards
 
 - **All bugfixes and features must have corresponding tests. We do not merge code without tests.**
+- Keep local unit tests lightweight: each test case should finish within one second on typical developer hardware. Split independent parameter matrices and use the smallest fixture or model that preserves the asserted behavior; do not relax assertions, coverage, or recall thresholds to meet the budget.
 - Use `rstest` (Rust) or `@pytest.mark.parametrize` (Python) for tests that differ only in inputs. Use `#[case::{name}(...)]` for readable case names.
 - Replace `print()` in tests with `assert` — prints don't catch regressions.
 - Extend existing tests instead of adding overlapping new ones. Add to existing test files.

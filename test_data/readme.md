@@ -27,6 +27,10 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   correctly, so there are duplicate field ids in the schema. There aren't great
   workarounds for readers. Writers should make sure to check the field ids in
   the schema and re-compute them if necessary.
+* `v0.10.15/non_divisible_pq`: This dataset has an 8-bit IVF-PQ index whose
+  64-dimensional vectors were divided into 14 sub-vectors. Writers at this
+  version silently omitted the final eight dimensions from the PQ codebook.
+  Readers should preserve that prefix-only search behavior.
 * `v0.27.1/pq_in_schema`: This dataset uses the old method of storing the PQ
   metadata in the schema metadata in the index file. We switched to storing them
   in a global buffer in https://github.com/lancedb/lance/pull/3829, but still
@@ -36,3 +40,9 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   that cross the layout's block boundary and positions used by phrase queries.
   The v1 fixture also retains the retired `skip_merge` parameter written by Lance
   3.0.1.
+* `v8.0.0/decimal_zonemap`: This dataset has a Decimal128 ZoneMap whose non-null
+  values have null min/max statistics because Decimal extrema were not computed
+  by Lance 8.0.0.
+* `v8.0.0/blobs/v2.0.lance` and `v8.0.0/blobs/v2.1.lance`: Legacy Blob
+  columns containing a payload, null, and empty bytes. These fixtures cover
+  reading released files alongside newly appended Blob v2 files.

@@ -79,9 +79,7 @@ pub struct IndexMetadata {
     pub distance_type: String,
 }
 
-pub fn is_system_index(index_meta: &lance_table::format::IndexMetadata) -> bool {
-    index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
-}
+pub use lance_table::system_index::is_system_index;
 
 pub fn infer_system_index_type(
     index_meta: &lance_table::format::IndexMetadata,
@@ -130,6 +128,7 @@ mod tests {
             IndexType::BloomFilter,
             IndexType::RTree,
             IndexType::Fm,
+            IndexType::MinHashLsh,
             IndexType::Vector,
             IndexType::IvfFlat,
             IndexType::IvfSq,
@@ -173,6 +172,9 @@ mod tests {
             ("R_TREE", IndexType::RTree),
             ("Fm", IndexType::Fm),
             ("FM", IndexType::Fm),
+            ("MinHashLsh", IndexType::MinHashLsh),
+            ("MINHASHLSH", IndexType::MinHashLsh),
+            ("MINHASH_LSH", IndexType::MinHashLsh),
             ("Vector", IndexType::Vector),
             ("VECTOR", IndexType::Vector),
             ("IVF_FLAT", IndexType::IvfFlat),

@@ -39,7 +39,7 @@ cat > "$docs_src/integrations/.pages" <<'EOF'
 nav:
   - Overview: index.md
   - Apache DataFusion: datafusion.md
-  - PostgreSQL: https://github.com/lancedb/pglance
+  - PostgreSQL: https://github.com/lance-format/pglance
   - PyTorch: pytorch.md
   - TensorFlow: tensorflow.md
 EOF

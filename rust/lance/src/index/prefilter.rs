@@ -48,7 +48,7 @@ pub struct DatasetPreFilter {
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
     pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowAddrMask>>>>,
-    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowAddrMask>>>,
+    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<Arc<RowAddrMask>>>>,
     // Fragment IDs whose data is still in the index but has been removed from the dataset.
     // Used by FTS merge-on-read to prune stale fragments at search time.
     pub(super) deleted_fragments: Option<RoaringBitmap>,
@@ -65,6 +65,19 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
+    ) -> Self {
+        let filter = filter.map(|filter| {
+            async move { filter.load().await.map(Arc::new) }
+                .in_current_span()
+                .boxed()
+        });
+        Self::new_with_filter_future(dataset, indices, filter)
+    }
+
+    pub(crate) fn new_with_filter_future(
+        dataset: Arc<Dataset>,
+        indices: &[IndexMetadata],
+        filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
         let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
@@ -83,8 +96,34 @@ impl DatasetPreFilter {
             Self::create_deletion_mask(dataset, fragments)
         }
         .map(SharedPrerequisite::spawn);
-        let filtered_ids = filter
-            .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
+        let filtered_ids = filter.map(SharedPrerequisite::spawn);
+        Self {
+            deleted_ids,
+            filtered_ids,
+            deleted_fragments: None,
+            overlay_block: None,
+            final_mask: Mutex::new(OnceCell::new()),
+        }
+    }
+
+    /// Like [`Self::new_with_filter_future`], but restricted to an explicit
+    /// fragment set instead of the union of the indices' fragment bitmaps.
+    ///
+    /// `combined_fields` needs the intersection of its target columns' coverage: a
+    /// cross-field BM25F score is only complete when every column's index holds the
+    /// row, so the union [`Self::new`] derives would admit rows that only some
+    /// columns cover. Routing through [`Self::create_restricted_deletion_mask`]
+    /// keeps the restriction in whichever id space the indices actually store,
+    /// stable row ids or row addresses, which a fragment-address block list cannot
+    /// do.
+    pub(crate) fn new_restricted_to_fragments(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
+    ) -> Self {
+        let deleted_ids = Self::create_restricted_deletion_mask(dataset, fragments)
+            .map(SharedPrerequisite::spawn);
+        let filtered_ids = filter.map(SharedPrerequisite::spawn);
         Self {
             deleted_ids,
             filtered_ids,
@@ -134,7 +173,7 @@ impl DatasetPreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn do_create_deletion_mask_row_id(
+    pub(super) async fn do_create_deletion_mask_row_id(
         dataset: Arc<Dataset>,
         restrict_to: Option<RoaringBitmap>,
     ) -> Result<Arc<RowAddrMask>> {
@@ -385,7 +424,7 @@ impl PreFilter for DatasetPreFilter {
         final_mask.get_or_init(|| {
             let mut combined = RowAddrMask::default();
             if let Some(filtered_ids) = &self.filtered_ids {
-                combined = combined & filtered_ids.get_ready();
+                combined = combined & filtered_ids.get_ready().as_ref().clone();
             }
             if let Some(deleted_ids) = &self.deleted_ids {
                 combined = combined & (*deleted_ids.get_ready()).clone();
@@ -561,6 +600,7 @@ mod test {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: Vec::new(),
+            covering_fields: vec![],
             name: "legacy".to_string(),
             dataset_version: dataset.manifest.version,
             fragment_bitmap: None,

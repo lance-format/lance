@@ -13,6 +13,10 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
+use super::row_ids::{
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    RowIdMeta,
+};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -36,7 +40,7 @@ pub struct DataFile {
     pub fields: Arc<[i32]>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
     ///
-    /// Note that -1 is a possibility and it indices that the field has
+    /// Note that -1 is a possibility and it indicates that the field has
     /// no top-level column in the file.
     ///
     /// Columns that lack a field id may still exist as extra entries in
@@ -165,10 +169,76 @@ impl DataFile {
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
-        full_schema.project_by_ids(&self.fields, false)
+        // Structural field IDs describe physical headers in V2.0 and may also
+        // appear with column_index=-1 in older V2.1+ manifests. They do not, by
+        // themselves, mean that every child in the current dataset schema is
+        // present in this file. In particular, a struct can retain its ID while
+        // schema evolution replaces its last old child with a new one.
+        fn project_field(
+            field: &lance_core::datatypes::Field,
+            mapped_columns: &HashMap<i32, i32>,
+            is_v2_0: bool,
+        ) -> Option<lance_core::datatypes::Field> {
+            if field.is_blob() || field.is_packed_struct() {
+                return mapped_columns
+                    .contains_key(&field.id)
+                    .then(|| field.clone());
+            }
+
+            let children = field
+                .children
+                .iter()
+                .filter_map(|child| project_field(child, mapped_columns, is_v2_0))
+                .collect::<Vec<_>>();
+            if !children.is_empty() {
+                return Some(lance_core::datatypes::Field {
+                    children,
+                    ..field.clone()
+                });
+            }
+
+            if field.children.is_empty() && mapped_columns.contains_key(&field.id) {
+                return Some(field.clone());
+            }
+
+            // V2.0 stores a physical header for structural fields. Keep that
+            // header to preserve the parent's row count and validity, but leave
+            // its children empty so missing descendants are null-filled by the
+            // fragment reader instead of being added to this file's projection.
+            if is_v2_0 && mapped_columns.contains_key(&field.id) {
+                return Some(lance_core::datatypes::Field {
+                    children: Vec::new(),
+                    ..field.clone()
+                });
+            }
+            None
+        }
+
+        if self.uses_v1_data_file_encoding() {
+            return full_schema.project_by_ids(&self.fields, false);
+        }
+        let mapped_columns = self
+            .fields
+            .iter()
+            .copied()
+            .zip(self.column_indices.iter().copied())
+            .filter(|(_, column_index)| *column_index >= 0)
+            .collect::<HashMap<_, _>>();
+        let is_v2_0 = matches!(
+            (self.file_major_version, self.file_minor_version),
+            (0, 3) | (2, 0)
+        );
+        Schema {
+            fields: full_schema
+                .fields
+                .iter()
+                .filter_map(|field| project_field(field, &mapped_columns, is_v2_0))
+                .collect(),
+            metadata: full_schema.metadata.clone(),
+        }
     }
 
-    pub fn is_legacy_file(&self) -> bool {
+    fn uses_v1_data_file_encoding(&self) -> bool {
         self.file_major_version == 0 && self.file_minor_version < 3
     }
 
@@ -181,7 +251,7 @@ impl DataFile {
     }
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
-        if self.is_legacy_file() {
+        if self.uses_v1_data_file_encoding() {
             // A tombstone marks a field superseded by a later data file. It is
             // not a field id, so it carries no ordering; the live ids around it
             // must still be sorted and distinct.
@@ -317,13 +387,9 @@ impl DataFileFieldInterner {
             pb::data_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(data) => {
                 Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
             }
-            pb::data_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                file,
-            ) => Ok(RowDatasetVersionMeta::External(ExternalFile {
-                path: file.path,
-                offset: file.offset,
-                size: file.size,
-            })),
+            pb::data_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(_) => {
+                Ok(RowDatasetVersionMeta::Column)
+            }
         }
     }
 
@@ -336,12 +402,8 @@ impl DataFileFieldInterner {
             pb::data_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
                 Ok(RowDatasetVersionMeta::Inline(cache.intern(data)))
             }
-            pb::data_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
-                Ok(RowDatasetVersionMeta::External(ExternalFile {
-                    path: file.path,
-                    offset: file.offset,
-                    size: file.size,
-                }))
+            pb::data_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
+                Ok(RowDatasetVersionMeta::Column)
             }
         }
     }
@@ -454,38 +516,6 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
-/// A reference to a part of a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct ExternalFile {
-    pub path: String,
-    pub offset: u64,
-    pub size: u64,
-}
-
-/// Metadata about location of the row id sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub enum RowIdMeta {
-    Inline(Vec<u8>),
-    External(ExternalFile),
-}
-
-impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
-    type Error = Error;
-
-    fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
-        match value {
-            pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
-            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
-        }
-    }
-}
-
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -554,6 +584,144 @@ impl Fragment {
             ) => Some(len - num_deleted_rows),
             _ => None,
         }
+    }
+
+    /// Every Lance-format file this fragment references: the base data files
+    /// plus the data file of each overlay. The fragment's other referenced
+    /// files are not in this format: a deletion file is `.arrow` or `.bin`, and
+    /// external row-id or row-version metadata is a raw byte range.
+    ///
+    /// Prefer this over `files`, which is the base data files only and so omits
+    /// overlays.
+    pub fn referenced_lance_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+        // Destructured on purpose: a new field here fails to compile until
+        // someone decides whether it references files.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter()
+            .chain(overlays.iter().map(|overlay| &overlay.data_file))
+    }
+
+    /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
+    /// the fields a clone has to normalize (`base_id`) across base and overlay
+    /// files alike.
+    pub fn referenced_lance_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `referenced_lance_files`, and so
+        // the two disjoint field borrows are visible to the borrow checker.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter_mut()
+            .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
+    }
+
+    /// Whether any of this fragment's row lineage sequences lives in a data
+    /// file column rather than inline.
+    pub fn has_spilled_row_lineage(&self) -> bool {
+        matches!(self.row_id_meta, Some(RowIdMeta::Column))
+            || matches!(
+                self.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            )
+            || matches!(
+                self.last_updated_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            )
+    }
+
+    /// The data file holding the row lineage column with the reserved
+    /// `field_id`, which is the one entry of [`Self::files`] whose fields carry
+    /// it. `None` when no file does, which for a sequence whose metadata says
+    /// it is spilled is corruption; so is more than one file carrying the id,
+    /// which this reports as an error.
+    pub fn row_lineage_file(&self, field_id: i32) -> Result<Option<&DataFile>> {
+        let mut carriers = self
+            .files
+            .iter()
+            .filter(|file| file.fields.contains(&field_id));
+        let file = carriers.next();
+        if let Some(extra) = carriers.next() {
+            return Err(Error::corrupt_file_named(
+                &extra.path,
+                format!(
+                    "fragment {} has more than one data file carrying row lineage field {}",
+                    self.id, field_id
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// The reserved field ids of the row lineage sequences this fragment
+    /// marks as spilled: [`ROW_ID_FIELD_ID`] when its row ids are, and
+    /// likewise [`ROW_CREATED_AT_VERSION_FIELD_ID`] and
+    /// [`ROW_LAST_UPDATED_AT_VERSION_FIELD_ID`] for its versions.
+    ///
+    /// These ids are never in the dataset schema, so code that decides whether
+    /// a data file is still needed by its schema fields has to keep a file
+    /// carrying one of them as well: that file is the sequence's only copy.
+    pub fn spilled_row_lineage_field_ids(&self) -> Vec<i32> {
+        let mut field_ids = Vec::new();
+        if matches!(self.row_id_meta, Some(RowIdMeta::Column)) {
+            field_ids.push(ROW_ID_FIELD_ID);
+        }
+        if matches!(
+            self.created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_CREATED_AT_VERSION_FIELD_ID);
+        }
+        if matches!(
+            self.last_updated_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_LAST_UPDATED_AT_VERSION_FIELD_ID);
+        }
+        field_ids
+    }
+
+    /// Check that every sequence this fragment marks as spilled has exactly
+    /// one carrier among [`Self::files`], and that the carrier is a v2 file,
+    /// the only version that can hold the columns.
+    ///
+    /// This reads metadata only. Committing a fragment that fails it would
+    /// publish lineage no reader can load, and once cleanup removed the
+    /// unreferenced carrier that lineage would be lost for good.
+    pub(crate) fn validate_row_lineage_carriers(&self) -> Result<()> {
+        for field_id in self.spilled_row_lineage_field_ids() {
+            let Some(file) = self.row_lineage_file(field_id)? else {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: it marks row lineage field {} as spilled but \
+                     none of its data files carries it",
+                    self.id, field_id
+                )));
+            };
+            if file.file_version()? == ConcreteFileVersion::V1 {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: its spilled row lineage field {} is carried by \
+                     legacy v1 data file {}, which cannot hold row lineage columns",
+                    self.id, field_id, file.path
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -629,12 +797,6 @@ impl Fragment {
             .push(DataFile::new_legacy(path, schema, None, None));
     }
 
-    // True if this fragment is made up of legacy v1 files, false otherwise
-    pub fn has_legacy_files(&self) -> bool {
-        // If any file in a fragment is legacy then all files in the fragment must be
-        self.files[0].is_legacy_file()
-    }
-
     // Helper method to infer the Lance version from a set of fragments
     //
     // Returns None if there are no data files
@@ -644,15 +806,15 @@ impl Fragment {
         // Determine version from first file
         let Some(sample_file) = fragments
             .iter()
-            .find(|f| !f.files.is_empty())
-            .map(|f| &f.files[0])
+            .flat_map(Self::referenced_lance_files)
+            .next()
         else {
             return Ok(None);
         };
         let file_version = sample_file.file_version()?;
         // Ensure all files match
         for frag in fragments {
-            for file in &frag.files {
+            for file in frag.referenced_lance_files() {
                 let this_file_version = file.file_version()?;
                 if file_version != this_file_version {
                     return Err(Error::invalid_input(format!(
@@ -723,13 +885,11 @@ impl From<&Fragment> for pb::DataFragment {
         });
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
-            RowIdMeta::Inline(data) => pb::data_fragment::RowIdSequence::InlineRowIds(data.clone()),
-            RowIdMeta::External(file) => {
-                pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                })
+            RowIdMeta::Inline(data) => {
+                pb::data_fragment::RowIdSequence::InlineRowIds(data.bytes().clone())
+            }
+            RowIdMeta::Column => {
+                pb::data_fragment::RowIdSequence::ColumnRowIds(pb::RowLineageColumn {})
             }
         });
         let last_updated_at_version_sequence =
@@ -941,6 +1101,23 @@ mod tests {
             Some(ConcreteFileVersion::V2_0)
         );
 
+        let mut mixed_overlay = v2_0.clone();
+        mixed_overlay.overlays.push(DataOverlayFile {
+            data_file: DataFile::new(
+                "overlay-v2_1.lance",
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_1,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+            committed_version: 1,
+        });
+        let error = Fragment::try_infer_version(&[mixed_overlay]).unwrap_err();
+        assert!(error.to_string().contains("2.0"));
+        assert!(error.to_string().contains("2.1"));
+
         let v2_1 = Fragment::new(2).with_file(
             "v2_1.lance",
             vec![0],
@@ -954,6 +1131,70 @@ mod tests {
         assert!(message.contains("All data files must have the same version"));
         assert!(message.contains("2.0"));
         assert!(message.contains("2.1"));
+    }
+
+    #[test]
+    fn data_file_schema_does_not_substitute_evolved_struct_children() {
+        let mut schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "values",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "later",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]))
+        .unwrap();
+        schema.set_field_id(None);
+        let parent_id = schema.fields[0].id;
+        let later_id = schema.fields[0].children[0].id;
+        let id_field_id = schema.fields[1].id;
+        schema.fields[0].children[0].id = later_id + 2;
+
+        let stale_file = DataFile::new(
+            "stale.lance",
+            vec![parent_id, later_id, id_field_id],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let stale_schema = stale_file.schema(&schema);
+        assert_eq!(
+            stale_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["values", "id"]
+        );
+        assert!(stale_schema.fields[0].children.is_empty());
+
+        let stale_v2_1_file = DataFile::new(
+            "stale-v2-1.lance",
+            vec![parent_id, later_id, id_field_id],
+            vec![-1, 0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        assert_eq!(
+            stale_v2_1_file.schema(&schema).fields,
+            vec![schema.fields[1].clone()]
+        );
+
+        let current_file = DataFile::new(
+            "current.lance",
+            vec![parent_id, later_id + 2, id_field_id],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        assert_eq!(current_file.schema(&schema), schema);
     }
 
     #[test]

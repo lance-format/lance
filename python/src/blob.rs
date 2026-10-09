@@ -3,7 +3,7 @@
 
 use crate::{error::PythonErrorExt, rt};
 use arrow::{
-    array::{Array, ArrayRef, GenericBinaryArray, OffsetSizeTrait, cast::AsArray, make_array},
+    array::{Array, ArrayRef, make_array},
     pyarrow::{FromPyArrow, ToPyArrow},
 };
 use arrow_data::ArrayData;
@@ -12,6 +12,7 @@ use bytes::Bytes;
 use lance::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
 };
+use lance_arrow::iter_binary_array;
 use pyo3::{
     Bound, PyErr, PyResult,
     exceptions::{PyRuntimeError, PyValueError},
@@ -91,9 +92,10 @@ fn descriptor_field_to_pyarrow<'py>(
 
 /// Normalize inputs accepted by [`PyPackedBlobWriter::write_blobs`] into Arrow arrays.
 ///
-/// BinaryArray, LargeBinaryArray, and ChunkedArray values of either binary type
-/// are accepted. Chunk boundaries, nulls, and empty values remain in the arrays;
-/// each row is later passed to the core writer as an optional byte slice.
+/// BinaryArray, LargeBinaryArray, BinaryViewArray, FixedSizeBinaryArray, and
+/// ChunkedArray values of any binary type are accepted. Chunk boundaries,
+/// nulls, and empty values remain in the arrays; each row is later passed to
+/// the core writer as an optional byte slice.
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
         Ok(data) => Ok(vec![validated_blob_payload(data, None)?]),
@@ -108,9 +110,9 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
             }
 
             let chunked_data_type = DataType::from_pyarrow_bound(&payloads.getattr("type")?)?;
-            if !matches!(chunked_data_type, DataType::Binary | DataType::LargeBinary) {
+            if !chunked_data_type.is_binary() {
                 return Err(PyValueError::new_err(format!(
-                    "Packed blob payloads must have Arrow type Binary or LargeBinary, got {chunked_data_type}"
+                    "Packed blob payloads must have a Binary Arrow type, got {chunked_data_type}"
                 )));
             }
 
@@ -129,9 +131,9 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
     let context = chunk_index
         .map(|index| format!("Packed blob payload chunk {index}"))
         .unwrap_or_else(|| "Packed blob payload array".to_string());
-    if !matches!(data.data_type(), DataType::Binary | DataType::LargeBinary) {
+    if !data.data_type().is_binary() {
         return Err(PyValueError::new_err(format!(
-            "{context} must have Arrow type Binary or LargeBinary, got {}",
+            "{context} must have a Binary Arrow type, got {}",
             data.data_type()
         )));
     }
@@ -147,20 +149,14 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
     Ok(make_array(data))
 }
 
-/// Stream one Arrow binary array into the core writer as zero-copy row slices.
-///
-/// Null rows become `None` so the core writer records null descriptors, keeping
-/// its output row-aligned with the input.
-async fn write_binary_payloads<O: OffsetSizeTrait>(
-    writer: &mut PackedBlobWriter,
-    payloads: &GenericBinaryArray<O>,
-) -> PyResult<()> {
-    writer
-        .write_packed_blobs(
-            (0..payloads.len()).map(|row| payloads.is_valid(row).then(|| payloads.value(row))),
-        )
-        .await
-        .infer_error()
+async fn write_binary_payloads(writer: &mut PackedBlobWriter, payloads: &ArrayRef) -> PyResult<()> {
+    let iter = iter_binary_array(payloads.as_ref()).map_err(|error| {
+        PyValueError::new_err(format!(
+            "Packed blob payloads must have a Binary Arrow type, got {}: {error}",
+            payloads.data_type()
+        ))
+    })?;
+    writer.write_packed_blobs(iter).await.infer_error()
 }
 
 #[pyclass(name = "BlobDescriptor", skip_from_py_object)]
@@ -348,7 +344,9 @@ impl PyPackedBlobWriter {
     ///
     /// Parameters
     /// ----------
-    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray, or pyarrow.ChunkedArray
+    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray,
+    ///     pyarrow.BinaryViewArray, pyarrow.FixedSizeBinaryArray, or
+    ///     pyarrow.ChunkedArray
     ///     A binary Arrow array. Every chunk of a chunked array must be binary.
     ///     Each input row produces one descriptor row, in order, across chunks
     ///     and repeated calls. Null rows produce null descriptors; empty but
@@ -368,19 +366,7 @@ impl PyPackedBlobWriter {
             let writer = self.inner_mut()?;
             rt().block_on(None, async {
                 for payloads in payloads {
-                    match payloads.data_type() {
-                        DataType::Binary => {
-                            write_binary_payloads(writer, payloads.as_binary::<i32>()).await?
-                        }
-                        DataType::LargeBinary => {
-                            write_binary_payloads(writer, payloads.as_binary::<i64>()).await?
-                        }
-                        data_type => {
-                            return Err(PyValueError::new_err(format!(
-                                "Packed blob payloads must have Arrow type Binary or LargeBinary, got {data_type}"
-                            )));
-                        }
-                    }
+                    write_binary_payloads(writer, &payloads).await?;
                 }
                 Ok(())
             })

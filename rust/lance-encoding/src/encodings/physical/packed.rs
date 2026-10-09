@@ -12,7 +12,6 @@
 use std::{convert::TryInto, sync::Arc};
 
 use arrow_array::types::UInt64Type;
-
 use lance_core::{Error, Result, datatypes::Field};
 
 use crate::{
@@ -187,10 +186,42 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
 }
 
 #[derive(Debug)]
+struct FixedPackedFieldData {
+    block: FixedWidthDataBlock,
+}
+
+impl FixedPackedFieldData {
+    fn append_row_bytes(&self, row_idx: usize, output: &mut Vec<u8>) -> Result<()> {
+        let bits_per_value = self.block.bits_per_value;
+        if !bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input(
+                "Packed struct encoding requires byte-aligned fixed-width children",
+            ));
+        }
+        let bytes_per_value = (bits_per_value / 8) as usize;
+        let start = row_idx
+            .checked_mul(bytes_per_value)
+            .ok_or_else(|| Error::invalid_input("Packed struct row size overflow"))?;
+        let end = start.checked_add(bytes_per_value).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Packed struct fixed child range overflow: row_idx={row_idx}, \
+                 bytes_per_value={bytes_per_value}"
+            ))
+        })?;
+        let data = self.block.data.as_ref();
+        if end > data.len() {
+            return Err(Error::invalid_input(
+                "Packed struct fixed child out of bounds",
+            ));
+        }
+        output.extend_from_slice(&data[start..end]);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 enum VariablePackedFieldData {
-    Fixed {
-        block: FixedWidthDataBlock,
-    },
+    Fixed(FixedPackedFieldData),
     Variable {
         block: VariableWidthBlock,
         bits_per_length: u64,
@@ -200,32 +231,12 @@ enum VariablePackedFieldData {
 impl VariablePackedFieldData {
     fn append_row_bytes(&self, row_idx: usize, output: &mut Vec<u8>) -> Result<()> {
         match self {
-            Self::Fixed { block } => {
-                let bits_per_value = block.bits_per_value;
-                if bits_per_value % 8 != 0 {
-                    return Err(Error::invalid_input(
-                        "Packed struct variable encoding requires byte-aligned fixed-width children",
-                    ));
-                }
-                let bytes_per_value = (bits_per_value / 8) as usize;
-                let start = row_idx
-                    .checked_mul(bytes_per_value)
-                    .ok_or_else(|| Error::invalid_input("Packed struct row size overflow"))?;
-                let end = start + bytes_per_value;
-                let data = block.data.as_ref();
-                if end > data.len() {
-                    return Err(Error::invalid_input(
-                        "Packed struct fixed child out of bounds",
-                    ));
-                }
-                output.extend_from_slice(&data[start..end]);
-                Ok(())
-            }
+            Self::Fixed(fixed_data) => fixed_data.append_row_bytes(row_idx, output),
             Self::Variable {
                 block,
                 bits_per_length,
             } => {
-                if bits_per_length % 8 != 0 {
+                if !bits_per_length.is_multiple_of(8) {
                     return Err(Error::invalid_input(
                         "Packed struct variable children must have byte-aligned length prefixes",
                     ));
@@ -284,6 +295,35 @@ impl VariablePackedFieldData {
     }
 }
 
+fn check_struct_validity(data: DataBlock, field_length: usize) -> Result<StructDataBlock> {
+    let DataBlock::Struct(struct_block) = data else {
+        return Err(Error::invalid_input(
+            "Packed struct encoder requires Struct data block",
+        ));
+    };
+
+    if struct_block.children.is_empty() {
+        return Err(Error::invalid_input(
+            "Packed struct encoder requires at least one child field",
+        ));
+    }
+    if struct_block.children.len() != field_length {
+        return Err(Error::invalid_input(
+            "Struct field metadata does not match number of children",
+        ));
+    }
+
+    let num_values = struct_block.children[0].num_values();
+    for child in struct_block.children.iter() {
+        if child.num_values() != num_values {
+            return Err(Error::invalid_input(
+                "Packed struct children must have matching value counts",
+            ));
+        }
+    }
+    Ok(struct_block)
+}
+
 #[derive(Debug)]
 pub struct PackedStructVariablePerValueEncoder {
     strategy: Arc<dyn CompressionStrategy>,
@@ -298,32 +338,8 @@ impl PackedStructVariablePerValueEncoder {
 
 impl PerValueCompressor for PackedStructVariablePerValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
-        let DataBlock::Struct(struct_block) = data else {
-            return Err(Error::invalid_input(
-                "Packed struct encoder requires Struct data block",
-            ));
-        };
-
-        if struct_block.children.is_empty() {
-            return Err(Error::invalid_input(
-                "Packed struct encoder requires at least one child field",
-            ));
-        }
-        if struct_block.children.len() != self.fields.len() {
-            return Err(Error::invalid_input(
-                "Struct field metadata does not match number of children",
-            ));
-        }
-
+        let struct_block = check_struct_validity(data, self.fields.len())?;
         let num_values = struct_block.children[0].num_values();
-        for child in struct_block.children.iter() {
-            if child.num_values() != num_values {
-                return Err(Error::invalid_input(
-                    "Packed struct children must have matching value counts",
-                ));
-            }
-        }
-
         let mut field_data = Vec::with_capacity(self.fields.len());
         let mut field_metadata = Vec::with_capacity(self.fields.len());
 
@@ -336,7 +352,8 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
                         encoding,
                         block.bits_per_value,
                     ));
-                    field_data.push(VariablePackedFieldData::Fixed { block });
+                    let block = FixedPackedFieldData { block };
+                    field_data.push(VariablePackedFieldData::Fixed(block));
                 }
                 PerValueDataBlock::Variable(block) => {
                     let bits_per_length = block.bits_per_offset as u64;
@@ -400,6 +417,83 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
 }
 
 #[derive(Debug)]
+pub(crate) struct PackedStructFixedPerValueEncoder {
+    field_len: usize,
+}
+
+impl PackedStructFixedPerValueEncoder {
+    pub(crate) fn new(fields: Vec<Field>) -> Self {
+        Self {
+            field_len: fields.len(),
+        }
+    }
+}
+
+impl PerValueCompressor for PackedStructFixedPerValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        let struct_block = check_struct_validity(data, self.field_len)?;
+
+        if struct_block.has_variable_width_child() {
+            return Err(Error::invalid_input(
+                "Packed struct fixed encoding requires all children to be fixed-width",
+            ));
+        }
+
+        let num_values = struct_block.children[0].num_values();
+        // Fixed length - supporting only flat encoding
+        let compressor = Box::new(ValueEncoder::default()) as Box<dyn PerValueCompressor>;
+        let mut field_data = Vec::with_capacity(self.field_len);
+        let mut field_bits_per_value = Vec::with_capacity(self.field_len);
+        let mut bits_per_row: u64 = 0;
+
+        for child_block in struct_block.children.into_iter() {
+            let (compressed, ..) = compressor.compress(child_block)?;
+            match compressed {
+                PerValueDataBlock::Fixed(block) => {
+                    bits_per_row = bits_per_row
+                        .checked_add(block.bits_per_value)
+                        .ok_or_else(|| Error::invalid_input("Packed struct row width overflow"))?;
+                    field_bits_per_value.push(block.bits_per_value);
+                    field_data.push(FixedPackedFieldData { block });
+                }
+                _ => {
+                    return Err(Error::invalid_input(
+                        "Packed struct fixed encoding requires all children to be fixed-width",
+                    ));
+                }
+            }
+        }
+
+        // Children are validated byte-aligned in `append_row_bytes`, so the row width
+        // is an exact number of bytes.
+        let bytes_per_row = (bits_per_row / 8) as usize;
+        let mut row_data: Vec<u8> =
+            Vec::with_capacity(bytes_per_row.saturating_mul(num_values as usize));
+        for row in 0..num_values as usize {
+            for field in &field_data {
+                field.append_row_bytes(row, &mut row_data)?;
+            }
+            debug_assert_eq!(row_data.len(), bytes_per_row * (row + 1));
+        }
+
+        let data_block = FixedWidthDataBlock {
+            data: LanceBuffer::from(row_data),
+            bits_per_value: bits_per_row,
+            num_values,
+            block_info: BlockInfo::new(),
+        };
+
+        Ok((
+            PerValueDataBlock::Fixed(data_block),
+            ProtobufUtils21::packed_struct(
+                ProtobufUtils21::flat(bits_per_row, None),
+                field_bits_per_value,
+            ),
+        ))
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum VariablePackedStructFieldKind {
     Fixed {
         bits_per_value: u64,
@@ -427,12 +521,59 @@ impl PackedStructVariablePerValueDecompressor {
     }
 }
 
+#[derive(Debug)]
+struct FixedFieldAccumulator {
+    builder: DataBlockBuilder,
+    bits_per_value: u64,
+    empty_value: DataBlock,
+}
+
+impl FixedFieldAccumulator {
+    fn append_empty(&mut self) -> Result<()> {
+        self.builder.append(&self.empty_value, 0..1)
+    }
+
+    fn new(bits_per_value: u64, num_values: u64) -> Result<Self> {
+        if !bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input(
+                "Packed struct fixed child must be byte-aligned",
+            ));
+        }
+
+        let bytes_per_value = bits_per_value.checked_div(8).ok_or_else(|| {
+            Error::invalid_input("Invalid bits per value for packed struct field")
+        })?;
+
+        let estimate = bytes_per_value
+            .checked_mul(num_values)
+            .ok_or_else(|| Error::invalid_input("Packed struct fixed child allocation overflow"))?;
+
+        let empty_value = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8; bytes_per_value as usize]),
+            bits_per_value,
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        });
+
+        Ok(Self {
+            builder: DataBlockBuilder::with_capacity_estimate(estimate),
+            bits_per_value,
+            empty_value,
+        })
+    }
+
+    fn finish(self) -> Result<FixedWidthDataBlock> {
+        let DataBlock::FixedWidth(block) = self.builder.finish() else {
+            return Err(Error::invalid_input(
+                "Expected fixed-width datablock from builder",
+            ));
+        };
+        Ok(block)
+    }
+}
+
 enum FieldAccumulator {
-    Fixed {
-        builder: DataBlockBuilder,
-        bits_per_value: u64,
-        empty_value: DataBlock,
-    },
+    Fixed(FixedFieldAccumulator),
     Variable32 {
         builder: DataBlockBuilder,
         empty_value: DataBlock,
@@ -449,11 +590,7 @@ impl FieldAccumulator {
     // one placeholder per child so child row counts remain aligned.
     fn append_empty(&mut self) -> Result<()> {
         match self {
-            Self::Fixed {
-                builder,
-                empty_value,
-                ..
-            } => builder.append(empty_value, 0..1),
+            Self::Fixed(fixed_field_accumulator) => fixed_field_accumulator.append_empty(),
             Self::Variable32 {
                 builder,
                 empty_value,
@@ -498,28 +635,8 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
         for field in &self.fields {
             match &field.kind {
                 VariablePackedStructFieldKind::Fixed { bits_per_value, .. } => {
-                    if bits_per_value % 8 != 0 {
-                        return Err(Error::invalid_input(
-                            "Packed struct fixed child must be byte-aligned",
-                        ));
-                    }
-                    let bytes_per_value = bits_per_value.checked_div(8).ok_or_else(|| {
-                        Error::invalid_input("Invalid bits per value for packed struct field")
-                    })?;
-                    let estimate = bytes_per_value.checked_mul(num_values).ok_or_else(|| {
-                        Error::invalid_input("Packed struct fixed child allocation overflow")
-                    })?;
-                    let empty_value = DataBlock::FixedWidth(FixedWidthDataBlock {
-                        data: LanceBuffer::from(vec![0_u8; bytes_per_value as usize]),
-                        bits_per_value: *bits_per_value,
-                        num_values: 1,
-                        block_info: BlockInfo::new(),
-                    });
-                    accumulators.push(FieldAccumulator::Fixed {
-                        builder: DataBlockBuilder::with_capacity_estimate(estimate),
-                        bits_per_value: *bits_per_value,
-                        empty_value,
-                    });
+                    let accumulator = FixedFieldAccumulator::new(*bits_per_value, num_values)?;
+                    accumulators.push(FieldAccumulator::Fixed(accumulator));
                 }
                 VariablePackedStructFieldKind::Variable {
                     bits_per_length, ..
@@ -572,14 +689,10 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                 match (&field.kind, accumulator) {
                     (
                         VariablePackedStructFieldKind::Fixed { bits_per_value, .. },
-                        FieldAccumulator::Fixed {
-                            builder,
-                            bits_per_value: acc_bits,
-                            ..
-                        },
+                        FieldAccumulator::Fixed(fixed_accumulator),
                     ) => {
-                        debug_assert_eq!(bits_per_value, acc_bits);
-                        let bytes_per_value = (bits_per_value / 8) as usize;
+                        debug_assert_eq!(*bits_per_value, fixed_accumulator.bits_per_value);
+                        let bytes_per_value = (*bits_per_value / 8) as usize;
                         let end = cursor + bytes_per_value;
                         if end > row_end {
                             return Err(Error::invalid_input(
@@ -592,7 +705,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                             num_values: 1,
                             block_info: BlockInfo::new(),
                         });
-                        builder.append(&value_block, 0..1)?;
+                        fixed_accumulator.builder.append(&value_block, 0..1)?;
                         cursor = end;
                     }
                     (
@@ -694,12 +807,10 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
                     VariablePackedStructFieldDecoder {
                         kind: VariablePackedStructFieldKind::Fixed { decompressor, .. },
                     },
-                    FieldAccumulator::Fixed { builder, .. },
+                    FieldAccumulator::Fixed(fixed_accumulator),
                 ) => {
-                    let DataBlock::FixedWidth(block) = builder.finish() else {
-                        panic!("Expected fixed-width datablock from builder");
-                    };
-                    let decoded = decompressor.decompress(block, num_values)?;
+                    let finished_accumulator = fixed_accumulator.finish()?;
+                    let decoded = decompressor.decompress(finished_accumulator, num_values)?;
                     children.push(decoded);
                 }
                 (
@@ -754,13 +865,131 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
     }
 }
 
+#[derive(Debug)]
+struct PackedStructFixedFieldDecoder {
+    bits_per_value: u64,
+    decompressor: Box<dyn FixedPerValueDecompressor>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PackedStructFixedPerValueDecompressor {
+    decoders: Vec<PackedStructFixedFieldDecoder>,
+}
+
+impl PackedStructFixedPerValueDecompressor {
+    pub(crate) fn new(description: &PackedStruct) -> Result<Self> {
+        let compression = description
+            .values
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("PackedStruct missing values encoding"))?
+            .compression
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid_input("PackedStruct values missing compression encoding")
+            })?;
+
+        // The encoder always flat-encodes each child, so that is the only layout we can decode.
+        if !matches!(compression, Compression::Flat(..)) {
+            return Err(Error::invalid_input(
+                "PackedStruct fixed encoding currently requires flat compression",
+            ));
+        }
+
+        let decoders = description
+            .bits_per_value
+            .iter()
+            .map(|&bits_per_value| {
+                let flat = crate::format::pb21::Flat {
+                    bits_per_value,
+                    data: None,
+                };
+                PackedStructFixedFieldDecoder {
+                    bits_per_value,
+                    decompressor: Box::new(ValueDecompressor::from_flat(&flat)),
+                }
+            })
+            .collect();
+        Ok(Self { decoders })
+    }
+}
+
+impl FixedPerValueDecompressor for PackedStructFixedPerValueDecompressor {
+    fn decompress(&self, data: FixedWidthDataBlock, num_values: u64) -> Result<DataBlock> {
+        if !data.bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input(
+                "Packed struct fixed encoding requires byte-aligned children",
+            ));
+        }
+        let bytes_per_row = (data.bits_per_value / 8) as usize;
+
+        // Byte offset of each child within a packed row (a running prefix sum of the
+        // child widths). The final offset must equal the packed row width.
+        let mut child_bytes = Vec::with_capacity(self.decoders.len());
+        for decoder in &self.decoders {
+            if !decoder.bits_per_value.is_multiple_of(8) {
+                return Err(Error::invalid_input(
+                    "Packed struct fixed child must be byte-aligned",
+                ));
+            }
+            child_bytes.push((decoder.bits_per_value / 8) as usize);
+        }
+        if child_bytes.iter().sum::<usize>() != bytes_per_row {
+            return Err(Error::invalid_input(
+                "Packed struct child widths do not sum to the packed row width",
+            ));
+        }
+        if bytes_per_row.saturating_mul(num_values as usize) > data.data.len() {
+            return Err(Error::invalid_input(
+                "Packed struct row bounds exceed buffer",
+            ));
+        }
+
+        // Un-zip the row-major buffer one child at a time by gathering that child's
+        // slice out of every row, then hand the column to the child decompressor.
+        let bytes = data.data.as_ref();
+        let mut children = Vec::with_capacity(self.decoders.len());
+        let mut field_offset = 0;
+        for (decoder, &field_bytes) in self.decoders.iter().zip(child_bytes.iter()) {
+            let mut child_buf = Vec::with_capacity(field_bytes * num_values as usize);
+            for row_idx in 0..num_values as usize {
+                let start = row_idx * bytes_per_row + field_offset;
+                child_buf.extend_from_slice(&bytes[start..start + field_bytes]);
+            }
+            let child_block = FixedWidthDataBlock {
+                data: LanceBuffer::from(child_buf),
+                bits_per_value: decoder.bits_per_value,
+                num_values,
+                block_info: BlockInfo::new(),
+            };
+            children.push(decoder.decompressor.decompress(child_block, num_values)?);
+            field_offset += field_bytes;
+        }
+
+        Ok(DataBlock::Struct(StructDataBlock {
+            children,
+            block_info: BlockInfo::new(),
+            validity: None,
+        }))
+    }
+
+    fn bits_per_value(&self) -> u64 {
+        self.decoders
+            .iter()
+            .map(|decoder| decoder.bits_per_value)
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        compression::CompressionStrategy,
         compression::DefaultDecompressionStrategy,
         compression_config::CompressionParams,
-        constants::PACKED_STRUCT_META_KEY,
+        constants::{
+            PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        },
         statistics::ComputeStat,
         testing::{
             TestCases, TestEncoding, check_round_trip_encoding_of_data, test_compression_strategy,
@@ -1208,6 +1437,134 @@ mod tests {
             &[0_u32, 1_u32, 1_u32, 1_u32]
         );
         assert_eq!(variable.data.as_ref(), b"a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_packed_struct_round_trip() -> Result<()> {
+        let arrow_fields: Fields = vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int64, false),
+        ]
+        .into();
+        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
+        let struct_field = Field::try_from(&arrow_struct)?;
+
+        let id_block = fixed_i32_block_from_array(Int32Array::from(vec![1, 2, 3, 4]));
+        let value_block = fixed_block_from_array(Int64Array::from(vec![10, 20, 30, 40]));
+
+        let struct_block = StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(id_block.clone()),
+                DataBlock::FixedWidth(value_block.clone()),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        };
+
+        let data_block = DataBlock::Struct(struct_block);
+
+        let compression_strategy =
+            test_compression_strategy(TestEncoding::StructuralU32, CompressionParams::default());
+        let compressor = CompressionStrategy::create_per_value(
+            compression_strategy.as_ref(),
+            &struct_field,
+            &data_block,
+        )?;
+        let (compressed, encoding) = compressor.compress(data_block)?;
+
+        let PerValueDataBlock::Fixed(zipped) = compressed else {
+            panic!("expected fixed-width packed struct output");
+        };
+
+        let decompression_strategy = DefaultDecompressionStrategy::default();
+        let decompressor =
+            crate::compression::DecompressionStrategy::create_fixed_per_value_decompressor(
+                &decompression_strategy,
+                &encoding,
+            )?;
+        let decoded = decompressor.decompress(zipped, 4)?;
+
+        let DataBlock::Struct(decoded_struct) = decoded else {
+            panic!("expected struct datablock after decode");
+        };
+
+        let decoded_id = decoded_struct.children[0].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_id.bits_per_value, 32);
+        assert_eq!(decoded_id.data.as_ref(), id_block.data.as_ref());
+
+        let decoded_value = decoded_struct.children[1].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_value.bits_per_value, 64);
+        assert_eq!(decoded_value.data.as_ref(), value_block.data.as_ref());
+
+        Ok(())
+    }
+
+    // End-to-end round trip through the file writer. Requesting full-zip on an
+    // all-fixed-width struct routes to `PackedStructFixedPerValueEncoder` (mini-block
+    // is only chosen for narrow structs), exercising the writer/reader wiring rather
+    // than just the block-level compress/decompress above.
+    #[tokio::test]
+    async fn fixed_packed_struct_full_zip_round_trip() {
+        let fields = Fields::from(vec![
+            Arc::new(ArrowField::new("id", DataType::Int32, false)),
+            Arc::new(ArrowField::new("value", DataType::Int64, false)),
+        ]);
+
+        let mut meta = HashMap::new();
+        meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+        meta.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        );
+
+        let array = Arc::new(StructArray::from(vec![
+            (
+                fields[0].clone(),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+            (
+                fields[1].clone(),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+            ),
+        ]));
+
+        let test_cases = TestCases::default()
+            .with_u32_structural_encodings()
+            .with_expected_encoding("packed_struct");
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, meta).await;
+    }
+
+    #[test]
+    fn fixed_packed_struct_rejects_variable_child() -> Result<()> {
+        let arrow_fields: Fields = vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]
+        .into();
+        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
+        let struct_field = Field::try_from(&arrow_struct)?;
+
+        let struct_block = DataBlock::Struct(StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(fixed_i32_block_from_array(Int32Array::from(vec![1, 2]))),
+                DataBlock::VariableWidth(variable_block_from_string_array(StringArray::from(
+                    vec!["a", "bb"],
+                ))),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        });
+
+        let encoder = PackedStructFixedPerValueEncoder::new(struct_field.children);
+        let err = encoder.compress(struct_block).unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("fixed-width"),
+            "unexpected error: {err}"
+        );
 
         Ok(())
     }

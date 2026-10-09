@@ -7,7 +7,7 @@
 //! including SIMD-accelerated pairwise hamming distance for binary hashes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::cast::AsArray;
@@ -19,7 +19,29 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
+use crate::distance::assert_batch_layout;
 use crate::{Error, Result};
+
+/// Schema of a Hamming distance-pair batch.
+static DISTANCE_PAIR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id_a", DataType::UInt64, false),
+        Field::new("row_id_b", DataType::UInt64, false),
+        Field::new("distance", DataType::UInt32, false),
+    ]))
+});
+
+/// Schema of a Hamming clustering-result batch.
+static CLUSTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("representative", DataType::UInt64, false),
+        Field::new(
+            "duplicates",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+            false,
+        ),
+    ]))
+});
 
 pub trait Hamming {
     /// Hamming distance between two vectors.
@@ -34,16 +56,16 @@ pub fn hamming(x: &[u8], y: &[u8]) -> f32 {
 
 #[inline]
 fn hamming_autovec<const L: usize>(x: &[u8], y: &[u8]) -> f32 {
-    let x_chunk = x.chunks_exact(L);
-    let y_chunk = y.chunks_exact(L);
-    let sum = x_chunk
-        .remainder()
+    let (x_chunks, x_remainder) = x.as_chunks::<L>();
+    let (y_chunks, y_remainder) = y.as_chunks::<L>();
+    let sum = x_remainder
         .iter()
-        .zip(y_chunk.remainder())
+        .zip(y_remainder)
         .map(|(&a, &b)| (a ^ b).count_ones())
         .sum::<u32>();
-    (sum + x_chunk
-        .zip(y_chunk)
+    (sum + x_chunks
+        .iter()
+        .zip(y_chunks)
         .map(|(x, y)| {
             x.iter()
                 .zip(y.iter())
@@ -62,13 +84,29 @@ pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {
         .sum::<u32>() as f32
 }
 
+/// Compute Hamming distances from one vector to a batch of vectors.
+///
+/// # Examples
+///
+/// ```
+/// use lance_linalg::distance::hamming::hamming_distance_batch;
+///
+/// let query = [0, u8::MAX];
+/// let targets = [0, u8::MAX, 1, u8::MAX - 1];
+/// let distances = hamming_distance_batch(&query, &targets, query.len()).collect::<Vec<_>>();
+/// assert_eq!(distances, [0.0, 2.0]);
+/// ```
+///
+/// # Panics
+///
+/// Panics if `dimension` is zero, `from.len()` differs from `dimension`, or
+/// `to` does not contain a whole number of vectors with that dimension.
 pub fn hamming_distance_batch<'a>(
     from: &'a [u8],
     to: &'a [u8],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+    assert_batch_layout(from.len(), to.len(), dimension);
     Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
 }
 
@@ -339,11 +377,7 @@ impl PairwiseResult {
 
     /// Convert to Arrow RecordBatch, consuming self.
     pub fn into_record_batch(self) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id_a", DataType::UInt64, false),
-            Field::new("row_id_b", DataType::UInt64, false),
-            Field::new("distance", DataType::UInt32, false),
-        ]));
+        let schema = DISTANCE_PAIR_SCHEMA.clone();
 
         let row_id_a = Arc::new(UInt64Array::from(self.row_id_a));
         let row_id_b = Arc::new(UInt64Array::from(self.row_id_b));
@@ -362,24 +396,57 @@ impl Default for PairwiseResult {
 
 /// Compute hamming distances for a query against multiple targets.
 /// Uses SIMD acceleration when available.
+///
+/// # Panics
+///
+/// Panics if `results` is not the same length as `targets`.
 #[inline]
 pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
-    debug_assert_eq!(targets.len(), results.len());
+    // Rejected in either direction, and before the dispatch. A shorter `results` the
+    // dispatcher's reslice would refuse on its own, and that reslice is what keeps the
+    // kernels' raw stores in bounds; this check just gets there first, with a message
+    // that names both lengths. An over-long one the reslice would instead truncate,
+    // handing the surplus tail back unwritten for the caller to read as distances.
+    // That is wrong output rather than a crash, which is why this is an `assert_eq!`
+    // and not a `debug_assert_eq!`.
+    let num_targets = targets.len();
+    let num_slots = results.len();
+    assert_eq!(
+        num_targets, num_slots,
+        "hamming_batch_u64 needs one result slot per target, \
+         got {num_targets} target(s) and {num_slots} slot(s)"
+    );
     hamming_batch_simd(query, targets, results);
 }
 
 /// SIMD-accelerated batch hamming distance computation.
+///
+/// # Panics
+///
+/// Panics if `results` is shorter than `targets`. `results.len()` is required to equal
+/// `targets.len()`: an over-long `results` is truncated here rather than rejected, and
+/// the surplus tail goes back to the caller unwritten. `hamming_batch_u64` asserts the
+/// equality before dispatching.
 #[inline]
 fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
+    // Both x86 kernels store through raw pointers over a range bounded by
+    // `targets.len()`, and this reslice makes `results` exactly that long, so it has to
+    // stay above the dispatch.
+    let results = &mut results[..targets.len()];
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512vpopcntdq") && is_x86_feature_detected!("avx512f") {
+            // SAFETY: both required features were just detected, and the reslice
+            // above makes `results.len() == targets.len()`.
             unsafe {
                 hamming_batch_avx512(query, targets, results);
             }
             return;
         }
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was just detected, and the reslice above makes
+            // `results.len() == targets.len()`.
             unsafe {
                 hamming_batch_avx2(query, targets, results);
             }
@@ -419,6 +486,15 @@ fn hamming_batch_scalar(query: u64, targets: &[u64], results: &mut [u32]) {
 }
 
 /// AVX-512 VPOPCNTDQ: Process 8 x 64-bit values at once.
+///
+/// The chunk loop reaches only the first `targets.len() / 8 * 8` slots through a
+/// raw pointer, 8 x u32 per chunk with no bounds check; the trailing slots go
+/// through bounds-checked indexing.
+///
+/// # Safety
+///
+/// The host must support AVX-512F and AVX512VPOPCNTDQ, and `results.len()` must
+/// be at least `targets.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512vpopcntdq")]
 unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -453,7 +529,16 @@ unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32])
     }
 }
 
-/// AVX2 popcount using lookup table (Harley-Seal / PSHUFB method).
+/// AVX2 popcount using a PSHUFB nibble lookup table.
+///
+/// The chunk loop reaches only the first `targets.len() / 4 * 4` slots through a
+/// raw pointer, 4 x u32 per chunk with no bounds check; the trailing slots go
+/// through bounds-checked indexing.
+///
+/// # Safety
+///
+/// The host must support AVX2, and `results.len()` must be at least
+/// `targets.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hamming_batch_avx2(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -915,14 +1000,7 @@ impl ClusteringResult {
 
     /// Get the schema for clustering result batches.
     pub fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("representative", DataType::UInt64, false),
-            Field::new(
-                "duplicates",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
-                false,
-            ),
-        ]))
+        CLUSTER_SCHEMA.clone()
     }
 
     /// Convert to Arrow RecordBatch with columns:
@@ -1050,6 +1128,21 @@ pub fn cluster_pairwise_result(result: &PairwiseResult) -> ClusteringResult {
 mod tests {
     use super::*;
     use lance_arrow::FixedSizeListArrayExt;
+    use rstest::rstest;
+
+    #[test]
+    fn test_result_schemas_are_initialized_once() {
+        // These schemas are handed out per call and per batch, so they are
+        // shared rather than rebuilt. Pointer equality is what distinguishes a
+        // shared schema from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(
+            &ClusteringResult::schema(),
+            &ClusteringResult::schema()
+        ));
+
+        let batch = PairwiseResult::default().into_record_batch();
+        assert!(Arc::ptr_eq(&batch.schema(), &DISTANCE_PAIR_SCHEMA));
+    }
 
     #[test]
     fn test_hamming() {
@@ -1065,6 +1158,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "distance batch length must be divisible by dimension: batch=5, dimension=2"
+    )]
+    fn test_hamming_distance_batch_rejects_partial_vector() {
+        let query = [0, 0];
+        let targets = [u8::MAX, u8::MAX, 0, 1, 0];
+
+        let _ = hamming_distance_batch(&query, &targets, query.len());
+    }
+
+    #[test]
     fn test_hamming_u64() {
         assert_eq!(hamming_u64(0, 0), 0);
         assert_eq!(hamming_u64(0, 1), 1);
@@ -1073,18 +1177,145 @@ mod tests {
         assert_eq!(hamming_u64(0xAAAAAAAAAAAAAAAA, 0x5555555555555555), 64);
     }
 
-    #[test]
-    fn test_hamming_batch_u64() {
-        let query = 0u64;
-        let targets: Vec<u64> = (0..128).collect();
-        let mut results = vec![0u32; 128];
+    /// Runs `kernel` over `n` targets, with 8 guard slots past the output it is
+    /// handed, then checks every value and every guard.
+    ///
+    /// 8 is the widest unchecked chunk store in the file, so an unchecked chunk
+    /// store that overruns by one chunk lands inside this allocation instead of
+    /// past it. The remainder loops cannot trip the guards at all: all three
+    /// index through bounds-checked `results[..]` and would panic instead.
+    fn check_kernel_tail(n: usize, kernel: impl FnOnce(u64, &[u64], &mut [u32])) {
+        const GUARD: u32 = u32::MAX;
+        const GUARD_SLOTS: usize = 8;
+        let query = 0xDEAD_BEEF_CAFE_F00D_u64;
+        let targets: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let mut results = vec![GUARD; n + GUARD_SLOTS];
 
-        hamming_batch_u64(query, &targets, &mut results);
+        kernel(query, &targets, &mut results[..n]);
 
-        assert_eq!(results[0], 0);
-        assert_eq!(results[1], 1);
-        assert_eq!(results[3], 2); // 0b11 has 2 bits set
-        assert_eq!(results[7], 3); // 0b111 has 3 bits set
+        for (slot, &target) in targets.iter().enumerate() {
+            assert_eq!(
+                results[slot],
+                (query ^ target).count_ones(),
+                "n={n}, slot {slot}"
+            );
+        }
+        for (slot, &guard) in results.iter().enumerate().skip(n) {
+            assert_eq!(guard, GUARD, "n={n}: wrote past results, at {slot}");
+        }
+    }
+
+    /// Each kernel behind `hamming_batch_u64` takes a fixed number of targets per
+    /// chunk and finishes the rest in a remainder loop: 4 for
+    /// `hamming_batch_avx2`, 8 for `hamming_batch_avx512` and for the unrolled
+    /// scalar fallback.
+    ///
+    /// The pairwise tests reach a remainder loop only when they are large enough
+    /// to take a parallel path. There the row ranges together pass every width
+    /// from one below the row count down to 1, so whichever kernel the host
+    /// dispatches has every residue covered incidentally, and a dropped or
+    /// out-of-bounds tail write surfaces somewhere in thousands of pairs, as a
+    /// mismatch or a panic. This asserts every slot at each width instead.
+    #[rstest]
+    #[case::one(1)]
+    #[case::two(2)]
+    #[case::three(3)]
+    #[case::four(4)]
+    #[case::five(5)]
+    #[case::six(6)]
+    #[case::seven(7)]
+    #[case::eight(8)]
+    #[case::nine(9)]
+    #[case::fifteen(15)]
+    #[case::sixteen(16)]
+    #[case::seventeen(17)]
+    #[case::one_hundred_twenty_eight(128)]
+    fn test_hamming_batch_u64(#[case] n: usize) {
+        check_kernel_tail(n, hamming_batch_u64);
+        // Also directly, because an x86_64 host with AVX2 takes an earlier branch
+        // and never reaches the scalar kernel through the dispatcher.
+        check_kernel_tail(n, hamming_batch_scalar);
+    }
+
+    #[rstest]
+    // Fewer slots than targets is the case that used to write out of bounds: on a
+    // host that takes the AVX2 path, `hamming_batch_avx2` wrote 28 bytes past a
+    // one-slot `results`.
+    #[case::eight_targets_one_slot(8, 1)]
+    // On the same path this one overran by 4 bytes instead of 28.
+    #[case::eight_targets_seven_slots(8, 7)]
+    // More slots than targets left the tail unwritten rather than overrunning, but
+    // the contract is one slot per target either way. This and the zero-target case
+    // below are the two that catch a guard weakened to a one-sided
+    // `results.len() >= targets.len()`.
+    #[case::eight_targets_nine_slots(8, 9)]
+    // The target count varies too, so that the two shortcuts most likely to appear
+    // here cannot slip past every case: an `if targets.is_empty() { return; }` above
+    // the check, or a `targets.len() < 8` fast path, would otherwise leave every
+    // eight-target case green. Four is the smallest target count that still reaches
+    // the AVX2 chunk loop.
+    #[case::four_targets_one_slot(4, 1)]
+    #[case::no_targets_one_slot(0, 1)]
+    // Zero slots is the case with no in-bounds slot at all, and the only one here
+    // that a `results.is_empty()` early return above the check would not survive.
+    // Its sentinel assertion is vacuous, so it pins the message and nothing else.
+    #[case::eight_targets_no_slots(8, 0)]
+    fn test_hamming_batch_u64_rejects_mismatched_lengths(
+        #[case] num_targets: usize,
+        #[case] num_slots: usize,
+    ) {
+        // No CPU feature gate: the length check precedes every kernel, so the panic
+        // happens on each host and no case reaches a kernel at all. Every case here is
+        // a mismatch; matching lengths are covered by `test_hamming_batch_u64` above,
+        // which calls `hamming_batch_u64` directly, and by
+        // `test_pairwise_correctness_1000_deterministic` below, which reaches it
+        // through `pairwise_hamming_distance_parallel`'s chunked path and checks the
+        // result against `reference_pairwise`.
+        //
+        // `catch_unwind` rather than `#[should_panic]`, because the property worth
+        // protecting is that the check runs before the dispatch, and
+        // `#[should_panic]` cannot observe order: a check moved below it can still
+        // panic with this same message, after a kernel has already written through
+        // `results`. The sentinel assertion at the end is what rules that out. It is
+        // also why the nine-slot case is here: a kernel's writes all land in bounds
+        // there, so nothing else would notice that it ran.
+        //
+        // A `debug_assert_eq!` carrying the same message still passes here when
+        // debug assertions are on, which is the profile `--profile ci` gives this
+        // crate; `cargo test --release -p lance-linalg --lib` (rust.yml) is what
+        // catches that revert.
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        let targets = vec![u64::MAX; num_targets];
+        let mut results = vec![SENTINEL; num_slots];
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hamming_batch_u64(0, &targets, &mut results);
+        }))
+        .expect_err("a length mismatch must panic");
+
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .expect("panic payload should be a string");
+        // Matching the whole message, not the two numbers separately, is deliberate:
+        // it pins the function name and the order the two lengths are reported in,
+        // which is what a message copied from a sibling guard would get wrong.
+        let expected = format!(
+            "hamming_batch_u64 needs one result slot per target, \
+             got {num_targets} target(s) and {num_slots} slot(s)"
+        );
+        assert!(
+            message.contains(&expected),
+            "expected {expected:?} in panic message, got {message:?}"
+        );
+        assert_eq!(
+            results.iter().position(|&slot| slot != SENTINEL),
+            None,
+            "a kernel reached `results`, so the length check no longer precedes it"
+        );
     }
 
     #[test]
@@ -1591,6 +1822,36 @@ mod tests {
     // =========================================================================
     // SIMD-specific tests
     // =========================================================================
+
+    // `hamming_batch_simd` returns early on the AVX-512 branch when
+    // `avx512vpopcntdq` and `avx512f` are both present, so on a host with both
+    // nothing reaches `hamming_batch_avx2` through `hamming_batch_u64`. This
+    // calls it directly. The AVX-512 kernel needs no such test: it only runs
+    // where the dispatched test already drives it.
+
+    /// `hamming_batch_avx2` consumes 4 targets per chunk, so `n % 4` covers its
+    /// remainder loop.
+    #[rstest]
+    #[cfg(target_arch = "x86_64")]
+    #[case::one(1)]
+    #[case::two(2)]
+    #[case::three(3)]
+    #[case::four(4)]
+    // Five, six and seven repeat remainders 1 through 3 with a chunk ahead of
+    // them, which one, two and three alone do not reach.
+    #[case::five(5)]
+    #[case::six(6)]
+    #[case::seven(7)]
+    fn test_avx2_covers_tail(#[case] n: usize) {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        check_kernel_tail(n, |query, targets, results| {
+            // SAFETY: AVX2 was just detected, and `check_kernel_tail` passes a
+            // `results` of exactly `targets.len()`.
+            unsafe { hamming_batch_avx2(query, targets, results) }
+        });
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]

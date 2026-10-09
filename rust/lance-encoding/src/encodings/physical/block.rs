@@ -605,6 +605,9 @@ impl BlockDecompressor for GeneralBlockDecompressor {
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
     pub(crate) compressor: Box<dyn BufferCompressor>,
+    // Runtime compressors normalize levels that they default or ignore. Block descriptors must
+    // retain the selected configuration so stable writers preserve those present/absent values.
+    block_compression: CompressionConfig,
 }
 
 impl Default for CompressedBufferEncoder {
@@ -617,25 +620,33 @@ impl Default for CompressedBufferEncoder {
         #[cfg(not(any(feature = "zstd", feature = "lz4")))]
         let (scheme, level) = (CompressionScheme::None, None);
 
-        let compressor =
-            GeneralBufferCompressor::get_compressor(CompressionConfig { scheme, level }).unwrap();
-        Self { compressor }
+        let block_compression = CompressionConfig { scheme, level };
+        let compressor = GeneralBufferCompressor::get_compressor(block_compression).unwrap();
+        Self {
+            compressor,
+            block_compression,
+        }
     }
 }
 
 impl CompressedBufferEncoder {
     pub fn try_new(compression_config: CompressionConfig) -> Result<Self> {
         let compressor = GeneralBufferCompressor::get_compressor(compression_config)?;
-        Ok(Self { compressor })
+        Ok(Self {
+            compressor,
+            block_compression: compression_config,
+        })
     }
 
     pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
         let scheme = CompressionScheme::try_from(scheme)?;
+        let block_compression = CompressionConfig {
+            scheme,
+            level: Some(0),
+        };
         Ok(Self {
-            compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
-                scheme,
-                level: Some(0),
-            })?,
+            compressor: GeneralBufferCompressor::get_compressor(block_compression)?,
+            block_compression,
         })
     }
 }
@@ -789,7 +800,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         self.compressor.compress(&encoded, &mut compressed)?;
         Ok((
             Some(LanceBuffer::from(compressed)),
-            ProtobufUtils21::wrapped(self.compressor.config(), inner_encoding)?,
+            ProtobufUtils21::wrapped(self.block_compression, inner_encoding)?,
         ))
     }
 }
@@ -950,7 +961,10 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY,
             },
             encodings::physical::block::lz4::Lz4BufferCompressor,
-            testing::{FnArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
+            testing::{
+                FnArrayGeneratorProvider, TestCases, TestEncoding,
+                check_round_trip_encoding_generated,
+            },
         };
 
         #[test]
@@ -984,49 +998,59 @@ mod tests {
             assert!(output.is_empty());
         }
 
+        #[rstest::rstest]
         #[test_log::test(tokio::test)]
-        async fn test_lz4_compress_round_trip() {
-            for data_type in &[
+        async fn test_lz4_compress_round_trip(
+            #[values(
                 DataType::Utf8,
                 DataType::LargeUtf8,
                 DataType::Binary,
-                DataType::LargeBinary,
-            ] {
-                let field = Field::new("", data_type.clone(), false);
-                let mut field_meta = HashMap::new();
-                field_meta.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
-                // Some bad cardinality estimatation causes us to use dictionary encoding currently
-                // which causes the expected encoding check to fail.
-                field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
-                field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
-                // Also disable size-based dictionary encoding
-                field_meta.insert(
-                    STRUCTURAL_ENCODING_META_KEY.to_string(),
-                    STRUCTURAL_ENCODING_FULLZIP.to_string(),
-                );
-                let field = field.with_metadata(field_meta);
-                let test_cases = TestCases::basic()
-                    // Need to use large pages as small pages might be too small to compress
-                    .with_page_sizes(vec![1024 * 1024])
-                    .with_expected_encoding("zstd")
-                    .with_structural_encodings();
+                DataType::LargeBinary
+            )]
+            data_type: DataType,
+            #[values(
+                TestEncoding::StructuralU16,
+                TestEncoding::StructuralU32,
+                TestEncoding::StructuralSparse
+            )]
+            encoding: TestEncoding,
+            #[values(false, true)] use_slicing: bool,
+        ) {
+            let field = Field::new("", data_type.clone(), false);
+            let mut field_meta = HashMap::new();
+            field_meta.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
+            // Some bad cardinality estimatation causes us to use dictionary encoding currently
+            // which causes the expected encoding check to fail.
+            field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+            field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
+            // Also disable size-based dictionary encoding
+            field_meta.insert(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            );
+            let field = field.with_metadata(field_meta);
+            let test_cases = TestCases::basic()
+                // Need to use large pages as small pages might be too small to compress
+                .with_page_sizes(vec![1024 * 1024])
+                .with_expected_encoding("zstd")
+                .with_encoding(encoding)
+                .with_slicing_modes([use_slicing]);
 
-                // Can't use the default random provider because random data isn't compressible
-                // and we will fallback to uncompressed encoding
-                let datagen = Box::new(FnArrayGeneratorProvider::new(move || match data_type {
-                    DataType::Utf8 => utf8_prefix_plus_counter("compressme", false),
-                    DataType::Binary => {
-                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), false)
-                    }
-                    DataType::LargeUtf8 => utf8_prefix_plus_counter("compressme", true),
-                    DataType::LargeBinary => {
-                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), true)
-                    }
-                    _ => panic!("Unsupported data type: {:?}", data_type),
-                }));
+            // Can't use the default random provider because random data isn't compressible
+            // and we will fallback to uncompressed encoding
+            let datagen = Box::new(FnArrayGeneratorProvider::new(move || match data_type {
+                DataType::Utf8 => utf8_prefix_plus_counter("compressme", false),
+                DataType::Binary => {
+                    binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), false)
+                }
+                DataType::LargeUtf8 => utf8_prefix_plus_counter("compressme", true),
+                DataType::LargeBinary => {
+                    binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), true)
+                }
+                _ => panic!("Unsupported data type: {:?}", data_type),
+            }));
 
-                check_round_trip_encoding_generated(field, datagen, test_cases).await;
-            }
+            check_round_trip_encoding_generated(field, datagen, test_cases).await;
         }
     }
 }

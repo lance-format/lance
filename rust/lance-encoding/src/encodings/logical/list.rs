@@ -120,10 +120,14 @@ impl StructuralFieldScheduler for StructuralListScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        // The child (items) column is scheduled with the same top-level row
+        // ranges (see `schedule_ranges`); the page repetition index maps those
+        // rows to items, so forward the ranges unchanged.
+        self.child.initialize(requested_ranges, filter, context)
     }
 }
 
@@ -175,6 +179,13 @@ impl StructuralFieldDecoder for StructuralListDecoder {
 
     fn data_type(&self) -> &DataType {
         &self.data_type
+    }
+
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        Err(lance_core::Error::not_supported(
+            "plan_decoded_bytes is not yet supported for fields with repetition (list/repeated types)"
+                .to_string(),
+        ))
     }
 }
 
@@ -240,8 +251,8 @@ mod tests {
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
-        UInt8Array, UInt64Array,
+        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StringArray,
+        StructArray, UInt8Array, UInt64Array,
         builder::{
             Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder, UInt32Builder,
         },
@@ -249,11 +260,12 @@ mod tests {
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use lance_datagen::{RowCount, Seed, array, gen_batch};
     use rstest::rstest;
 
     use crate::testing::{
-        TestCases, TestEncoding, check_basic_random, check_round_trip_encoding_of_data,
-        create_test_field_encoder, test_encoding_strategy,
+        TestCases, TestEncoding, check_round_trip_encoding_of_data, create_test_field_encoder,
+        test_encoding_strategy,
     };
 
     fn make_list_type(inner_type: DataType) -> DataType {
@@ -262,6 +274,61 @@ mod tests {
 
     fn make_large_list_type(inner_type: DataType) -> DataType {
         DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
+    }
+
+    #[derive(Clone, Copy)]
+    enum NullPattern {
+        None,
+        Mixed,
+        All,
+    }
+
+    async fn check_nested_type(
+        data_type: DataType,
+        null_pattern: NullPattern,
+        encoding: TestEncoding,
+    ) {
+        check_nested_type_with_metadata(data_type, null_pattern, encoding, HashMap::new()).await;
+    }
+
+    async fn check_nested_type_with_metadata(
+        data_type: DataType,
+        null_pattern: NullPattern,
+        encoding: TestEncoding,
+        field_metadata: HashMap<String, String>,
+    ) {
+        let null_rate = match null_pattern {
+            NullPattern::None => None,
+            NullPattern::Mixed => Some(0.5),
+            NullPattern::All => Some(1.0),
+        };
+        let make_batch = |seed, rows| {
+            let mut generator = gen_batch()
+                .with_seed(Seed::from(seed))
+                .anon_col(array::rand_type(&data_type));
+            if let Some(null_rate) = null_rate {
+                generator.with_random_nulls(null_rate);
+            }
+            generator
+                .into_batch_rows(RowCount::from(rows))
+                .unwrap()
+                .column(0)
+                .clone()
+        };
+
+        // Combine a non-zero-offset slice with an independently generated batch.
+        // This covers both offset rebasing and rep/def accumulation at the ingest
+        // boundary without repeating the full generic random-test matrix.
+        let first = make_batch(0, 513).slice(1, 512);
+        let second = make_batch(1, 513);
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![4096])
+            .with_encoding(encoding)
+            .with_batch_size(257)
+            .with_range(510..515)
+            .with_indices(vec![0, 511, 512, 1024]);
+
+        check_round_trip_encoding_of_data(vec![first, second], &test_cases, field_metadata).await;
     }
 
     async fn try_encode_v22_pages(
@@ -315,6 +382,7 @@ mod tests {
 
     fn assert_split_miniblock_layout(
         pages: &[crate::encoder::EncodedPage],
+        min_miniblock_pages: usize,
         expect_structural_only_page: bool,
     ) {
         let mut miniblock_pages = 0;
@@ -345,19 +413,18 @@ mod tests {
         }
 
         assert!(
-            miniblock_pages > 0,
-            "expected leaf values to remain on mini-block pages"
+            miniblock_pages >= min_miniblock_pages,
+            "expected at least {min_miniblock_pages} mini-block pages, got {miniblock_pages}"
         );
         assert_eq!(
             fullzip_pages, 0,
             "split list pages should not fall back to full-zip"
         );
-        if expect_structural_only_page {
-            assert!(
-                structural_only_pages > 0,
-                "expected at least one structural-only page"
-            );
-        }
+        assert_eq!(
+            structural_only_pages > 0,
+            expect_structural_only_page,
+            "structural-only page presence did not match expectation; got {structural_only_pages}"
+        );
     }
 
     fn assert_has_fullzip_layout(pages: &[crate::encoder::EncodedPage]) {
@@ -378,15 +445,28 @@ mod tests {
     async fn test_list(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(NullPattern::None, NullPattern::Mixed, NullPattern::All)]
+        null_pattern: NullPattern,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             structural_encoding.into(),
         );
-        let field =
-            Field::new("", make_list_type(DataType::Int32), true).with_metadata(field_metadata);
-        check_basic_random(field).await;
+        check_nested_type_with_metadata(
+            make_list_type(DataType::Int32),
+            null_pattern,
+            encoding,
+            field_metadata,
+        )
+        .await;
     }
 
     #[rstest]
@@ -394,35 +474,103 @@ mod tests {
     async fn test_deeply_nested_lists(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(1, 2, 3, 4, 5)] depth: usize,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        test_encoding: TestEncoding,
     ) {
-        let mut field_metadata = HashMap::new();
-        field_metadata.insert(
+        let mut data_type = DataType::Int32;
+        for _ in 0..depth {
+            data_type = make_list_type(data_type);
+        }
+
+        let mut generator = gen_batch()
+            .with_seed(Seed::from(depth as u64))
+            .anon_col(array::rand_type(&data_type));
+        generator.with_random_nulls(0.2);
+        let source = generator
+            .into_batch_rows(RowCount::from(1026))
+            .unwrap()
+            .column(0)
+            .clone();
+
+        // Two non-zero-offset slices cover nested offset rebasing across ingest
+        // batches. The selected range and indices straddle that batch boundary.
+        let data = vec![source.slice(1, 512), source.slice(513, 513)];
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![4096])
+            .with_encoding(test_encoding)
+            .with_batch_size(257)
+            .with_range(510..515)
+            .with_indices(vec![0, 511, 512, 1024]);
+        let field_metadata = HashMap::from([(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             structural_encoding.into(),
-        );
-        let field = Field::new("item", DataType::Int32, true).with_metadata(field_metadata);
-        for _ in 0..5 {
-            let field = Field::new("", make_list_type(field.data_type().clone()), true);
-            check_basic_random(field).await;
-        }
+        )]);
+
+        check_round_trip_encoding_of_data(data, &test_cases, field_metadata).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_list() {
-        let field = Field::new("", make_large_list_type(DataType::Int32), true);
-        check_basic_random(field).await;
+    async fn test_large_list(
+        #[values(NullPattern::None, NullPattern::Mixed, NullPattern::All)]
+        null_pattern: NullPattern,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        check_nested_type(
+            make_large_list_type(DataType::Int32),
+            null_pattern,
+            encoding,
+        )
+        .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_nested_strings() {
-        let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_basic_random(field).await;
+    async fn test_nested_strings(
+        #[values(NullPattern::None, NullPattern::Mixed, NullPattern::All)]
+        null_pattern: NullPattern,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        check_nested_type(make_list_type(DataType::Utf8), null_pattern, encoding).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_nested_list() {
-        let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
-        check_basic_random(field).await;
+    async fn test_nested_list(
+        #[values(NullPattern::None, NullPattern::Mixed, NullPattern::All)]
+        null_pattern: NullPattern,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        check_nested_type(
+            make_list_type(make_list_type(DataType::Int32)),
+            null_pattern,
+            encoding,
+        )
+        .await;
     }
 
     /// Regression test: a `List<List<Float32>>` column written as MULTIPLE
@@ -448,16 +596,22 @@ mod tests {
     async fn test_multipage_nested_float_list(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        test_encoding: TestEncoding,
     ) {
         use arrow_array::Float32Array;
 
         // Production shape: 3 inner lists per row, 768 floats each.
         let inner_per_row: usize = 3;
         let inner_len: usize = 768;
-        // Two chunks (batches) -> two pages; a read batch that spans the page
-        // boundary is where the multi-page outer-offset bug triggered. A single
-        // [2731] chunk (one page) decodes fine, which is why this needs >= 2.
-        let chunk_rows: &[usize] = &[1366, 1365];
+        // Each chunk contains ~1.38 MiB of leaf values, so both cross the 1 MiB
+        // value-page limit. A read batch that spans the ingest boundary is where
+        // the multi-page outer-offset bug triggered.
+        let chunk_rows: &[usize] = &[150, 149];
 
         let make_chunk = |start_row: usize, num_rows: usize| -> Arc<dyn Array> {
             let total_inner = num_rows * inner_per_row;
@@ -511,28 +665,55 @@ mod tests {
             structural_encoding.into(),
         );
 
-        let test_cases = TestCases::default().with_structural_encodings();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![1024 * 1024])
+            .with_encoding(test_encoding)
+            .with_batch_size(151)
+            .with_range(148..152)
+            .with_indices(vec![0, 149, 150, 298]);
         check_round_trip_encoding_of_data(chunks, &test_cases, field_metadata).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_list_struct_list() {
+    async fn test_list_struct_list(
+        #[values(NullPattern::None, NullPattern::Mixed, NullPattern::All)]
+        null_pattern: NullPattern,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         let struct_type = DataType::Struct(Fields::from(vec![Field::new(
             "inner_str",
             DataType::Utf8,
             false,
         )]));
 
-        let field = Field::new("", make_list_type(struct_type), true);
-        check_basic_random(field).await;
+        check_nested_type(make_list_type(struct_type), null_pattern, encoding).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_list_struct_empty() {
+    async fn test_list_struct_empty(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         let fields = Fields::from(vec![Field::new("inner", DataType::UInt64, true)]);
         let items = UInt64Array::from(Vec::<u64>::new());
         let structs = StructArray::new(fields, vec![Arc::new(items)], None);
-        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0; 2 * 1024 * 1024 + 1]));
+        // Exceed two 1 MiB offset pages so flushing the empty struct child is
+        // still exercised multiple times (the original #2762 regression).
+        let num_rows = 2 * 1024 * 1024 / size_of::<i32>() + 1;
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0; num_rows + 1]));
         let lists = ListArray::new(
             Arc::new(Field::new("item", structs.data_type().clone(), true)),
             offsets,
@@ -542,7 +723,9 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(lists)],
-            &TestCases::default(),
+            &TestCases::default()
+                .with_page_sizes(vec![1024 * 1024])
+                .with_encoding(encoding),
             HashMap::new(),
         )
         .await;
@@ -1103,8 +1286,11 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
     ) {
-        // 2.5 million rows, mostly empty lists. ~100 lists have 10 short strings each.
-        let num_rows = 2_500_000u32;
+        // Three chunks' worth of rep/def levels (1 rep bit + 1 def bit each), so the
+        // planner must split the page. See #6184.
+        let levels_per_chunk =
+            crate::encodings::logical::primitive::miniblock::max_repdef_levels_per_chunk(2);
+        let num_rows = (levels_per_chunk * 3) as u32;
         let num_non_empty = 100u32;
         let strings_per_list = 10;
 
@@ -1139,13 +1325,28 @@ mod tests {
             structural_encoding.into(),
         );
 
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = try_encode_v22_pages_with_metadata(list_array.clone(), field_metadata.clone())
+            .await
+            .unwrap();
+        if structural_encoding == STRUCTURAL_ENCODING_MINIBLOCK {
+            assert_split_miniblock_layout(&pages, 2, true);
+        }
+
+        let chunk_boundary = levels_per_chunk;
         let test_cases = TestCases::default()
-            .with_range(0..1000)
-            .with_range(0..num_rows as u64)
-            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
-            .with_dense_encodings();
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
-            .await;
+            .with_range(chunk_boundary - 2..chunk_boundary + 2)
+            .with_indices(vec![
+                0,
+                (step / 2) as u64,
+                chunk_boundary - 1,
+                chunk_boundary,
+                num_rows as u64 - 1,
+            ])
+            .with_batch_size(64 * 1024)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_encoding(TestEncoding::StructuralU32);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1153,20 +1354,20 @@ mod tests {
         // Redacted reproduction from a production schema shape containing ARRAY(BOOLEAN).
         // The field names are not relevant; the failure requires sparse list structure
         // with a 1-bit Boolean leaf value.
-        let num_rows = 200_000usize;
-        let num_non_empty = 10usize;
+        let levels_per_chunk =
+            crate::encodings::logical::primitive::miniblock::max_repdef_levels_per_chunk(2);
+        // One row past the chunk limit forces a split. Keeping values at both ends ensures
+        // both sides of that split remain mini-block pages instead of structural-only pages.
+        let num_rows = (levels_per_chunk + 1) as usize;
         let booleans_per_list = 8usize;
-        let step = num_rows / num_non_empty;
 
         let mut offsets = Vec::with_capacity(num_rows + 1);
-        let mut values = Vec::with_capacity(num_non_empty * booleans_per_list);
+        let mut values = Vec::with_capacity(2 * booleans_per_list);
         offsets.push(0i32);
 
-        let mut next_non_empty = step / 2;
         for row in 0..num_rows {
-            if row == next_non_empty {
+            if row == 0 || row == num_rows - 1 {
                 values.extend((0..booleans_per_list).map(|idx| idx % 2 == 0));
-                next_non_empty += step;
             }
             offsets.push(values.len() as i32);
         }
@@ -1181,12 +1382,13 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_range(0..1000)
-            .with_range(0..num_rows as u64)
-            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
-            .with_dense_encodings();
+            .with_indices(vec![0, levels_per_chunk / 2, num_rows as u64 - 1])
+            .with_batch_size(64 * 1024)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_encoding(TestEncoding::StructuralU32);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, false);
+        assert_split_miniblock_layout(&pages, 2, false);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1222,12 +1424,20 @@ mod tests {
             .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_sparse_boolean_list_with_long_null_prefix() {
+    async fn test_sparse_boolean_list_with_long_null_prefix(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32
+        )]
+        encoding: TestEncoding,
+    ) {
         let null_prefix_rows = 70_000usize;
         let trailing_empty_rows = 9usize;
         let booleans_per_list = 8usize;
@@ -1256,10 +1466,10 @@ mod tests {
         let test_cases = TestCases::default()
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, null_prefix_rows as u64, num_rows as u64 - 1])
-            .with_dense_encodings();
+            .with_encoding(encoding);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1290,78 +1500,41 @@ mod tests {
             .with_dense_encodings();
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
-    #[test_log::test(tokio::test)]
-    async fn test_nested_sparse_boolean_list_fails_without_panic() {
-        let empty_inner_lists = 70_000usize;
-        let booleans_per_list = 8usize;
-
+    fn unsplittable_nested_list(items: ArrayRef, empty_inner_lists: usize) -> ArrayRef {
         let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
-        let values = (0..booleans_per_list)
-            .map(|idx| idx % 2 == 0)
-            .collect::<Vec<_>>();
-        inner_offsets.push(values.len() as i32);
-
-        let inner_items = BooleanArray::from(values);
+        inner_offsets.push(items.len() as i32);
         let inner_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Boolean, true)),
+            Arc::new(Field::new("item", items.data_type().clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
-            Arc::new(inner_items),
+            items,
             None,
         );
-        let outer_list = ListArray::new(
+        Arc::new(ListArray::new(
             Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 1])),
             Arc::new(inner_list),
             None,
-        );
-
-        let err = try_encode_v22_pages(Arc::new(outer_list))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Mini-block cannot encode"),
-            "unexpected error: {err}"
-        );
+        ))
     }
 
+    #[rstest]
+    #[case::boolean(Arc::new(BooleanArray::from(vec![true, false, true, false, true, false, true, false])))]
+    #[case::string(Arc::new(StringArray::from(vec!["value", "other"])))]
     #[test_log::test(tokio::test)]
-    async fn test_nested_sparse_string_single_row_falls_back_to_fullzip() {
-        let empty_inner_lists = 70_000usize;
-
-        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
-        inner_offsets.push(1);
-        inner_offsets.push(2);
-
-        let mut strings = StringBuilder::new();
-        strings.append_value("value");
-        strings.append_value("other");
-        let inner_items = strings.finish();
-        let inner_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
-            Arc::new(inner_items),
-            None,
-        );
-        let outer_list = ListArray::new(
-            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 2])),
-            Arc::new(inner_list),
-            None,
-        );
-
-        let outer_list = Arc::new(outer_list) as ArrayRef;
-        let pages = encode_v22_pages(outer_list.clone()).await;
+    async fn test_nested_sparse_single_row_falls_back_to_fullzip(#[case] items: ArrayRef) {
+        let list = unsplittable_nested_list(items, 70_000);
+        let pages = encode_v22_pages(list.clone()).await;
         assert_has_fullzip_layout(&pages);
 
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_indices(vec![0])
             .with_dense_encodings();
-        check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::new()).await;
     }
 
     /// Builds the HNSW-flush repro shape: a dense prefix where every row has
@@ -1369,9 +1542,9 @@ mod tests {
     /// lists. Mirrors `HNSW::schema()` `__neighbors` / `__dists` columns:
     /// dense level-0 lists, then ~6x as many mostly-empty higher-level rows.
     fn make_hnsw_shaped_list_u32() -> ListArray {
-        const DENSE_ROWS: u32 = 40_000;
+        const DENSE_ROWS: u32 = 5_000;
         const NEIGHBORS_PER_ROW: u32 = 32;
-        const EMPTY_TAIL_ROWS: u32 = 240_000;
+        const EMPTY_TAIL_ROWS: u32 = 70_000;
 
         let mut list_builder = ListBuilder::new(UInt32Builder::new());
         let mut next_val: u32 = 0;
@@ -1400,7 +1573,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list_hnsw_shape_splits_to_miniblock_v2_2() {
         let list_array = make_hnsw_shaped_list_u32();
-        let dense_rows: u64 = 40_000;
+        let dense_rows: u64 = 5_000;
         let total_rows = list_array.len() as u64;
 
         let test_cases = TestCases::default()
@@ -1411,7 +1584,7 @@ mod tests {
             .with_encoding(TestEncoding::StructuralU32);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1438,7 +1611,52 @@ mod tests {
         let pages = try_encode_v22_pages_with_metadata(list_array.clone(), field_metadata.clone())
             .await
             .unwrap();
-        assert_split_miniblock_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_list_i32_not_supported() {
+        // Lists encode items using repetition levels so the number of decoded
+        // bytes depends on the per-row list lengths, which are not known at
+        // planning time without inspecting page data.  For this PR we
+        // explicitly reject the call rather than returning a wrong estimate.
+        use crate::decoder::StructuralFieldDecoder;
+        use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        use arrow_schema::Field;
+
+        // Build a List<i32> array where every row has a random (variable) length
+        // to illustrate the case we cannot plan for.
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        let lengths = [0usize, 3, 1, 7, 2, 0, 5];
+        let mut value = 0i32;
+        for &len in &lengths {
+            for _ in 0..len {
+                builder.values().append_value(value);
+                value += 1;
+            }
+            builder.append(true);
+        }
+        let _list_array = builder.finish(); // variable-length rows confirmed
+
+        // Construct the decoder tree directly (no pages needed for this check).
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_type = DataType::List(item_field.clone());
+
+        let child = Box::new(StructuralPrimitiveFieldDecoder::new(&item_field, false));
+        let decoder = super::StructuralListDecoder::new(child, list_type);
+
+        let err = decoder
+            .plan_decoded_bytes(lengths.len() as u64)
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("repetition"),
+            "error should mention repetition, got: {err}"
+        );
     }
 }

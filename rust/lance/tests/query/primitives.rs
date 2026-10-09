@@ -5,19 +5,22 @@ use std::sync::Arc;
 
 use arrow::datatypes::*;
 use arrow_array::{
-    ArrayRef, BinaryArray, BinaryViewArray, Float32Array, Float64Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    ArrayRef, BinaryArray, BinaryViewArray, Float16Array, Float32Array, Float64Array, Int32Array,
+    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    StringViewArray,
 };
 use arrow_schema::DataType;
+use half::f16;
 use lance::Dataset;
-use lance::dataset::WriteParams;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 
 use lance::index::DatasetIndexExt;
 use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 
-use super::{test_filter, test_scan, test_take};
+use super::{assert_filter_ids, test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;
 
 #[tokio::test]
@@ -138,6 +141,7 @@ async fn test_btree_nullable_or_with_absent_value() {
 
 #[tokio::test]
 #[rstest::rstest]
+#[case::float16(DataType::Float16)]
 #[case::float32(DataType::Float32)]
 #[case::float64(DataType::Float64)]
 async fn test_query_float(#[case] data_type: DataType) {
@@ -146,17 +150,20 @@ async fn test_query_float(#[case] data_type: DataType) {
         .col("value", array::rand_type(&data_type).with_random_nulls(0.1))
         .into_batch_rows(RowCount::from(60))
         .unwrap();
+    // BloomFilter is left out for Float16 because that index rejects the type
+    // outright. `test_bloom_filter_rejects_float16` pins the rejection so this
+    // skip cannot outlive it.
+    let mut index_types = vec![
+        None,
+        Some(IndexType::BTree),
+        Some(IndexType::Bitmap),
+        Some(IndexType::ZoneMap),
+    ];
+    if data_type != DataType::Float16 {
+        index_types.push(Some(IndexType::BloomFilter));
+    }
     DatasetTestCases::from_data(batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::BTree),
-                Some(IndexType::Bitmap),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
+        .with_index_types("value", index_types)
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
@@ -170,12 +177,63 @@ async fn test_query_float(#[case] data_type: DataType) {
         .await
 }
 
+/// `test_query_float` runs its Float16 case without `IndexType::BloomFilter`
+/// because that index refuses the type. Pin the refusal here so the skip cannot
+/// outlive it: once bloom filters accept Float16 this test fails, and whoever
+/// makes it pass should drop the skip too.
+#[tokio::test]
+async fn test_bloom_filter_rejects_float16() {
+    let batch = gen_batch()
+        .col("value", array::rand_type(&DataType::Float16))
+        .into_batch_rows(RowCount::from(16))
+        .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://bloom_f16",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let err = ds
+        .create_index(
+            &["value"],
+            IndexType::BloomFilter,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .expect_err("bloom filter should still refuse Float16");
+    assert!(
+        matches!(err, lance::Error::InvalidInput { .. }),
+        "unexpected error variant: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("Float16"),
+        "error should name the rejected type: {err}"
+    );
+}
+
 #[tokio::test]
 #[rstest::rstest]
+#[case::float16(DataType::Float16)]
 #[case::float32(DataType::Float32)]
 #[case::float64(DataType::Float64)]
 async fn test_query_float_special_values(#[case] data_type: DataType) {
     let value_array: Arc<dyn arrow_array::Array> = match data_type {
+        DataType::Float16 => Arc::new(Float16Array::from(vec![
+            Some(f16::ZERO),
+            Some(f16::NEG_ZERO),
+            Some(f16::INFINITY),
+            Some(f16::NEG_INFINITY),
+            Some(f16::NAN),
+            Some(f16::ONE),
+            Some(f16::NEG_ONE),
+            Some(f16::MIN),
+            Some(f16::MAX),
+            None,
+        ])),
         DataType::Float32 => Arc::new(Float32Array::from(vec![
             Some(0.0_f32),
             Some(-0.0_f32),
@@ -209,29 +267,159 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
         RecordBatch::try_from_iter(vec![("id", id_array as ArrayRef), ("value", value_array)])
             .unwrap();
 
+    // BloomFilter is left out for Float16 for the reason
+    // `test_bloom_filter_rejects_float16` pins: that index refuses the type.
+    let mut index_types = vec![
+        None,
+        Some(IndexType::BTree),
+        Some(IndexType::Bitmap),
+        Some(IndexType::ZoneMap),
+    ];
+    if data_type != DataType::Float16 {
+        index_types.push(Some(IndexType::BloomFilter));
+    }
+
     DatasetTestCases::from_data(batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::BTree),
-                Some(IndexType::Bitmap),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
+        .with_index_types("value", index_types)
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
-            test_filter(&original, &ds, "value > 0.0").await;
-            test_filter(&original, &ds, "value < 0.0").await;
-            test_filter(&original, &ds, "value = 0.0").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
             test_filter(&original, &ds, "isnan(value)").await;
             test_filter(&original, &ds, "not isnan(value)").await;
+
+            // The remaining predicates compare against zero, where DataFusion
+            // 54 answers by Arrow's total order: it ranks `-0.0` below `+0.0`
+            // instead of treating the two encodings as one number the way
+            // IEEE 754 and SQL do. That makes it useless as the reference, so
+            // assert the rows. Ids are 0: +0.0, 1: -0.0, 2: +inf, 3: -inf,
+            // 4: NaN, 5: 1.0, 6: -1.0, 7: MIN, 8: MAX, 9: NULL.
+            for zero in ["0.0", "-0.0"] {
+                assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
+                assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
+                assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
+                assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8]).await;
+                // NaN is row 4. Arrow sorts it above every other value, so it
+                // survives `>` and `>=`, which IEEE would reject. That gap is
+                // not specific to zero and this rewrite leaves it alone.
+                assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8]).await;
+                assert_filter_ids(&ds, &format!("value >= {zero}"), &[0, 1, 2, 4, 5, 8]).await;
+                // A literal on the left. DataFusion's canonicalizer swaps it back
+                // before the rewrite runs, so this pins the answer rather than the
+                // mirroring branch, which `a_literal_on_the_left_mirrors_the_operator`
+                // owns and which SQL reaches only when the other side is not a
+                // bare column.
+                assert_filter_ids(&ds, &format!("{zero} > value"), &[3, 6, 7]).await;
+                // BETWEEN only works because the simplifier expands it into two
+                // comparisons before the rewrite runs.
+                assert_filter_ids(&ds, &format!("value BETWEEN {zero} AND {zero}"), &[0, 1]).await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value NOT BETWEEN {zero} AND {zero}"),
+                    &[2, 3, 4, 5, 6, 7, 8],
+                )
+                .await;
+                // An IN list gains the encoding it does not spell out.
+                assert_filter_ids(&ds, &format!("value IN ({zero}, 1.0)"), &[0, 1, 5]).await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value NOT IN ({zero}, 1.0)"),
+                    &[2, 3, 4, 6, 7, 8],
+                )
+                .await;
+                // Composed with NULL logic, where this index layer has broken before.
+                assert_filter_ids(
+                    &ds,
+                    &format!("value != {zero} OR value IS NULL"),
+                    &[2, 3, 4, 5, 6, 7, 8, 9],
+                )
+                .await;
+            }
         })
         .await
+}
+
+/// A rewritten zero predicate still has to reach a scalar index. Without this,
+/// the rewrite could reshape the predicate into something `maybe_indexed_column`
+/// no longer recognizes, and every zero filter would quietly fall back to a full
+/// scan plus refine while still returning the right rows. Only the default BTree
+/// index is covered here; the other index types are exercised for row equality by
+/// `test_query_float_special_values`, not for pushdown.
+#[tokio::test]
+async fn test_float_zero_predicate_uses_scalar_index() {
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(vec![0.0, -0.0, 1.0, -1.0])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut ds = Dataset::write(reader, "memory://zero_index_pushdown", None)
+        .await
+        .unwrap();
+    ds.create_index(
+        &["value"],
+        IndexType::Scalar,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    for predicate in ["value = 0.0", "value < 0.0", "value != 0.0"] {
+        let plan = ds
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "`{predicate}` should use the scalar index, got plan:\n{plan}"
+        );
+        // The rewrite's output survives a second `optimize_expr`, which the scan
+        // path does run, so the predicate must not appear twice.
+        assert_eq!(
+            plan.matches("value_idx").count(),
+            1,
+            "`{predicate}` should search the index once, got plan:\n{plan}"
+        );
+    }
+
+    // Rows appended after the index is built are answered by the unindexed scan
+    // while the rest come from the index. Both halves have to agree.
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(4..8)) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(vec![0.0, -0.0, 1.0, -1.0])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let ds = InsertBuilder::new(Arc::new(ds))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    assert_filter_ids(&ds, "value = 0.0", &[0, 1, 4, 5]).await;
+    assert_filter_ids(&ds, "value < 0.0", &[3, 7]).await;
+    assert_filter_ids(&ds, "value >= 0.0", &[0, 1, 2, 4, 5, 6]).await;
 }
 
 #[tokio::test]
@@ -516,4 +704,88 @@ async fn test_filtered_scan_after_compact_with_srid() {
         "Expected 90 rows (100 written - 10 deleted) but got {}",
         results.num_rows()
     );
+}
+
+/// Verifies that a zone map index on a string column is used (ScalarIndexQuery
+/// in the plan) for both IS NULL and IS NOT NULL predicate filters.
+///
+/// IS NOT NULL must not silently fall back to a full scan when a zone map
+/// index exists — both predicates should leverage the index.
+#[tokio::test]
+async fn test_zone_map_null_index_used() {
+    // 6 non-null strings and 4 null values across 10 rows.
+    let string_values = vec![
+        Some("alpha"),
+        None,
+        Some("beta"),
+        Some("gamma"),
+        None,
+        Some("delta"),
+        None,
+        Some("epsilon"),
+        Some("zeta"),
+        None,
+    ];
+    let value_array = Arc::new(StringArray::from(string_values)) as ArrayRef;
+    let id_array = Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef;
+    let batch = RecordBatch::try_from_iter(vec![("id", id_array), ("value", value_array)]).unwrap();
+
+    let mut ds = InsertBuilder::new("memory://")
+        .execute(vec![batch])
+        .await
+        .unwrap();
+
+    ds.create_index(
+        &["value"],
+        IndexType::ZoneMap,
+        None,
+        &lance_index::scalar::ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // IS NULL: the zone map index must appear in the plan.
+    let plan = ds
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery"),
+        "IS NULL should use zone map index, got plan:\n{}",
+        plan
+    );
+    let null_batch = ds
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(null_batch.num_rows(), 4);
+
+    // IS NOT NULL: the zone map index must also appear in the plan.
+    let plan = ds
+        .scan()
+        .filter("value IS NOT NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery"),
+        "IS NOT NULL should use zone map index, got plan:\n{}",
+        plan
+    );
+    let non_null_batch = ds
+        .scan()
+        .filter("value IS NOT NULL")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(non_null_batch.num_rows(), 6);
 }

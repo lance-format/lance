@@ -14,7 +14,7 @@
 // https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/LICENSE
 
 use arrayref::{array_mut_ref, array_ref};
-use core::mem::size_of;
+use core::mem::{MaybeUninit, size_of};
 
 mod bitpacker_internal;
 
@@ -55,7 +55,7 @@ macro_rules! pack {
                 // Special case for W=T, we can just copy the input value directly to the packed value.
                 paste!(seq_t!(row in $T {
                     let idx = index(row, $lane);
-                    $packed[<$T>::LANES * row + $lane] = __kernel__!(idx);
+                    $packed[<$T>::LANES * row + $lane].write(__kernel__!(idx));
                 }));
             } else {
                 // A mask of W bits.
@@ -86,7 +86,7 @@ macro_rules! pack {
 
                     #[allow(unused_assignments)]
                     if next_word > curr_word {
-                        $packed[<$T>::LANES * curr_word + $lane] = tmp;
+                        $packed[<$T>::LANES * curr_word + $lane].write(tmp);
                         let remaining_bits: usize = ((row + 1) * $W) % T;
                         // Keep the remaining bits for the next packed value.
                         tmp = src >> $W - remaining_bits;
@@ -200,8 +200,66 @@ pub trait BitPacking: FastLanes {
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]);
 }
 
-impl BitPacking for u8 {
-    unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+/// Bitpacking kernels that can initialize previously uninitialized output storage.
+pub trait BitPackingUninit: BitPacking {
+    /// Packs into potentially uninitialized output storage.
+    ///
+    /// # Safety
+    /// The input and output lengths have the same requirements as
+    /// [`BitPacking::unchecked_pack`]. Every output element is initialized on return.
+    unsafe fn unchecked_pack_uninit(width: usize, input: &[Self], output: &mut [MaybeUninit<Self>]);
+
+    /// Unpacks into potentially uninitialized output storage.
+    ///
+    /// # Safety
+    /// The input and output lengths have the same requirements as
+    /// [`BitPacking::unchecked_unpack`]. Every output element is initialized on return.
+    unsafe fn unchecked_unpack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    );
+}
+
+macro_rules! impl_bitpacking_compat {
+    ($ty:ty) => {
+        impl BitPacking for $ty {
+            unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+                let output = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        output.as_mut_ptr().cast::<MaybeUninit<Self>>(),
+                        output.len(),
+                    )
+                };
+                unsafe { <Self as BitPackingUninit>::unchecked_pack_uninit(width, input, output) };
+            }
+
+            unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+                let output = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        output.as_mut_ptr().cast::<MaybeUninit<Self>>(),
+                        output.len(),
+                    )
+                };
+                unsafe {
+                    <Self as BitPackingUninit>::unchecked_unpack_uninit(width, input, output)
+                };
+            }
+        }
+    };
+}
+
+impl_bitpacking_compat!(u8);
+impl_bitpacking_compat!(u16);
+impl_bitpacking_compat!(u32);
+impl_bitpacking_compat!(u64);
+
+impl BitPackingUninit for u8 {
+    unsafe fn unchecked_pack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             output.len(),
@@ -256,7 +314,11 @@ impl BitPacking for u8 {
         }
     }
 
-    unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+    unsafe fn unchecked_unpack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             input.len(),
@@ -273,7 +335,7 @@ impl BitPacking for u8 {
         match width {
             0 => {
                 // A zero-width packed chunk implies all zeros.
-                output.fill(0);
+                output.fill(MaybeUninit::new(0));
             }
             1 => unpack_8_1(
                 array_ref![input, 0, 1024 / 8],
@@ -313,8 +375,12 @@ impl BitPacking for u8 {
     }
 }
 
-impl BitPacking for u16 {
-    unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+impl BitPackingUninit for u16 {
+    unsafe fn unchecked_pack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             output.len(),
@@ -402,7 +468,11 @@ impl BitPacking for u16 {
         }
     }
 
-    unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+    unsafe fn unchecked_unpack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             input.len(),
@@ -418,7 +488,7 @@ impl BitPacking for u16 {
 
         match width {
             0 => {
-                output.fill(0);
+                output.fill(MaybeUninit::new(0));
             }
             1 => unpack_16_1(
                 array_ref![input, 0, 1024 / 16],
@@ -491,8 +561,12 @@ impl BitPacking for u16 {
     }
 }
 
-impl BitPacking for u32 {
-    unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+impl BitPackingUninit for u32 {
+    unsafe fn unchecked_pack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             output.len(),
@@ -646,7 +720,11 @@ impl BitPacking for u32 {
         }
     }
 
-    unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+    unsafe fn unchecked_unpack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             input.len(),
@@ -662,7 +740,7 @@ impl BitPacking for u32 {
 
         match width {
             0 => {
-                output.fill(0);
+                output.fill(MaybeUninit::new(0));
             }
             1 => unpack_32_1(
                 array_ref![input, 0, 1024 / 32],
@@ -801,8 +879,12 @@ impl BitPacking for u32 {
     }
 }
 
-impl BitPacking for u64 {
-    unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
+impl BitPackingUninit for u64 {
+    unsafe fn unchecked_pack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             output.len(),
@@ -1087,7 +1169,11 @@ impl BitPacking for u64 {
         }
     }
 
-    unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
+    unsafe fn unchecked_unpack_uninit(
+        width: usize,
+        input: &[Self],
+        output: &mut [MaybeUninit<Self>],
+    ) {
         let packed_len = 128 * width / size_of::<Self>();
         debug_assert_eq!(
             input.len(),
@@ -1103,7 +1189,7 @@ impl BitPacking for u64 {
 
         match width {
             0 => {
-                output.fill(0);
+                output.fill(MaybeUninit::new(0));
             }
             1 => unpack_64_1(
                 array_ref![input, 0, 1024 / 64],
@@ -1375,10 +1461,10 @@ impl BitPacking for u64 {
 
 macro_rules! unpack_8 {
     ($name:ident, $bits:expr) => {
-        fn $name(input: &[u8; 1024 * $bits / u8::T], output: &mut [u8; 1024]) {
+        fn $name(input: &[u8; 1024 * $bits / u8::T], output: &mut [MaybeUninit<u8>; 1024]) {
             for lane in 0..u8::LANES {
                 unpack!(u8, $bits, input, lane, |$idx, $elem| {
-                    output[$idx] = $elem;
+                    output[$idx].write($elem);
                 });
             }
         }
@@ -1396,7 +1482,7 @@ unpack_8!(unpack_8_8, 8);
 
 macro_rules! pack_8 {
     ($name:ident, $bits:expr) => {
-        fn $name(input: &[u8; 1024], output: &mut [u8; 1024 * $bits / u8::T]) {
+        fn $name(input: &[u8; 1024], output: &mut [MaybeUninit<u8>; 1024 * $bits / u8::T]) {
             for lane in 0..u8::LANES {
                 pack!(u8, $bits, output, lane, |$idx| { input[$idx] });
             }
@@ -1414,10 +1500,10 @@ pack_8!(pack_8_8, 8);
 
 macro_rules! unpack_16 {
     ($name:ident, $bits:expr) => {
-        fn $name(input: &[u16; 1024 * $bits / u16::T], output: &mut [u16; 1024]) {
+        fn $name(input: &[u16; 1024 * $bits / u16::T], output: &mut [MaybeUninit<u16>; 1024]) {
             for lane in 0..u16::LANES {
                 unpack!(u16, $bits, input, lane, |$idx, $elem| {
-                    output[$idx] = $elem;
+                    output[$idx].write($elem);
                 });
             }
         }
@@ -1443,7 +1529,7 @@ unpack_16!(unpack_16_16, 16);
 
 macro_rules! pack_16 {
     ($name:ident, $bits:expr) => {
-        fn $name(input: &[u16; 1024], output: &mut [u16; 1024 * $bits / u16::T]) {
+        fn $name(input: &[u16; 1024], output: &mut [MaybeUninit<u16>; 1024 * $bits / u16::T]) {
             for lane in 0..u16::LANES {
                 pack!(u16, $bits, output, lane, |$idx| { input[$idx] });
             }
@@ -1470,10 +1556,10 @@ pack_16!(pack_16_16, 16);
 
 macro_rules! unpack_32 {
     ($name:ident, $bit_width:expr) => {
-        fn $name(input: &[u32; 1024 * $bit_width / u32::T], output: &mut [u32; 1024]) {
+        fn $name(input: &[u32; 1024 * $bit_width / u32::T], output: &mut [MaybeUninit<u32>; 1024]) {
             for lane in 0..u32::LANES {
                 unpack!(u32, $bit_width, input, lane, |$idx, $elem| {
-                    output[$idx] = $elem
+                    output[$idx].write($elem);
                 });
             }
         }
@@ -1515,7 +1601,10 @@ unpack_32!(unpack_32_32, 32);
 
 macro_rules! pack_32 {
     ($name:ident, $bits:expr) => {
-        fn $name(input: &[u32; 1024], output: &mut [u32; 1024 * $bits / u32::BITS as usize]) {
+        fn $name(
+            input: &[u32; 1024],
+            output: &mut [MaybeUninit<u32>; 1024 * $bits / u32::BITS as usize],
+        ) {
             for lane in 0..u32::LANES {
                 pack!(u32, $bits, output, lane, |$idx| { input[$idx] });
             }
@@ -1558,10 +1647,10 @@ pack_32!(pack_32_32, 32);
 
 macro_rules! unpack_64 {
     ($name:ident, $bit_width:expr) => {
-        fn $name(input: &[u64; 1024 * $bit_width / u64::T], output: &mut [u64; 1024]) {
+        fn $name(input: &[u64; 1024 * $bit_width / u64::T], output: &mut [MaybeUninit<u64>; 1024]) {
             for lane in 0..u64::LANES {
                 unpack!(u64, $bit_width, input, lane, |$idx, $elem| {
-                    output[$idx] = $elem
+                    output[$idx].write($elem);
                 });
             }
         }
@@ -1636,7 +1725,10 @@ unpack_64!(unpack_64_64, 64);
 
 macro_rules! pack_64 {
     ($name:ident, $bits:expr) => {
-        fn $name(input: &[u64; 1024], output: &mut [u64; 1024 * $bits / u64::BITS as usize]) {
+        fn $name(
+            input: &[u64; 1024],
+            output: &mut [MaybeUninit<u64>; 1024 * $bits / u64::BITS as usize],
+        ) {
             for lane in 0..u64::LANES {
                 pack!(u64, $bits, output, lane, |$idx| { input[$idx] });
             }
@@ -1842,13 +1934,16 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u8;
         }
 
-        let mut packed = vec![0; 1024 * bit_width / 8];
+        let mut packed = vec![MaybeUninit::uninit(); 1024 * bit_width / 8];
         for lane in 0..u8::LANES {
             // Always loop over lanes first. This is what the compiler vectorizes.
             pack!(u8, bit_width, packed, lane, |$pos| {
                 values[$pos]
             });
         }
+        // The pack kernel writes every element of the packed output.
+        let packed =
+            unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len()) };
 
         let mut unpacked: [u8; 1024] = [0; 1024];
         for lane in 0..u8::LANES {
@@ -1868,13 +1963,16 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u16;
         }
 
-        let mut packed = vec![0; 1024 * bit_width / 16];
+        let mut packed = vec![MaybeUninit::uninit(); 1024 * bit_width / 16];
         for lane in 0..u16::LANES {
             // Always loop over lanes first. This is what the compiler vectorizes.
             pack!(u16, bit_width, packed, lane, |$pos| {
                 values[$pos]
             });
         }
+        // The pack kernel writes every element of the packed output.
+        let packed =
+            unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u16>(), packed.len()) };
 
         let mut unpacked: [u16; 1024] = [0; 1024];
         for lane in 0..u16::LANES {
@@ -1894,13 +1992,16 @@ mod test {
             *value = (rng.next() % (1 << bit_width)) as u32;
         }
 
-        let mut packed = vec![0; 1024 * bit_width / 32];
+        let mut packed = vec![MaybeUninit::uninit(); 1024 * bit_width / 32];
         for lane in 0..u32::LANES {
             // Always loop over lanes first. This is what the compiler vectorizes.
             pack!(u32, bit_width, packed, lane, |$pos| {
                 values[$pos]
             });
         }
+        // The pack kernel writes every element of the packed output.
+        let packed =
+            unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u32>(), packed.len()) };
 
         let mut unpacked: [u32; 1024] = [0; 1024];
         for lane in 0..u32::LANES {
@@ -1926,13 +2027,16 @@ mod test {
             }
         }
 
-        let mut packed = vec![0; 1024 * bit_width / 64];
+        let mut packed = vec![MaybeUninit::uninit(); 1024 * bit_width / 64];
         for lane in 0..u64::LANES {
             // Always loop over lanes first. This is what the compiler vectorizes.
             pack!(u64, bit_width, packed, lane, |$pos| {
                 values[$pos]
             });
         }
+        // The pack kernel writes every element of the packed output.
+        let packed =
+            unsafe { core::slice::from_raw_parts(packed.as_ptr().cast::<u64>(), packed.len()) };
 
         let mut unpacked: [u64; 1024] = [0; 1024];
         for lane in 0..u64::LANES {

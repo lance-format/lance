@@ -177,7 +177,7 @@ class KMeans:
         for idx in zero_counts.nonzero(as_tuple=False):
             # split the largest cluster and remove empty cluster
             max_idx = torch.argmax(counts).item()
-            # add 1% gassuian noise to the largest centroid
+            # add 1% gaussian noise to the largest centroid
             # do this twice so we effectively split the largest cluster into 2
             # rand_like returns on [0, 1) so we need to shift it to [-0.5, 0.5)
             noise = (torch.rand_like(centroids[idx]) - 0.5) * 0.01 + 1

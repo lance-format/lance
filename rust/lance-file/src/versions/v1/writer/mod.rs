@@ -983,6 +983,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_empty_non_nullable_string() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let store = ObjectStore::memory();
+        let path = Path::from("/empty");
+        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        file_writer
+            .write(&[RecordBatch::new_empty(arrow_schema)])
+            .await
+            .unwrap();
+        let summary = file_writer.finish().await.unwrap();
+        assert_eq!(summary.num_rows, 0);
+
+        let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        assert_eq!(actual.num_rows(), 0);
+    }
+
+    #[tokio::test]
     async fn test_collect_stats() {
         // Validate:
         // Only collects stats for requested columns

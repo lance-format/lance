@@ -26,14 +26,14 @@
 //! All sections read back zero-copy via [`lance_arrow::ipc`]. This is the FTS
 //! counterpart of `partition_serde.rs` for vector indices.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     Array, Float32Array, LargeBinaryArray, ListArray, RecordBatch, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 
@@ -59,6 +59,44 @@ const POSTING_VARIANT_PLAIN: u8 = 0;
 const POSTING_VARIANT_COMPRESSED: u8 = 1;
 const GROUP_VARIANT_MATERIALIZED: u8 = 0;
 const GROUP_VARIANT_PACKED: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Section schemas
+// ---------------------------------------------------------------------------
+
+// One posting list is written per token, so these are built once rather than
+// per section.
+
+static BLOCK_OFFSETS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        BLOCK_OFFSETS_COLUMN,
+        DataType::UInt32,
+        false,
+    )]))
+});
+
+static PLAIN_POSTING_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new(ROW_IDS_COLUMN, DataType::UInt64, false),
+        Field::new(FREQUENCIES_COLUMN, DataType::Float32, false),
+    ]))
+});
+
+static BLOCKS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        BLOCKS_COLUMN,
+        DataType::LargeBinary,
+        false,
+    )]))
+});
+
+static IMPACTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        IMPACTS_COLUMN,
+        DataType::LargeBinary,
+        false,
+    )]))
+});
 
 // ---------------------------------------------------------------------------
 // Codec enum mappings
@@ -155,12 +193,8 @@ fn write_position_sections(
         }
         CompressedPositionStorage::SharedStream(stream) => {
             let offsets = UInt32Array::from(stream.block_offsets().to_vec());
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                BLOCK_OFFSETS_COLUMN,
-                DataType::UInt32,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(offsets)])?;
+            let batch =
+                RecordBatch::try_new(BLOCK_OFFSETS_SCHEMA.clone(), vec![Arc::new(offsets)])?;
             w.write_ipc(&batch)?;
             w.write_raw(stream.bytes())?;
         }
@@ -260,11 +294,10 @@ fn serialize_plain(w: &mut CacheEntryWriter<'_>, plain: &PlainPostingList) -> Re
 
     let row_ids = UInt64Array::new(plain.row_ids.clone(), None);
     let frequencies = Float32Array::new(plain.frequencies.clone(), None);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(ROW_IDS_COLUMN, DataType::UInt64, false),
-        Field::new(FREQUENCIES_COLUMN, DataType::Float32, false),
-    ]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(frequencies)])?;
+    let batch = RecordBatch::try_new(
+        PLAIN_POSTING_SCHEMA.clone(),
+        vec![Arc::new(row_ids), Arc::new(frequencies)],
+    )?;
     w.write_ipc(&batch)?;
 
     if let Some(list) = &plain.positions {
@@ -340,24 +373,20 @@ fn serialize_compressed(
     };
     w.write_header(&header)?;
 
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        BLOCKS_COLUMN,
-        DataType::LargeBinary,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(posting.blocks.clone())])?;
+    let batch = RecordBatch::try_new(
+        BLOCKS_SCHEMA.clone(),
+        vec![Arc::new(posting.blocks.clone())],
+    )?;
     w.write_ipc(&batch)?;
 
     if let Some(storage) = &posting.positions {
         write_position_sections(w, storage)?;
     }
     if let Some(impacts) = &posting.impacts {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            IMPACTS_COLUMN,
-            DataType::LargeBinary,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(impacts.entries().clone())])?;
+        let batch = RecordBatch::try_new(
+            IMPACTS_SCHEMA.clone(),
+            vec![Arc::new(impacts.entries().clone())],
+        )?;
         w.write_ipc(&batch)?;
     }
     Ok(())

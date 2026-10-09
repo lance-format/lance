@@ -483,6 +483,7 @@ async fn create_aws_vendor(
     properties: &HashMap<String, String>,
 ) -> Result<Option<Box<dyn CredentialVendor>>> {
     use aws::{AwsCredentialVendor, AwsCredentialVendorConfig};
+    use lance_core::utils::parse::str_is_truthy;
     use lance_namespace::error::NamespaceError;
 
     // AWS requires role_arn to be configured
@@ -517,7 +518,7 @@ async fn create_aws_vendor(
     // AssumeRole path when neither is present keeps existing behavior.
     let assume_via_pod = properties
         .get(aws_props::ASSUME_VIA_POD_WEB_IDENTITY)
-        .map(|v| v.eq_ignore_ascii_case("true"))
+        .map(|v| str_is_truthy(v))
         .unwrap_or(false);
     let pod_token_file = properties
         .get(aws_props::POD_WEB_IDENTITY_TOKEN_FILE)

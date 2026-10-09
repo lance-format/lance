@@ -62,7 +62,7 @@ pub use codec::{
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 pub use moka::MokaCacheBackend;
-pub use quick::{QuickCacheBackend, recommended_cache_shards};
+pub use quick::{QuickCacheBackend, QuickCacheShardPolicy, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 
 use std::any::TypeId;
@@ -335,6 +335,11 @@ impl LanceCache {
         self.state.backend.size_bytes().await
     }
 
+    /// Weighted capacity in bytes, if the backend reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.state.backend.capacity_bytes()
+    }
+
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
@@ -477,6 +482,45 @@ impl LanceCache {
         self.state.backend.insert(&key, metadata, size, None).await;
     }
 
+    pub async fn get_or_insert_unsized_with_key<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<Arc<K::ValueType>>
+    where
+        K: UnsizedCacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<Arc<K::ValueType>>> + Send,
+    {
+        let key = self.unsized_key(&cache_key);
+        let state = self.state.clone();
+        let typed_loader = Box::pin(async move {
+            let value = loader().await?;
+            let size = state.entry_size(&value);
+            Ok((Arc::new(value) as CacheEntry, size))
+        });
+
+        let (entry, was_cached) = self
+            .state
+            .backend
+            .get_or_insert(&key, typed_loader, None)
+            .await?;
+        let entry = entry.downcast::<Arc<K::ValueType>>().map_err(|_| {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+            Error::io(format!(
+                "cache backend returned a value with the wrong concrete type for unsized key type {:?}",
+                K::stable_type_id()
+            ))
+        })?;
+        if was_cached {
+            self.state.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(entry.as_ref().clone())
+    }
+
     pub async fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
     where
         K: UnsizedCacheKey,
@@ -544,6 +588,12 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
         }
+    }
+
+    /// Weighted capacity in bytes, if the cache is alive and its backend
+    /// reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.upgrade()?.capacity_bytes()
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>

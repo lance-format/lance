@@ -74,7 +74,7 @@ impl FragmentSession {
         if row_offsets.len() > 1 && FileFragment::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
-            self.reader.legacy_read_range_as_batch(range).await
+            self.reader.read_range_as_batch(range).await
         } else {
             self.reader.take_as_batch(row_offsets, None).await
         }

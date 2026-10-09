@@ -600,19 +600,17 @@ fn rows_in_buffer(
 
 #[cfg(test)]
 pub mod test {
-    use crate::testing::{ArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated};
-
     use super::*;
-    use std::marker::PhantomData;
+    use crate::BufferScheduler;
 
-    use arrow_array::{
-        ArrowPrimitiveType, PrimitiveArray,
-        types::{Int16Type, Int32Type, Int64Type, UInt8Type, UInt32Type, UInt64Type},
-    };
+    use arrow_buffer::ArrowNativeType;
 
-    use arrow_schema::{DataType, Field};
-    use lance_datagen::{ArrayGenerator, array::rand_with_distribution};
-    use rand::distr::Uniform;
+    fn fixed_width_values<T: ArrowNativeType>(block: DataBlock) -> Vec<T> {
+        let DataBlock::FixedWidth(FixedWidthDataBlock { data, .. }) = block else {
+            panic!("expected fixed-width data");
+        };
+        data.borrow_to_typed_slice::<T>().to_vec()
+    }
 
     #[test]
     fn test_rows_in_buffer() {
@@ -655,226 +653,76 @@ pub mod test {
         assert_eq!(StartOffset::SkipFull(8), result);
     }
 
-    struct DistributionArrayGeneratorProvider<
-        DataType,
-        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-    >
-    where
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        phantom: PhantomData<DataType>,
-        distribution: Dist,
-    }
+    #[test_log::test(tokio::test)]
+    async fn test_bitpacked_scheduler_non_byte_aligned_ranges() {
+        // Legacy 5-bit LSB-first encoding of values 1..=10, with a two-byte prefix.
+        let data = Bytes::from_static(&[0xFA, 0xCE, 0x41, 0x0C, 0x52, 0xCC, 0x41, 0x49, 0x01]);
+        let io: Arc<dyn crate::EncodingsIo> = Arc::new(BufferScheduler::new(data));
+        let scheduler = BitpackedScheduler::new(5, 16, 2, false);
 
-    impl<DataType, Dist> DistributionArrayGeneratorProvider<DataType, Dist>
-    where
-        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        fn new(dist: Dist) -> Self {
-            Self {
-                distribution: dist,
-                phantom: Default::default(),
-            }
-        }
-    }
+        let decoder = scheduler
+            .schedule_ranges(&[1..3, 5..9], &io, 0)
+            .await
+            .unwrap();
+        let decoded = decoder.decode(3, 3).unwrap();
 
-    impl<DataType, Dist> ArrayGeneratorProvider for DistributionArrayGeneratorProvider<DataType, Dist>
-    where
-        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        fn provide(&self) -> Box<dyn ArrayGenerator> {
-            rand_with_distribution::<DataType, Dist>(self.distribution.clone())
-        }
-
-        fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
-            Box::new(Self {
-                phantom: self.phantom,
-                distribution: self.distribution.clone(),
-            })
-        }
+        // The scheduled rows are [2, 3, 6, 7, 8, 9]. Skipping across the first
+        // Bytes response must begin in the middle of the second response.
+        assert_eq!(fixed_width_values::<u16>(decoded), vec![7, 8, 9]);
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_bitpack_primitive() {
-        let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
-            // check less than one byte for multi-byte type
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 19).unwrap(),
-                    ),
-                ),
-            ),
-            // // check that more than one byte for multi-byte type
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(5 << 7, 6 << 7).unwrap(),
-                    ),
-                ),
-            ),
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(5 << 42, 6 << 42).unwrap(),
-                    ),
-                ),
-            ),
-            // check less than one byte for single-byte type
-            (
-                DataType::UInt8,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt8Type, Uniform<u8>>::new(
-                        Uniform::new(0, 19).unwrap(),
-                    ),
-                ),
-            ),
-            // check less than one byte for single-byte type
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(129, 259).unwrap(),
-                    ),
-                ),
-            ),
-            // check byte aligned for single byte
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always give 8 bits
-                        Uniform::new(200, 250).unwrap(),
-                    ),
-                ),
-            ),
-            // check where the num_bits divides evenly into the bit length of the type
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(1, 3).unwrap(), // 2 bits
-                    ),
-                ),
-            ),
-            // check byte aligned for multiple bytes
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always always give 16 bits
-                        Uniform::new(200 << 8, 250 << 8).unwrap(),
-                    ),
-                ),
-            ),
-            // check byte aligned where the num bits doesn't divide evenly into the byte length
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        // this range should always give 24 hits
-                        Uniform::new(200 << 16, 250 << 16).unwrap(),
-                    ),
-                ),
-            ),
-            // check that we can still encode an all-0 array
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 1).unwrap(),
-                    ),
-                ),
-            ),
-            // check for signed types
-            (
-                DataType::Int16,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int16Type, Uniform<i16>>::new(
-                        Uniform::new(-5, 5).unwrap(),
-                    ),
-                ),
-            ),
-            (
-                DataType::Int64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
-                        Uniform::new(-(5 << 42), 6 << 42).unwrap(),
-                    ),
-                ),
-            ),
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-(5 << 7), 6 << 7).unwrap(),
-                    ),
-                ),
-            ),
-            // check signed where packed to < 1 byte for multi-byte type
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-19, 19).unwrap(),
-                    ),
-                ),
-            ),
-            // check signed byte aligned to single byte
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        // this range should always give 8 bits
-                        Uniform::new(-120, 120).unwrap(),
-                    ),
-                ),
-            ),
-            // check signed byte aligned to multiple bytes
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        // this range should always give 16 bits
-                        Uniform::new(-120 << 8, 120 << 8).unwrap(),
-                    ),
-                ),
-            ),
-            // check that it works for all positive integers even if type is signed
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(10, 20).unwrap(),
-                    ),
-                ),
-            ),
-            // check that all 0 works for signed type
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(0, 1).unwrap(),
-                    ),
-                ),
-            ),
-        ];
+    async fn test_bitpacked_scheduler_signed_byte_aligned() {
+        // Legacy 16-bit little-endian encoding of [513, -1, 4660, -32768].
+        let data = Bytes::from_static(&[0x01, 0x02, 0xFF, 0xFF, 0x34, 0x12, 0x00, 0x80]);
+        let io: Arc<dyn crate::EncodingsIo> = Arc::new(BufferScheduler::new(data));
+        let scheduler = BitpackedScheduler::new(16, 32, 0, true);
 
-        for (data_type, array_gen_provider) in bitpacked_test_cases {
-            let field = Field::new("", data_type.clone(), false);
-            let test_cases = TestCases::basic().with_structural_encodings();
-            check_round_trip_encoding_generated(field, array_gen_provider.copy(), test_cases).await;
+        let decoder = scheduler.schedule_ranges(&[1..4], &io, 0).await.unwrap();
+        let decoded = decoder.decode(0, 3).unwrap();
+
+        assert_eq!(fixed_width_values::<i32>(decoded), vec![-1, 4660, -32768]);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpacked_for_non_negative_scheduler_chunk_boundary() {
+        const BIT_WIDTH: usize = 7;
+        const NUM_CHUNKS: usize = 2;
+        const WORDS_PER_CHUNK: usize = ELEMS_PER_CHUNK as usize * BIT_WIDTH / u32::BITS as usize;
+
+        let values = (0..ELEMS_PER_CHUNK as usize * NUM_CHUNKS)
+            .map(|index| ((index * 13 + 7) % 127) as u32)
+            .collect::<Vec<_>>();
+        let mut packed = vec![0_u32; WORDS_PER_CHUNK * NUM_CHUNKS];
+        for chunk_index in 0..NUM_CHUNKS {
+            let value_start = chunk_index * ELEMS_PER_CHUNK as usize;
+            let word_start = chunk_index * WORDS_PER_CHUNK;
+            // SAFETY: Both slices have the exact input and output lengths required
+            // for one 1,024-value chunk at this bit width.
+            unsafe {
+                BitPacking::unchecked_pack(
+                    BIT_WIDTH,
+                    &values[value_start..value_start + ELEMS_PER_CHUNK as usize],
+                    &mut packed[word_start..word_start + WORDS_PER_CHUNK],
+                );
+            }
         }
+
+        let mut data = vec![0xFA, 0xCE, 0x01];
+        data.extend_from_slice(cast_slice(&packed));
+        let io: Arc<dyn crate::EncodingsIo> = Arc::new(BufferScheduler::new(Bytes::from(data)));
+        let scheduler = BitpackedForNonNegScheduler::new(BIT_WIDTH as u64, 32, 3);
+
+        let decoder = scheduler
+            .schedule_ranges(&[1020..1028, 1530..1533], &io, 0)
+            .await
+            .unwrap();
+        let decoded = decoder.decode(2, 7).unwrap();
+        let expected = (1022..1028)
+            .chain(1530..1531)
+            .map(|index| values[index])
+            .collect::<Vec<_>>();
+
+        assert_eq!(fixed_width_values::<u32>(decoded), expected);
     }
 }

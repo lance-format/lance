@@ -30,6 +30,8 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ProjectTest extends OperationTestBase {
 
@@ -65,6 +67,38 @@ public class ProjectTest extends OperationTestBase {
               assertEquals(new Schema(fieldList), committedDataset2.getSchema());
             }
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPreservesNullabilityEqualityAndRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testAssertsNonNull").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      Schema schema = testDataset.getSchema();
+
+      // The assertion is part of the operation's identity.
+      assertNotEquals(
+          Project.builder().schema(schema).preservesNullability(true).build(),
+          Project.builder().schema(schema).preservesNullability(false).build());
+      assertEquals(
+          Project.builder().schema(schema).preservesNullability(true).build(),
+          Project.builder().schema(schema).preservesNullability(true).build());
+
+      // The explicit non-default assertion must survive the JNI round trip.
+      try (Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(Project.builder().schema(schema).preservesNullability(true).build())
+              .build()) {
+        try (Dataset committed = new CommitBuilder(dataset).execute(txn)) {
+          Transaction readBack = committed.readTransaction().orElseThrow();
+          Project project = (Project) readBack.operation();
+          assertTrue(project.preservesNullability());
         }
       }
     }

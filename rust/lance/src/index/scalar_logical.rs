@@ -4,7 +4,9 @@
 //! Query-time logical views over scalar index segments.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +14,9 @@ use futures::future::try_join_all;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
+use lance_index::scalar::{
+    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+};
 use lance_index::{Index, IndexType};
 use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
@@ -142,10 +146,20 @@ impl ScalarIndex for LogicalScalarIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let results = try_join_all(
             self.segments
                 .iter()
-                .map(|segment| segment.search(query, metrics)),
+                .map(|segment| segment.search_with_options(query, options, metrics)),
         )
         .await?;
         combine_search_results(results)
@@ -164,6 +178,17 @@ impl ScalarIndex for LogicalScalarIndex {
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input(format!(
+            "LogicalScalarIndex '{}' is a query-time wrapper and does not support remap; rebuild the index to consolidate segments before remapping",
+            self.name
+        )))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
         _dest_store: &dyn lance_index::scalar::IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(
@@ -329,7 +354,33 @@ pub async fn open_named_scalar_index(
     index_name: &str,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    open_scalar_index_segments(dataset, column, index_name, None, None, metrics).await
+}
+
+/// Open selected scalar index segments whose coverage intersects `fragments`.
+///
+/// A `None` scope preserves the unscoped behavior for that dimension. UUID selection happens
+/// before any segment is opened.
+pub async fn open_scalar_index_segments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    fragments: Option<&RoaringBitmap>,
+    segment_uuids: Option<&HashSet<uuid::Uuid>>,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
+    let mut indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    if let Some(segment_uuids) = segment_uuids {
+        indices.retain(|index| segment_uuids.contains(&index.uuid));
+    }
+    if let Some(fragments) = fragments {
+        indices.retain(|index| {
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|coverage| coverage.intersection_len(fragments) > 0)
+        });
+    }
     match indices.len() {
         0 => Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
@@ -366,11 +417,14 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::array;
+    use lance_datagen::{ArrayGeneratorExt, array};
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
+    use lance_index::scalar::{
+        BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchOptions, SearchResult,
+    };
+    use lance_select::{RowAddrTreeMap, RowSetOps};
 
     use crate::Dataset;
     use crate::dataset::WriteParams;
@@ -432,7 +486,10 @@ mod tests {
     async fn test_open_named_scalar_index_uses_all_btree_segments() {
         let test_dir = TempStrDir::default();
         let dataset = lance_datagen::gen_batch()
-            .col("value", array::step::<Int32Type>())
+            .col(
+                "value",
+                array::fill::<Int32Type>(7).with_nulls(&[true, false, true, true]),
+            )
             .into_dataset(
                 test_dir.as_str(),
                 FragmentCount::from(4),
@@ -464,6 +521,20 @@ mod tests {
         let committed = dataset.load_indices_by_name("value_btree").await.unwrap();
         assert_eq!(committed.len(), fragments.len());
 
+        let target_fragment = fragments[1].id() as u32;
+        let scope = RoaringBitmap::from_iter([target_fragment]);
+        let scoped = open_scalar_index_segments(
+            &dataset,
+            "value",
+            "value_btree",
+            Some(&scope),
+            None,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped.calculate_included_frags().await.unwrap(), scope);
+
         let logical =
             open_named_scalar_index(&dataset, "value", "value_btree", &NoOpMetricsCollector)
                 .await
@@ -474,11 +545,77 @@ mod tests {
             dataset.fragment_bitmap.as_ref().clone()
         );
 
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(99)));
+        let tracked = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let SearchResult::Exact(tracked) = tracked else {
+            panic!("BTree search should be exact");
+        };
+        assert!(tracked.true_rows().is_empty());
+        assert!(!tracked.null_rows().is_empty());
+
+        let untracked = logical
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(untracked, SearchResult::exact(RowAddrTreeMap::default()));
+
         let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_btree")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+    }
+
+    #[tokio::test]
+    async fn test_open_scalar_index_segments_keeps_partial_overlap() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let mut segments = Vec::with_capacity(2);
+        for pair in fragments.chunks(2) {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_pairs".to_string())
+                    .fragments(pair.iter().map(|fragment| fragment.id() as u32).collect())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_btree_pairs", "value", segments)
+            .await
+            .unwrap();
+
+        let target_fragment = fragments[1].id() as u32;
+        let scoped = open_scalar_index_segments(
+            &dataset,
+            "value",
+            "value_btree_pairs",
+            Some(&RoaringBitmap::from_iter([target_fragment])),
+            None,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            scoped.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter([fragments[0].id() as u32, target_fragment])
+        );
     }
 
     #[tokio::test]
@@ -1895,5 +2032,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+    }
+
+    /// Legacy storage counts through MaterializeIndexExec. Deleting the unselected
+    /// segment directory must still leave the selected segment countable.
+    #[tokio::test]
+    async fn legacy_storage_count_opens_only_selected_segment() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V1
+        );
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragment_ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let mut segments = Vec::new();
+        for fragment_id in &fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx".to_string())
+                    .fragments(vec![*fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("i_idx", "i", segments)
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name("i_idx").await.unwrap();
+        let selected = committed[0].uuid;
+        let omitted = committed[1].uuid;
+        assert_eq!(
+            dataset
+                .count_indexed_rows("i_idx", "i >= 0", Some(&[selected]), None)
+                .await
+                .unwrap(),
+            4
+        );
+
+        let omitted_dir = std::path::Path::new(test_dir.as_str())
+            .join("_indices")
+            .join(omitted.to_string());
+        assert!(omitted_dir.is_dir(), "{}", omitted_dir.display());
+        std::fs::remove_dir_all(&omitted_dir).unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert_eq!(
+            dataset
+                .count_indexed_rows("i_idx", "i >= 0", Some(&[selected]), None)
+                .await
+                .unwrap(),
+            4
+        );
+        dataset
+            .count_indexed_rows("i_idx", "i >= 0", Some(&[omitted]), None)
+            .await
+            .unwrap_err();
     }
 }

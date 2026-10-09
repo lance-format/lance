@@ -34,7 +34,6 @@ use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
@@ -255,9 +254,7 @@ pub async fn shuffle_dataset(
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
         info!("Precomputed shuffle files provided, skip calculation of IVF partition.");
         let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path), true, None)?;
-        unsafe {
-            shuffler.set_unsorted_buffers(&buffers);
-        }
+        shuffler.set_unsorted_buffers(&buffers);
 
         shuffler
     } else {
@@ -380,9 +377,7 @@ pub async fn shuffle_vectors(
         Some(shuffle_output_root_filename.to_string()),
     )?;
 
-    unsafe {
-        shuffler.set_unsorted_buffers(&unsorted_filenames);
-    }
+    shuffler.set_unsorted_buffers(&unsorted_filenames);
 
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
@@ -408,7 +403,7 @@ pub struct IvfShuffler {
 
     shuffle_output_root_filename: String,
 
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -448,21 +443,17 @@ impl IvfShuffler {
             unsorted_buffers: vec![],
             is_legacy,
             shuffle_output_root_filename,
-            format_version: LanceFileVersion::V2_0,
+            format_version: ConcreteFileVersion::V2_0,
         })
     }
 
-    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+    pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
         self.format_version = format_version;
         self
     }
 
     /// Set the unsorted buffers to be shuffled.
-    ///
-    /// # Safety
-    ///
-    /// user must ensure the buffers are valid.
-    pub unsafe fn set_unsorted_buffers(&mut self, unsorted_buffers: &[impl ToString]) {
+    pub fn set_unsorted_buffers(&mut self, unsorted_buffers: &[impl ToString]) {
         self.unsorted_buffers = unsorted_buffers.iter().map(|x| x.to_string()).collect();
     }
 
@@ -515,9 +506,7 @@ impl IvfShuffler {
 
         file_writer.finish().await?;
 
-        unsafe {
-            self.set_unsorted_buffers(&[UNSORTED_BUFFER]);
-        }
+        self.set_unsorted_buffers(&[UNSORTED_BUFFER]);
 
         Ok(())
     }
@@ -808,7 +797,7 @@ impl IvfShuffler {
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
                     let mut file_writer = versions::create_writer(
-                        ConcreteFileVersion::from(this.format_version),
+                        this.format_version,
                         writer,
                         lance_schema,
                         FileWriterOptions::default(),
@@ -976,6 +965,14 @@ mod test {
         (stream, shuffler)
     }
 
+    #[tokio::test]
+    async fn test_missing_unsorted_buffer_returns_error() {
+        let mut shuffler = IvfShuffler::try_new(1, None, false, None).unwrap();
+        shuffler.set_unsorted_buffers(&["missing.lance"]);
+
+        shuffler.total_batches().await.unwrap_err();
+    }
+
     fn check_batch(batch: RecordBatch, idx: usize, num_rows: usize) {
         let row_ids = batch
             .column_by_name(ROW_ID)
@@ -1088,7 +1085,7 @@ mod test {
         shuffler.write_unsorted_stream(stream).await.unwrap();
 
         // set the same buffer twice we should get double the data
-        unsafe { shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]) }
+        shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]);
 
         let partition_files = shuffler.write_partitioned_shuffles(200, 1).await.unwrap();
 
@@ -1118,7 +1115,7 @@ mod test {
         shuffler.write_unsorted_stream(stream).await.unwrap();
 
         // set the same buffer twice we should get double the data
-        unsafe { shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]) }
+        shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]);
 
         let partition_files = shuffler.write_partitioned_shuffles(1, 32).await.unwrap();
         assert_eq!(partition_files.len(), 200);

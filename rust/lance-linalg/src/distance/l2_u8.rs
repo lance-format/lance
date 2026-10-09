@@ -3,9 +3,10 @@
 
 //! Unsigned int8 squared L2 distance with runtime-dispatched SIMD backends.
 //!
-//! Computes `Σ(a[i] - b[i])²` for u8 slices, returning a u32 result.
-//! Used by Scalar Quantization (SQ) distance computation where both L2
-//! and Cosine metric types operate on quantized u8 codes.
+//! Computes `Σ(a[i] - b[i])²` for u8 slices. The u32 entry points return the
+//! low 32 bits, while [`l2_u8_u64`] chunks those kernels to produce the full
+//! result used by Scalar Quantization (SQ), where both L2 and Cosine metric
+//! types operate on quantized u8 codes.
 //!
 //! Backends (selected at runtime, best available wins):
 //!   1. scalar     — portable reference, also used for tails
@@ -22,14 +23,18 @@
 
 use std::sync::OnceLock;
 
+use super::{U8_U32_ACCUMULATOR_MAX_LEN, assert_equal_lengths};
+
 /// Portable scalar u8 squared L2 distance, also used for SIMD tail elements.
+///
+/// The result is the low 32 bits of the exact squared distance. Use
+/// [`l2_u8_u64`] when the full result is required.
 #[inline]
 pub fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
-        .sum()
+    assert_equal_lengths(a.len(), b.len());
+    a.iter().zip(b.iter()).fold(0, |sum, (&x, &y)| {
+        sum.wrapping_add((x.abs_diff(y) as u32).pow(2))
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -80,7 +85,7 @@ mod x86 {
         // Scalar tail
         while i < n {
             let d = a[i].abs_diff(b[i]) as u32;
-            result += d * d;
+            result = result.wrapping_add(d * d);
             i += 1;
         }
         result
@@ -119,7 +124,7 @@ mod x86 {
         // Scalar tail
         while i < n {
             let d = a[i].abs_diff(b[i]) as u32;
-            result += d * d;
+            result = result.wrapping_add(d * d);
             i += 1;
         }
         result
@@ -153,14 +158,48 @@ fn select_backend() -> L2U8Fn {
 }
 
 /// Dispatched u8 squared L2 distance, selecting the best available SIMD backend.
+///
+/// The result is the low 32 bits of the exact squared distance. Use
+/// [`l2_u8_u64`] when the full result is required.
 #[inline]
 pub fn l2_u8(a: &[u8], b: &[u8]) -> u32 {
+    assert_equal_lengths(a.len(), b.len());
     (DISPATCH.get_or_init(select_backend))(a, b)
+}
+
+/// Calculates the exact u8 squared L2 distance with a u64 accumulator.
+///
+/// This retains the runtime-selected SIMD kernel and widens its result between
+/// chunks that are guaranteed to fit in a u32.
+///
+/// # Example
+///
+/// ```
+/// use lance_linalg::distance::l2_u8::l2_u8_u64;
+///
+/// assert_eq!(l2_u8_u64(&[10, 20], &[7, 21]), 10);
+/// ```
+#[inline]
+pub fn l2_u8_u64(a: &[u8], b: &[u8]) -> u64 {
+    assert_equal_lengths(a.len(), b.len());
+    if a.len() <= U8_U32_ACCUMULATOR_MAX_LEN {
+        return l2_u8(a, b) as u64;
+    }
+    a.chunks(U8_U32_ACCUMULATOR_MAX_LEN)
+        .zip(b.chunks(U8_U32_ACCUMULATOR_MAX_LEN))
+        .map(|(a, b)| l2_u8(a, b) as u64)
+        .sum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_mismatched_lengths() {
+        assert!(std::panic::catch_unwind(|| l2_u8_scalar(&[1, 2], &[1])).is_err());
+        assert!(std::panic::catch_unwind(|| l2_u8(&[1, 2], &[1])).is_err());
+    }
 
     fn fill_random(buf: &mut [u8], seed: &mut u32) {
         for slot in buf.iter_mut() {
@@ -272,5 +311,22 @@ mod tests {
         // max single-element distance: 255² = 65025
         assert_eq!(l2_u8(&[0], &[255]), 65025);
         assert_eq!(l2_u8(&[255], &[0]), 65025);
+    }
+
+    #[test]
+    fn overflow_is_backend_independent_and_wide_result_is_exact() {
+        let len = U8_U32_ACCUMULATOR_MAX_LEN + 1;
+        let a = vec![u8::MAX; len];
+        let b = vec![0; len];
+        let exact = u8::MAX as u64 * u8::MAX as u64 * len as u64;
+
+        check_all_backends(&a, &b, "u32 overflow");
+        assert_eq!(l2_u8_scalar(&a, &b), exact as u32);
+        assert_eq!(l2_u8_u64(&a, &b), exact);
+        assert_eq!(
+            crate::distance::l2::l2_distance_uint_scalar(&a, &b),
+            exact as f32
+        );
+        assert_eq!(crate::distance::l2::l2::<u8>(&a, &b), exact as f32);
     }
 }

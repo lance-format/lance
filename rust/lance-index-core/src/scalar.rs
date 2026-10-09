@@ -3,15 +3,18 @@
 
 //! Abstract scalar index traits and types for Lance index plugins
 
+use crate::remapping::{RowAddrTranslator, materialize_remap};
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -52,6 +55,7 @@ pub enum BuiltinIndexType {
     RTree,
     Inverted,
     Fm,
+    MinHashLsh,
 }
 
 impl BuiltinIndexType {
@@ -66,6 +70,7 @@ impl BuiltinIndexType {
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
             Self::Fm => "fm",
+            Self::MinHashLsh => "minhashlsh",
         }
     }
 }
@@ -84,6 +89,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
             IndexType::Fm => Ok(Self::Fm),
+            IndexType::MinHashLsh => Ok(Self::MinHashLsh),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
@@ -172,6 +178,29 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
+    /// Read several record batches, returning one batch per entry of
+    /// `batch_numbers`, in the order requested.
+    ///
+    /// The default implementation issues one read per batch, costing a request
+    /// per batch, with in-flight requests capped at
+    /// [`get_num_compute_intensive_cpus`] rather than growing with the whole
+    /// request. Readers whose batches sit on predictable row ranges override
+    /// this to fold them into a single [`Self::read_ranges`] call, so that
+    /// neighbouring batches share a request.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        let futures: Vec<_> = batch_numbers
+            .iter()
+            .map(|n| self.read_record_batch(*n, batch_size))
+            .collect();
+        futures::stream::iter(futures)
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect()
+            .await
+    }
     /// Reads a global buffer by index.
     async fn read_global_buffer(&self, _index: u32) -> Result<Bytes> {
         Err(Error::not_supported(
@@ -209,19 +238,60 @@ pub trait IndexReader: Send + Sync {
     /// This allows the caller to process rows incrementally without loading the
     /// entire range into memory at once.
     ///
-    /// The default implementation falls back to [`Self::read_range`] and wraps
-    /// the result in a single-item stream.
+    /// Every batch except the last holds exactly `batch_size` rows; the last one
+    /// holds the remainder. `batch_readahead` bounds how many batches may be
+    /// decoded ahead of the consumer.
+    ///
+    /// The default implementation falls back to [`Self::read_range`] and slices
+    /// the result into `batch_size` chunks.
     async fn read_range_stream(
         &self,
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
+        batch_size: u64,
+        _batch_readahead: u32,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         let batch = self.read_range(range, projection).await?;
         let schema = batch.schema();
+        let batch_size = (batch_size as usize).max(1);
+        let chunks = (0..batch.num_rows())
+            .step_by(batch_size)
+            .map(move |start| Ok(batch.slice(start, batch_size.min(batch.num_rows() - start))))
+            .collect::<Vec<_>>();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            futures::stream::once(async move { Ok(batch) }),
+            futures::stream::iter(chunks),
         )))
+    }
+    /// Stream every record batch of the file in order, sized like
+    /// [`Self::read_record_batch`].
+    ///
+    /// The `n`-th item of the returned stream is identical to
+    /// `read_record_batch(n, batch_size)`, so callers that need every batch
+    /// (index updates, remaps, prewarming) get one sequential pass over the file
+    /// instead of one random read per batch. `batch_readahead` bounds how many
+    /// batches may be read ahead of the consumer.
+    ///
+    /// The default implementation issues one `read_record_batch` per batch,
+    /// `batch_readahead` at a time.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>>
+    where
+        Self: 'static,
+    {
+        let num_batches = self.num_batches(batch_size).await;
+        let schema: Arc<Schema> = Arc::new(self.schema().into());
+        let reader = self.clone();
+        let stream = futures::stream::iter(0..num_batches as u64)
+            .map(move |n| {
+                let reader = reader.clone();
+                async move { reader.read_record_batch(n, batch_size).await }
+            })
+            .buffered(batch_readahead.max(1) as usize);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
@@ -245,6 +315,29 @@ pub trait IndexReader: Send + Sync {
 pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
     fn clone_arc(&self) -> Arc<dyn IndexStore>;
+
+    /// Return whether this store has the same live storage binding as `other`.
+    ///
+    /// `true` means cached indices holding [`IndexReader`]s created through `other` are safe to
+    /// reuse through this store. `false` means they must be reopened through
+    /// [`IndexStore::open_index_file`]. Implementations should return `true` only when readers,
+    /// credentials, and connection handles are interchangeable between both stores. The
+    /// conservative default prevents custom stores from accidentally reusing a store-bound
+    /// index.
+    ///
+    /// ```
+    /// use lance_index_core::scalar::IndexStore;
+    ///
+    /// fn can_reuse_cached_index(
+    ///     current_store: &dyn IndexStore,
+    ///     cached_store: &dyn IndexStore,
+    /// ) -> bool {
+    ///     current_store.is_same_storage_binding(cached_store)
+    /// }
+    /// ```
+    fn is_same_storage_binding(&self, _other: &dyn IndexStore) -> bool {
+        false
+    }
 
     /// Suggested I/O parallelism for the store
     fn io_parallelism(&self) -> usize;
@@ -398,7 +491,7 @@ pub enum TrainingOrdering {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingCriteria {
     pub ordering: TrainingOrdering,
     pub needs_row_ids: bool,
@@ -500,6 +593,36 @@ impl UpdateCriteria {
     }
 }
 
+/// Execution-time options for scalar index searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Preserve rows where the query evaluates to NULL.
+    ///
+    /// Callers may disable this only when NULL rows cannot affect the final
+    /// result, such as a top-level filter whose NULL results will be discarded.
+    track_nulls: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self { track_nulls: true }
+    }
+}
+
+impl SearchOptions {
+    /// Configure whether searches preserve rows where the query evaluates to
+    /// NULL. When disabled, implementations return only TRUE rows.
+    pub fn with_track_nulls(mut self, track_nulls: bool) -> Self {
+        self.track_nulls = track_nulls;
+        self
+    }
+
+    /// Whether searches preserve rows where the query evaluates to NULL.
+    pub fn track_nulls(&self) -> bool {
+        self.track_nulls
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -511,6 +634,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
+
+    /// Search the scalar index with execution-time options.
+    ///
+    /// Index implementations that do not need the options can rely on this
+    /// default implementation. The default preserves the behavior of
+    /// [`Self::search`].
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        _options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.search(query, metrics).await
+    }
 
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids
@@ -529,11 +666,61 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn can_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    ///
+    /// Legacy remapping API using an in-memory mapping. Retained for existing
+    /// callers and plugins; new tagged fragment reuse maintenance goes through
+    /// [`Self::remap_streaming`], whose default implementation prepares a
+    /// complete in-memory mapping and calls this method once.
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
+
+    /// The fragments whose row addresses this index's files may hold, or
+    /// `None` when the index cannot tell.
+    ///
+    /// Only the in-memory fallback of [`Self::remap_streaming`] reads it: an
+    /// address left out of the mapping it prepares stays unchanged through
+    /// [`Self::remap`], so the fallback maps every address of every listed
+    /// fragment explicitly, and declines when the list is unknown. An
+    /// implementation that overrides this must list every fragment its files
+    /// can hold addresses for, including fragments the index no longer claims
+    /// in its declared coverage (a retired source, or one withdrawn after an
+    /// in-place rewrite). Not needed by indices that implement
+    /// `remap_streaming` themselves.
+    fn stored_fragments(&self) -> Option<RoaringBitmap> {
+        None
+    }
+
+    /// Remap the row ids through a translator whose payload may need reads,
+    /// creating a new remapped version of this index in `dest_store`.
+    ///
+    /// The default implementation keeps existing indices working: a
+    /// synchronous translator is handed to [`Self::remap`] as it is, and a
+    /// batch translator is first materialized into a complete in-memory
+    /// mapping ([`materialize_remap`], bounded by the translator's budget and
+    /// requiring [`Self::stored_fragments`]) before one call to
+    /// [`Self::remap`]. That fallback costs the mapping's memory and reads the
+    /// index once more; it declines with a
+    /// [`RemapUnavailable`](crate::remapping::RemapUnavailable) it cannot
+    /// prove a complete mapping within budget. Built-in indices override this
+    /// to translate one unit of work at a time (a page, a partition, a spill
+    /// batch) without any map sized to the source rows.
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        match translator {
+            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref(), dest_store).await,
+            RowAddrTranslator::Batch(remapper) => {
+                let mapping =
+                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
+                self.remap(&mapping, dest_store).await
+            }
+        }
+    }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
     ///
@@ -554,6 +741,16 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Returns the value type expected by [`Self::update`], when the index has
+    /// a durable type contract for its training data.
+    ///
+    /// Wrapper indices use this to transform new data to the same type as the
+    /// loaded index instead of inferring a potentially different type from an
+    /// update batch. Index types without such a contract may return `None`.
+    fn training_data_type(&self) -> Option<DataType> {
+        None
+    }
 
     /// Global `[min, max]` of the indexed column from index metadata, without a
     /// scan, or `None` if this index type cannot supply a sound bound. When

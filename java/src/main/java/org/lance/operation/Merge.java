@@ -27,14 +27,24 @@ import java.util.Objects;
  */
 public class Merge extends SchemaOperation {
   private final List<FragmentMetadata> fragments;
+  // True when this merge makes no nullability-affecting schema change: it
+  // introduces no field that data staged against an earlier schema could not
+  // safely omit. Without the assertion the merge conservatively conflicts with
+  // concurrent appends, whose fragments would omit new columns and read as null.
+  private final boolean preservesNullability;
 
-  protected Merge(List<FragmentMetadata> fragments, Schema schema) {
+  protected Merge(List<FragmentMetadata> fragments, Schema schema, boolean preservesNullability) {
     super(schema);
     this.fragments = fragments;
+    this.preservesNullability = preservesNullability;
   }
 
   public List<FragmentMetadata> fragments() {
     return fragments;
+  }
+
+  public boolean preservesNullability() {
+    return preservesNullability;
   }
 
   @Override
@@ -47,6 +57,7 @@ public class Merge extends SchemaOperation {
     return MoreObjects.toStringHelper(this)
         .add("fragments", fragments)
         .add("schema", schema())
+        .add("preservesNullability", preservesNullability)
         .toString();
   }
 
@@ -56,12 +67,13 @@ public class Merge extends SchemaOperation {
     if (o == null || getClass() != o.getClass()) return false;
     if (!super.equals(o)) return false;
     Merge that = (Merge) o;
-    return Objects.equals(fragments, that.fragments);
+    return Objects.equals(fragments, that.fragments)
+        && preservesNullability == that.preservesNullability;
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(super.hashCode(), fragments);
+    return Objects.hash(super.hashCode(), fragments, preservesNullability);
   }
 
   public static Builder builder() {
@@ -71,6 +83,8 @@ public class Merge extends SchemaOperation {
   public static class Builder {
     private List<FragmentMetadata> fragments;
     private Schema schema;
+    // No assertion by default, which conservatively conflicts.
+    private boolean preservesNullability = false;
 
     private Builder() {}
 
@@ -84,8 +98,13 @@ public class Merge extends SchemaOperation {
       return this;
     }
 
+    public Builder preservesNullability(boolean preservesNullability) {
+      this.preservesNullability = preservesNullability;
+      return this;
+    }
+
     public Merge build() {
-      return new Merge(fragments, schema);
+      return new Merge(fragments, schema, preservesNullability);
     }
   }
 }

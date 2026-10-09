@@ -60,7 +60,9 @@ public class LsmPointLookupPlanner implements AutoCloseable {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
     this.allocator = dataset.allocator();
-    nativeCreate(dataset, shardSnapshots, Optional.ofNullable(pkColumns));
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      nativeCreate(dataset, shardSnapshots, Optional.ofNullable(pkColumns));
+    }
   }
 
   private native void nativeCreate(

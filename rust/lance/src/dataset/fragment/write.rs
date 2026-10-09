@@ -3,27 +3,28 @@
 
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+#[cfg(test)]
+use lance_file::version::LanceFileVersion;
+use lance_file::version::stable_file_version;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_file::writer::FileWriter;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
-use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::utils::SchemaAdapter;
-use crate::dataset::write::validate_and_resolve_target_bases_with_primary;
+use crate::dataset::write::{
+    GenericWriter, V2WriterAdapter, validate_and_resolve_target_bases_with_primary,
+};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -101,6 +102,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         self
     }
 
+    pub(crate) fn file_writer_options(&self) -> FileWriterOptions {
+        self.write_params
+            .and_then(|params| params.file_writer_options.clone())
+            .unwrap_or_default()
+    }
+
     /// Write a fragment.
     pub async fn write(
         &self,
@@ -108,16 +115,10 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
-        // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
-        // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
-        // multi-fragment and dataset write paths perform this through `do_write_fragments`;
-        // the single-fragment create path must do the same or the raw UTF-8 string bytes
-        // would be written into a column whose schema declares JSONB, corrupting reads.
-        let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         let version = self
             .write_params
             .map(|params| params.storage_version_or_default())
-            .unwrap_or_else(|| ConcreteFileVersion::from(LanceFileVersion::Stable));
+            .unwrap_or_else(stable_file_version);
         crate::dataset::versions::write_fragment(
             version,
             self,
@@ -163,44 +164,27 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let (mut writer, data_file) = create_writer(obj_writer, schema, filename)?;
-        fragment.files.push(data_file);
+        let (writer, data_file) = create_writer(obj_writer, schema, filename)?;
+        fragment.files.push(data_file.clone());
 
         progress.begin(&fragment).await?;
 
+        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None, None);
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
-        let mut broken_stream = break_stream(stream, break_limit)
-            .map_ok(|batch| vec![batch])
-            .boxed();
-        while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
-            writer.write_batches(batch_chunk.iter()).await?;
+        let mut broken_stream = break_stream(stream, break_limit);
+        while let Some(batch) = broken_stream.next().await {
+            writer.write_batch(&batch?).await?;
         }
 
-        let write_summary = writer.finish().await?;
-        fragment.physical_rows = Some(write_summary.num_rows as usize);
+        let (num_rows, data_file) = writer.finish().await?;
+        fragment.physical_rows = Some(num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        let field_ids: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(field_id, _)| *field_id as i32)
-            .collect::<Vec<_>>()
-            .into();
-        let column_indices: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(_, column_index)| *column_index as i32)
-            .collect::<Vec<_>>()
-            .into();
-
-        fragment.files[0].fields = field_ids;
-        fragment.files[0].column_indices = column_indices;
-        fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
+        fragment.files[0] = data_file;
 
         progress.complete(&fragment).await?;
 
@@ -256,6 +240,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             params,
             target_bases_info,
             Vec::new(),
+            None,
+            None,
         )
         .await
     }
@@ -322,30 +308,27 @@ impl<'a> FragmentCreateBuilder<'a> {
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
-        let mut builder = DatasetBuilder::from_uri(self.dataset_uri);
-        let accessor = self
-            .write_params
-            .and_then(|p| p.store_params.as_ref())
-            .and_then(|p| p.storage_options_accessor.clone());
-        if let Some(accessor) = accessor {
-            builder = builder.with_storage_options_accessor(accessor);
-        }
-        match builder.load().await {
-            Ok(dataset) => {
-                // Use the schema from the dataset, because it has the correct
-                // field ids.
-                Ok(Some(dataset.schema().clone()))
-            }
-            Err(Error::DatasetNotFound { .. }) => {
-                // If the dataset does not exist, we can use the schema from
-                // the reader.
-                Ok(None)
-            }
+        let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+        match self.load_existing_dataset(&params).await {
+            // Use the schema from the dataset, because it has the correct
+            // field ids.
+            Ok(dataset) => Ok(Some(dataset.schema().clone())),
+            // If the dataset does not exist, we can use the schema from
+            // the reader.
+            Err(Error::DatasetNotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
     async fn existing_dataset(&self, params: &WriteParams) -> Result<Option<Dataset>> {
+        match self.load_existing_dataset(params).await {
+            Ok(dataset) => Ok(Some(dataset)),
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn load_existing_dataset(&self, params: &WriteParams) -> Result<Dataset> {
         let mut builder = DatasetBuilder::from_uri(self.dataset_uri).with_read_params(ReadParams {
             store_options: params.store_params.clone(),
             commit_handler: params.commit_handler.clone(),
@@ -357,11 +340,7 @@ impl<'a> FragmentCreateBuilder<'a> {
                 builder = builder.with_base_store_params(base_path, store_params.clone());
             }
         }
-        match builder.load().await {
-            Ok(dataset) => Ok(Some(dataset)),
-            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
+        builder.load().await
     }
 
     fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
@@ -380,7 +359,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, record_batch,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
@@ -495,6 +474,52 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
         assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_create_with_session() {
+        let session = Arc::new(crate::session::Session::new(
+            0,
+            1024 * 1024,
+            Default::default(),
+        ));
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        // Keep the dataset alive: the registry only holds weak references, so
+        // the in-memory store survives through the dataset's strong reference.
+        let initial_batch =
+            record_batch!(("a", Int64, [1, 2, 3]), ("b", Utf8, ["a", "b", "c"])).unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute(vec![initial_batch])
+            .await
+            .unwrap();
+        // Drop a column so the surviving field id is non-trivial (!= 0).
+        dataset.drop_columns(&["a"]).await.unwrap();
+        let field_id = dataset.schema().field("b").unwrap().id;
+        assert_ne!(field_id, 0);
+
+        let append_batch = record_batch!(("b", Utf8, ["d", "e"])).unwrap();
+        let append_data =
+            RecordBatchIterator::new([Ok(append_batch.clone())], append_batch.schema());
+
+        let append_params = WriteParams {
+            session: Some(session.clone()),
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let fragment = FragmentCreateBuilder::new(dataset.uri())
+            .write_params(&append_params)
+            .write(append_data, None)
+            .await
+            .unwrap();
+
+        assert_eq!(fragment.files[0].fields.as_ref(), &[field_id]);
+        // The manifest load for schema inference went through the shared
+        // session's metadata cache.
+        assert!(session.metadata_cache_stats().await.num_entries > 0);
     }
 
     #[tokio::test]
@@ -690,8 +715,7 @@ mod tests {
 
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
-            let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version).to_data_file_numbers();
+            let (major_version, minor_version) = file_version.resolve().to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
@@ -723,8 +747,7 @@ mod tests {
 
         assert!(!fragment.is_empty());
         fragment[0].files.iter().for_each(|f| {
-            let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version).to_data_file_numbers();
+            let (major_version, minor_version) = file_version.resolve().to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })

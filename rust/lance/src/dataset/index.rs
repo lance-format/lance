@@ -4,6 +4,7 @@
 pub mod frag_reuse;
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use crate::index::scalar::infer_scalar_index_details;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::ConcreteFileVersion;
 use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -25,14 +26,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};
+use super::versions;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetIndexRemapperOptions {}
 
 /// Loads index metadata when compaction has at least one index to remap.
 ///
-/// Returns all index metadata, including system indices, so the remapper uses a
-/// consistent snapshot. Returns `None` when there are no non-system indices.
+/// Returns all usable index metadata, including system indices, so the remapper
+/// uses a consistent snapshot. Returns `None` when there are no usable
+/// non-system indices.
 pub(crate) async fn load_indices_for_remapping(
     dataset: &Dataset,
 ) -> Result<Option<Arc<Vec<IndexMetadata>>>> {
@@ -68,7 +71,7 @@ impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
         index: &IndexMetadata,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
     }
@@ -82,6 +85,9 @@ impl IndexRemapper for DatasetIndexRemapper {
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
+        // The compaction remap is fully materialized: one shared synchronous
+        // translator serves every index.
+        let mapping = RowAddrTranslator::sync(mapping);
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {
             let needs_remapped = !is_system_index(index)
@@ -104,12 +110,19 @@ impl IndexRemapper for DatasetIndexRemapper {
                         let index_details = match &index.index_details {
                             Some(index_details) => index_details.as_ref().clone(),
                             None => {
-                                // Migration path, if we didn't store details before then use the default
-                                // details.
-                                assert!(index.fields.len() == 1);
-                                let field = index.fields.first().unwrap();
+                                // Migration path, if we didn't store details before then use the
+                                // default details. This only supports a single keyed field, not a
+                                // composite index.
+                                let Some(field) = index.keyed_field() else {
+                                    return Err(Error::index(format!(
+                                        "Index {} has fields {:?} (carried fields {:?}); the \
+                                         legacy index-details migration path only supports a \
+                                         single keyed field",
+                                        index.uuid, index.fields, index.covering_fields
+                                    )));
+                                };
                                 let field =
-                                    self.dataset.schema().field_by_id(*field).ok_or_else(|| {
+                                    self.dataset.schema().field_by_id(field).ok_or_else(|| {
                                         Error::internal(format!(
                                             "Index {} references field {} which does not exist",
                                             index.uuid, field
@@ -157,18 +170,12 @@ pub trait LanceIndexStoreExt {
         Self: Sized;
 }
 
-/// Extract the lance file version from a dataset, floored at V2_0.
+/// Select the exact file version used for index files in this dataset version.
 ///
 /// Index files should never use the legacy format. If the dataset uses legacy
-/// format or doesn't have a version set, V2_0 is used as the minimum.
-pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
-    dataset
-        .manifest
-        .data_storage_format
-        .lance_file_version()
-        .ok()
-        .map(|v| v.resolve().max(LanceFileVersion::V2_0))
-        .unwrap_or(LanceFileVersion::V2_0)
+/// format, V2_0 is selected explicitly by the dataset composition table.
+pub(crate) fn dataset_format_version(dataset: &Dataset) -> ConcreteFileVersion {
+    versions::index_file_version(dataset.manifest.data_storage_format.lance_file_format())
 }
 
 #[async_trait]
@@ -209,7 +216,9 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_linalg::distance::MetricType;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -249,6 +258,56 @@ mod tests {
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, FRAG_REUSE_INDEX_NAME);
         assert!(options.create_remapper(&dataset).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remapper_not_created_for_unknown_index_type() {
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let current = dataset.load_indices().await.unwrap();
+        let unknown = IndexMetadata {
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            fragment_bitmap: None,
+            ..current[0].clone()
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![unknown],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        assert!(
+            DatasetIndexRemapperOptions::default()
+                .create_remapper(&dataset)
+                .await
+                .unwrap()
+                .is_none(),
+            "compaction must not migrate an index type this build cannot open"
+        );
     }
 
     #[tokio::test]
@@ -364,5 +423,155 @@ mod tests {
         assert!(committed_ids.contains(&remapped[0].old_id));
         assert_ne!(remapped[0].old_id, unaffected_segment_id);
         assert_ne!(remapped[0].new_id, unaffected_segment_id);
+    }
+
+    /// A covered index must be withdrawn from remapping rather than remapped.
+    /// No index type carries the declared payload through a remap, so a
+    /// replacement would republish a covering claim its storage does not back.
+    /// Withdrawal also means the legacy `index_details: None` migration path is
+    /// never reached for such an index, so it cannot panic there either.
+    #[tokio::test]
+    async fn test_remapper_migration_path_withdraws_covered_index() {
+        let reader = lance_datagen::gen_batch()
+            .col("a", array::step::<arrow_array::types::Int32Type>())
+            .col("b", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let a_id = dataset.schema().field("a").unwrap().id;
+        let b_id = dataset.schema().field("b").unwrap().id;
+        let current = dataset.load_indices().await.unwrap();
+        let mut legacy_covered = current[0].clone();
+        legacy_covered.fields = vec![a_id, b_id];
+        legacy_covered.covering_fields = vec![b_id];
+        // Force the legacy migration path this fix touches.
+        legacy_covered.index_details = None;
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![legacy_covered],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+
+        // Fully delete every row so `remap_index` returns `RemapResult::Keep`,
+        // landing in the `index_details: None` migration branch this fix touches.
+        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
+            .map(|i| (i as u64, None))
+            .collect::<HashMap<_, _>>();
+        let remapper = DatasetIndexRemapperOptions::default()
+            .create_remapper(&dataset)
+            .await
+            .unwrap()
+            .expect("a real index should require a remapper");
+        let remapped = remapper
+            .remap_indices(RowAddrRemap::direct(remap_to_empty), &[0])
+            .await
+            .unwrap();
+
+        // Withdrawn, not remapped: no index type carries the declared payload
+        // through a remap, so producing a replacement would republish a covering
+        // claim its storage does not back. The original entry stays in the
+        // manifest and simply stops covering the rewritten fragments.
+        assert!(
+            remapped.is_empty(),
+            "a covered index must be withdrawn from remapping, got {remapped:?}"
+        );
+        let _ = index_uuid;
+    }
+
+    /// The same migration path must reject -- cleanly, not with a panic -- a
+    /// malformed `covering_fields` longer than `fields`.
+    ///
+    /// Note this is a genuinely synthetic scenario, not one a real commit can
+    /// produce: `crate::index::remap_index`'s own `keyed > 1` guard (a sibling
+    /// fix in this same phase) already rejects every organically-committable
+    /// composite index *before* this migration path ever runs, since it is
+    /// only reached from that function's `RemapResult::Keep` arm. And
+    /// `validate_covering_fields` rejects a fully-consumed `covering_fields`
+    /// (`keyed == 0` with non-empty `fields`) at `Operation::CreateIndex`
+    /// commit time, and `TryFrom<pb::IndexMetadata>` rejects it again when a
+    /// manifest is decoded. The only way left to reach this branch's rejection
+    /// is metadata that passed through neither, which is how this test reaches
+    /// it: seeding the index cache directly rather than committing through a
+    /// `Transaction`.
+    #[tokio::test]
+    async fn test_remapper_migration_path_rejects_malformed_covering_fields() {
+        let reader = lance_datagen::gen_batch()
+            .col("a", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        for idx in &mut indices {
+            if idx.uuid == index_uuid {
+                // Force the legacy migration path, and malform `covering_fields`
+                // to be longer than `fields` -- more carried fields than fields
+                // at all. No normal commit can produce this.
+                idx.index_details = None;
+                idx.covering_fields = idx
+                    .fields
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(999))
+                    .collect();
+            }
+        }
+        let metadata_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&metadata_key, Arc::new(indices))
+            .await;
+
+        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
+            .map(|i| (i as u64, None))
+            .collect::<HashMap<_, _>>();
+        let remapper = DatasetIndexRemapperOptions::default()
+            .create_remapper(&dataset)
+            .await
+            .unwrap()
+            .expect("a real index should require a remapper");
+        let error = remapper
+            .remap_indices(RowAddrRemap::direct(remap_to_empty), &[0])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("are not among its fields"),
+            "malformed covering must fail closed via the validator, not be \
+             withdrawn as an ordinary covered index; got: {error}"
+        );
     }
 }

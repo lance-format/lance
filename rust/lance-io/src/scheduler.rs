@@ -3,6 +3,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
+use futures::future::Either;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
 use std::collections::BinaryHeap;
@@ -1190,6 +1191,8 @@ impl FileScheduler {
     /// Each request has a backpressure ID which controls which backpressure throttle
     /// is applied to the request.  Requests made to the same backpressure throttle
     /// will be throttled together.
+    ///
+    /// Ranges must be sorted by their start offset.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
@@ -1197,6 +1200,19 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
+
+        if let Some((range_index, ranges)) = request
+            .windows(2)
+            .enumerate()
+            .find(|(_, ranges)| ranges[0].start > ranges[1].start)
+        {
+            return Either::Left(std::future::ready(Err(Error::invalid_input(format!(
+                "I/O request ranges must be sorted by start offset: range at index {range_index} is {:?}, but range at index {} is {:?}",
+                ranges[0],
+                range_index + 1,
+                ranges[1]
+            )))));
+        }
 
         let mut merged_requests = Vec::with_capacity(request.len());
 
@@ -1250,7 +1266,7 @@ impl FileScheduler {
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
-        async move {
+        Either::Right(async move {
             let bytes_vec = bytes_vec_fut.await?;
 
             let mut orig_index = 0;
@@ -1293,7 +1309,7 @@ impl FileScheduler {
             }
 
             Ok(final_bytes)
-        }
+        })
     }
 
     pub fn with_priority(&self, priority: u64) -> Self {
@@ -1697,6 +1713,38 @@ mod tests {
             );
         }
         assert_eq!(11, scheduler.stats().iops);
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_unordered_ranges_are_rejected(#[case] use_lite_scheduler: bool) {
+        let path = Path::parse("unordered-ranges").unwrap();
+        let source = (0_u8..64).collect::<Vec<_>>();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &source).await.unwrap();
+
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(use_lite_scheduler),
+            ..SchedulerConfig::default_for_testing()
+        };
+        let scheduler = ScanScheduler::new(object_store, config);
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let ranges = vec![9..26, 0..49];
+        let error = file_scheduler.submit_request(ranges, 0).await.unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "I/O request ranges must be sorted by start offset: range at index 0 is 9..26, but range at index 1 is 0..49"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]

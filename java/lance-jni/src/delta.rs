@@ -188,6 +188,33 @@ fn inner_get_updated_rows<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_delta_DatasetDelta_nativeGetDeletedRowIds<'local>(
+    mut env: JNIEnv<'local>,
+    j_delta: JObject<'local>,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_get_deleted_row_ids(&mut env, j_delta, stream_addr)
+    )
+}
+
+fn inner_get_deleted_row_ids<'local>(
+    env: &mut JNIEnv,
+    j_delta: JObject<'local>,
+    stream_addr: jlong,
+) -> Result<()> {
+    let delta_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDatasetDelta>(&j_delta, NATIVE_DELTA) }?;
+
+    let stream: DatasetRecordBatchStream = block_on(delta_guard.inner.get_deleted_row_ids())?;
+    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
+
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_delta_DatasetDelta_releaseNativeDelta(
     mut env: JNIEnv,
     obj: JObject,

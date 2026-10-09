@@ -101,15 +101,11 @@ pub struct NullableDataBlock {
 }
 
 impl NullableDataBlock {
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         let nulls = self.nulls.into_buffer();
-        let data = self.data.into_arrow(data_type, validate)?.into_builder();
+        let data = self.data.into_arrow_impl(data_type, true)?.into_builder();
         let data = data.null_bit_buffer(Some(nulls));
-        if validate {
-            Ok(data.build()?)
-        } else {
-            Ok(unsafe { data.build_unchecked() })
-        }
+        Ok(data.build()?)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -173,7 +169,7 @@ impl FixedWidthDataBlock {
         self,
         data_type: DataType,
         num_values: u64,
-        validate: bool,
+        _validate: bool,
     ) -> Result<ArrayData> {
         // Booleans expanded for full-zip (bits_per_value==8, one byte each) need re-packing to
         // Arrow's bit-packed format.
@@ -190,16 +186,16 @@ impl FixedWidthDataBlock {
             .add_buffer(data_buffer)
             .len(num_values as usize)
             .null_count(0);
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+        Ok(builder.build()?)
     }
 
-    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    /// Convert this block into Arrow data with full layout validation.
+    ///
+    /// The `validate` argument is retained for API compatibility. Conversion is
+    /// always validated because callers can construct this public type directly.
+    pub fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
-        self.do_into_arrow(data_type, root_num_values, validate)
+        self.do_into_arrow(data_type, root_num_values, true)
     }
 
     pub fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -510,13 +506,13 @@ impl FixedSizeListBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         let num_values = self.num_values();
         let builder = match &data_type {
             DataType::FixedSizeList(child_field, _) => {
                 let child_data = self
                     .child
-                    .into_arrow(child_field.data_type().clone(), validate)?;
+                    .into_arrow_impl(child_field.data_type().clone(), true)?;
                 ArrayDataBuilder::new(data_type)
                     .add_child_data(child_data)
                     .len(num_values as usize)
@@ -524,11 +520,7 @@ impl FixedSizeListBlock {
             }
             _ => panic!("Expected FixedSizeList data type and got {:?}", data_type),
         };
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+        Ok(builder.build()?)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -993,12 +985,12 @@ pub struct StructDataBlock {
 }
 
 impl StructDataBlock {
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
         if let DataType::Struct(fields) = &data_type {
             let mut builder = ArrayDataBuilder::new(DataType::Struct(fields.clone()));
             let mut num_rows = 0;
             for (field, child) in fields.iter().zip(self.children) {
-                let child_data = child.into_arrow(field.data_type().clone(), validate)?;
+                let child_data = child.into_arrow_impl(field.data_type().clone(), true)?;
                 num_rows = child_data.len();
                 builder = builder.add_child_data(child_data);
             }
@@ -1014,11 +1006,7 @@ impl StructDataBlock {
             };
 
             let builder = builder.len(num_rows);
-            if validate {
-                Ok(builder.build()?)
-            } else {
-                Ok(unsafe { builder.build_unchecked() })
-            }
+            Ok(builder.build()?)
         } else {
             Err(Error::internal(format!(
                 "Expected Struct, got {:?}",
@@ -1112,30 +1100,39 @@ impl DictionaryDataBlock {
         self,
         key_type: Box<DataType>,
         value_type: Box<DataType>,
-        validate: bool,
+        _validate: bool,
     ) -> Result<ArrayData> {
-        let indices = self.indices.into_arrow((*key_type).clone(), validate)?;
+        let declared_key_bits = key_type.byte_width() as u64 * 8;
+        if self.indices.bits_per_value != declared_key_bits {
+            return Err(lance_core::Error::corrupt_file_named(
+                "dictionary",
+                format!(
+                    "dictionary indices use {} bits but the declared {} key type uses {} bits",
+                    self.indices.bits_per_value, key_type, declared_key_bits
+                ),
+            ));
+        }
+        let indices_num_values = self.indices.num_values;
+        let indices = self
+            .indices
+            .do_into_arrow((*key_type).clone(), indices_num_values, true)?;
         let dictionary = self
             .dictionary
-            .into_arrow((*value_type).clone(), validate)?;
+            .into_arrow_impl((*value_type).clone(), true)?;
 
         let builder = indices
             .into_builder()
             .add_child_data(dictionary)
             .data_type(DataType::Dictionary(key_type, value_type));
 
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+        Ok(builder.build()?)
     }
 
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         if let DataType::Dictionary(key_type, value_type) = data_type {
             self.into_arrow_dict(key_type, value_type, validate)
         } else {
-            self.decode()?.into_arrow(data_type, validate)
+            self.decode()?.into_arrow_impl(data_type, validate)
         }
     }
 
@@ -1186,8 +1183,15 @@ pub enum DataBlock {
 }
 
 impl DataBlock {
-    /// Convert self into an Arrow ArrayData
-    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    /// Convert self into an Arrow ArrayData with full layout validation.
+    ///
+    /// The `validate` argument is retained for API compatibility. Conversion is
+    /// always validated because callers can construct data blocks directly.
+    pub fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        self.into_arrow_impl(data_type, true)
+    }
+
+    fn into_arrow_impl(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         match self {
             Self::Empty() => Ok(new_empty_array(&data_type).to_data()),
             Self::Constant(inner) => inner.into_arrow(data_type, validate),
@@ -1549,13 +1553,22 @@ fn arrow_binary_to_data_block(
     bits_per_offset: u8,
 ) -> DataBlock {
     let data_vec = arrays.iter().map(|arr| arr.to_data()).collect::<Vec<_>>();
+    arrow_binary_array_data_to_data_block(&data_vec, num_values, bits_per_offset)
+}
+
+fn arrow_binary_array_data_to_data_block(
+    data_vec: &[ArrayData],
+    num_values: u64,
+    bits_per_offset: u8,
+) -> DataBlock {
     let bytes_per_offset = bits_per_offset as usize / 8;
     let offsets = data_vec
         .iter()
         .map(|d| {
-            LanceBuffer::from(
-                d.buffers()[0].slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset),
-            )
+            LanceBuffer::from(d.buffers()[0].slice_with_length(
+                d.offset() * bytes_per_offset,
+                (d.len() + 1) * bytes_per_offset,
+            ))
         })
         .collect::<Vec<_>>();
     let (offsets, data_ranges) = if bits_per_offset == 32 {
@@ -1693,8 +1706,6 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
     let mut indices = array_dict.keys();
     let num_values = indices.len() as u64;
     let mut values = array_dict.values().clone();
-    // Placeholder, if we need to upcast, we will initialize this and set `indices` to refer to it
-    let mut upcast = None;
 
     // TODO: Should we just always normalize indices to u32?  That would make logic simpler
     // and we're going to bitpack them soon anyways
@@ -1710,18 +1721,22 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
         let first_invalid_index = first_invalid_index.unwrap_or_else(|| {
             let null_arr = new_null_array(values.data_type(), 1);
             values = arrow_select::concat::concat(&[values.as_ref(), null_arr.as_ref()]).unwrap();
-            let null_index = values.len() - 1;
-            let max_index_val = max_index_val(indices.data_type());
-            if null_index as u64 > max_index_val {
-                // Widen the index type
-                if max_index_val >= u32::MAX as u64 {
-                    unimplemented!("Dictionary arrays with 2^32 unique value (or more) and a null")
-                }
-                upcast = Some(arrow_cast::cast(indices, &DataType::UInt32).unwrap());
-                indices = upcast.as_ref().unwrap();
-            }
-            null_index
+            values.len() - 1
         });
+        let max_index_val = max_index_val(indices.data_type());
+        let upcast = if first_invalid_index as u64 > max_index_val {
+            // Widen the index type when the null dictionary value cannot be addressed by the
+            // declared key type, whether the value already existed or was appended above.
+            if max_index_val >= u32::MAX as u64 {
+                unimplemented!("Dictionary arrays with 2^32 unique value (or more) and a null")
+            }
+            Some(arrow_cast::cast(indices, &DataType::UInt32).unwrap())
+        } else {
+            None
+        };
+        if let Some(upcast) = upcast.as_ref() {
+            indices = upcast;
+        }
         // This can't fail since we already checked for fit
         let null_index_arr = arrow_cast::cast(
             &UInt64Array::from(vec![first_invalid_index as u64]),
@@ -1808,6 +1823,71 @@ fn extract_nulls(arrays: &[ArrayRef], num_values: u64) -> Nullability {
 }
 
 impl DataBlock {
+    fn validate_variable_width_offsets<T: ArrowNativeType + Ord>(
+        array_data: &ArrayData,
+    ) -> std::result::Result<(), String> {
+        if array_data.is_empty() && array_data.buffers()[0].is_empty() {
+            return Ok(());
+        }
+        let offset_size = std::mem::size_of::<T>();
+        let offset_start = array_data.offset() * offset_size;
+        let offset_len = (array_data.len() + 1) * offset_size;
+        let offset_buffer =
+            LanceBuffer::from(array_data.buffers()[0].slice_with_length(offset_start, offset_len));
+        let offsets = offset_buffer.borrow_to_typed_slice::<T>();
+        VariableWidthBlock::offset_violation_detail(
+            offsets.as_ref(),
+            array_data.buffers()[1].len(),
+            0,
+        )
+        .map_or(Ok(()), Err)
+    }
+
+    // `validate_full` also rescans UTF-8 contents and character boundaries on every flush.
+    // Encoding only needs a complete monotonicity and bounds proof before slicing offsets.
+    fn validate_variable_width_layouts(array_data: &ArrayData) -> std::result::Result<(), String> {
+        match array_data.data_type() {
+            DataType::Binary | DataType::Utf8 => {
+                Self::validate_variable_width_offsets::<i32>(array_data)?;
+            }
+            DataType::LargeBinary | DataType::LargeUtf8 => {
+                Self::validate_variable_width_offsets::<i64>(array_data)?;
+            }
+            _ => {}
+        }
+        for child_data in array_data.child_data() {
+            Self::validate_variable_width_layouts(child_data)?;
+        }
+        Ok(())
+    }
+
+    fn validate_array_data(
+        array_data: &ArrayData,
+        field_name: &str,
+        array_index: usize,
+    ) -> Result<()> {
+        let validation = array_data
+            .validate()
+            .map_err(|error| error.to_string())
+            .and_then(|_| Self::validate_variable_width_layouts(array_data));
+        validation.map_err(|error| {
+            Error::invalid_input_source(
+                format!(
+                    "Invalid Arrow array for field '{}' at buffered array {}: {}",
+                    field_name, array_index, error
+                )
+                .into(),
+            )
+        })
+    }
+
+    pub(crate) fn validate_arrays(arrays: &[ArrayRef], field_name: &str) -> Result<()> {
+        for (array_index, array) in arrays.iter().enumerate() {
+            Self::validate_array_data(&array.to_data(), field_name, array_index)?;
+        }
+        Ok(())
+    }
+
     pub fn from_arrays(arrays: &[ArrayRef], num_values: u64) -> Self {
         if arrays.is_empty() || num_values == 0 {
             return Self::AllNull(AllNullDataBlock { num_values: 0 });
@@ -2046,7 +2126,8 @@ mod tests {
         new_null_array,
         types::{Int8Type, Int32Type},
     };
-    use arrow_buffer::{BooleanBuffer, NullBuffer};
+    use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
+    use arrow_data::ArrayData;
 
     use arrow_schema::{DataType, Field, Fields};
     use lance_core::Error;
@@ -2210,6 +2291,70 @@ mod tests {
             vec![string.slice(0, 1), string2.slice(0, 1)],
             vec![0, 5, 8],
             b"hellofoo",
+        );
+    }
+
+    #[rstest]
+    #[case::utf8(
+        DataType::Utf8,
+        Buffer::from_slice_ref([0_i32, 5, 10]),
+        32,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5])
+    )]
+    #[case::large_utf8(
+        DataType::LargeUtf8,
+        Buffer::from_slice_ref([0_i64, 5, 10]),
+        64,
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5])
+    )]
+    fn test_variable_width_array_data_offset(
+        #[case] data_type: DataType,
+        #[case] offsets: Buffer,
+        #[case] bits_per_offset: u8,
+        #[case] expected_offsets: LanceBuffer,
+    ) {
+        let array_data = ArrayData::builder(data_type)
+            .len(1)
+            .offset(1)
+            .add_buffer(offsets)
+            .add_buffer(Buffer::from(b"helloworld"))
+            .build()
+            .unwrap();
+
+        DataBlock::validate_array_data(&array_data, "text", 0).unwrap();
+        let data = super::arrow_binary_array_data_to_data_block(&[array_data], 1, bits_per_offset);
+
+        let data = data.as_variable_width().unwrap();
+        assert_eq!(data.offsets, expected_offsets);
+        assert_eq!(data.data, LanceBuffer::copy_slice(b"world"));
+    }
+
+    #[rstest]
+    #[case::utf8(DataType::Utf8, Buffer::from_slice_ref([0_i32, -1]))]
+    #[case::large_utf8(DataType::LargeUtf8, Buffer::from_slice_ref([0_i64, -1]))]
+    fn test_invalid_string_offsets_rejected_before_encoding(
+        #[case] data_type: DataType,
+        #[case] offsets: Buffer,
+    ) {
+        let array_data = unsafe {
+            ArrayData::builder(data_type)
+                .len(1)
+                .add_buffer(offsets)
+                .add_buffer(Buffer::from(b""))
+                .build_unchecked()
+        };
+
+        let error = DataBlock::validate_array_data(&array_data, "text", 0).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("field 'text'"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("offset[1] (-1)"),
+            "unexpected message: {message}"
         );
     }
 
@@ -2499,6 +2644,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_fixed_width_conversion_always_validates_layout() {
+        let block = FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8; 4]),
+            bits_per_value: 32,
+            num_values: 2,
+            block_info: BlockInfo::new(),
+        };
+
+        for validate in [false, true] {
+            block
+                .clone()
+                .into_arrow(DataType::Int32, validate)
+                .expect_err("a short values buffer must be rejected");
+            DataBlock::FixedWidth(block.clone())
+                .into_arrow(DataType::Int32, validate)
+                .expect_err("a short values buffer must be rejected");
+        }
+    }
+
     #[rstest]
     #[case::i32_decreasing(
         LanceBuffer::reinterpret_vec(vec![0_i32, 5, 2]),
@@ -2679,6 +2844,35 @@ mod tests {
         assert!(
             matches!(error, Error::CorruptFile { .. }),
             "expected CorruptFile, got: {error}"
+        );
+    }
+
+    #[test]
+    fn dictionary_rejects_indices_wider_than_declared_key_type() {
+        let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 128]),
+                bits_per_value: 32,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec![
+                Some("zero"),
+                Some("one"),
+                None,
+            ]))),
+        });
+
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let error = dictionary
+            .into_arrow(data_type, false)
+            .expect_err("mismatched dictionary index widths must be rejected");
+
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(
+            error.to_string().contains(
+                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits"
+            )
         );
     }
 
