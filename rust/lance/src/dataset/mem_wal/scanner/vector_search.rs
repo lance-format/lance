@@ -656,12 +656,19 @@ impl LsmVectorSearchPlanner {
                 batch_store,
                 index_store,
                 schema,
+                visible_count,
                 ..
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                // The block lists were built at this count; re-reading the cursor
+                // could surface rows whose older copies they do not block.
+                let mut scanner = MemTableScanner::new_at_readable_count(
+                    batch_store.clone(),
+                    index_store.clone(),
+                    schema.clone(),
+                    *visible_count,
+                );
                 // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
@@ -3828,5 +3835,111 @@ mod tests {
             "newest-wins: the stale on-query copy (distance ~0) must be excluded, got {:?}",
             rows
         );
+    }
+
+    /// A row that becomes visible in the active memtable while a search is
+    /// being planned must not be returned alongside the older copy it replaces.
+    #[tokio::test]
+    async fn test_vector_search_write_during_planning_returns_key_once() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let near = [0.12, 0.22, 0.32, 0.42];
+        let far = [9.0, 9.0, 9.0, 9.0];
+
+        // Gen 1 (SSTable) holds id=1 at the query; the active gen 2 holds only
+        // id=2, far away.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = create_dataset(&gen1_uri, vec![batch_rows(&schema, &[(1, q)])]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        gen1.create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let initial = batch_rows(&schema, &[(2, far)]);
+        let (position, offset, _) = batch_store.append(initial.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&initial, offset, Some(position))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        // The concurrent write: a new version of id=1, appended and indexed so
+        // the active memtable's visible count grows mid-plan.
+        let cache = Arc::new(RunOnOpen::new(1, {
+            let batch_store = batch_store.clone();
+            let index_store = index_store.clone();
+            let update = batch_rows(&schema, &[(1, near)]);
+            move || {
+                let (position, offset, _) = batch_store.append(update.clone()).unwrap();
+                index_store
+                    .insert_with_batch_position(&update, offset, Some(position))
+                    .unwrap();
+            }
+        }));
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: batch_store.clone(),
+                        index_store: index_store.clone(),
+                        schema: schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )
+        .with_sstable_cache(cache.clone());
+
+        let plan = planner
+            .plan_search(&create_query_vector(), 3, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        assert!(cache.has_run(), "the write must land during planning");
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = collect_id_dist(&batches)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2], "each key must be returned once");
     }
 }
