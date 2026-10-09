@@ -127,8 +127,10 @@ use the previously validated range through k=1000.
 
 ## One fallback threshold per metric
 
-Calibration and full held-out routing evaluation are complete. The preregistered
-native validation is still running; its results will be reported separately.
+[FALLBACK_RESULTS.md](FALLBACK_RESULTS.md) records the frozen constants,
+complete all-k routing evaluation, and all 30 native held-out groups. Every
+native candidate group meets the 95% mean-recall target, but a single constant
+can still approach exhaustive scans. No production defaults are changed.
 
 [FALLBACK_PROTOCOL.md](FALLBACK_PROTOCOL.md) defines a separate experiment with
 one constant gap margin for each metric and no learned floor or cap. Calibration
