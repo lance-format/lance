@@ -586,18 +586,20 @@ async fn merge_scalar_indices<'a>(
 
     // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
     // segments (plus any deletion-affected one); with `num_indices_to_merge: Some(0)`
-    // (append mode) it selects none at all. A row-id-domain BTree or Bitmap
-    // segment left outside that selection would otherwise survive untouched
-    // beside the freshly built address-domain segment this call is about to
-    // create. `LogicalScalarIndex` takes the whole named index's result domain
-    // from its first segment alone, so that mix makes every match the new
-    // segment finds look like a row id needing resolution, and matching rows
-    // silently vanish when that resolution misses. Fold every such segment
-    // into this rebuild, regardless of which ones the trailing-window
-    // heuristic already picked, so the named index never ends up straddling
-    // both domains.
-    if matches!(index_type, IndexType::BTree | IndexType::Bitmap)
-        && dataset.manifest.uses_stable_row_ids()
+    // (append mode) it selects none at all. A row-id-domain BTree, Bitmap, or
+    // LabelList segment left outside that selection would otherwise survive
+    // untouched beside the freshly built address-domain segment this call is
+    // about to create. `LogicalScalarIndex` takes the whole named index's
+    // result domain from its first segment alone, so that mix makes every
+    // match the new segment finds look like a row id needing resolution, and
+    // matching rows silently vanish when that resolution misses. Fold every
+    // such segment into this rebuild, regardless of which ones the
+    // trailing-window heuristic already picked, so the named index never
+    // ends up straddling both domains.
+    if matches!(
+        index_type,
+        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
+    ) && dataset.manifest.uses_stable_row_ids()
     {
         for idx in old_indices {
             if !idx.results_are_row_addrs()
@@ -656,15 +658,17 @@ async fn merge_scalar_indices<'a>(
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
 
-    // A BTree or Bitmap segment persisted before address-domain support
-    // stores row ids directly. Merging it with newly scanned address-domain
-    // data on a stable-row-id dataset would silently combine two different
-    // domains in the same postings column, so such a segment must be rebuilt
-    // from scratch (a full rescan, never touching its stale page data) rather
-    // than merged. Harmless elsewhere: without stable row ids the two domains
-    // coincide.
-    let legacy_domain_mismatch = matches!(index_type, IndexType::BTree | IndexType::Bitmap)
-        && dataset.manifest.uses_stable_row_ids()
+    // A BTree, Bitmap, or LabelList segment persisted before address-domain
+    // support stores row ids directly. Merging it with newly scanned
+    // address-domain data on a stable-row-id dataset would silently combine
+    // two different domains in the same postings column, so such a segment
+    // must be rebuilt from scratch (a full rescan, never touching its stale
+    // page data) rather than merged. Harmless elsewhere: without stable row
+    // ids the two domains coincide.
+    let legacy_domain_mismatch = matches!(
+        index_type,
+        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
+    ) && dataset.manifest.uses_stable_row_ids()
         && selected_old_indices
             .iter()
             .any(|segment| !segment.results_are_row_addrs());
@@ -813,6 +817,28 @@ async fn merge_scalar_indices<'a>(
                         None,
                     )
                     .await?
+                }
+                IndexType::LabelList => {
+                    // No N:1 merge primitive wired into this path (unlike
+                    // BTree/Bitmap/NGram above) -- `has_segment_merge_primitive`
+                    // excludes it, so `can_merge_segments` only allows this arm
+                    // with exactly one selected segment, which `update` below
+                    // updates in place. Its domain can be either: harmless
+                    // without stable row ids (the two domains coincide), and
+                    // `legacy_domain_mismatch` above already forces a full
+                    // rebuild instead of reaching here for a stale row-id-domain
+                    // segment under stable row ids. So pass its own domain
+                    // through, not a hardcoded one.
+                    let old_data_filter = build_old_data_filter(
+                        dataset.as_ref(),
+                        &effective_old_frags,
+                        &deleted_old_frags,
+                        reference_index.results_are_row_addresses(),
+                    )
+                    .await?;
+                    reference_index
+                        .update(new_data_stream, &new_store, old_data_filter)
+                        .await?
                 }
                 _ => {
                     let old_data_filter = build_old_data_filter(
