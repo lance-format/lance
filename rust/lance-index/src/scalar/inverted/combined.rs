@@ -19,11 +19,14 @@
 //! ```
 //!
 //! Scoring uses exact (non-quantized) document lengths and a shared tokenizer
-//! across columns. Every candidate in the union of the query terms' postings is
-//! scored; see [`combined_fields_search`].
+//! across columns. A term-at-a-time MAXSCORE (Lucene `CombinedFieldQuery`'s
+//! constant per-term ceiling, ordinary MAXSCORE across terms) prunes candidate
+//! scoring for a top-k query without changing the top-k it returns; see
+//! [`combined_fields_search`].
 
 mod cursor;
 mod flat;
+mod maxscore;
 mod search;
 mod stats;
 #[cfg(test)]

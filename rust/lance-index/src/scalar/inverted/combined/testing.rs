@@ -5,7 +5,8 @@
 //! document views, index and flat-scan corpora, and the exact reference scans
 //! the tests compare against.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -33,8 +34,11 @@ use super::super::index::{
     PostingListBuilder, PostingTailCodec, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
 };
 use super::super::query::{FtsSearchParams, Operator, Tokens};
+use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::super::tokenizer::document_tokenizer::DocType;
 use super::super::tokenizer::{InvertedIndexParams, LEGACY_BLOCK_SIZE};
+use super::cursor::{CombinedTermPostings, MaterializedTerm};
+use super::maxscore::{MaxscoreStats, combined_maxscore};
 use super::{
     CombinedCorpusStats, CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
 };
@@ -42,6 +46,70 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexStore, RowIdRemapper};
+
+pub(super) fn term(idf: f32, entries: &[(u64, f32)]) -> MaterializedTerm {
+    let mut postings = entries.to_vec();
+    postings.sort_unstable_by_key(|(row_id, _)| *row_id);
+    MaterializedTerm::new(CombinedTermPostings { idf, postings })
+}
+
+// A varying blended length so scores are not all equal.
+pub(super) fn dl_of(row_id: u64) -> f32 {
+    3.0 + (row_id % 4) as f32
+}
+
+/// Exhaustive reference: score every row in the union of the postings (only
+/// rows holding every term for AND) and return the top `limit` scores,
+/// descending.
+pub(super) fn exact_topk_scores(
+    cursors: &[MaterializedTerm],
+    dl_prime: impl Fn(u64) -> f32,
+    limit: usize,
+    require_all_terms: bool,
+    scorer: &CombinedFieldsBM25Scorer,
+) -> Vec<f32> {
+    let union: BTreeSet<u64> = cursors
+        .iter()
+        .flat_map(|t| t.postings.postings.iter().map(|(row_id, _)| *row_id))
+        .collect();
+    let mut scores: Vec<f32> = union
+        .into_iter()
+        .filter_map(|row_id| {
+            let dl = dl_prime(row_id);
+            let mut score = 0.0f32;
+            let mut missing = false;
+            for t in cursors {
+                let tf = t.postings.tf_prime(row_id);
+                if tf <= 0.0 {
+                    missing = true;
+                    continue;
+                }
+                score += t.postings.idf * scorer.doc_weight(tf, dl);
+            }
+            (!(require_all_terms && missing)).then_some(score)
+        })
+        .collect();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    scores.truncate(limit);
+    scores
+}
+
+pub(super) fn maxscore_scores(
+    cursors: &mut [MaterializedTerm],
+    dl_prime: impl Fn(u64) -> f32,
+    limit: usize,
+    require_all_terms: bool,
+    scorer: &CombinedFieldsBM25Scorer,
+) -> (Vec<f32>, MaxscoreStats) {
+    let (top, stats) = combined_maxscore(cursors, dl_prime, limit, require_all_terms, scorer);
+    let mut scores: Vec<f32> = top.into_iter().map(|Reverse(doc)| doc.score.0).collect();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    (scores, stats)
+}
+
+pub(super) fn test_scorer() -> CombinedFieldsBM25Scorer {
+    CombinedFieldsBM25Scorer::new(1000, 5.0, HashMap::new())
+}
 
 pub(super) fn compressed_list(postings: &[(u32, u32)]) -> CompressedPostingList {
     let doc_ids: Vec<u32> = postings.iter().map(|(d, _)| *d).collect();
