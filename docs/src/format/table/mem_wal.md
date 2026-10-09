@@ -103,6 +103,7 @@ Each WAL entry is an Apache Arrow IPC stream file.
 The Arrow schema metadata includes:
 
 - `writer_epoch`: decimal string containing the writer epoch that created the entry.
+- `generation`: decimal string containing the memtable generation the entry's batches belong to. A flush drains one memtable, so an entry never spans two generations. A reader rebuilds generation boundaries from this value. Absent in WAL-only mode, which holds no memtable.
 - `fence_sentinel`: optional marker for a data-less fence sentinel entry.
 
 A normal WAL entry contains one or more record batches.

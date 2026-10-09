@@ -204,7 +204,7 @@ impl BlockingDataset {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
-        version: Option<u64>,
+        reference: Option<Ref>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
@@ -253,9 +253,14 @@ impl BlockingDataset {
             builder = builder.with_base_store_params(base_path, store_params);
         }
 
-        if let Some(ver) = version {
-            builder = builder.with_version(ver);
-        }
+        builder = match reference {
+            Some(Ref::VersionNumber(version)) | Some(Ref::Version(None, Some(version))) => {
+                builder.with_version(version)
+            }
+            Some(Ref::Version(Some(branch), version)) => builder.with_branch(&branch, version),
+            Some(Ref::Tag(tag)) => builder.with_tag(&tag),
+            Some(Ref::Version(None, None)) | None => builder,
+        };
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
@@ -1647,6 +1652,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     _obj: JObject,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1664,6 +1670,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             &mut env,
             path,
             version_obj,
+            ref_obj,
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
@@ -1721,6 +1728,7 @@ fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1734,6 +1742,10 @@ fn inner_open_native<'local>(
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
+    // ReadOptions.Builder rejects setting both, so at most one of them is present.
+    let reference = env
+        .get_optional(&ref_obj, |env, jref| transform_jref_to_ref(jref, env))?
+        .or(version.map(Ref::from));
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
@@ -1762,7 +1774,7 @@ fn inner_open_native<'local>(
 
     let dataset = BlockingDataset::open(
         &path_str,
-        version,
+        reference,
         block_size,
         index_cache_size_bytes,
         metadata_cache_size_bytes,
@@ -4018,73 +4030,105 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRows(
 fn inner_count_indexed_rows(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    _jindex_name: JString,
+    jindex_name: JString,
     jfilter: JString,
     jfragment_ids: JObject, // Optional<List<Integer>>
 ) -> Result<i64> {
+    let index_name: String = jindex_name.extract(env)?;
     let filter: String = jfilter.extract(env)?;
+    let fragment_ids = extract_count_fragment_ids(env, &jfragment_ids)?;
 
-    // Extract optional fragment IDs
-    let fragment_ids: Option<Vec<u32>> = if env
-        .call_method(&jfragment_ids, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let list_obj = env
-            .call_method(&jfragment_ids, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let list = env.get_list(&list_obj)?;
-        let mut ids = Vec::new();
-        let mut iter = list.iter(env)?;
-        while let Some(elem) = iter.next(env)? {
-            let int_val = env.call_method(&elem, "intValue", "()I", &[])?.i()?;
-            ids.push(int_val as u32);
-        }
-        Some(ids)
-    } else {
-        None
-    };
+    count_indexed_rows(env, java_dataset, index_name, filter, None, fragment_ids)
+}
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRowsWithSegments(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jsegment_uuids: JObject, // List<UUID>
+    jfragment_ids: JObject,  // Optional<List<Integer>>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_count_indexed_rows_with_segments(
+            &mut env,
+            java_dataset,
+            jindex_name,
+            jfilter,
+            jsegment_uuids,
+            jfragment_ids,
+        ),
+        -1
+    )
+}
+
+fn inner_count_indexed_rows_with_segments(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jsegment_uuids: JObject,
+    jfragment_ids: JObject,
+) -> Result<i64> {
+    let index_name: String = jindex_name.extract(env)?;
+    let filter: String = jfilter.extract(env)?;
+    let segment_uuids =
+        import_vec_to_rust(env, &jsegment_uuids, |env, obj| obj.extract_object(env))?;
+    let fragment_ids = extract_count_fragment_ids(env, &jfragment_ids)?;
+
+    count_indexed_rows(
+        env,
+        java_dataset,
+        index_name,
+        filter,
+        Some(segment_uuids),
+        fragment_ids,
+    )
+}
+
+fn extract_count_fragment_ids(
+    env: &mut JNIEnv,
+    jfragment_ids: &JObject,
+) -> Result<Option<Vec<u32>>> {
+    env.get_ints_opt(jfragment_ids)?
+        .map(|fragment_ids| {
+            fragment_ids
+                .into_iter()
+                .map(|fragment_id| {
+                    u32::try_from(fragment_id).map_err(|_| {
+                        Error::input_error(format!(
+                            "fragment ID must be non-negative, got {fragment_id}"
+                        ))
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn count_indexed_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    index_name: String,
+    filter: String,
+    segment_uuids: Option<Vec<Uuid>>,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<i64> {
     let count = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-
-        // Use a scanner with fragment filtering to count rows
-        // This ensures we only count rows in the specified fragments
-        let inner = dataset_guard.inner.clone();
-
-        block_on(async {
-            let mut scanner = inner.scan();
-
-            // Apply filter
-            if !filter.is_empty() {
-                scanner.filter(&filter)?;
-            }
-
-            // Empty projection and enable row_id for count_rows to work
-            // count_rows() requires metadata-only projection
-            scanner.project::<String>(&[])?;
-            scanner.with_row_id();
-
-            // Apply fragment filter if specified
-            if let Some(frag_ids) = fragment_ids {
-                // Convert FileFragment to Fragment by extracting metadata
-                let filtered_fragments: Vec<_> = inner
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|f| frag_ids.contains(&(f.id() as u32)))
-                    .map(|f| f.metadata().clone())
-                    .collect();
-                scanner.with_fragments(filtered_fragments);
-            }
-
-            // Use the scanner's count_rows method
-            let count = scanner.count_rows().await?;
-
-            Ok::<i64, lance::Error>(count as i64)
-        })?
+        block_on(dataset_guard.inner.count_indexed_rows(
+            &index_name,
+            &filter,
+            segment_uuids.as_deref(),
+            fragment_ids.as_deref(),
+        ))?
     };
 
-    Ok(count)
+    i64::try_from(count)
+        .map_err(|_| Error::input_error(format!("indexed row count {count} exceeds Java long")))
 }
 
 //////////////////////////////

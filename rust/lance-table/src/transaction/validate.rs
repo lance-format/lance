@@ -215,9 +215,43 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
         )));
     }
 
-    // Collect new fragment IDs
-    let new_fragment_map: HashMap<u64, &Fragment> =
-        new_fragments.iter().map(|f| (f.id, f)).collect();
+    // Id 0 means unassigned (assigned at commit, like Append); a non-zero id
+    // unknown to the manifest was pre-reserved. The first occurrence of each
+    // previous id is the existing fragment (mirrors build_manifest), so staged
+    // id-0 fragments must follow the existing ones.
+    let mut new_fragment_map: HashMap<u64, &Fragment> = HashMap::new();
+    for fragment in new_fragments {
+        if fragment.id != 0 && new_fragment_map.contains_key(&fragment.id) {
+            return Err(Error::invalid_input(format!(
+                "Merge operation contains duplicate fragment id {}. \
+                 New fragments must use id 0 (assigned at commit time) or a unique reserved id.",
+                fragment.id
+            )));
+        }
+        new_fragment_map.entry(fragment.id).or_insert(fragment);
+    }
+
+    // build_manifest treats the FIRST occurrence of each previous id as the
+    // merged existing fragment, so a staged id-0 fragment listed before the
+    // fragment it collides with would silently take that fragment's place.
+    // The row-count and row-id-metadata checks below only catch that swap
+    // when the two fragments differ; enforce the order structurally instead:
+    // every fragment classified as existing must precede every new one.
+    let previous_ids: HashSet<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let mut seen_previous: HashSet<u64> = HashSet::new();
+    let mut first_new_id: Option<u64> = None;
+    for fragment in new_fragments {
+        let is_existing = previous_ids.contains(&fragment.id) && seen_previous.insert(fragment.id);
+        if !is_existing {
+            first_new_id.get_or_insert(fragment.id);
+        } else if let Some(new_id) = first_new_id {
+            return Err(Error::invalid_input(format!(
+                "Merge operation lists existing fragment {} after a new fragment \
+                 (id {}). New fragments must be listed after every existing fragment.",
+                fragment.id, new_id
+            )));
+        }
+    }
 
     // Check that all original fragments are preserved in the new fragments list
     // Validate that each original fragment's metadata is preserved
@@ -233,6 +267,16 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
                     original_fragment.id,
                     original_fragment.physical_rows,
                     new_fragment.physical_rows
+                )));
+            }
+            // A previous-id fragment without row id metadata on a stable
+            // dataset is most likely a staged fragment listed too early.
+            if manifest.uses_stable_row_ids() && new_fragment.row_id_meta.is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Merge operation dropped row id metadata for existing fragment {}. \
+                     New fragments (id 0) must be listed after the existing fragments; \
+                     they are assigned row ids at commit time.",
+                    original_fragment.id
                 )));
             }
         } else {
@@ -272,10 +316,12 @@ fn merge_schema_valid(
     fragments: &[Fragment],
 ) -> Result<()> {
     let prior_schema = &manifest.schema;
-    let new_fragment_map: HashMap<u64, &Fragment> = fragments
-        .iter()
-        .map(|fragment| (fragment.id, fragment))
-        .collect();
+    // First occurrence wins: a later staged fragment with placeholder id 0 is
+    // not fragment 0's merged version.
+    let mut new_fragment_map: HashMap<u64, &Fragment> = HashMap::new();
+    for fragment in fragments {
+        new_fragment_map.entry(fragment.id).or_insert(fragment);
+    }
 
     // Remap and semantic errors first: a renumbered schema usually violates
     // both the shared-id and new-id clauses.

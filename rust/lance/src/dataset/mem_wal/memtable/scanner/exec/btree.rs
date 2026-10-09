@@ -150,7 +150,8 @@ impl BTreeIndexExec {
                 let mut results = Vec::new();
                 let snapshot = index.snapshot();
 
-                for (key, positions) in snapshot {
+                // Null keys sort first but are in no range.
+                for (key, positions) in snapshot.into_iter().filter(|(key, _)| !key.0.is_null()) {
                     let in_range = match (lower, upper) {
                         (Some(l), Some(u)) => &key.0 >= l && &key.0 < u,
                         (Some(l), None) => &key.0 >= l,
@@ -362,7 +363,7 @@ impl ExecutionPlan for BTreeIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 

@@ -193,7 +193,7 @@ impl Transaction {
     }
 
     /// `fields` plus every field nested under them, deduplicated.
-    fn with_descendants(schema: &Schema, fields: Vec<u32>) -> Vec<u32> {
+    pub fn with_descendants(schema: &Schema, fields: Vec<u32>) -> Vec<u32> {
         let mut expanded = Vec::with_capacity(fields.len());
         for id in fields {
             expanded.push(id);
@@ -403,6 +403,19 @@ impl Transaction {
             return;
         }
 
+        let fragment_ids = updated_fragments.iter().map(|f| f.id as u32).collect();
+        Self::prune_updated_fragment_ids_from_indices(indices, &fragment_ids, fields_modified);
+    }
+
+    /// [`Self::prune_updated_fields_from_indices`] by fragment id.
+    pub fn prune_updated_fragment_ids_from_indices(
+        indices: &mut [IndexMetadata],
+        fragment_ids: &RoaringBitmap,
+        fields_modified: &[u32],
+    ) {
+        if fields_modified.is_empty() || fragment_ids.is_empty() {
+            return;
+        }
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
         let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
@@ -413,9 +426,7 @@ impl Transaction {
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
-                for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                    fragment_bitmap.remove(fragment_id);
-                }
+                *fragment_bitmap -= fragment_ids;
             }
         }
     }
@@ -443,10 +454,17 @@ impl Transaction {
     ) -> Vec<(u64, Vec<u32>)> {
         let prev_by_id: HashMap<u64, &Fragment> =
             prev_fragments.iter().map(|f| (f.id, f)).collect();
+        // Only the first occurrence of a previous id is that fragment's merged
+        // version; later ones are staged fragments still carrying placeholder
+        // id 0, which must not be mistaken for a rewrite of fragment 0.
+        let mut seen_prev_ids = HashSet::new();
         new_fragments
             .iter()
             .filter_map(|new_frag| {
                 let prev = prev_by_id.get(&new_frag.id)?;
+                if !seen_prev_ids.insert(new_frag.id) {
+                    return None;
+                }
                 let prev_paths = Self::fragment_field_paths(prev);
                 let new_paths = Self::fragment_field_paths(new_frag);
                 let mut changed: Vec<u32> = prev_paths

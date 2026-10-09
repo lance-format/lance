@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::projection::ProjectionMapping;
 use futures::FutureExt;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -476,6 +477,10 @@ pub struct TakeExec {
     metrics: ExecutionPlanMetricsSet,
     /// Scanner-level byte budget for output batches.
     batch_size_bytes: Option<u64>,
+    /// Whether the input columns lead the output unchanged. A take that adds
+    /// fields to an input struct changes that column, so orderings on it do
+    /// not carry across.
+    has_unchanged_input: bool,
 }
 
 impl DisplayAs for TakeExec {
@@ -564,12 +569,23 @@ impl TakeExec {
             &output_schema,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
+        let has_unchanged_input = input
+            .schema()
+            .fields()
+            .iter()
+            .zip(output_arrow.fields())
+            .all(|(input_field, output_field)| input_field == output_field);
+        let eq_properties = if has_unchanged_input {
+            Self::output_equivalences(&input, &output_arrow)?
+        } else {
+            EquivalenceProperties::new(output_arrow.clone())
+        };
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
+                .with_eq_properties(eq_properties),
         );
 
         Ok(Some(Self {
@@ -581,7 +597,23 @@ impl TakeExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             batch_size_bytes,
+            has_unchanged_input,
         }))
+    }
+
+    /// The input's orderings and equivalences on `output`, whose leading
+    /// columns are the input's. Rows keep their input order.
+    fn output_equivalences(
+        input: &Arc<dyn ExecutionPlan>,
+        output: &SchemaRef,
+    ) -> Result<EquivalenceProperties> {
+        let input_schema = input.schema();
+        let indices = (0..input_schema.fields().len()).collect::<Vec<_>>();
+        let mapping = ProjectionMapping::from_indices(&indices, &input_schema)?;
+        Ok(input
+            .properties()
+            .eq_properties
+            .project(&mapping, output.clone()))
     }
 
     /// The output of a take operation will be all columns from the input schema followed
@@ -654,6 +686,12 @@ impl ExecutionPlan for TakeExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Rows keep their order, but a changed input column must not let a
+        // sort above be pushed below the take.
+        vec![self.has_unchanged_input]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {

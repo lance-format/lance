@@ -497,13 +497,14 @@ impl<'a> CommitBuilder<'a> {
             commit_new_dataset(
                 object_store.as_ref(),
                 source_store.as_deref(),
-                commit_handler.as_ref(),
+                &commit_handler,
                 &base_path,
+                &dest.uri(),
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
-                session.store_registry(),
+                session.clone(),
             )
             .await?
         };
@@ -638,7 +639,7 @@ mod tests {
 
     use crate::utils::test::ThrottledStoreWrapper;
 
-    use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
 
     use super::*;
 
@@ -1161,6 +1162,119 @@ mod tests {
             matches!(&error, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
             "got {error:?}"
         );
+    }
+
+    /// Loses the first commit race without writing anything, then commits
+    /// through the wrapped handler.
+    #[derive(Debug)]
+    struct ConflictOnceCommitHandler {
+        inner: Arc<dyn CommitHandler>,
+        conflicted: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for ConflictOnceCommitHandler {
+        fn is_version_not_found_definitive(&self) -> bool {
+            self.inner.is_version_not_found_definitive()
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<TableTransaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            if !self
+                .conflicted
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CommitError::CommitConflict);
+            }
+            self.inner
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    /// A commit that starts far behind the latest version must not spend its
+    /// conflict-retry budget catching up. Every listing is slow here, so
+    /// catching up alone outlasts `retry_timeout`; the first attempt then
+    /// loses a race, and the retry must still get to run and succeed.
+    #[tokio::test]
+    async fn test_commit_retry_timeout_excludes_initial_catch_up() {
+        let catch_up_latency = Duration::from_millis(400);
+        let retry_timeout = Duration::from_millis(300);
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: catch_up_latency,
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = || {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+            )
+            .unwrap()
+        };
+        let stale = Arc::new(
+            InsertBuilder::new("memory://retry-after-catch-up")
+                .with_params(&write_params)
+                .execute(vec![batch()])
+                .await
+                .unwrap(),
+        );
+        // Versions committed by another writer after `stale` was read.
+        let mut latest = stale.clone();
+        for _ in 0..3 {
+            latest = Arc::new(
+                InsertBuilder::new(latest.clone())
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Append,
+                        ..write_params.clone()
+                    })
+                    .execute(vec![batch()])
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(latest.manifest.version, 4);
+
+        let committed = CommitBuilder::new(stale.clone())
+            .with_commit_handler(Arc::new(ConflictOnceCommitHandler {
+                inner: stale.commit_handler.clone(),
+                conflicted: std::sync::atomic::AtomicBool::new(false),
+            }))
+            .with_retry_timeout(retry_timeout)
+            .with_timeout(None)
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(committed.manifest.version, 5);
     }
 
     #[tokio::test]

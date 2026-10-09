@@ -353,7 +353,7 @@ pub(super) async fn build_scalar_index(
     params: &ScalarIndexParams,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
-    preprocessed_data: Option<SendableRecordBatchStream>,
+    preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
     let inverted_params = (params.index_type.eq_ignore_ascii_case("inverted")
@@ -404,7 +404,17 @@ pub(super) async fn build_scalar_index(
 
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match (preprocessed_data, resolved_fts_field.as_ref()) {
-        (Some(preprocessed_data), _) => preprocessed_data,
+        (Some((preprocessed_data, declared)), _) => {
+            let required = training_request.criteria();
+            if declared != *required {
+                return Err(Error::invalid_input(format!(
+                    "preprocessed data for index type '{}' is {declared:?}, but it trains from \
+                     {required:?}",
+                    params.index_type
+                )));
+            }
+            preprocessed_data
+        }
         (None, Some(resolved)) => {
             load_fts_training_data(
                 dataset,
@@ -572,7 +582,15 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    open_scalar_index_with_plan(dataset, column, index, None, metrics).await
+    open_scalar_index_with_plan(
+        dataset,
+        column,
+        index,
+        None,
+        super::frag_reuse::OpenPurpose::Query,
+        metrics,
+    )
+    .await
 }
 
 /// [`open_scalar_index`] for a segment the manifest does not list (a staged
@@ -584,6 +602,7 @@ pub(crate) async fn open_scalar_index_with_plan(
     column: &str,
     index: &IndexMetadata,
     staged: Option<&super::frag_reuse::SegmentRemappingPlan>,
+    purpose: super::frag_reuse::OpenPurpose,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let index_uuid = index.uuid;
@@ -592,8 +611,10 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let resolved =
-        super::frag_reuse::open_row_id_remapping_with_plan(dataset, index, staged, metrics).await?;
+    let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
+        dataset, index, staged, purpose, metrics,
+    )
+    .await?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
@@ -627,12 +648,15 @@ pub(crate) async fn open_scalar_index_with_plan(
                 .await?;
             }
 
+            let index_version = u32::try_from(index.index_version).unwrap_or(0);
+
             let index = match batch_remapping {
                 Some(remapping) => {
                     plugin
                         .load_index_with_remapping(
                             index_store,
                             &index_details,
+                            index_version,
                             Some(remapping),
                             &index_cache,
                         )
@@ -640,7 +664,13 @@ pub(crate) async fn open_scalar_index_with_plan(
                 }
                 None => {
                     plugin
-                        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                        .load_index(
+                            index_store,
+                            &index_details,
+                            index_version,
+                            frag_reuse_index,
+                            &index_cache,
+                        )
                         .await?
                 }
             };

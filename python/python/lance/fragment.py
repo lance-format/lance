@@ -1309,10 +1309,12 @@ def write_fragments(
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
     enable_stable_row_ids: bool
-        Experimental: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        Has no effect. Row ids are not assigned by this function; they are
+        assigned when the fragments are committed to a dataset (e.g. via
+        :class:`lance.LanceOperation.Append`, or
+        :class:`lance.LanceOperation.Merge` when merging staged fragments
+        with existing ones, together with :meth:`lance.LanceDataset.commit`),
+        based on whether the target dataset uses stable row ids.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.

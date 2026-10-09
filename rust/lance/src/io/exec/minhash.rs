@@ -789,7 +789,7 @@ mod tests {
             .unwrap();
         let allowed = batch[ROW_ID].as_primitive::<UInt64Type>().value(0);
         let found = hits(&dataset, BASE, 1, |scan| {
-            scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            scan.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 allowed,
             ])));
         })
