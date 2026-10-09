@@ -2224,6 +2224,10 @@ impl Scanner {
     /// Overrides the default (`get_num_compute_intensive_cpus()`). Used by
     /// `EnforceDistribution` and similar rules to decide how many parallel
     /// partitions to use. Set to 1 in tests that assert specific plan shapes.
+    ///
+    /// A scan that reads in order (see [`Self::scan_in_order`]) and has no sort
+    /// does not split its filters and projections across partitions, because
+    /// merging the partitions would lose the order.
     pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
         self.target_parallelism = Some(n);
         self
@@ -2950,6 +2954,30 @@ impl Scanner {
         }
 
         Ok(output_expr)
+    }
+
+    /// The `order_by` keys as columns of the final projection's output, or `None`
+    /// when a key does not pass through the projection unchanged.
+    fn ordering_in_output(
+        ordering: &[ColumnOrdering],
+        projection: &[(Arc<dyn PhysicalExpr>, String)],
+    ) -> Option<Vec<PhysicalSortExpr>> {
+        ordering
+            .iter()
+            .map(|col| {
+                let index = projection.iter().position(|(expr, _)| {
+                    expr.downcast_ref::<Column>()
+                        .is_some_and(|column| column.name() == col.column_name)
+                })?;
+                Some(PhysicalSortExpr {
+                    expr: Arc::new(Column::new(&projection[index].1, index)),
+                    options: SortOptions {
+                        descending: !col.ascending,
+                        nulls_first: col.nulls_first,
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Create a stream from the Scanner.
@@ -3842,6 +3870,10 @@ impl Scanner {
 
         // Final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        let output_sort = self
+            .ordering
+            .as_ref()
+            .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
@@ -3851,15 +3883,40 @@ impl Scanner {
         }
 
         let optimizer = get_physical_optimizer();
+        let optimize = |plan: Arc<dyn ExecutionPlan>, options: &ConfigOptions| {
+            optimizer
+                .rules
+                .iter()
+                .try_fold(plan, |plan, rule| rule.optimize(plan, options))
+        };
         let mut options = ConfigOptions::default();
         options.execution.target_partitions = self
             .target_parallelism
             .unwrap_or_else(get_num_compute_intensive_cpus);
-        for rule in optimizer.rules {
-            plan = rule.optimize(plan, &options)?;
+        // An unsorted scan declares no output ordering, so the partitions of a
+        // round-robin repartition would be merged in whichever order they finish.
+        let has_sort = self.ordering.is_some()
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.minhash_query.is_some();
+        options.optimizer.enable_round_robin_repartition = has_sort || !self.ordered;
+        let optimized = optimize(plan.clone(), &options)?;
+        let properties = optimized.properties();
+        // The final merge sorts by the output ordering, so with `order_by` it must
+        // cover every sort key. It cannot if the projection drops or changes one.
+        let keeps_order = match (&self.ordering, output_sort) {
+            (None, _) => properties.output_ordering().is_some(),
+            (Some(_), Some(output_sort)) => properties
+                .equivalence_properties()
+                .ordering_satisfy(output_sort)?,
+            (Some(_), None) => false,
+        };
+        if !has_sort || keeps_order {
+            return Ok(optimized);
         }
 
-        Ok(plan)
+        options.optimizer.enable_round_robin_repartition = false;
+        Ok(optimize(plan, &options)?)
     }
 
     // Check if a filter plan references version columns
@@ -13237,6 +13294,97 @@ mod test {
             plan.output_ordering().is_some(),
             "flat KNN must retain its output ordering:\n{displayed}"
         );
+    }
+
+    // More rows than one batch, so the row count alone does not keep the
+    // optimizer from splitting the read across partitions.
+    async fn scan_order_dataset() -> Dataset {
+        gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .col(
+                "grp",
+                array::cycle::<Int32Type>((0..12_288).map(|idx| idx / 1_000).collect()),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(4_096))
+            .await
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::computed_column(None, &[], &[], false)]
+    // Row 1 of fragments 2, 1 and 0
+    #[case::take_with_filter(
+        Some("_rowid IN (8589934593, 4294967297, 1) AND idx >= 0"),
+        &[],
+        &[],
+        false
+    )]
+    #[case::sort_column_projected_away(None, &["idx"], &[], false)]
+    // The sorted partitions are merged back in order, so they may run in parallel.
+    #[case::sort_column_kept(None, &["idx"], &[("idx", "idx")], true)]
+    #[case::sort_key_partly_projected(None, &["grp", "idx"], &[("grp", "grp")], false)]
+    // `idx > 0` keeps an ordering on its second column, but a weaker one than `idx`.
+    #[case::sort_key_weakened(
+        None,
+        &["grp", "idx"],
+        &[("grp", "grp"), ("flag", "idx > 0")],
+        false
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_order_survives_parallelism(
+        #[case] filter: Option<&str>,
+        #[case] descending_by: &[&str],
+        #[case] extra_columns: &[(&str, &str)],
+        #[case] round_robin: bool,
+    ) {
+        let dataset = scan_order_dataset().await;
+        let mut scan = dataset.scan();
+        scan.target_parallelism(8);
+        let mut columns = vec![("foo", "idx * 2")];
+        columns.extend_from_slice(extra_columns);
+        scan.project_with_transform(&columns).unwrap();
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+        }
+        if !descending_by.is_empty() {
+            let ordering = descending_by
+                .iter()
+                .map(|column| ColumnOrdering::desc_nulls_first(column.to_string()))
+                .collect();
+            scan.order_by(Some(ordering)).unwrap();
+        }
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("RoundRobinBatch"), round_robin, "{plan}");
+        let mut expected = match filter {
+            Some(_) => vec![1, 4_097, 8_193],
+            None => (0..12_288).collect::<Vec<i32>>(),
+        };
+        if !descending_by.is_empty() {
+            expected.reverse();
+        }
+        let expected = expected.iter().map(|idx| idx * 2).collect::<Vec<_>>();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["foo"].as_primitive::<Int32Type>().values(),
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unordered_scan_keeps_parallelism() {
+        let dataset = scan_order_dataset().await;
+        let mut scan = dataset.scan();
+        scan.target_parallelism(8);
+        scan.scan_in_order(false);
+        scan.project_with_transform(&[("foo", "idx * 2")]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("RoundRobinBatch"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut values = batch["foo"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..12_288).map(|idx| idx * 2).collect::<Vec<_>>());
     }
 
     #[rstest]

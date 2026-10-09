@@ -799,6 +799,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_minhash_search_unordered_scan_keeps_rank_order() {
+        let dataset = indexed_dataset().await;
+        let explained = plan(&dataset, |scan| {
+            scan.scan_in_order(false).target_parallelism(8);
+            scan.project_with_transform(&[("id", "id"), ("foo", "id * 2")])
+                .unwrap();
+        })
+        .await;
+        // The search emits rows by rank but declares no ordering, so nothing may
+        // split them across partitions.
+        assert!(!explained.contains("RoundRobinBatch"), "{explained}");
+    }
+
+    #[tokio::test]
     async fn test_minhash_search_rejects_invalid_scans() {
         let dataset = indexed_dataset().await;
 
