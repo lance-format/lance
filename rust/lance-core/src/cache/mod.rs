@@ -51,13 +51,16 @@ pub mod codec;
 mod entry_io;
 mod key;
 mod moka;
+mod priority;
 mod quick;
+pub use priority::PriorityEntries;
 mod registry;
 
-pub use backend::{CacheBackend, CacheEntry};
+pub use backend::{CacheBackend, CacheEntry, CacheTier};
 pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
-    CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
+    CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, CacheRangeReader, MAGIC,
+    has_cache_envelope,
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
@@ -135,6 +138,11 @@ pub trait CacheKey {
     /// paths override this with typed, allocation-free field encoding.
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(self.key().as_ref());
+    }
+
+    /// Per-key cache policy, defaulting to the value type's codec.
+    fn codec_for_key(&self) -> Option<CacheCodec> {
+        Self::codec()
     }
 
     /// Optional codec for serializing/deserializing this key's value type.
@@ -363,8 +371,77 @@ impl LanceCache {
         let key = self.sized_key(cache_key);
         self.state
             .backend
-            .insert(&key, metadata, size, K::codec())
+            .insert(&key, metadata, size, cache_key.codec_for_key())
             .await;
+    }
+
+    /// Read a resident entry without loading its disk copy.
+    pub async fn get_resident_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        self.state
+            .backend
+            .get_resident(&key)
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()
+    }
+
+    /// Report whether an entry is resident without counting as an access.
+    pub async fn peek_resident_with_key<K: CacheKey>(&self, cache_key: &K) -> bool {
+        let key = self.sized_key(cache_key);
+        self.state.backend.peek_resident(&key).await
+    }
+
+    /// Predict which tier would serve a read of the entry, without reading it
+    /// or counting as an access; see [`CacheBackend::peek_tier`].
+    pub async fn peek_tier_with_key<K: CacheKey>(&self, cache_key: &K) -> CacheTier {
+        let key = self.sized_key(cache_key);
+        self.state.backend.peek_tier(&key).await
+    }
+
+    /// Whether lower layered planes gate RAM admission on a resident sign plane.
+    pub fn plane_admission_gated(&self) -> bool {
+        self.state.backend.plane_admission_gated()
+    }
+
+    /// Read memory or persistent storage without promoting a persistent hit.
+    pub async fn get_without_promotion_with_key<K>(
+        &self,
+        cache_key: &K,
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key = self.sized_key(cache_key);
+        self.state
+            .backend
+            .get_without_promotion(&key, cache_key.codec_for_key())
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()
+    }
+
+    /// Read selected rows from a persistent entry without memory admission.
+    pub async fn get_rows_with_key<K>(
+        &self,
+        cache_key: &K,
+        rows: &[u32],
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.state
+            .backend
+            .get_rows(&self.sized_key(cache_key), rows, cache_key.codec_for_key())
+            .await?
+            .downcast::<K::ValueType>()
+            .ok()
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -373,7 +450,12 @@ impl LanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let key = self.sized_key(cache_key);
-        let Some(entry) = self.state.backend.get(&key, K::codec()).await else {
+        let Some(entry) = self
+            .state
+            .backend
+            .get(&key, cache_key.codec_for_key())
+            .await
+        else {
             self.state.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -449,7 +531,7 @@ impl LanceCache {
         let (entry, was_cached) = self
             .state
             .backend
-            .get_or_insert(&key, typed_loader, K::codec())
+            .get_or_insert(&key, typed_loader, cache_key.codec_for_key())
             .await?;
         let entry = entry.downcast::<K::ValueType>().map_err(|_| {
             self.state.misses.fetch_add(1, Ordering::Relaxed);
@@ -583,6 +665,65 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
         }
+    }
+
+    /// Read RAM only, avoiding whole-entry promotion for candidate range reads.
+    pub async fn get_resident_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?.get_resident_with_key(cache_key).await
+    }
+
+    /// Report residency without counting as an access; a dropped cache holds nothing.
+    pub async fn peek_resident_with_key<K: CacheKey>(&self, cache_key: &K) -> bool {
+        match self.upgrade() {
+            Some(cache) => cache.peek_resident_with_key(cache_key).await,
+            None => false,
+        }
+    }
+
+    /// Predict the serving tier without counting as an access; a dropped
+    /// cache holds nothing.
+    pub async fn peek_tier_with_key<K: CacheKey>(&self, cache_key: &K) -> CacheTier {
+        match self.upgrade() {
+            Some(cache) => cache.peek_tier_with_key(cache_key).await,
+            None => CacheTier::Absent,
+        }
+    }
+
+    /// Whether lower layered planes gate RAM admission; a dropped cache keeps the default.
+    pub fn plane_admission_gated(&self) -> bool {
+        self.upgrade()
+            .is_none_or(|cache| cache.plane_admission_gated())
+    }
+
+    /// Read a cached candidate plane without whole-entry RAM admission.
+    pub async fn get_without_promotion_with_key<K>(
+        &self,
+        cache_key: &K,
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?
+            .get_without_promotion_with_key(cache_key)
+            .await
+    }
+
+    /// Read selected cached rows without promoting a whole plane.
+    pub async fn get_rows_with_key<K>(
+        &self,
+        cache_key: &K,
+        rows: &[u32],
+    ) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        self.upgrade()?.get_rows_with_key(cache_key, rows).await
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -1069,6 +1210,84 @@ mod tests {
             Some(&vec![2])
         );
         assert_eq!((cache.stats().await.hits, cache.size().await), (2, 2));
+    }
+
+    #[test]
+    fn plane_admission_gating_passes_through() {
+        let cache = LanceCache::with_capacity(4096);
+        let weak = WeakLanceCache::from(&cache);
+        assert!(cache.plane_admission_gated() && weak.plane_admission_gated());
+
+        drop(cache);
+        assert!(weak.plane_admission_gated());
+    }
+
+    #[tokio::test]
+    async fn residency_peek_passes_through() {
+        let cache = LanceCache::with_capacity(4096);
+        let weak = WeakLanceCache::from(&cache);
+        assert!(!cache.peek_resident_with_key(&TestKey::new(1)).await);
+        cache
+            .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+            .await;
+        assert!(cache.peek_resident_with_key(&TestKey::new(1)).await);
+        assert!(weak.peek_resident_with_key(&TestKey::new(1)).await);
+        assert!(!weak.peek_resident_with_key(&TestKey::new(2)).await);
+
+        drop(cache);
+        assert!(!weak.peek_resident_with_key(&TestKey::new(1)).await);
+    }
+
+    /// Lance's in-memory backends have no tier below RAM, so the default tier
+    /// peek reports resident entries and nothing else as held. Peeks are not
+    /// accesses: they count neither hits nor misses.
+    #[tokio::test]
+    async fn tier_peek_defaults_to_residency_without_access() {
+        for kind in [TestBackendKind::Moka, TestBackendKind::Quick] {
+            let cache = kind.cache(4096);
+            let weak = WeakLanceCache::from(&cache);
+            assert_eq!(
+                cache.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+            cache
+                .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+                .await;
+            assert_eq!(
+                cache.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Resident,
+                "{kind:?}"
+            );
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Resident,
+                "{kind:?}"
+            );
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(2)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+            let stats = cache.stats().await;
+            assert_eq!((stats.hits, stats.misses), (0, 0), "{kind:?}");
+
+            cache.clear().await;
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+            cache
+                .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+                .await;
+            drop(cache);
+            assert_eq!(
+                weak.peek_tier_with_key(&TestKey::new(1)).await,
+                CacheTier::Absent,
+                "{kind:?}"
+            );
+        }
     }
 
     #[tokio::test]
