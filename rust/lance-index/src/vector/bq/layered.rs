@@ -33,8 +33,13 @@ impl RQLayout {
 }
 
 use super::ex_dot::{blocked_ex_code_bytes, pack_blocked_row};
-use super::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN};
-use super::transform::{EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD};
+use super::storage::{
+    RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN, RABIT_CODE_COLUMN,
+};
+use super::transform::{
+    ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_ADD_FACTORS_FIELD,
+    EX_SCALE_FACTORS_COLUMN, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_COLUMN,
+};
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
 use arrow_schema::{DataType, Field};
 use lance_arrow::FixedSizeListArrayExt;
@@ -227,15 +232,67 @@ impl DeepSizeOf for PlaneBatch {
         self.0.deep_size_of_children(context)
     }
 }
+
+/// Plane entry holding a layered partition's [`HIGH_BOUNDS_COLUMN`] and
+/// [`FULL_BOUNDS_COLUMN`] under [`SignBounds::Lazy`]. Only High precision,
+/// and full precision on a file without error factors, prune with them.
+pub const SIGN_BOUNDS_PLANE: u8 = 3;
+
+/// Memory priority of the sign plane. Priority-aware tiers keep the sign
+/// plane over the high plane over the low plane.
+const SIGN_PLANE_MEMORY_PRIORITY: u8 = 3;
+
+/// Where a layered index's cache keeps the estimator bounds columns
+/// ([`HIGH_BOUNDS_COLUMN`], [`FULL_BOUNDS_COLUMN`]). The placement decides
+/// what the sign plane entry holds, so it is part of that entry's key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SignBounds {
+    /// In their own plane entry, [`SIGN_BOUNDS_PLANE`], read only by the
+    /// scans that prune with them. Full-precision scans prune with the
+    /// native error factors instead, so they read them only on a file
+    /// without error factors.
+    #[default]
+    Lazy,
+    /// In the sign plane entry, so every scan reads them with the sign
+    /// codes. There is no bounds plane.
+    Eager,
+}
+
+impl SignBounds {
+    /// The spelling of `LANCE_RQ_SIGN_BOUNDS`: `lazy` or `eager`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lazy => "lazy",
+            Self::Eager => "eager",
+        }
+    }
+}
+
+impl std::fmt::Display for SignBounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Plane keys live under the immutable index UUID namespace.
 pub struct PlaneKey {
     pub partition: usize,
     pub plane: u8,
+    /// The index's bounds placement. Only the sign plane's key depends on
+    /// it: the other planes hold the same columns under either placement.
+    pub sign_bounds: SignBounds,
 }
 impl CacheKey for PlaneKey {
     type ValueType = PlaneBatch;
     fn key(&self) -> Cow<'_, str> {
-        format!("{}:{}", self.partition, self.plane).into()
+        // Persisted entries outlive the process, so each sign-plane
+        // composition needs its own key. The sign plane with bounds keeps
+        // the key its entries had before the bounds plane existed.
+        if self.plane == 0 && self.sign_bounds == SignBounds::Lazy {
+            format!("{}:0-bounds", self.partition).into()
+        } else {
+            format!("{}:{}", self.partition, self.plane).into()
+        }
     }
     fn type_name() -> &'static str {
         "RQPlane"
@@ -244,7 +301,7 @@ impl CacheKey for PlaneKey {
         Self::codec().map(|codec| {
             codec
                 .with_plane_tag(self.plane)
-                .with_memory_priority(3 - self.plane)
+                .with_memory_priority(plane_memory_priority(self.plane))
         })
     }
     fn codec() -> Option<CacheCodec> {
@@ -252,33 +309,50 @@ impl CacheKey for PlaneKey {
     }
 }
 
-/// Column projection for sign (0), high (1), or low (2), including factors.
-pub fn plane_columns(plane: u8) -> &'static [&'static str] {
-    use super::storage::RABIT_CODE_COLUMN;
-    use super::transform::{
-        ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
-        SCALE_FACTORS_COLUMN,
-    };
+/// The bounds plane is read with the high plane, by High precision, so it
+/// ranks with it.
+fn plane_memory_priority(plane: u8) -> u8 {
     match plane {
-        0 => &[
-            lance_core::ROW_ID,
-            RABIT_CODE_COLUMN,
-            ADD_FACTORS_COLUMN,
-            SCALE_FACTORS_COLUMN,
-            ERROR_FACTORS_COLUMN,
-            HIGH_BOUNDS_COLUMN,
-            FULL_BOUNDS_COLUMN,
-        ],
-        1 => &[
+        SIGN_BOUNDS_PLANE => SIGN_PLANE_MEMORY_PRIORITY - 1,
+        _ => SIGN_PLANE_MEMORY_PRIORITY.saturating_sub(plane),
+    }
+}
+
+/// The sign plane's columns under [`SignBounds::Eager`]: those it keeps
+/// under [`SignBounds::Lazy`], then the bounds plane's.
+static SIGN_PLANE_WITH_BOUNDS_COLUMNS: [&str; 7] = [
+    lance_core::ROW_ID,
+    RABIT_CODE_COLUMN,
+    ADD_FACTORS_COLUMN,
+    SCALE_FACTORS_COLUMN,
+    ERROR_FACTORS_COLUMN,
+    HIGH_BOUNDS_COLUMN,
+    FULL_BOUNDS_COLUMN,
+];
+/// Where the bounds columns start in [`SIGN_PLANE_WITH_BOUNDS_COLUMNS`].
+const BOUNDS_COLUMNS_START: usize = 5;
+
+/// Column projection of a layered partition's plane entry, including its
+/// factors: sign (0), high (1), low (2) or [`SIGN_BOUNDS_PLANE`], with the
+/// bounds columns placed by `sign_bounds`. Empty for a plane the placement
+/// does not have.
+pub fn plane_columns(plane: u8, sign_bounds: SignBounds) -> &'static [&'static str] {
+    match (plane, sign_bounds) {
+        (0, SignBounds::Lazy) => &SIGN_PLANE_WITH_BOUNDS_COLUMNS[..BOUNDS_COLUMNS_START],
+        (0, SignBounds::Eager) => &SIGN_PLANE_WITH_BOUNDS_COLUMNS,
+        (1, _) => &[
             RABIT_BLOCKED_EX_CODE_COLUMN,
             HIGH_ADD_FACTORS_COLUMN,
             HIGH_SCALE_FACTORS_COLUMN,
         ],
-        2 => &[
+        (2, _) => &[
             RABIT_BLOCKED_EX_CODE_LO_COLUMN,
             EX_ADD_FACTORS_COLUMN,
             EX_SCALE_FACTORS_COLUMN,
         ],
+        (SIGN_BOUNDS_PLANE, SignBounds::Lazy) => {
+            &SIGN_PLANE_WITH_BOUNDS_COLUMNS[BOUNDS_COLUMNS_START..]
+        }
         _ => &[],
     }
 }
@@ -654,18 +728,188 @@ mod tests {
 
     #[test]
     fn plane_key_codec_tags_plane_and_priority() {
-        for plane in 0..=2u8 {
+        for (plane, priority) in [(0, 3), (1, 2), (2, 1), (SIGN_BOUNDS_PLANE, 2)] {
             let codec = PlaneKey {
                 partition: 7,
                 plane,
+                sign_bounds: SignBounds::Lazy,
             }
             .codec_for_key()
             .unwrap();
             assert_eq!(codec.plane_tag(), Some(plane));
-            assert_eq!(codec.memory_priority(), 3 - plane);
+            assert_eq!(codec.memory_priority(), priority);
             assert!(codec.supports_row_selection());
         }
         assert_eq!(PlaneKey::codec().unwrap().plane_tag(), None);
+    }
+
+    /// Only the sign plane's key depends on the bounds placement, and the
+    /// sign plane with bounds keeps its original key.
+    #[test]
+    fn plane_key_separates_sign_plane_compositions() {
+        let key = |plane, sign_bounds| {
+            let plane_key = PlaneKey {
+                partition: 7,
+                plane,
+                sign_bounds,
+            };
+            plane_key.key().into_owned()
+        };
+        assert_eq!(key(0, SignBounds::Eager), "7:0");
+        assert_ne!(key(0, SignBounds::Lazy), key(0, SignBounds::Eager));
+        for plane in [1, 2, SIGN_BOUNDS_PLANE] {
+            assert_eq!(key(plane, SignBounds::Lazy), format!("7:{plane}"));
+            assert_eq!(key(plane, SignBounds::Eager), format!("7:{plane}"));
+        }
+    }
+
+    /// The bounds plane holds exactly the columns the lazy placement leaves
+    /// out of the sign plane, in the eager sign plane's order.
+    #[test]
+    fn plane_columns_place_bounds_by_sign_bounds() {
+        let lazy_sign = plane_columns(0, SignBounds::Lazy);
+        let bounds = plane_columns(SIGN_BOUNDS_PLANE, SignBounds::Lazy);
+        assert_eq!(bounds, [HIGH_BOUNDS_COLUMN, FULL_BOUNDS_COLUMN]);
+        assert_eq!(
+            [lazy_sign, bounds].concat(),
+            plane_columns(0, SignBounds::Eager)
+        );
+        assert!(!lazy_sign.iter().any(|name| bounds.contains(name)));
+        assert!(plane_columns(SIGN_BOUNDS_PLANE, SignBounds::Eager).is_empty());
+        for plane in [1, 2] {
+            assert_eq!(
+                plane_columns(plane, SignBounds::Lazy),
+                plane_columns(plane, SignBounds::Eager)
+            );
+            assert_eq!(plane_columns(plane, SignBounds::Lazy).len(), 3);
+        }
+        assert!(plane_columns(SIGN_BOUNDS_PLANE + 1, SignBounds::Lazy).is_empty());
+    }
+
+    /// A layered store needs the full bounds only to prune full precision on
+    /// a file without error factors. Without the high bounds, a High scan of
+    /// a layered store scores every row instead of pruning with the error
+    /// factors, which bound only the full-precision estimator.
+    #[rstest]
+    fn layered_bounds_required_only_when_read(
+        #[values(DistanceType::L2, DistanceType::Dot)] distance_type: DistanceType,
+    ) {
+        const ROWS: usize = 37;
+        const DIM: usize = 64;
+        let values: Vec<f32> = (0..DIM * ROWS)
+            .map(|i| ((i * 13 % 97) as f32 - 48.) / 48.)
+            .collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values.clone()), DIM as i32)
+                .unwrap();
+        let rq = RabitQuantizer::build(
+            &vectors,
+            distance_type,
+            &RQBuildParams::new(7).with_layered(true),
+        )
+        .unwrap();
+        let norms = Float32Array::from(
+            values
+                .chunks(DIM)
+                .map(|r| r.iter().map(|v| v * v).sum::<f32>())
+                .collect::<Vec<_>>(),
+        );
+        let input = RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(vectors) as ArrayRef),
+            (
+                lance_core::ROW_ID,
+                Arc::new(UInt64Array::from((0..ROWS as u64).collect::<Vec<_>>())) as ArrayRef,
+            ),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0; ROWS])) as ArrayRef,
+            ),
+            (CENTROID_DIST_COLUMN, Arc::new(norms) as ArrayRef),
+        ])
+        .unwrap();
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap();
+        let batch = RQTransformer::new(rq.clone(), distance_type, centroids, "vector")
+            .unwrap()
+            .transform(&input)
+            .unwrap();
+        let metadata = rq.metadata_ref();
+        let open = |batch: RecordBatch| {
+            RabitQuantizationStorage::try_from_batch(batch, metadata, distance_type, None)
+        };
+        let lean_batch = batch
+            .drop_column(HIGH_BOUNDS_COLUMN)
+            .unwrap()
+            .drop_column(FULL_BOUNDS_COLUMN)
+            .unwrap();
+        let bounded = open(batch.clone()).unwrap();
+        let lean = open(lean_batch.clone()).unwrap();
+        let query: ArrayRef = Arc::new(Float32Array::from(values[..DIM].to_vec()));
+        let dist_q_c = match distance_type {
+            DistanceType::L2 => values[..DIM].iter().map(|v| v * v).sum(),
+            _ => 1.0,
+        };
+        fn lower_bounds(calc: &super::super::storage::RabitDistCalculator<'_>) -> Vec<Option<u32>> {
+            calc.binary_inner_products()
+                .into_iter()
+                .enumerate()
+                .map(|(row, ip)| calc.raw_query_lower_bound(row, ip).map(f32::to_bits))
+                .collect()
+        }
+        for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
+            for rq_precision in [RQPrecision::High, RQPrecision::Full] {
+                let options = DistanceCalculatorOptions {
+                    approx_mode,
+                    rq_precision,
+                };
+                let case = format!("{distance_type:?} {approx_mode:?} {rq_precision:?}");
+                let (mut bounded_scratch, mut lean_scratch) = (Vec::new(), Vec::new());
+                let bounded_calc = bounded.dist_calculator_with_scratch(
+                    query.clone(),
+                    dist_q_c,
+                    None,
+                    &mut bounded_scratch,
+                    options,
+                );
+                let lean_calc = lean.dist_calculator_with_scratch(
+                    query.clone(),
+                    dist_q_c,
+                    None,
+                    &mut lean_scratch,
+                    options,
+                );
+                assert_eq!(
+                    lean_calc.distance_all(ROWS),
+                    bounded_calc.distance_all(ROWS),
+                    "{case}"
+                );
+                let bounded_bounds = lower_bounds(&bounded_calc);
+                assert!(bounded_bounds.iter().all(Option::is_some), "{case}");
+                if rq_precision == RQPrecision::Full {
+                    assert_eq!(lower_bounds(&lean_calc), bounded_bounds, "{case}");
+                } else {
+                    assert!(
+                        lower_bounds(&lean_calc).iter().all(Option::is_none),
+                        "{case}"
+                    );
+                }
+            }
+        }
+
+        let error = open(lean_batch.drop_column(ERROR_FACTORS_COLUMN).unwrap()).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("missing column"), "{error}");
+        assert!(message.contains(FULL_BOUNDS_COLUMN), "{error}");
+        open(
+            batch
+                .drop_column(ERROR_FACTORS_COLUMN)
+                .unwrap()
+                .drop_column(HIGH_BOUNDS_COLUMN)
+                .unwrap(),
+        )
+        .unwrap();
     }
 
     #[rstest]
