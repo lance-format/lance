@@ -13,7 +13,7 @@ from .lance import RewriteResult as RewriteResult
 # from .lance import CompactionPlan as CompactionPlan
 
 
-class CompactionOptions(TypedDict):
+class CompactionOptions(TypedDict, total=False):
     """Options for compaction."""
 
     target_rows_per_fragment: Optional[int]
@@ -41,7 +41,7 @@ class CompactionOptions(TypedDict):
     Whether to compact fragments with soft deleted rows so they are no
     longer present in the file. (default: True)
     """
-    materialize_deletions_threadhold: Optional[float]
+    materialize_deletions_threshold: Optional[float]
     """
     The fraction of original rows that are soft deleted in a fragment
     before the fragment is a candidate for compaction.
@@ -120,4 +120,14 @@ class CompactionOptions(TypedDict):
     remain unchanged and act as boundaries, so fragments on opposite sides
     are not combined into the same task. Duplicate and unknown IDs are
     ignored. (default: None)
+    """
+    data_storage_version: Optional[str]
+    """
+    Output data file version, such as "2.2", "stable", or "next". If omitted,
+    compaction uses the compaction config target when set, otherwise the dataset's
+    default write version. It does not change that default.
+    The planner fixes release selectors to exact versions before distributing
+    tasks. V1/V2 cross-family targets are rejected. Binary copy requires matching
+    input versions and no overlays; TryBinaryCopy reencodes ineligible inputs,
+    while ForceBinaryCopy reports an error.
     """

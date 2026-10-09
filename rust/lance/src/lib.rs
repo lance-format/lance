@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// The streaming IVF training stack (see index::vector::ivf), awaited whole by
+// its training tests, has a future type that nests past the default limit of
+// 128. `recursion_limit` is a crate-level inner attribute, so it necessarily
+// applies to every build of this crate, not only the test build that currently
+// exercises that future. benches/streaming_ivf_training.rs raises the limit for
+// the same stack.
+#![recursion_limit = "256"]
+
 //! Lance Columnar Data Format
 //!
 //! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,

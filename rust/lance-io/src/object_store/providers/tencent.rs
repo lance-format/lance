@@ -101,6 +101,8 @@ impl ObjectStoreProvider for TencentStoreProvider {
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            paginated_lister: None,
         })
     }
 }

@@ -41,12 +41,17 @@
 //! ```
 
 use std::cell::UnsafeCell;
+use std::collections::HashSet;
 use std::mem::MaybeUninit;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
+use arrow_buffer::Buffer;
 use arrow_schema::DataType;
+
+use crate::dataset::mem_wal::MemTableDataTarget;
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -100,7 +105,7 @@ impl StoredBatch {
     /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
     /// zero-copy slices and are counted at full capacity for each slice — an
     /// over-count in the safe direction.
-    fn estimate_array_size(data: &ArrayData) -> usize {
+    pub(crate) fn estimate_array_size(data: &ArrayData) -> usize {
         match data.get_slice_memory_size() {
             Ok(size) => size + Self::view_data_buffers_size(data),
             // Fall back to the full-buffer sum for layouts the slice-aware call
@@ -198,6 +203,18 @@ pub struct BatchStore {
     /// Estimated size in bytes (for flush threshold).
     estimated_bytes: AtomicUsize,
 
+    /// Sum of [`Buffer::capacity`] over the distinct allocations the stored
+    /// batches keep alive. See [`Self::retained_bytes`].
+    retained_bytes: AtomicUsize,
+
+    /// Addresses of the allocations already counted into `retained_bytes`, so
+    /// batches sharing a parent buffer charge it once.
+    ///
+    /// Only `append`/`append_batches` touch it, already serialized by the
+    /// writer guard; the `Mutex` is what makes that sound for a `Sync` type,
+    /// not a second layer of exclusion.
+    retained_buffers: Mutex<HashSet<usize>>,
+
     /// Writer-global coordinate of this store's batch 0.
     ///
     /// A *coordinate*, not a cursor: stamped once at construction and never
@@ -206,6 +223,14 @@ pub struct BatchStore {
     /// lets a writer-global cursor (the WAL durability count) be mapped onto a
     /// particular store.
     global_offset: usize,
+
+    /// Final generation/data-file identity for batches in this store.
+    target: Option<MemTableDataTarget>,
+
+    /// The memtable generation these batches belong to. Recorded in each WAL
+    /// entry so replay keeps the writer's generation boundaries, even if the
+    /// shard is reopened with a different size limit.
+    generation: u64,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -245,6 +270,15 @@ impl BatchStore {
     /// batch sequence. Used by `freeze_memtable` for every memtable after the
     /// first; the first starts at 0.
     pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
+        Self::with_capacity_at_target(capacity, global_offset, None, 0)
+    }
+
+    pub(crate) fn with_capacity_at_target(
+        capacity: usize,
+        global_offset: usize,
+        target: Option<MemTableDataTarget>,
+        generation: u64,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
         // Allocate uninitialized storage
@@ -260,8 +294,17 @@ impl BatchStore {
             capacity,
             total_rows: AtomicUsize::new(0),
             estimated_bytes: AtomicUsize::new(0),
+            retained_bytes: AtomicUsize::new(0),
+            retained_buffers: Mutex::new(HashSet::new()),
             global_offset,
+            target,
+            generation,
         }
+    }
+
+    /// The memtable generation these batches belong to.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Calculate recommended capacity from memtable size configuration.
@@ -318,6 +361,7 @@ impl BatchStore {
         // Row offset is the total rows BEFORE this batch
         let row_offset = self.total_rows.load(Ordering::Relaxed) as u64;
 
+        let retained = self.charge_retained(&batch);
         let stored = StoredBatch::new(batch, row_offset, idx);
         let num_rows = stored.num_rows;
         let estimated_size = stored.estimated_size;
@@ -335,6 +379,7 @@ impl BatchStore {
         self.total_rows.fetch_add(num_rows, Ordering::Relaxed);
         self.estimated_bytes
             .fetch_add(estimated_size, Ordering::Relaxed);
+        self.retained_bytes.fetch_add(retained, Ordering::Relaxed);
 
         // CRITICAL: Publish with Release ordering.
         // This ensures all writes above are visible to readers
@@ -375,11 +420,13 @@ impl BatchStore {
         let mut results = Vec::with_capacity(count);
         let mut total_rows_added = 0usize;
         let mut total_bytes_added = 0usize;
+        let mut total_retained_added = 0usize;
         let mut row_offset = self.total_rows.load(Ordering::Relaxed) as u64;
 
         // Write all batches to slots (not yet visible to readers)
         for (i, batch) in batches.into_iter().enumerate() {
             let idx = start_idx + i;
+            total_retained_added += self.charge_retained(&batch);
             let stored = StoredBatch::new(batch, row_offset, idx);
             let num_rows = stored.num_rows;
             let estimated_size = stored.estimated_size;
@@ -404,6 +451,8 @@ impl BatchStore {
             .fetch_add(total_rows_added, Ordering::Relaxed);
         self.estimated_bytes
             .fetch_add(total_bytes_added, Ordering::Relaxed);
+        self.retained_bytes
+            .fetch_add(total_retained_added, Ordering::Relaxed);
 
         // CRITICAL: Publish ALL batches at once with Release ordering.
         // This ensures all writes above are visible to readers
@@ -412,6 +461,57 @@ impl BatchStore {
             .store(start_idx + count, Ordering::Release);
 
         Ok(results)
+    }
+
+    /// Charge the allocations `batch` retains that this store has not counted
+    /// yet, and return how much that added.
+    ///
+    /// The unit is the allocation, not the window a batch reads through it: a
+    /// one-row zero-copy slice pins its whole parent buffer, so measuring the
+    /// window would let an unbounded footprint in under a small number.
+    ///
+    /// Charged once per *distinct buffer view*, not strictly once per
+    /// allocation. `ArrayData::slice` advances the offset and leaves the buffer
+    /// pointer alone, so ordinary slices of one parent do dedupe; a buffer that
+    /// came back re-sliced from a kernel (`Buffer::slice_with_length`, concat or
+    /// take output) presents a different `data_ptr` for the same allocation and
+    /// is charged again in full. That over-counts, which is the safe direction
+    /// for a ceiling.
+    ///
+    /// `retained_buffers` is never pruned: it grows with every batch this store
+    /// accepts, bounded only by the store being dropped at flush. The walk plus
+    /// `to_data`, the mutex and a hash insert run per column per append — fine
+    /// at current batch rates, and the thing to look at first if that changes.
+    ///
+    /// Call under the writer guard, before the batch is moved into its slot.
+    fn charge_retained(&self, batch: &RecordBatch) -> usize {
+        let mut seen = self.retained_buffers.lock().unwrap();
+        let mut added = 0;
+        for column in batch.columns() {
+            Self::walk_buffers(&column.to_data(), &mut |buffer| {
+                if seen.insert(buffer.data_ptr().as_ptr() as usize) {
+                    // `capacity` reads 0 for a foreign allocation whose size
+                    // arrow was not told; the window is the only figure left.
+                    added += buffer.capacity().max(buffer.len());
+                }
+            });
+        }
+        added
+    }
+
+    /// Every buffer reachable from `data`, validity and nested children
+    /// included — `ArrayData::buffers` alone omits both, and the variadic
+    /// `Utf8View`/`BinaryView` data buffers hang off it as ordinary entries.
+    fn walk_buffers(data: &ArrayData, visit: &mut impl FnMut(&Buffer)) {
+        for buffer in data.buffers() {
+            visit(buffer);
+        }
+        if let Some(nulls) = data.nulls() {
+            visit(nulls.buffer());
+        }
+        for child in data.child_data() {
+            Self::walk_buffers(child, visit);
+        }
     }
 
     fn acquire_writer(&self) -> BatchStoreWriterGuard<'_> {
@@ -461,8 +561,25 @@ impl BatchStore {
 
     /// Get estimated size in bytes.
     #[inline]
-    pub fn estimated_bytes(&self) -> usize {
+    pub fn row_bytes(&self) -> usize {
         self.estimated_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Heap this store actually keeps alive: every distinct allocation its
+    /// batches reference, counted once at its full capacity.
+    ///
+    /// Differs from [`Self::row_bytes`] wherever a batch is a zero-copy slice.
+    /// `row_bytes` measures the window, because it drives the flush threshold
+    /// and a flush writes only the rows in that window. This measures what the
+    /// allocator cannot hand back until the memtable is dropped — which is the
+    /// question a memory ceiling is asking. Sixteen one-row slices of sixteen
+    /// large parents are megabytes here and a few hundred bytes there.
+    ///
+    /// Deduplicated within a store, not across them: two memtables slicing one
+    /// parent each charge it in full, which errs toward refusing writes.
+    #[inline]
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Relaxed)
     }
 
     // =========================================================================
@@ -479,6 +596,10 @@ impl BatchStore {
     #[inline]
     pub fn global_offset(&self) -> usize {
         self.global_offset
+    }
+
+    pub(crate) fn target(&self) -> Option<&MemTableDataTarget> {
+        self.target.as_ref()
     }
 
     /// The local exclusive end of this store covered by a writer-global cursor.
@@ -1093,7 +1214,7 @@ mod tests {
 
         // Two non-nullable Int32 columns → exactly 4 bytes/row/col of payload.
         let payload_bytes = num_slices * chunk * 2 * std::mem::size_of::<i32>();
-        let estimated = store.estimated_bytes();
+        let estimated = store.row_bytes();
         assert!(
             estimated >= payload_bytes,
             "estimate {estimated} should cover the actual payload {payload_bytes}"
@@ -1103,6 +1224,54 @@ mod tests {
         assert!(
             estimated * 10 < over_counting_sum,
             "estimate {estimated} should be far below the over-counting sum {over_counting_sum}"
+        );
+    }
+
+    /// `row_bytes` and `retained_bytes` answer different questions about the
+    /// same slices, and a memory ceiling needs the second one.
+    #[test]
+    fn test_retained_bytes_counts_pinned_parents_once() {
+        let chunk = 100_000;
+
+        // Sixteen one-row slices, each off its own parent. The windows are
+        // trivial, but every parent stays alive in full for as long as the
+        // store does — this is the shape that lets a window-based ledger admit
+        // an unbounded footprint.
+        let distinct = BatchStore::with_capacity(16);
+        for _ in 0..16 {
+            distinct
+                .append(create_test_batch(chunk).slice(0, 1))
+                .unwrap();
+        }
+        // Two non-nullable Int32 columns.
+        let parent_payload = 16 * chunk * 2 * std::mem::size_of::<i32>();
+        assert!(
+            distinct.retained_bytes() >= parent_payload,
+            "retained {} must cover the {parent_payload} bytes of pinned parents",
+            distinct.retained_bytes()
+        );
+        assert!(
+            distinct.row_bytes() * 1_000 < distinct.retained_bytes(),
+            "row_bytes {} measures the windows and is nowhere near the retained {}",
+            distinct.row_bytes(),
+            distinct.retained_bytes()
+        );
+
+        // Sixteen slices of *one* parent pin one allocation, so the ledger must
+        // charge it once — the failure this shares with a naive full-capacity
+        // sum, which would report ~16×.
+        let parent = create_test_batch(chunk);
+        let shared = BatchStore::with_capacity(16);
+        for k in 0..16 {
+            shared
+                .append(parent.slice(k * (chunk / 16), chunk / 16))
+                .unwrap();
+        }
+        assert!(
+            shared.retained_bytes() * 8 < distinct.retained_bytes(),
+            "one shared parent ({}) must not be charged like sixteen ({})",
+            shared.retained_bytes(),
+            distinct.retained_bytes()
         );
     }
 

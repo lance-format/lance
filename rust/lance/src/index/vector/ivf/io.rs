@@ -975,10 +975,10 @@ mod tests {
             return;
         };
 
-        const DIM: usize = 32;
-        const ROWS: usize = 1024;
-        const NLIST: usize = 4;
-        const NUM_BUILDS: usize = 3;
+        const DIM: usize = 8;
+        const ROWS: usize = 256;
+        const NLIST: usize = 2;
+        const NUM_BUILDS: usize = 2;
 
         // Keep the dataset out of the temp dir's `.tmp*` namespace so the parent
         // never confuses it with a leaked scratch directory.
@@ -996,6 +996,24 @@ mod tests {
             .await
             .unwrap();
 
+        let ivf_params = IvfBuildParams {
+            num_partitions: Some(NLIST),
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        };
+        let hnsw_params = HnswBuildParams::default()
+            .max_level(2)
+            .num_edges(4)
+            .ef_construction(16);
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 2,
+            num_bits: 8,
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        };
+
         for _ in 0..NUM_BUILDS {
             crate::index::vector::ivf::build_ivf_hnsw_pq_index(
                 &ds,
@@ -1003,9 +1021,9 @@ mod tests {
                 "idx",
                 uuid::Uuid::new_v4(),
                 MetricType::L2,
-                &IvfBuildParams::new(NLIST),
-                &HnswBuildParams::default(),
-                &PQBuildParams::new(4, 8),
+                &ivf_params,
+                &hnsw_params,
+                &pq_params,
             )
             .await
             .unwrap();

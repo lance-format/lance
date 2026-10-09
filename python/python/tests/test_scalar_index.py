@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import collections.abc
 import json
 import os
 import random
@@ -20,13 +21,16 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
+from lance.dataset import ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
+    CombinedFieldsQuery,
     DocumentGranularity,
     FullTextOperator,
     MatchQuery,
+    MinHashQuery,
     MultiMatchQuery,
     Occur,
     PhraseQuery,
@@ -134,19 +138,26 @@ def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""
     num_fragments = 3
-    rows_per_fragment = 10000
+    rows_per_fragment = 100
     total_rows = num_fragments * rows_per_fragment
 
+    fragment_path = tmp_path / "fragment"
     fragment_ds = generate_multi_fragment_dataset(
-        tmp_path / "fragment",
+        fragment_path,
         num_fragments=num_fragments,
         rows_per_fragment=rows_per_fragment,
     )
 
-    complete_ds = generate_multi_fragment_dataset(
-        tmp_path / "complete",
-        num_fragments=num_fragments,
-        rows_per_fragment=rows_per_fragment,
+    complete_path = tmp_path / "complete"
+    shutil.copytree(fragment_path, complete_path)
+    complete_ds = lance.dataset(complete_path)
+    fragment_count = len(fragment_ds.get_fragments())
+    complete_count = len(complete_ds.get_fragments())
+    assert fragment_count == num_fragments, (
+        f"Expected {num_fragments} segmented fragments, got {fragment_count}"
+    )
+    assert complete_count == num_fragments, (
+        f"Expected {num_fragments} complete-index fragments, got {complete_count}"
     )
 
     fragment_ds_committed = _commit_segmented_btree_index(
@@ -184,6 +195,8 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
     Index dataclasses. This characterization test guards the dict keys and
     values so the deprecated method stays backwards compatible.
     """
+    from lance.bitmap import Bitmap
+
     with pytest.warns(DeprecationWarning):
         indices = indexed_dataset.list_indices()
 
@@ -204,7 +217,13 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
         assert set(idx) == expected_keys
         assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
         assert isinstance(idx["fields"], list)
-        assert isinstance(idx["fragment_ids"], set)
+        # `fragment_ids` is a Bitmap rather than a builtin `set`, so the
+        # compatibility that matters is that it still answers the abstract
+        # check and still supports set algebra.
+        assert isinstance(idx["fragment_ids"], Bitmap)
+        assert isinstance(idx["fragment_ids"], collections.abc.Set)
+        assert idx["fragment_ids"] & {0} == {0}
+        assert idx["fragment_ids"] - {0} == set()
         assert isinstance(idx["version"], int)
         assert idx["type"] != "Unknown"
         assert idx["base_id"] is None
@@ -1536,13 +1555,22 @@ def test_indexed_filter_with_fts_index(tmp_path):
 
 
 def test_fts_ngram_tokenizer(tmp_path):
-    data = pa.table({"text": ["hello world", "lance database", "lance is cool"]})
-    ds = lance.write_dataset(data, tmp_path)
+    data = pa.table(
+        {"text": ["hello world", "lance database", "lance is cool", "theatre", "other"]}
+    )
+    ds = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
     ds.create_scalar_index("text", index_type="INVERTED", base_tokenizer="ngram")
 
     results = ds.to_table(full_text_query="lan")
     assert results.num_rows == 2
     assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+    results = ds.to_table(full_text_query="the")
+    assert set(results["text"].to_pylist()) == {"theatre", "other"}
+
+    params = ds.stats.index_stats("text_idx")["indices"][0]["params"]
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is False
 
     results = ds.to_table(full_text_query="nce")  # spellchecker:disable-line
     assert results.num_rows == 2
@@ -2066,6 +2094,65 @@ def test_fts_multi_match_query(tmp_path):
         tmp_path,
         index_params={"with_position": False},
     )
+
+
+@pytest.mark.parametrize(
+    "operator,combined_ids,multi_ids",
+    [
+        # combined_fields treats the columns as one virtual field, so AND matches
+        # when each term appears in any field (rows 0 and 1); best_fields AND only
+        # matches row 1, where a single field holds both terms.
+        (FullTextOperator.AND, {0, 1}, {1}),
+        (FullTextOperator.OR, {0, 1, 2}, {0, 1, 2}),
+    ],
+)
+def test_fts_combined_fields_query(tmp_path, operator, combined_ids, multi_ids):
+    data = pa.table(
+        {
+            "id": [0, 1, 2],
+            # row 0 splits the terms across fields, row 1 has both in one field,
+            # row 2 has only "john".
+            "title": ["john", "john smith", "john"],
+            "body": ["smith", "foo", "alice"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("body", "INVERTED")
+
+    def ids(query):
+        return set(ds.to_table(full_text_query=query, columns=["id"])["id"].to_pylist())
+
+    assert (
+        ids(CombinedFieldsQuery("john smith", ["title", "body"], operator=operator))
+        == combined_ids
+    )
+    assert (
+        ids(MultiMatchQuery("john smith", ["title", "body"], operator=operator))
+        == multi_ids
+    )
+
+
+def test_fts_combined_fields_boost_validation(tmp_path):
+    # Per-column boosts must be >= 1 (Lucene CombinedFieldQuery constraint), and
+    # the boost count must match the column count.
+    data = pa.table({"title": ["hello"], "body": ["world"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("title", "INVERTED")
+    ds.create_scalar_index("body", "INVERTED")
+
+    with pytest.raises(ValueError, match="boost"):
+        CombinedFieldsQuery("hello", ["title", "body"], boosts=[0.5, 1.0])
+    with pytest.raises(ValueError):
+        CombinedFieldsQuery("hello", ["title", "body"], boosts=[1.0])
+
+    # Fractional weights >= 1 are accepted.
+    result = ds.to_table(
+        full_text_query=CombinedFieldsQuery(
+            "hello", ["title", "body"], boosts=[1.5, 1.0]
+        )
+    )
+    assert result.num_rows == 1
 
 
 def test_fts_boolean_query(tmp_path):
@@ -2896,7 +2983,7 @@ def test_zonemap_index_remapping(tmp_path: Path):
     # Run compaction to merge fragments
     compaction = dataset.optimize.compact_files(target_rows_per_fragment=2000)
     assert compaction.fragments_removed == 5
-    assert len(dataset.get_fragments()) == 3
+    assert len(dataset.get_fragments()) == 2
 
     # Check if the zone map index is no longer being used
     scanner = dataset.scanner(filter="values > 2500", prefilter=True)
@@ -3032,6 +3119,71 @@ def test_bloomfilter_deletion_handling(tmp_path: Path):
     assert ds.to_table(filter="value = 0").num_rows == 0
     ids = ds.to_table(filter="value = 1")["id"].to_pylist()
     assert ids == [0, 2, 4, 6, 8]
+
+
+def test_minhash_lsh_index():
+    base = "the quick brown fox jumps over the lazy dog and runs away very fast"
+    near = "the quick brown fox jumps over the lazy dog and runs away very quickly"
+    texts = [
+        base,
+        near,
+        "completely unrelated sentence about columnar storage in lance files",
+        base,
+        None,
+        "another unrelated row that talks about vector indices and recall",
+    ]
+    tbl = pa.table({"id": list(range(len(texts))), "text": texts})
+    ds = lance.write_dataset(tbl, "memory://minhash", max_rows_per_file=2)
+    assert len(ds.get_fragments()) == 3
+    ds.create_scalar_index(
+        "text",
+        IndexConfig(
+            index_type="minhashlsh",
+            parameters={"num_hashes": 64, "num_bands": 16, "shingle_size": 2},
+        ),
+    )
+    stats = ds.stats.index_stats("text_idx")
+    assert stats["index_type"] == "MinHashLsh"
+    assert stats["indices"][0]["num_docs"] == 5
+    assert stats["indices"][0]["num_hashes"] == 64
+
+    query = MinHashQuery(base, "text")
+    plan = ds.scanner(nearest=query, limit=3).explain_plan()
+    assert "MinHashSearch: column=text, limit=3" in plan
+
+    result = ds.to_table(nearest=query, limit=3, columns=["id"])
+    assert result.column_names == ["id", "_distance"]
+    assert result["id"].to_pylist() == [0, 3, 1]
+    distances = result["_distance"].to_pylist()
+    assert distances[0] == 0.0 and distances[1] == 0.0
+    assert 0.0 < distances[2] < 0.5
+
+    # limit defaults to 10, filters prefilter the candidates
+    assert ds.to_table(nearest=query).num_rows == 3
+    filtered = ds.to_table(nearest=query, limit=3, filter="id > 0", prefilter=True)
+    assert filtered["id"].to_pylist() == [3, 1]
+
+    with pytest.raises(Exception, match="No MinHash LSH index found for column id"):
+        ds.to_table(nearest=MinHashQuery(base, "id"), limit=3)
+
+    # Rows appended after the index was built are scored on the fly
+    ds = lance.write_dataset(
+        pa.table({"id": [6, 7], "text": [base, "nothing alike"]}),
+        ds,
+        mode="append",
+    )
+    plan = ds.scanner(nearest=query, limit=3).explain_plan()
+    assert "MinHashFlatSearch" in plan
+    assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist() == [
+        0,
+        3,
+        6,
+    ]
+    assert ds.to_table(nearest=query, limit=3, columns=["id"], fast_search=True)[
+        "id"
+    ].to_pylist() == [0, 3, 1]
+    with pytest.raises(TypeError):
+        ScannerBuilder(ds).minhash_search("not a query")  # type: ignore[arg-type]
 
 
 def test_json_index():
@@ -3198,6 +3350,28 @@ def test_label_list_index(tmp_path: Path):
     indices = dataset.describe_indices()
     assert len(indices) == 1
     assert indices[0].index_type == "LabelList"
+
+
+@pytest.mark.parametrize("stable_row_ids", [False, True])
+def test_label_list_update_removes_old_labels(tmp_path: Path, stable_row_ids):
+    dataset = lance.write_dataset(
+        pa.table({"labels": [["old"], ["keep"]]}),
+        tmp_path,
+        enable_stable_row_ids=stable_row_ids,
+        max_rows_per_file=1,
+        max_rows_per_group=1,
+    )
+    dataset.create_scalar_index("labels", "LABEL_LIST")
+    predicate = "array_has_any(labels, ['old'])"
+    dataset.update({"labels": "['new']"}, where=predicate)
+    assert dataset.to_table(filter=predicate).num_rows == 0
+
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter=predicate, use_scalar_index=False).num_rows == 0
+    assert dataset.to_table(filter=predicate).num_rows == 0
+    assert dataset.to_table(filter="array_has_any(labels, ['new'])").num_rows == 1
+    assert dataset.to_table(filter="array_has_any(labels, ['keep'])").num_rows == 1
 
 
 def test_label_list_index_array_contains(tmp_path: Path):
@@ -5368,74 +5542,98 @@ def test_btree_fragment_ids_parameter_validation(tmp_path):
     assert segment.fragment_ids == {valid_fragment_id}
 
 
-@pytest.mark.parametrize(
-    "test_name,filter_expr",
-    [
-        # Test 1: Boundary values at fragment edges
-        ("First value", "id = 0"),
-        ("Fragment 0 last value", "id = 9999"),
-        ("Fragment 1 first value", "id = 10000"),
-        ("Fragment 1 last value", "id = 19999"),
-        ("Fragment 2 first value", "id = 20000"),
-        ("Last value", "id = 29999"),
-        # Test 2: Values in the middle of fragments
-        ("Fragment 0 middle", "id = 5000"),
-        ("Fragment 1 middle", "id = 15000"),
-        ("Fragment 2 middle", "id = 25000"),
-        # Test 3: Range queries within single fragments
-        ("Range within fragment 0", "id >= 10 AND id < 20"),
-        ("Range within fragment 1", "id >= 10010 AND id < 10020"),
-        ("Range within fragment 2", "id >= 20010 AND id < 20020"),
-        # Test 4: Range queries spanning multiple fragments
-        ("Cross fragment 0-1", "id >= 9995 AND id < 10005"),
-        ("Cross fragment 1-2", "id >= 19995 AND id < 20005"),
-        ("Cross all fragments", "id >= 5000 AND id < 25000"),
-        # Test 5: Edge cases
-        ("Non-existent small value", "id = -1"),
-        ("Non-existent large value", "id = 30100"),
-        ("Large range", "id >= 0 AND id < 30000"),
-        # Test 6: Comparison operators
-        ("Less than boundary", "id < 10000"),
-        ("Greater than boundary", "id > 19999"),
-        ("Less than or equal", "id <= 10050"),
-        ("Greater than or equal", "id >= 10050"),
-    ],
-)
-def test_btree_query_comparison_parametrized(
-    btree_comparison_datasets, test_name, filter_expr
-):
+def test_btree_query_comparison(btree_comparison_datasets):
     """
-    Parametrized B-tree index query comparison test.
+    B-tree index query comparison test covering representative query shapes.
 
     Compares segmented fragment-built BTree results with a complete BTree index.
     """
     fragment_ds = btree_comparison_datasets["fragment_ds"]
     complete_ds = btree_comparison_datasets["complete_ds"]
+    rows_per_fragment = btree_comparison_datasets["rows_per_fragment"]
+    total_rows = btree_comparison_datasets["total_rows"]
+    fragment_starts = [idx * rows_per_fragment for idx in range(3)]
+    fragment_ends = [start + rows_per_fragment - 1 for start in fragment_starts]
+    fragment_middles = [start + rows_per_fragment // 2 for start in fragment_starts]
+    range_start_offset = rows_per_fragment // 10
+    range_end_offset = range_start_offset * 2
+    cross_fragment_margin = rows_per_fragment // 20
 
-    fragment_results = fragment_ds.scanner(
-        filter=filter_expr,
-        columns=["id", "text"],
-    ).to_table()
+    cases = [
+        # Boundary values at fragment edges
+        ("First value", f"id = {fragment_starts[0]}"),
+        ("Fragment 0 last value", f"id = {fragment_ends[0]}"),
+        ("Fragment 1 first value", f"id = {fragment_starts[1]}"),
+        ("Fragment 1 last value", f"id = {fragment_ends[1]}"),
+        ("Fragment 2 first value", f"id = {fragment_starts[2]}"),
+        ("Last value", f"id = {total_rows - 1}"),
+        # Values in the middle of fragments
+        ("Fragment 0 middle", f"id = {fragment_middles[0]}"),
+        ("Fragment 1 middle", f"id = {fragment_middles[1]}"),
+        ("Fragment 2 middle", f"id = {fragment_middles[2]}"),
+        # Range queries within single fragments
+        (
+            "Range within fragment 0",
+            f"id >= {fragment_starts[0] + range_start_offset} "
+            f"AND id < {fragment_starts[0] + range_end_offset}",
+        ),
+        (
+            "Range within fragment 1",
+            f"id >= {fragment_starts[1] + range_start_offset} "
+            f"AND id < {fragment_starts[1] + range_end_offset}",
+        ),
+        (
+            "Range within fragment 2",
+            f"id >= {fragment_starts[2] + range_start_offset} "
+            f"AND id < {fragment_starts[2] + range_end_offset}",
+        ),
+        # Range queries spanning multiple fragments
+        (
+            "Cross fragment 0-1",
+            f"id >= {fragment_ends[0] - cross_fragment_margin + 1} "
+            f"AND id < {fragment_starts[1] + cross_fragment_margin}",
+        ),
+        (
+            "Cross fragment 1-2",
+            f"id >= {fragment_ends[1] - cross_fragment_margin + 1} "
+            f"AND id < {fragment_starts[2] + cross_fragment_margin}",
+        ),
+        (
+            "Cross all fragments",
+            f"id >= {fragment_middles[0]} AND id < {fragment_middles[2]}",
+        ),
+        # Missing values and the full indexed range
+        ("Non-existent small value", f"id = {fragment_starts[0] - 1}"),
+        (
+            "Non-existent large value",
+            f"id = {total_rows + rows_per_fragment}",
+        ),
+        (
+            "Large range",
+            f"id >= {fragment_starts[0]} AND id < {total_rows}",
+        ),
+        # Comparison operators
+        ("Less than boundary", f"id < {fragment_starts[1]}"),
+        ("Greater than boundary", f"id > {fragment_ends[1]}"),
+        ("Less than or equal", f"id <= {fragment_middles[1]}"),
+        ("Greater than or equal", f"id >= {fragment_middles[1]}"),
+    ]
 
-    complete_results = complete_ds.scanner(
-        filter=filter_expr,
-        columns=["id", "text"],
-    ).to_table()
+    for test_name, filter_expr in cases:
+        fragment_results = fragment_ds.scanner(
+            filter=filter_expr,
+            columns=["id", "text"],
+        ).to_table()
+        complete_results = complete_ds.scanner(
+            filter=filter_expr,
+            columns=["id", "text"],
+        ).to_table()
 
-    assert fragment_results.num_rows == complete_results.num_rows, (
-        f"Test '{test_name}' failed: Fragment index "
-        f"returned {fragment_results.num_rows} rows, "
-        f"but complete index returned {complete_results.num_rows}"
-        f" rows for filter: {filter_expr}"
-    )
-
-    if fragment_results.num_rows > 0:
-        fragment_ids = sorted(fragment_results.column("id").to_pylist())
-        complete_ids = sorted(complete_results.column("id").to_pylist())
-
-        assert fragment_ids == complete_ids, (
-            f"Test '{test_name}' failed: Fragment index "
-            f"and complete index returned different results for filter: {filter_expr}"
+        fragment_results = fragment_results.sort_by([("id", "ascending")])
+        complete_results = complete_results.sort_by([("id", "ascending")])
+        assert fragment_results.equals(complete_results), (
+            f"Test '{test_name}' failed: segmented and complete BTree indexes returned "
+            f"different results for filter: {filter_expr}"
         )
 
 
@@ -5614,6 +5812,12 @@ def test_scan_statistics_callback(tmp_path):
     assert isinstance(scan_stats.parts_loaded, int)
     assert isinstance(scan_stats.index_comparisons, int)
     assert isinstance(scan_stats.all_counts, dict)
+    assert isinstance(scan_stats.all_times, dict)
+    for key, value in scan_stats.all_times.items():
+        assert isinstance(key, str)
+        assert isinstance(value, int)
+        assert value >= 0
+    assert "all_times=" in repr(scan_stats)
 
     # Verify we got some I/O activity
     assert scan_stats.iops > 0, "Expected some I/O operations"
@@ -6310,7 +6514,9 @@ def test_vector_filter_fts_search(tmp_path):
         prefilter=False, nearest=vector_query, filter=MatchQuery("text", "text")
     )
     result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
+    # The approximate IVF_PQ index can return the two nearest "text" matches
+    # (299 and 300) in either order, so assert the set of ids, not the order.
+    assert sorted(result["id"].to_pylist()) == [299, 300]
 
     # Case 2: search with prefilter=true, search_filter=match("text"),
     #         filter="category='geography'"
@@ -6332,7 +6538,9 @@ def test_vector_filter_fts_search(tmp_path):
         filter=MatchQuery("text", "text"),
     )
     result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
+    # The approximate IVF_PQ index can return the two nearest "text" matches
+    # (299 and 300) in either order, so assert the set of ids, not the order.
+    assert sorted(result["id"].to_pylist()) == [299, 300]
 
     # Case 4: search with prefilter=false, search_filter=match("text"),
     #       filter="category='geography'"

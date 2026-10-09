@@ -105,4 +105,13 @@ impl WrappingObjectStore for FailingProxyStore {
     ) -> Arc<dyn object_store::ObjectStore> {
         Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
     }
+
+    // Injects behaviour into every request, so a listing must not go around it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
 }

@@ -13,7 +13,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use lance_core::{Error, ROW_ID, Result};
-use lance_linalg::distance::{DistanceType, cosine_distance, dot_f32, l2_f32};
+use lance_linalg::distance::{DistanceType, cosine_distance, dot_distance, l2_f32};
 
 use super::graph::ScoredPoint;
 
@@ -82,7 +82,7 @@ pub trait VectorSource: Send + Sync {
 pub fn compute_f32_distance(query: &[f32], vector: &[f32], distance_type: DistanceType) -> f32 {
     match distance_type {
         DistanceType::L2 => l2_f32(query, vector),
-        DistanceType::Dot => dot_f32(query, vector),
+        DistanceType::Dot => dot_distance(query, vector),
         DistanceType::Cosine => cosine_distance(query, vector),
         DistanceType::Hamming => f32::INFINITY,
     }
@@ -194,6 +194,25 @@ impl ArrowFixedSizeListVectorStore {
             distance_type,
             schema,
         })
+    }
+
+    /// Heap bytes of the store's own slabs, all sized from `capacity` and
+    /// `max_batches` at construction.
+    ///
+    /// Excludes the vectors themselves: batches are held by reference, so their
+    /// bytes belong to the MemTable's batch store and counting them here would
+    /// double-count. That also makes this independent of `dim`.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        Self::reserved_bytes(self.capacity, self.max_batches)
+    }
+
+    /// What [`Self::resident_bytes`] will report for a store of this shape,
+    /// answerable before one exists — the slabs are sized from these two
+    /// numbers alone, and `dim` never enters. Lets a memory ceiling charge for
+    /// the store ahead of the first insert that allocates it.
+    pub(crate) fn reserved_bytes(capacity: usize, max_batches: usize) -> usize {
+        max_batches * std::mem::size_of::<StoredArrowBatch>()
+            + capacity * (std::mem::size_of::<RowLookup>() + std::mem::size_of::<u64>())
     }
 
     /// Number of committed vectors.

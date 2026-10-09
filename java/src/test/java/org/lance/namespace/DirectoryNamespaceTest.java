@@ -18,6 +18,7 @@ import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.FragmentMetadata;
 import org.lance.ReadOptions;
+import org.lance.Ref;
 import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.namespace.errors.ErrorCode;
@@ -81,6 +82,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -715,6 +717,44 @@ public class DirectoryNamespaceTest {
           getDescribeTableVersionCount(namespaceClient),
           "describe_table_version should have been called once when opening version 1");
 
+      // Fork dev at main:1 and move it past main's latest version (dev gets 2 and 3), tag its
+      // head, then open refs through the namespace: the ref must survive the namespace open and
+      // resolve on the branch, including a branch version main does not have.
+      try (Dataset latestDs =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .build()) {
+        try (Dataset devDs = latestDs.createBranch("dev", Ref.ofMain(1))) {
+          devDs.updateConfig(Collections.singletonMap("step", "1"));
+          devDs.updateConfig(Collections.singletonMap("step", "2"));
+          assertEquals(3, devDs.version());
+        }
+        latestDs.tags().create("first", Ref.ofMain(1));
+        latestDs.tags().create("dev_head", Ref.ofBranch("dev", 3));
+      }
+      Object[][] refCases = {
+        {Ref.ofBranch("dev"), 3L, true},
+        {Ref.ofBranch("dev", 3), 3L, true},
+        {Ref.ofTag("dev_head"), 3L, true},
+        {Ref.ofTag("first"), 1L, false},
+      };
+      for (Object[] refCase : refCases) {
+        Ref ref = (Ref) refCase[0];
+        try (Dataset refDs =
+            Dataset.open()
+                .allocator(allocator)
+                .namespaceClient(namespaceClient)
+                .tableId(tableId)
+                .readOptions(new ReadOptions.Builder().setRef(ref).build())
+                .build()) {
+          assertEquals((long) refCase[1], refDs.version(), ref.toString());
+          assertEquals(2, refDs.countRows(), ref.toString()); // main's latest has 4 rows
+          assertEquals(refCase[2], refDs.uri().contains("tree/dev"), refDs.uri());
+        }
+      }
+
       namespaceClient.close();
     }
   }
@@ -1161,7 +1201,7 @@ public class DirectoryNamespaceTest {
     // Count rows
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(3, count);
   }
 
@@ -1183,7 +1223,7 @@ public class DirectoryNamespaceTest {
         new CountTableRowsRequest()
             .id(Arrays.asList("workspace", "test_table"))
             .predicate("age > 28");
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(2, count); // Alice (30) and Charlie (35)
   }
 
@@ -1210,7 +1250,7 @@ public class DirectoryNamespaceTest {
     // Verify row count increased
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(6, count);
   }
 
@@ -1233,7 +1273,7 @@ public class DirectoryNamespaceTest {
             .id(Arrays.asList("workspace", "test_table"))
             .k(10)
             .vector(new QueryTableRequestVector());
-    byte[] resultBytes = namespaceClient.queryTable(queryReq);
+    byte[] resultBytes = namespaceClient.queryTable(queryReq).getData();
     assertNotNull(resultBytes);
     assertTrue(resultBytes.length > 0);
   }

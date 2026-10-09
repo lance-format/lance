@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
 from .blob import (
@@ -63,10 +63,6 @@ from .mem_wal import (
     ShardWriter,
     evaluate_sharding_spec,
 )
-from .namespace import (
-    DescribeTableRequest,
-    LanceNamespace,
-)
 from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
@@ -77,6 +73,7 @@ if TYPE_CHECKING:
 
     from lance.commit import CommitLock
     from lance.dependencies import pandas as pd
+    from lance.namespace import LanceNamespace
 
     ts_types = Union[datetime, pd.Timestamp, str]
 
@@ -148,7 +145,7 @@ def dataset(
     default_scan_options: Optional[Dict[str, str]] = None,
     metadata_cache_size_bytes: Optional[int] = None,
     index_cache_size_bytes: Optional[int] = None,
-    read_params: Optional[Dict[str, any]] = None,
+    read_params: Optional[Dict[str, Any]] = None,
     session: Optional[Session] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
@@ -269,6 +266,8 @@ def dataset(
 
         # Resolve the latest table metadata here. The requested dataset version is
         # applied by the lower-level dataset open path after namespace resolution.
+        from .namespace import DescribeTableRequest
+
         request = DescribeTableRequest(id=table_id, version=None)
         response = namespace_client.describe_table(request)
 
@@ -364,3 +363,14 @@ forkserver instead."
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(before=__warn_on_fork)
+
+
+# `lance.namespace` pulls in the generated `lance_namespace` REST client, which
+# costs more than a second of import time. Most users never touch a namespace,
+# so resolve these re-exports on first access instead of at `import lance`.
+def __getattr__(name: str):
+    if name in ("DescribeTableRequest", "LanceNamespace"):
+        from . import namespace
+
+        return getattr(namespace, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

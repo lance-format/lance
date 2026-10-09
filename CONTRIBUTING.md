@@ -25,9 +25,15 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
     a. Install pre-commit: https://pre-commit.com/#install
     b. Run `pre-commit install` in the root of the repo
 
-## x86_64 CPU compatibility
+## Building for legacy x86_64 hosts (pre-Haswell)
 
-The default workspace build targets `x86-64-v2` (SSE4.2), so binaries can run on pre-Haswell silicon that does not support AVX2. Runtime SIMD dispatch in `lance-linalg::distance` picks the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use `lance.simd_info()` to verify which tier was selected.
+The default workspace build targets `haswell` (AVX2 + FMA + F16C), matching the published wheels. To build a binary that runs on pre-Haswell silicon (Sandy Bridge / Ivy Bridge / Westmere on Intel, Bulldozer / Piledriver / Steamroller on AMD — i.e. CPUs without AVX2), set the baseline yourself at build time:
+
+```sh
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+```
+
+Runtime SIMD dispatch in `lance-linalg::distance` will then pick the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use `lance.simd_info()` to verify which tier was selected.
 
 ## Sample Workflow
 
