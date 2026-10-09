@@ -21,6 +21,10 @@ use crate::{
     ROW_OFFSET_FIELD, Result, WILDCARD,
 };
 
+/// Number of requested columns at which [`Schema::project`] and its variants
+/// look names up through a hash index instead of scanning the fields.
+const MIN_COLUMNS_FOR_NAME_INDEX: usize = 32;
+
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
 pub struct Schema {
@@ -263,16 +267,35 @@ impl Schema {
         preserve_system_columns: bool,
     ) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
+        // A linear scan of the fields per requested column is quadratic when
+        // most of a wide schema is requested, so index the names once. For a
+        // few columns, hashing every name would cost more than the scans.
+        // `or_insert` keeps the first of duplicate names, like the scan.
+        let name_index: Option<HashMap<&str, usize>> =
+            (columns.len() >= MIN_COLUMNS_FOR_NAME_INDEX).then(|| {
+                let mut index = HashMap::with_capacity(self.fields.len());
+                for (i, f) in self.fields.iter().enumerate() {
+                    index.entry(f.name.as_str()).or_insert(i);
+                }
+                index
+            });
+        // Top-level field index -> position of its projection in `candidates`.
+        let mut candidate_pos: HashMap<usize, usize> = HashMap::new();
         for col in columns {
             let split = parse_field_path(col.as_ref())?;
             let first = split[0].as_str();
-            if let Some(field) = self.field(first) {
+            let field_idx = match &name_index {
+                Some(index) => index.get(first).copied(),
+                None => self.fields.iter().position(|f| f.name == first),
+            };
+            if let Some(field_idx) = field_idx {
                 let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
-                let projected_field = field.project(&split_refs)?;
-                if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
-                    candidate_field.merge(&projected_field)?;
+                let projected_field = self.fields[field_idx].project(&split_refs)?;
+                if let Some(&pos) = candidate_pos.get(&field_idx) {
+                    candidates[pos].merge(&projected_field)?;
                 } else {
-                    candidates.push(projected_field)
+                    candidate_pos.insert(field_idx, candidates.len());
+                    candidates.push(projected_field);
                 }
             } else if crate::is_system_column(first) {
                 if preserve_system_columns {
@@ -2361,6 +2384,72 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&excluded), expected_arrow_schema);
+    }
+
+    #[test]
+    fn test_project_scanned_and_indexed_lookups_agree() {
+        let struct_children = ArrowFields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]);
+        let mut fields: Vec<ArrowField> = (0..MIN_COLUMNS_FOR_NAME_INDEX)
+            .map(|i| ArrowField::new(format!("c{i}"), DataType::Int32, true))
+            .collect();
+        fields.push(ArrowField::new(
+            "s",
+            DataType::Struct(struct_children.clone()),
+            true,
+        ));
+        fields.push(ArrowField::new("a`b", DataType::Int32, true));
+        let schema = Schema::try_from(&ArrowSchema::new(fields.clone())).unwrap();
+        let merged_s = ArrowField::new(
+            "s",
+            DataType::Struct(ArrowFields::from(vec![
+                struct_children[2].as_ref().clone(),
+                struct_children[0].as_ref().clone(),
+            ])),
+            true,
+        );
+
+        // A repeated column and sibling sub-paths each merge into the
+        // candidate created by their first occurrence.
+        let repeats = ["s.c", "c1", "s.a", "c1"];
+        assert!(repeats.len() < MIN_COLUMNS_FOR_NAME_INDEX);
+        let scanned = schema.project(&repeats).unwrap();
+        assert_eq!(
+            ArrowSchema::from(&scanned),
+            ArrowSchema::new(vec![merged_s.clone(), fields[1].clone()])
+        );
+
+        let mut wide: Vec<String> = (0..MIN_COLUMNS_FOR_NAME_INDEX)
+            .map(|i| format!("c{i}"))
+            .collect();
+        wide.extend(repeats.iter().map(|c| c.to_string()));
+        let indexed = schema.project(&wide).unwrap();
+        let mut expected = fields[..MIN_COLUMNS_FOR_NAME_INDEX].to_vec();
+        expected.push(merged_s);
+        assert_eq!(ArrowSchema::from(&indexed), ArrowSchema::new(expected));
+
+        // A quoted first segment names a top-level field literally: `a``b`
+        // finds the field named a`b, and `s.a` is not re-split into the
+        // nested path s.a.
+        let quoted = fields.last().unwrap().clone();
+        let scanned = schema.project(&["`a``b`"]).unwrap();
+        assert_eq!(
+            ArrowSchema::from(&scanned),
+            ArrowSchema::new(vec![quoted.clone()])
+        );
+        let indexed = schema
+            .project(&["`a``b`"; MIN_COLUMNS_FOR_NAME_INDEX])
+            .unwrap();
+        assert_eq!(ArrowSchema::from(&indexed), ArrowSchema::new(vec![quoted]));
+
+        let err = schema.project(&["`s.a`"]).unwrap_err();
+        assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
+        wide.push("`s.a`".to_string());
+        let err = schema.project(&wide).unwrap_err();
+        assert!(matches!(err, Error::FieldNotFound { .. }), "{err}");
     }
 
     #[test]
