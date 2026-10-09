@@ -112,6 +112,7 @@ pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<In
     let split = apply_scalar_indices(see_through_relabelling(filter, catalog), catalog)?;
     Ok(split
         .scalar_query
+        .map(ScalarIndexExpr::optimize)
         .filter(is_evaluable)
         .map(|searches| IndexedFilter {
             searches,
@@ -351,6 +352,18 @@ mod tests {
         let (positions, exact) = run("id = 1 OR name = 'alpha7'");
         assert_eq!(positions, vec![1, 7]);
         assert!(exact);
+    }
+
+    /// Bounds on one column, split by another conjunct, are searched as one
+    /// range: each bound alone is over the budget, together they are not.
+    #[test]
+    fn split_bounds_on_one_column_search_as_one_range() {
+        let (store, specs) = store();
+        let split = plan("id >= 2 AND name = 'alpha4' AND id <= 6", &specs).unwrap();
+        let ctx = SearchContext::new(9).with_match_budget(5);
+        let (positions, exact) = positions(evaluate(&split.searches, &store, &ctx).unwrap());
+        assert_eq!(positions, vec![4]);
+        assert!(exact, "no bound should have declined");
     }
 
     /// An unindexed conjunct comes back as the leftover; the indexed one still
