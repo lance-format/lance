@@ -456,7 +456,7 @@ message Constant {
   optional bytes value = 1;
 }
 
-/* A metadata-only arithmetic sequence of unsigned fixed-width values.
+/* A metadata-only arithmetic sequence for unstable Lance 2.3 only.
  *
  * The value at index i is `start + step * i`. The container supplies the
  * number of values. Writers use this encoding only when step is positive and
@@ -474,8 +474,8 @@ message Range {
   uint64 step = 3;
 }
 
-/* A non-decreasing unsigned fixed-width sequence represented by its first
- * value and the differences between adjacent values.
+/* An unstable Lance 2.3 non-decreasing unsigned fixed-width sequence
+ * represented by its first value and the differences between adjacent values.
  *
  * The child contains one fewer value than the input. The container supplies
  * the input cardinality. Delta has a payload exactly when its child has one.
