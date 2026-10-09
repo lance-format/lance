@@ -1756,6 +1756,7 @@ pub(crate) async fn commit_transaction(
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
         if !strict_overwrite {
+            let checked_since = dataset.manifest.version;
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             ensure_can_write_manifest(&dataset.manifest)?;
@@ -1768,6 +1769,23 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
+            let seen = other_transactions
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<HashSet<_>>();
+            let missing = (checked_since + 1..=dataset.manifest.version)
+                .filter(|version| !seen.contains(version))
+                .collect::<Vec<_>>();
+            if rebase.needs_versions(&missing) {
+                return Err(Error::retryable_commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "versions {missing:?} were cleaned up, so this index cannot be carried \
+                         through the deferred compaction it covers; rebuild it"
+                    )
+                    .into(),
+                ));
+            }
 
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;

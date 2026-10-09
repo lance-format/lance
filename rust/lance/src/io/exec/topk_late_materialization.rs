@@ -36,6 +36,8 @@
 //! A [`TakeExec`] or row-stream [`FilteredReadExec`] in the chain (the
 //! scanner's own late materialization behind a filter) is dropped: the take
 //! above the sort fetches its columns instead.
+//! Row-stream reads with a physical row selection prevent the rewrite, since
+//! dropping them would remove a restriction that must apply before sorting.
 
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
@@ -165,8 +167,12 @@ impl TopKLateMaterialization {
                 if read.row_stream_input().is_none() {
                     break;
                 }
+                if read.options().physical_row_addr_prefilter.is_some() {
+                    return Err("row-stream read has a physical row selection".into());
+                }
                 // Row-stream reads take every input row: their constructor
-                // rejects filters, scan ranges, and deleted rows.
+                // rejects filters, scan ranges, and deleted rows, and the
+                // guard above excludes physical row selections.
                 dropped_takes.push(read.dataset().clone());
             } else if let Some(take) = current.downcast_ref::<TakeExec>() {
                 dropped_takes.push(take.dataset().clone());
@@ -454,6 +460,15 @@ mod tests {
     use crate::dataset::WriteParams;
     use crate::io::exec::filtered_read::FilteredReadOptions;
 
+    #[cfg(feature = "substrait")]
+    use crate::io::exec::filtered_read_proto::{
+        filtered_read_exec_from_proto, filtered_read_exec_to_proto,
+    };
+    #[cfg(feature = "substrait")]
+    use datafusion::prelude::SessionContext;
+    #[cfg(feature = "substrait")]
+    use lance_select::RowAddrTreeMap;
+
     /// `wide` and `other` are functions of `key`, so a take that fetched the
     /// wrong rows shows up as a mismatch against the unrewritten plan. With
     /// `has_deletions`, the top row (`key = 9`) and one mid row are deleted, so row
@@ -626,6 +641,54 @@ mod tests {
             .unwrap();
         assert_eq!(takes, 1);
         assert_eq!(run(rewritten).await, run(plan).await);
+    }
+
+    #[cfg(feature = "substrait")]
+    #[rstest]
+    #[tokio::test]
+    async fn preserves_physical_row_stream_selection(
+        #[values(false, true)] has_stable_row_ids: bool,
+        #[values(false, true)] is_partitioned: bool,
+    ) {
+        let dataset = dataset(has_stable_row_ids, false).await;
+        let source_options = FilteredReadOptions::basic_full_read(&dataset).with_projection(
+            dataset
+                .empty_projection()
+                .union_columns(["key"], OnMissing::Error)
+                .unwrap()
+                .with_row_id(),
+        );
+        let source: Arc<dyn ExecutionPlan> =
+            Arc::new(FilteredReadExec::try_new(dataset.clone(), source_options, None).unwrap());
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_projection(
+            dataset
+                .empty_projection()
+                .union_columns(["key", "wide", "other"], OnMissing::Error)
+                .unwrap(),
+        );
+        let state = SessionContext::new().state();
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let mut proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        // Only the intermediate read restricts the selection; its source reads
+        // every fragment, as custom decoded plans are allowed to do.
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        let mut encoded = Vec::new();
+        rows.serialize_into(&mut encoded).unwrap();
+        proto.options.as_mut().unwrap().physical_row_addr_allowlist = Some(encoded);
+        let selected = filtered_read_exec_from_proto(proto, Some(dataset), Some(source), &state)
+            .await
+            .unwrap();
+        let plan = top_k(Arc::new(selected), is_partitioned);
+        let rewritten = optimize(&TopKLateMaterialization::new(), &plan);
+        assert!(Arc::ptr_eq(&rewritten, &plan));
+        let expected = arrow_array::record_batch!(
+            ("key", Int32, [8, 5, 3]),
+            ("wide", Utf8, ["i", "f", "d"]),
+            ("other", Int32, [80, 50, 30])
+        )
+        .unwrap();
+        assert_eq!(run(rewritten).await, expected);
     }
 
     #[rstest]

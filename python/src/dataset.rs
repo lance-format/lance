@@ -1423,7 +1423,7 @@ impl Dataset {
         )
         .infer_error()?
         {
-            scanner.with_row_addr_prefilter(mask);
+            scanner.with_row_id_prefilter(mask);
         }
 
         scanner

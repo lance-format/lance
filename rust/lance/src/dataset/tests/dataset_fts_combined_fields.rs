@@ -907,7 +907,7 @@ async fn test_fts_combined_fields_covers_unindexed_fragments(#[case] operator: O
 }
 
 /// An external row-address prefilter
-/// ([`Scanner::with_row_addr_prefilter`](crate::dataset::Scanner::with_row_addr_prefilter))
+/// ([`Scanner::with_row_id_prefilter`](crate::dataset::Scanner::with_row_id_prefilter))
 /// must restrict a `combined_fields` result.
 ///
 /// The two plan shapes reach it by different routes and are both checked: the
@@ -988,7 +988,7 @@ async fn test_fts_combined_fields_respects_external_row_mask(#[case] append_unin
                     Operator::Or,
                 )))
                 .unwrap()
-                .with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                .with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
                     allowed,
                 )));
             let batch = scan.try_into_batch().await.unwrap();
