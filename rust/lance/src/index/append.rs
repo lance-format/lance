@@ -586,16 +586,19 @@ async fn merge_scalar_indices<'a>(
 
     // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
     // segments (plus any deletion-affected one); with `num_indices_to_merge: Some(0)`
-    // (append mode) it selects none at all. A row-id-domain BTree segment left
-    // outside that selection would otherwise survive untouched beside the
-    // freshly built address-domain segment this call is about to create.
-    // `LogicalScalarIndex` takes the whole named index's result domain from its
-    // first segment alone, so that mix makes every match the new segment finds
-    // look like a row id needing resolution, and matching rows silently vanish
-    // when that resolution misses. Fold every such segment into this rebuild,
-    // regardless of which ones the trailing-window heuristic already picked,
-    // so the named index never ends up straddling both domains.
-    if index_type == IndexType::BTree && dataset.manifest.uses_stable_row_ids() {
+    // (append mode) it selects none at all. A row-id-domain BTree or Bitmap
+    // segment left outside that selection would otherwise survive untouched
+    // beside the freshly built address-domain segment this call is about to
+    // create. `LogicalScalarIndex` takes the whole named index's result domain
+    // from its first segment alone, so that mix makes every match the new
+    // segment finds look like a row id needing resolution, and matching rows
+    // silently vanish when that resolution misses. Fold every such segment
+    // into this rebuild, regardless of which ones the trailing-window
+    // heuristic already picked, so the named index never ends up straddling
+    // both domains.
+    if matches!(index_type, IndexType::BTree | IndexType::Bitmap)
+        && dataset.manifest.uses_stable_row_ids()
+    {
         for idx in old_indices {
             if !idx.results_are_row_addrs()
                 && !selected_old_indices
@@ -653,13 +656,14 @@ async fn merge_scalar_indices<'a>(
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
 
-    // A BTree segment persisted before address-domain support stores row ids
-    // directly. Merging it with newly scanned address-domain data on a
-    // stable-row-id dataset would silently combine two different domains in
-    // the same `ids` column, so such a segment must be rebuilt from scratch
-    // (a full rescan, never touching its stale page data) rather than merged.
-    // Harmless elsewhere: without stable row ids the two domains coincide.
-    let btree_legacy_domain_mismatch = index_type == IndexType::BTree
+    // A BTree or Bitmap segment persisted before address-domain support
+    // stores row ids directly. Merging it with newly scanned address-domain
+    // data on a stable-row-id dataset would silently combine two different
+    // domains in the same postings column, so such a segment must be rebuilt
+    // from scratch (a full rescan, never touching its stale page data) rather
+    // than merged. Harmless elsewhere: without stable row ids the two domains
+    // coincide.
+    let legacy_domain_mismatch = matches!(index_type, IndexType::BTree | IndexType::Bitmap)
         && dataset.manifest.uses_stable_row_ids()
         && selected_old_indices
             .iter()
@@ -679,7 +683,7 @@ async fn merge_scalar_indices<'a>(
     let can_merge_segments = !effective_old_frags.is_empty()
         && !update_criteria.requires_old_data
         && !ngram_requires_rebuild
-        && !btree_legacy_domain_mismatch
+        && !legacy_domain_mismatch
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
@@ -778,7 +782,7 @@ async fn merge_scalar_indices<'a>(
                         dataset.as_ref(),
                         &selected_old_indices,
                         None,
-                        false,
+                        true,
                     )
                     .await?;
                     crate::index::scalar::bitmap::open_and_merge_segments(
@@ -5192,12 +5196,16 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("num", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from_iter_values(0..100)),
                 Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(arrow_array::StringArray::from_iter_values(
+                    (0..100).map(|i| format!("cat-{i}")),
+                )),
             ],
         )
         .unwrap();
@@ -5213,23 +5221,29 @@ mod tests {
         .await
         .unwrap();
 
+        // NGram, not Bitmap: this index must be row-id-domain to exercise the
+        // stable-row-id allow-list path below (Bitmap moved to row-address
+        // domain, which uses coarse fragment filtering instead and never reads
+        // a deletion vector).
         dataset
             .create_index(
-                &["num"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 None,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 true,
             )
             .await
             .unwrap();
 
         // Update rewrites the first 25 rows under the same stable row ids,
-        // leaving a deletion vector on the original fragment.
+        // leaving a deletion vector on the original fragment. Changes the
+        // indexed column itself (`cat`), so the rewritten rows are unindexed
+        // and `optimize_indices` below has something to merge.
         UpdateBuilder::new(Arc::new(dataset.clone()))
             .update_where("id < 25")
             .unwrap()
-            .set("num", "-1")
+            .set("cat", "'updated'")
             .unwrap()
             .build()
             .unwrap()
