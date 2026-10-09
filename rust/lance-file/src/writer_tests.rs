@@ -717,6 +717,103 @@ mod tests {
         assert_eq!(mismatch.actual.extension_type_name(), None);
     }
 
+    #[rstest]
+    #[case::nullable_null(false)]
+    #[case::non_nullable_null(true)]
+    #[tokio::test]
+    async fn test_structural_writer_checks_reordered_nullability(
+        #[case] has_non_nullable_null: bool,
+        #[values(false, true)] has_extra_column: bool,
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let valid = arrow_array::record_batch!(
+            ("b", Int32, [Some(30), None]),
+            ("a", Int32, [Some(3), Some(4)]),
+            ("extra", Int32, [None, None])
+        )
+        .unwrap();
+        let invalid = arrow_array::record_batch!(
+            ("b", Int32, [Some(30), Some(40)]),
+            ("a", Int32, [Some(3), None]),
+            ("extra", Int32, [None, None])
+        )
+        .unwrap();
+        let indices = if has_extra_column {
+            vec![2, 0, 1]
+        } else {
+            vec![0, 1]
+        };
+        let valid = valid.project(&indices).unwrap();
+        let invalid = invalid.project(&indices).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            schema.clone(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        // Zero-row batches are no-ops even when a required column is missing.
+        writer
+            .write_batch(&valid.project(&[0]).unwrap().slice(0, 0))
+            .await
+            .unwrap();
+        if has_non_nullable_null {
+            let error = writer.write_batch(&invalid).await.unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("`a`"), "{message}");
+            assert!(message.contains("non-null"), "{message}");
+        }
+        // A rejected batch must leave the encoders usable for a valid batch.
+        writer.write_batch(&valid).await.unwrap();
+        assert_eq!(writer.finish().await.unwrap().num_rows, 2);
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(
+                read_int32_column(
+                    &reader,
+                    &schema,
+                    version,
+                    name,
+                    lance_io::ReadBatchParams::RangeFull,
+                )
+                .await,
+                valid[name]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
         StructArray::new(
             fields,

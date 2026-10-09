@@ -532,17 +532,6 @@ impl EncodingPipeline {
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (column, field) in batch
-            .columns()
-            .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(column.as_ref(), field)?;
-        }
-        Ok(())
-    }
-
     fn encode_columns(
         &mut self,
         fields: &[(usize, ArrayRef)],
@@ -567,34 +556,6 @@ impl EncodingPipeline {
             .collect()
     }
 
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
-            .as_ref()
-            .unwrap()
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(field_index, field)| {
-                let array = batch.column_by_name(&field.name).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                    )
-                })?;
-                Ok((field_index, array.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
-    }
-
     #[instrument(skip_all, level = "debug")]
     pub async fn write_batch(
         &mut self,
@@ -614,7 +575,6 @@ impl EncodingPipeline {
         self.expected_types
             .get_or_insert_with(|| ExpectedTypes::new(schema))
             .check_batch(batch)?;
-        self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -625,9 +585,29 @@ impl EncodingPipeline {
             ));
         }
 
+        // Validate the name-selected arrays before mutating any field encoder.
+        let field_arrays = schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_index, field)| {
+                let array = batch.column_by_name(&field.name).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Cannot write batch.  The batch was missing the column `{}`",
+                            field.name
+                        )
+                        .into(),
+                    )
+                })?;
+                Self::verify_field_nullability(array.as_ref(), field)?;
+                Ok((field_index, array.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         for external_buffer in external_buffers.take_buffers() {
             sink.write_aligned_buffer(&external_buffer).await?;
         }
