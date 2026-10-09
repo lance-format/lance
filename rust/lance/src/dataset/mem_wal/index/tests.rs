@@ -1288,7 +1288,7 @@ fn same_index_compares_what_an_index_is_built_from() {
         InvertedIndexParams::default().with_position(true),
     )));
     let mut rebuilt = unresolved.clone();
-    rebuilt.details = Some(Arc::new(prost_types::Any {
+    rebuilt.index_details = Some(Arc::new(prost_types::Any {
         type_url: "/lance.table.InvertedIndexDetails".to_string(),
         value: vec![1],
     }));

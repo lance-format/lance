@@ -585,9 +585,9 @@ pub struct MemIndexSpec {
     pub plugin: Arc<dyn MemIndexPlugin>,
     /// What [`MemIndexPlugin::resolve`] returned.
     pub params: Arc<dyn MemIndexParams>,
-    /// The base-table index's details message, which the query parser is built
-    /// from.
-    pub details: Option<Arc<prost_types::Any>>,
+    /// The base-table index's details message. The query parser is built from
+    /// it, and a change to it makes a different index.
+    pub index_details: Option<Arc<prost_types::Any>>,
 }
 
 impl MemIndexSpec {
@@ -615,12 +615,12 @@ impl MemIndexSpec {
             columns: vec![column.into()],
             plugin,
             params,
-            details: None,
+            index_details: None,
         }
     }
 
     /// Whether `other` describes the same index: name, columns, field ids,
-    /// plugin type, plugin version, settings and base-table details.
+    /// plugin type, plugin version, settings and base-table index details.
     pub fn same_index(&self, other: &Self) -> bool {
         self.name == other.name
             && self.columns == other.columns
@@ -630,7 +630,7 @@ impl MemIndexSpec {
             && self.plugin.details_message() == other.plugin.details_message()
             && self.plugin.version() == other.plugin.version()
             && self.params.same_as(other.params.as_ref())
-            && self.details == other.details
+            && self.index_details == other.index_details
     }
 
     /// `params` as `P`, the type its plugin's own

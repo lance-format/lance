@@ -50,7 +50,7 @@ impl MemIndexCatalog {
             if let [column] = spec.columns.as_slice()
                 && let Some(parser) = spec
                     .plugin
-                    .query_parser(spec.name.clone(), spec.details.as_deref())
+                    .query_parser(spec.name.clone(), spec.index_details.as_deref())
             {
                 catalog.add_parser(column, parser);
             }
