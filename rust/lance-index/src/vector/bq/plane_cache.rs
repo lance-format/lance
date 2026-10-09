@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Row-addressable persistent ex planes. Sign codes retain their transposed IPC body.
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{Array, Float32Array, RecordBatch, UInt8Array, cast::AsArray, types::UInt8Type};
@@ -153,48 +154,20 @@ impl CacheCodecImpl for PlaneBatch {
         version: u32,
         rows: &[u32],
     ) -> Result<Self> {
-        if version != Self::CURRENT_VERSION {
-            return Err(Error::invalid_input(
-                "plane cache version has no row directory",
-            ));
-        }
-        let header = Header::parse(&reader.read_range(offset..offset + HEADER_BYTES)?)?;
-        if rows.windows(2).any(|pair| pair[0] >= pair[1])
-            || rows.last().is_some_and(|&row| row as usize >= header.rows)
-        {
-            return Err(Error::invalid_input("invalid cached candidate offsets"));
-        }
+        let header = read_row_header(reader, offset, version)?;
         let width = header.width;
         let stride = header.stride();
         let mut codes = Vec::new();
         let mut adds = Vec::new();
         let mut scales = Vec::new();
-        let mut start = 0;
-        while start < rows.len() {
-            let mut end = start + 1;
-            while end < rows.len()
-                && (rows[end] - rows[end - 1] - 1) as usize <= COALESCE_GAP_BYTES / stride
-            {
-                end += 1;
-            }
-            let first = rows[start] as usize;
-            let last = rows[end - 1] as usize + 1;
-            let base = offset
-                .checked_add(HEADER_BYTES)
-                .ok_or_else(|| Error::invalid_input("plane offset overflow"))?;
-            let byte_start = first
-                .checked_mul(stride)
-                .and_then(|v| base.checked_add(v))
-                .ok_or_else(|| Error::invalid_input("plane offset overflow"))?;
-            let byte_end = last
-                .checked_mul(stride)
-                .and_then(|v| base.checked_add(v))
-                .ok_or_else(|| Error::invalid_input("plane offset overflow"))?;
-            let bytes = reader.read_range(byte_start..byte_end)?;
-            if bytes.len() != byte_end - byte_start {
+        for (bytes_range, run) in row_runs(&header, offset, rows)? {
+            let first = rows[run.start] as usize;
+            let len = bytes_range.len();
+            let bytes = reader.read_range(bytes_range)?;
+            if bytes.len() != len {
                 return Err(Error::invalid_input("short plane range read"));
             }
-            for &row in &rows[start..end] {
+            for &row in &rows[run] {
                 let local = (row as usize - first) * stride;
                 header.append(
                     &bytes[local..local + width + 8],
@@ -203,10 +176,69 @@ impl CacheCodecImpl for PlaneBatch {
                     &mut scales,
                 );
             }
-            start = end;
         }
         header.batch(codes, adds, scales)
     }
+    fn plan_row_ranges(
+        reader: &dyn CacheRangeReader,
+        offset: usize,
+        version: u32,
+        rows: &[u32],
+    ) -> Result<Option<Vec<Range<usize>>>> {
+        let header = read_row_header(reader, offset, version)?;
+        Ok(Some(
+            row_runs(&header, offset, rows)?
+                .into_iter()
+                .map(|(bytes, _)| bytes)
+                .collect(),
+        ))
+    }
+}
+
+fn read_row_header(reader: &dyn CacheRangeReader, offset: usize, version: u32) -> Result<Header> {
+    if version != PlaneBatch::CURRENT_VERSION {
+        return Err(Error::invalid_input(
+            "plane cache version has no row directory",
+        ));
+    }
+    Header::parse(&reader.read_range(offset..offset + HEADER_BYTES)?)
+}
+
+/// Payload byte ranges for sorted, unique `rows`, each paired with the span of
+/// `rows` it covers. Rows closer than [`COALESCE_GAP_BYTES`] share one range.
+fn row_runs(
+    header: &Header,
+    offset: usize,
+    rows: &[u32],
+) -> Result<Vec<(Range<usize>, Range<usize>)>> {
+    if rows.windows(2).any(|pair| pair[0] >= pair[1])
+        || rows.last().is_some_and(|&row| row as usize >= header.rows)
+    {
+        return Err(Error::invalid_input("invalid cached candidate offsets"));
+    }
+    let stride = header.stride();
+    let base = offset
+        .checked_add(HEADER_BYTES)
+        .ok_or_else(|| Error::invalid_input("plane offset overflow"))?;
+    let byte_offset = |row: usize| {
+        row.checked_mul(stride)
+            .and_then(|v| base.checked_add(v))
+            .ok_or_else(|| Error::invalid_input("plane offset overflow"))
+    };
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len()
+            && (rows[end] - rows[end - 1] - 1) as usize <= COALESCE_GAP_BYTES / stride
+        {
+            end += 1;
+        }
+        let bytes = byte_offset(rows[start] as usize)?..byte_offset(rows[end - 1] as usize + 1)?;
+        runs.push((bytes, start..end));
+        start = end;
+    }
+    Ok(runs)
 }
 
 #[cfg(test)]
@@ -270,5 +302,69 @@ mod tests {
                 CacheDecode::Miss(_)
             ));
         }
+    }
+
+    #[test]
+    fn row_plan_matches_ranges_read_by_decode() {
+        const ROWS: usize = 4096;
+        const WIDTH: usize = 56;
+        let header = Header {
+            plane: 1,
+            rows: ROWS,
+            width: WIDTH,
+        };
+        let original = header
+            .batch(
+                (0..ROWS * WIDTH).map(|v| (v % 253) as u8).collect(),
+                (0..ROWS).map(|v| v as f32).collect(),
+                vec![0.5; ROWS],
+            )
+            .unwrap();
+        let codec = CacheCodec::from_impl::<PlaneBatch>();
+        let mut encoded = Vec::new();
+        codec
+            .serialize(
+                &(Arc::new(original) as Arc<dyn std::any::Any + Send + Sync>),
+                &mut encoded,
+            )
+            .unwrap();
+        let encoded = Bytes::from(encoded);
+        let requested = std::cell::RefCell::new(Vec::new());
+        let read = |range: Range<usize>| -> Result<Bytes> {
+            requested.borrow_mut().push(range.clone());
+            Ok(encoded.slice(range))
+        };
+        let stride = WIDTH + 8;
+        let gap = COALESCE_GAP_BYTES / stride;
+        let row_sets: Vec<Vec<u32>> = vec![
+            vec![],
+            vec![0],
+            vec![ROWS as u32 - 1],
+            (0..ROWS as u32).collect(),
+            (0..ROWS as u32).step_by(gap + 1).collect(),
+            (0..ROWS as u32).step_by(gap + 2).collect(),
+            vec![1, 2, 3, 900, 901, 3000, 4095],
+        ];
+        for rows in row_sets {
+            requested.borrow_mut().clear();
+            let CacheDecode::Hit(_) = codec.deserialize_rows(&read, &rows) else {
+                panic!("range decode failed for {rows:?}")
+            };
+            // The envelope and body header come first; the rest are row reads.
+            let decoded_rows = requested.borrow()[3..].to_vec();
+            let plan = codec.plan_rows(&read, &rows).expect("plane codec plans");
+            assert_eq!(plan, decoded_rows);
+            let expected_runs = if rows.is_empty() {
+                0
+            } else {
+                1 + rows
+                    .windows(2)
+                    .filter(|w| (w[1] - w[0] - 1) as usize > gap)
+                    .count()
+            };
+            assert_eq!(plan.len(), expected_runs);
+        }
+        assert!(codec.plan_rows(&read, &[5, 5]).is_none());
+        assert!(codec.plan_rows(&read, &[ROWS as u32]).is_none());
     }
 }
