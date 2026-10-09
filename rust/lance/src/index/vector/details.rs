@@ -294,7 +294,8 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
             VectorIndexParams::with_ivf_rq_params(
                 metric,
                 ivf,
-                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type),
+                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type)
+                    .with_layered(rq.layered),
             )
         }
         (Some(hnsw), Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -688,8 +689,8 @@ async fn convert_v3_metadata_to_details(
                         }
                     };
                     Some(Compression::Rq(RabitQuantization {
-                        layered: false,
-                        row_layout: rabit_quantization::RowLayout::Columns.into(),
+                        layered: rq.layered,
+                        row_layout: rabit_quantization::RowLayout::Columns as i32,
                         num_bits: rq.num_bits as u32,
                         rotation_type: rotation_type.into(),
                     }))

@@ -281,6 +281,22 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         Self::try_from_batch(batch, metadata, distance_type, None)
     }
 
+    /// Materialize a projected precision level. Non-RQ stores accept only full.
+    fn try_from_batch_at_precision(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+        precision: super::bq::layered::RQPrecision,
+    ) -> Result<Self> {
+        if precision != super::bq::layered::RQPrecision::Full {
+            return Err(Error::invalid_input(
+                "rq_precision requires a layered IVF_RQ index",
+            ));
+        }
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, remapper)
+    }
+
     fn metadata(&self) -> &Self::Metadata;
 
     fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {

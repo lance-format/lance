@@ -118,6 +118,13 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         dist_q_c: Some(query.dist_q_c),
         query_parallelism: Some(query.query_parallelism),
         approx_mode: approx_mode_to_proto(query.approx_mode) as i32,
+        rq_cascade_factor: query.rq_cascade_factor,
+        rq_precision: match query.rq_precision {
+            lance_index::vector::bq::layered::RQPrecision::Full => "full",
+            lance_index::vector::bq::layered::RQPrecision::High => "high",
+            lance_index::vector::bq::layered::RQPrecision::Sign => "sign",
+        }
+        .to_string(),
         // No planner narrows the covering projection yet, so this is always absent:
         // "materialize every covering column declared". See `CoveringProjection`.
         covering_projection: None,
@@ -137,6 +144,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         .transpose()?;
 
     Ok(Query {
+        rq_cascade_factor: proto.rq_cascade_factor,
         column: proto.column,
         key,
         k: proto.k as usize,
@@ -151,6 +159,11 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
         approx_mode: approx_mode_from_proto(proto.approx_mode),
+        rq_precision: if proto.rq_precision.is_empty() {
+            Default::default()
+        } else {
+            proto.rq_precision.parse()?
+        },
     })
 }
 
@@ -343,6 +356,8 @@ mod tests {
     fn test_query_roundtrip() {
         let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3]));
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key,
             k: 10,
@@ -383,6 +398,8 @@ mod tests {
     fn test_query_roundtrip_none_metric() {
         let key: ArrayRef = Arc::new(Float32Array::from(vec![1.0]));
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "v".to_string(),
             key,
             k: 5,
@@ -461,6 +478,8 @@ mod tests {
 
         let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key,
             k: 10,
@@ -509,6 +528,8 @@ mod tests {
 
         let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key,
             k: 10,
@@ -573,6 +594,8 @@ mod tests {
         let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
         let query = Query {
+            rq_cascade_factor: None,
+            rq_precision: Default::default(),
             column: "vector".to_string(),
             key,
             k: 10,
