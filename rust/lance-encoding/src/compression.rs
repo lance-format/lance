@@ -1529,6 +1529,10 @@ pub(crate) fn validate_delta_child_encoding(
 ) -> Result<()> {
     let child_bits_per_value = match child.compression.as_ref() {
         Some(Compression::Flat(flat)) => flat.bits_per_value,
+        Some(Compression::Constant(constant)) => {
+            decode_fixed_width_constant(constant, expected_bits_per_value)?;
+            expected_bits_per_value
+        }
         Some(Compression::Range(range)) => range.uncompressed_bits_per_value,
         Some(Compression::InlineBitpacking(bitpacking)) => bitpacking.uncompressed_bits_per_value,
         Some(Compression::OutOfLineBitpacking(bitpacking)) => {
