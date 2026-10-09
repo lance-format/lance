@@ -9,7 +9,10 @@
 //! per index, later reads fetch only the codes (and bounds) from the file:
 //! on an object store a native partition miss takes 2 requests instead of
 //! 8, and a layered one 3 instead of 13. Reads attach copies of the resident
-//! rows, so cache entries hold, and are charged, what a file read returns.
+//! rows, so a batch holds, and is charged, what a file read returns. Cache
+//! entries hold that batch, or only the columns reads fetch from the file
+//! (`EntryColumns::Codes`), and every read of such an entry attaches the
+//! resident rows again.
 //!
 //! The store is an entry of the index cache ([`ResidentColumnsKey`]),
 //! charged what its arrays allocate. The handles of live indexes lease it
@@ -26,8 +29,8 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use arrow::compute::concat_batches;
-use arrow_array::{Array, ArrayRef, UInt64Array, new_empty_array};
-use arrow_schema::{Field, Schema};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, new_empty_array};
+use arrow_schema::{Field, Schema, SchemaRef};
 use arrow_select::concat::concat;
 use arrow_select::take::take;
 use futures::TryStreamExt;
@@ -74,6 +77,13 @@ fn resident_width(field: &Field) -> Option<usize> {
 /// Whether the store keeps column `field` of an IVF_RQ storage file.
 pub(crate) fn is_resident(field: &Field) -> bool {
     resident_width(field).is_some()
+}
+
+/// Whether reads always fetch column `name` of an IVF_RQ storage file from
+/// the file: the columns a code-only cache entry holds. Every other column
+/// of a plane or partition is a fixed-width one the store keeps.
+pub(crate) fn is_file_column(name: &str) -> bool {
+    FILE_COLUMNS.contains(&name)
 }
 
 /// Bytes of values the resident store holds for an IVF_RQ storage file with
@@ -621,6 +631,56 @@ impl ResidentColumnStore {
         self.num_rows
     }
 
+    /// `schema`'s columns at the ascending file rows `rows`: copies of this
+    /// store's rows of the columns it keeps (see [`ResidentColumn::copy_rows`])
+    /// and, by name, the other columns of `file_batch`, which holds them at
+    /// the same rows, read from the file or a code-only cache entry. The
+    /// batch is the one a read of every column from the file returns.
+    pub(crate) fn attach(
+        &self,
+        schema: SchemaRef,
+        file_batch: Option<&RecordBatch>,
+        rows: &UInt64Array,
+    ) -> Result<RecordBatch> {
+        let started = Instant::now();
+        if let Some(batch) = file_batch
+            && batch.num_rows() != rows.len()
+        {
+            return Err(Error::internal(format!(
+                "resident columns attach to {} rows of a batch of {} rows",
+                rows.len(),
+                batch.num_rows()
+            )));
+        }
+        let mut copied_bytes = 0;
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let column = match self.column(field.name()) {
+                Some(column) => {
+                    let copy = column.copy_rows(rows)?;
+                    copied_bytes += copy.get_buffer_memory_size() as u64;
+                    copy
+                }
+                None => file_batch
+                    .and_then(|batch| batch.column_by_name(field.name()))
+                    .cloned()
+                    .ok_or_else(|| Error::internal(format!("unread column {}", field.name())))?,
+            };
+            columns.push(column);
+        }
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+        )?;
+        let stats = layered_stats::counters();
+        stats.resident_attach_calls.incr();
+        stats.resident_attach_rows.add(rows.len() as u64);
+        stats.resident_attach_bytes.add(copied_bytes);
+        stats.resident_attach_ns.add_elapsed(started);
+        Ok(batch)
+    }
+
     /// Heap memory the store holds: its arrays' buffers, which the
     /// `resident_columns_alloc_bytes` of its load count, plus its pages and
     /// its map of columns.
@@ -1139,6 +1199,50 @@ mod tests {
         for rows in [vec![5, 100], vec![7, 5]] {
             let error = column.copy_rows(&UInt64Array::from(rows)).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        }
+    }
+
+    /// Attaching the resident columns to a batch of the other columns at
+    /// the same rows lays the columns out in the schema's order, copies the
+    /// resident rows and shares the others' buffers; a batch of other rows
+    /// or without a column the store does not keep is an error.
+    #[test]
+    fn attach_copies_resident_rows_and_takes_file_columns() {
+        let store = ResidentColumnStore {
+            columns: HashMap::from([("factor".to_string(), column())]),
+            num_rows: 100,
+            bytes: 400,
+        };
+        assert!(is_file_column(RABIT_CODE_COLUMN));
+        assert!(!is_file_column("factor"));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(RABIT_CODE_COLUMN, DataType::UInt8, true),
+            Field::new("factor", DataType::Float32, true),
+        ]));
+        let rows = [5u64, 39, 40, 99];
+        let codes: ArrayRef = Arc::new(arrow_array::UInt8Array::from(vec![1u8, 2, 3, 4]));
+        let file_batch = RecordBatch::try_from_iter([(RABIT_CODE_COLUMN, codes.clone())]).unwrap();
+        let calls = || layered_stats::counters().resident_attach_calls.get();
+        let before = calls();
+        let batch = store
+            .attach(
+                schema.clone(),
+                Some(&file_batch),
+                &UInt64Array::from(rows.to_vec()),
+            )
+            .unwrap();
+        assert!(calls() > before);
+        assert_eq!(batch.schema(), schema);
+        assert_eq!(values(batch.column(1)), as_values(&rows));
+        assert_eq!(
+            batch.column(0).to_data().buffers()[0].as_ptr(),
+            codes.to_data().buffers()[0].as_ptr()
+        );
+        for (batch, rows) in [(Some(&file_batch), vec![5, 39]), (None, rows.to_vec())] {
+            let error = store
+                .attach(schema.clone(), batch, &UInt64Array::from(rows))
+                .unwrap_err();
+            assert!(matches!(error, Error::Internal { .. }), "{error}");
         }
     }
 

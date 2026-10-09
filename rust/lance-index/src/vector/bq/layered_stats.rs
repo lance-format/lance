@@ -6,10 +6,12 @@
 //! The counters only advance while a query runs the lazy scan (or is checked
 //! for it), so production queries with the scan disabled touch at most the
 //! `ineligible_disabled` counter. The `resident_columns_*`,
-//! `resident_store_evictions` and `pinned_overflow` counters are the
-//! exception: they advance when an IVF_RQ index, layered or not, opens with
-//! or loads its resident columns. Readers take deltas with
-//! [`snapshot_and_reset`].
+//! `resident_attach_*`, `resident_store_evictions` and `pinned_overflow`
+//! counters are the exception: they advance when an IVF_RQ index, layered or
+//! not, opens with, loads or reads through its resident columns. So is
+//! `storage_construct_repacks`, which advances when any RaBitQ storage is
+//! built from codes it must rewrite.
+//! Readers take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,6 +53,13 @@ impl Counter {
 
     fn take(&self) -> u64 {
         self.0.swap(0, Ordering::Relaxed)
+    }
+
+    /// The count so far, without resetting it: tests that run beside others
+    /// can only bound the growth of a process-wide counter from below.
+    #[cfg(test)]
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -309,6 +318,24 @@ layered_lazy_counters! {
         /// Leases of a resident store that found no room under the index
         /// cache's pinned cap, leaving the store evictable.
         pinned_overflow,
+        /// RaBitQ storages, layered or not, whose construction rewrote the
+        /// stored codes: packed sign codes stored unpacked, or repacked
+        /// legacy sequential ex codes into the blocked layout. A storage
+        /// built from codes stored packed and blocked, as the index builder
+        /// writes them and cache entries keep them, rewrites nothing.
+        storage_construct_repacks,
+        /// Batches assembled with copies of an index's resident rows: every
+        /// read of a plane or partition from the file that takes its small
+        /// columns from the resident store, and every read of a code-only
+        /// cache entry (`LANCE_RQ_ENTRY_COLUMNS=codes`), hits included.
+        resident_attach_calls,
+        /// Rows those batches hold.
+        resident_attach_rows,
+        /// Bytes of the resident rows copied into them: what a full entry
+        /// would have kept in the cache.
+        resident_attach_bytes,
+        /// Time spent assembling them, copies included.
+        resident_attach_ns,
     }
     ranked {
         /// Probes gathered lazily.
