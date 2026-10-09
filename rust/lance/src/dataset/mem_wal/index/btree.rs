@@ -430,8 +430,7 @@ impl FixedIntBackend {
     fn get(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         let Some(enc) = encode_scalar(value) else {
             if value.is_null() {
-                let nulls = self.null_positions.lock().unwrap().clone();
-                return (nulls.len() <= limit).then_some(nulls);
+                return nulls_within(&self.null_positions, limit);
             }
             return Some(Vec::new());
         };
@@ -645,8 +644,7 @@ impl BytesBackend {
     fn get(&self, value: &ScalarValue, limit: usize) -> Option<Vec<RowPosition>> {
         let Some(bytes) = value_bytes(value) else {
             if value.is_null() {
-                let nulls = self.null_positions.lock().unwrap().clone();
-                return (nulls.len() <= limit).then_some(nulls);
+                return nulls_within(&self.null_positions, limit);
             }
             return Some(Vec::new());
         };
@@ -1011,6 +1009,13 @@ impl Backend {
             Self::Scalar(b) => b.snapshot(),
         }
     }
+}
+
+/// The null positions, or `None` when more than `limit`. Checked before
+/// copying, since the copy holds the insert lock.
+fn nulls_within(nulls: &Mutex<Vec<RowPosition>>, limit: usize) -> Option<Vec<RowPosition>> {
+    let nulls = nulls.lock().unwrap();
+    (nulls.len() <= limit).then(|| nulls.clone())
 }
 
 /// `positions` collected, or `None` once there are more than `limit`.
@@ -1549,6 +1554,16 @@ mod tests {
             found(SargableQuery::IsIn((20..31).map(value).collect())),
             None
         );
+
+        let nulls = |count: usize| {
+            let array = arrow_array::new_null_array(&data_type, count);
+            let schema = ArrowSchema::new(vec![Field::new("v", data_type.clone(), true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![array]).unwrap()
+        };
+        index.insert(&nulls(10), 110).unwrap();
+        assert_eq!(found(SargableQuery::IsNull()), Some(10));
+        index.insert(&nulls(1), 120).unwrap();
+        assert_eq!(found(SargableQuery::IsNull()), None);
     }
 
     /// An exclusive lower bound drops every row of its key, and a range whose
