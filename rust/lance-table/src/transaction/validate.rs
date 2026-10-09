@@ -827,8 +827,9 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 /// Readers resolve columns by field id (name -> schema id -> DataFile::fields
 /// position), so renumbered ids silently rebind live columns to other columns'
 /// bytes. Shared ids may be renamed to unused names within the same parent,
-/// but must not take another sibling's name or move between parents. Their logical
-/// type, nullability, storage encoding, and dictionary may change only when every
+/// but must not take another sibling's name or move between parents. Parent ids
+/// must agree with the actual schema tree. Their logical type, nullability,
+/// storage encoding, and dictionary may change only when every
 /// existing base or overlay file carrying the id is replaced and every
 /// proposed fragment materializes the id in a base data file. New ids must
 /// exceed the manifest's max so a dropped field's id is never reused. An
@@ -854,15 +855,49 @@ fn merge_schema_valid(
         let Some(prior_field) = prior_schema.field_by_id(field.id) else {
             continue;
         };
-        let prior_path = prior_schema.field_path(field.id)?;
-        let new_path = new_schema.field_path(field.id)?;
+        // A cloned field can keep a stale parent_id after moving in the schema tree.
+        let prior_parent = prior_schema
+            .field_ancestry_by_id(field.id)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Missing prior schema ancestry for field id {}",
+                    field.id
+                ))
+            })?
+            .into_iter()
+            .rev()
+            .nth(1);
+        let new_parent = new_schema
+            .field_ancestry_by_id(field.id)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Missing proposed schema ancestry for field id {}",
+                    field.id
+                ))
+            })?
+            .into_iter()
+            .rev()
+            .nth(1);
+        let prior_parent_id = prior_parent.map_or(-1, |parent| parent.id);
+        let new_parent_id = new_parent.map_or(-1, |parent| parent.id);
+        if prior_field.parent_id != prior_parent_id || field.parent_id != new_parent_id {
+            return Err(Error::invalid_input(format!(
+                "Merge operation has inconsistent parent ids for field id {} (\"{}\"): \
+                 prior field declares {} but its schema ancestry has {}; proposed field \
+                 declares {} but its schema ancestry has {}.",
+                field.id,
+                new_schema.field_path(field.id)?,
+                prior_field.parent_id,
+                prior_parent_id,
+                field.parent_id,
+                new_parent_id
+            )));
+        }
         // Match siblings by parent id so an ancestor rename does not hide renumbering.
-        let prior_siblings = prior_schema
-            .field_by_id(field.parent_id)
-            .map_or(prior_schema.fields.as_slice(), |parent| {
-                parent.children.as_slice()
-            });
-        if field.parent_id != prior_field.parent_id
+        let prior_siblings = prior_parent.map_or(prior_schema.fields.as_slice(), |parent| {
+            parent.children.as_slice()
+        });
+        if new_parent_id != prior_parent_id
             || prior_siblings
                 .iter()
                 .any(|sibling| sibling.name == field.name && sibling.id != field.id)
@@ -871,7 +906,9 @@ fn merge_schema_valid(
                 "Merge operation remaps field id {} from \"{}\" to \"{}\". \
                  Merge must preserve the dataset's field ids: derive the new schema \
                  from the dataset's current schema instead of renumbering fields.",
-                field.id, prior_path, new_path
+                field.id,
+                prior_schema.field_path(field.id)?,
+                new_schema.field_path(field.id)?
             )));
         }
         if let Some(changes) = shared_field_binding_changes(prior_field, field)
@@ -882,7 +919,9 @@ fn merge_schema_valid(
                  every existing fragment: {}. Merge must preserve each existing field's \
                  logical type, nullability, storage encoding, and dictionary unless all \
                  existing base and overlay files carrying that field are replaced.",
-                field.id, new_path, changes
+                field.id,
+                new_schema.field_path(field.id)?,
+                changes
             )));
         }
     }
@@ -1867,28 +1906,54 @@ mod tests {
         assert!(err.to_string().contains("remaps field id 1"), "{err}");
     }
 
+    #[rstest::rstest]
+    #[case::dropped_parent_stale(false, false)]
+    #[case::retained_parent_stale(true, false)]
+    #[case::dropped_parent_updated(false, true)]
+    #[case::retained_parent_updated(true, true)]
     #[test]
-    fn test_merge_rejects_moving_field_to_unused_path() {
+    fn test_merge_rejects_moving_field_to_unused_path(
+        #[case] retain_parent: bool,
+        #[case] update_parent_id: bool,
+    ) {
         let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
             "s",
-            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, true)].into()),
+            DataType::Struct(
+                vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Int32, true),
+                ]
+                .into(),
+            ),
             true,
         )]))
         .unwrap();
-        let manifest = manifest_with_file_fields(schema.clone(), vec![1]);
+        let manifest = manifest_with_file_fields(schema.clone(), vec![1, 2]);
         let mut moved = schema;
-        let mut child = moved.fields.pop().unwrap().children.remove(0);
+        let mut child = moved.fields[0].children.remove(0);
+        if !retain_parent {
+            moved.fields.clear();
+        }
         child.name = "renamed".into();
-        child.parent_id = -1;
+        if update_parent_id {
+            child.parent_id = -1;
+        }
         moved.fields.push(child);
+        moved.validate().unwrap();
 
-        let err = merge_schema_valid(&manifest, &moved, &manifest.fragments).unwrap_err();
+        let operation = Operation::Merge {
+            schema: moved,
+            fragments: manifest.fragments.as_ref().clone(),
+            preserves_nullability: true,
+        };
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-        assert!(
-            err.to_string()
-                .contains("remaps field id 1 from \"s.x\" to \"renamed\""),
-            "{err}"
-        );
+        let expected = if update_parent_id {
+            "remaps field id 1 from \"s.x\" to \"renamed\""
+        } else {
+            "inconsistent parent ids for field id 1"
+        };
+        assert!(err.to_string().contains(expected), "{err}");
     }
 
     #[test]

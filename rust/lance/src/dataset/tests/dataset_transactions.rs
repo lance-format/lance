@@ -1552,6 +1552,55 @@ async fn test_merge_rejects_renumbered_nested_field_ids() {
 }
 
 #[rstest::rstest]
+#[case::dropped_parent(false)]
+#[case::retained_parent(true)]
+#[tokio::test]
+async fn test_merge_rejects_move_with_stale_parent_id(#[case] retain_parent: bool) -> Result<()> {
+    let nested = StructArray::from(record_batch!(
+        ("x", Int32, [Some(1), None, Some(3)]),
+        ("y", Int32, [10, 20, 30])
+    )?);
+    let batch = RecordBatch::try_from_iter([("s", Arc::new(nested) as Arc<dyn Array>)])?;
+    let uri = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    let version = dataset.version().version;
+
+    let mut moved = dataset.schema().clone();
+    let mut child = moved.fields[0].children.remove(0);
+    assert_eq!(child.parent_id, moved.fields[0].id);
+    if !retain_parent {
+        moved.fields.clear();
+    }
+    child.name = "renamed".into();
+    moved.fields.push(child);
+    moved.validate()?;
+
+    let err = commit_merge(&dataset, moved).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("inconsistent parent ids for field id 1"),
+        "{err}"
+    );
+
+    // A rejected merge must leave the persisted version readable with its original schema.
+    let reopened = Dataset::open(&uri).await?;
+    assert_eq!(reopened.version().version, version);
+    assert_eq!(reopened.schema(), dataset.schema());
+    assert_eq!(reopened.scan().try_into_batch().await?, batch);
+    Ok(())
+}
+
+#[rstest::rstest]
 #[case::drop_a("a")]
 #[case::drop_b("b")]
 #[case::drop_c("c")]
