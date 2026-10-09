@@ -4,8 +4,8 @@
 //! An index built while other processes write to and compact the table, then
 //! committed through conflict resolution. On a table whose fragment reuse index
 //! is untagged, a deferred compaction does not conflict with the build; changes
-//! that leave its coverage stale withdraw that coverage instead. Every commit is
-//! checked by comparing index lookups with a scan.
+//! that leave its coverage stale withdraw that coverage instead. Every index
+//! that commits is checked by comparing its lookups with a scan.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -153,6 +153,17 @@ async fn fragment_of(uri: &str, id: i32) -> u32 {
         .as_primitive::<UInt64Type>()
         .value(0)
         >> 32) as u32
+}
+
+/// Checks that `val_idx` covers every live fragment except the one holding
+/// row `id`, or every one when `id` is `None`.
+async fn assert_covers_all_but_the_fragment_of(uri: &str, id: Option<i32>) {
+    let mut expected = live_fragments(uri).await;
+    if let Some(id) = id {
+        expected.remove(fragment_of(uri, id).await);
+    }
+    let live = live_fragments(uri).await;
+    assert_eq!(&coverage(uri, "val_idx").await & &live, expected);
 }
 
 /// The fragments `name` covers, by their current ids.
@@ -468,7 +479,7 @@ enum Fold {
 async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_process: bool) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
-    let mut table = indexed_table(uri, 2).await;
+    let mut table = indexed_table(uri, 4).await;
     let mut builder = if same_process {
         table.clone()
     } else {
@@ -479,7 +490,8 @@ async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_
             .await
             .unwrap();
     }
-    let fragment = table.fragments()[0].id;
+    // Overlays row 0, the first row of its fragment.
+    let fragment = fragment_of(uri, 0).await as u64;
     let mut table = overlay_val(table, fragment, 999).await;
     if !matches!(fold, Fold::Never) {
         compact_files(&mut table, folding_compaction(2), None)
@@ -492,7 +504,9 @@ async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_
         .await
         .unwrap();
 
-    assert_lookups_match_scan(uri, probes(12, [999])).await;
+    assert_lookups_match_scan(uri, probes(24, [999])).await;
+    let folded = (!matches!(fold, Fold::Never)).then_some(0);
+    assert_covers_all_but_the_fragment_of(uri, folded).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -517,7 +531,7 @@ enum Racing {
 async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] racing: Racing) {
     let dir = TempStrDir::default();
     let uri = dir.as_str().to_string();
-    let table = indexed_table(&uri, 2).await;
+    let table = indexed_table(&uri, 4).await;
     // Keeps the build's version through the cleanup.
     table
         .tags()
@@ -531,9 +545,9 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
         match racing {
             Racing::UpdateInPlace => update_in_place(table, vec![0], vec![999]).await,
             Racing::FoldOverlay => {
-                let fragment = table.fragments()[0].id;
+                let fragment = fragment_of(&hook_uri, 0).await as u64;
                 let mut table = overlay_val(table, fragment, 999).await;
-                compact_files(&mut table, folding_compaction(1), None)
+                compact_files(&mut table, folding_compaction(2), None)
                     .await
                     .unwrap();
             }
@@ -560,7 +574,15 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
         .unwrap();
 
     assert_eq!(race.attempts.load(Ordering::SeqCst), 2);
-    assert_lookups_match_scan(&uri, probes(12, [999])).await;
+    assert_lookups_match_scan(&uri, probes(24, [999])).await;
+    if matches!(racing, Racing::RemapAndTrim) {
+        // Nothing translates the trimmed groups any more, so the index covers
+        // no live fragment and their rows are scanned.
+        let live = live_fragments(&uri).await;
+        assert!(coverage(&uri, "val_idx").await.is_disjoint(&live));
+    } else {
+        assert_covers_all_but_the_fragment_of(&uri, Some(0)).await;
+    }
 }
 
 /// A retry keeps what the first attempt pruned for an update, even once the
@@ -593,43 +615,57 @@ async fn test_index_retry_keeps_pruning_for_a_cleaned_up_update() {
     assert_lookups_match_scan(&uri, probes(12, [999])).await;
 }
 
-/// A cleaned-up version in the window can hide a change to a compaction's
-/// output, so an index covering a recorded compaction's sources refuses it.
-/// An index covering none, or a table with no fragment reuse index, commits.
+#[derive(Clone, Copy, Debug)]
+enum Gap {
+    /// The compaction's own version, in the build's window.
+    HidesTheCompaction,
+    /// A version before the compaction, which stays visible.
+    BeforeTheCompaction,
+    /// A version in the window; the compaction came before the build.
+    AfterACompactionBeforeTheBuild,
+    /// A version in the window; the table never compacted.
+    NoFragmentReuseIndex,
+}
+
+/// A cleaned-up version at or after a recorded compaction of fragments the
+/// index covers could hide a change to its output, so the commit is refused.
+/// Any other gap commits, as it would without the fragment reuse index.
 #[rstest]
-#[case::hides_a_covered_compaction(true, true, false)]
-#[case::compaction_before_the_build(true, false, true)]
-#[case::no_fragment_reuse_index(false, false, true)]
+#[case::hides_the_compaction(Gap::HidesTheCompaction, false)]
+#[case::before_the_compaction(Gap::BeforeTheCompaction, true)]
+#[case::after_a_compaction_before_the_build(Gap::AfterACompactionBeforeTheBuild, true)]
+#[case::no_fragment_reuse_index(Gap::NoFragmentReuseIndex, true)]
 #[tokio::test]
-async fn test_index_over_a_cleaned_up_version(
-    #[case] compact: bool,
-    #[case] compaction_in_window: bool,
-    #[case] commits: bool,
-) {
+async fn test_index_over_a_cleaned_up_version(#[case] gap: Gap, #[case] commits: bool) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let mut table = indexed_table(uri, 2).await;
-    if compact && !compaction_in_window {
+    if matches!(gap, Gap::AfterACompactionBeforeTheBuild) {
         compact_files(&mut table, deferred_compaction(2), None)
             .await
             .unwrap();
     }
-    let read_version = table.manifest.version;
     table
         .tags()
-        .create("index-build", read_version)
+        .create("index-build", table.manifest.version)
         .await
         .unwrap();
     let mut builder = open_in_new_session(uri).await;
-    if compaction_in_window {
+    let mut gone = None;
+    if !matches!(gap, Gap::HidesTheCompaction) {
+        table.update_config([("first", "true")]).await.unwrap();
+        gone = Some(table.manifest.version);
+    }
+    if matches!(gap, Gap::HidesTheCompaction | Gap::BeforeTheCompaction) {
         compact_files(&mut table, deferred_compaction(2), None)
             .await
             .unwrap();
-    } else {
-        table.update_config([("first", "true")]).await.unwrap();
+        if matches!(gap, Gap::HidesTheCompaction) {
+            gone = Some(table.manifest.version);
+        }
     }
     update_in_place(table, vec![0], vec![999]).await;
-    clean_up_versions(uri, vec![read_version + 1]).await;
+    clean_up_versions(uri, vec![gone.unwrap()]).await;
 
     let result = build_index(&mut builder, "val", "val_idx", false).await;
     if commits {
@@ -859,4 +895,89 @@ async fn test_index_under_the_remap_job_is_correct_or_retries() {
         }
     }
     assert!(committed >= 8, "only {committed} of 16 seeds committed");
+}
+
+/// An index on `s.x`, where `s` is a packed struct, built before a deferred
+/// compaction: rewriting `s` in place on the compaction's output rewrites one
+/// physical column for the parent, and must still withdraw the child index's
+/// coverage of the fragments that output came from.
+#[tokio::test]
+async fn test_index_on_a_packed_child_withdraws_a_rewritten_parent() {
+    use arrow_array::StructArray;
+    use arrow_schema::Fields;
+    use lance_encoding::constants::PACKED_STRUCT_META_KEY;
+
+    let children = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
+    let mut packed = ArrowField::new("s", DataType::Struct(children.clone()), false);
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("spare", DataType::Int32, false),
+        packed.clone(),
+    ]));
+    let ids = Arc::new(Int32Array::from_iter_values(0..12)) as ArrayRef;
+    let xs = Arc::new(StructArray::new(children.clone(), vec![ids.clone()], None)) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids.clone(), ids, xs]).unwrap();
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let mut table = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    build_index(&mut table, "id", "id_idx", false)
+        .await
+        .unwrap();
+    let mut builder = open_in_new_session(uri).await;
+    compact_files(&mut table, deferred_compaction(2), None)
+        .await
+        .unwrap();
+
+    let patch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            packed,
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+            Arc::new(StructArray::new(
+                children,
+                vec![Arc::new(Int32Array::from(vec![333])) as ArrayRef],
+                None,
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    MergeInsertBuilder::try_new(Arc::new(table), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![patch])
+        .await
+        .unwrap();
+
+    build_index(&mut builder, "s.x", "x_idx", false)
+        .await
+        .unwrap();
+
+    let dataset = open_in_new_session(uri).await;
+    for (filter, expected) in [("s.x = 333", 1), ("s.x = 3", 0)] {
+        let mut scan = dataset.scan();
+        scan.filter(filter).unwrap().use_scalar_index(false);
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), expected);
+        assert_eq!(
+            dataset.count_rows(Some(filter.into())).await.unwrap(),
+            expected,
+            "{filter} through the index"
+        );
+    }
 }

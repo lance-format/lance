@@ -193,7 +193,7 @@ impl Transaction {
     }
 
     /// `fields` plus every field nested under them, deduplicated.
-    fn with_descendants(schema: &Schema, fields: Vec<u32>) -> Vec<u32> {
+    pub fn with_descendants(schema: &Schema, fields: Vec<u32>) -> Vec<u32> {
         let mut expanded = Vec::with_capacity(fields.len());
         for id in fields {
             expanded.push(id);
@@ -413,6 +413,9 @@ impl Transaction {
         fragment_ids: &RoaringBitmap,
         fields_modified: &[u32],
     ) {
+        if fields_modified.is_empty() || fragment_ids.is_empty() {
+            return;
+        }
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
         let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();

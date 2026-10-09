@@ -1736,16 +1736,19 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
-            let complete = other_transactions
+            let seen = other_transactions
                 .iter()
                 .map(|(version, _)| *version)
-                .eq(checked_since + 1..=dataset.manifest.version);
-            if !complete && rebase.relies_on_untagged_reuse() {
+                .collect::<HashSet<_>>();
+            let missing = (checked_since + 1..=dataset.manifest.version)
+                .filter(|version| !seen.contains(version))
+                .collect::<Vec<_>>();
+            if rebase.needs_versions(&missing) {
                 return Err(Error::retryable_commit_conflict_source(
                     dataset.manifest.version,
                     format!(
-                        "versions since {checked_since} were cleaned up, so this index cannot be \
-                         carried through deferred compactions; rebuild it"
+                        "versions {missing:?} were cleaned up, so this index cannot be carried \
+                         through the deferred compaction it covers; rebuild it"
                     )
                     .into(),
                 ));
