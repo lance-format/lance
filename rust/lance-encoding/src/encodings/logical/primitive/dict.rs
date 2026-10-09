@@ -110,6 +110,65 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     }
 }
 
+fn clear_out_of_range_null_keys_impl<K: ArrowDictionaryKeyType>(
+    array: Arc<dyn Array>,
+) -> Result<Arc<dyn Array>> {
+    let dict_array = array.as_dictionary_opt::<K>().expect_ok()?;
+    let num_values = dict_array.values().len();
+    let Some(nulls) = dict_array.keys().nulls() else {
+        return Ok(array);
+    };
+
+    // There is no valid replacement key for an empty dictionary, so that case
+    // requires separate handling and must remain unchanged here.
+    if num_values == 0 {
+        return Ok(array);
+    }
+
+    let has_out_of_range_null_key = dict_array
+        .keys()
+        .values()
+        .iter()
+        .zip(nulls.iter())
+        .any(|(key, is_valid)| !is_valid && key.to_usize().is_none_or(|key| key >= num_values));
+    if !has_out_of_range_null_key {
+        return Ok(array);
+    }
+
+    // Building from the logical iterator writes the default physical key into
+    // every null slot while preserving the original validity bitmap.
+    let keys = PrimitiveArray::<K>::from_iter(dict_array.keys().iter());
+    let values = dict_array.values().clone();
+    Ok(Arc::new(DictionaryArray::<K>::try_new(keys, values)?) as Arc<dyn Array>)
+}
+
+/// Replaces out-of-range physical keys in null dictionary slots with a valid key.
+///
+/// Arrow permits arbitrary keys in null slots, but the structural encoder removes
+/// key validity after recording it as rep-def. The replacement keeps the array
+/// valid when that null buffer is removed without changing its logical values.
+pub(super) fn clear_out_of_range_null_keys(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+    match array.data_type() {
+        DataType::Dictionary(key_type, _) => match key_type.as_ref() {
+            DataType::UInt8 => clear_out_of_range_null_keys_impl::<UInt8Type>(array),
+            DataType::UInt16 => clear_out_of_range_null_keys_impl::<UInt16Type>(array),
+            DataType::UInt32 => clear_out_of_range_null_keys_impl::<UInt32Type>(array),
+            DataType::UInt64 => clear_out_of_range_null_keys_impl::<UInt64Type>(array),
+            DataType::Int8 => clear_out_of_range_null_keys_impl::<Int8Type>(array),
+            DataType::Int16 => clear_out_of_range_null_keys_impl::<Int16Type>(array),
+            DataType::Int32 => clear_out_of_range_null_keys_impl::<Int32Type>(array),
+            DataType::Int64 => clear_out_of_range_null_keys_impl::<Int64Type>(array),
+            _ => Err(Error::not_supported_source(
+                format!("Unsupported dictionary key type: {}", key_type).into(),
+            )),
+        },
+        _ => Err(Error::internal(format!(
+            "Data type is not a dictionary: {}",
+            array.data_type()
+        ))),
+    }
+}
+
 fn dict_encode_variable_width<T>(
     variable_width_data_block: &VariableWidthBlock,
     bits_per_offset: u8,

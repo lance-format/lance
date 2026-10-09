@@ -22,9 +22,12 @@ rustflags = [
 ]
 
 [target.x86_64-unknown-linux-gnu]
-# Published extensions must load before runtime SIMD detection selects an
-# optimized kernel, including on x86_64 hosts without AVX or AVX2.
-rustflags = ["-C", "target-cpu=x86-64-v2"]
+# See the note in ../../.cargo/config.toml for details on this choice.
+#
+# Note that pylance users cannot easily change this value (they would need to build
+# pylance from source).  This is an intentional choice to provide strong performance
+# by default for pylance wheels.
+rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon,+fp16"]

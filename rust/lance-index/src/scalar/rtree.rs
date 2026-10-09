@@ -38,6 +38,10 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
+};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -296,7 +300,11 @@ impl CacheKey for RTreeCacheKey {
 pub struct RTreeIndex {
     pub(crate) metadata: Arc<RTreeMetadata>,
     store: Arc<dyn IndexStore>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
     nulls_reader: Arc<dyn IndexReader>,
@@ -326,6 +334,31 @@ impl RTreeIndex {
             metadata: Arc::new(metadata),
             store,
             frag_reuse_index,
+            batch_remapper: None,
+            index_cache: WeakLanceCache::from(index_cache),
+            pages_reader,
+            nulls_reader,
+        }))
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
+        let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
+        validate_stored_page_size(metadata.page_size, metadata.num_items)?;
+        let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
+
+        Ok(Arc::new(Self {
+            metadata: Arc::new(metadata),
+            store,
+            frag_reuse_index: None,
+            batch_remapper: remapping,
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
@@ -513,6 +546,19 @@ fn remap_rtree_data(
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
 
+fn remap_rtree_data_async(
+    data: SendableRecordBatchStream,
+    remapper: Arc<dyn BatchRowIdRemapper>,
+) -> SendableRecordBatchStream {
+    let schema = data.schema();
+    let remapped = data.and_then(move |batch| {
+        let remapper = remapper.clone();
+        // The row ID is column 1 in BBOX_ROWID_SCHEMA.
+        async move { Ok(remap_record_batch_async(remapper.as_ref(), batch, 1).await?) }
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
+}
+
 /// Merge caller-selected RTree segments into one self-contained segment.
 ///
 /// Each source may supply a filter for rows that are still live. The merged index recomputes its
@@ -584,7 +630,11 @@ pub async fn merge_rtree_indices(
         }
         let mut source_nulls = source.search_null(&NoOpMetricsCollector).await?;
         if let Some(remapper) = &source.frag_reuse_index {
+            // Legacy synchronous remapping path.
             source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls);
+        } else if let Some(remapper) = &source.batch_remapper {
+            // Tagged asynchronous path.
+            source_nulls = remap_row_addrs_tree_map_async(remapper.as_ref(), &source_nulls).await?;
         }
         if let Some(filter) = filter {
             filter.retain_old_rows(&mut source_nulls);
@@ -593,7 +643,11 @@ pub async fn merge_rtree_indices(
 
         let mut data = source.as_ref().clone().into_data_stream().await?;
         if let Some(remapper) = source.frag_reuse_index.clone() {
+            // Legacy synchronous remapping path.
             data = remap_rtree_data(data, remapper);
+        } else if let Some(remapper) = source.batch_remapper.clone() {
+            // Tagged asynchronous path.
+            data = remap_rtree_data_async(data, remapper);
         }
         data_streams.push(match filter {
             Some(filter) => filter_rtree_data(data, filter.clone()),
@@ -713,8 +767,13 @@ impl ScalarIndex for RTreeIndex {
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
+                    // Legacy synchronous remapping path.
                     rowids = fri.remap_row_addrs_tree_map(&rowids);
                     null_map = fri.remap_row_addrs_tree_map(&null_map);
+                } else if let Some(remapper) = &self.batch_remapper {
+                    // Tagged asynchronous path.
+                    rowids = remap_row_addrs_tree_map_async(remapper.as_ref(), &rowids).await?;
+                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
                 }
                 Ok(SearchResult::AtMost(NullableRowAddrSet::new(
                     rowids, null_map,
@@ -724,7 +783,11 @@ impl ScalarIndex for RTreeIndex {
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
+                    // Legacy synchronous remapping path.
                     null_map = fri.remap_row_addrs_tree_map(&null_map);
+                } else if let Some(remapper) = &self.batch_remapper {
+                    // Tagged asynchronous path.
+                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
                 }
                 Ok(SearchResult::Exact(NullableRowAddrSet::new(
                     null_map,
@@ -743,6 +806,17 @@ impl ScalarIndex for RTreeIndex {
         _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "RTree does not support remap".into(),
+        ))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::invalid_input_source(
             "RTree does not support remap".into(),
         ))
@@ -1188,10 +1262,25 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(RTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(RTreeIndex::load_with_remapping(index_store, remapping, cache).await?)
     }
 }
 
@@ -1307,7 +1396,10 @@ mod tests {
         )
     }
 
+    // Spill-enabled index builds share the cached DataFusion memory pool within the
+    // test process, so keep them in one resource group.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_search_bbox() {
         let bbox_type = RectType::new(Dimension::XY, Default::default());
 
@@ -1353,6 +1445,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_search_null() {
         let point_type = PointType::new(Dimension::XY, Default::default());
 
@@ -1389,6 +1482,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_empty_geometries_are_not_indexed() {
         let line_string_type = LineStringType::new(Dimension::XY, Default::default());
         let mut builder = LineStringBuilder::new(line_string_type);
@@ -1449,6 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_non_finite_bounds_are_not_treated_as_empty() {
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
@@ -1489,6 +1584,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_merge_rtree_indices_filters_rows_and_nulls() {
         let point_type = PointType::new(Dimension::XY, Default::default());
         let mut first_builder = PointBuilder::new(point_type.clone());
@@ -1586,6 +1682,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_removes_pre_fix_empty_entries() {
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
@@ -1651,6 +1748,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_and_search() {
         fn gen_data(num_items: u32, frag_id: u32, nulls_addrs: &mut RowAddrTreeMap) -> RectArray {
             let bbox_type = RectType::new(Dimension::XY, Default::default());
@@ -1748,6 +1846,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_prewarm() {
         let point_type = PointType::new(Dimension::XY, Default::default());
 

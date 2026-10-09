@@ -30,6 +30,7 @@ use object_store::{
 use crate::object_store::WrappingObjectStore;
 #[cfg(feature = "metrics")]
 use crate::object_store::metrics::{InFlightGuard, record_outcome};
+use object_store::list::PaginatedListStore;
 
 #[derive(Debug, Default, Clone)]
 pub struct IOTracker {
@@ -182,6 +183,16 @@ impl IoMetricsGuard {
 impl WrappingObjectStore for IOTracker {
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore::new(target, self.stats.clone()))
+    }
+
+    // A pushed-down listing records itself against the store's tracker, so it is already
+    // counted without passing through here.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        Some(original)
     }
 }
 
@@ -419,15 +430,24 @@ impl ObjectStore for IoTrackingStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
+        let is_head = options.head;
         let range = match &options.range {
             Some(GetRange::Bounded(range)) => Some(range.clone()),
             _ => None, // TODO: fill in other options.
         };
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-
-            self.record_read("get_opts", location.to_owned(), num_bytes, range);
+            let num_bytes = if is_head {
+                0
+            } else {
+                result.range.end - result.range.start
+            };
+            self.record_read(
+                if is_head { "head" } else { "get_opts" },
+                location.to_owned(),
+                num_bytes,
+                range,
+            );
         }
         result
     }

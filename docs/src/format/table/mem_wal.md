@@ -39,7 +39,7 @@ All MemWAL index data is stored in the `MemWalIndexDetails` protobuf message in 
 
 The index stores:
 
-- **Configuration**: `sharding_specs`, `maintained_indexes`, and `writer_config_defaults`.
+- **Configuration**: `sharding_specs`, `maintained_indexes`, `maintain_all_indexes`, and `writer_config_defaults`.
 - **Compaction progress**: `compacted_sstables`, the last SSTable compacted into the base table for each shard.
 - **Index catchup progress**: `index_catchup`, the compacted SSTable generation covered by each base-table index.
 - **Shard snapshots**: optional point-in-time snapshot fields for read optimization.
@@ -103,6 +103,7 @@ Each WAL entry is an Apache Arrow IPC stream file.
 The Arrow schema metadata includes:
 
 - `writer_epoch`: decimal string containing the writer epoch that created the entry.
+- `generation`: decimal string containing the memtable generation the entry's batches belong to. A flush drains one memtable, so an entry never spans two generations. A reader rebuilds generation boundaries from this value. Absent in WAL-only mode, which holds no memtable.
 - `fence_sentinel`: optional marker for a data-less fence sentinel entry.
 
 A normal WAL entry contains one or more record batches.
@@ -144,6 +145,29 @@ _mem_wal/{shard_id}/{random8}_gen_{i}/
 `{random8}` is an 8-character random hex value generated for each flush attempt.
 If a flush attempt fails, a retry writes a different directory instead of reusing a partially written one.
 The shard manifest records the successful directory name in the SSTable's `path`.
+
+### SSTable Accounting
+
+Alongside `generation` and `path`, a shard manifest entry may record what the
+SSTable holds, as the writer's MemTable accounted for it at flush:
+
+- `in_memory_bytes`: payload size of the rows, summed over the MemTable's
+  buffers as the window each one holds.
+- `physical_rows`: rows held, counting the older duplicates of a primary key
+  that the generation's deletion vector masks. A scan applying the deletion
+  vector yields fewer.
+- `primary_key_bytes`: total payload size of the primary-key columns over every
+  row in `physical_rows`. Not a per-row size, which varies for a
+  variable-length key.
+
+All three are estimates of payload, not bounds on what reading the SSTable
+costs: they exclude the per-array structure a reader materializes, and
+`primary_key_bytes` is not the size of any encoded form of the key. A consumer
+budgeting memory from them adds its own headroom.
+
+All three are optional. An entry written before they existed records none of
+them, and a reader must not treat an absent value as zero; `primary_key_bytes`
+is also absent on a table with no primary key.
 
 The SSTable directory is a standard Lance dataset written with the base table's data storage version.
 Each SSTable is written as one fragment.
@@ -243,7 +267,7 @@ It is not used to choose the newest row inside the same SSTable; the deletion ve
 
 ### Maintained User Indexes
 
-When the MemWAL index lists `maintained_indexes`, flush may build matching indexes inside the SSTable.
+When the MemWAL index names indexes to maintain -- in `maintained_indexes`, or every index the table has when `maintain_all_indexes` is set -- flush may build matching indexes inside the SSTable.
 These index files live in the SSTable's `_indices/{index_uuid}/` directory and are recorded in the SSTable's Lance manifest.
 The implicit primary-key BTree sidecar is not included in `maintained_indexes` and does not live under `_indices/`.
 
@@ -335,7 +359,8 @@ The `index_details` field contains a `MemWalIndexDetails` protobuf message.
 Important fields:
 
 - `sharding_specs`: sharding configuration used by writers and shard pruning.
-- `maintained_indexes`: names of base-table indexes to maintain in MemTables and SSTables.
+- `maintained_indexes`: names of base-table indexes to maintain in MemTables and SSTables. Ignored when `maintain_all_indexes` is set.
+- `maintain_all_indexes`: maintain every index the table has rather than the names above. The set is resolved from the table's indexes each time a MemTable is built, so an index created after the MemWAL was installed is picked up and a dropped one falls out. An index the writer cannot mirror is skipped, so introducing one does not make the table unwritable; a name in `maintained_indexes` that it cannot mirror is an error instead, because the caller asked for that index. The field carries presence: absent and empty `maintained_indexes` mean maintain nothing, while set and empty means maintain everything.
 - `writer_config_defaults`: string map of default writer configuration values persisted for all writers.
 - `compacted_sstables`: per-shard compaction progress, updated atomically with base-table compaction commits.
 - `index_catchup`: per-index coverage progress after data has been compacted into the base table.
