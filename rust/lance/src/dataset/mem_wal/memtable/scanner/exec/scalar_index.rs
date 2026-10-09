@@ -31,8 +31,7 @@ use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_p
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// An index may decline a search matching more than `1 / MATCH_BUDGET_SHARE`
-/// of the visible rows, which are then all read, since listing that many costs
-/// more than reading them.
+/// of the visible rows; reading them all is then cheaper.
 const MATCH_BUDGET_SHARE: u64 = 16;
 
 /// Matches always worth listing, whatever the share.
@@ -121,8 +120,8 @@ impl ScalarMemIndexExec {
         };
         let visible_rows = max_readable_row + 1;
         let mut ctx = SearchContext::new(max_readable_row);
-        // A declined search leaves the rows to the filter, so only offer an
-        // index the choice when there is one to apply.
+        // A declined search needs `recheck` to filter the rows, so set a budget
+        // only when there is one.
         if self.recheck.is_some() {
             ctx = ctx.with_match_budget((visible_rows / MATCH_BUDGET_SHARE).max(MIN_MATCH_BUDGET));
         }
@@ -376,23 +375,12 @@ mod tests {
     }
 
     /// Past the match budget every visible row is read with the filter, and a
-    /// batch past the readable count stays unread.
+    /// batch past the readable count stays unread. The filter is wider than the
+    /// index query, so only a declined search returns ids below 100.
     #[tokio::test]
     async fn a_broad_answer_reads_every_visible_row_with_the_filter() {
-        const ROWS_PER_BATCH: usize = 1_000;
-        const READABLE_BATCHES: usize = 20;
         let schema = create_test_schema();
-        let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let mut indexes = IndexStore::new();
-        indexes.add_btree("id_idx".to_string(), 0, "id".to_string());
-        for n in 0..=READABLE_BATCHES {
-            let start = n * ROWS_PER_BATCH;
-            let batch = create_test_batch(&schema, start as i32, ROWS_PER_BATCH);
-            batch_store.append(batch.clone()).unwrap();
-            indexes
-                .insert_with_batch_position(&batch, start as u64, Some(n))
-                .unwrap();
-        }
+        let (batch_store, indexes) = broad_memtable(&schema);
         let visible_rows = (READABLE_BATCHES * ROWS_PER_BATCH) as u64;
 
         let query = SargableQuery::Range(
@@ -413,7 +401,7 @@ mod tests {
 
         let planner = lance_datafusion::planner::Planner::new(schema.clone());
         let recheck = planner
-            .create_physical_expr(&planner.parse_filter("id >= 100").unwrap())
+            .create_physical_expr(&planner.parse_filter("id >= 50").unwrap())
             .unwrap();
         let schema_with_rowid = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -440,12 +428,65 @@ mod tests {
             .unwrap();
 
         let (ids, row_ids) = ids_and_row_ids(&batches);
-        let expected: Vec<i32> = (100..visible_rows as i32).collect();
+        let expected: Vec<i32> = (50..visible_rows as i32).collect();
         assert_eq!(ids, expected);
         assert_eq!(
             row_ids,
             expected.iter().map(|id| *id as u64).collect::<Vec<_>>()
         );
+    }
+
+    const ROWS_PER_BATCH: usize = 1_000;
+    const READABLE_BATCHES: usize = 20;
+
+    /// `READABLE_BATCHES` readable batches of `ROWS_PER_BATCH` ids counting up
+    /// from 0, plus one more batch past the readable count, with a B-tree on
+    /// `id`.
+    fn broad_memtable(schema: &SchemaRef) -> (Arc<BatchStore>, IndexStore) {
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        let mut indexes = IndexStore::new();
+        indexes.add_btree("id_idx".to_string(), 0, "id".to_string());
+        for n in 0..=READABLE_BATCHES {
+            let start = n * ROWS_PER_BATCH;
+            let batch = create_test_batch(schema, start as i32, ROWS_PER_BATCH);
+            batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, start as u64, Some(n))
+                .unwrap();
+        }
+        (batch_store, indexes)
+    }
+
+    /// With no filter to fall back on, a search past the budget is still
+    /// answered.
+    #[tokio::test]
+    async fn a_search_with_no_filter_to_fall_back_on_is_never_declined() {
+        let schema = create_test_schema();
+        let (batch_store, indexes) = broad_memtable(&schema);
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int32(Some(100))),
+            std::ops::Bound::Unbounded,
+        );
+        let exec = ScalarMemIndexExec::new(
+            batch_store,
+            Arc::new(indexes),
+            search("id_idx", "id", query),
+            None,
+            true,
+            READABLE_BATCHES,
+            None,
+            schema,
+            false,
+            false,
+        );
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, READABLE_BATCHES * ROWS_PER_BATCH - 100);
     }
 
     /// Candidates an index only narrowed to are checked against the filter,
@@ -551,11 +592,9 @@ mod tests {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(100));
 
-        // Create index registry with btree index on "id" (field_id = 0)
         let mut registry = IndexStore::new();
         registry.add_btree("id_idx".to_string(), 0, "id".to_string());
 
-        // Insert test data and update index
         let batch = create_test_batch(&schema, 0, 10);
         registry.insert(&batch, 0).unwrap();
         batch_store.append(batch).unwrap();
@@ -585,7 +624,6 @@ mod tests {
         let stream = exec.execute(0, ctx).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
-        // Should find one row with id=5
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
     }
@@ -631,7 +669,6 @@ mod tests {
         let stream = exec.execute(0, ctx).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
-        // Should find 3 rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
     }
@@ -644,7 +681,6 @@ mod tests {
         let mut registry = IndexStore::new();
         registry.add_btree("id_idx".to_string(), 0, "id".to_string());
 
-        // Insert two batches at positions 0 and 1
         let batch1 = create_test_batch(&schema, 0, 10);
         let batch2 = create_test_batch(&schema, 10, 10);
         registry.insert(&batch1, 0).unwrap();
@@ -660,7 +696,7 @@ mod tests {
             SargableQuery::Equals(ScalarValue::Int32(Some(15))),
         );
 
-        // Query with max_readable=0 should not see batch at position 1
+        // Only the first batch is readable; id 15 is in the second.
         let exec = ScalarMemIndexExec::new(
             batch_store.clone(),
             indexes.clone(),
@@ -681,7 +717,7 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 0);
 
-        // Query with max_readable=1 should see both batches
+        // Both batches readable.
         let exec = ScalarMemIndexExec::new(
             batch_store,
             indexes,
@@ -711,7 +747,6 @@ mod tests {
         let mut indexes = IndexStore::new();
         indexes.add_btree("id_idx".to_string(), 0, "id".to_string());
 
-        // Insert batch with 10 rows at position 0
         let batch = create_test_batch(&schema, 0, 10);
         batch_store.append(batch.clone()).unwrap();
         indexes
@@ -720,7 +755,6 @@ mod tests {
 
         let indexes = Arc::new(indexes);
 
-        // Add _rowid to schema
         let schema_with_rowid = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
@@ -746,7 +780,6 @@ mod tests {
             false,
         );
 
-        // Verify the plan output
         let debug_str = format!("{:?}", exec);
         assert!(debug_str.contains("with_row_id: true"));
         assert!(debug_str.contains("with_row_address: false"));
@@ -755,11 +788,9 @@ mod tests {
         let stream = exec.execute(0, ctx).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
-        // Should find one row with id=5
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
 
-        // Verify _rowid column is present and has correct value
         let batch = &batches[0];
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.schema().field(2).name(), "_rowid");
@@ -769,7 +800,7 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        assert_eq!(row_ids.value(0), 5); // Row position for id=5 is 5
+        assert_eq!(row_ids.value(0), 5);
     }
 
     #[tokio::test]
@@ -797,7 +828,6 @@ mod tests {
             SargableQuery::Equals(ScalarValue::Int32(Some(5))),
         );
 
-        // Test plan display without _rowid
         let exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarMemIndexExec::new(
             batch_store.clone(),
             indexes.clone(),
@@ -818,7 +848,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Test plan display with _rowid
         let schema_with_rowid = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),

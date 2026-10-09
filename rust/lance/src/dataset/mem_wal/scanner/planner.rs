@@ -576,9 +576,10 @@ mod integration_tests {
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
+    use lance_core::datatypes::Schema as LanceSchema;
 
     /// Create test schema with id as primary key.
     fn create_pk_schema() -> Arc<ArrowSchema> {
@@ -1439,9 +1440,13 @@ mod integration_tests {
 
         // Create active memtable with BTree index
         let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let mut index_store = IndexStore::new();
-        // Add BTree index on id column (field_id=0)
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let mut index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &LanceSchema::try_from(schema.as_ref()).unwrap(),
+            100,
+            4,
+        )
+        .unwrap();
         // Reuse it as the PK index so the block-list can dedup this generation.
         index_store.enable_pk_index(&[("id".to_string(), 0)]);
 
@@ -1500,7 +1505,7 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan structure with BTree index optimization.
+        // Verify plan structure with a B-tree on the memtable.
         // Instead of complex pattern matching, verify key components directly:
         use datafusion::physical_plan::displayable;
         let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
@@ -1518,14 +1523,14 @@ mod integration_tests {
 
         // 2. The active arm uses the fused dedup scan: it deduplicates to
         //    newest-per-PK *before* applying the predicate, so it deliberately
-        //    forgoes the in-memory BTree skip (the dedup must see every
+        //    forgoes the index route (the dedup must see every
         //    version). See MemTableDedupScanExec.
         assert!(
             plan_str.contains("MemTableDedupScanExec"),
             "Active memtable should use the fused dedup scan"
         );
         assert!(
-            !plan_str.contains("BTreeIndexExec"),
+            !plan_str.contains("ScalarMemIndexExec"),
             "the active memtable must not use the index skip"
         );
 

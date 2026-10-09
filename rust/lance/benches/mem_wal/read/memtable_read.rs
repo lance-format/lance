@@ -34,7 +34,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::write::{CacheConfig, IndexStore, MemTable};
+use lance::dataset::mem_wal::write::{CacheConfig, IndexStore, MemIndexSpec, MemTable};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -185,8 +185,15 @@ async fn setup_memtable(
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     // Field IDs: id=0, text=1, vector=2
-    let mut index_store = IndexStore::new();
-    index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+    // Filters reach only an index built from a spec.
+    let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+    let mut index_store = IndexStore::from_specs(
+        &[MemIndexSpec::btree("id_idx", 0, "id")],
+        &lance_schema,
+        total_rows.max(1),
+        num_batches,
+    )
+    .unwrap();
     index_store.add_fts("text_idx".to_string(), 1, "text".to_string());
     index_store.add_hnsw(
         "vector_idx".to_string(),

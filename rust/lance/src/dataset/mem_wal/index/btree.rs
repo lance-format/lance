@@ -1011,8 +1011,8 @@ impl Backend {
     }
 }
 
-/// The null positions, or `None` when more than `limit`. Checked before
-/// copying, since the copy holds the insert lock.
+/// The null positions, or `None` when more than `limit`. Checked first: the
+/// copy holds the insert lock.
 fn nulls_within(nulls: &Mutex<Vec<RowPosition>>, limit: usize) -> Option<Vec<RowPosition>> {
     let nulls = nulls.lock().unwrap();
     (nulls.len() <= limit).then(|| nulls.clone())
@@ -1286,7 +1286,6 @@ impl MemIndex for BTreeMemIndex {
             return Ok(None);
         };
 
-        // Past the budget the index declines and the caller reads every row.
         let limit = ctx.match_budget.map_or(usize::MAX, |budget| {
             usize::try_from(budget).unwrap_or(usize::MAX)
         });
@@ -1358,7 +1357,7 @@ impl PrimaryKeyIndex for BTreeMemIndex {
 }
 
 impl BTreeMemIndex {
-    /// Positions whose value falls between `lower` and `upper`, honouring
+    /// Positions whose value falls between `lower` and `upper`, honoring
     /// whether each bound is inclusive.
     ///
     /// The walk covers `[lower, upper)`, so an inclusive upper bound adds that

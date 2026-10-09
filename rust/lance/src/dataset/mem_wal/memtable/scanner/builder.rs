@@ -1148,7 +1148,7 @@ impl MemTableScanner {
     /// Plan a newest-per-PK active-arm scan via `MemTableDedupScanExec` —
     /// dedup runs before the predicate so a PK whose newest version fails the
     /// filter cannot leak an older version that passes. Unlike
-    /// `plan_full_scan`, this never takes the BTree skip (dedup needs
+    /// `plan_full_scan`, this never takes the index route (dedup needs
     /// every version) and never pushes a limit (the LSM caps results above
     /// the cross-source merge).
     pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1196,8 +1196,8 @@ impl MemTableScanner {
 
     /// Plan a filter answered from the memtable's indexes.
     ///
-    /// When the indexes only narrow the rows, or part of the filter has no
-    /// index, the rows they return are checked against the whole filter.
+    /// When an index narrows or declines, or part of the filter has no index,
+    /// the rows read are checked against the whole filter.
     async fn plan_index_query(&self, indexed: IndexedFilter) -> Result<Arc<dyn ExecutionPlan>> {
         let projection_indices = self.compute_projection_indices()?;
         let index_exec = ScalarMemIndexExec::new(
@@ -1437,9 +1437,14 @@ mod tests {
         schema: &Schema,
         batches: &[(i32, usize)], // (start_id, count)
     ) -> Arc<IndexStore> {
-        let mut index_store = IndexStore::new();
-        // Add a btree index on "id" column
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let lance_schema = LanceSchema::try_from(schema).unwrap();
+        let index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &lance_schema,
+            1_000,
+            batches.len(),
+        )
+        .unwrap();
 
         let mut row_offset = 0u64;
         for (batch_pos, (start_id, count)) in batches.iter().enumerate() {
@@ -1627,7 +1632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn btree_filter_fallback_preserves_non_representable_predicates() {
+    async fn a_filter_no_index_answers_is_applied_by_the_scan() {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(100));
         let indexes = create_index_store_with_batches(&batch_store, &schema, &[(0, 10)]);
@@ -2881,16 +2886,16 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        let mut indexes = IndexStore::new();
-        indexes.add_btree("v_idx".to_string(), 0, "v".to_string());
-        indexes
-            .insert_with_batch_position(&batch, 0, Some(0))
-            .unwrap();
-        let batch_store = Arc::new(BatchStore::with_capacity(4));
-        batch_store.append(batch).unwrap();
-
-        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        let mut scanner = memtable_over(&[MemIndexSpec::btree("v_idx", 0, "v")], batch);
         scanner.filter(filter).unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        assert!(
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("ScalarMemIndexExec"),
+            "the filter must reach the B-tree"
+        );
         let found = scanner.try_into_batch().await.unwrap();
         assert_eq!(found.num_rows(), 1);
         assert_eq!(found["v"].null_count(), 0);
@@ -2926,6 +2931,35 @@ mod tests {
 
     fn id_btree(deviation: Deviation) -> MemIndexSpec {
         wrapped(MemIndexSpec::btree("id_idx", 0, "id"), deviation)
+    }
+
+    /// A filter whose leftover reads a column the projection drops still applies
+    /// it, and each row keeps its own address.
+    #[tokio::test]
+    async fn the_index_route_rechecks_before_projecting() {
+        let schema = create_test_schema();
+        let mut scanner = memtable_over(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            create_test_batch(&schema, 0, 10),
+        );
+        scanner.filter("id >= 4 AND name = 'name_5'").unwrap();
+        scanner.project(&["id"]).unwrap().with_row_address();
+        let plan = scanner.create_plan().await.unwrap();
+        assert!(
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("ScalarMemIndexExec"),
+            "the filter must reach the B-tree"
+        );
+        let found = scanner.try_into_batch().await.unwrap();
+        assert!(found.column_by_name("name").is_none());
+        assert_eq!(ids(&found), vec![5]);
+        let addresses = found[super::super::exec::ROW_ADDRESS_COLUMN]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(addresses.values().to_vec(), vec![5]);
     }
 
     /// A comparison with null is never true, so null rows match no `IN` list.
@@ -3146,8 +3180,9 @@ mod tests {
     }
 
     /// Every search goes to its index and never returns a row past what is
-    /// readable. An index that fails a search it accepted fails it, and so does
-    /// one that declines it, except a filter index, which is read past.
+    /// readable. An index that fails a search it accepted fails the search, and
+    /// so does one that declines it, except for a filter, which then reads
+    /// every row.
     #[rstest::rstest]
     #[tokio::test]
     async fn a_search_holds_its_index_to_what_it_accepted(
@@ -3220,7 +3255,12 @@ mod tests {
     /// Three batches holding the values a comparison is most likely to get
     /// wrong: nulls, NaN, both zeros, the infinities, empty and non-ASCII text.
     /// `rid` identifies each row and carries no index.
-    fn differential_memtable(indexed: &[&str]) -> (Arc<BatchStore>, Arc<IndexStore>, SchemaRef) {
+    /// Twelve rows of edge values, with a B-tree on each `indexed` column; one on
+    /// a `declining` column declines every filter it is asked.
+    fn differential_memtable(
+        indexed: &[&str],
+        declining: &[&str],
+    ) -> (Arc<BatchStore>, Arc<IndexStore>, SchemaRef) {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("rid", DataType::Int32, false),
             Field::new("i", DataType::Int64, true),
@@ -3304,7 +3344,12 @@ mod tests {
             .iter()
             .map(|column| {
                 let field_id = lance_schema.field(column).unwrap().id;
-                MemIndexSpec::btree(format!("{column}_idx"), field_id, *column)
+                let spec = MemIndexSpec::btree(format!("{column}_idx"), field_id, *column);
+                if declining.contains(column) {
+                    wrapped(spec, Deviation::AcceptsThenDeclines)
+                } else {
+                    spec
+                }
             })
             .collect();
         let indexes = IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap();
@@ -3355,7 +3400,8 @@ mod tests {
     }
 
     /// Every filter returns the same rows through the indexes as reading every
-    /// row, with indexes on some columns so filters mix both.
+    /// row, with indexes on some columns so filters mix both, and with an index
+    /// that declines inside `AND` and `OR`.
     #[tokio::test]
     async fn an_index_answers_every_filter_the_way_a_scan_does() {
         let filters = [
@@ -3425,19 +3471,20 @@ mod tests {
             "d IS NULL",
             "d < DATE '2024-01-01' AND b",
         ];
-        for indexed in [
-            &["i", "f", "s", "b", "d"][..],
-            &["i"][..],
-            &["s", "f"][..],
-            &["b", "d"][..],
+        for (indexed, declining) in [
+            (&["i", "f", "s", "b", "d"][..], &[][..]),
+            (&["i"][..], &[][..]),
+            (&["s", "f"][..], &[][..]),
+            (&["b", "d"][..], &[][..]),
+            (&["i", "f", "s", "b", "d"][..], &["s"][..]),
         ] {
-            let memtable = differential_memtable(indexed);
+            let memtable = differential_memtable(indexed, declining);
             for filter in filters {
                 let scanned = filtered_rids(&memtable, filter, false).await;
                 let indexed_rids = filtered_rids(&memtable, filter, true).await;
                 assert_eq!(
                     indexed_rids, scanned,
-                    "`{filter}` with indexes on {indexed:?}: index route vs reading every row"
+                    "`{filter}` with indexes on {indexed:?}, {declining:?} declining: index route vs reading every row"
                 );
             }
         }

@@ -26,8 +26,7 @@ use lance_index::scalar::expression::{
 use super::query::{MemMatches, MemSearchResult, PositionSet, ScalarQuery, SearchContext};
 use super::{BTreeMemIndexPlugin, IndexStore, MemIndexPlugin, MemIndexSpec};
 
-/// The catalog's name for the memtable's own key index. No base-table index
-/// carries it, so it never shadows a maintained one.
+/// The name of the memtable's own key index: one no base-table index can have.
 pub const OWN_KEY_INDEX: &str = "\u{0}primary key";
 
 /// The memtable's indexes, in the shape the expression pass expects.
@@ -82,7 +81,7 @@ impl MemIndexCatalog {
         );
     }
 
-    /// Whether any index claims expressions on some column.
+    /// Whether no index claims expressions on any column.
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
@@ -99,7 +98,7 @@ impl IndexInformationProvider for MemIndexCatalog {
 /// A filter split into index searches.
 #[derive(Debug)]
 pub struct IndexedFilter {
-    /// `AND`/`OR` over one search per index.
+    /// The index searches, combined with `AND` and `OR`.
     pub searches: ScalarIndexExpr,
     /// Whether the searches are the whole filter, with nothing left over.
     pub is_whole_filter: bool,
@@ -227,8 +226,8 @@ mod tests {
         (result.at_most.into(), exact)
     }
 
-    /// A label-list parser claims a list comparison despite the cast field ids
-    /// add.
+    /// A label-list parser claims a list comparison even though field ids make
+    /// the planner cast the column.
     #[test]
     fn an_index_sees_through_a_cast_that_only_relabels_nested_fields() {
         let item = Field::new("item", DataType::Utf8, true).with_metadata(HashMap::from([(
@@ -367,6 +366,36 @@ mod tests {
         assert!(exact, "no bound should have declined");
     }
 
+    /// The memtable's own key index answers a key filter exactly.
+    #[test]
+    fn the_own_key_index_answers_exactly() {
+        let arrow = schema();
+        let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
+        let mut store = IndexStore::from_specs(&[], &lance, 1_000, 16).unwrap();
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+        let ids: Vec<i32> = (0..10).collect();
+        let batch = RecordBatch::try_new(
+            arrow.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(StringArray::from(vec![Some("x"); 10])),
+                Arc::new(Int32Array::from(ids)),
+            ],
+        )
+        .unwrap();
+        store.insert(&batch, 0).unwrap();
+
+        let planner = Planner::new(arrow);
+        let filter = planner
+            .optimize_expr(planner.parse_filter("id = 4").unwrap())
+            .unwrap();
+        let split = plan_filter(&filter, store.filter_catalog())
+            .unwrap()
+            .expect("the key filter reaches the own key index");
+        let found = positions(evaluate(&split.searches, &store, &SearchContext::new(9)).unwrap());
+        assert_eq!(found, (vec![4], true));
+    }
+
     /// An unindexed conjunct comes back as the leftover; the indexed one still
     /// narrows.
     #[test]
@@ -396,7 +425,7 @@ mod tests {
 
     /// A float zero reaches the index as both zeros, as the full scan reads it.
     #[test]
-    fn planning_sees_the_optimized_expression() {
+    fn a_float_zero_reaches_the_index_as_both_zeros() {
         let arrow = Arc::new(ArrowSchema::new(vec![Field::new(
             "value",
             DataType::Float64,
