@@ -262,17 +262,30 @@ impl Schema {
         err_on_missing: bool,
         preserve_system_columns: bool,
     ) -> Result<Self> {
+        // Index the top-level fields by name once so each requested column is an
+        // O(1) lookup instead of an O(F) scan. `entry().or_insert()` keeps the
+        // first occurrence, matching the previous `fields.iter().find()` behavior.
+        let mut field_by_name: HashMap<&str, &Field> = HashMap::with_capacity(self.fields.len());
+        for f in &self.fields {
+            field_by_name.entry(f.name.as_str()).or_insert(f);
+        }
+
         let mut candidates: Vec<Field> = vec![];
+        // Map a candidate's top-level name to its position in `candidates` so the
+        // merge lookup for a repeated column is O(1) instead of an O(C) scan.
+        let mut candidate_index: HashMap<String, usize> = HashMap::with_capacity(columns.len());
+
         for col in columns {
             let split = parse_field_path(col.as_ref())?;
             let first = split[0].as_str();
-            if let Some(field) = self.field(first) {
+            if let Some(field) = field_by_name.get(first).copied() {
                 let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
                 let projected_field = field.project(&split_refs)?;
-                if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
-                    candidate_field.merge(&projected_field)?;
+                if let Some(&idx) = candidate_index.get(first) {
+                    candidates[idx].merge(&projected_field)?;
                 } else {
-                    candidates.push(projected_field)
+                    candidate_index.insert(first.to_string(), candidates.len());
+                    candidates.push(projected_field);
                 }
             } else if crate::is_system_column(first) {
                 if preserve_system_columns {

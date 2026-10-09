@@ -61,5 +61,9 @@ datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
 name = "cache_keys"
 harness = false
 
+[[bench]]
+name = "schema_project"
+harness = false
+
 [lints]
 workspace = true
