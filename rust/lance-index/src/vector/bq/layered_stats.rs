@@ -6,9 +6,10 @@
 //! The counters only advance while a query runs the lazy scan (or is checked
 //! for it), so production queries with the scan disabled touch at most the
 //! `ineligible_disabled` counter. The `resident_columns_*`,
-//! `resident_attach_*`, `resident_store_evictions` and `pinned_overflow`
-//! counters are the exception: they advance when an IVF_RQ index, layered or
-//! not, opens with, loads or reads through its resident columns. So is
+//! `resident_attach_*`, `code_only_partition_*`, `resident_store_evictions`
+//! and `pinned_overflow` counters are the exception: they advance when an
+//! IVF_RQ index, layered or not, opens with, loads or reads through its
+//! resident columns. So is
 //! `storage_construct_repacks`, which advances when any RaBitQ storage is
 //! built from codes it must rewrite, and `plane_rows_unpack_*`, which advance
 //! on every read of a plane-row IVF_RQ file.
@@ -341,18 +342,42 @@ layered_lazy_counters! {
         /// built from codes stored packed and blocked, as the index builder
         /// writes them and cache entries keep them, rewrites nothing.
         storage_construct_repacks,
-        /// Batches assembled with copies of an index's resident rows: every
-        /// read of a plane or partition from the file that takes its small
-        /// columns from the resident store, and every read of a code-only
-        /// cache entry (`LANCE_RQ_ENTRY_COLUMNS=codes`), hits included.
+        /// Batches assembled with an index's resident rows, copied or shared:
+        /// every read of a plane or partition from the file that takes its
+        /// small columns from the resident store, and every read of a
+        /// code-only cache entry (`LANCE_RQ_ENTRY_COLUMNS=codes`), hits
+        /// included.
         resident_attach_calls,
         /// Rows those batches hold.
         resident_attach_rows,
-        /// Bytes of the resident rows copied into them: what a full entry
-        /// would have kept in the cache.
+        /// Bytes of the resident rows those batches hold, copied or shared,
+        /// each row at its columns' fixed widths: what a full entry would
+        /// have kept in the cache.
         resident_attach_bytes,
-        /// Time spent assembling them, copies included.
+        /// Time spent assembling them once their rows are resolved: the
+        /// copies (or views) of the resident rows, the other columns' clones
+        /// and the batch. Summed over every attach, including those of
+        /// partitions prepared at once, so it is CPU time rather than time
+        /// on a query's critical path.
         resident_attach_ns,
+        /// Of those batches, whole partitions and planes in which every
+        /// resident column shares the store's buffers.
+        resident_attach_shares,
+        /// Whole partitions and planes that copied a resident column: reads
+        /// that become cache entries (full entries, or partitions of a native
+        /// index with a graph), partitions streamed out of the index, and
+        /// columns a view cannot cover.
+        resident_attach_whole_copies,
+        /// Sparse gathers, whose rows are always copied.
+        resident_attach_gathers,
+        /// Bytes the whole copies and the gathers copied.
+        resident_attach_copied_bytes,
+        /// Storages of native partitions built from their code-only entry
+        /// (`LANCE_RQ_ENTRY_COLUMNS=codes`), once per read of the partition.
+        code_only_partition_builds,
+        /// Time those builds took: the attach of the resident rows and the
+        /// storage's construction, without a fallback load of the store.
+        code_only_partition_build_ns,
         /// Bytes of packed row columns that reads of plane-row IVF_RQ files
         /// unpacked into the column layout's fields.
         plane_rows_unpack_bytes,

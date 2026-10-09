@@ -64,9 +64,10 @@
 //! Plane entries hold the plane or, on an index with code-only entries
 //! (`LANCE_RQ_ENTRY_COLUMNS=codes` with the small columns resident), its code
 //! columns alone. The storage attaches the resident rows of the other
-//! columns to every plane it serves, sign stage and gathered rows alike, so
-//! the scan scores the same batches either way; a sparse origin read returns
-//! every column itself.
+//! columns to every plane it serves, sign stage and gathered rows alike,
+//! views of the store for a whole plane and copies for gathered rows, so the
+//! scan scores the same batches either way; a sparse origin read returns
+//! every column itself. The views live as long as the scan holds the plane.
 
 use std::collections::BinaryHeap;
 use std::future::Future;
