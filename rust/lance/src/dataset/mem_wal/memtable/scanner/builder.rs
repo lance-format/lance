@@ -1234,7 +1234,8 @@ impl MemTableScanner {
         // is the only correct arm here. An upper bound is safe on HNSW: it
         // trims the far tail, which the top-k would have dropped anyway.
         let hnsw_safe_with_bounds = query.distance_lower_bound.is_none();
-        let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
+        let exec: Arc<dyn ExecutionPlan> = if self.use_index
+            && filter_predicate.is_none()
             && hnsw_safe_with_pk
             && hnsw_safe_with_bounds
             && self.has_vector_index(&query.column, query.distance_type)
@@ -1579,7 +1580,7 @@ impl MemTableScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{BooleanArray, Int32Array, StringArray};
+    use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     fn create_test_schema() -> SchemaRef {
@@ -3136,5 +3137,34 @@ mod tests {
             err.to_string().contains("unsupported type Float64"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A null is in no range, though each B-tree backend sorts null keys
+    /// first.
+    #[rstest::rstest]
+    #[case::int(Arc::new(Int32Array::from(vec![None, Some(1), Some(3)])) as ArrayRef, "v < 2")]
+    #[case::string(Arc::new(StringArray::from(vec![None, Some("a"), Some("c")])) as ArrayRef, "v < 'b'")]
+    #[case::float(Arc::new(Float64Array::from(vec![None, Some(1.0), Some(3.0)])) as ArrayRef, "v < 2.0")]
+    #[tokio::test]
+    async fn an_open_lower_bound_excludes_nulls(#[case] values: ArrayRef, #[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.add_btree("v_idx".to_string(), 0, "v".to_string());
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        batch_store.append(batch).unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.filter(filter).unwrap();
+        let found = scanner.try_into_batch().await.unwrap();
+        assert_eq!(found.num_rows(), 1);
+        assert_eq!(found["v"].null_count(), 0);
     }
 }

@@ -449,6 +449,24 @@ def test_schema_metadata(tmp_path: Path):
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
 
+def test_get_version(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path)
+    lance.write_dataset(pa.table({"a": range(5)}), tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    dataset.delete("a < 3")
+
+    info = dataset.get_version()
+    assert info == dataset.versions()[-1]
+    assert info["version"] == dataset.version
+    assert isinstance(info["timestamp"], datetime)
+    assert info["metadata"]["total_fragments"] == "2"
+    assert info["metadata"]["total_rows"] == "9"
+    assert info["metadata"]["total_deletion_files"] == "2"
+    assert info["metadata"]["total_deletion_file_rows"] == "6"
+
+    assert dataset.checkout_version(1).get_version() == dataset.versions()[0]
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"

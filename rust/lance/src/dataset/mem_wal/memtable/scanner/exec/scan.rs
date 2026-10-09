@@ -354,7 +354,7 @@ impl ExecutionPlan for MemTableScanExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 
@@ -500,6 +500,28 @@ mod tests {
         let stats = exec.partition_statistics(None).unwrap();
         // Statistics are Absent to avoid DataFusion analysis bugs
         assert_eq!(stats.num_rows, Precision::Absent);
+        assert_eq!(stats.column_statistics.len(), exec.schema().fields().len());
+    }
+
+    /// A union merges its inputs' statistics column by column, so a memtable
+    /// scan planned beside another read (as an LSM read plans one beside the
+    /// base table) must report an entry for every output column.
+    #[tokio::test]
+    async fn test_scan_exec_statistics_merge_under_union() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::union::UnionExec;
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        batch_store
+            .append(create_test_batch(&schema, 0, 10))
+            .unwrap();
+        let scan: Arc<dyn ExecutionPlan> =
+            Arc::new(MemTableScanExec::new(batch_store, 1, None, schema, false));
+        let other: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(scan.schema()));
+
+        let union = UnionExec::try_new(vec![scan, other]).unwrap();
+        union.partition_statistics(None).unwrap();
     }
 
     #[tokio::test]

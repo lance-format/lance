@@ -123,7 +123,7 @@ jobs:
   build-macos:
     name: Build on MacOS Arm64
     runs-on: warp-macos-14-arm64-6x
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -185,7 +185,7 @@ jobs:
           inputs.mode == 'dry_run'
         working-directory: java
         run: |
-          mvn --batch-mode -DskipTests -Dskip.build.jni=true package
+          ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true package
       - name: Publish with Java 11
         if: |
           github.event_name == 'release' ||
@@ -195,7 +195,7 @@ jobs:
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
-          mvn --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
+          ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
