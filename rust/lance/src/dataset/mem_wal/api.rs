@@ -15,15 +15,16 @@
 //! A writer that is already open keeps the set it opened with until something
 //! calls [`DatasetMemWalExt::refresh_mem_wal_index_configs`].
 //!
-//! A rename reaches sealed generations and replay, but not the active MemTable,
-//! which keeps its original names until its writer reopens.
+//! A rename reaches every MemTable, sealed generation and replayed entry: each
+//! is read by field id.
 //!
 //! # Upgrading
 //!
 //! Generations are read by field id. Ones flushed before that carry positional
 //! ids instead, which mispair against a table whose ids have gaps, and nothing
 //! records which scheme a generation used. Compact generations into base before
-//! upgrading. Durable WAL entries are unaffected: they carry no ids.
+//! upgrading. Durable WAL entries are unaffected: one without ids is matched by
+//! name.
 //!
 //! # Known gaps
 //!

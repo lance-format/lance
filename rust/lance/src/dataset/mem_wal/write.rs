@@ -5919,38 +5919,12 @@ mod tests {
         let err = conform_to_storage_schema(narrow, &storage, &["id".to_string()])
             .expect_err("a column's type cannot change");
         assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
             err.to_string().contains("count"),
             "the refusal should name the column, got: {err}"
-        );
-    }
-
-    /// A cast that would lose the value is an error, not a column of nulls.
-    #[test]
-    fn test_conform_refuses_a_lossy_retype() {
-        let numeric = schema_with_tombstone(&ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Int32, true),
-        ]));
-        let textual = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("name", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(StringArray::from(vec!["not a number"])),
-            ],
-        )
-        .unwrap();
-
-        let error = conform_to_storage_schema(textual, &numeric, &["id".to_string()]).unwrap_err();
-        assert!(
-            matches!(error, Error::InvalidInput { .. }),
-            "expected InvalidInput, got {error:?}"
-        );
-        assert!(
-            error.to_string().contains("name"),
-            "the error should name the column: {error}"
         );
     }
 

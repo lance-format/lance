@@ -11,8 +11,8 @@
 //! the same name under a different id is a different column. Names are used only
 //! where no id exists, as in a batch a caller just handed in.
 //!
-//! A table with a MemWAL refuses type changes, so an id that disappears always
-//! means the column was dropped.
+//! A table with a MemWAL refuses type changes, so an id that disappears
+//! normally means the column was dropped.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -303,20 +303,13 @@ fn resolve_field(
         return Ok(Source::Take(index));
     }
     // The same column under a different scalar type. A table with a MemWAL
-    // refuses a cast, so this is a disagreement to surface rather than paper
-    // over; a struct differing only in its children is handled below.
-    if !matches!(
-        (source.data_type(), field.data_type()),
-        (DataType::Struct(_), DataType::Struct(_))
-    ) {
-        return Err(Error::invalid_input(format!(
-            "column `{name}` is stored as {} and the schema declares {}; a column's type \
-             cannot change on a table with a MemWAL",
-            source.data_type(),
-            field.data_type()
-        )));
-    }
-    unreachable!("a struct is resolved above and any other mismatch is rejected")
+    // refuses a cast, so this is a disagreement to surface rather than paper over.
+    Err(Error::invalid_input(format!(
+        "column `{name}` is stored as {} and the schema declares {}; a column's type \
+         cannot change on a table with a MemWAL",
+        source.data_type(),
+        field.data_type()
+    )))
 }
 
 /// Whether this type carries its children inside its own type, so an array of

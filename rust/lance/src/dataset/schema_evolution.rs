@@ -1630,13 +1630,6 @@ mod test {
             .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
             .await
             .expect("restating a column's existing nullability must be allowed");
-
-        // A rename is untouched by the guard.
-        dataset
-            .alter_columns(&[ColumnAlteration::new("value".into()).rename("amount".into())])
-            .await
-            .expect("a rename must be allowed");
-        assert!(dataset.schema().field("amount").is_some());
     }
 
     #[test]

@@ -39,7 +39,9 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 /// # Invariant
 ///
 /// A field id must keep identifying the same column while any generation holds
-/// it. Lance does not enforce this: `max_field_id` is a maximum over the current
+/// it. A dataset migrated with
+/// [`Dataset::migrate_to_non_reusable_field_ids`](crate::Dataset::migrate_to_non_reusable_field_ids)
+/// never reuses an id. Otherwise `max_field_id` is a maximum over the current
 /// schema and base fragments, so dropping a column can lower it and let the next
 /// added column reuse the id. Reads then serve the dropped column's values as
 /// the new one. Callers that retain generations must drain them before a
