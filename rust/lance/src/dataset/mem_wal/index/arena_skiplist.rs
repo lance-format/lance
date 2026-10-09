@@ -357,7 +357,7 @@ impl<K: Ord> SkipListReader<K> {
     /// key owns outside its node (e.g. a long `Box<[u8]>` key) — the arena
     /// never sees those, so whoever built the key charges them; see
     /// `BytesBackend::key_heap_bytes`.
-    pub(crate) fn resident_bytes(&self) -> usize {
+    pub fn resident_bytes(&self) -> usize {
         self.core.arena_bytes.load(Ordering::Relaxed)
     }
 
@@ -438,6 +438,11 @@ impl<K: Ord> SkipListReader<K> {
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.core.len()
+    }
+
+    /// Whether no node has been inserted.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

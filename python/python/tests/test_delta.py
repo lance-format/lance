@@ -110,6 +110,12 @@ def test_delta_with_explicit_version_range():
 
     assert total_rows == 2
 
+    # Version 0 is the empty snapshot: (0, 1] holds the first write, (0, 0] nothing.
+    inserted = ds.delta(begin_version=0, end_version=1).get_inserted_rows()
+    assert sorted(inserted.read_all().column("id").to_pylist()) == [1, 2, 3]
+    empty = ds.delta(begin_version=0, end_version=0).get_inserted_rows()
+    assert empty.read_all().num_rows == 0
+
 
 def test_delta_validation_errors():
     table = pa.table({"id": pa.array([1, 2, 3], type=pa.int32())})

@@ -17,7 +17,7 @@ use std::{
 
 use arrow::array::BinaryBuilder;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -81,6 +81,13 @@ const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 /// It also keeps both output columns far below the `i32` offset ceiling of
 /// Arrow's `Binary`/`Utf8` layouts.
 const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum key bytes in one record batch of a serialized [`BitmapIndexState`].
+///
+/// The lookup keys are written as several bounded batches because one `Utf8`
+/// or `Binary` array cannot hold 2 GiB of key bytes, while a large label-list
+/// index can have more than that across its distinct keys.
+const MAX_STATE_LOOKUP_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
 const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
 // Smaller than MAX_ROWS_PER_CHUNK to bound the per-cursor in-memory batch
@@ -199,43 +206,37 @@ impl CacheKey for BitmapKey {
 /// cache handle, a lazy reader, a fragment-reuse index). `BitmapIndexState`
 /// captures just the data needed to rebuild it: the value→file-offset map,
 /// the null bitmap, and the value type.
+///
+/// The state shares the index's parsed `index_map` and builds its Arrow form
+/// only in [`CacheCodecImpl::serialize`]. Opening an index therefore never
+/// copies every key into one array, which would overflow the `i32` offsets
+/// of `Utf8`/`Binary` keys once they reach 2 GiB.
 #[derive(Debug, Clone)]
 pub struct BitmapIndexState {
-    /// Value-to-row-offset lookup, encoded as an Arrow `RecordBatch` so we can
-    /// reuse the existing IPC utilities for zero-copy round trips.
-    ///
-    /// Schema: `keys: <value_type>`, `offsets: UInt64`. Iteration order of
-    /// `index_map` is preserved on serialize and the `BTreeMap` resorts the
-    /// entries on deserialize, so the wire form does not need to be sorted.
-    lookup_batch: RecordBatch,
     /// Already-remapped null bitmap (remapping is applied during load, so the
     /// cached state matches the in-memory representation).
     null_map: Arc<RowAddrTreeMap>,
-    /// Cached separately from the schema for the empty-index case where the
-    /// `lookup_batch` is empty but we still need to remember the column type.
+    /// Kept separately from `index_map` for the empty-index case, where no key
+    /// carries the column type.
     value_type: DataType,
-    /// Parsed form of `lookup_batch`. Not serialized — populated eagerly in
-    /// both [`BitmapIndexState::from_index`] and [`CacheCodecImpl::deserialize`].
-    /// Stored as `Arc` so cloning into a new [`BitmapIndex`] is O(1).
+    /// Value-to-row-offset lookup. Stored as `Arc` so cloning into a new
+    /// [`BitmapIndex`] is O(1).
     index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
 }
 
 impl DeepSizeOf for BitmapIndexState {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.lookup_batch.get_array_memory_size()
-            + self.null_map.deep_size_of_children(context)
-            + self.index_map.deep_size_of_children(context)
+        self.null_map.deep_size_of_children(context) + self.index_map.deep_size_of_children(context)
     }
 }
 
 impl BitmapIndexState {
-    pub(crate) fn from_index(index: &BitmapIndex) -> Result<Self> {
-        Ok(Self {
-            lookup_batch: build_lookup_batch(&index.index_map, &index.value_type)?,
+    pub(crate) fn from_index(index: &BitmapIndex) -> Self {
+        Self {
             null_map: index.null_map.clone(),
             value_type: index.value_type.clone(),
             index_map: index.index_map.clone(),
-        })
+        }
     }
 
     fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
@@ -247,7 +248,7 @@ impl BitmapIndexState {
                     "BitmapIndexState::from_scalar_index called with a non-bitmap index",
                 )
             })?;
-        Self::from_index(bitmap)
+        Ok(Self::from_index(bitmap))
     }
 
     pub(crate) fn to_bitmap_index(
@@ -273,46 +274,74 @@ impl BitmapIndexState {
         index_map: BTreeMap<OrderableScalarValue, usize>,
         null_map: RowAddrTreeMap,
         value_type: DataType,
-    ) -> Result<Self> {
-        Ok(Self {
-            lookup_batch: build_lookup_batch(&index_map, &value_type)?,
+    ) -> Self {
+        Self {
             null_map: Arc::new(null_map),
             value_type,
             index_map: Arc::new(index_map),
-        })
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn lookup_batch(&self) -> &RecordBatch {
-        &self.lookup_batch
+    pub(crate) fn index_map(&self) -> &BTreeMap<OrderableScalarValue, usize> {
+        &self.index_map
     }
 
     #[cfg(test)]
     pub(crate) fn null_map(&self) -> &RowAddrTreeMap {
         &self.null_map
     }
+
+    /// Encode `index_map` as `(keys, offsets)` batches in key order, starting a
+    /// new batch before its keys would exceed `max_batch_bytes`. Always returns
+    /// at least one batch so an empty index still records its value type.
+    fn lookup_batches(&self, max_batch_bytes: usize) -> Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keys", self.value_type.clone(), true),
+            Field::new("offsets", DataType::UInt64, false),
+        ]));
+        let mut batches = Vec::new();
+        let mut keys = Vec::new();
+        let mut offsets = Vec::new();
+        let mut batch_bytes = 0;
+        for (key, offset) in self.index_map.iter() {
+            let key_bytes = key.0.size();
+            if !keys.is_empty() && batch_bytes + key_bytes > max_batch_bytes {
+                batches.push(Self::lookup_batch(
+                    schema.clone(),
+                    std::mem::take(&mut keys),
+                    std::mem::take(&mut offsets),
+                )?);
+                batch_bytes = 0;
+            }
+            keys.push(key.0.clone());
+            offsets.push(*offset as u64);
+            batch_bytes += key_bytes;
+        }
+        if !keys.is_empty() {
+            batches.push(Self::lookup_batch(schema.clone(), keys, offsets)?);
+        }
+        if batches.is_empty() {
+            batches.push(RecordBatch::new_empty(schema));
+        }
+        Ok(batches)
+    }
+
+    fn lookup_batch(
+        schema: SchemaRef,
+        keys: Vec<ScalarValue>,
+        offsets: Vec<u64>,
+    ) -> Result<RecordBatch> {
+        let keys = ScalarValue::iter_to_array(keys)?;
+        let offsets = Arc::new(UInt64Array::from(offsets));
+        Ok(RecordBatch::try_new(schema, vec![keys, offsets])?)
+    }
 }
 
-fn build_lookup_batch(
-    index_map: &BTreeMap<OrderableScalarValue, usize>,
-    value_type: &DataType,
-) -> Result<RecordBatch> {
-    let keys = if index_map.is_empty() {
-        arrow_array::new_empty_array(value_type)
-    } else {
-        ScalarValue::iter_to_array(index_map.keys().map(|k| k.0.clone()))?
-    };
-    let offsets = Arc::new(UInt64Array::from_iter_values(
-        index_map.values().map(|v| *v as u64),
-    ));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("keys", value_type.clone(), true),
-        Field::new("offsets", DataType::UInt64, false),
-    ]));
-    Ok(RecordBatch::try_new(schema, vec![keys, offsets])?)
-}
-
-fn parse_lookup_batch(batch: &RecordBatch) -> Result<BTreeMap<OrderableScalarValue, usize>> {
+fn parse_lookup_batch(
+    batch: &RecordBatch,
+    index_map: &mut BTreeMap<OrderableScalarValue, usize>,
+) -> Result<()> {
     let keys = batch.column(0);
     let offsets = batch
         .column(1)
@@ -321,43 +350,59 @@ fn parse_lookup_batch(batch: &RecordBatch) -> Result<BTreeMap<OrderableScalarVal
         .ok_or_else(|| {
             Error::internal("BitmapIndexState: expected UInt64 offsets column".to_string())
         })?;
-    let mut index_map = BTreeMap::new();
     for idx in 0..batch.num_rows() {
         let value = OrderableScalarValue(ScalarValue::try_from_array(keys, idx)?);
         index_map.insert(value, offsets.value(idx) as usize);
     }
-    Ok(index_map)
+    Ok(())
 }
 
 impl CacheCodecImpl for BitmapIndexState {
     const TYPE_ID: &'static str = "lance.scalar.BitmapIndexState";
-    const CURRENT_VERSION: u32 = 1;
+    /// Version 1 wrote the lookup as a single-batch IPC stream. Version 2
+    /// writes several bounded batches, which version-1 readers reject, so
+    /// they must see these entries as unsupported and miss. This build still
+    /// reads version 1: a one-batch stream is a multi-batch stream.
+    const CURRENT_VERSION: u32 = 2;
 
     /// Wire format:
     /// ```text
     /// RAW_BLOB  : null_map (roaring tree map, portable encoding)
-    /// ARROW_IPC : (keys: <value_type>, offsets: UInt64)
+    /// ARROW_IPC : one or more (keys: <value_type>, offsets: UInt64) batches
     /// ```
-    /// The value type is recovered from the IPC section schema.
+    /// Batches are in key order and each holds at most
+    /// `MAX_STATE_LOOKUP_BATCH_BYTES` of keys, except that a single larger
+    /// key takes a batch of its own. The value type is recovered from the IPC
+    /// section schema.
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let mut null_bytes = Vec::with_capacity(self.null_map.serialized_size());
         self.null_map.serialize_into(&mut null_bytes)?;
         w.write_raw(&null_bytes)?;
-        w.write_ipc(&self.lookup_batch)?;
+        w.write_ipc_batches(self.lookup_batches(MAX_STATE_LOOKUP_BATCH_BYTES)?)?;
         Ok(())
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
         let null_bytes = r.read_raw()?;
         let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
-        let lookup_batch = r.read_ipc()?;
-        let value_type = lookup_batch.schema().field(0).data_type().clone();
-        let index_map = Arc::new(parse_lookup_batch(&lookup_batch)?);
+        let lookup_batches = r.read_ipc_batches()?;
+        let value_type = lookup_batches
+            .first()
+            .ok_or_else(|| {
+                Error::internal("BitmapIndexState: lookup section has no batches".to_string())
+            })?
+            .schema()
+            .field(0)
+            .data_type()
+            .clone();
+        let mut index_map = BTreeMap::new();
+        for batch in &lookup_batches {
+            parse_lookup_batch(batch, &mut index_map)?;
+        }
         Ok(Self {
-            lookup_batch,
             null_map,
             value_type,
-            index_map,
+            index_map: Arc::new(index_map),
         })
     }
 }
@@ -2538,9 +2583,20 @@ mod tests {
         let data = bytes::Bytes::from(buf);
         let mut reader = CacheEntryReader::new(&data, 0, BitmapIndexState::CURRENT_VERSION);
         let restored = BitmapIndexState::deserialize(&mut reader).unwrap();
-        assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert_eq!(restored.index_map, state.index_map);
         assert_eq!(&*restored.null_map, &*state.null_map);
         assert_eq!(restored.value_type, state.value_type);
+    }
+
+    fn utf8_state(num_keys: usize, key_len: usize) -> BitmapIndexState {
+        let index_map = (0..num_keys)
+            .map(|i| {
+                let mut key = format!("{i:08}");
+                key.extend(std::iter::repeat_n('x', key_len.saturating_sub(key.len())));
+                (OrderableScalarValue(ScalarValue::Utf8(Some(key))), i)
+            })
+            .collect();
+        BitmapIndexState::new_for_test(index_map, RowAddrTreeMap::new(), DataType::Utf8)
     }
 
     #[test]
@@ -2553,69 +2609,86 @@ mod tests {
         let mut null_map = RowAddrTreeMap::new();
         null_map.insert(RowAddress::new_from_parts(0, 3).into());
         null_map.insert(RowAddress::new_from_parts(0, 5).into());
-        let state = BitmapIndexState {
-            lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
-            null_map: Arc::new(null_map),
-            value_type: DataType::Int32,
-            index_map: Arc::new(index_map),
-        };
-        assert_state_roundtrips(&state);
+        assert_state_roundtrips(&BitmapIndexState::new_for_test(
+            index_map,
+            null_map,
+            DataType::Int32,
+        ));
 
         // Empty state: no keys, empty null map. Schema still carries the type.
-        let empty_state = BitmapIndexState {
-            lookup_batch: build_lookup_batch(&BTreeMap::new(), &DataType::Utf8).unwrap(),
-            null_map: Arc::new(RowAddrTreeMap::new()),
-            value_type: DataType::Utf8,
-            index_map: Arc::new(BTreeMap::new()),
-        };
-        assert_state_roundtrips(&empty_state);
+        assert_state_roundtrips(&BitmapIndexState::new_for_test(
+            BTreeMap::new(),
+            RowAddrTreeMap::new(),
+            DataType::Utf8,
+        ));
+
+        // Keys spanning several serialized batches.
+        let state = utf8_state(100, 1024);
+        assert_eq!(
+            state
+                .lookup_batches(MAX_STATE_LOOKUP_BATCH_BYTES)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(state.lookup_batches(16 * 1024).unwrap().len() > 1);
+        assert_state_roundtrips(&state);
     }
 
-    /// The lookup batch must decode zero-copy through the full envelope-bearing
-    /// [`CacheCodec`] even though the envelope pushes the IPC section to a
-    /// non-aligned starting offset.
+    /// Lookup batches must split by key bytes and keep global key order, so
+    /// no single `Utf8` array has to hold every key.
     #[test]
-    fn test_bitmap_index_state_lookup_is_zero_copy() {
-        const ALIGN: usize = 64;
-        let mut index_map = BTreeMap::new();
-        for k in 0..32i32 {
-            index_map.insert(
-                OrderableScalarValue(ScalarValue::Int32(Some(k))),
-                k as usize,
-            );
-        }
-        let state = BitmapIndexState {
-            lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
-            null_map: Arc::new(RowAddrTreeMap::new()),
-            value_type: DataType::Int32,
-            index_map: Arc::new(index_map),
-        };
+    fn test_bitmap_index_state_lookup_batches_are_bounded() {
+        const KEY_LEN: usize = 1024;
+        const MAX_BATCH_BYTES: usize = 8 * KEY_LEN;
+        let state = utf8_state(100, KEY_LEN);
 
-        let codec = CacheCodec::from_impl::<BitmapIndexState>();
-        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(state);
-        let mut buf = Vec::new();
-        codec.serialize(&any, &mut buf).unwrap();
-
-        // Model a backend reading into a 64-byte-aligned buffer.
-        let mut v = vec![0u8; buf.len() + ALIGN];
-        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
-        v[pad..pad + buf.len()].copy_from_slice(&buf);
-        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
-
-        let restored = codec.deserialize(&data).hit().unwrap();
-        let restored = restored.downcast::<BitmapIndexState>().unwrap();
-
-        let base = data.as_ptr() as usize;
-        let end = base + data.len();
-        for col in restored.lookup_batch.columns() {
-            for buffer in col.to_data().buffers() {
-                let ptr = buffer.as_ptr() as usize;
-                assert!(
-                    ptr >= base && ptr < end,
-                    "lookup batch buffer was realigned out of the input — misaligned IPC section",
-                );
+        let batches = state.lookup_batches(MAX_BATCH_BYTES).unwrap();
+        assert!(batches.len() > 1, "expected several lookup batches");
+        let mut restored = BTreeMap::new();
+        let mut previous_key: Option<String> = None;
+        for batch in &batches {
+            let keys = arrow::array::AsArray::as_string::<i32>(batch.column(0));
+            assert!(keys.value_data().len() <= MAX_BATCH_BYTES);
+            for key in keys.iter().flatten() {
+                if let Some(previous_key) = &previous_key {
+                    assert!(previous_key.as_str() < key, "lookup batches out of order");
+                }
+                previous_key = Some(key.to_string());
             }
+            parse_lookup_batch(batch, &mut restored).unwrap();
         }
+        assert_eq!(&restored, state.index_map());
+    }
+
+    /// Version-1 entries wrote the whole lookup as one IPC batch. They must
+    /// still decode after the switch to multi-batch sections.
+    #[test]
+    fn test_bitmap_index_state_reads_version_1_entries() {
+        let state = utf8_state(10, 16);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keys", DataType::Utf8, true),
+            Field::new("offsets", DataType::UInt64, false),
+        ]));
+        let lookup_batch = BitmapIndexState::lookup_batch(
+            schema,
+            state.index_map.keys().map(|k| k.0.clone()).collect(),
+            state.index_map.values().map(|v| *v as u64).collect(),
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        let mut writer = CacheEntryWriter::new(&mut buf);
+        let mut null_bytes = Vec::new();
+        state.null_map.serialize_into(&mut null_bytes).unwrap();
+        writer.write_raw(&null_bytes).unwrap();
+        writer.write_ipc(&lookup_batch).unwrap();
+
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, 1);
+        let restored = BitmapIndexState::deserialize(&mut reader).unwrap();
+        assert_eq!(restored.index_map, state.index_map);
+        assert_eq!(restored.value_type, DataType::Utf8);
     }
 
     #[tokio::test]

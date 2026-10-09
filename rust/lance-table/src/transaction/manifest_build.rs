@@ -11,9 +11,10 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS,
-    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
+    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    validate_non_reusable_field_id_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -189,6 +190,18 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        if current_manifest.uses_non_reusable_field_ids() {
+            // Before activation, different fields could share an ID across versions.
+            // Keeping today's high-water mark cannot prevent restoring such a collision.
+            let Some(restored_max_field_id) = manifest.max_allocated_field_id else {
+                return Err(Error::invalid_input(format!(
+                    "Cannot restore version {version}: non-reusable field IDs were activated after that version"
+                )));
+            };
+            manifest.max_allocated_field_id =
+                Some(restored_max_field_id.max(current_manifest.max_field_id()));
+            manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        }
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
@@ -1724,6 +1737,46 @@ impl Transaction {
             )
         };
 
+        if config.activate_non_reusable_field_ids {
+            let already_active = current_manifest
+                .map(|manifest| manifest.uses_non_reusable_field_ids())
+                .unwrap_or(false);
+            if !already_active {
+                manifest.activate_non_reusable_field_ids();
+                manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+            }
+        }
+
+        // Only newly published Blob data files activate the capability. Comparing
+        // physical files also covers column rewrites and overlays while leaving
+        // metadata-only changes and deletion vectors on old tables alone.
+        let blob_fields: Vec<_> = manifest
+            .schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob_v2())
+            .map(|field| field.id)
+            .collect();
+        if !blob_fields.is_empty() {
+            let old_files: HashSet<_> = current_manifest
+                .into_iter()
+                .flat_map(|manifest| manifest.fragments.iter())
+                .flat_map(|fragment| fragment.referenced_lance_files())
+                .map(|file| (file.base_id, file.path.as_str()))
+                .collect();
+            if manifest
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+                .any(|file| {
+                    !old_files.contains(&(file.base_id, file.path.as_str()))
+                        && file.fields.iter().any(|id| blob_fields.contains(id))
+                })
+            {
+                manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
+                manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
+            }
+        }
+
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
@@ -1769,6 +1822,7 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -1931,13 +1985,20 @@ impl Transaction {
                 // Assign a new ID if not already assigned
                 let mut base_to_add = new_base.clone();
                 if base_to_add.id == 0 {
-                    let next_id = manifest
-                        .base_paths
-                        .keys()
-                        .max()
-                        .map(|&id| id + 1)
-                        .unwrap_or(1);
-                    base_to_add.id = next_id;
+                    base_to_add.id = crate::format::BasePath::unused_id(
+                        manifest
+                            .base_paths
+                            .keys()
+                            .copied()
+                            .chain(std::iter::once(0)),
+                    )?;
+                } else if manifest.has_managed_blobs()
+                    && let Some(existing) = manifest.base_paths.get(&base_to_add.id)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot replace base ID {} bound to {:?} with {:?}",
+                        base_to_add.id, existing.path, base_to_add.path
+                    )));
                 }
 
                 manifest.base_paths.insert(base_to_add.id, base_to_add);
@@ -1959,6 +2020,7 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         }
 
+        validate_non_reusable_field_id_flags(&manifest)?;
         Ok((manifest, final_indices))
     }
 
@@ -3369,6 +3431,38 @@ mod tests {
             .map(|overlay| overlay.data_file.path.as_str())
             .collect::<Vec<_>>();
         assert_eq!(overlay_paths, ["kept-mixed.lance", "kept-live.lance"]);
+    }
+
+    #[test]
+    fn activation_sets_writer_gate_when_auto_flags_are_disabled() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut config = default_build_config();
+        config.auto_set_feature_flags = false;
+        config.activate_non_reusable_field_ids = true;
+
+        let (activated, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &config)
+            .unwrap();
+
+        assert!(activated.uses_non_reusable_field_ids());
+        assert_eq!(
+            activated.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_ne!(
+            activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
     }
 
     #[test]

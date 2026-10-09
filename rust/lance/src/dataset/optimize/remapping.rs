@@ -1104,6 +1104,16 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     Ok(())
 }
 
+/// Remap every stored segment of the index named `name` (default
+/// `{column}_idx`) on `columns[0]` through the fragment reuse history.
+///
+/// Segments are visited in manifest order and each one is committed on its
+/// own, so the manifest may advance several times in one call. A segment that
+/// is already caught up, blocked by a partial compaction, withdrawn or without
+/// coverage, bitmap-less, over the remap budget or of a type this build cannot
+/// remap is skipped with a log and the pass continues. Corrupt metadata, a
+/// history this build cannot interpret, and I/O or translation failures return
+/// `Err`; commits of earlier segments in the pass have already landed then.
 pub async fn remap_column_index(
     dataset: &mut Dataset,
     columns: &[&str],
@@ -1124,19 +1134,36 @@ pub async fn remap_column_index(
 
     let index_name = name.unwrap_or(format!("{column}_idx"));
 
-    // On a tagged table the named segment is resolved from the STORED
-    // metadata: the query-filtered listing may exclude exactly the segments
-    // maintenance must reach (e.g. a straddled segment left with no query
-    // coverage). The v0 path below keeps its filtered lookup untouched.
-    let stored = crate::index::load_all_indices(dataset).await?;
-    if stored
+    // Every stored segment of the name is visited. A committed remap appends
+    // its replacement at the end of the list and the per-segment remap
+    // re-reads the manifest by uuid, so the uuids taken here stay valid.
+    // Tagged tables resolve from the stored list: the query listing may
+    // exclude a straddled segment that maintenance must still reach.
+    let tagged = crate::index::load_all_indices(dataset)
+        .await?
         .iter()
-        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
-    {
-        let index = stored
+        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0);
+    let segments: Vec<IndexMetadata> = if tagged {
+        crate::index::load_all_indices_by_name(dataset, &index_name).await?
+    } else {
+        dataset
+            .load_indices()
+            .await?
             .iter()
-            .find(|idx| idx.name == index_name)
-            .ok_or_else(|| Error::index(format!("Index with name {} not found", index_name)))?;
+            .filter(|idx| idx.name == index_name)
+            .cloned()
+            .collect()
+    };
+    if segments.is_empty() {
+        return Err(Error::index(format!(
+            "Index with name {} not found",
+            index_name
+        )));
+    }
+    for index in &segments {
+        // The real question is "does this index belong to this column",
+        // i.e. its one keyed field is `field.id`. Carried fields are
+        // irrelevant here, same as in `index::remap_index`.
         if index.keyed_field() != Some(field.id) {
             return Err(Error::index(format!(
                 "Index name {} already exists with fields {:?} (carried fields {:?}); \
@@ -1145,52 +1172,28 @@ pub async fn remap_column_index(
             )));
         }
         if !index.covering_fields.is_empty() {
+            // Same rule as `optimize_indices`, and for the same reason: no
+            // index type carries the declared payload through a remap, so the
+            // result would still claim values its storage does not hold. The
+            // caller named this index, so refuse out loud -- compaction
+            // withdraws instead only because it must not block a table-level
+            // operation over one index it cannot remap.
             return Err(Error::index(format!(
                 "Remapping index '{}' is not supported: it declares covering \
                  fields {:?}, which no index builder writes or preserves yet",
                 index_name, index.covering_fields,
             )));
         }
-        return remap_index_tagged(dataset, &index.uuid).await;
     }
 
-    let indices = dataset.load_indices().await?;
-    let index = match indices.iter().find(|i| i.name == index_name) {
-        None => {
-            return Err(Error::index(format!(
-                "Index with name {} not found",
-                index_name
-            )));
+    for index in &segments {
+        if tagged {
+            remap_index_tagged(dataset, &index.uuid).await?;
+        } else {
+            remap_index(dataset, &index.uuid).await?;
         }
-        Some(index) => {
-            // The real question is "does this index belong to this column",
-            // i.e. its one keyed field is `field.id`. Carried fields are
-            // irrelevant here, same as in `index::remap_index`.
-            if index.keyed_field() != Some(field.id) {
-                Err(Error::index(format!(
-                    "Index name {} already exists with fields {:?} (carried fields {:?}); \
-                     expected a single keyed field {}",
-                    index_name, index.fields, index.covering_fields, field.id
-                )))
-            } else if !index.covering_fields.is_empty() {
-                // Same rule as `optimize_indices`, and for the same reason: no
-                // index type carries the declared payload through a remap, so the
-                // result would still claim values its storage does not hold. The
-                // caller named this index, so refuse out loud -- compaction
-                // withdraws instead only because it must not block a table-level
-                // operation over one index it cannot remap.
-                Err(Error::index(format!(
-                    "Remapping index '{}' is not supported: it declares covering \
-                     fields {:?}, which no index builder writes or preserves yet",
-                    index_name, index.covering_fields,
-                )))
-            } else {
-                Ok(index)
-            }
-        }
-    }?;
-
-    remap_index(dataset, &index.uuid).await
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1912,17 +1915,21 @@ mod tests {
 
     mod tagged_remap_integration {
         use super::*;
+        use crate::dataset::builder::DatasetBuilder;
         use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::dataset::write::CommitBuilder;
-        use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+        use crate::dataset::{InsertBuilder, ReadParams, WriteMode, WriteParams};
         use crate::index::DatasetIndexExt;
         use crate::index::frag_reuse::decode_frag_reuse_ledger;
         use crate::index::frag_reuse_reader::tests as reader_tests;
+        use crate::utils::test::FailingProxyStore;
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int32Type;
         use lance_index::IndexType;
+        use lance_index::optimize::OptimizeOptions;
         use lance_index::scalar::ScalarIndexParams;
+        use lance_io::object_store::ObjectStoreParams;
         use lance_table::transaction::RewriteGroup;
 
         /// `i` indexed by `i_idx` over every fragment; `w`, an unindexed copy
@@ -3261,9 +3268,9 @@ mod tests {
         // Under v0 a deferred compaction leaves the segment's file holding
         // the SOURCE addresses while its stored bitmap is swapped to the
         // DESTINATION; the tagged planner must remap such a segment from the
-        // fragments its file really addresses. `remap_column_index` on a
-        // tagged table remaps only the FIRST stored segment of the name, so
-        // tests with several segments call it per segment and pin the order.
+        // fragments its file really addresses. `remap_column_index` visits
+        // every stored segment of the name in manifest order, so tests with
+        // several segments pin the order and check each segment's outcome.
         // ------------------------------------------------------------------
 
         async fn fresh(uri: &str) -> Dataset {
@@ -3669,7 +3676,7 @@ mod tests {
             assert_eq!(segments.len(), 2);
             assert_eq!(
                 segments[0].uuid, old.uuid,
-                "remap_column_index reaches the first stored segment: the old one"
+                "the old segment is stored first, the delta after it"
             );
             // The delta covers everything unindexed: the appended fragment
             // and the upgrade partition's destinations.
@@ -4057,6 +4064,560 @@ mod tests {
                 assert!(!plan.contains("ANN"), "{plan}");
                 assert_eq!(indexed, exact, "ranking for i = {key}");
             }
+        }
+
+        // ------------------------------------------------------------------
+        // One call visits every stored segment of the name.
+        // ------------------------------------------------------------------
+
+        /// A disk table whose `i_idx` has two segments stored as [A, B]: A
+        /// over the fixture's fragments {0,1} (i 0..8) and the delta B that
+        /// `optimize_indices(append)` builds over one appended fragment
+        /// (i 100..104). Returns the table and the appended fragment's id.
+        async fn two_segment_table(uri: &str) -> (Dataset, u32) {
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut dataset = append_values(&dataset, 100..104).await;
+            let appended = dataset.fragments().last().unwrap().id as u32;
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            let segments = segments_named(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2);
+            assert_eq!(
+                segments[0].fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([0, 1])
+            );
+            assert_eq!(
+                segments[1].fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([appended])
+            );
+            (dataset, appended)
+        }
+
+        /// Stored order [A, B] with A already caught up (its lineage is
+        /// untouched, an Identity plan) and B needing a hop: one call reaches
+        /// B. Before the fix the pass ended at A's Identity, B kept its
+        /// source addresses, its transition stayed pinned in the ledger and
+        /// trim could never release it.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn later_segment_is_remapped_when_the_first_is_caught_up() {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (mut dataset, appended) = Box::pin(two_segment_table(uri)).await;
+            reserve_fragments(&mut dataset, 40).await;
+            // Only the appended fragment is partitioned: {appended} -> {10, 11}.
+            let mut dataset = commit_stable_partition(dataset, &[appended as u64], 10).await;
+            let before = segments_named(&dataset, "i_idx").await;
+            let (a_before, b_before) = (&before[0], &before[1]);
+            assert_eq!(
+                b_before.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([appended])
+            );
+            let version_before = dataset.manifest.version;
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                dataset.manifest.version,
+                version_before + 1,
+                "exactly one segment (B) is committed"
+            );
+            let after = segments_named(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2);
+            let a_after = after
+                .iter()
+                .find(|segment| segment.uuid == a_before.uuid)
+                .expect("the caught-up segment is left in place");
+            assert_eq!(a_after.dataset_version, a_before.dataset_version);
+            assert_eq!(a_after.fragment_bitmap, a_before.fragment_bitmap);
+            let b_after = after
+                .iter()
+                .find(|segment| segment.uuid != a_before.uuid)
+                .unwrap();
+            assert_ne!(b_after.uuid, b_before.uuid, "B must be remapped");
+            assert!(b_after.dataset_version > b_before.dataset_version);
+            assert_eq!(
+                b_after.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([10, 11]),
+                "B's bitmap is restamped onto the partition destinations"
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_after, 100).await,
+                vec![10]
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_after, 101).await,
+                vec![11]
+            );
+
+            // Nothing needs the partition any more: trim drains the history.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(
+                segments_named(&dataset, FRAG_REUSE_INDEX_NAME).await.len(),
+                0,
+                "the released transition leaves an empty history, trimmed away"
+            );
+
+            let reopened = fresh(uri).await;
+            assert_index_matches_scan(&reopened, (0..8).chain(100..104)).await;
+        }
+
+        /// Both segments need a hop (A: {0,1} -> {10,11}, B: {42} ->
+        /// {20,21}): one call remaps both, a second call commits nothing.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn one_call_remaps_every_segment_that_needs_a_hop() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 40).await;
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let mut dataset = append_values(&dataset, 100..104).await;
+            let appended = dataset.fragments().last().unwrap().id as u32;
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            let before = segments_named(&dataset, "i_idx").await;
+            assert_eq!(before.len(), 2);
+            assert_eq!(
+                before[0].fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([0, 1])
+            );
+            assert_eq!(
+                before[1].fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([appended]),
+                "the delta covers only the appended fragment"
+            );
+            let mut dataset = commit_stable_partition(dataset, &[appended as u64], 20).await;
+            let all_values: Vec<i32> = (0..8).chain(100..104).collect();
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+
+            let version_before = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset.manifest.version,
+                version_before + 2,
+                "each remapped segment is one commit"
+            );
+            let after = segments_named(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2);
+            for segment in &before {
+                assert!(
+                    after.iter().all(|remapped| remapped.uuid != segment.uuid),
+                    "segment {} must be replaced",
+                    segment.uuid
+                );
+            }
+            // Remapped in stored order, each landing at the end of the list.
+            let bitmaps: Vec<RoaringBitmap> = after
+                .iter()
+                .map(|segment| segment.fragment_bitmap.clone().unwrap())
+                .collect();
+            assert_eq!(
+                bitmaps,
+                vec![
+                    RoaringBitmap::from_iter([10, 11]),
+                    RoaringBitmap::from_iter([20, 21])
+                ]
+            );
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            assert_eq!(sorted_values(&dataset, Some("i = 5")).await, vec![5]);
+            assert_eq!(sorted_values(&dataset, Some("i = 101")).await, vec![101]);
+
+            let version = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, version, "nothing left to remap");
+            let again: Vec<Uuid> = segments_named(&dataset, "i_idx")
+                .await
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect();
+            assert_eq!(
+                again,
+                after.iter().map(|segment| segment.uuid).collect::<Vec<_>>()
+            );
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(
+                segments_named(&dataset, FRAG_REUSE_INDEX_NAME).await.len(),
+                0,
+                "with every segment caught up the history is trimmed away"
+            );
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+        }
+
+        /// A segment the pass cannot remap does not end it. Stored order
+        /// [A, B]: A fully covers a partition whose destination a later
+        /// compaction consumes only partially (Blocked, kept as it is, the
+        /// shape of `partial_compaction_after_restamp_blocks_remap_and_keeps_mappings`),
+        /// B owns all sources of its own partition. One call skips A and
+        /// remaps B; trim keeps the two transitions A still needs and
+        /// releases B's.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn blocked_segment_does_not_end_the_pass() {
+            let dataset = reader_tests::fixture().await;
+            let mut dataset = append_values(&dataset, 100..104).await; // F2
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap(); // B over {2}
+            let mut dataset = append_values(&dataset, 200..204).await; // F3, unindexed
+            reserve_fragments(&mut dataset, 40).await;
+            // A's lineage: {0,1} -> {10,11}, then {3,10} -> {20} consumes one
+            // destination together with the unindexed fragment (manifest
+            // order after the partition is [2, 3, 10, 11]).
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let dataset = commit_ordered_compaction(dataset, &[3, 10], 20).await;
+            // B's lineage: {2} -> {30, 31}, fully owned.
+            let mut dataset = commit_stable_partition(dataset, &[2], 30).await;
+            let all_values: Vec<i32> = (0..8).chain(100..104).chain(200..204).collect();
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            let before = segments_named(&dataset, "i_idx").await;
+            assert_eq!(before.len(), 2);
+            let (a_before, b_before) = (&before[0], &before[1]);
+            assert_eq!(
+                a_before.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([0, 1])
+            );
+            assert_eq!(
+                b_before.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([2])
+            );
+            let version_before = dataset.manifest.version;
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                dataset.manifest.version,
+                version_before + 1,
+                "only B is committed"
+            );
+            let after = segments_named(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2);
+            let a_after = after
+                .iter()
+                .find(|segment| segment.uuid == a_before.uuid)
+                .expect("the blocked segment is kept as it is");
+            assert_eq!(a_after.fragment_bitmap, a_before.fragment_bitmap);
+            assert_eq!(a_after.dataset_version, a_before.dataset_version);
+            let b_after = after
+                .iter()
+                .find(|segment| segment.uuid != a_before.uuid)
+                .unwrap();
+            assert_ne!(b_after.uuid, b_before.uuid, "B must be remapped");
+            assert!(b_after.dataset_version > b_before.dataset_version);
+            assert_eq!(
+                b_after.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([30, 31])
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_after, 100).await,
+                vec![30]
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_after, 101).await,
+                vec![31]
+            );
+
+            // Trim: A still needs its partition and, through it, the
+            // compaction; B's partition is released.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
+            assert_eq!(
+                ledger.transitions().len(),
+                2,
+                "A's two transitions stay, B's is released"
+            );
+            assert!(ledger.consumer(0).is_some(), "A's partition is kept");
+            assert!(
+                ledger.consumer(10).is_some(),
+                "the compaction after it is kept"
+            );
+            assert!(ledger.consumer(2).is_none(), "B's partition is released");
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            assert_eq!(
+                sorted_values(&dataset, Some("i < 8")).await,
+                (0..8).collect::<Vec<_>>()
+            );
+            assert_eq!(sorted_values(&dataset, Some("i = 102")).await, vec![102]);
+        }
+
+        /// An untagged table whose `i_idx` has two segments stored as [A, B]:
+        /// A over fragments {0,1} (i 0..8) and the delta B over the two-row
+        /// pair {2,3} (i 100..104). A v0 deferred compaction of the pair at
+        /// target 4 leaves A disjoint from the reuse chain (caught up) and B
+        /// holding the pair's addresses behind its swapped bitmap. Returns the
+        /// table and the compaction's destination fragment.
+        async fn v0_two_segment_table(uri: &str) -> (Dataset, u32) {
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let dataset = append_values(&dataset, 100..102).await;
+            let mut dataset = append_values(&dataset, 102..104).await;
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            let segments = segments_named(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2);
+            assert_eq!(
+                segments[0].fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([0, 1])
+            );
+            assert_eq!(
+                segments[1].fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([2, 3])
+            );
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 4,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            assert_eq!(entry.index_version, 0, "the table stays v0");
+            let legacy = legacy_versions(&dataset).await;
+            assert_eq!(legacy.len(), 1);
+            let destination = v0_destination(&legacy[0]);
+            assert_eq!(
+                loaded_bitmap(&dataset, "i_idx").await,
+                RoaringBitmap::from_iter([0, 1]),
+                "the first segment of the name is served as it is"
+            );
+            (dataset, destination)
+        }
+
+        /// The v0 branch of the same walk: stored order [A, B] with A
+        /// disjoint from the reuse chain (no remap, no commit) and B the
+        /// deferred segment. One call reaches B. Before the fix the name
+        /// resolved to A alone, B's file kept the pair's addresses and the
+        /// legacy version could never be trimmed.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn v0_later_segment_is_remapped_when_the_first_is_caught_up() {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (mut dataset, destination) = Box::pin(v0_two_segment_table(uri)).await;
+            let before = segments_named(&dataset, "i_idx").await;
+            let (a_before, b_before) = (&before[0], &before[1]);
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_before, 100).await,
+                vec![2]
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_before, 103).await,
+                vec![3]
+            );
+            let version_before = dataset.manifest.version;
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                dataset.manifest.version,
+                version_before + 1,
+                "exactly one segment (B) is committed"
+            );
+            let after = segments_named(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2);
+            let a_after = after
+                .iter()
+                .find(|segment| segment.uuid == a_before.uuid)
+                .expect("the caught-up segment is left in place");
+            assert_eq!(a_after.dataset_version, a_before.dataset_version);
+            assert_eq!(a_after.fragment_bitmap, a_before.fragment_bitmap);
+            let b_after = after
+                .iter()
+                .find(|segment| segment.uuid != a_before.uuid)
+                .unwrap();
+            assert_ne!(b_after.uuid, b_before.uuid, "B must be remapped");
+            assert!(b_after.dataset_version > b_before.dataset_version);
+            assert_eq!(
+                b_after.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([destination])
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_after, 100).await,
+                vec![destination]
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, b_after, 103).await,
+                vec![destination]
+            );
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                legacy_versions(&dataset).await.is_empty(),
+                "with B caught up the legacy version is trimmed"
+            );
+            let reopened = fresh(uri).await;
+            assert_index_matches_scan(&reopened, (0..8).chain(100..104)).await;
+        }
+
+        /// Both segments need a hop (A: {0,1} -> {10,11}, B: {appended} ->
+        /// {20,21}) and B's commit hits an injected store error: the pass
+        /// ends after A's commit with B untouched, and a retry once the store
+        /// recovers commits B alone.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn io_error_on_a_later_segment_is_finished_by_a_retry() {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (mut dataset, appended) = Box::pin(two_segment_table(uri)).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let dataset = commit_stable_partition(dataset, &[appended as u64], 20).await;
+            let all_values: Vec<i32> = (0..8).chain(100..104).collect();
+            assert_eq!(sorted_values(&dataset, None).await, all_values);
+            let before = segments_named(&dataset, "i_idx").await;
+            assert_eq!(before.len(), 2);
+            let (a_before, b_before) = (&before[0], &before[1]);
+            let version_before = dataset.manifest.version;
+
+            // Each remapped segment is one commit, so the second transaction
+            // write of the pass is B's.
+            let failing = Arc::new(FailingProxyStore::new());
+            failing.fail_after_n("put", "_transactions", 1, "injected store failure");
+            failing.fail_after_n(
+                "put_multipart",
+                "_transactions",
+                1,
+                "injected store failure",
+            );
+            let slashed = uri.replace('\\', "/");
+            let prefix = if slashed.starts_with('/') { "" } else { "/" };
+            let routed = format!("file-object-store://{prefix}{slashed}");
+            let mut faulted = DatasetBuilder::from_uri(&routed)
+                .with_read_params(ReadParams {
+                    store_options: Some(ObjectStoreParams {
+                        object_store_wrapper: Some(failing),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .load()
+                .await
+                .unwrap();
+            let error = remap_column_index(&mut faulted, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("injected store failure"),
+                "{error}"
+            );
+            assert_eq!(
+                faulted.manifest.version,
+                version_before + 1,
+                "A's commit landed, B's did not"
+            );
+            let partial = segments_named(&faulted, "i_idx").await;
+            assert_eq!(partial.len(), 2);
+            let b_kept = partial
+                .iter()
+                .find(|segment| segment.uuid == b_before.uuid)
+                .expect("B is untouched");
+            assert_eq!(b_kept.dataset_version, b_before.dataset_version);
+            assert_eq!(
+                b_kept.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([appended])
+            );
+            let a_after = partial
+                .iter()
+                .find(|segment| segment.uuid != b_before.uuid)
+                .unwrap();
+            assert_ne!(a_after.uuid, a_before.uuid, "A is replaced");
+            assert_eq!(
+                a_after.fragment_bitmap.clone().unwrap(),
+                RoaringBitmap::from_iter([10, 11])
+            );
+
+            // The store has recovered: a session without the fault finishes
+            // the pass.
+            let mut dataset = fresh(uri).await;
+            assert_eq!(dataset.manifest.version, version_before + 1);
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset.manifest.version,
+                version_before + 2,
+                "only B is committed by the retry"
+            );
+            let after = segments_named(&dataset, "i_idx").await;
+            assert_eq!(after.len(), 2);
+            assert_eq!(after[0].uuid, a_after.uuid, "A is left alone");
+            assert_ne!(after[1].uuid, b_before.uuid, "B is replaced");
+            let bitmaps: Vec<RoaringBitmap> = after
+                .iter()
+                .map(|segment| segment.fragment_bitmap.clone().unwrap())
+                .collect();
+            assert_eq!(
+                bitmaps,
+                vec![
+                    RoaringBitmap::from_iter([10, 11]),
+                    RoaringBitmap::from_iter([20, 21])
+                ]
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, &after[1], 100).await,
+                vec![20]
+            );
+            assert_eq!(
+                raw_file_fragments_for(&dataset, &after[1], 103).await,
+                vec![21]
+            );
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(
+                segments_named(&dataset, FRAG_REUSE_INDEX_NAME).await.len(),
+                0,
+                "with every segment caught up the history is trimmed away"
+            );
+            let reopened = fresh(uri).await;
+            assert_index_matches_scan(&reopened, all_values.iter().copied()).await;
         }
     }
 

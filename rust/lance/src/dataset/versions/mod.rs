@@ -151,7 +151,11 @@ pub async fn write_fragments(
     // set them aside before the schema is checked against the dataset's and
     // put them back on the schema that is written. This has to come before
     // the blob promotion, which gives every negative field id a new one.
-    let (normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    if dataset.is_none() {
+        // Input Arrow IDs must not seed allocation for a new dataset's blob children.
+        normalized_schema.try_reassign_field_ids(None)?;
+    }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
             write::promote_legacy_blob_schema(&normalized_schema)?
@@ -666,6 +670,7 @@ pub async fn open_writer(
             };
             if schema.fields_pre_order().any(Field::is_blob_v2) {
                 write::open_current_blob_v2_writer(
+                    version,
                     create_file_writer,
                     object_store,
                     schema,
@@ -700,16 +705,17 @@ pub async fn open_update_writer(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    let options = WriterOptions::update(
+        dataset.session.store_registry(),
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    );
     open_writer(
         version,
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(
-            dataset.session.store_registry(),
-            external_base_resolver,
-            allow_external_blob_outside_bases,
-        ),
+        options,
     )
     .await
 }

@@ -37,10 +37,11 @@ use super::MergeInsertMetrics;
 /// whole rows.
 ///
 /// This is the v2 counterpart of the legacy in-place write path: the columns
-/// present in the source are written as new data files attached to the
-/// fragments that already hold the matched rows, and the old versions of those
-/// columns are tombstoned. Columns absent from the source are never read or
-/// written, which is what makes a narrow update of a wide table cheap.
+/// present in the source, excluding join keys, are written as new data files
+/// attached to the fragments that already hold the matched rows, and the old
+/// versions of those columns are tombstoned. Columns absent from the source
+/// are never read or written, which is what makes a narrow update of a wide
+/// table cheap.
 ///
 /// Compared to [`super::FullSchemaMergeInsertExec`] this node:
 /// - consumes only the source data columns plus `_rowaddr` / `_rowid` /
@@ -477,11 +478,11 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             } = MergeInsertJob::update_fragments(
                 dataset.clone(),
                 patch_stream,
-                current_version,
                 target_bases_info,
                 &spill_session_context,
                 &spill_execution_options,
-                params.write_version(&dataset),
+                (current_version, params.write_version(&dataset)),
+                &params.on,
             )
             .await?;
 

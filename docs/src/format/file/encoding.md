@@ -329,113 +329,74 @@ have per offset (for variable-width data).
 
 ### Sparse Page Layout
 
-Sparse pages require Lance 2.3. They represent flat or nested Arrow structure directly as slot-domain mappings instead
-of dense repetition and definition events. Writers emit this layout only in files declared as 2.3 or above. The layout is
-identified only by `PageLayout`; field metadata does not identify the layout of an existing page.
+Sparse pages require Lance 2.3 and are identified by `PageLayout`. They represent Arrow structure as ordered
+slot-domain mappings and store leaf values in independently readable mini-block chunks.
 
-A domain is a layer-local integer coordinate space `[0, num_slots)`, and a slot is one element in that space. The
-outer-most domain contains the page's top-level rows. Each layer maps its parent domain to the next layer's parent
-domain, and the terminal child domain contains the leaf value slots stored in value chunks.
+#### Structural Domains
 
-Structural layers are ordered from outer-most to inner-most:
+A domain is a layer-local coordinate space `[0, size)`. Layers are ordered from outer-most to inner-most:
 
-- validity maps a nullable item or struct slot to valid or null
+- validity preserves the domain and identifies null slots
 - list maps non-empty parent slots to variable-size child ranges
-- fixed-size-list maps each parent slot to a child range of a fixed dimension
+- fixed-size-list maps each parent slot to `dimension` children
 
-The layer list may be empty for a flat, non-nullable leaf page. In that case the scheduling domain and
-`num_visible_items` must be equal. The explicit writer currently emits its normalized all-valid layer even when a flat
-page could use this shorter wire representation.
+The outer domain contains logical page rows. To obtain its size, divide the page metadata's row count by the product
+of all fixed-size-list layer dimensions, including dimensions below variable-size lists. Dimensions must be positive,
+the product must not overflow, and the division must be exact. With no fixed-size-list layers the product is one.
 
-A list slot that is valid and absent from `non_empty_positions` is an empty list. Maps use the same structural contract
-as lists. The terminal child-domain size equals `SparseLayout.num_visible_items`.
+Each layer's parent size is the preceding child size. Validity preserves that size; fixed-size-list multiplies it by
+`dimension`; list supplies `num_child_slots`, which must equal the sum of its counts. Keeping this list summary permits
+downstream domains to be determined without reading structural payloads. The terminal domain is the leaf slot count,
+including null leaf slots. The layer list may be empty for a flat, non-nullable page.
 
-`SparseLayout.num_visible_items` is the number of leaf value slots encoded in value chunks. Null leaf slots count
-because they still occupy positions in Arrow's leaf value buffer; a nullable primitive with 100 slots, including 30
-nulls, has 100 visible items. `SparseLayout.num_items` is the number of entries in the equivalent dense repetition and
-definition stream. It equals `num_visible_items` plus one structural placeholder for every list slot without children.
-The first layer's `num_slots` is the logical top-level row count used for projection.
+A valid list slot absent from `non_empty_positions` is an empty list. Null list slots have no children.
+Maps use the same structural contract as lists.
 
-Position sets have four semantic representations: `empty`, `all`, one non-empty `range`, or an `explicit`
-delta-compressed `u64` buffer. Count sets are `empty`, one positive `constant` value, or an `explicit` compressed `u64`
-buffer. Every layer has a `SparseValiditySet` whose meaning is explicit:
+#### Structural Sequences
 
-- `SPARSE_VALIDITY_NULL_POSITIONS`: stored positions are null and all other positions are valid
-- `SPARSE_VALIDITY_VALID_POSITIONS`: stored positions are valid and all other positions are null
+Positions and list counts are [generic unsigned blocks](#generic-unsigned-blocks) with inline `CompressiveEncoding`
+descriptors and unsigned 64-bit values. Positions are absolute, strictly increasing, and below their parent-domain
+size. Counts are positive child counts in non-empty-position order. Sparse applies no additional transform.
 
-The unspecified validity meaning is invalid. Both polarities are part of the wire contract and have identical Arrow
-semantics after normalization.
+`SparseValiditySet.num_positions` supplies the validity sequence cardinality.
+`SparseListLayer.num_non_empty_positions` supplies both the non-empty position and count sequence cardinalities.
+Descriptors are required even for empty sequences; encoding and payload rules follow the generic block contract.
 
-#### Writer Selection
+Every layer has validity with one of two meanings:
 
-Writers may emit this layout only for Lance 2.3+ fields. A field can request it explicitly with
-`lance-encoding:structural-encoding=sparse`; the same request is an input error for earlier file versions. Without an
-explicit structural encoding, the Lance 2.3 writer selects sparse only when the dense mini-block repetition/definition
-budget would split the page or one top-level row exceeds that budget, and only when the value path is supported by the
-sparse writer. Explicit `miniblock`, `fullzip`, and `sparse` requests are not changed by this automatic policy. Lance
-2.2 and earlier writers never select sparse.
+- `SPARSE_VALIDITY_NULL_POSITIONS`: stored positions are null; all other positions are valid
+- `SPARSE_VALIDITY_VALID_POSITIONS`: stored positions are valid; all other positions are null
 
-Unsupported sparse value paths, including dictionary values and variable-width packed structs, retain their dense
-behavior. Writers normalize Arrow validity and list structure once. Within-budget dense pages do not build sparse
-position/count plans. All-valid layers use null positions plus `empty`; all-null layers use valid positions plus
-`empty`. Other layers choose the validity polarity with the lower semantic encoded cost, with ties using null
-positions. Field metadata controls writer selection only: readers always use `PageLayout` to determine the layout of
-an encoded page and must not use field metadata for that decision.
+The unspecified meaning is invalid. Non-empty list positions must be valid.
 
-Pages without a value payload keep the existing canonical `ConstantLayout`: structural-only types such as an empty
-struct, and leaf pages whose visible values are all null, do not emit `SparseLayout`. An explicitly sparse page with
-at least one non-null visible value does emit `SparseLayout`, even when all non-null values are equal. This boundary
-avoids introducing a second structural-only representation without evidence that it improves the existing constant
-encoding.
+#### Buffers
 
-#### Buffers and Selective Reads
+Buffer 0 contains one 8-byte metadata entry per value chunk: `(chunk_size / 8) - 1` as little-endian `u32`, followed
+by the chunk's leaf slot count as little-endian `u32`. Chunk sizes are positive multiples of 8; each chunk contains
+between 1 and 32,768 leaf slots. The byte sum equals buffer 1's length and the slot sum equals the terminal domain size.
+An empty terminal domain has empty buffers 0 and 1.
 
-A sparse page contains the following physical buffers:
+Buffer 1 contains mini-block value chunks. Each chunk starts with a zero little-endian `u16` repetition/definition
+level count, followed by one little-endian `u32` byte length for each value buffer required by `value_compression`.
+The header and each value buffer are padded to an 8-byte boundary. Value buffers follow their descriptor-defined order.
+The header, buffers, and padding must consume the chunk exactly. Value compression follows the shared mini-block
+contract, including generic variable-width offsets.
 
-| Buffer | Contents |
-| ------ | -------- |
-| 0 | Value chunk metadata, one 8-byte entry per chunk |
-| 1 | Mini-block compressed value chunks without repetition or definition levels |
-| 2+ | One buffer for each explicit position or count set, in structural-layer field order |
+Remaining buffers contain zero or one payload per generic structural sequence. Sequences are visited in
+outer-to-inner layer order. Within a list layer the order is non-empty positions, counts, then validity positions.
+Validity and fixed-size-list layers contain only their validity sequence. Each sequence consumes the payload count
+specified by its generic codec; missing or extra buffers are invalid.
 
-Each value chunk metadata entry stores `(chunk_size / 8) - 1` as little-endian `u32`, followed by its visible value
-count as little-endian `u32`. Chunk sizes must be positive multiples of 8 and fit this representation. The sum of
-chunk sizes must equal buffer 1 exactly and the sum of chunk value counts must equal `num_visible_items`. A value chunk
-contains at most 32,768 visible values. `num_buffers` describes the number of value buffers inside every chunk and
-excludes the structural buffers.
-
-General-compressed sparse buffers use the existing length-prefixed LZ4 or Zstd representation and must not contain
-another general-compression wrapper. SparseLayout does not impose additional size or descriptor-complexity limits on
-otherwise representable buffers.
-
-Readers normalize structural metadata once, project requested top-level ranges through each layer, and read only value
-chunks that intersect the resulting leaf ranges. When no leaf range remains, readers rebuild offsets and validity from
-the structural plan without reading buffer 1.
-
-#### Caching and Point Reads
-
-Reader initialization loads buffer 0 and every explicit structural buffer, then validates and normalizes them into a
-cached page plan. The cached state contains parsed value-chunk descriptors and prefix offsets, decoded semantic
-position/count sets, validity, and the ordered structural layers. It does not contain value payload bytes from buffer
-1. The plan is cached per field and page and reused by later scans, range reads, and takes.
-
-After that plan is cached, reading one primitive leaf value reads only the value chunk that contains it. A cold read
-first loads the structural metadata and then the intersecting value chunk. Reading one top-level list or
-fixed-size-list value may intersect multiple leaf chunks and reads each intersecting chunk. A selection whose projected
-structure contains no leaf slots reads no value chunk.
+The structural domains map row selections to leaf ranges. Buffer 0 locates the independently readable value chunks
+intersecting those ranges. Empty leaf selections require no value payload. Cache placement and codec selection
+policies are implementation choices.
 
 #### Validation
 
-Readers must reject malformed sparse metadata instead of inferring or repairing it. Required checks include:
-
-- physical buffer count, chunk-count bounds, and every checked offset/size range
-- first-layer row domain, adjacent parent/child domain chaining, and terminal visible-value domain
-- semantic set cardinality, explicit position ordering and bounds, and validity meaning
-- exact `num_items`
-- list non-empty positions being valid, count cardinality, positive counts, and child-count sum
-- fixed-size-list dimension and checked child-domain multiplication
-- value chunk byte/value sums, size representation and alignment, general-compression headers, descriptor buffer
-  count, and complete chunk consumption
+Readers reject malformed metadata and payloads. Validation covers checked domain arithmetic and buffer ranges,
+sequence cardinality and position bounds/order, validity meaning, non-empty-list validity, positive counts and their
+child-domain sum, and exact chunk byte/slot sums and consumption. Structural sequence validation otherwise follows
+the generic unsigned block contract.
 
 ```protobuf
 %%% proto.message.SparseLayout %%%
@@ -443,10 +404,6 @@ Readers must reject malformed sparse metadata instead of inferring or repairing 
 
 ```protobuf
 %%% proto.message.SparseStructuralLayer %%%
-```
-
-```protobuf
-%%% proto.message.SparseValidityLayer %%%
 ```
 
 ```protobuf
@@ -459,14 +416,6 @@ Readers must reject malformed sparse metadata instead of inferring or repairing 
 
 ```protobuf
 %%% proto.message.SparseValiditySet %%%
-```
-
-```protobuf
-%%% proto.message.SparsePositionSet %%%
-```
-
-```protobuf
-%%% proto.message.SparseCountSet %%%
 ```
 
 ### Constant Page Layout
@@ -567,6 +516,11 @@ free to pretend that the fixed-size list data type does not exist.
 
 ## Compression
 
+Generic block compression (including Range, Delta, block dictionary compositions and generic mini-block
+offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
+contracts. The complete 2.3 format will undergo a consolidated format vote when it is proposed for stable
+status; intermediate unstable revisions do not establish compatibility requirements.
+
 Once a structural encoding is chosen we must determine how to compress the data. There are various buffers that
 might be compressed (e.g. data, repetition, definition, dictionary, etc.). The available compression algorithms
 are also constrained by the structural encoding chosen. For example, when using the full zip layout we require
@@ -585,6 +539,9 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Flat            | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
+| Range           | ✅ (2.3)              | ❌                       | ❌                         |
+| Delta           | ✅ (2.3)              | ❌                       | ❌                         |
+| Dictionary      | ✅ (2.3)              | ❌                       | ❌                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -611,11 +568,109 @@ When applied in a mini-block context each block may have a different number of v
 until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
 we have passed.
 
+Lance 2.1 and 2.2 store each variable-width mini-block in the legacy interleaved form. `Variable.offsets` is a
+plain `Flat` encoding, and each chunk has one buffer:
+
+```text
+chunk buffer
+├── chunk-relative offsets
+└── value bytes
+```
+
+The first legacy offset points past the offset table to the first value byte. The chunk is padded to an 8-byte
+boundary.
+
+Starting with Lance 2.3, a writer may instead encode the offsets as an independently decodable generic block when
+that produces fewer complete serialized bytes, including the descriptor, chunk header, buffer entries and padding.
+Every chunk in the page uses the same offset codec. Its offset sequence contains `num_values + 1` unsigned values,
+starts at zero, is non-decreasing, and ends at the length of that chunk's value buffer.
+
+The writer first chooses the same power-of-two chunk boundaries as the legacy layout. For each chunk it subtracts
+the first offset, then collects range, delta, run and bounded-cardinality statistics in one pass. It evaluates the
+permitted codecs over the complete family of chunks, including metadata and aligned payload costs, and selects one
+codec for the page. The writer serializes both the legacy and selected generic candidates and emits the generic
+candidate only when its complete serialized size is strictly smaller. A tie preserves the legacy bytes.
+
+```text
+metadata-only offset codec       payload-bearing offset codec
+└── value buffer                 ├── offset payload buffer
+                                 └── value buffer
+```
+
+A non-`Flat` `Variable.offsets` descriptor identifies this generic form and follows the
+[generic unsigned block contract](#generic-unsigned-blocks). `Flat` remains the legacy interleaved signal; writers
+do not emit a separate generic `Flat` container.
+Readers fetch and decode only the selected mini-block, so the additional logical buffer does not change random-read
+granularity.
+
+### Generic Unsigned Blocks
+
+A generic unsigned block has a `CompressiveEncoding` descriptor and zero or one payload buffer. Its container supplies
+the unsigned width (`u32` or `u64`) and cardinality. The codec alone determines transforms, scalar representation,
+child grammar and payload framing; the container defines the meaning and constraints of the decoded values.
+
+An empty sequence uses `Constant` with an absent scalar and no payload. Non-empty `Constant` stores one little-endian
+scalar of the declared width. `Range` and other metadata-only expressions consume no payload, including
+`Delta(Constant)`. Each payload-bearing root consumes exactly one buffer; RLE and dictionary roots frame their
+children inside that buffer. These rules apply to both variable-width offsets and sparse structural sequences.
+
+The generic fixed-width decoder accepts one composite root at most:
+
+```text
+generic unsigned block root
+├── leaf: Flat, Constant, Range, InlineBitpacking, OutOfLineBitpacking
+├── Delta(leaf)
+├── General(Flat)
+├── Rle(values=leaf, run_lengths=u32 leaf)
+└── Dictionary(indices=u32 leaf, items=sequence-width leaf)
+```
+
+`Delta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
+positive, and their checked sum equals `num_values`. Dictionary indices have `num_values` entries and every index
+is less than the declared dictionary item count. General compression must decode exactly the byte length implied by
+the containing cardinality and sequence width. Readers reject missing children, incompatible widths, unsupported
+nesting, wrong payload arity, malformed framing and arithmetic overflow.
+
 ### Constant
 
-Constant compression is currently only utilized in a few specialized scenarios such as all-null arrays.
+For [generic unsigned blocks](#generic-unsigned-blocks), Constant repeats one scalar for the container-supplied
+cardinality without a payload. The generic block contract also defines the empty-sequence representation.
+Other containers, such as all-null encodings, define their own Constant semantics.
 
-This will likely change in future versions.
+### Range
+
+Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences. It stores the first
+value and a positive step; the containing block supplies the number of values. Readers compute value `i` as
+`start + step * i` and reject invalid widths or arithmetic overflow.
+
+```protobuf
+%%% proto.message.Range %%%
+```
+
+### Delta
+
+Delta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1` adjacent
+differences. The differences are represented by a child block codec. Delta has a payload exactly when its child
+has one, and readers reconstruct values with checked prefix sums.
+
+```protobuf
+%%% proto.message.Delta %%%
+```
+
+### Block Dictionary
+
+A block dictionary represents unsigned `u32` or `u64` values with a `u32` indices child and a dictionary-items
+child. Both children are concrete block codecs. When either child has a payload, the outer payload is framed as:
+
+```text
+u64 indices_payload_bytes
+u64 items_payload_bytes
+indices payload
+dictionary-items payload
+```
+
+A metadata-only child has a zero framed length. If both children are metadata-only, the dictionary itself has no
+payload. Readers validate the frame boundaries, child widths and cardinalities, and every dictionary index.
 
 ### Bitpacking
 

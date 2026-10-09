@@ -221,6 +221,10 @@ name = "ivf_pq"
 harness = false
 
 [[bench]]
+name = "nullable_vector_training"
+harness = false
+
+[[bench]]
 name = "streaming_ivf_training"
 harness = false
 
@@ -335,6 +339,10 @@ harness = false
 
 [[bench]]
 name = "hamming"
+harness = false
+
+[[bench]]
+name = "hamming_ivf_training"
 harness = false
 
 [lints]
