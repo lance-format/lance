@@ -826,8 +826,9 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 ///
 /// Readers resolve columns by field id (name -> schema id -> DataFile::fields
 /// position), so renumbered ids silently rebind live columns to other columns'
-/// bytes. Shared ids must keep their field path. Their logical type,
-/// nullability, storage encoding, and dictionary may change only when every
+/// bytes. Shared ids may be renamed to unused names within the same parent,
+/// but must not take another sibling's name or move between parents. Their logical
+/// type, nullability, storage encoding, and dictionary may change only when every
 /// existing base or overlay file carrying the id is replaced and every
 /// proposed fragment materializes the id in a base data file. New ids must
 /// exceed the manifest's max so a dropped field's id is never reused. An
@@ -855,7 +856,17 @@ fn merge_schema_valid(
         };
         let prior_path = prior_schema.field_path(field.id)?;
         let new_path = new_schema.field_path(field.id)?;
-        if prior_path != new_path {
+        // Match siblings by parent id so an ancestor rename does not hide renumbering.
+        let prior_siblings = prior_schema
+            .field_by_id(field.parent_id)
+            .map_or(prior_schema.fields.as_slice(), |parent| {
+                parent.children.as_slice()
+            });
+        if field.parent_id != prior_field.parent_id
+            || prior_siblings
+                .iter()
+                .any(|sibling| sibling.name == field.name && sibling.id != field.id)
+        {
             return Err(Error::invalid_input(format!(
                 "Merge operation remaps field id {} from \"{}\" to \"{}\". \
                  Merge must preserve the dataset's field ids: derive the new schema \
@@ -1822,6 +1833,62 @@ mod tests {
         let mut rewritten = manifest.fragments[0].clone();
         rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
         merge_schema_valid(&manifest, &rewritten_schema, &[rewritten]).unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::parent("s")]
+    #[case::child("s.x")]
+    #[test]
+    fn test_merge_allows_id_preserving_rename(#[case] path: &str) {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        )]))
+        .unwrap();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![1, 2]);
+        let mut renamed = schema;
+        let field_id = renamed.field(path).unwrap().id;
+        renamed.mut_field_by_id(field_id).unwrap().name = "renamed".into();
+        merge_schema_valid(&manifest, &renamed, &manifest.fragments).unwrap();
+
+        // Renaming an ancestor must not hide an accidental remapping of its children.
+        renamed.fields[0].children.swap(0, 1);
+        renamed.fields[0].children[0].id = 1;
+        renamed.fields[0].children[1].id = 2;
+        let err = merge_schema_valid(&manifest, &renamed, &manifest.fragments).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("remaps field id 1"), "{err}");
+    }
+
+    #[test]
+    fn test_merge_rejects_moving_field_to_unused_path() {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, true)].into()),
+            true,
+        )]))
+        .unwrap();
+        let manifest = manifest_with_file_fields(schema.clone(), vec![1]);
+        let mut moved = schema;
+        let mut child = moved.fields.pop().unwrap().children.remove(0);
+        child.name = "renamed".into();
+        child.parent_id = -1;
+        moved.fields.push(child);
+
+        let err = merge_schema_valid(&manifest, &moved, &manifest.fragments).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("remaps field id 1 from \"s.x\" to \"renamed\""),
+            "{err}"
+        );
     }
 
     #[test]

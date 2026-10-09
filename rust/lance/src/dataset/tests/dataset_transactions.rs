@@ -28,7 +28,7 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Int32Array, RecordBatchIterator, StringArray, StructArray,
+    Int32Array, Int64Array, RecordBatchIterator, StringArray, StructArray, record_batch,
     types::{Int32Type, Int64Type},
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1405,6 +1405,60 @@ async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset>
         false,
     )
     .await
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_alter_columns_rename_and_cast(
+    #[values(false, true)] non_reusable_field_ids: bool,
+    #[values(false, true)] rename_first: bool,
+) -> Result<()> {
+    let batch = record_batch!(
+        ("id", Int32, [1, 2, 3]),
+        ("name", Utf8, [Some("a"), None, Some("c")])
+    )?;
+    let uri = "memory://";
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    if non_reusable_field_ids {
+        dataset.migrate_to_non_reusable_field_ids().await?;
+    }
+    let version = dataset.version().version;
+    let name_id = dataset.schema().field("name").unwrap().id;
+    let max_field_id = dataset.manifest.max_field_id();
+    let original = dataset.clone();
+
+    let mut alterations = [
+        ColumnAlteration::new("id".into()).cast_to(DataType::Int64),
+        ColumnAlteration::new("name".into()).rename("full_name".into()),
+    ];
+    if rename_first {
+        alterations.reverse();
+    }
+    dataset.alter_columns(&alterations).await?;
+    dataset.validate().await?;
+
+    assert_eq!(dataset.version().version, version + 1);
+    assert!(dataset.schema().field("name").is_none());
+    assert_eq!(dataset.schema().field("full_name").unwrap().id, name_id);
+    let id_field = dataset.schema().field("id").unwrap();
+    assert!(id_field.id > max_field_id);
+    assert_eq!(id_field.data_type(), DataType::Int64);
+
+    let reopened = original.checkout_version(version + 1).await?;
+    assert_eq!(reopened.schema(), dataset.schema());
+    let data = reopened.scan().try_into_batch().await?;
+    assert_eq!(data["id"].as_ref(), &Int64Array::from(vec![1, 2, 3]));
+    assert_eq!(data["full_name"].as_ref(), batch["name"].as_ref());
+    Ok(())
 }
 
 // Which clause rejects the lossy round-trip depends on the hole's
