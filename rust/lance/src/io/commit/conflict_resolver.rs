@@ -589,22 +589,22 @@ impl<'a> TransactionRebase<'a> {
             return Ok(());
         }
         let mut reuse = UntaggedReuse {
-            groups: HashMap::new(),
+            groups: HashSet::new(),
             sources: HashMap::new(),
             manifest: dataset.manifest.clone(),
         };
         if let Some(entry) = entry {
             let details = load_frag_reuse_index_details(dataset, entry).await?;
-            for version in details.versions.iter() {
-                for group in version.groups.iter() {
-                    let old: Arc<[u64]> = sorted_ids(group.old_frags.iter().map(|f| f.id)).into();
-                    for new in &group.new_frags {
-                        reuse.sources.insert(new.id as u32, old.clone());
-                    }
-                    // Conflict resolution stamps the record with the version
-                    // the compaction rebased onto, so it committed the next one.
-                    reuse.groups.insert(old, version.dataset_version + 1);
+            for group in details
+                .versions
+                .iter()
+                .flat_map(|version| version.groups.iter())
+            {
+                let old: Arc<[u64]> = sorted_ids(group.old_frags.iter().map(|f| f.id)).into();
+                for new in &group.new_frags {
+                    reuse.sources.insert(new.id as u32, old.clone());
                 }
+                reuse.groups.insert(old);
             }
         }
         self.untagged_reuse = Some(Box::new(reuse));
@@ -612,29 +612,26 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// Whether a version cleaned up from this attempt's window could hide a
-    /// change this CreateIndex must account for: one at or after the commit of a
-    /// recorded deferred compaction of fragments it covers, which could have
-    /// folded an overlay into or updated that compaction's output. Earlier
-    /// versions only touched fragments under their own ids, as without the
-    /// fragment reuse index.
+    /// change this CreateIndex must account for: it covers the source fragments
+    /// of a recorded deferred compaction, whose values must stay unchanged from
+    /// the build until that compaction read them, and its output's after.
+    /// Compactions before the build do not count: the index covers their
+    /// output under its own id.
     pub(crate) fn needs_versions(&self, missing: &[u64]) -> bool {
         let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
             (&self.untagged_reuse, &self.transaction.operation)
         else {
             return false;
         };
-        let Some(last_missing) = missing.iter().max() else {
-            return false;
-        };
-        reuse.groups.iter().any(|(sources, committed)| {
-            committed <= last_missing
-                && new_indices.iter().any(|index| {
+        !missing.is_empty()
+            && reuse.groups.iter().any(|sources| {
+                new_indices.iter().any(|index| {
                     index
                         .fragment_bitmap
                         .as_ref()
                         .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
                 })
-        })
+            })
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -3303,9 +3300,8 @@ fn wrong_operation_err(op: &Operation) -> Error {
 /// The latest manifest's untagged fragment reuse index, as a CreateIndex sees it.
 #[derive(Debug)]
 struct UntaggedReuse {
-    /// Each recorded group's sorted source fragment ids, and the version its
-    /// compaction committed.
-    groups: HashMap<Arc<[u64]>, u64>,
+    /// Each recorded group's source fragment ids, sorted.
+    groups: HashSet<Arc<[u64]>>,
     /// Each recorded group's output fragments, mapped to its source ids.
     sources: HashMap<u32, Arc<[u64]>>,
     /// The latest manifest, whose schema overlays are matched against.
@@ -3319,7 +3315,7 @@ impl UntaggedReuse {
         !groups.is_empty()
             && groups.iter().all(|group| {
                 self.groups
-                    .contains_key(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
+                    .contains(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
             })
     }
 

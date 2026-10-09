@@ -621,18 +621,22 @@ enum Gap {
     HidesTheCompaction,
     /// A version before the compaction, which stays visible.
     BeforeTheCompaction,
+    /// An in-place update of the compaction's sources, before it.
+    HidesAnUpdateBeforeTheCompaction,
     /// A version in the window; the compaction came before the build.
     AfterACompactionBeforeTheBuild,
     /// A version in the window; the table never compacted.
     NoFragmentReuseIndex,
 }
 
-/// A cleaned-up version at or after a recorded compaction of fragments the
-/// index covers could hide a change to its output, so the commit is refused.
-/// Any other gap commits, as it would without the fragment reuse index.
+/// When the index covers a recorded compaction's sources, a cleaned-up version
+/// anywhere in its window could hide a change to them before the compaction
+/// read them, or to its output after, so the commit is refused. A gap commits
+/// when the index covers no such sources, as without the fragment reuse index.
 #[rstest]
 #[case::hides_the_compaction(Gap::HidesTheCompaction, false)]
-#[case::before_the_compaction(Gap::BeforeTheCompaction, true)]
+#[case::before_the_compaction(Gap::BeforeTheCompaction, false)]
+#[case::hides_an_update_before_the_compaction(Gap::HidesAnUpdateBeforeTheCompaction, false)]
 #[case::after_a_compaction_before_the_build(Gap::AfterACompactionBeforeTheBuild, true)]
 #[case::no_fragment_reuse_index(Gap::NoFragmentReuseIndex, true)]
 #[tokio::test]
@@ -640,6 +644,13 @@ async fn test_index_over_a_cleaned_up_version(#[case] gap: Gap, #[case] commits:
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let mut table = indexed_table(uri, 2).await;
+    if matches!(gap, Gap::HidesAnUpdateBeforeTheCompaction) {
+        // An index on `spare`, which the update leaves alone, still covers
+        // the updated fragments, so the compaction defers its remap for them.
+        build_index(&mut table, "spare", "spare_idx", false)
+            .await
+            .unwrap();
+    }
     if matches!(gap, Gap::AfterACompactionBeforeTheBuild) {
         compact_files(&mut table, deferred_compaction(2), None)
             .await
@@ -652,11 +663,19 @@ async fn test_index_over_a_cleaned_up_version(#[case] gap: Gap, #[case] commits:
         .unwrap();
     let mut builder = open_in_new_session(uri).await;
     let mut gone = None;
-    if !matches!(gap, Gap::HidesTheCompaction) {
+    if matches!(gap, Gap::HidesAnUpdateBeforeTheCompaction) {
+        // Rows 0 and 6, one in each fragment the compaction then merges.
+        update_in_place(table, vec![0, 6], vec![999, 60]).await;
+        table = open_in_new_session(uri).await;
+        gone = Some(table.manifest.version);
+    } else if !matches!(gap, Gap::HidesTheCompaction) {
         table.update_config([("first", "true")]).await.unwrap();
         gone = Some(table.manifest.version);
     }
-    if matches!(gap, Gap::HidesTheCompaction | Gap::BeforeTheCompaction) {
+    if matches!(
+        gap,
+        Gap::HidesTheCompaction | Gap::BeforeTheCompaction | Gap::HidesAnUpdateBeforeTheCompaction
+    ) {
         compact_files(&mut table, deferred_compaction(2), None)
             .await
             .unwrap();
@@ -664,7 +683,9 @@ async fn test_index_over_a_cleaned_up_version(#[case] gap: Gap, #[case] commits:
             gone = Some(table.manifest.version);
         }
     }
-    update_in_place(table, vec![0], vec![999]).await;
+    if !matches!(gap, Gap::HidesAnUpdateBeforeTheCompaction) {
+        update_in_place(table, vec![0], vec![999]).await;
+    }
     clean_up_versions(uri, vec![gone.unwrap()]).await;
 
     let result = build_index(&mut builder, "val", "val_idx", false).await;
