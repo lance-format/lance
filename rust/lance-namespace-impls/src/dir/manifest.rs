@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ADDR, ROW_ID, Result, box_error};
+use lance_core::{Error, ROW_ADDR, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -1089,19 +1089,13 @@ impl ManifestNamespace {
         Self::string_list_array(values, "object_id")
     }
 
-    fn value_row_id_schema(value_field: Field) -> SchemaRef {
-        Arc::new(ArrowSchema::new(vec![
-            value_field,
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]))
-    }
-
-    /// Like [`Self::value_row_id_schema`], but for a BTree stream: BTree
-    /// training always reads its id column as `ROW_ADDR`, never `ROW_ID` (see
-    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
+    /// Schema for a manifest index training stream: BTree, Bitmap, and
+    /// LabelList all read their id column as `ROW_ADDR`, never `ROW_ID` (see
+    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`, `BITMAP_ROW_ADDR_DOMAIN_VERSION`, and
+    /// `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
     /// rows with is already an address, not a row id -- see the single
     /// fragment id 0 invariant in `rewrite_manifest` -- so only the column
-    /// name needs to change, not the values.
+    /// name matters, not the values.
     fn value_row_addr_schema(value_field: Field) -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
             value_field,
@@ -1241,7 +1235,11 @@ impl ManifestNamespace {
         base_objects_values: Vec<Option<Vec<String>>>,
         base_objects_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
-        let schema = Self::value_row_id_schema(BASE_OBJECTS_VALUE_FIELD.clone());
+        // Like `object_type_index_stream`, but for LabelList: LabelList
+        // training also reads its id column as `ROW_ADDR`, never `ROW_ID`
+        // (see `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). Only the column name
+        // needs to change, not the values -- see `value_row_addr_schema`.
+        let schema = Self::value_row_addr_schema(BASE_OBJECTS_VALUE_FIELD.clone());
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (
