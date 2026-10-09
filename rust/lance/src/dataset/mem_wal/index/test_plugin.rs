@@ -30,7 +30,8 @@ pub enum Deviation {
     DeclinesRealSearches,
     /// Declines probes, answers every real search.
     DeclinesProbes,
-    /// Accepts every query while planning, then declines it.
+    /// Accepts every query while planning, then declines it; a filter, which
+    /// planning does not ask about, is simply declined.
     AcceptsThenDeclines,
     /// Accepts every query while planning, then fails it.
     AcceptsThenFails,

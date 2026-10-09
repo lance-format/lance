@@ -273,7 +273,8 @@ impl IndexStore {
         self.indexes.insert(name, index);
     }
 
-    /// Add a B-tree over one column.
+    /// Add a B-tree over one column. Filters do not reach it; build with
+    /// [`Self::from_specs`] for that.
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.add_index(name, Arc::new(BTreeMemIndex::new(field_id, column)));
     }
@@ -435,8 +436,8 @@ impl IndexStore {
         self.indexes.get(name)
     }
 
-    /// The B-tree the memtable keeps over a single key column, when no user
-    /// index serves as the key index.
+    /// The B-tree the memtable keeps over a single key column, when no
+    /// maintained index serves as the key index.
     pub(crate) fn own_key_index(&self) -> Option<Arc<dyn MemIndex>> {
         match &self.pk_index {
             Some(PkIndex::Owned(OwnedPk::Single(index))) => {

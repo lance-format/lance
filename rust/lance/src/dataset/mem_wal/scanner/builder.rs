@@ -2172,8 +2172,15 @@ mod tests {
         use arrow_array::{Int32Array, StringArray};
 
         let store = BatchStore::with_capacity(8);
-        let mut index = IndexStore::new();
-        index.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let index = IndexStore::from_specs(
+            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+                "id_idx", 0, "id",
+            )],
+            &lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+            100,
+            8,
+        )
+        .unwrap();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

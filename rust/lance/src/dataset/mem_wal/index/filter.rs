@@ -5,8 +5,9 @@
 //!
 //! The filter goes through [`apply_scalar_indices`], the pass the base table's
 //! scan uses, with a provider built from the memtable's indexes and their
-//! plugins' [`ScalarQueryParser`]s. The result is a tree of index searches plus
-//! a leftover expression applied to the rows the indexes narrowed to.
+//! plugins' [`ScalarQueryParser`]s. The result is a tree of index searches and
+//! whether they cover the whole filter; when they do not, the rows they select
+//! are checked against the whole filter.
 //!
 //! `NOT` is not evaluated from indexes: complementing a result needs each
 //! index's null rows, which they do not report, so such a filter is scanned.
@@ -58,15 +59,16 @@ impl MemIndexCatalog {
     }
 
     /// Answer expressions on `column` from the memtable's own key index too,
-    /// after any maintained index on it.
+    /// after any maintained index on it. Only a catalog with a schema, as
+    /// [`IndexStore::from_specs`] builds, can type the column.
     pub(crate) fn add_own_key_index(&mut self, column: &str) {
         if let Some(parser) = BTreeMemIndexPlugin.query_parser(OWN_KEY_INDEX.to_string(), None) {
             self.add_parser(column, parser);
         }
     }
 
-    /// The first parser added for a column answers an expression it claims,
-    /// as on the base table.
+    /// The first parser added for a column, in spec order and then the own key
+    /// index, answers an expression it claims, as on the base table.
     fn add_parser(&mut self, column: &str, parser: Box<dyn ScalarQueryParser>) {
         if let Some((_, existing)) = self.columns.get_mut(column) {
             existing.add(parser);
@@ -104,7 +106,8 @@ pub struct IndexedFilter {
     pub is_whole_filter: bool,
 }
 
-/// Split `filter` into index searches; `None` when no index can help.
+/// Split `filter` into index searches; `None` when no index can help or the
+/// searches need `NOT`.
 pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<IndexedFilter>> {
     if catalog.is_empty() {
         return Ok(None);
@@ -219,6 +222,7 @@ mod tests {
     use lance_index::scalar::expression::{LabelListQueryParser, ScalarIndexSearch};
 
     use super::*;
+    use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
 
     /// The positions a tree selected, and whether they are the exact answer.
     fn positions(result: MemSearchResult) -> (Vec<u64>, bool) {
@@ -278,15 +282,19 @@ mod tests {
         ]))
     }
 
-    /// Two B-trees, on `id` and `name`, over ten rows: `id` counts up and
-    /// `name` is `alpha<id>`, with no `_`, which `LIKE` treats as a wildcard.
+    /// Two B-trees, on `id` and `name`, over ten rows: `id` counts up, `name` is
+    /// `alpha<id>` (no `_`, a `LIKE` wildcard), and unindexed `other` is
+    /// `id % 3`.
     fn store() -> (IndexStore, Vec<MemIndexSpec>) {
-        let arrow = schema();
-        let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
-        let specs = vec![
+        store_with(vec![
             MemIndexSpec::btree("id_idx", 0, "id"),
             MemIndexSpec::btree("name_idx", 1, "name"),
-        ];
+        ])
+    }
+
+    fn store_with(specs: Vec<MemIndexSpec>) -> (IndexStore, Vec<MemIndexSpec>) {
+        let arrow = schema();
+        let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
         let store = IndexStore::from_specs(&specs, &lance, 1_000, 16).unwrap();
 
         let ids: Vec<i32> = (0..10).collect();
@@ -319,7 +327,7 @@ mod tests {
     fn run(filter: &str) -> (Vec<u64>, bool) {
         let (store, specs) = store();
         let split = plan(filter, &specs).expect("the filter reaches an index");
-        positions(evaluate(&split.searches, &store, &SearchContext::new(u64::MAX)).unwrap())
+        positions(evaluate(&split.searches, &store, &SearchContext::new(9)).unwrap())
     }
 
     /// Every shape the on-disk B-tree's parser claims reaches the memtable one.
@@ -335,6 +343,7 @@ mod tests {
             ("id BETWEEN 4 AND 6", vec![4, 5, 6]),
             // A prefix match, turned into a range over the ordered keys.
             ("name LIKE 'alpha1%'", vec![1]),
+            ("name IS NULL", vec![]),
         ] {
             let (positions, exact) = run(filter);
             assert_eq!(positions, expected, "filter: {filter}");
@@ -391,15 +400,15 @@ mod tests {
             .unwrap();
         let split = plan_filter(&filter, store.filter_catalog())
             .unwrap()
-            .expect("the key filter reaches the own key index");
+            .expect("the key filter reaches the memtable's own key index");
         let found = positions(evaluate(&split.searches, &store, &SearchContext::new(9)).unwrap());
         assert_eq!(found, (vec![4], true));
     }
 
-    /// An unindexed conjunct comes back as the leftover; the indexed one still
-    /// narrows.
+    /// An unindexed conjunct is left out of the searches, so they do not cover
+    /// the whole filter.
     #[test]
-    fn an_unindexed_conjunct_becomes_the_leftover_expression() {
+    fn an_unindexed_conjunct_leaves_the_searches_short_of_the_whole_filter() {
         let (_, specs) = store();
         let split =
             plan("id >= 4 AND other = 1", &specs).expect("the indexed half reaches an index");
@@ -411,16 +420,27 @@ mod tests {
 
     /// Nothing is indexed, so there is nothing to plan and the caller scans.
     #[test]
-    fn a_filter_on_no_indexed_column_declines() {
+    fn a_filter_on_no_indexed_column_is_left_to_the_scan() {
         let (_, specs) = store();
         assert!(plan("other = 1", &specs).is_none());
     }
 
     /// A filter with `NOT` over an indexed leaf is scanned.
     #[test]
-    fn a_negated_filter_declines_rather_than_answering_wrongly() {
+    fn a_negated_filter_is_left_to_the_scan() {
         let (_, specs) = store();
         assert!(plan("NOT (id = 5)", &specs).is_none());
+    }
+
+    /// A parsed query names no column, so an index over two is never asked one.
+    #[test]
+    fn an_index_over_several_columns_answers_no_filter() {
+        let pair = MemIndexSpec {
+            columns: vec!["id".to_string(), "name".to_string()],
+            ..MemIndexSpec::btree("pair_idx", 0, "id")
+        };
+        let lance = LanceSchema::try_from(schema().as_ref()).unwrap();
+        assert!(MemIndexCatalog::new(&[pair], &lance).is_empty());
     }
 
     /// A float zero reaches the index as both zeros, as the full scan reads it.
@@ -462,10 +482,14 @@ mod tests {
         }
     }
 
-    /// Positions past the visibility watermark are not returned.
+    /// Positions past the visibility watermark are not returned, even from an
+    /// index that offers them.
     #[test]
     fn evaluation_honors_the_visibility_watermark() {
-        let (store, specs) = store();
+        let (store, specs) = store_with(vec![wrapped(
+            MemIndexSpec::btree("id_idx", 0, "id"),
+            Deviation::AnswersPastVisible,
+        )]);
         let split = plan("id >= 0", &specs).unwrap();
         let (positions, _) =
             positions(evaluate(&split.searches, &store, &SearchContext::new(4)).unwrap());

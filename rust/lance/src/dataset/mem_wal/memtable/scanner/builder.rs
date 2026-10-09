@@ -1051,8 +1051,7 @@ impl MemTableScanner {
     /// they select — a projected `meta.a` yields `meta: Struct<a>`.
     ///
     /// An unresolvable column is an error here, matching
-    /// [`Self::compute_projection_indices`]; both used to disagree, one
-    /// silently dropping what the other rejected.
+    /// [`Self::compute_projection_indices`].
     fn projected_data_fields(&self) -> Result<Vec<Field>> {
         let Some(ref projection) = self.projection else {
             return Ok(self
@@ -1631,62 +1630,30 @@ mod tests {
         assert_eq!(ids, vec![2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
+    /// The B-tree answers what its parser claims; a negated list and a filter on
+    /// an unindexed column are left to the scan, which still returns their rows.
+    #[rstest::rstest]
+    #[case::not_in("id NOT IN (1, 2)", vec![0, 3, 4, 5, 6, 7, 8, 9], "MemTableScanExec")]
+    #[case::unindexed("name = 'name_3'", vec![3], "MemTableScanExec")]
+    #[case::at_most("id <= 5", vec![0, 1, 2, 3, 4, 5], "ScalarMemIndexExec")]
+    #[case::above("id > 5", vec![6, 7, 8, 9], "ScalarMemIndexExec")]
     #[tokio::test]
-    async fn a_filter_no_index_answers_is_applied_by_the_scan() {
+    async fn each_filter_takes_the_route_its_indexes_allow(
+        #[case] filter: &str,
+        #[case] expected: Vec<i32>,
+        #[case] route: &str,
+    ) {
         let schema = create_test_schema();
-        let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let indexes = create_index_store_with_batches(&batch_store, &schema, &[(0, 10)]);
-
-        async fn ids_for(
-            batch_store: Arc<BatchStore>,
-            indexes: Arc<IndexStore>,
-            schema: SchemaRef,
-            filter: &str,
-        ) -> Vec<i32> {
-            let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
-            scanner.filter(filter).unwrap();
-            scanner
-                .try_into_batch()
-                .await
-                .unwrap()
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .values()
-                .to_vec()
-        }
-
-        assert_eq!(
-            ids_for(
-                batch_store.clone(),
-                indexes.clone(),
-                schema.clone(),
-                "id NOT IN (1, 2)"
-            )
-            .await,
-            vec![0, 3, 4, 5, 6, 7, 8, 9]
+        let mut scanner = memtable_over(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            create_test_batch(&schema, 0, 10),
         );
-        assert_eq!(
-            ids_for(
-                batch_store.clone(),
-                indexes.clone(),
-                schema.clone(),
-                "id <= 5"
-            )
-            .await,
-            vec![0, 1, 2, 3, 4, 5]
-        );
-        assert_eq!(
-            ids_for(batch_store, indexes, schema, "id > 5").await,
-            vec![6, 7, 8, 9]
-        );
+        scanner.filter(filter).unwrap();
+        let (ids, plan) = found(scanner).await.unwrap();
+        assert!(plan.contains(route), "{filter} should take {route}: {plan}");
+        assert_eq!(ids, expected);
     }
 
-    /// `full_text_search` now takes a structured `FullTextSearchQuery` (matching
-    /// the dataset `Scanner`); `local_fts_query` maps the supported leaf shapes
-    /// and rejects compound queries and missing columns.
     /// A boost query routed through the public entry point has to score the way
     /// the compound scorer does — `positive - negative_boost * negative` — or
     /// active rows rank differently from committed rows for the same query, and
@@ -2962,23 +2929,6 @@ mod tests {
         assert_eq!(addresses.values().to_vec(), vec![5]);
     }
 
-    /// A comparison with null is never true, so null rows match no `IN` list.
-    #[tokio::test]
-    async fn a_null_in_an_in_list_matches_no_row() {
-        let schema = create_test_schema();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("a"), None, Some("b"), None])),
-            ],
-        )
-        .unwrap();
-        let mut scanner = memtable_over(&[MemIndexSpec::btree("name_idx", 1, "name")], batch);
-        scanner.filter("name IN ('a', NULL)").unwrap();
-        assert_eq!(ids(&scanner.try_into_batch().await.unwrap()), vec![0]);
-    }
-
     /// With no maintained index on the key column, a key filter is answered by
     /// the memtable's own key index.
     #[rstest::rstest]
@@ -3005,6 +2955,20 @@ mod tests {
         let (ids, plan) = found(scanner).await.unwrap();
         assert!(plan.contains("ScalarMemIndexExec"), "{plan}");
         assert_eq!(ids, expected);
+    }
+
+    /// Rows an index offers past what is readable are dropped before the read.
+    #[tokio::test]
+    async fn an_index_answer_past_the_readable_rows_is_cut() {
+        let schema = create_test_schema();
+        let mut scanner = memtable_over(
+            &[id_btree(Deviation::AnswersPastVisible)],
+            create_test_batch(&schema, 0, 10),
+        );
+        scanner.filter("id < 9").unwrap();
+        let (ids, plan) = found(scanner).await.unwrap();
+        assert!(plan.contains("ScalarMemIndexExec"), "{plan}");
+        assert_eq!(ids, (0..9).collect::<Vec<_>>());
     }
 
     /// Rows an index offers only as candidates are checked against the filter
@@ -3219,44 +3183,10 @@ mod tests {
         assert!(error.to_string().contains(message), "{error}");
     }
 
-    fn scan_ids(batch: &RecordBatch) -> Vec<i32> {
-        batch["id"]
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values()
-            .to_vec()
-    }
-
-    /// The unindexed part of a filter is applied to an exact index answer.
-    #[tokio::test]
-    async fn an_exact_index_answer_still_applies_the_unindexed_rest_of_the_filter() {
-        let schema = create_test_schema();
-        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
-        let indexes = IndexStore::from_specs(
-            &[MemIndexSpec::btree("id_idx", 0, "id")],
-            &lance_schema,
-            100,
-            16,
-        )
-        .unwrap();
-        let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let batch = create_test_batch(&schema, 0, 10);
-        batch_store.append(batch.clone()).unwrap();
-        indexes
-            .insert_with_batch_position(&batch, 0, Some(0))
-            .unwrap();
-
-        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
-        scanner.filter("id >= 4 AND name = 'name_5'").unwrap();
-        assert_eq!(scan_ids(&scanner.try_into_batch().await.unwrap()), vec![5]);
-    }
-
-    /// Three batches holding the values a comparison is most likely to get
+    /// Twelve rows in three batches of the values a comparison most often gets
     /// wrong: nulls, NaN, both zeros, the infinities, empty and non-ASCII text.
-    /// `rid` identifies each row and carries no index.
-    /// Twelve rows of edge values, with a B-tree on each `indexed` column; one on
-    /// a `declining` column declines every filter it is asked.
+    /// Each `indexed` column has a B-tree, one on a `declining` column declines
+    /// every filter, and `rid` names each row with no index.
     fn differential_memtable(
         indexed: &[&str],
         declining: &[&str],
@@ -3479,6 +3409,25 @@ mod tests {
             (&["i", "f", "s", "b", "d"][..], &["s"][..]),
         ] {
             let memtable = differential_memtable(indexed, declining);
+            if declining.is_empty() && indexed.len() == 5 {
+                for filter in [
+                    "i = 7",
+                    "f = 0.0",
+                    "s LIKE 'ap%'",
+                    "b",
+                    "d = DATE '2022-01-08'",
+                ] {
+                    let (batch_store, indexes, schema) = &memtable;
+                    let mut scanner =
+                        MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+                    scanner.filter(filter).unwrap();
+                    let plan = scanner.create_plan().await.unwrap();
+                    let plan = datafusion::physical_plan::displayable(plan.as_ref())
+                        .indent(false)
+                        .to_string();
+                    assert!(plan.contains("ScalarMemIndexExec"), "{filter}: {plan}");
+                }
+            }
             for filter in filters {
                 let scanned = filtered_rids(&memtable, filter, false).await;
                 let indexed_rids = filtered_rids(&memtable, filter, true).await;

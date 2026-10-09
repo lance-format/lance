@@ -1540,7 +1540,7 @@ mod tests {
         // first (oldest) match. The plan-path active arm now sorts `_rowid`
         // DESC and keeps the first row (largest `_rowid` = newest insert).
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::write::BatchStore;
         use futures::TryStreamExt;
 
         let schema = create_pk_schema();
@@ -1548,11 +1548,8 @@ mod tests {
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let mut index_store = IndexStore::new();
-        // BTree on the PK: the point lookup resolves keys through the indexed PK
-        // path, which this exercises. (`indexed_count`/`visible_count` advance
-        // from the batch position regardless of whether any index is configured.)
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        // A B-tree on the key, so the active arm's filter goes through it.
+        let index_store = btree_on_id(&schema);
 
         // Two writes to pk=1, then an unrelated pk=2. The "new" row goes
         // *second* so its `_rowid` is larger.
@@ -1827,7 +1824,22 @@ mod tests {
         );
     }
 
-    /// Build an in-memory active memtable ref from batches, with a BTree on
+    /// An index store with a B-tree on `id`, which filters reach.
+    fn btree_on_id(schema: &ArrowSchema) -> IndexStore {
+        let lance = lance_core::datatypes::Schema::try_from(schema).unwrap();
+        let field_id = lance.field("id").unwrap().id;
+        IndexStore::from_specs(
+            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+                "id_idx", field_id, "id",
+            )],
+            &lance,
+            1_000,
+            64,
+        )
+        .unwrap()
+    }
+
+    /// Build an in-memory active memtable ref from batches, with a B-tree on
     /// `id` and the visibility watermark advanced so every row is visible.
     fn active_memtable_ref(
         schema: &Arc<ArrowSchema>,
@@ -1836,8 +1848,7 @@ mod tests {
     ) -> crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef {
         use crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef;
         let batch_store = Arc::new(BatchStore::with_capacity(64));
-        let mut index_store = IndexStore::new();
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let index_store = btree_on_id(schema);
         for b in batches {
             let (idx, row_offset, _) = batch_store.append(b.clone()).unwrap();
             index_store

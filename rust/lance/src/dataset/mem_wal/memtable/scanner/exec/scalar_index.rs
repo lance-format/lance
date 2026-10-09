@@ -48,7 +48,7 @@ pub struct ScalarMemIndexExec {
     /// indexes decided the filter alone.
     recheck: Option<PhysicalExprRef>,
     /// Whether the index searches are the whole filter.
-    is_filter_covered: bool,
+    is_whole_filter: bool,
     readable_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
@@ -82,7 +82,7 @@ impl ScalarMemIndexExec {
         indexes: Arc<IndexStore>,
         index_expr: ScalarIndexExpr,
         recheck: Option<PhysicalExprRef>,
-        is_filter_covered: bool,
+        is_whole_filter: bool,
         readable_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
@@ -101,7 +101,7 @@ impl ScalarMemIndexExec {
             indexes,
             index_expr,
             recheck,
-            is_filter_covered,
+            is_whole_filter,
             readable_count,
             projection,
             output_schema,
@@ -246,7 +246,7 @@ impl DisplayAs for ScalarMemIndexExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ScalarMemIndexExec: query={}, rechecked={}, with_row_id={}, with_row_address={}",
+                    "ScalarMemIndexExec: query={}, whole_filter={}, with_row_id={}, with_row_address={}",
                     self.index_expr.to_expr(),
                     self.recheck.is_some(),
                     self.with_row_id,
@@ -256,7 +256,7 @@ impl DisplayAs for ScalarMemIndexExec {
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ScalarMemIndexExec\nquery={}\nrechecked={}\nwith_row_id={}\nwith_row_address={}",
+                    "ScalarMemIndexExec\nquery={}\nwhole_filter={}\nwith_row_id={}\nwith_row_address={}",
                     self.index_expr.to_expr(),
                     self.recheck.is_some(),
                     self.with_row_id,
@@ -300,7 +300,7 @@ impl ExecutionPlan for ScalarMemIndexExec {
         let (positions, exact) = self.query_index()?;
 
         // Candidates from a narrowing or partial answer still need the filter.
-        let recheck = if !exact || !self.is_filter_covered {
+        let recheck = if !exact || !self.is_whole_filter {
             let Some(recheck) = &self.recheck else {
                 return Err(DataFusionError::Internal(
                     "the indexes did not decide the filter, but no filter was given to re-check with"
@@ -322,7 +322,6 @@ impl ExecutionPlan for ScalarMemIndexExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        // We can't know the exact count without querying the index
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
@@ -588,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_eq_query() {
+    async fn an_equality_returns_its_row() {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(100));
 
@@ -629,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_in_query() {
+    async fn a_list_returns_each_listed_row() {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(100));
 
@@ -674,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_visibility() {
+    async fn a_row_past_the_readable_batches_is_not_returned() {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(100));
 
@@ -740,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_with_row_id() {
+    async fn a_row_id_is_the_rows_position() {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(100));
 
@@ -804,7 +803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_plan_display() {
+    async fn the_plan_shows_the_query_and_its_flags() {
         use crate::utils::test::assert_plan_node_equals;
         use datafusion::physical_plan::ExecutionPlan;
 
@@ -843,7 +842,7 @@ mod tests {
 
         assert_plan_node_equals(
             exec,
-            "ScalarMemIndexExec: query=id = Int32(5), rechecked=false, with_row_id=false, with_row_address=false",
+            "ScalarMemIndexExec: query=id = Int32(5), whole_filter=false, with_row_id=false, with_row_address=false",
         )
         .await
         .unwrap();
@@ -869,7 +868,7 @@ mod tests {
 
         assert_plan_node_equals(
             exec,
-            "ScalarMemIndexExec: query=id = Int32(5), rechecked=false, with_row_id=true, with_row_address=false",
+            "ScalarMemIndexExec: query=id = Int32(5), whole_filter=false, with_row_id=true, with_row_address=false",
         )
         .await
         .unwrap();

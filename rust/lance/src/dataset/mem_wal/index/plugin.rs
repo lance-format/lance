@@ -353,11 +353,11 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// them.
     fn columns(&self) -> &[String];
 
-    /// Whether this index can answer a ranked search, asked while planning with
-    /// the query [`search`](Self::search) will receive. Only finding which
+    /// Whether this index can answer `query`, asked while planning with the
+    /// query [`search`](Self::search) will receive. Only finding which
     /// full-text granularities exist asks a probe instead. A full-text query's
-    /// search options must not decide the answer. Filters are not asked: they
-    /// reach the index through [`MemIndexPlugin::query_parser`].
+    /// search options must not decide the answer. Planning a filter does not
+    /// ask: a filter reaches the index through [`MemIndexPlugin::query_parser`].
     fn can_answer(&self, query: &dyn MemQuery) -> bool;
 
     /// Index every row of `batch`. Row `n` occupies position `row_offset + n`.
@@ -464,8 +464,8 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug + Any {
 
     /// The parser the on-disk index of this kind uses, so a filter expression
     /// it claims reaches this index as the same query. `index_details` are the
-    /// base-table index's, absent for a memtable configured directly. `None`
-    /// for a kind no filter expression names.
+    /// base-table index's, absent for a memtable configured directly. `None`,
+    /// the default, keeps every filter off this kind.
     fn query_parser(
         &self,
         _index_name: String,
@@ -571,8 +571,8 @@ fn check_details_message(plugin: &dyn MemIndexPlugin) -> Result<()> {
     Ok(())
 }
 
-/// One index a memtable maintains: its plugin, its columns, and what the plugin
-/// resolved for it.
+/// One index a memtable maintains: its plugin, its columns, what the plugin
+/// resolved for it, and the base-table index's details.
 #[derive(Clone)]
 pub struct MemIndexSpec {
     /// Index name, matching the base-table index it maintains.

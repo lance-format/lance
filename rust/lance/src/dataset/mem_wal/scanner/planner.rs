@@ -1531,7 +1531,7 @@ mod integration_tests {
         );
         assert!(
             !plan_str.contains("ScalarMemIndexExec"),
-            "the active memtable must not use the index skip"
+            "the active memtable must not use the index route"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets

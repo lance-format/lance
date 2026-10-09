@@ -1463,7 +1463,7 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
         )))
     }
 
-    /// A B-tree accepts any column type.
+    /// One top-level column, of any type.
     fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
         ctx.single_column()?;
         ctx.check_top_level_columns()
@@ -1571,7 +1571,9 @@ mod tests {
     #[case::fixed_int(DataType::Int32)]
     #[case::bytes(DataType::Utf8)]
     #[case::scalar(DataType::Float64)]
-    fn exclusive_and_inverted_ranges(#[case] data_type: DataType) {
+    fn an_exclusive_lower_bound_drops_its_key_and_crossed_bounds_match_nothing(
+        #[case] data_type: DataType,
+    ) {
         let value = |n: i32| match data_type {
             DataType::Int32 => ScalarValue::Int32(Some(n)),
             DataType::Utf8 => ScalarValue::Utf8(Some(format!("{n:03}"))),
