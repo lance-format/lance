@@ -248,6 +248,7 @@ fn ex_code_storage_load(c: &mut Criterion) {
         num_bits: NUM_BITS,
         packed: true,
         layered: false,
+        row_layout: RQRowLayout::Columns,
         query_estimator: RabitQueryEstimator::RawQuery,
     };
     let code_len = LOAD_DIM / 8;

@@ -27,6 +27,7 @@ use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::RowIdRemapper;
 use crate::vector::bq::builder::RabitQuantizer;
+use crate::vector::bq::storage::RQRowLayout;
 use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 
 pub trait Quantization:
@@ -246,6 +247,12 @@ pub trait QuantizerMetadata:
     // the metadata that should be stored in global buffer
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
         Ok(None)
+    }
+
+    /// How the storage file lays out each row's fields. Only an IVF_RQ file
+    /// can store plane rows; every other storage holds one column per field.
+    fn row_layout(&self) -> RQRowLayout {
+        RQRowLayout::Columns
     }
 
     async fn load(reader: &V1FileReader) -> Result<Self>;

@@ -10,7 +10,8 @@
 //! counters are the exception: they advance when an IVF_RQ index, layered or
 //! not, opens with, loads or reads through its resident columns. So is
 //! `storage_construct_repacks`, which advances when any RaBitQ storage is
-//! built from codes it must rewrite.
+//! built from codes it must rewrite, and `plane_rows_unpack_*`, which advance
+//! on every read of a plane-row IVF_RQ file.
 //! Readers take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -267,8 +268,9 @@ layered_lazy_counters! {
         lazy_rank0_scored_queries,
         /// Time from the start of each of those scans until it published the
         /// scoring of its first probe (rank 0) to the gathers: once the probe
-        /// was scored or, earlier, once its rows filled the heap. No gather
-        /// that waits for the threshold or its turn is released before.
+        /// was scored or, with `LANCE_RQ_LAZY_PARTIAL_PUBLISH=on`, earlier,
+        /// once its rows filled the heap. No gather that waits for the
+        /// threshold or its turn is released before.
         lazy_rank0_scored_ns,
         /// Lazy scans that issued a gather of a probe that is not
         /// `certain_dense`, whose issue waits on scoring progress; see
@@ -336,6 +338,11 @@ layered_lazy_counters! {
         resident_attach_bytes,
         /// Time spent assembling them, copies included.
         resident_attach_ns,
+        /// Bytes of packed row columns that reads of plane-row IVF_RQ files
+        /// unpacked into the column layout's fields.
+        plane_rows_unpack_bytes,
+        /// Time spent unpacking them.
+        plane_rows_unpack_ns,
     }
     ranked {
         /// Probes gathered lazily.
@@ -392,6 +399,20 @@ layered_lazy_counters! {
         stage2_pruned_live,
         /// Exactly scored survivors outside the query's distance range.
         stage2_exact_rejected,
+        /// Lazy probes whose survivors first filled the heap to `k` rows
+        /// while they were scored, and that published the heap's top then,
+        /// before the probe was scored whole, which only
+        /// `LANCE_RQ_LAZY_PARTIAL_PUBLISH=on` does. That threshold is the
+        /// `k`-th best of the rows scored so far, looser than the probe's
+        /// final one.
+        mid_probe_full_publishes,
+        /// Gathers that selected their survivors against such a mid-probe
+        /// threshold: issued after it was published and before its probe
+        /// was scored whole.
+        partial_threshold_issues,
+        /// Survivors of those gathers whose ex rows were gathered, part of
+        /// `rows_fetched`.
+        partial_threshold_rows,
     }
     maxima {
         /// Largest number of probes still unscored at a gather's issue.

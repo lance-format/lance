@@ -43,8 +43,23 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 /// Most vector indices should use this version unless they need to bump for a
 /// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
-/// Version for IVF_RQ indices.
-pub const IVF_RQ_INDEX_VERSION: u32 = 2;
+/// Version of IVF_RQ indices in the plane-row layout, and the highest IVF_RQ
+/// version this build reads.
+pub const IVF_RQ_INDEX_VERSION: u32 = 3;
+/// Version of IVF_RQ indices in the column layout, which readers that predate
+/// the plane-row layout accept.
+pub const IVF_RQ_COLUMNS_INDEX_VERSION: u32 = 2;
+
+/// The index version an IVF_RQ segment whose auxiliary file is in `row_layout`
+/// is committed with. Every writer (build, append, optimize, conversion) takes
+/// it from the layout it writes, so a column-layout index never takes the
+/// plane-row version, which older readers leave out of their usable indexes.
+pub fn ivf_rq_index_version(row_layout: vector::bq::RQRowLayout) -> i32 {
+    match row_layout {
+        vector::bq::RQRowLayout::Columns => IVF_RQ_COLUMNS_INDEX_VERSION as i32,
+        vector::bq::RQRowLayout::PlaneRows => IVF_RQ_INDEX_VERSION as i32,
+    }
+}
 
 /// The factor of threshold to trigger split / join for vector index.
 ///
@@ -106,6 +121,27 @@ mod tests {
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
         assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+    }
+
+    #[test]
+    fn test_ivf_rq_index_version_follows_row_layout() {
+        use crate::vector::bq::RQRowLayout;
+        assert_eq!(
+            ivf_rq_index_version(RQRowLayout::Columns),
+            IVF_RQ_COLUMNS_INDEX_VERSION as i32
+        );
+        assert_eq!(
+            ivf_rq_index_version(RQRowLayout::PlaneRows),
+            IVF_RQ_INDEX_VERSION as i32
+        );
+        // Plane rows are the read ceiling; columns keep the version readers
+        // without plane-row support accept, which still exceeds IVF_PQ's.
+        assert_eq!(
+            ivf_rq_index_version(RQRowLayout::PlaneRows),
+            IndexType::IvfRq.version()
+        );
+        assert!(ivf_rq_index_version(RQRowLayout::Columns) < IndexType::IvfRq.version());
+        assert!(ivf_rq_index_version(RQRowLayout::Columns) > IndexType::IvfPq.version());
     }
 
     #[test]

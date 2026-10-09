@@ -38,11 +38,12 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
-use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::bq::plane_rows::{PlaneRowsSpec, requests_fullzip};
+use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, RQRowLayout, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
-    QuantizationMetadata, QuantizationType, QuantizerBuildParams,
+    QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
@@ -1612,12 +1613,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let storage_path = self.index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.clone().join(INDEX_FILE_NAME);
 
+        // An IVF_RQ quantizer whose metadata asks for plane rows (a new
+        // build's params, or the index an append, optimize or remap extends)
+        // writes its storage as one fixed-width row column per plane, every
+        // partition's rows packed after the sign codes take their stored form.
+        let plane_rows = match Into::<Quantizer>::into(quantizer.clone()) {
+            Quantizer::Rabit(rq) if rq.metadata_ref().row_layout == RQRowLayout::PlaneRows => {
+                Some(PlaneRowsSpec::try_new(rq.metadata_ref())?)
+            }
+            _ => None,
+        };
         let writer_options = FileWriterOptions::default();
         let mut storage_writer = if is_flat {
             None
         } else {
-            let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
-            fields.extend(quantizer.extra_fields());
+            let fields = match &plane_rows {
+                Some(spec) => spec.file_fields(requests_fullzip(self.format_version)),
+                None => {
+                    let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
+                    fields.extend(quantizer.extra_fields());
+                    fields
+                }
+            };
             let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
             Some(file_versions::create_writer(
                 self.format_version,
@@ -1703,6 +1720,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 .as_fixed_size_list();
                             let unpacked = Arc::new(unpack_codes(codes_fsl));
                             batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
+                        }
+                        if let Some(spec) = &plane_rows {
+                            batch = spec.pack(&batch)?;
                         }
 
                         if storage_writer.is_none() {

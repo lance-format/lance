@@ -26,6 +26,7 @@ use v3::subindex::SubIndexType;
 
 pub mod bq;
 pub mod distributed;
+pub(crate) mod exact_buffers;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
