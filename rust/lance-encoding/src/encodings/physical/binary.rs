@@ -909,7 +909,19 @@ mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
+        // Empty values at index 3 and at the end: the first is inside the take pass
+        // below rather than only the full scan, the second leaves the page's last item
+        // zero-length, which is the one shape where a length prefix of 0 has no bytes
+        // following it. No other forced-full-zip test carries an empty value.
+        let string_array = StringArray::from(vec![
+            Some("abc"),
+            None,
+            Some("pqr"),
+            Some(""),
+            None,
+            Some("m"),
+            Some(""),
+        ]);
         let string_array = arrow_cast::cast(&string_array, &data_type).unwrap();
 
         let mut field_metadata = HashMap::new();
@@ -922,7 +934,7 @@ mod tests {
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![0, 1, 3, 4]);
+            .with_indices(vec![0, 1, 3, 4, 6]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
