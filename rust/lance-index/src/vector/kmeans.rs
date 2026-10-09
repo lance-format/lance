@@ -33,7 +33,9 @@ use lance_linalg::distance::dot_f16::{
 };
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
 use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
-use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
+use lance_linalg::kernels::{
+    Normalizable, argmin_value_float, argmin_value_float_with_bias, normalize,
+};
 use log::{info, warn};
 use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
@@ -305,6 +307,37 @@ fn compute_balance_loss(cluster_sizes: &[usize], n: usize, balance_factor: f32) 
     balance_factor * (size_loss - n.pow(2) as f32 / cluster_sizes.len() as f32)
 }
 
+/// Dot clustering constrains nonzero centroids to the unit sphere. A zero
+/// cluster sum has no preferred direction, so leave it zero instead of creating
+/// NaNs. Normalize after splitting as well, since perturbation changes the norm.
+fn normalize_centroids<T: ArrowPrimitiveType>(
+    centroids: &PrimitiveArray<T>,
+    dimension: usize,
+) -> ArrayRef
+where
+    T::Native: Normalizable,
+{
+    Arc::new(PrimitiveArray::<T>::from_iter_values(
+        centroids.values().chunks(dimension).flat_map(|centroid| {
+            let is_zero = centroid.iter().all(Zero::is_zero);
+            let (normalized, _) = normalize(centroid);
+            normalized.zip(centroid).map(
+                move |(value, &original)| {
+                    if is_zero { original } else { value }
+                },
+            )
+        }),
+    ))
+}
+
+fn kmeans_has_converged(previous_loss: f64, loss: f64, tolerance: f64) -> bool {
+    if loss == 0.0 {
+        previous_loss == 0.0
+    } else {
+        (previous_loss - loss).abs() < tolerance * loss.abs()
+    }
+}
+
 pub trait KMeansAlgo<T: Num> {
     /// Recompute the membership of each vector.
     ///
@@ -336,7 +369,7 @@ pub trait KMeansAlgo<T: Num> {
         );
 
         let k = centroids.len() / dimension;
-        let mut cluster_radius = vec![0.0; k];
+        let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
         for (cluster_id, dist) in membership.iter().zip(dists.iter()) {
             if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
@@ -345,6 +378,11 @@ pub trait KMeansAlgo<T: Num> {
                 losses[cluster_id] += *dist as f64;
             }
         }
+        cluster_radius.iter_mut().for_each(|radius| {
+            if *radius == f32::NEG_INFINITY {
+                *radius = 0.0;
+            }
+        });
 
         (membership, cluster_radius, losses)
     }
@@ -632,12 +670,14 @@ where
 
         split_clusters(cluster_sizes, &mut centroids, dimension);
 
-        KMeans {
+        let mut model = KMeans {
             centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
             dimension,
             distance_type,
             loss,
-        }
+        };
+        model.normalize_dot_centroids();
+        model
     }
 }
 
@@ -818,6 +858,24 @@ pub struct KMeans {
 }
 
 impl KMeans {
+    fn normalize_dot_centroids(&mut self) {
+        if self.distance_type != DistanceType::Dot {
+            return;
+        }
+        self.centroids = match self.centroids.data_type() {
+            DataType::Float16 => {
+                normalize_centroids(self.centroids.as_primitive::<Float16Type>(), self.dimension)
+            }
+            DataType::Float32 => {
+                normalize_centroids(self.centroids.as_primitive::<Float32Type>(), self.dimension)
+            }
+            DataType::Float64 => {
+                normalize_centroids(self.centroids.as_primitive::<Float64Type>(), self.dimension)
+            }
+            _ => self.centroids.clone(),
+        };
+    }
+
     fn empty(dimension: usize, distance_type: DistanceType) -> Self {
         Self {
             centroids: arrow_array::array::new_empty_array(&DataType::Float32),
@@ -881,7 +939,7 @@ impl KMeans {
     ) -> arrow::error::Result<KMeansMembershipAndLoss> {
         let (membership, distances) = self.compute_membership_and_distances(data)?;
         let k = self.centroids.len() / self.dimension;
-        let mut cluster_radius: Vec<f32> = vec![0.0_f32; k];
+        let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
         for (cluster_id, dist) in membership.iter().zip(distances.iter()) {
             if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
@@ -890,6 +948,11 @@ impl KMeans {
                 losses[cluster_id] += *dist as f64;
             }
         }
+        cluster_radius.iter_mut().for_each(|radius| {
+            if *radius == f32::NEG_INFINITY {
+                *radius = 0.0;
+            }
+        });
         Ok((membership, cluster_radius, losses))
     }
 
@@ -1037,6 +1100,9 @@ impl KMeans {
                 ),
             };
 
+            // Random samples and caller-provided training seeds may have
+            // different norms; constrain them before the first assignment.
+            kmeans.normalize_dot_centroids();
             let mut loss = f64::MAX;
             for i in 1..=params.max_iters {
                 if let Some(cb) = &params.on_progress {
@@ -1080,15 +1146,17 @@ impl KMeans {
                     params.distance_type,
                     last_loss,
                 );
-                if (loss - last_loss).abs() < params.tolerance * last_loss {
+                // Keep `last_loss` as the scale reference to preserve the legacy
+                // convergence threshold.
+                if kmeans_has_converged(loss, last_loss, params.tolerance) {
+                    let relative_loss_diff = if last_loss == 0.0 {
+                        if loss == 0.0 { 0.0 } else { f64::INFINITY }
+                    } else {
+                        (loss - last_loss).abs() / last_loss.abs()
+                    };
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
-                        i,
-                        params.max_iters,
-                        redo,
-                        loss,
-                        last_loss,
-                        (loss - last_loss).abs() / last_loss
+                        i, params.max_iters, redo, loss, last_loss, relative_loss_diff
                     );
                     break;
                 }
@@ -1522,7 +1590,8 @@ impl KMeans {
 
     /// Train a [`KMeans`] model with full parameters.
     ///
-    /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
+    /// Dot training normalizes centroids, including initialization and
+    /// hierarchical leaves, while preserving the norms of the input vectors.
     pub fn new_with_params(
         data: &FixedSizeListArray,
         k: usize,
@@ -1959,7 +2028,7 @@ mod tests {
     use arrow_array::types::Float16Type;
     use half::f16;
     use lance_arrow::*;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
 
     use super::*;
     use lance_linalg::distance::dot_f16::amx_fp16_supported;
@@ -2000,6 +2069,140 @@ mod tests {
                     "dim={dim} k={k} nprobes={nprobes} picked different partitions"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_dot_normalizes_initial_centroids_before_assignment() {
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![10.0, 0.0, 1.0, 1.0]),
+            2,
+        )
+        .unwrap();
+        let params = KMeansParams {
+            init: KMeanInit::Incremental(Arc::new(data.clone())),
+            distance_type: DistanceType::Dot,
+            max_iters: 1,
+            ..Default::default()
+        };
+        let model = KMeans::new_with_params(&data, 2, &params).unwrap();
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+        assert_eq!(&centroids[..2], &[1.0, 0.0]);
+        for value in &centroids[2..] {
+            assert!((value - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        }
+        assert_eq!(
+            model.compute_membership_and_loss(&data).unwrap().0,
+            vec![Some(0), Some(1)]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(DataType::Float16, 2e-3, 1.0)]
+    #[case(DataType::Float32, 1e-6, 1.0)]
+    #[case(DataType::Float64, 1e-12, 1.0)]
+    #[case(DataType::Float64, 1e-12, 1e-50)]
+    fn test_dot_normalizes_means_without_normalizing_data(
+        #[case] data_type: DataType,
+        #[case] tolerance: f64,
+        #[case] scale: f64,
+    ) {
+        let values = arrow::compute::cast(
+            &arrow_array::Float64Array::from(vec![6.0 * scale, 0.0, 0.0, 2.0 * scale]),
+            &data_type,
+        )
+        .unwrap();
+        let data = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let model = KMeans::new_with_params(
+            &data,
+            1,
+            &KMeansParams {
+                distance_type: DistanceType::Dot,
+                max_iters: 1,
+                seed: Some(42),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let centroids = arrow::compute::cast(model.centroids.as_ref(), &DataType::Float64).unwrap();
+        let values = centroids.as_primitive::<Float64Type>().values();
+        // Preserve the input norms: normalizing the rows would instead yield
+        // equal centroid coordinates.
+        assert!((values[0] - 3.0 / 10.0f64.sqrt()).abs() < tolerance);
+        assert!((values[1] - 1.0 / 10.0f64.sqrt()).abs() < tolerance);
+    }
+
+    #[rstest::rstest]
+    #[case(vec![0.0, 0.0, 0.0, 0.0])]
+    #[case(vec![3.0, 4.0, -3.0, -4.0])]
+    fn test_dot_zero_cluster_sum_stays_finite(#[case] values: Vec<f32>) {
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 2).unwrap();
+        let model = KMeans::new_with_params(
+            &data,
+            1,
+            &KMeansParams {
+                distance_type: DistanceType::Dot,
+                max_iters: 2,
+                seed: Some(42),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            model
+                .centroids
+                .as_primitive::<Float32Type>()
+                .values()
+                .as_ref(),
+            &[0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn test_dot_normalizes_split_centroids() {
+        let model = KMeansAlgoFloat::<Float32Type>::to_kmeans(
+            &[3.0, 4.0, 3.0, 4.0],
+            2,
+            2,
+            &[Some(0), Some(0)],
+            &mut [2, 0],
+            DistanceType::Dot,
+            0.0,
+        );
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+        for centroid in centroids.as_chunks::<2>().0 {
+            assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
+        }
+        assert_ne!(&centroids[..2], &centroids[2..]);
+    }
+
+    #[test]
+    fn test_dot_hierarchical_centroids_are_normalized() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let values = (0..512 * 8)
+            .map(|_| rng.random_range(-3.0f32..3.0))
+            .collect::<Vec<_>>();
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 8).unwrap();
+        let model = KMeans::new_with_params(
+            &data,
+            257,
+            &KMeansParams {
+                distance_type: DistanceType::Dot,
+                max_iters: 2,
+                seed: Some(42),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(model.centroids.len(), 257 * 8);
+        for centroid in model
+            .centroids
+            .as_primitive::<Float32Type>()
+            .values()
+            .as_chunks::<8>()
+            .0
+        {
+            assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }
     }
 
@@ -2077,6 +2280,64 @@ mod tests {
         membership.iter().for_each(|cd| {
             assert!(cd.is_some());
         });
+    }
+
+    #[test]
+    fn test_dot_membership_preserves_negative_distances_and_radius() {
+        let centroids = Float32Array::from(vec![2.0, 1.0]);
+        let kmeans = KMeans::with_centroids(Arc::new(centroids), 1, DistanceType::Dot, f64::MAX);
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![2.0, 3.0]), 1).unwrap();
+
+        let (membership, radii, losses) = kmeans.compute_membership_and_loss(&data).unwrap();
+
+        assert_eq!(membership, vec![Some(0), Some(0)]);
+        assert_eq!(radii, vec![-3.0, 0.0]);
+        assert_eq!(losses, vec![-8.0, 0.0]);
+    }
+
+    #[test]
+    fn test_l2_membership_preserves_positive_radii() {
+        let centroids = Float32Array::from(vec![0.0, 10.0]);
+        let kmeans = KMeans::with_centroids(Arc::new(centroids), 1, DistanceType::L2, f64::MAX);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 12.0]), 1)
+            .unwrap();
+
+        let (membership, radii, losses) = kmeans.compute_membership_and_loss(&data).unwrap();
+
+        assert_eq!(membership, vec![Some(0), Some(1)]);
+        assert_eq!(radii, vec![1.0, 4.0]);
+        assert_eq!(losses, vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn test_convergence_scale_is_sign_independent() {
+        assert!(kmeans_has_converged(-10.0, -10.0005, 1e-4));
+        assert!(kmeans_has_converged(10.0, 10.0005, 1e-4));
+        assert!(!kmeans_has_converged(-10.0, -10.01, 1e-4));
+        assert!(!kmeans_has_converged(10.0, 10.01, 1e-4));
+        assert!(kmeans_has_converged(0.0, 0.0, 1e-4));
+        assert!(!kmeans_has_converged(1.0, 0.0, 1e-4));
+    }
+
+    #[test]
+    fn scaled_l2_does_not_stop_early() {
+        let scale = 1e-5_f32;
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..=100).map(|value| value as f32 * scale)),
+            1,
+        )
+        .unwrap();
+        let initial =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, scale]), 1)
+                .unwrap();
+        let params = KMeansParams::new(Some(Arc::new(initial)), 50, 1, DistanceType::L2);
+
+        let model = KMeans::new_with_params(&data, 2, &params).unwrap();
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+
+        assert!((centroids[0] - 24.5 * scale).abs() < 1e-7, "{centroids:?}");
+        assert!((centroids[1] - 75.0 * scale).abs() < 1e-7, "{centroids:?}");
     }
 
     #[tokio::test]
@@ -2670,7 +2931,13 @@ mod tests {
         // 80% of the vectors sit in one dense blob near the origin, the rest
         // spread over the unit cube, so a fixed fan-out would starve the blob
         // of centroids.
-        let mut values = generate_random_array(rows * dim).values().to_vec();
+        //
+        // Seeded so that tests asserting on seeded training see the same input
+        // every run: on about 1% of random inputs, exact reassignment leaves a
+        // hierarchical leaf without vectors when refinement is off.
+        let mut values = generate_random_array_with_seed::<Float32Type>(rows * dim, [42; 32])
+            .values()
+            .to_vec();
         for value in values.iter_mut().take(rows * 8 / 10 * dim) {
             *value *= 0.05;
         }

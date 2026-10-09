@@ -522,6 +522,22 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
+def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+    fragment = dataset.get_fragments()[0]
+    expression = pc.field("s") != "C:\\temp"
+
+    assert dataset.count_rows(filter=expression) == 2
+    assert fragment.count_rows(expression) == 1
+    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
+    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
+        "id"
+    ].to_pylist() == [0]
+
+
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
 def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     ds = write_dataset(
@@ -1616,3 +1632,42 @@ def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
     small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
     assert len(small_budget) > len(default_batches)
     assert pa.Table.from_batches(small_budget) == fragment.to_table()
+
+
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_merge_commits_staged_new_fragments(
+    tmp_path: Path, enable_stable_row_ids: bool
+):
+    # Regression test for https://github.com/lance-format/lance/issues/7702: a
+    # Merge that introduces staged fragments must assign fresh fragment ids
+    # and, on stable row id datasets, row ids at commit time.
+    tab = pa.table({"id": [1, 2, 3, 4], "v": [10, 20, 30, 40]})
+    ds = write_dataset(
+        tab,
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    new_frags = write_fragments(pa.table({"id": [5, 6], "v": [50, 60]}), tmp_path)
+    assert all(f.id == 0 for f in new_frags)
+
+    if enable_stable_row_ids:
+        pre = ds.to_table(with_row_id=True)
+        pre_row_ids = dict(zip(pre["id"].to_pylist(), pre["_rowid"].to_pylist()))
+
+    all_frags = [f.metadata for f in ds.get_fragments()] + list(new_frags)
+    merge = lance.LanceOperation.Merge(all_frags, ds.lance_schema)
+    ds = lance.LanceDataset.commit(tmp_path, merge, read_version=ds.version)
+
+    frag_ids = [f.fragment_id for f in ds.get_fragments()]
+    assert frag_ids == [0, 1, 2]
+    table = ds.to_table(with_row_id=True)
+    assert sorted(table["id"].to_pylist()) == [1, 2, 3, 4, 5, 6]
+    row_ids = table["_rowid"].to_pylist()
+    assert len(set(row_ids)) == 6
+    if enable_stable_row_ids:
+        assert sorted(row_ids) == list(range(6))
+        assert all(f.metadata.row_id_meta is not None for f in ds.get_fragments())
+        # Pre-existing rows keep their exact row ids through the merge.
+        post_row_ids = dict(zip(table["id"].to_pylist(), row_ids))
+        assert {i: post_row_ids[i] for i in pre_row_ids} == pre_row_ids

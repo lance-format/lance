@@ -1,0 +1,33 @@
+[package]
+name = "lance-jsonb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "JSONB binary encoding, parsing, and JSONPath evaluation for Lance"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+byteorder = { workspace = true }
+ethnum = "1.5.2"
+fast-float2 = "0.2.3"
+itoa = "1.0"
+jiff = "0.2.10"
+nom = "8.0.0"
+num-traits = { workspace = true }
+ordered-float = { version = "5.1.0", default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+zmij = "1.0"
+
+[dev-dependencies]
+goldenfile = "1.8"
+json-five = "0.3.0"
+proptest = { workspace = true }
+
+[lints]
+workspace = true

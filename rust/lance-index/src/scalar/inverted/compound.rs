@@ -25,7 +25,8 @@ use super::{
     index::{DocSet, InvertedPartition},
     prepare_bm25_query,
     query::{
-        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
+        try_collect_query_tokens,
     },
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
@@ -686,6 +687,7 @@ impl CompoundScorerPlan {
                     .map(|query| Self::from_query(query, num_leaves))
                     .collect::<Result<Vec<_>>>()?,
             }),
+            FtsQuery::CombinedFields(_) => Err(combined_fields_unsupported()),
         }
     }
 
@@ -3769,8 +3771,22 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
                 collect_leaf_queries(child, leaves)?;
             }
         }
+        FtsQuery::CombinedFields(_) => return Err(combined_fields_unsupported()),
     }
     Ok(())
+}
+
+/// A `combined_fields` node reaching the compound scorer is a planner bug.
+///
+/// Every leaf here draws its postings from one column's index and scores them
+/// with a `MemBM25Scorer`, whereas BM25F blends `tf'`/`dl'`/`docFreq'` across
+/// several columns before scoring. The planner keeps such trees out via
+/// `supports_compound_scorer`, so this is an explicit error.
+fn combined_fields_unsupported() -> Error {
+    Error::not_supported(
+        "the compound FTS scorer cannot score a combined_fields (BM25F) node: its statistics \
+         are blended across columns and do not fit the single-index leaf protocol",
+    )
 }
 
 struct PreparedLeaf {
@@ -3783,7 +3799,7 @@ pub(super) fn tokenize_leaf(
     index: &InvertedIndex,
     leaf: &LeafQuery,
     params: &FtsSearchParams,
-) -> Tokens {
+) -> Result<Tokens> {
     // Keep the legacy explicit-fuzzy rewrite independent of index analysis.
     // AUTO fuzziness still expands later, but its source terms must first use
     // the same normalization and filtering as the indexed vocabulary.
@@ -3798,7 +3814,7 @@ pub(super) fn tokenize_leaf(
     } else {
         index.tokenizer()
     };
-    collect_query_tokens(leaf.terms(), &mut tokenizer)
+    try_collect_query_tokens(leaf.terms(), &mut tokenizer)
 }
 
 async fn prepare_compound_query(
@@ -3831,7 +3847,7 @@ async fn prepare_compound_query(
     }
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
+        let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
         let prepared = match &prepared_match {
             Some(prepared) => prepared.clone(),
             None => Arc::new(

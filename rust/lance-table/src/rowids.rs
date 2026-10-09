@@ -18,6 +18,7 @@ use std::ops::{Range, RangeInclusive};
 mod bitmap;
 mod encoded_array;
 mod index;
+mod runs;
 pub mod segment;
 mod serde;
 pub mod version;
@@ -317,6 +318,25 @@ impl RowIdSequence {
         self.0.extend(other.0);
     }
 
+    /// Re-encode every segment that is smaller as a run of `Range` segments
+    /// than as it is stored now (see [`U64Segment::as_ranges`]). Returns
+    /// whether anything changed.
+    ///
+    /// The result is written as plain `Range` segments, which every reader
+    /// understands, but a reader without the compact in-memory form handles
+    /// thousands of segments per fragment slowly, so this is only called for
+    /// tables that opted in.
+    pub fn use_range_segments(&mut self) -> bool {
+        let mut changed = false;
+        for segment in &mut self.0 {
+            if let Some(ranges) = segment.as_ranges() {
+                *segment = ranges;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Remove a set of row ids from the sequence.
     pub fn delete(&mut self, row_ids: impl IntoIterator<Item = u64>) {
         // Order the row ids by position in which they appear in the sequence.
@@ -589,6 +609,14 @@ impl RowIdSequence {
     pub fn mask_to_offset_ranges(&self, mask: &RowAddrMask) -> Vec<Range<u64>> {
         let mut offset = 0;
         let mut ranges = Vec::new();
+        let finite_allow_list = mask
+            .allow_list()
+            .and_then(|allow_list| allow_list.len().map(|len| (allow_list, len)));
+        // Bitmap segment count/span and the shared selection below are
+        // computed lazily on the first bitmap segment: masks and sequences
+        // that never reach the per-id path pay nothing extra.
+        let mut bitmap_info: Option<(u64, u64)> = None;
+        let mut shared_cache: Option<Option<Vec<u64>>> = None;
         for segment in &self.0 {
             match segment {
                 U64Segment::Range(range) => {
@@ -645,6 +673,71 @@ impl RowIdSequence {
                     })));
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
+                    // When the mask is a finite allow-list, walk the selected
+                    // ids directly instead of materializing the whole range.
+                    // `row_addrs()` yields addresses in sorted order, so bitmap
+                    // prefix counts accumulate incrementally. Per-id work grows
+                    // with the selection size while the range path grows with
+                    // the bitmap span, so selections broader than the span keep
+                    // the old range-based path below (a heuristic holding each
+                    // call near the old cost), as do masks without finite
+                    // cardinality (e.g. full-fragment markers).
+                    if let Some((allow_list, num_selected)) = finite_allow_list {
+                        // Count/span computed once, on first use, so masks and
+                        // sequences that never take this path pay nothing extra.
+                        let (bitmap_segments, bitmap_span) =
+                            *bitmap_info.get_or_insert_with(|| {
+                                let mut info = (0u64, 0u64);
+                                for segment in &self.0 {
+                                    if let U64Segment::RangeWithBitmap { range, .. } = segment {
+                                        info.0 += 1;
+                                        info.1 += range.end - range.start;
+                                    }
+                                }
+                                info
+                            });
+                        if num_selected <= bitmap_span {
+                            // Rescanning the whole selection in every bitmap
+                            // segment would cost O(segments x selected). With
+                            // more than one bitmap segment, the sorted selection
+                            // is materialized once so each segment only visits
+                            // its own id range (binary search); a single bitmap
+                            // segment streams the selection directly with no copy.
+                            let offset_start = offset;
+                            if bitmap_segments > 1 {
+                                let cached = shared_cache.get_or_insert_with(|| {
+                                    allow_list
+                                        .row_addrs()
+                                        .map(|selected| selected.map(u64::from).collect())
+                                });
+                                if let Some(ids) = cached {
+                                    offset += bitmap.count_ones() as u64;
+                                    let start = ids.partition_point(|id| *id < range.start);
+                                    let end = ids.partition_point(|id| *id < range.end);
+                                    ranges.extend(bitmap_selected_offsets(
+                                        ids[start..end].iter().copied(),
+                                        range,
+                                        bitmap,
+                                        offset_start,
+                                    ));
+                                    continue;
+                                }
+                            } else if let Some(selected) = allow_list.row_addrs() {
+                                offset += bitmap.count_ones() as u64;
+                                let in_range = selected.filter_map(|address| {
+                                    let row_id = u64::from(address);
+                                    range.contains(&row_id).then_some(row_id)
+                                });
+                                ranges.extend(bitmap_selected_offsets(
+                                    in_range,
+                                    range,
+                                    bitmap,
+                                    offset_start,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                     let mut ids = RowAddrTreeMap::from(range.clone());
                     let offset_start = offset;
                     offset += range.end - range.start;
@@ -666,6 +759,24 @@ impl RowIdSequence {
                             bitmap_iter_pos += 1;
                         }
                         offset_start + position_in_range - holes_passed
+                    })));
+                }
+                U64Segment::Ranges { range, runs } => {
+                    let offset_start = offset;
+                    offset += runs.present_len() as u64;
+                    let mut ids = RowAddrTreeMap::new();
+                    for present in runs.present_ranges() {
+                        ids.insert_range(
+                            (range.start + present.start as u64)
+                                ..(range.start + present.end as u64),
+                        );
+                    }
+                    ids.mask(mask);
+                    ranges.extend(GroupingIterator::new(ids.into_addr_iter().map(|addr| {
+                        let position = runs
+                            .position((addr - range.start) as u32)
+                            .expect("addresses were inserted from the present ranges");
+                        offset_start + position as u64
                     })));
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
@@ -726,6 +837,31 @@ impl<I: Iterator<Item = u64>> Iterator for GroupingIterator<I> {
     }
 }
 
+/// Offsets of sorted `ids` (all within `range`) via incremental bitmap
+/// prefix counts, grouped into ranges. Every id is visited once; the bitmap
+/// slice between consecutive ids is popcounted exactly once overall.
+fn bitmap_selected_offsets(
+    ids: impl Iterator<Item = u64>,
+    range: &Range<u64>,
+    bitmap: &bitmap::Bitmap,
+    offset_start: u64,
+) -> Vec<Range<u64>> {
+    let mut previous_position = 0;
+    let mut live_before = 0;
+    let selected_offsets = ids.filter_map(|row_id| {
+        let position = (row_id - range.start) as usize;
+        if !bitmap.get(position) {
+            return None;
+        }
+        live_before += bitmap
+            .slice(previous_position, position - previous_position)
+            .count_ones();
+        previous_position = position;
+        Some(offset_start + live_before as u64)
+    });
+    GroupingIterator::new(selected_offsets).collect()
+}
+
 impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
@@ -747,6 +883,14 @@ impl From<&RowIdSequence> for RowAddrTreeMap {
                     seg.insert_range(range.clone());
                     for hole in holes.iter() {
                         seg.remove(hole);
+                    }
+                }
+                U64Segment::Ranges { range, runs } => {
+                    for present in runs.present_ranges() {
+                        seg.insert_range(
+                            (range.start + present.start as u64)
+                                ..(range.start + present.end as u64),
+                        );
                     }
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
@@ -1658,6 +1802,41 @@ mod test {
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![0..2]);
 
+        // Sparse selections across bitmap bytes must count earlier live ids,
+        // skip holes, and include the preceding segment's offset.
+        let mut bitmap = Bitmap::new_full(1_024);
+        for hole in [3, 7, 64, 1_000] {
+            bitmap.clear(hole);
+        }
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithBitmap {
+                range: 1_000..2_024,
+                bitmap,
+            },
+        ]);
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[
+            999, 1_002, 1_003, 1_063, 1_064, 1_065, 2_000, 2_023, 2_024,
+        ]));
+        assert_eq!(
+            sequence.mask_to_offset_ranges(&mask),
+            vec![7..8, 66..68, 1_024..1_025]
+        );
+        assert!(
+            sequence
+                .mask_to_offset_ranges(&RowAddrMask::allow_nothing())
+                .is_empty()
+        );
+        let missing = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[999, 2_024]));
+        assert!(sequence.mask_to_offset_ranges(&missing).is_empty());
+
+        // A full-fragment allow-list has no finite cardinality and uses the
+        // range-based path.
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(0);
+        let mask = RowAddrMask::from_allowed(full_fragment);
+        assert_eq!(sequence.mask_to_offset_ranges(&mask), vec![0..5, 5..1_025]);
+
         // Test with a sorted array segment
         let sequence = RowIdSequence(vec![U64Segment::SortedArray(vec![0, 2, 4, 6, 8].into())]);
         let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 6, 8]));
@@ -1696,6 +1875,245 @@ mod test {
         let mask = RowAddrMask::allow_nothing();
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![]);
+    }
+
+    /// Brute-force oracle for `mask_to_offset_ranges`: expand every live id
+    /// in order and keep the offsets selected by the mask. It shares no logic
+    /// with the optimized paths, so agreement proves semantic equivalence.
+    /// Like the implementation, offsets are grouped per segment, so ranges
+    /// adjacent across a segment boundary stay split (e.g. `0..5, 5..1025`).
+    fn oracle_mask_to_offset_ranges(
+        sequence: &RowIdSequence,
+        mask: &RowAddrMask,
+    ) -> Vec<Range<u64>> {
+        let mut ranges = Vec::new();
+        let mut offset = 0u64;
+        for segment in &sequence.0 {
+            let selected = segment
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row_id)| mask.selected(row_id).then_some(offset + i as u64));
+            ranges.extend(GroupingIterator::new(selected));
+            offset += segment.len() as u64;
+        }
+        ranges
+    }
+
+    /// Deterministic xorshift64* generator; keeps randomized tests free of new
+    /// dev-dependencies.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0.max(1);
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            debug_assert!(bound > 0);
+            self.next() % bound
+        }
+    }
+
+    /// Random multi-segment sequence over disjoint id ranges. Returns the
+    /// sequence, every hole id (in-span but absent), and the first id past
+    /// the end, for mask generation.
+    fn random_sequence(rng: &mut TestRng) -> (RowIdSequence, Vec<u64>, u64) {
+        let mut segments = Vec::new();
+        let mut holes = Vec::new();
+        let mut cursor = rng.below(1_000);
+        for _ in 0..(1 + rng.below(4)) {
+            match rng.below(5) {
+                // Contiguous range.
+                0 => {
+                    let span = 1 + rng.below(300);
+                    segments.push(U64Segment::Range(cursor..cursor + span));
+                    cursor += span;
+                }
+                // Bitmap with 10%-90% holes; first slot stays live so the
+                // segment is never empty.
+                1 | 2 => {
+                    let span = (50 + rng.below(1_950)) as usize;
+                    let hole_pct = 10 + rng.below(81);
+                    let present: Vec<bool> = (0..span)
+                        .map(|i| i == 0 || rng.next() % 100 >= hole_pct)
+                        .collect();
+                    for (i, live) in present.iter().enumerate() {
+                        if !live {
+                            holes.push(cursor + i as u64);
+                        }
+                    }
+                    segments.push(U64Segment::RangeWithBitmap {
+                        range: cursor..cursor + span as u64,
+                        bitmap: present.as_slice().into(),
+                    });
+                    cursor += span as u64;
+                }
+                // Range with a few holes.
+                3 => {
+                    let span = 20 + rng.below(180);
+                    let mut hole_ids: Vec<u64> = (0..1 + rng.below(5).min(span - 1))
+                        .map(|_| cursor + rng.below(span))
+                        .collect();
+                    hole_ids.sort_unstable();
+                    hole_ids.dedup();
+                    if hole_ids.len() as u64 == span {
+                        hole_ids.pop();
+                    }
+                    holes.extend(hole_ids.clone());
+                    segments.push(U64Segment::RangeWithHoles {
+                        range: cursor..cursor + span,
+                        holes: hole_ids.into(),
+                    });
+                    cursor += span;
+                }
+                // Sorted or unsorted array of a few ids.
+                _ => {
+                    let count = 1 + rng.below(8);
+                    let span = count * 3 + 1;
+                    let mut ids: Vec<u64> = (0..count).map(|_| cursor + rng.below(span)).collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    if rng.below(2) == 0 {
+                        // Fisher-Yates shuffle for the unsorted encoding.
+                        for i in (1..ids.len()).rev() {
+                            ids.swap(i, rng.below(i as u64 + 1) as usize);
+                        }
+                        segments.push(U64Segment::Array(ids.into()));
+                    } else {
+                        segments.push(U64Segment::SortedArray(ids.into()));
+                    }
+                    cursor += span;
+                }
+            }
+        }
+        (RowIdSequence(segments), holes, cursor)
+    }
+
+    /// Random allow-list mixing live ids, hole ids, and ids outside every
+    /// segment.
+    fn random_allow_mask(
+        rng: &mut TestRng,
+        live: &[u64],
+        holes: &[u64],
+        past_end: u64,
+        count: usize,
+    ) -> RowAddrMask {
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            match rng.below(10) {
+                0..=5 => ids.push(live[rng.below(live.len() as u64) as usize]),
+                6..=7 if !holes.is_empty() => {
+                    ids.push(holes[rng.below(holes.len() as u64) as usize])
+                }
+                8 if live[0] > 0 => ids.push(live[0] - 1 - rng.below(live[0].min(500))),
+                _ => ids.push(past_end + rng.below(500)),
+            }
+        }
+        RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(ids.as_slice()))
+    }
+
+    #[test]
+    fn test_mask_to_offset_ranges_matches_brute_force() {
+        for seed in 0..50u64 {
+            let mut rng = TestRng(seed);
+            let (sequence, holes, past_end) = random_sequence(&mut rng);
+            let live: Vec<u64> = sequence.iter().collect();
+            assert!(!live.is_empty(), "seed {seed} generated no live ids");
+
+            let blocked: Vec<u64> = (0..30.min(live.len()))
+                .map(|_| live[rng.below(live.len() as u64) as usize])
+                .collect();
+            let mut masks = vec![
+                RowAddrMask::allow_nothing(),
+                RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(live.as_slice())),
+                RowAddrMask::default(),
+                RowAddrMask::from_block(RowAddrTreeMap::new()),
+                RowAddrMask::from_block(RowAddrTreeMap::from_iter(blocked.as_slice())),
+            ];
+            for _ in 0..3 {
+                let count = 1 + rng.below(20) as usize;
+                masks.push(random_allow_mask(&mut rng, &live, &holes, past_end, count));
+            }
+            let medium = live.len().clamp(1, 1_000);
+            masks.push(random_allow_mask(&mut rng, &live, &holes, past_end, medium));
+            // Broader than the bitmap span: keeps the old range-based path.
+            let min_live = live.iter().min().copied().unwrap_or(0);
+            let cover = past_end.saturating_sub(min_live).max(1);
+            let mut broad: Vec<u64> = live.clone();
+            broad.extend(past_end..past_end + 2 * cover + 50);
+            masks.push(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                broad.as_slice(),
+            )));
+            // Only missing ids: holes plus ids outside every segment.
+            if holes.is_empty() {
+                let beyond: Vec<u64> = (0..50).map(|i| past_end + i).collect();
+                masks.push(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                    beyond.as_slice(),
+                )));
+            } else {
+                masks.push(random_allow_mask(&mut rng, &holes, &holes, past_end, 50));
+            }
+
+            for (i, mask) in masks.iter().enumerate() {
+                assert_eq!(
+                    sequence.mask_to_offset_ranges(mask),
+                    oracle_mask_to_offset_ranges(&sequence, mask),
+                    "seed {seed} mask {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mask_to_offset_ranges_multiple_bitmap_segments() {
+        // Live ids and their offsets:
+        // seg0 Range(0..5):                0..5      -> offsets 0..5
+        // seg1 bitmap 100..110, holes
+        //   102, 107: 100,101,103,104,105,106,108,109 -> offsets 5..13
+        // seg2 bitmap 200..205, hole 200: 201,202,203,204 -> offsets 13..17
+        let bitmap_a: Vec<bool> = (0..10).map(|i| i != 2 && i != 7).collect();
+        let bitmap_b: Vec<bool> = (0..5).map(|i| i != 0).collect();
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithBitmap {
+                range: 100..110,
+                bitmap: bitmap_a.as_slice().into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 200..205,
+                bitmap: bitmap_b.as_slice().into(),
+            },
+        ]);
+        // Hits in every segment plus hole ids (102, 107, 200) and ids
+        // outside every segment (50, 1_000).
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[
+            0, 4, 100, 103, 109, 201, 204, 102, 107, 200, 50, 1_000,
+        ]));
+        let ranges = sequence.mask_to_offset_ranges(&mask);
+        // Offsets 0, 4, 5, 7, 12, 13, 16. Ranges stay split at the segment
+        // boundaries (4..5 vs 5..6, 12..13 vs 13..14), matching the old path.
+        assert_eq!(ranges, vec![0..1, 4..5, 5..6, 7..8, 12..13, 13..14, 16..17]);
+        assert_eq!(ranges, oracle_mask_to_offset_ranges(&sequence, &mask));
+        // A mask with no live ids selects nothing even across segments.
+        let missing = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[102, 200, 50, 1_000]));
+        assert!(sequence.mask_to_offset_ranges(&missing).is_empty());
+
+        // A selection broader than the bitmap span (17 live + 100 beyond
+        // every segment) keeps the old range-based path; results must match.
+        let mut broad: Vec<u64> = (0..5).collect();
+        broad.extend((100..110).filter(|id| *id != 102 && *id != 107));
+        broad.extend(201..205);
+        broad.extend(10_000..10_100);
+        let broad_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(broad.as_slice()));
+        assert_eq!(
+            sequence.mask_to_offset_ranges(&broad_mask),
+            oracle_mask_to_offset_ranges(&sequence, &broad_mask)
+        );
     }
 
     #[test]
@@ -1828,5 +2246,64 @@ mod test {
         let r = seq.row_id_range().unwrap();
         assert_eq!(*r.start(), 0);
         assert_eq!(*r.end(), 104);
+    }
+
+    #[test]
+    fn test_range_segments_sequence_matches_bitmap_sequence() {
+        let live: Vec<u64> = (0..600u64)
+            .filter(|v| !(50..250).contains(v) && !(300..310).contains(v))
+            .collect();
+        let bitmap_sequence = RowIdSequence::from(live.as_slice());
+        assert!(matches!(
+            bitmap_sequence.0.as_slice(),
+            [U64Segment::RangeWithBitmap { .. }]
+        ));
+        let mut runs_sequence = bitmap_sequence.clone();
+        assert!(runs_sequence.use_range_segments());
+        assert!(matches!(
+            runs_sequence.0.as_slice(),
+            [U64Segment::Ranges { .. }]
+        ));
+        // Idempotent: a second pass has nothing left to convert.
+        let again = runs_sequence.clone();
+        assert!(!runs_sequence.use_range_segments());
+        assert_eq!(runs_sequence, again);
+
+        assert_eq!(runs_sequence.iter().collect::<Vec<_>>(), live);
+        assert_eq!(runs_sequence.len(), bitmap_sequence.len());
+        let mut cursor = runs_sequence.cursor();
+        let mut chunked = Vec::new();
+        for start in (0..live.len()).step_by(37) {
+            let end = (start + 37).min(live.len());
+            chunked.extend(runs_sequence.select_range_with_cursor(&mut cursor, start..end));
+        }
+        assert_eq!(chunked, live);
+        let picks = [0usize, 5, 49, 50, 300];
+        assert_eq!(
+            runs_sequence
+                .select(picks.iter().copied())
+                .collect::<Vec<_>>(),
+            bitmap_sequence
+                .select(picks.iter().copied())
+                .collect::<Vec<_>>()
+        );
+
+        for mask in [
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 49, 50, 100, 250, 251, 599])),
+            RowAddrMask::from_block(RowAddrTreeMap::from_iter(&[0, 250, 305, 599])),
+        ] {
+            assert_eq!(
+                runs_sequence.mask_to_offset_ranges(&mask),
+                bitmap_sequence.mask_to_offset_ranges(&mask)
+            );
+        }
+        assert_eq!(
+            RowAddrTreeMap::from(&runs_sequence),
+            RowAddrTreeMap::from(&bitmap_sequence)
+        );
+        assert_eq!(
+            read_row_ids(write_row_ids(&runs_sequence).as_slice()).unwrap(),
+            runs_sequence
+        );
     }
 }

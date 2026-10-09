@@ -22,11 +22,13 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
+use lance_arrow::RecordBatchExt;
 use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
+use crate::dataset::blob::prepared_blob_batch_to_descriptors;
 use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
@@ -34,11 +36,13 @@ use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::reconcile::relabel_to;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -108,6 +112,22 @@ pub struct LsmPointLookupPlanner {
     /// Prefix of the in-memory memtables this planner reads. Applies to the fast
     /// BTree probe and the plan fallback alike, so both resolve a key the same.
     visibility: MemTableVisibility,
+    /// `base_schema` with each field's id, which is what resolves a sealed
+    /// generation's columns to the table's. Defaults to `base_schema`, which
+    /// carries them when the caller built it from a Lance schema.
+    identity_schema: SchemaRef,
+    /// Whether every in-memory memtable uses the table's current schema. The
+    /// fast paths read columns by the table's names, so if any memtable was
+    /// created before a schema change, lookups take the slower plan path.
+    in_memory_matches_table: bool,
+}
+
+/// Whether every in-memory memtable `collector` holds matches `table_schema`.
+fn in_memory_matches_table(collector: &LsmDataSourceCollector, table_schema: &Schema) -> bool {
+    collector
+        .in_memory_refs_newest_first()
+        .iter()
+        .all(|m| memtable_matches_table(&m.schema, table_schema))
 }
 
 impl LsmPointLookupPlanner {
@@ -122,12 +142,13 @@ impl LsmPointLookupPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
-    ) -> Self {
-        let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false);
-        Self {
+    ) -> Result<Self> {
+        let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false)?;
+        let in_memory_matches_table = in_memory_matches_table(&collector, &base_schema);
+        Ok(Self {
             collector,
             pk_columns,
-            base_schema,
+            base_schema: Arc::clone(&base_schema),
             bloom_filters: std::collections::HashMap::new(),
             session: None,
             store_params: None,
@@ -136,7 +157,16 @@ impl LsmPointLookupPlanner {
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
             visibility: MemTableVisibility::Published,
-        }
+            identity_schema: base_schema,
+            in_memory_matches_table,
+        })
+    }
+
+    /// Supply the table's field ids, when `base_schema` was built without them.
+    pub fn with_identity_schema(mut self, identity_schema: SchemaRef) -> Self {
+        self.in_memory_matches_table = in_memory_matches_table(&self.collector, &identity_schema);
+        self.identity_schema = identity_schema;
+        self
     }
 
     /// Read the in-memory memtables at `visibility`. See
@@ -217,8 +247,12 @@ impl LsmPointLookupPlanner {
             // fall through to an older arm — resurrecting the deleted row. Then
             // the carried `_tombstone` column is projected away.
             Some(coalesced) => {
-                let canonical =
-                    canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+                let canonical = canonical_output_schema(
+                    projection,
+                    &self.base_schema,
+                    &self.pk_columns,
+                    false,
+                )?;
                 filter_tombstones_after_coalesce(coalesced, &canonical)
             }
             None => self.empty_plan(projection),
@@ -262,9 +296,13 @@ impl LsmPointLookupPlanner {
         for source in sources {
             let generation = source.generation().as_u64();
 
-            let scan = self
-                .build_source_scan(&source, projection, &filter_expr)
-                .await?;
+            // Type-erased, not merely boxed: the `Send` proof recurses
+            // through a boxed future's concrete type but stops at a trait
+            // object. An arm resolves a generation's schema before it
+            // scans, which nests deeply enough to need that.
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                Box::pin(self.build_source_scan(&source, projection, &filter_expr));
+            let scan = arm.await?;
 
             // Data is stored in reverse order, so first match is newest
             let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(scan, 0, Some(1)));
@@ -331,7 +369,7 @@ impl LsmPointLookupPlanner {
         projection: Option<&[String]>,
     ) -> Result<RecordBatch> {
         let canonical =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         let target = carry_schema(&canonical, &self.pk_columns);
         let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
         for key in keys {
@@ -373,7 +411,8 @@ impl LsmPointLookupPlanner {
         // requirement avoids the `OrderableScalarValue` panic on comparing
         // mismatched variants — the plan path coerces, so a coercible-but-
         // different literal (e.g. `Int64` for an `Int32` PK) falls back.
-        let fast_eligible = pk_values.len() == 1
+        let fast_eligible = self.in_memory_matches_table
+            && pk_values.len() == 1
             && self.pk_columns.len() == 1
             && self
                 .base_schema
@@ -394,7 +433,7 @@ impl LsmPointLookupPlanner {
                         &self.base_schema,
                         &self.pk_columns,
                         false,
-                    );
+                    )?;
                     &projected
                 }
             };
@@ -407,7 +446,6 @@ impl LsmPointLookupPlanner {
                         match probe_memtable(
                             &m.batch_store,
                             &m.index_store,
-                            &self.pk_columns[0],
                             &pk_values[0],
                             target,
                             self.visibility,
@@ -473,7 +511,7 @@ impl LsmPointLookupPlanner {
         let target = match projection {
             None => self.none_target.clone(),
             Some(_) => {
-                canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)
+                canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?
             }
         };
         if keys.is_empty() {
@@ -498,7 +536,8 @@ impl LsmPointLookupPlanner {
             .first()
             .and_then(|c| self.base_schema.field_with_name(c).ok())
             .map(|f| f.data_type().clone());
-        let fast_eligible = self.pk_columns.len() == 1
+        let fast_eligible = self.in_memory_matches_table
+            && self.pk_columns.len() == 1
             && !target.fields().iter().any(|f| is_system_column(f.name()))
             && pk_type
                 .as_ref()
@@ -510,7 +549,6 @@ impl LsmPointLookupPlanner {
                 .await;
         }
 
-        let pk_col = &self.pk_columns[0];
         let refs = self.collector.in_memory_refs_newest_first();
         // Hits grouped by (memtable index, batch index) so each source batch is
         // gathered with a single `take`.
@@ -519,8 +557,7 @@ impl LsmPointLookupPlanner {
         for key in keys {
             let mut resolved = false;
             for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key, self.visibility)?
-                {
+                match probe_position(&m.batch_store, &m.index_store, key, self.visibility)? {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -609,7 +646,7 @@ impl LsmPointLookupPlanner {
                     &self.base_schema,
                     &self.pk_columns,
                     false,
-                )),
+                )?),
             }
         } else {
             self.lookup_many(keys, projection).await?
@@ -651,13 +688,16 @@ impl LsmPointLookupPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let cols = build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
         let target =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         let want_row_id = wants_row_id(projection);
         let want_row_addr = wants_row_address(projection);
         let scan: Arc<dyn ExecutionPlan> = match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 // Only the base produces row IDs callers can use against the
                 // dataset (e.g. `take_rows`); non-base arms NULL via canonical.
                 if want_row_id {
@@ -671,7 +711,10 @@ impl LsmPointLookupPlanner {
                 // rustc's depth limit up this point-lookup chain, and boxing inside
                 // `create_plan` instead triggers a `Box<Future>: Send` solver overflow
                 // (E0275 downstream). Same for the other arms below.
-                Box::pin(scanner.create_plan()).await?
+                let scan = Box::pin(scanner.create_plan()).await?;
+                // The source schema narrows a struct in declaration order, the
+                // canonical one in selection order; cast the children by name.
+                project_to_canonical(scan, &target)?
             }
             LsmDataSource::SsTable { path, .. } => {
                 let dataset = open_sstable(
@@ -683,13 +726,36 @@ impl LsmPointLookupPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                // Carry `_tombstone` through so the post-coalesce filter can drop
-                // a deleted key (gen written before deletes existed lack it →
-                // `project_to_carry` synthesizes `false`).
+                // A sealed generation holds the names the table had when it was
+                // sealed, so the projection, the key filter and the output all
+                // go through the same resolution the scanner uses.
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.filter_expr(filter.clone());
-                Box::pin(scanner.create_plan()).await?
+                let generation = GenerationRead::new(
+                    dataset.schema(),
+                    &self.identity_schema,
+                    &self.pk_columns,
+                    cols,
+                );
+                // Every generation stores every primary key column — a key
+                // cannot be added or dropped — so the key filter always moves.
+                let stored_filter = generation.to_stored(filter).ok_or_else(|| {
+                    lance_core::Error::internal(format!(
+                        "point lookup: `{filter}` names a column generation {} does not store",
+                        source.generation()
+                    ))
+                })?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(
+                    &dataset.schema().project(&generation.stored_projection())?,
+                )?;
+                scanner.filter_expr(stored_filter);
+                let scan = Box::pin(scanner.create_plan()).await?;
+                // `_tombstone` is carried through so the post-coalesce filter
+                // can drop a deleted key; a generation written before deletes
+                // existed lacks it and `project_to_carry` synthesizes `false`.
+                generation.reconcile(scan)?
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -708,8 +774,33 @@ impl LsmPointLookupPlanner {
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.filter_expr(filter.clone());
+                // A memtable created before a schema change still uses the old
+                // column names, so read it like a flushed generation of that age.
+                let generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                match &generation {
+                    None => {
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                        scanner.filter_expr(filter.clone());
+                    }
+                    Some(generation) => {
+                        let stored_filter = generation.to_stored(filter).ok_or_else(|| {
+                            lance_core::Error::internal(format!(
+                                "point lookup: `{filter}` names a column memtable {} does not store",
+                                source.generation()
+                            ))
+                        })?;
+                        scanner.project(&generation.stored_projection())?;
+                        scanner.filter_expr(stored_filter);
+                    }
+                }
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
                 // insert order) so we can pick the most recently inserted
                 // duplicate below. Without this, a `FilterExec → LIMIT 1`
@@ -717,6 +808,11 @@ impl LsmPointLookupPlanner {
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
                 let raw = Box::pin(scanner.create_plan()).await?;
+                // `_rowid` is not a table column; it passes through unchanged.
+                let raw = match &generation {
+                    None => raw,
+                    Some(generation) => generation.reconcile(raw)?,
+                };
                 // The filter already restricts to the exact PK value, so the
                 // scan yields that key's insert history. Within the active
                 // memtable larger `_rowid` = newer insert, so sorting `_rowid`
@@ -753,7 +849,7 @@ impl LsmPointLookupPlanner {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let schema =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }
@@ -904,13 +1000,12 @@ enum ProbePos {
 }
 
 /// Resolve the `(batch_idx, row)` of a key's newest *visible* row in one
-/// in-memory memtable via a seek-and-stop on the ordered skiplist
-/// (`BTreeMemIndex::get_newest_visible`), honoring the MVCC watermark. No
+/// in-memory memtable with one seek on its primary-key index
+/// ([`IndexStore::pk_newest_visible`]), honoring the MVCC watermark. No
 /// materialization.
 fn probe_position(
     batch_store: &BatchStore,
     index_store: &IndexStore,
-    pk_column: &str,
     pk_value: &ScalarValue,
     visibility: MemTableVisibility,
 ) -> Result<ProbePos> {
@@ -936,14 +1031,13 @@ fn probe_position(
     }
     let max_visible_row = visible_end - 1;
 
-    // A single-column primary key always has a value-keyed BTree (reused or
-    // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
-    // seek yields the answer with no re-check. Absent only when the table has no
-    // PK index, where the caller falls back to the plan path.
-    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
+    // One seek on the primary-key index, no re-check; without one the caller
+    // plans instead.
+    if !index_store.has_pk_index() {
         return Ok(ProbePos::NoIndex);
-    };
-    let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
+    }
+    let Some(pos) = index_store.pk_newest_visible(std::slice::from_ref(pk_value), max_visible_row)
+    else {
         return Ok(ProbePos::Miss);
     };
     let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
@@ -979,6 +1073,11 @@ fn resolve_position(
 /// Gather `rows` from `batch_store`'s batch `batch_idx` into the `target`
 /// schema. A single row is a zero-copy `slice` (the common point-lookup case);
 /// multiple rows use one vectorized `take` per column.
+///
+/// Columns are stored whole, so a nested projection (`meta.a` -> `meta:
+/// Struct<a>`) leaves the gathered array wider than `target`. Those columns are
+/// narrowed with one `project_by_schema` pass; a projection that selects only
+/// whole columns matches the stored types and skips it.
 fn gather_rows(
     batch_store: &BatchStore,
     batch_idx: usize,
@@ -993,26 +1092,43 @@ fn gather_rows(
     // shared schema `Arc`, and under concurrency that refcount cache line
     // ping-pongs across cores. `schema_ref()` borrows it.
     let stored_schema = stored.data.schema_ref();
-    let cols: Vec<Arc<dyn Array>> = target
-        .fields()
+    let mut cols: Vec<Arc<dyn Array>> = Vec::with_capacity(target.fields().len());
+    let mut stored_fields: Vec<Arc<Field>> = Vec::with_capacity(target.fields().len());
+    let mut differs = false;
+    for f in target.fields() {
+        let idx = stored_schema.index_of(f.name()).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "point-lookup projection column '{}' not found in memtable batch",
+                f.name()
+            ))
+        })?;
+        let stored_field = &stored_schema.fields()[idx];
+        differs |= stored_field.data_type() != f.data_type();
+        stored_fields.push(stored_field.clone());
+        let col = stored.data.column(idx);
+        // Single row: zero-copy `slice` (the common point-lookup case, and
+        // measurably faster than `take` — copying regressed single-thread
+        // ~30% with no N-thread gain). Multiple rows: one vectorized `take`.
+        cols.push(match &indices {
+            None => col.slice(rows[0] as usize, 1),
+            Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)?,
+        });
+    }
+    if !differs {
+        return Ok(RecordBatch::try_new(target.clone(), cols)?);
+    }
+    // A stored column can differ from the target by the field ids the memtable
+    // keeps inside a nested type, by a narrower nested shape the caller asked
+    // for, or by both. Relabelling needs the two types to agree on their
+    // children, so the shape is settled first.
+    let gathered = RecordBatch::try_new(Arc::new(Schema::new(stored_fields)), cols)?;
+    let gathered = prepared_blob_batch_to_descriptors(&gathered)?;
+    let narrowed = gathered.project_by_schema(target)?;
+    let cols = narrowed
+        .columns()
         .iter()
-        .map(|f| {
-            let idx = stored_schema.index_of(f.name()).map_err(|_| {
-                lance_core::Error::invalid_input(format!(
-                    "point-lookup projection column '{}' not found in memtable batch",
-                    f.name()
-                ))
-            })?;
-            let col = stored.data.column(idx);
-            // Single row: zero-copy `slice` (the common point-lookup case, and
-            // measurably faster than `take` — copying regressed single-thread
-            // ~30% with no N-thread gain). Multiple rows: one vectorized `take`.
-            match &indices {
-                None => Ok(col.slice(rows[0] as usize, 1)),
-                Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)
-                    .map_err(lance_core::Error::from),
-            }
-        })
+        .zip(target.fields())
+        .map(|(col, f)| relabel_to(col, f.data_type()))
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(target.clone(), cols)?)
 }
@@ -1023,12 +1139,11 @@ fn gather_rows(
 fn probe_memtable(
     batch_store: &BatchStore,
     index_store: &IndexStore,
-    pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
     visibility: MemTableVisibility,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value, visibility)? {
+    match probe_position(batch_store, index_store, pk_value, visibility)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {
@@ -1051,6 +1166,7 @@ fn probe_memtable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::cast::AsArray;
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
@@ -1112,7 +1228,8 @@ mod tests {
         // Create collector without memtables
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         let pk_values = vec![ScalarValue::Int32(Some(2))];
         let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
@@ -1152,7 +1269,8 @@ mod tests {
         // Create collector
         let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot]);
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         let pk_values = vec![ScalarValue::Int32(Some(2))];
         let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
@@ -1187,6 +1305,7 @@ mod tests {
         bf.insert_hash(pk_hash);
 
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone())
+            .unwrap()
             .with_bloom_filter(1, Arc::new(bf));
 
         let pk_values = vec![ScalarValue::Int32(Some(2))];
@@ -1206,7 +1325,8 @@ mod tests {
 
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let pk_values = vec![ScalarValue::Int32(Some(42))];
         let expr = planner.build_pk_filter_expr(&pk_values).unwrap();
@@ -1242,7 +1362,8 @@ mod tests {
             .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         // id=3 lives in the SSTable
         let pk_values = vec![ScalarValue::Int32(Some(3))];
@@ -1288,7 +1409,8 @@ mod tests {
         let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
 
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         // User requests `_rowaddr` between `id` and `name`, plus `_rowoffset` at end.
         let projection = vec![
@@ -1355,7 +1477,8 @@ mod tests {
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let projection = vec![
             "id".to_string(),
@@ -1394,7 +1517,8 @@ mod tests {
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let projection = vec!["missing".to_string()];
         let pk_values = vec![ScalarValue::Int32(Some(2))];
@@ -1464,7 +1588,8 @@ mod tests {
                 },
             );
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let plan = planner
             .plan_lookup(&[ScalarValue::Int32(Some(1))], None)
@@ -1535,7 +1660,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         // `lookup` takes the fast probe path (single-column PK, no system cols).
         let hit = planner
@@ -1622,7 +1748,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
         let key = [ScalarValue::Int32(Some(1))];
 
         assert!(
@@ -1678,7 +1805,8 @@ mod tests {
             .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let plan = planner
             .plan_lookup(&[ScalarValue::Int32(Some(1))], None)
@@ -1764,7 +1892,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(20))], None)
@@ -1807,7 +1936,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(5))], None)
@@ -1838,7 +1968,8 @@ mod tests {
                 frozen: vec![],
             },
         );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         // In active only → fast-path hit.
         let row = planner
@@ -1886,7 +2017,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(20))], Some(&["name".to_string()]))
@@ -1904,6 +2036,161 @@ mod tests {
         assert_eq!(names, vec!["name", "id"]);
         assert_eq!(name_at(&row), "v_20");
         assert_eq!(id_at(&row), 20);
+    }
+
+    /// `id` (PK) + `meta: Struct<a: Int64, b: Utf8>`, one row per id.
+    fn create_nested_schema() -> Arc<ArrowSchema> {
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_metadata),
+            Field::new("meta", DataType::Struct(nested_meta_fields()), true),
+        ]))
+    }
+
+    fn nested_meta_fields() -> arrow_schema::Fields {
+        arrow_schema::Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ])
+    }
+
+    fn create_nested_batch(schema: &Arc<ArrowSchema>, ids: &[i32]) -> RecordBatch {
+        let a: Vec<i64> = ids.iter().map(|id| *id as i64 * 10).collect();
+        let b: Vec<String> = ids.iter().map(|id| format!("b_{}", id)).collect();
+        let meta = arrow_array::StructArray::new(
+            nested_meta_fields(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(a)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(b)) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids.to_vec())), Arc::new(meta)],
+        )
+        .unwrap()
+    }
+
+    fn nested_planner(schema: &Arc<ArrowSchema>, ids: &[i32]) -> LsmPointLookupPlanner {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let active = active_memtable_ref(schema, &[create_nested_batch(schema, ids)], 1);
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active,
+                    frozen: vec![],
+                },
+            );
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap()
+    }
+
+    /// The children `meta` carries in `batch`, in order.
+    fn meta_children(batch: &RecordBatch) -> Vec<String> {
+        let arrow_schema::DataType::Struct(fields) = batch
+            .schema()
+            .field_with_name("meta")
+            .unwrap()
+            .data_type()
+            .clone()
+        else {
+            panic!("meta is not a struct");
+        };
+        fields.iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// A nested projection narrows the canonical schema to `meta: Struct<a>`,
+    /// but the memtable stores `meta` whole. The fast-path gather has to narrow
+    /// the stored column to match — handing the whole `Struct<a, b>` to
+    /// `RecordBatch::try_new` against a `Struct<a>` schema is a type error.
+    #[tokio::test]
+    async fn test_lookup_nested_projection_narrows_struct() {
+        let schema = create_nested_schema();
+        let planner = nested_planner(&schema, &[1, 2]);
+
+        let row = planner
+            .lookup(
+                &[ScalarValue::Int32(Some(1))],
+                Some(&["meta.a".to_string()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let row_schema = row.schema();
+        let names: Vec<&str> = row_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["meta", "id"]);
+        assert_eq!(meta_children(&row), vec!["a"]);
+        assert_eq!(id_at(&row), 1);
+        let meta = row.column_by_name("meta").unwrap().as_struct();
+        assert_eq!(
+            meta.column_by_name("a")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    /// `lookup_many` reaches the same gather through the batched
+    /// group-by-source path, so it narrows identically.
+    #[tokio::test]
+    async fn test_lookup_many_nested_projection_narrows_struct() {
+        let schema = create_nested_schema();
+        let planner = nested_planner(&schema, &[1, 2]);
+
+        let batch = planner
+            .lookup_many(
+                &[ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(2))],
+                Some(&["meta.a".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(meta_children(&batch), vec!["a"]);
+        let a = batch
+            .column_by_name("meta")
+            .unwrap()
+            .as_struct()
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .clone();
+        let mut values: Vec<i64> = (0..batch.num_rows()).map(|i| a.value(i)).collect();
+        values.sort();
+        assert_eq!(values, vec![10, 20]);
+    }
+
+    /// Control for the two tests above: projecting the whole struct leaves the
+    /// stored column untouched, so the narrowing pass must stay skipped.
+    #[tokio::test]
+    async fn test_lookup_whole_struct_projection_passes_through() {
+        let schema = create_nested_schema();
+        let planner = nested_planner(&schema, &[1]);
+
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], Some(&["meta".to_string()]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(meta_children(&row), vec!["a", "b"]);
     }
 
     #[tokio::test]
@@ -1928,7 +2215,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int64(Some(20))], None)
@@ -1956,7 +2244,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let err = planner.lookup(&[], None).await;
         assert!(err.is_err(), "empty pk_values must error, not panic");
@@ -1988,7 +2277,7 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema)
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap()
     }
 
     #[tokio::test]
@@ -2086,26 +2375,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_against_from_configs_built_index() {
-        // A point lookup against an index built the production way
-        // (`IndexStore::from_configs`) resolves correctly via the seek-and-stop
-        // skiplist probe.
-        use crate::dataset::mem_wal::index::{BTreeIndexConfig, IndexStore, MemIndexConfig};
+    async fn test_lookup_against_from_specs_built_index() {
+        // An index built as a writer builds it answers through the key index.
+        use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
 
         let schema = create_pk_schema();
         let batch = create_test_batch(&schema, &[10, 20, 30], "v");
         let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let index_store = IndexStore::from_configs(
-            &[MemIndexConfig::BTree(BTreeIndexConfig {
-                name: "id_idx".to_string(),
-                field_id: 0,
-                column: "id".to_string(),
-            })],
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        let mut index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &lance_schema,
             1000,
             100,
         )
         .unwrap();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         let (idx, row_offset, _) = batch_store.append(batch.clone()).unwrap();
         index_store
             .insert_with_batch_position(&batch, row_offset, Some(idx))
@@ -2126,13 +2412,14 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(20))], None)
             .await
             .unwrap()
-            .expect("range fallback must find the row");
+            .expect("the key index finds the row");
         assert_eq!(id_at(&row), 20);
         assert!(
             planner
@@ -2204,7 +2491,7 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema)
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema).unwrap()
     }
 
     /// Read the `_tombstone` marker from row 0 of a keep-tombstone result.
@@ -2370,7 +2657,8 @@ mod tests {
                 frozen: vec![],
             },
         );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema).unwrap();
 
         let proj = vec!["id".to_string(), "_rowid".to_string()];
         assert!(
@@ -2403,5 +2691,182 @@ mod tests {
         let batch = planner.lookup_many(&keys, None).await.unwrap();
         assert_eq!(batch.num_rows(), 2, "the tombstoned key is omitted");
         assert_eq!(sorted_ids(&batch), vec![1, 3]);
+    }
+
+    /// A lookup projecting a nested field still finds the row after an
+    /// unrelated column is added.
+    #[tokio::test]
+    async fn a_nested_point_lookup_survives_an_unrelated_column_add() {
+        let stored_schema = create_nested_schema();
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let active = active_memtable_ref(
+                &stored_schema,
+                &[create_nested_batch(&stored_schema, &[1])],
+                1,
+            );
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        crate::dataset::mem_wal::scanner::collector::InMemoryMemTables {
+                            active,
+                            frozen: vec![],
+                        },
+                    );
+            let planner =
+                LsmPointLookupPlanner::new(collector, vec!["id".to_string()], table_schema)
+                    .unwrap();
+            let row = planner
+                .lookup(
+                    &[ScalarValue::Int32(Some(1))],
+                    Some(&["meta.a".to_string()]),
+                )
+                .await
+                .expect("an unrelated added column must preserve a nested point lookup")
+                .expect("the row is still present");
+            assert_eq!(meta_children(&row), vec!["a"]);
+            assert_eq!(id_at(&row), 1);
+            let meta = row.column_by_name("meta").unwrap().as_struct();
+            assert_eq!(
+                meta.column_by_name("a")
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0),
+                10,
+            );
+        }
+    }
+
+    /// Struct children selected out of declaration order come back in the
+    /// selected order, so no child gets another child's values.
+    #[tokio::test]
+    async fn a_nested_projection_keeps_selection_order() {
+        let stored_schema = create_nested_schema();
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let active = active_memtable_ref(
+                &stored_schema,
+                &[create_nested_batch(&stored_schema, &[1])],
+                1,
+            );
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        crate::dataset::mem_wal::scanner::collector::InMemoryMemTables {
+                            active,
+                            frozen: vec![],
+                        },
+                    );
+            let planner =
+                LsmPointLookupPlanner::new(collector, vec!["id".to_string()], table_schema)
+                    .unwrap();
+            let row = planner
+                .lookup(
+                    &[ScalarValue::Int32(Some(1))],
+                    Some(&["meta.b".to_string(), "meta.a".to_string()]),
+                )
+                .await
+                .expect("a reversed nested selection still resolves")
+                .expect("the row is still present");
+            assert_eq!(
+                meta_children(&row),
+                vec!["b", "a"],
+                "the output follows the selection, not the declaration"
+            );
+        }
+    }
+
+    /// Where the planned lookup reads the key from.
+    #[derive(Clone, Copy, Debug)]
+    enum NestedArm {
+        Base,
+        SsTable,
+        ActiveMemTable,
+    }
+
+    /// The planned lookup (not the in-memory fast path) narrows a struct the
+    /// way the fast path does, from whichever source holds the key. A WAL shard
+    /// sends a nested selection as its leaf paths, so `meta` itself is never
+    /// named.
+    #[rstest]
+    #[case::base(NestedArm::Base)]
+    #[case::sstable(NestedArm::SsTable)]
+    #[case::active_memtable(NestedArm::ActiveMemTable)]
+    #[tokio::test]
+    async fn a_planned_lookup_narrows_a_struct_selected_by_leaf_paths(#[case] arm: NestedArm) {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        use futures::TryStreamExt;
+
+        let schema = create_nested_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let batch = create_nested_batch(&schema, &[1, 2]);
+        let collector = match arm {
+            NestedArm::Base => {
+                let base = Arc::new(create_dataset(&base_uri, vec![batch]).await);
+                LsmDataSourceCollector::new(base, vec![])
+            }
+            NestedArm::SsTable => {
+                let shard_id = Uuid::new_v4();
+                let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+                create_dataset(&gen1_uri, vec![batch]).await;
+                let shard = ShardSnapshot::new(shard_id)
+                    .with_current_generation(2)
+                    .with_sstable(1, "gen_1".to_string());
+                LsmDataSourceCollector::without_base_table(base_uri, vec![shard])
+            }
+            NestedArm::ActiveMemTable => {
+                LsmDataSourceCollector::without_base_table(base_uri, vec![])
+                    .with_in_memory_memtables(
+                        Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: active_memtable_ref(&schema, &[batch], 1),
+                            frozen: vec![],
+                        },
+                    )
+            }
+        };
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
+
+        let projection = ["id", "meta.b", "meta.a"].map(String::from);
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(2))], Some(&projection))
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+        assert_eq!(rows.len(), 1, "expected exactly one row for pk=2");
+        let row = rows[0];
+
+        assert_eq!(id_at(row), 2);
+        assert_eq!(meta_children(row), vec!["b", "a"]);
+        let meta = row.column_by_name("meta").unwrap().as_struct();
+        assert_eq!(
+            meta.column_by_name("a")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            20
+        );
+        assert_eq!(
+            meta.column_by_name("b")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            "b_2"
+        );
     }
 }

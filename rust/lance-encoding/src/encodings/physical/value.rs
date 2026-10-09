@@ -528,8 +528,6 @@ pub struct ValueDecompressor {
     /// This number is a little trickier to compute because we also have to include bytes
     /// of any inner validity
     bits_per_value: u64,
-    /// How many items are in each value (e.g. FSL<Int32, 100> would be 100)
-    items_per_value: u64,
     layers: Vec<ValueFslDesc>,
 }
 
@@ -538,23 +536,29 @@ impl ValueDecompressor {
         Self {
             bits_per_item: description.bits_per_value,
             bits_per_value: description.bits_per_value,
-            items_per_value: 1,
             layers: Vec::default(),
         }
     }
 
     pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Result<Self> {
         let mut layers = Vec::new();
-        let mut cum_dim = 1;
-        let mut bytes_per_value = 0;
+        let mut cum_dim = 1_u64;
+        let mut bytes_per_value = 0_u64;
         loop {
+            if description.items_per_value == 0 {
+                return Err(Error::invalid_input("FSL dimension must be positive"));
+            }
             layers.push(ValueFslDesc {
                 has_validity: description.has_validity,
                 dimension: description.items_per_value,
             });
-            cum_dim *= description.items_per_value;
+            cum_dim = cum_dim
+                .checked_mul(description.items_per_value)
+                .ok_or_else(|| Error::invalid_input("FSL dimension product overflows"))?;
             if description.has_validity {
-                bytes_per_value += cum_dim.div_ceil(8);
+                bytes_per_value = bytes_per_value
+                    .checked_add(cum_dim.div_ceil(8))
+                    .ok_or_else(|| Error::invalid_input("FSL validity size overflows"))?;
             }
             let encoding = description
                 .values
@@ -570,12 +574,19 @@ impl ValueDecompressor {
                     description = inner;
                 }
                 Compression::Flat(flat) => {
-                    let mut bits_per_value = bytes_per_value * 8;
-                    bits_per_value += flat.bits_per_value * cum_dim;
+                    if flat.bits_per_value == 0 || flat.data.is_some() {
+                        return Err(Error::invalid_input(
+                            "FSL requires positive plain Flat leaf width",
+                        ));
+                    }
+                    let bits_per_value = flat
+                        .bits_per_value
+                        .checked_mul(cum_dim)
+                        .and_then(|bits| bytes_per_value.checked_mul(8)?.checked_add(bits))
+                        .ok_or_else(|| Error::invalid_input("FSL value bit width overflows"))?;
                     return Ok(Self {
                         bits_per_item: flat.bits_per_value,
                         bits_per_value,
-                        items_per_value: cum_dim,
                         layers,
                     });
                 }
@@ -584,8 +595,9 @@ impl ValueDecompressor {
                 Compression::Constant(_) => {
                     return Ok(Self {
                         bits_per_item: 0,
-                        bits_per_value: bytes_per_value * 8,
-                        items_per_value: cum_dim,
+                        bits_per_value: bytes_per_value.checked_mul(8).ok_or_else(|| {
+                            Error::invalid_input("FSL validity bit width overflows")
+                        })?,
                         layers,
                     });
                 }
@@ -619,8 +631,46 @@ impl BlockDecompressor for ValueDecompressor {
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
+    fn num_buffers(&self) -> usize {
+        1 + self
+            .layers
+            .iter()
+            .filter(|layer| layer.has_validity)
+            .count()
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
-        let num_items = num_values * self.items_per_value;
+        if data.len() != self.num_buffers() {
+            return Err(Error::invalid_input(format!(
+                "Flat/FSL mini-block has {} buffers, expected {}",
+                data.len(),
+                self.num_buffers()
+            )));
+        }
+        let mut child_values = num_values;
+        let mut buffers = data.iter();
+        for layer in &self.layers {
+            child_values = child_values
+                .checked_mul(layer.dimension)
+                .ok_or_else(|| Error::invalid_input("FSL child value count overflows"))?;
+            if layer.has_validity {
+                validate_fixed_buffer(
+                    buffers
+                        .next()
+                        .ok_or_else(|| Error::invalid_input("FSL validity buffer is missing"))?,
+                    child_values,
+                    1,
+                )?;
+            }
+        }
+        validate_fixed_buffer(
+            buffers
+                .next()
+                .ok_or_else(|| Error::invalid_input("Flat value buffer is missing"))?,
+            child_values,
+            self.bits_per_item,
+        )?;
+        let num_items = child_values;
         let mut buffer_iter = data.into_iter().rev();
 
         // Always at least 1 buffer
@@ -655,6 +705,20 @@ impl MiniBlockDecompressor for ValueDecompressor {
             .checked_mul(self.bits_per_value)
             .map(|bits| bits.div_ceil(8))
     }
+}
+
+fn validate_fixed_buffer(data: &LanceBuffer, num_values: u64, bits: u64) -> Result<()> {
+    let expected = num_values
+        .checked_mul(bits)
+        .map(|bits| bits.div_ceil(8))
+        .ok_or_else(|| Error::invalid_input("Flat decoded bit length overflows"))?;
+    if data.len() as u64 != expected {
+        return Err(Error::invalid_input(format!(
+            "Flat buffer has {} bytes, expected {expected}",
+            data.len()
+        )));
+    }
+    Ok(())
 }
 
 struct FslDecompressorValidityBuilder {

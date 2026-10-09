@@ -450,6 +450,7 @@ def test_initialize_mem_wal_manual(tmp_path):
     assert details["num_shards"] == 0
     assert details["sharding_specs"] == []
     assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is True
     assert details["writer_config_defaults"] == {}
 
 
@@ -517,7 +518,29 @@ def test_initialize_mem_wal_maintained_indexes(tmp_path):
     ds.create_scalar_index("id", "BTREE", name="id_btree")
     ds.initialize_mem_wal(maintained_indexes=["id_btree"])
 
-    assert ds.mem_wal_index_details()["maintained_indexes"] == ["id_btree"]
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == ["id_btree"]
+    assert details["maintain_all_indexes"] is False
+
+
+def test_initialize_mem_wal_maintains_none_and_all_differently(tmp_path):
+    # Both leave maintained_indexes empty, so the flag is the only thing
+    # separating "every index the table has" from "no index at all".
+    ds = _mem_wal_dataset(tmp_path)
+    ds.create_scalar_index("id", "BTREE", name="id_btree")
+    ds.initialize_mem_wal(maintained_indexes=[])
+
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is False
+
+    all_ds = _mem_wal_dataset(tmp_path, "all")
+    all_ds.create_scalar_index("id", "BTREE", name="id_btree")
+    all_ds.initialize_mem_wal()
+
+    all_details = all_ds.mem_wal_index_details()
+    assert all_details["maintained_indexes"] == []
+    assert all_details["maintain_all_indexes"] is True
 
 
 def test_initialize_mem_wal_writer_config_defaults(tmp_path):

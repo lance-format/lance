@@ -449,6 +449,24 @@ def test_schema_metadata(tmp_path: Path):
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
 
+def test_get_version(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path)
+    lance.write_dataset(pa.table({"a": range(5)}), tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    dataset.delete("a < 3")
+
+    info = dataset.get_version()
+    assert info == dataset.versions()[-1]
+    assert info["version"] == dataset.version
+    assert isinstance(info["timestamp"], datetime)
+    assert info["metadata"]["total_fragments"] == "2"
+    assert info["metadata"]["total_rows"] == "9"
+    assert info["metadata"]["total_deletion_files"] == "2"
+    assert info["metadata"]["total_deletion_file_rows"] == "6"
+
+    assert dataset.checkout_version(1).get_version() == dataset.versions()[0]
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -1984,15 +2002,25 @@ def test_cleanup_with_rate_limit(tmp_path):
     assert (finished - start) >= 2_000_000_000  # 2s
 
 
-def test_create_from_commit(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+@pytest.mark.parametrize("as_transaction", [False, True])
+def test_create_from_commit(tmp_path: Path, as_transaction: bool):
+    metadata = {b"source": b"user metadata"}
+    table = pa.Table.from_pydict(
+        {"a": range(100), "b": range(100)}
+    ).replace_schema_metadata(metadata)
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    fragments = [
+        lance.fragment.LanceFragment.create(base_dir, table.slice(offset, 50))
+        for offset in (0, 50)
+    ]
 
-    operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
+    operation = lance.LanceOperation.Overwrite(table.schema, fragments)
+    transaction = lance.Transaction(0, operation) if as_transaction else operation
+    dataset = lance.LanceDataset.commit(base_dir, transaction)
     tbl = dataset.to_table()
     assert tbl == table
+    assert len(dataset.get_fragments()) == 2
+    assert dataset.schema.metadata == metadata
 
 
 def test_strict_overwrite(tmp_path: Path):
@@ -2660,6 +2688,38 @@ def test_delete_data(tmp_path: Path):
     assert dataset.count_rows() > 0
     dataset.delete("true")
     assert dataset.count_rows() == 0
+
+
+@pytest.mark.parametrize(
+    "predicate, remaining_ids",
+    [
+        pytest.param(pc.field("s") != "C:\\temp", [0, 3], id="escaped_string"),
+        pytest.param(
+            pc.field("s").isin(["C:\\temp", 'say "hi"']),
+            [2, 3],
+            id="isin_and_quote",
+        ),
+        pytest.param(~(pc.field("s") == "plain"), [2, 3], id="negation"),
+        pytest.param(pc.field("s").is_null(), [0, 1, 2], id="is_null"),
+    ],
+)
+def test_delete_pyarrow_expression(tmp_path: Path, predicate, remaining_ids):
+    data = pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "vec": pa.array(
+                [[0.0], [1.0], [2.0], [3.0]], type=pa.list_(pa.float32(), 1)
+            ),
+            "s": ["C:\\temp", 'say "hi"', "plain", None],
+        }
+    )
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+
+    deleted_rows = len(data) - len(remaining_ids)
+    assert dataset.count_rows(filter=predicate) == deleted_rows
+    assert dataset.delete(predicate) == {"num_deleted_rows": deleted_rows}
+    assert sorted(dataset.to_table()["id"].to_pylist()) == remaining_ids
 
 
 def check_merge_stats(merge_dict, expected):
@@ -3983,6 +4043,24 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        pytest.param(pc.field("p") == "C:\\data\\a.csv", id="escaped_string"),
+        pytest.param(pc.field("p").isin(["C:\\data\\a.csv"]), id="isin"),
+    ],
+)
+def test_update_pyarrow_expression(tmp_path: Path, where):
+    data = pa.table(
+        {"id": [0, 1, 2], "p": ["C:\\data\\a.csv", "x", "y"], "n": [0, 0, 0]}
+    )
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    assert len(dataset.get_fragments()) == 2
+
+    assert dataset.update({"n": "1"}, where=where) == {"num_rows_updated": 1}
+    assert dataset.to_table().sort_by("id")["n"].to_pylist() == [1, 0, 0]
 
 
 def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
@@ -5790,6 +5868,25 @@ def test_detached_commits(tmp_path: Path):
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
 
 
+def test_detached_raw_arrow_merge_preserves_schema_metadata(tmp_path: Path):
+    metadata = {b"source": b"user metadata"}
+    table = pa.table({"x": [0, 1]}).replace_schema_metadata(metadata)
+    dataset = lance.write_dataset(table, tmp_path)
+    fragment = dataset.get_fragments()[0].metadata
+    with pytest.deprecated_call():
+        operation = lance.LanceOperation.Merge([fragment], dataset.schema, True)
+
+    detached = lance.LanceDataset.commit(
+        dataset,
+        operation,
+        read_version=dataset.version,
+        detached=True,
+    )
+
+    assert detached.to_table() == dataset.to_table()
+    assert detached.schema.metadata == metadata
+
+
 def test_dataset_drop(tmp_path: Path):
     table = pa.table({"x": [0]})
     lance.write_dataset(table, tmp_path)
@@ -6920,6 +7017,46 @@ def test_commit_message_and_get_properties(tmp_path):
         transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
         == "Use Dataset.commit"
     )
+
+
+def test_get_transactions_on_branch(tmp_path):
+    table = pa.table({"a": [1]})
+    dataset = lance.write_dataset(table, tmp_path)
+    branch = dataset.create_branch("dev")
+
+    branch = lance.write_dataset(table, branch.uri, mode="append")
+    transactions = branch.get_transactions(2)
+
+    assert len(transactions) == 2
+    assert transactions[0] is not None
+    assert isinstance(transactions[0].operation, lance.LanceOperation.Append)
+
+    clone_transaction = transactions[1]
+    assert clone_transaction is not None
+    assert clone_transaction.read_version == dataset.version
+    clone = clone_transaction.operation
+    assert isinstance(clone, lance.LanceOperation.Clone)
+    assert clone.is_shallow
+    assert clone.ref_name is None
+    assert clone.ref_version == dataset.version
+    assert clone.ref_path == dataset.uri
+    assert clone.branch_name == "dev"
+
+
+def test_commit_deep_clone_rejected(tmp_path: Path):
+    source = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "source")
+    clone = lance.LanceOperation.Clone(
+        is_shallow=False,
+        ref_name=None,
+        ref_version=source.version,
+        ref_path=source.uri,
+        branch_name=None,
+    )
+
+    # Committed directly, a deep clone would reference files never copied to
+    # the target; LanceDataset.deep_clone copies them first.
+    with pytest.raises(OSError, match="deep Clone cannot be committed directly"):
+        lance.LanceDataset.commit(tmp_path / "target", clone, read_version=0)
 
 
 def test_commit_with_stable_row_ids(tmp_path: Path):

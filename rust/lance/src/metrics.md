@@ -15,6 +15,11 @@ identifies the store; its cardinality is controlled by the
 - `full` — the store's unique prefix (`s3$my-bucket`, `az$container@account`
   where Azure's account also matters), so multiple buckets on the same cloud
   can be told apart. Cardinality grows with the number of stores accessed.
+- `dataset` — `base` as in `full`, plus a `dataset` label carrying the URI the
+  store was opened for (`s3://my-bucket/path/table.lance`), so requests can be
+  attributed to a dataset. In this mode each URI gets its own object store and
+  HTTP client instead of sharing one per bucket, while the AIMD throttle budget
+  stays shared per bucket. Cardinality grows with the number of datasets opened.
 - `off` — omit the `base` label entirely.
 
 `operation` is one of `get`, `put`, `put_part`, `head`, `list`, `delete`,

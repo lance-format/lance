@@ -540,17 +540,9 @@ pub(crate) fn normalized_column_num_rows(info: &ColumnInfo) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
         let page_rows = match &page.encoding {
             PageEncoding::Structural(layout) => match &layout.layout {
-                Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => sparse
-                    .structural_layers
-                    .first()
-                    .and_then(|layer| layer.layer.as_ref())
-                    .map_or(page.num_rows, |layer| match layer {
-                        pbenc21::sparse_structural_layer::Layer::Validity(layer) => layer.num_slots,
-                        pbenc21::sparse_structural_layer::Layer::List(layer) => layer.num_slots,
-                        pbenc21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
-                            layer.num_slots
-                        }
-                    }),
+                Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => {
+                    sparse.row_count_and_scale(page.num_rows)?.0
+                }
                 _ => page.num_rows,
             },
             _ => page.num_rows,
@@ -2432,6 +2424,7 @@ mod tests {
     use arrow_array::{
         DictionaryArray, Int8Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
         StringArray, UInt32Array,
+        cast::AsArray,
         types::{Float64Type, Int8Type, Int32Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -2472,8 +2465,14 @@ mod tests {
         )
     }
 
+    #[rstest::rstest]
+    #[case("nullable")]
+    #[case("rle")]
+    #[case("dictionary")]
+    #[case("binary_range")]
+    #[case("binary_delta")]
     #[tokio::test]
-    async fn sparse_file_writer_reader_scan_range_and_take_roundtrip() {
+    async fn sparse_file_writer_reader_scan_range_and_take_roundtrip(#[case] kind: &str) {
         let fs = FsFixture::default();
         let sparse_metadata = HashMap::from([(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -2498,7 +2497,7 @@ mod tests {
             Some(NullBuffer::from(vec![true, false, true, true, true, true])),
         )
         .unwrap();
-        let batch = RecordBatch::try_new(
+        let mut batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![
@@ -2513,7 +2512,69 @@ mod tests {
             ],
         )
         .unwrap();
-        let input = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema);
+        if matches!(kind, "rle" | "dictionary") {
+            let counts = (0..2048).map(|i| {
+                if kind == "rle" {
+                    i / 128 + 1
+                } else {
+                    [1, 31, 127][i % 3]
+                }
+            });
+            let mut offsets = vec![0_i32];
+            for count in counts {
+                offsets.push(offsets.last().unwrap() + count as i32);
+            }
+            let values = Int32Array::from_iter_values(0..*offsets.last().unwrap());
+            let list = ListArray::try_new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                Arc::new(values),
+                None,
+            )
+            .unwrap();
+            batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..2048)),
+                    Arc::new(list),
+                ],
+            )
+            .unwrap();
+        }
+        if kind.starts_with("binary_") {
+            let metadata = HashMap::from([
+                (
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    STRUCTURAL_ENCODING_SPARSE.to_string(),
+                ),
+                ("lance-encoding:compression".to_string(), "none".to_string()),
+            ]);
+            let values = Arc::new(StringArray::from_iter_values((0..2048).map(|i| {
+                let len = if kind == "binary_range" {
+                    8
+                } else {
+                    [4, 10, 5, 8][i % 4]
+                };
+                char::from(b'a' + (i % 26) as u8).to_string().repeat(len)
+            })));
+            let item = Arc::new(Field::new("item", DataType::Utf8, true));
+            let lists = ListArray::try_new(
+                item.clone(),
+                OffsetBuffer::new(ScalarBuffer::from((0..=2048).collect::<Vec<i32>>())),
+                values.clone(),
+                None,
+            )
+            .unwrap();
+            batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("values", DataType::Utf8, true).with_metadata(metadata.clone()),
+                    Field::new("items", DataType::List(item), true).with_metadata(metadata),
+                ])),
+                vec![values, Arc::new(lists)],
+            )
+            .unwrap();
+        }
+        let input = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         write_lance_file(
             input,
             &fs,
@@ -2537,6 +2598,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(file_reader.metadata().column_infos.len(), 2);
+        if matches!(kind, "rle" | "dictionary") {
+            let PageEncoding::Structural(layout) =
+                &file_reader.metadata().column_infos[1].page_infos[0].encoding
+            else {
+                panic!("expected structural page")
+            };
+            let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
+                panic!("expected sparse page")
+            };
+            let counts = sparse
+                .structural_layers
+                .iter()
+                .find_map(|layer| {
+                    if let Some(pb21::sparse_structural_layer::Layer::List(list)) = &layer.layer {
+                        list.counts.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    (kind, &counts.compression),
+                    ("rle", Some(pb21::compressive_encoding::Compression::Rle(_)))
+                        | (
+                            "dictionary",
+                            Some(pb21::compressive_encoding::Compression::Dictionary(_))
+                        )
+                ),
+                "unexpected count codec: {counts:?}"
+            );
+        }
+        if kind.starts_with("binary_") {
+            for column in &file_reader.metadata().column_infos {
+                let PageEncoding::Structural(layout) = &column.page_infos[0].encoding else {
+                    panic!("expected structural page")
+                };
+                let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
+                    panic!("expected sparse page")
+                };
+                let Some(pb21::compressive_encoding::Compression::Variable(variable)) =
+                    &sparse.value_compression.as_ref().unwrap().compression
+                else {
+                    panic!("expected variable values")
+                };
+                let offsets = &variable.offsets.as_ref().unwrap().compression;
+                if kind == "binary_range" {
+                    assert!(matches!(
+                        offsets,
+                        Some(pb21::compressive_encoding::Compression::Range(_))
+                    ));
+                } else {
+                    assert!(matches!(
+                        offsets,
+                        Some(pb21::compressive_encoding::Compression::Delta(_))
+                    ));
+                }
+            }
+        }
         assert!(
             file_reader
                 .metadata()
@@ -2567,7 +2687,10 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(scan, vec![batch.clone()]);
+        assert_eq!(
+            arrow_select::concat::concat_batches(&batch.schema(), &scan).unwrap(),
+            batch
+        );
 
         let range = file_reader
             .read_stream(
@@ -4026,6 +4149,147 @@ mod tests {
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), total_rows);
+    }
+
+    /// The writer cuts a column into many small pages when its buffer is
+    /// small (or, for nested columns, when the rep/def levels of a page hit
+    /// the mini-block budget). Reading them must not cost one request per page.
+    #[tokio::test]
+    async fn test_read_batches_page_reads_into_one_request() {
+        let fs = FsFixture::default();
+        // Every batch is 40 KiB of values, so the 64 KiB buffer flushes a page
+        // after every second batch.
+        let reader = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10_000), BatchCount::from(10));
+        write_lance_file(
+            reader,
+            &fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions {
+                data_cache_bytes: Some(64 * 1024),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let num_pages = file_reader.metadata().column_infos[0].page_infos.len();
+        assert!(
+            num_pages > 4,
+            "the writer must cut several pages, got {num_pages}"
+        );
+
+        let read_all = || async {
+            file_reader
+                .read_stream(
+                    lance_io::ReadBatchParams::RangeFull,
+                    100_000,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+        // The first read also initializes the page metadata; the cache keeps
+        // it, so the second read is data I/O only.
+        read_all().await;
+        fs.object_store.io_stats_incremental();
+        let batches = read_all().await;
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            100_000
+        );
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 1,
+            "{num_pages} adjacent pages must be read together, not one request each"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_batches_column_reads_into_one_request(
+        #[values(ConcreteFileVersion::V2_0, ConcreteFileVersion::V2_1)]
+        version: ConcreteFileVersion,
+    ) {
+        let fs = FsFixture::default();
+        // 16 int32 columns of 256 rows: one 1 KiB page each, written back to
+        // back, so one row's reads sit within the local 4 KiB block size.
+        let mut generator = gen_batch();
+        for i in 0..16 {
+            generator = generator.col(format!("c{i}"), array::step::<Int32Type>());
+        }
+        write_lance_file(
+            generator.into_reader_rows(RowCount::from(256), BatchCount::from(1)),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let take = |row: u32| {
+            let file_reader = &file_reader;
+            async move {
+                file_reader
+                    .read_stream(
+                        lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![row])),
+                        1,
+                        1,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+            }
+        };
+        // The first take also initializes the page metadata; the cache keeps
+        // it, so the second take is data I/O only.
+        take(3).await;
+        fs.object_store.io_stats_incremental();
+        let batches = take(200).await;
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 1,
+            "one row across 16 adjacent column pages must be one request, not one per column"
+        );
+        assert_eq!(batches[0].num_columns(), 16);
+        for column in batches[0].columns() {
+            assert_eq!(column.as_primitive::<Int32Type>().value(0), 200);
+        }
     }
 
     #[rstest]
