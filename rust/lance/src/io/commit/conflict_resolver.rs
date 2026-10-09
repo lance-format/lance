@@ -58,7 +58,9 @@ pub struct TransactionRebase<'a> {
     current_lineage: Option<TaggedLineage>,
     /// The latest manifest's live fragments, loaded with `current_lineage`.
     current_live: Option<RoaringBitmap>,
-    /// Deferred compactions, for a CreateIndex on an untagged table.
+    /// The latest manifest's untagged fragment reuse index, as a CreateIndex
+    /// on an untagged table sees it (empty when the table has none). Loaded by
+    /// [`Self::load_current_lineage`]; `None` otherwise.
     untagged_reuse: Option<Box<UntaggedReuse>>,
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
@@ -559,9 +561,9 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// The untagged counterpart of the tagged lineage: the groups the latest
-    /// fragment reuse index still records, matched by source fragment ids.
-    /// A trimmed record is missing, so the index retries.
+    /// The untagged counterpart of the tagged lineage. Skipped for a fragment
+    /// reuse index cleanup, which `finish_create_index` checks itself, and for
+    /// the MemWAL index, which covers no fragments.
     async fn load_untagged_reuse(
         &mut self,
         dataset: &Dataset,
@@ -572,7 +574,7 @@ impl<'a> TransactionRebase<'a> {
         };
         if new_indices
             .iter()
-            .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME || index.name == MEM_WAL_INDEX_NAME)
         {
             return Ok(());
         }
@@ -585,57 +587,48 @@ impl<'a> TransactionRebase<'a> {
         ) {
             return Ok(());
         }
-        let mut deferred_groups = HashSet::new();
+        let mut reuse = UntaggedReuse {
+            groups: HashSet::new(),
+            sources: HashMap::new(),
+            manifest: dataset.manifest.clone(),
+        };
         if let Some(entry) = entry {
             let details = load_frag_reuse_index_details(dataset, entry).await?;
-            deferred_groups.extend(
-                details
-                    .versions
-                    .iter()
-                    .flat_map(|version| version.groups.iter())
-                    .map(|group| sorted_ids(group.old_frags.iter().map(|f| f.id))),
-            );
+            for group in details
+                .versions
+                .iter()
+                .flat_map(|version| version.groups.iter())
+            {
+                let old = sorted_ids(group.old_frags.iter().map(|f| f.id));
+                for new in &group.new_frags {
+                    reuse.sources.insert(new.id as u32, old.clone());
+                }
+                reuse.groups.insert(old);
+            }
         }
-        self.untagged_reuse = Some(Box::new(UntaggedReuse {
-            deferred_groups,
-            carried: HashMap::new(),
-            schema: dataset.schema().clone(),
-        }));
+        self.untagged_reuse = Some(Box::new(reuse));
         Ok(())
     }
 
-    /// Resumes where an earlier commit attempt saw deferred compactions move
-    /// the index's rows.
-    pub(crate) fn resume_untagged_carried(&mut self, carried: Option<HashMap<u32, RoaringBitmap>>) {
-        if let (Some(reuse), Some(carried)) = (self.untagged_reuse.as_mut(), carried) {
-            reuse.carried = carried;
-        }
-    }
-
-    pub(crate) fn untagged_carried(&self) -> Option<HashMap<u32, RoaringBitmap>> {
-        self.untagged_reuse
-            .as_ref()
-            .map(|reuse| reuse.carried.clone())
-    }
-
-    /// Whether this CreateIndex covers rows a recorded deferred compaction
-    /// moved, which needs every version since its read version to follow.
+    /// Whether this CreateIndex covers fragments a recorded deferred compaction
+    /// rewrote. Following its rows then needs every version in the window
+    /// checked, so a cleaned-up one refuses the commit.
     pub(crate) fn relies_on_untagged_reuse(&self) -> bool {
-        let Some(reuse) = &self.untagged_reuse else {
+        let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
+            (&self.untagged_reuse, &self.transaction.operation)
+        else {
             return false;
         };
-        let Operation::CreateIndex { new_indices, .. } = &self.transaction.operation else {
-            return false;
-        };
-        new_indices.iter().any(|index| {
-            index.fragment_bitmap.as_ref().is_none_or(|bitmap| {
+        new_indices
+            .iter()
+            .filter_map(|index| index.fragment_bitmap.as_ref())
+            .any(|bitmap| {
                 reuse
-                    .deferred_groups
+                    .groups
                     .iter()
                     .flatten()
                     .any(|id| bitmap.contains(*id as u32))
             })
-        })
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -1227,21 +1220,18 @@ impl<'a> TransactionRebase<'a> {
                             live,
                             Some(lineage),
                         );
-                    } else if let Some(reuse) = &self.untagged_reuse {
+                    } else {
+                        // A compaction's output holds rows an index built before
+                        // it covers under the fragments it was compacted from.
                         let updated = updated_fragments
                             .iter()
-                            .flat_map(|fragment| reuse.index_ids(fragment.id as u32))
-                            .map(|id| Fragment::new(id as u64))
-                            .collect::<Vec<_>>();
-                        Transaction::prune_updated_fields_from_indices(
+                            .map(|fragment| {
+                                index_ids(self.untagged_reuse.as_deref(), fragment.id as u32)
+                            })
+                            .fold(RoaringBitmap::new(), |ids, more| ids | more);
+                        Transaction::prune_updated_fragment_ids_from_indices(
                             new_indices,
                             &updated,
-                            fields_modified,
-                        );
-                    } else {
-                        Transaction::prune_updated_fields_from_indices(
-                            new_indices,
-                            updated_fragments,
                             fields_modified,
                         );
                     }
@@ -1349,20 +1339,23 @@ impl<'a> TransactionRebase<'a> {
                     if self_is_tagged_trim {
                         return Ok(());
                     }
-                    // if a reuse update is present, index remapping is deferred and
-                    // there is no conflict with concurrent CreateIndex of column indices.
+                    // if index remapping is deferred, there is no conflict with
+                    // concurrent CreateIndex of column indices. On an untagged table it
+                    // was if the rewrite carries a reuse update (visible only in the
+                    // process that committed it) or the latest reuse index records it.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    let deferred = match &self.untagged_reuse {
-                        Some(reuse) => reuse.is_deferred(groups),
-                        None => frag_reuse_index
+                    let deferred = frag_reuse_index
+                        .as_ref()
+                        .is_some_and(|entry| !is_tagged(entry))
+                        || self
+                            .untagged_reuse
                             .as_ref()
-                            .is_some_and(|entry| !is_tagged(entry)),
-                    };
+                            .is_some_and(|reuse| reuse.records(groups));
                     if deferred {
-                        if let Some(reuse) = self.untagged_reuse.as_mut() {
-                            reuse.carry(groups, new_indices);
+                        if let Some(reuse) = &self.untagged_reuse {
+                            reuse.withdraw_folded_overlays(groups, new_indices);
                         }
                         let ngram_coverage = new_indices
                             .iter()
@@ -1379,11 +1372,8 @@ impl<'a> TransactionRebase<'a> {
                             .iter()
                             .flat_map(|group| group.old_fragments.iter())
                             .any(|fragment| {
-                                let ids = match &self.untagged_reuse {
-                                    Some(reuse) => reuse.index_ids(fragment.id as u32),
-                                    None => RoaringBitmap::from_iter([fragment.id as u32]),
-                                };
-                                !ids.is_disjoint(&ngram_coverage)
+                                !index_ids(self.untagged_reuse.as_deref(), fragment.id as u32)
+                                    .is_disjoint(&ngram_coverage)
                             })
                         {
                             return Err(
@@ -3288,58 +3278,72 @@ fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
 
-/// Deferred compactions on an untagged table, as a CreateIndex sees them.
+/// The latest manifest's untagged fragment reuse index, as a CreateIndex sees it.
 #[derive(Debug)]
 struct UntaggedReuse {
-    /// Recorded groups, as sorted source fragment ids.
-    deferred_groups: HashSet<Vec<u64>>,
-    /// Compaction outputs, mapped to the fragment ids the index knows them by.
-    carried: HashMap<u32, RoaringBitmap>,
-    schema: lance_core::datatypes::Schema,
+    /// Each recorded group's source fragment ids, sorted.
+    groups: HashSet<Vec<u64>>,
+    /// Each recorded group's output fragments, mapped to its source ids.
+    sources: HashMap<u32, Vec<u64>>,
+    /// The latest manifest, whose schema overlays are matched against.
+    manifest: Arc<lance_table::format::Manifest>,
 }
 
 impl UntaggedReuse {
-    fn is_deferred(&self, groups: &[RewriteGroup]) -> bool {
-        groups.iter().all(|group| {
-            self.deferred_groups
-                .contains(&sorted_ids(group.old_fragments.iter().map(|f| f.id)))
-        })
+    /// Whether every group of a rewrite is recorded, so it deferred its index
+    /// remap and the record is still there to translate an index built before it.
+    fn records(&self, groups: &[RewriteGroup]) -> bool {
+        !groups.is_empty()
+            && groups.iter().all(|group| {
+                self.groups
+                    .contains(&sorted_ids(group.old_fragments.iter().map(|f| f.id)))
+            })
     }
 
     fn index_ids(&self, fragment: u32) -> RoaringBitmap {
-        let mut ids = self.carried.get(&fragment).cloned().unwrap_or_default();
-        ids.insert(fragment);
+        let mut ids = RoaringBitmap::new();
+        let mut pending = vec![fragment];
+        while let Some(id) = pending.pop() {
+            if ids.insert(id)
+                && let Some(sources) = self.sources.get(&id)
+            {
+                pending.extend(sources.iter().map(|source| *source as u32));
+            }
+        }
         ids
     }
 
-    /// Records where a rewrite moved the index's rows, withdrawing a group
-    /// that folded in an overlay newer than the index.
-    fn carry(&mut self, groups: &[RewriteGroup], indices: &mut [IndexMetadata]) {
+    /// Withdraws from each index the groups that folded in an overlay on one of
+    /// its fields newer than it: nothing is left to mask the stale values.
+    fn withdraw_folded_overlays(&self, groups: &[RewriteGroup], indices: &mut [IndexMetadata]) {
         for group in groups {
-            let ids = group
-                .old_fragments
-                .iter()
-                .map(|fragment| self.index_ids(fragment.id as u32))
-                .fold(RoaringBitmap::new(), |ids, more| ids | more);
             for index in indices.iter_mut() {
-                let folded_newer_overlay = group.old_fragments.iter().any(|fragment| {
+                let folded = group.old_fragments.iter().any(|fragment| {
                     fragment.overlays.iter().any(|overlay| {
                         overlay_affects_index(
                             overlay,
                             &index.fields,
                             index.dataset_version,
-                            &self.schema,
+                            &self.manifest.schema,
                         )
                     })
                 });
-                if folded_newer_overlay && let Some(bitmap) = &mut index.fragment_bitmap {
-                    *bitmap -= &ids;
+                if folded && let Some(bitmap) = &mut index.fragment_bitmap {
+                    for fragment in &group.old_fragments {
+                        *bitmap -= self.index_ids(fragment.id as u32);
+                    }
                 }
             }
-            for fragment in &group.new_fragments {
-                self.carried.insert(fragment.id as u32, ids.clone());
-            }
         }
+    }
+}
+
+/// The fragment ids an index built before deferred compactions may cover
+/// `fragment`'s rows under: itself and every fragment it was compacted from.
+fn index_ids(reuse: Option<&UntaggedReuse>, fragment: u32) -> RoaringBitmap {
+    match reuse {
+        Some(reuse) => reuse.index_ids(fragment),
+        None => RoaringBitmap::from_iter([fragment]),
     }
 }
 

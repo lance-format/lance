@@ -403,6 +403,16 @@ impl Transaction {
             return;
         }
 
+        let fragment_ids = updated_fragments.iter().map(|f| f.id as u32).collect();
+        Self::prune_updated_fragment_ids_from_indices(indices, &fragment_ids, fields_modified);
+    }
+
+    /// [`Self::prune_updated_fields_from_indices`] by fragment id.
+    pub fn prune_updated_fragment_ids_from_indices(
+        indices: &mut [IndexMetadata],
+        fragment_ids: &RoaringBitmap,
+        fields_modified: &[u32],
+    ) {
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
         let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
@@ -413,9 +423,7 @@ impl Transaction {
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
-                for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                    fragment_bitmap.remove(fragment_id);
-                }
+                *fragment_bitmap -= fragment_ids;
             }
         }
     }

@@ -1693,9 +1693,6 @@ pub(crate) async fn commit_transaction(
     });
 
     let mut transaction = transaction.clone();
-    // Where earlier attempts saw deferred compactions move an index's rows:
-    // each attempt checks only the versions committed since the previous one.
-    let mut untagged_carried = None;
     // What a rewrite on a tagged fragment reuse history assembled for the
     // attempt; handed to the manifest build, never written back into
     // `transaction`.
@@ -1739,7 +1736,6 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
-            rebase.resume_untagged_carried(untagged_carried.take());
             let complete = other_transactions
                 .iter()
                 .map(|(version, _)| *version)
@@ -1758,7 +1754,6 @@ pub(crate) async fn commit_transaction(
             for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;
             }
-            untagged_carried = rebase.untagged_carried();
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
