@@ -78,3 +78,101 @@ groups, but exits with status 1 because the unchanged FineWeb k=100 control has
 94.97875% mean recall against the preregistered 95% target. The target and frozen
 parameters were not changed after evaluation. See [RESULTS.md](RESULTS.md) for
 the full distributions, paired baseline comparisons and filtered limitations.
+
+## Additional k=10,000 and k=100,000 experiment
+
+[LARGE_K_RESULTS.md](LARGE_K_RESULTS.md) records the frozen parameters, complete
+native comparisons, independent returned-ID audit, and numerical checks. All ten
+Auto corpus/k groups pass the 95% held-out mean-recall target.
+
+[LARGE_K_PROTOCOL.md](LARGE_K_PROTOCOL.md) defines the separate two-anchor
+experiment. It reuses the original data and query split, preserves the completed
+study, and writes memory-mappable top-100,000 truth and returned IDs to a new
+directory. Run preparation once for every corpus before calibrating:
+
+```bash
+for corpus in dino-10m laion-10m fineweb-10m wiki-cohere-35m dpr-wikipedia-single-nq; do
+  uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/prepare_large.py "$STUDY" "$LARGE_STUDY" "$corpus"
+done
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/calibrate_large.py "$LARGE_STUDY"
+cp "$LARGE_STUDY/calibration.json" "$LARGE_STUDY/calibration-frozen.json"
+```
+
+Build the experimental runtime in an isolated checkout of the measured source
+(`0bcc82431`; the runtime at `12def694f` is identical). Preserve both the original
+main runtime and the PR runtime before rebuilding. Apply only the
+generated patch, which enables the two exact anchors and adds their profile and
+policy-gate tests:
+
+```bash
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/build_large_patch.py "$EXPERIMENT_CHECKOUT" "$LARGE_STUDY/calibration-frozen.json" "$LARGE_STUDY/experimental.patch"
+```
+
+Follow that checkout's environment setup, formatting, build and test instructions;
+use `release-with-debug` for the native benchmark. Record the experimental
+library SHA256 in `$LARGE_STUDY/candidate-binary.sha256` and copy the original
+main hash to `$LARGE_STUDY/baseline-binary.sha256`. With the experimental runtime
+selected and the same timing environment described above, run every corpus:
+
+```bash
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/calibrate_large.py "$LARGE_STUDY" --evaluate
+for corpus in dino-10m laion-10m fineweb-10m wiki-cohere-35m dpr-wikipedia-single-nq; do
+  taskset -c 0-15 uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/measure_large.py "$LARGE_STUDY" "$corpus" --baseline-runtime "$BASELINE_RUNTIME"
+done
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/audit_large.py "$LARGE_STUDY"
+```
+
+This experiment measures the requested anchors. The defaults in this PR continue to
+use the previously validated range through k=1000.
+
+## One fallback threshold per metric
+
+Calibration and full held-out routing evaluation are complete. The preregistered
+native validation is still running; its results will be reported separately.
+
+[FALLBACK_PROTOCOL.md](FALLBACK_PROTOCOL.md) defines a separate experiment with
+one constant gap margin for each metric and no learned floor or cap. Calibration
+and held-out routing checks cover every integer k from 1 through 100,000 using
+the frozen exact-neighbor prefixes. A signed-multiplier comparison retains the
+old f32 arithmetic and checks whether opposite nearest-distance signs rule out
+a shared dot multiplier.
+
+Use the prepared large-k study as immutable input and a fresh output directory:
+
+```bash
+uv run --frozen --no-sync pytest -q ../benchmarks/auto-ivf-large-k/test_fallback.py
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/calibrate_fallback.py "$LARGE_STUDY" "$FALLBACK_STUDY"
+cp "$FALLBACK_STUDY/calibration.json" "$FALLBACK_STUDY/calibration-frozen.json"
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/calibrate_fallback.py "$LARGE_STUDY" "$FALLBACK_STUDY" --calibration-simulation
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/calibrate_fallback.py "$LARGE_STUDY" "$FALLBACK_STUDY" --evaluate
+```
+
+Build the constant-fallback experiment in an isolated checkout of the
+PR runtime source, `0bcc82431` (also unchanged at `12def694f`). Preserve all earlier
+runtimes before rebuilding, and use that checkout's environment, test, lint, and
+`release-with-debug` instructions:
+
+```bash
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/build_fallback_patch.py "$EXPERIMENT_CHECKOUT" "$FALLBACK_STUDY/calibration-frozen.json" "$FALLBACK_STUDY/experimental.patch"
+```
+
+Record the new native library hash in `$FALLBACK_STUDY/candidate-binary.sha256`.
+For this experiment, the baseline is the preserved PR runtime
+(`17bd3bb4...`), selected through `$FALLBACK_BASELINE_RUNTIME`; record that library
+hash in `$FALLBACK_STUDY/baseline-binary.sha256`. Both processes explicitly request
+the full maximum probe count to select the fallback policy even at small k.
+
+With the experimental runtime selected and the timing environment above:
+
+```bash
+for corpus in dino-10m laion-10m fineweb-10m wiki-cohere-35m dpr-wikipedia-single-nq; do
+  taskset -c 0-15 uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/measure_fallback.py "$FALLBACK_STUDY" "$corpus" --baseline-runtime "$FALLBACK_BASELINE_RUNTIME"
+done
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/audit_fallback.py "$FALLBACK_STUDY"
+```
+
+Native validation uses the first 512 held-out queries at six representative k
+values, with 128 serial timings and 32 matched baseline queries. The remaining
+384 queries contribute recall and counters. Keep these populations distinct
+from the full-query, all-k routing simulations. The experimental patch preserves
+historical-index behavior and does not change the defaults in this PR.
