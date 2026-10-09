@@ -523,7 +523,11 @@ async fn run_local(planner: &LsmFtsSearchPlanner, queries: &[String], k: usize) 
     for q in queries {
         let t0 = Instant::now();
         let plan = planner
-            .plan_search(TEXT_COL, FullTextSearchQuery::new(q.clone()), Some(k), None)
+            .plan_search(
+                FullTextSearchQuery::new(q.clone()).with_column(TEXT_COL.to_string())?,
+                Some(k),
+                None,
+            )
             .await?;
         let stream = plan.execute(0, ctx.task_ctx())?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;

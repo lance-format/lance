@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     decoder::{
-        DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
+        DecodeArrayTask, DrainLimit, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
     decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
@@ -428,6 +428,31 @@ impl ChildState {
         composite.has_more = self.rows_drained != self.num_rows;
         Ok(composite)
     }
+
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let mut safe_rows = 0;
+        let mut bytes = 0u64;
+        let mut budget = byte_budget;
+        let mut remaining = num_rows;
+        for decoder in &self.scheduled {
+            if remaining == 0 {
+                break;
+            }
+            let rows_in_page = remaining.min(decoder.rows_left());
+            let page_limit = decoder.max_rows_to_drain(rows_in_page, budget)?;
+            safe_rows += page_limit.rows;
+            bytes = bytes.saturating_add(page_limit.bytes);
+            if page_limit.rows < rows_in_page {
+                break;
+            }
+            budget = budget.saturating_sub(page_limit.bytes);
+            remaining -= rows_in_page;
+        }
+        Ok(DrainLimit {
+            rows: safe_rows,
+            bytes,
+        })
+    }
 }
 
 // Wrapper around ChildState that orders using rows_unawaited
@@ -545,6 +570,25 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             }),
             num_rows,
         })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        // Each child column concatenates into its own Arrow array, so every child
+        // gets the full budget; the most constrained child bounds the batch.
+        self.children.iter().try_fold(
+            DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+            },
+            |limit, child| {
+                child
+                    .max_rows_to_drain(num_rows, byte_budget)
+                    .map(|child_limit| DrainLimit {
+                        rows: limit.rows.min(child_limit.rows),
+                        bytes: limit.bytes.max(child_limit.bytes),
+                    })
+            },
+        )
     }
 
     fn rows_loaded(&self) -> u64 {

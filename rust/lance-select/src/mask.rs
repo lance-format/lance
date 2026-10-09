@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::{Range, RangeBounds, RangeInclusive};
 use std::{collections::BTreeMap, io::Read};
@@ -590,6 +590,62 @@ impl RowAddrTreeMap {
         count
     }
 
+    /// Build a set from many independently sorted runs of row addresses.
+    ///
+    /// Each run must be sorted ascending; the runs may interleave arbitrarily
+    /// and may repeat addresses (the result is a set). This is the cheap way
+    /// to assemble the output of a scan that produced one sorted chunk per
+    /// page or partition: building one map per run and unioning them costs
+    /// O(runs x fragments) tiny bitmaps, whereas here every address is
+    /// bucketed by fragment in a single pass, a bucket is sorted only if the
+    /// runs that fed it actually interleaved, and exactly one bitmap is built
+    /// per fragment.
+    ///
+    /// Cost is O(N) plus O(n log n) for each bucket whose runs interleaved,
+    /// where N is the total number of addresses and n the bucket size.
+    pub fn from_sorted_runs<'a, I>(runs: I) -> Self
+    where
+        I: IntoIterator<Item = &'a [u64]>,
+    {
+        // fragment -> (low 32 bits of every address seen, still sorted?)
+        let mut buckets: HashMap<u32, (Vec<u32>, bool)> = HashMap::new();
+        for run in runs {
+            let mut rest = run;
+            while let Some(&first) = rest.first() {
+                let fragment = (first >> 32) as u32;
+                // A sorted run keeps each fragment's addresses contiguous, so
+                // the segment for `fragment` is a prefix of `rest`.
+                let end = rest
+                    .iter()
+                    .position(|addr| (addr >> 32) as u32 != fragment)
+                    .unwrap_or(rest.len());
+                let (segment, tail) = rest.split_at(end);
+                let (offsets, sorted) = buckets
+                    .entry(fragment)
+                    .or_insert_with(|| (Vec::new(), true));
+                if *sorted && offsets.last().is_some_and(|&last| last > first as u32) {
+                    *sorted = false;
+                }
+                offsets.extend(segment.iter().map(|addr| *addr as u32));
+                rest = tail;
+            }
+        }
+
+        let inner = buckets
+            .into_iter()
+            .map(|(fragment, (mut offsets, sorted))| {
+                if !sorted {
+                    offsets.sort_unstable();
+                }
+                offsets.dedup();
+                let bitmap = RoaringBitmap::from_sorted_iter(offsets)
+                    .expect("offsets were sorted and deduplicated");
+                (fragment, RowAddrSelection::Partial(bitmap))
+            })
+            .collect();
+        Self { inner }
+    }
+
     /// Add a bitmap for a single fragment
     pub fn insert_bitmap(&mut self, fragment: u32, bitmap: RoaringBitmap) {
         self.inner
@@ -623,6 +679,24 @@ impl RowAddrTreeMap {
         let frag_id_set = frag_ids.into_iter().collect::<HashSet<_>>();
         self.inner
             .retain(|frag_id, _| frag_id_set.contains(frag_id));
+    }
+
+    /// Optimize partial fragment selections for compact serialization.
+    ///
+    /// ```
+    /// use lance_select::RowAddrTreeMap;
+    ///
+    /// let mut rows = RowAddrTreeMap::from_iter(0..1_000_000);
+    /// let unoptimized_size = rows.serialized_size();
+    /// rows.optimize();
+    /// assert!(rows.serialized_size() < unoptimized_size);
+    /// ```
+    pub fn optimize(&mut self) {
+        for selection in self.inner.values_mut() {
+            if let RowAddrSelection::Partial(bitmap) = selection {
+                bitmap.optimize();
+            }
+        }
     }
 
     /// Compute the serialized size of the set.
@@ -1268,6 +1342,57 @@ mod tests {
     }
 
     #[test]
+    fn test_from_sorted_runs() {
+        let addr = |frag: u64, off: u64| frag << 32 | off;
+
+        // No runs, and runs that are all empty, give an empty set.
+        assert_eq!(RowAddrTreeMap::from_sorted_runs([]), RowAddrTreeMap::new());
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&[][..], &[][..]]),
+            RowAddrTreeMap::new()
+        );
+
+        // A single run is taken as-is (no sort needed) and spans fragments.
+        let single = [addr(0, 3), addr(0, 9), addr(2, 1), addr(7, 0)];
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&single[..]]),
+            rows(&single)
+        );
+
+        // Interleaved runs whose fragments overlap: every bucket must be
+        // re-sorted and the union must match the naive construction.
+        let run_a = [addr(0, 5), addr(1, 2), addr(1, 8), addr(3, 4)];
+        let run_b = [addr(0, 1), addr(0, 6), addr(1, 3), addr(2, 0)];
+        let run_c = [addr(1, 0), addr(3, 4), addr(3, 5)]; // repeats addr(3, 4)
+        let expected: Vec<u64> = run_a
+            .iter()
+            .chain(run_b.iter())
+            .chain(run_c.iter())
+            .copied()
+            .collect();
+        let actual = RowAddrTreeMap::from_sorted_runs([&run_a[..], &run_b[..], &run_c[..]]);
+        assert_eq!(actual, rows(&expected));
+        assert_eq!(actual.len(), Some(10));
+
+        // Runs that touch disjoint fragment ranges never need a sort, and a
+        // later run that continues a bucket in order keeps it sorted too.
+        let lo = [addr(0, 0), addr(0, 1)];
+        let hi = [addr(0, 2), addr(5, 0)];
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&lo[..], &hi[..]]),
+            rows(&[addr(0, 0), addr(0, 1), addr(0, 2), addr(5, 0)])
+        );
+
+        // Bare stable row ids (no fragment bits) all land in bucket 0.
+        let ids_a = [1_u64, 4, 9];
+        let ids_b = [2_u64, 4, 10];
+        assert_eq!(
+            RowAddrTreeMap::from_sorted_runs([&ids_a[..], &ids_b[..]]),
+            rows(&[1, 2, 4, 9, 10])
+        );
+    }
+
+    #[test]
     fn test_row_addr_mask_construction() {
         let full_mask = RowAddrMask::all_rows();
         assert_eq!(full_mask.max_len(), None);
@@ -1470,6 +1595,22 @@ mod tests {
         assert!(
             err.to_string().contains("only 0 bytes remain"),
             "expected a length complaint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_row_addr_tree_map_optimize_compacts_dense_ranges() {
+        let mut rows = RowAddrTreeMap::from_iter(0..1_000_000);
+        let unoptimized_size = rows.serialized_size();
+
+        rows.optimize();
+
+        assert!(rows.serialized_size() < unoptimized_size);
+        let mut serialized = Vec::with_capacity(rows.serialized_size());
+        rows.serialize_into(&mut serialized).unwrap();
+        assert_eq!(
+            RowAddrTreeMap::deserialize_from(serialized.as_slice()).unwrap(),
+            rows
         );
     }
 

@@ -32,6 +32,8 @@ _BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
+# Default sequential read-ahead size in bytes.
+DEFAULT_BLOB_BUFFER_SIZE = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -385,58 +387,99 @@ class BlobColumn:
         return BlobIterator(iter(self.blob_column))
 
 
-class BlobFile(io.RawIOBase):
-    """Represents a blob in a Lance dataset as a file-like object."""
+class BlobFile(io.BufferedIOBase):
+    """Represents a blob in a Lance dataset as a file-like object.
 
-    def __init__(self, inner: LanceBlobFile):
-        """
-        Internal only:  To obtain a BlobFile use
-        :py:meth:`lance.dataset.Dataset.take_blobs`.
-        """
+    ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+    do not change the sequential cursor.
+
+    Obtain a handle from :py:meth:`lance.dataset.Dataset.take_blobs`.
+    """
+
+    def __init__(
+        self,
+        inner: LanceBlobFile,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
+    ):
+        super().__init__()
         self.inner = inner
+        self.inner.set_buffer_size(_validate_buffer_size(buffer_size))
+        self._raw = _RawBlobFile(inner)
 
-    ## Note: most methods undocumented since they are defined by
-    ## the base class.
     def close(self) -> None:
-        self.inner.close()
+        self._raw.close()
 
     @property
     def closed(self) -> bool:
-        return self.inner.is_closed()
+        return self._raw.closed
 
     def readable(self) -> bool:
         return True
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        if whence == io.SEEK_SET:
-            self.inner.seek(offset)
-        elif whence == io.SEEK_CUR:
-            self.inner.seek(self.inner.tell() + offset)
-        elif whence == io.SEEK_END:
-            self.inner.seek(self.inner.size() + offset)
-        else:
-            raise ValueError(f"Invalid whence: {whence}")
-
-        return self.inner.tell()
+        return self._raw.seek(offset, whence)
 
     def seekable(self) -> bool:
         return True
 
     def tell(self) -> int:
-        return self.inner.tell()
+        return self._raw.tell()
 
     def size(self) -> int:
         """
         Returns the size of the blob in bytes.
         """
-        return self.inner.size()
+        return self._raw.size()
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            return self._raw.readall()
+        if size == 0:
+            return b""
+        buf = bytearray(size)
+        n = self.readinto(buf)
+        if n == size:
+            return bytes(buf)
+        return bytes(buf[:n])
+
+    def read1(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            size = io.DEFAULT_BUFFER_SIZE
+        return self._raw.read(size)
 
     def readall(self) -> bytes:
-        return self.inner.readall()
+        if self.closed:
+            raise ValueError("read of closed file")
+        return self._raw.readall()
+
+    def readinto(self, b) -> int:
+        if isinstance(b, bytearray):
+            if self.closed:
+                raise ValueError("readinto of closed file")
+            if not b:
+                return 0
+            n = self._raw.readinto(b)
+            if n == 0 or n == len(b):
+                return n
+            return n + self._refill_readinto(memoryview(b)[n:])
+
+        view = memoryview(b).cast("B")
+        if view.readonly:
+            raise TypeError(
+                "readinto() argument must be read-write bytes-like object, "
+                f"not {type(b).__name__}"
+            )
+        if self.closed:
+            raise ValueError("readinto of closed file")
+        return self._refill_readinto(view)
 
     def read_range(self, offset: int, length: int) -> bytes:
         """Read a blob-local byte range without changing the current cursor."""
-        return self.inner.read_range(offset, length)
+        return self._raw.read_range(offset, length)
 
     def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
         """
@@ -458,10 +501,83 @@ class BlobFile(io.RawIOBase):
         data : List[bytes]
             One payload per requested range, in input order.
         """
-        return self.inner.read_ranges(ranges)
-
-    def readinto(self, b: bytearray) -> int:
-        return self.inner.read_into(b)
+        return self._raw.read_ranges(ranges)
 
     def __repr__(self) -> str:
         return f"<BlobFile size={self.size()}>"
+
+    def _refill_readinto(self, view) -> int:
+        filled = 0
+        while filled < len(view):
+            n = self._raw.readinto(view[filled:])
+            if n == 0:
+                break
+            filled += n
+        return filled
+
+
+class _RawBlobFile(io.RawIOBase):
+    """One inner ``read_up_to`` per ``read`` / ``readinto``."""
+
+    def __init__(self, inner: LanceBlobFile):
+        self.inner = inner
+
+    def close(self) -> None:
+        self.inner.close()
+
+    @property
+    def closed(self) -> bool:
+        return self.inner.is_closed()
+
+    def readable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self.inner.tell() + offset
+        elif whence == io.SEEK_END:
+            position = self.inner.size() + offset
+        else:
+            raise ValueError(f"Invalid whence: {whence}")
+        if position < 0:
+            raise ValueError(f"negative seek value {position}")
+        self.inner.seek(position)
+        return self.inner.tell()
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.inner.tell()
+
+    def size(self) -> int:
+        return self.inner.size()
+
+    def readall(self) -> bytes:
+        return self.inner.readall()
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        return self.inner.read_range(offset, length)
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        return self.inner.read_ranges(ranges)
+
+    def readinto(self, b) -> int:
+        # The Rust binding requires bytearray.
+        if isinstance(b, bytearray):
+            return self.inner.read_into(b)
+        view = memoryview(b).cast("B")
+        buffer = bytearray(len(view))
+        bytes_read = self.inner.read_into(buffer)
+        view[:bytes_read] = buffer[:bytes_read]
+        return bytes_read
+
+
+def _validate_buffer_size(buffer_size: int) -> int:
+    if isinstance(buffer_size, bool) or not isinstance(buffer_size, int):
+        raise TypeError(f"buffer_size must be an int, got {type(buffer_size).__name__}")
+    if buffer_size < 0:
+        raise ValueError("buffer_size must be non-negative")
+    return buffer_size

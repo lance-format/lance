@@ -49,7 +49,7 @@ pub type RowPosition = u64;
 
 // Re-export public types used externally
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
-pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
+pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions, search_cross_column};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
 pub use pk_key::encode_pk_tuple;
@@ -324,7 +324,7 @@ impl MemIndexKind {
 ///
 /// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
 /// grow with future config (e.g. shard-specific tuning).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MemIndexConfig {
     /// BTree index for scalar fields (point lookups, range queries).
     BTree(BTreeIndexConfig),

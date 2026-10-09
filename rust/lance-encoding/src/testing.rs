@@ -35,7 +35,8 @@ use crate::{
         try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
         try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
-        try_variable_rle_block, try_variable_width_miniblock, try_variable_width_per_value,
+        try_variable_rle_block, try_variable_width_miniblock,
+        try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -141,7 +142,11 @@ impl CompressionStrategy for TestCompressionStrategy {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
-            } else if let Some(compressor) = try_variable_width_miniblock(field, data, &params)? {
+            } else if let Some(compressor) = if self.encoding == TestEncoding::StructuralSparse {
+                try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
+            } else {
+                try_variable_width_miniblock(field, data, &params)?
+            } {
                 compressor
             } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
                 compressor
@@ -496,6 +501,9 @@ async fn test_decode(
     expected: Option<Arc<dyn Array>>,
     io: Arc<dyn EncodingsIo>,
     is_structural_encoding: bool,
+    // The rows this read will schedule, used to exercise range-scoped page
+    // initialization.  `None` initializes every page (the eager path).
+    requested_ranges: Option<Arc<[Range<u64>]>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
@@ -506,7 +514,7 @@ async fn test_decode(
         128 * 1024 * 1024,
     ));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
-    let decode_scheduler = DecodeBatchScheduler::try_new(
+    let decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         &lance_schema,
         &column_indices,
         column_infos,
@@ -515,6 +523,7 @@ async fn test_decode(
         Arc::<DecoderPlugins>::default(),
         io,
         cache,
+        requested_ranges.as_deref(),
         &FilterExpression::no_filter(),
         &DecoderConfig::default(),
     )
@@ -906,6 +915,8 @@ fn tag(e: &Compression) -> &'static str {
         FixedSizeList(_) => "fixed_size_list",
         PackedStruct(_) => "packed_struct",
         VariablePackedStruct(_) => "variable_packed_struct",
+        Range(_) => "range",
+        Delta(_) => "delta",
     }
 }
 
@@ -1367,6 +1378,8 @@ async fn check_round_trip_encoding_inner(
         expected_data.clone(),
         scheduler_copy.clone(),
         is_structural_encoding,
+        // Full scan exercises the eager (initialize-everything) path.
+        None,
         |mut decode_scheduler, tx| {
             async move {
                 decode_scheduler.schedule_range(
@@ -1390,6 +1403,9 @@ async fn check_round_trip_encoding_inner(
             .map(|arr| arr.slice(range.start as usize, num_rows as usize));
         let scheduler = scheduler.clone();
         let range = range.clone();
+        // Range reads exercise the range-scoped (lazy) path: only the pages this
+        // contiguous range overlaps should be initialized.
+        let requested_ranges = Some(Arc::<[Range<u64>]>::from(vec![range.clone()]));
         test_decode(
             num_rows,
             test_cases.batch_size,
@@ -1398,6 +1414,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            requested_ranges,
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_range(
@@ -1446,6 +1463,11 @@ async fn check_round_trip_encoding_inner(
 
         let scheduler = scheduler.clone();
         let indices = indices.clone();
+        // Take reads exercise the lazy path with scattered rows. One range per
+        // index is a superset of the pages `schedule_take` later touches.
+        let requested_ranges = Some(Arc::<[Range<u64>]>::from(
+            indices.iter().map(|&i| i..i + 1).collect::<Vec<_>>(),
+        ));
         test_decode(
             num_rows,
             test_cases.batch_size,
@@ -1454,6 +1476,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            requested_ranges,
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_take(

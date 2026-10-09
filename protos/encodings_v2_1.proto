@@ -456,6 +456,41 @@ message Constant {
   optional bytes value = 1;
 }
 
+/* A metadata-only arithmetic sequence for unstable Lance 2.3 only.
+ *
+ * The value at index i is `start + step * i`. The container supplies the
+ * number of values. Writers use this encoding only when step is positive and
+ * the final value fits in the declared bit width.
+ *
+ * The input is a u32 or u64 fixed-width data block.
+ * There is no output buffer.
+ */
+message Range {
+  // The width of each decompressed value. Must be 32 or 64.
+  uint64 uncompressed_bits_per_value = 1;
+  // The first value in the sequence.
+  uint64 start = 2;
+  // The positive difference between adjacent values.
+  uint64 step = 3;
+}
+
+/* An unstable Lance 2.3 non-decreasing unsigned fixed-width sequence
+ * represented by its first value and the differences between adjacent values.
+ *
+ * The child contains one fewer value than the input. The container supplies
+ * the input cardinality. Delta has a payload exactly when its child has one.
+ *
+ * The input is a u32 or u64 fixed-width data block.
+ */
+message Delta {
+  // The width of each decompressed value. Must be 32 or 64.
+  uint64 uncompressed_bits_per_value = 1;
+  // The first uncompressed value.
+  uint64 base = 2;
+  // Compression applied to the adjacent differences.
+  CompressiveEncoding deltas = 3;
+}
+
 /* A compression scheme in which a single fixed-width block is "packed" into
  * a smaller fixed-width block values where each value has fewer bits.
  *
@@ -671,5 +706,7 @@ message CompressiveEncoding {
         FixedSizeList fixed_size_list = 11;
         PackedStruct packed_struct = 12;
         VariablePackedStruct variable_packed_struct = 13;
+        Range range = 14;
+        Delta delta = 15;
     }
 }

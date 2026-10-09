@@ -141,6 +141,23 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+
+    fn decompress_exact(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        expected_bytes: usize,
+    ) -> Result<()> {
+        self.decompress(input_buf, output_buf)?;
+        if output_buf.len() != expected_bytes {
+            return Err(Error::invalid_input(format!(
+                "General compression produced {} bytes, expected {expected_bytes}",
+                output_buf.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn config(&self) -> CompressionConfig;
 }
 
@@ -290,6 +307,65 @@ mod zstd {
             Ok(())
         }
 
+        fn decompress_exact(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+            expected_bytes: usize,
+        ) -> Result<()> {
+            if input_buf.is_empty() {
+                if expected_bytes == 0 {
+                    return Ok(());
+                }
+                return Err(Error::invalid_input(format!(
+                    "Zstd payload is empty, expected {expected_bytes} output bytes"
+                )));
+            }
+            let compressed = if self.is_raw_stream_format(input_buf) {
+                input_buf
+            } else {
+                let declared = u64::from_le_bytes(input_buf[..8].try_into().map_err(|_| {
+                    Error::invalid_input("Zstd payload is shorter than its 8-byte length prefix")
+                })?);
+                let declared = usize::try_from(declared).map_err(|_| {
+                    Error::invalid_input("Zstd declared output length does not fit usize")
+                })?;
+                if declared != expected_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "Zstd declares {declared} output bytes, expected {expected_bytes}"
+                    )));
+                }
+                &input_buf[8..]
+            };
+            let start = output_buf.len();
+            let end = start
+                .checked_add(expected_bytes)
+                .ok_or_else(|| Error::invalid_input("Zstd output buffer length overflows usize"))?;
+            output_buf
+                .try_reserve_exact(expected_bytes)
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Zstd could not reserve {expected_bytes} output bytes: {error}"
+                    ))
+                })?;
+            output_buf.resize(end, 0);
+            let decoded = decompress_to_buffer(compressed, &mut output_buf[start..]);
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    output_buf.truncate(start);
+                    return Err(error.into());
+                }
+            };
+            if decoded != expected_bytes {
+                output_buf.truncate(start);
+                return Err(Error::invalid_input(format!(
+                    "Zstd produced {decoded} bytes, expected {expected_bytes}"
+                )));
+            }
+            Ok(())
+        }
+
         fn config(&self) -> CompressionConfig {
             CompressionConfig {
                 scheme: CompressionScheme::Zstd,
@@ -358,6 +434,56 @@ mod lz4 {
             Ok(())
         }
 
+        fn decompress_exact(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+            expected_bytes: usize,
+        ) -> Result<()> {
+            let declared = input_buf.get(..4).ok_or_else(|| {
+                Error::invalid_input("LZ4 payload is shorter than its 4-byte length prefix")
+            })?;
+            let declared =
+                u32::from_le_bytes(declared.try_into().map_err(|_| {
+                    Error::invalid_input("LZ4 payload has an invalid length prefix")
+                })?) as usize;
+            if declared != expected_bytes {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 declares {declared} output bytes, expected {expected_bytes}"
+                )));
+            }
+            let start = output_buf.len();
+            let end = start
+                .checked_add(expected_bytes)
+                .ok_or_else(|| Error::invalid_input("LZ4 output buffer length overflows usize"))?;
+            output_buf
+                .try_reserve_exact(expected_bytes)
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "LZ4 could not reserve {expected_bytes} output bytes: {error}"
+                    ))
+                })?;
+            output_buf.resize(end, 0);
+            let decoded =
+                ::lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start..]);
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    output_buf.truncate(start);
+                    return Err(Error::invalid_input(format!(
+                        "LZ4 decompression error: {error}"
+                    )));
+                }
+            };
+            if decoded != expected_bytes {
+                output_buf.truncate(start);
+                return Err(Error::invalid_input(format!(
+                    "LZ4 produced {decoded} bytes, expected {expected_bytes}"
+                )));
+            }
+            Ok(())
+        }
+
         fn config(&self) -> CompressionConfig {
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
@@ -377,6 +503,22 @@ impl BufferCompressor for NoopBufferCompressor {
     }
 
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        output_buf.extend_from_slice(input_buf);
+        Ok(())
+    }
+
+    fn decompress_exact(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        expected_bytes: usize,
+    ) -> Result<()> {
+        if input_buf.len() != expected_bytes {
+            return Err(Error::invalid_input(format!(
+                "Uncompressed payload has {} bytes, expected {expected_bytes}",
+                input_buf.len()
+            )));
+        }
         output_buf.extend_from_slice(input_buf);
         Ok(())
     }
@@ -722,6 +864,21 @@ mod tests {
         }
 
         #[test]
+        fn test_zstd_exact_output_rejects_declared_length() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+            let mut output = Vec::new();
+            let error = compressor
+                .decompress_exact(&compressed, &mut output, 7)
+                .unwrap_err();
+            assert!(error.to_string().contains("expected 7"));
+            assert!(output.is_empty());
+        }
+
+        #[test]
         fn test_zstd_compress_decompress_multiple_times() {
             let compressor = ZstdBufferCompressor::new(0);
             let (input_data_1, input_data_2) = (b"Hello ", b"World");
@@ -824,6 +981,21 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+        }
+
+        #[test]
+        fn test_lz4_exact_output_rejects_declared_length() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+            let mut output = Vec::new();
+            let error = compressor
+                .decompress_exact(&compressed, &mut output, 7)
+                .unwrap_err();
+            assert!(error.to_string().contains("declares"));
+            assert!(output.is_empty());
         }
 
         #[rstest::rstest]

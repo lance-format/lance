@@ -23,12 +23,17 @@ use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
+#[cfg(feature = "fp16kernels")]
+use crate::distance::HalfBackend;
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
 ))]
 use crate::distance::{BatchIter, BatchKernel, BatchKind, BatchOperation};
-use crate::distance::{assert_batch_layout, assert_equal_lengths, int8_query_to_f32};
+use crate::distance::{
+    HALF_KERNELS_COMPILED, HalfType, assert_batch_layout, assert_equal_lengths, half_backend,
+    int8_query_to_f32, x86_half_features,
+};
 #[cfg(all(
     target_arch = "x86_64",
     not(all(target_feature = "avx2", target_feature = "fma"))
@@ -49,21 +54,20 @@ fn dot_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
-    let x_chunks = to.chunks_exact(LANES);
-    let y_chunks = from.chunks_exact(LANES);
-    let sum = if x_chunks.remainder().is_empty() {
+    let (x_chunks, x_remainder) = to.as_chunks::<LANES>();
+    let (y_chunks, y_remainder) = from.as_chunks::<LANES>();
+    let sum = if x_remainder.is_empty() {
         Output::zero()
     } else {
-        x_chunks
-            .remainder()
+        x_remainder
             .iter()
-            .zip(y_chunks.remainder().iter())
+            .zip(y_remainder.iter())
             .map(|(&x, &y)| x.as_() * y.as_())
             .sum::<Output>()
     };
     // Use known size to allow LLVM to kick in auto-vectorization.
     let mut sums = [Output::zero(); LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             sums[i] += x[i].as_() * y[i].as_();
         }
@@ -140,9 +144,15 @@ impl Dot for bf16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match *SIMD_SUPPORT {
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::Bf16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 bf16_kernel::dot_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(
@@ -150,19 +160,19 @@ impl Dot for bf16 {
                 kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 bf16_kernel::dot_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 bf16_kernel::dot_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 bf16_kernel::dot_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 bf16_kernel::dot_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
@@ -197,9 +207,15 @@ impl Dot for f16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match *SIMD_SUPPORT {
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::F16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(
@@ -207,24 +223,24 @@ impl Dot for f16 {
                 kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 kernel::dot_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the f16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
+            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
+            // route; this fallback only extends the tiers the C kernel already
+            // served to Avx512FP16 after checking F16C and FMA.
             _ => dot_scalar::<Self, f32, 32>(x, y),
         }
     }
@@ -364,7 +380,7 @@ impl BatchOperation for DotBatch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let product = _mm256_mul_ps(key_values, vector_values);
                 f(acc, unsafe { hsum256_ps(product) })
@@ -388,7 +404,7 @@ impl BatchOperation for DotBatch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let product = _mm256_mul_ps(key_values, vector_values);
                 f(acc, unsafe { hsum256_ps(product) })

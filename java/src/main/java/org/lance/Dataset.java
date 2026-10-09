@@ -71,6 +71,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -460,6 +461,7 @@ public class Dataset implements Closeable {
         openNative(
             path,
             options.getVersion(),
+            options.getRef(),
             options.getBlockSize(),
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
@@ -484,6 +486,7 @@ public class Dataset implements Closeable {
   private static native Dataset openNative(
       String path,
       Optional<Long> version,
+      Optional<Ref> ref,
       Optional<Integer> blockSize,
       long indexCacheSize,
       long metadataCacheSizeBytes,
@@ -1482,6 +1485,10 @@ public class Dataset implements Closeable {
    * counts matching row addresses, which is more efficient than scanning when the index covers the
    * filter column.
    *
+   * <p>Planning is pinned to {@code indexName}. A filter that cannot be answered by that scalar
+   * index is rejected instead of scanning the table or selecting another index. Deleted rows are
+   * excluded.
+   *
    * @param indexName the name of the scalar index to use
    * @param filter the filter expression (e.g., "column = 5")
    * @param fragmentIds optional list of fragment IDs to restrict the count to
@@ -1499,8 +1506,57 @@ public class Dataset implements Closeable {
     }
   }
 
+  /**
+   * Count rows matching a filter using explicit physical segments of a scalar index.
+   *
+   * <p>Only {@code segmentUuids} are opened. Their current fragment coverage defines the count
+   * scope: matching deleted rows inside that scope are excluded, and rows outside it are not
+   * counted. When {@code fragmentIds} is omitted, the scope is derived from that coverage. When it
+   * is present, its set must equal the coverage; order does not matter. A mismatch is rejected with
+   * an error that reports both sets.
+   *
+   * <p>The selection is accepted only when it includes every segment that contributes to that
+   * coverage. After fragment reuse, one source segment can advertise every destination fragment
+   * while still depending on its siblings. An incomplete selection is rejected, and the error names
+   * the missing segment UUIDs. A segment whose coverage does not overlap the selection can be
+   * queried alone.
+   *
+   * <p>An empty segment list, duplicate segment UUIDs, an unknown UUID, a UUID from a different
+   * index, or a segment without fragment coverage is rejected. The existing three-argument method
+   * remains available and does not take a segment list.
+   *
+   * @param indexName the logical scalar index name that every selected segment must belong to
+   * @param filter the filter expression (e.g., "column = 5")
+   * @param segmentUuids physical segment UUIDs to open; must be non-empty and contain no duplicates
+   * @param fragmentIds optional fragment IDs that must match the selected segments' current
+   *     coverage
+   * @return count of matching rows in the selected segment scope
+   */
+  public long countIndexedRows(
+      String indexName,
+      String filter,
+      List<UUID> segmentUuids,
+      Optional<List<Integer>> fragmentIds) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+      Preconditions.checkArgument(
+          filter != null && !filter.isEmpty(), "filter cannot be null or empty");
+      Preconditions.checkNotNull(segmentUuids, "segmentUuids cannot be null");
+      Preconditions.checkArgument(!segmentUuids.isEmpty(), "segmentUuids cannot be empty");
+      return nativeCountIndexedRowsWithSegments(indexName, filter, segmentUuids, fragmentIds);
+    }
+  }
+
   private native long nativeCountIndexedRows(
       String indexName, String filter, Optional<List<Integer>> fragmentIds);
+
+  private native long nativeCountIndexedRowsWithSegments(
+      String indexName,
+      String filter,
+      List<UUID> segmentUuids,
+      Optional<List<Integer>> fragmentIds);
 
   /**
    * Calculate the size of the dataset.
@@ -1934,6 +1990,33 @@ public class Dataset implements Closeable {
 
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
+  private static void checkReadBufferSize(long bufferSize) {
+    if (bufferSize < 0) {
+      throw new IllegalArgumentException("bufferSize must be non-negative");
+    }
+  }
+
+  static void setBlobReadBufferSize(List<BlobFile> blobs, long bufferSize) throws IOException {
+    try {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.setReadBufferSize(bufferSize);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          try {
+            blob.close();
+          } catch (IOException | RuntimeException closeError) {
+            e.addSuppressed(closeError);
+          }
+        }
+      }
+      throw e;
+    }
+  }
+
   /**
    * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
    * with Rust/Python.
@@ -1969,6 +2052,19 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Open {@link BlobFile} handles and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobs(List<Long> rowIds, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobs(rowIds, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
    * Open {@link BlobFile} handles for given row indices on a blob column.
    *
    * <pre>{@code
@@ -1995,6 +2091,19 @@ public class Dataset implements Closeable {
           column != null && !column.isEmpty(), "column cannot be null or empty");
       return nativeTakeBlobsByIndices(rowIndices, column);
     }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by row index and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByIndices(rowIndices, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
   }
 
   /**
@@ -2032,10 +2141,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @return a new Dataset of the branch
    */
   public Dataset createBranch(String branch, Ref ref) {
@@ -2045,10 +2156,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @param storageOptions the storage options to create branch with
    * @return a new Dataset of the branch
    */
@@ -2069,8 +2182,9 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
-   * specified (branch_name, version_number).
+   * Checkout using a unified {@link Ref} which can be a tag, the latest version on the default
+   * branch or a named branch, or a specified (branch_name, version_number). In reference contexts,
+   * {@code "main"} is an alias for the default branch.
    *
    * @param ref the checkout reference
    * @return a new Dataset instance checked out to the specified reference
@@ -2101,7 +2215,7 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag on main branch. This is left for compatibility. We should use {@link
+     * Create a new tag on the default branch. This is left for compatibility. We should use {@link
      * #create(String, Ref)} instead.
      *
      * @param tag the tag name
@@ -2116,7 +2230,8 @@ public class Dataset implements Closeable {
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void create(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "Tag name cannot be null");
@@ -2133,6 +2248,8 @@ public class Dataset implements Closeable {
      *
      * @param tag the name of the tag to create
      * @param versionNumber the version number (or commit reference) to associate with the tag
+     * @param targetBranch the branch to tag. In reference contexts, {@code "main"} is an alias for
+     *     the default branch.
      */
     @Deprecated
     public void create(String tag, long versionNumber, String targetBranch) {
@@ -2152,11 +2269,11 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version_number on main. This is left for compatibility. We should use
-     * {@link #update(String, Ref)} instead.
+     * Update a tag to a new version_number on the default branch. This is left for compatibility.
+     * We should use {@link #update(String, Ref)} instead.
      *
      * @param tag the tag name
-     * @param versionNumber the versionNumber on main.
+     * @param versionNumber the versionNumber on the default branch.
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
@@ -2167,7 +2284,8 @@ public class Dataset implements Closeable {
      * Update a tag to a new reference.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void update(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "tag cannot be null");
@@ -2219,7 +2337,8 @@ public class Dataset implements Closeable {
     /**
      * Delete a branch and its metadata.
      *
-     * @param branchName the branch to delete
+     * @param branchName the branch to delete. {@code "main"} is reserved for the default branch and
+     *     cannot be deleted as a named branch.
      */
     public void delete(String branchName) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {

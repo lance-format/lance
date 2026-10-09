@@ -47,7 +47,7 @@ use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::{
@@ -71,8 +71,8 @@ use lance_arrow::*;
 
 use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
-    SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks,
+    PreFilterSource, SelectionVectorToPrefilter,
 };
 
 mod adaptive_probe;
@@ -549,6 +549,38 @@ impl KNNVectorDistanceExec {
             input_schema: stored_schema,
             output_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
+    /// Rebuild this node with a different per-query `k`.
+    ///
+    /// A batch node bounds every query's candidates by its own `k` and carries no
+    /// enclosing top-k `SortExec`, so a caller that rewrites the plan to widen the
+    /// candidate set has nothing else to move. `k` feeds only the execute-time cut,
+    /// never the schema or plan properties, so the rest of the node carries over.
+    ///
+    /// Returns an error for a zero `k` on a batch node, matching `try_new_batch`.
+    pub fn with_k(&self, k: usize) -> Result<Self> {
+        if self.is_batch && k == 0 {
+            return Err(Error::invalid_input(
+                "k must be positive for batch KNN".to_string(),
+            ));
+        }
+        Ok(Self {
+            input: self.input.clone(),
+            query: self.query.clone(),
+            is_batch: self.is_batch,
+            query_count: self.query_count,
+            k,
+            lower_bound: self.lower_bound,
+            upper_bound: self.upper_bound,
+            column: self.column.clone(),
+            distance_type: self.distance_type,
+            retain_vector: self.retain_vector,
+            input_schema: self.input_schema.clone(),
+            output_schema: self.output_schema.clone(),
+            properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -1194,7 +1226,7 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// [`ANNIvfSubIndexExec`] and the batch [`ANNIvfBatchExec`] so the prefilter is
 /// wired identically (and, for a batch, built once and shared across queries).
 ///
-/// `overlay_block`, when `Some`, excludes rows whose index entries may be stale
+/// `masks.overlay_block`, when `Some`, excludes rows whose index entries may be stale
 /// due to a newer data overlay (see [`DatasetPreFilter::with_overlay_block`]).
 fn build_dataset_prefilter(
     dataset: Arc<Dataset>,
@@ -1202,13 +1234,16 @@ fn build_dataset_prefilter(
     prefilter_source: &PreFilterSource,
     partition: usize,
     context: Arc<datafusion::execution::context::TaskContext>,
-    overlay_block: Option<RowAddrMask>,
-    external_mask: Option<Arc<RowAddrMask>>,
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
 ) -> DataFusionResult<Arc<DatasetPreFilter>> {
     let prefilter_loader = match prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
             let stream = src_node.execute(partition, context)?;
-            Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            Some(
+                Box::new(FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition))
+                    as Box<dyn FilterLoader>,
+            )
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
             let stream = src_node.execute(partition, context)?;
@@ -1217,14 +1252,14 @@ fn build_dataset_prefilter(
         PreFilterSource::None => None,
     };
     // AND the external row-address mask into whatever the filter produced.
-    let prefilter_loader = match external_mask {
+    let prefilter_loader = match masks.external_mask {
         Some(mask) => {
             Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
         }
         None => prefilter_loader,
     };
     let mut pre_filter = DatasetPreFilter::new(dataset, indices, prefilter_loader);
-    if let Some(overlay_block) = overlay_block {
+    if let Some(overlay_block) = masks.overlay_block {
         pre_filter = pre_filter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(pre_filter))
@@ -1419,9 +1454,12 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                 let ds = ds.clone();
                 let metrics = metrics.clone();
                 async move {
-                    let index = ds
-                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
-                        .await?;
+                    let index = {
+                        let _open_timer =
+                            IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
+                        ds.open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                            .await?
+                    };
                     // Normalize cosine queries once before partition ranking.
                     let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
@@ -2300,8 +2338,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             &prefilter_source,
             partition,
             context,
-            self.overlay_block.clone(),
-            self.external_mask.clone(),
+            PreFilterMasks {
+                overlay_block: self.overlay_block.clone(),
+                external_mask: self.external_mask.clone(),
+            },
+            &self.metrics,
         )?;
         let indices_by_uuid = Arc::new(
             indices
@@ -2337,9 +2378,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                         )
                         .await?;
-                        let raw_index = ds
-                            .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
-                            .await?;
+                        let raw_index = {
+                            let _open_timer = IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
+                            ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
+                        };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
                         let (vector_type, _) = crate::index::vector::utils::get_vector_type(ds.schema(), &column)?;
                         let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref(), &vector_type)?;
@@ -2475,7 +2517,7 @@ pub fn new_knn_batch_exec(
 /// because the two-node pipeline streams one partition-list per delta through a
 /// per-query top-k, whereas the shared scan must invert queries onto partitions
 /// and keep one heap per query in a single pass. It still reuses the underlying
-/// primitives (partition load, prefilter wiring via [`build_dataset_prefilter`],
+/// primitives (partition load, prefilter wiring via `build_dataset_prefilter`,
 /// and the per-partition accumulate the index performs).
 ///
 /// Output schema: `{query_index: Int32, _distance: Float32, _rowid: UInt64}`,
@@ -2530,6 +2572,32 @@ impl ANNIvfBatchExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Returns a reference to the vector query. Its `key` holds all
+    /// [`Self::query_count`] vectors concatenated.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// Returns the number of query vectors packed into [`Self::query`].
+    pub fn query_count(&self) -> usize {
+        self.query_count
+    }
+
+    /// Returns a reference to the dataset.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Returns a reference to the index metadata.
+    pub fn indices(&self) -> &[IndexMetadata] {
+        &self.indices
+    }
+
+    /// Returns a reference to the prefilter source.
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
     }
 }
 
@@ -2640,11 +2708,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
             &self.prefilter_source,
             partition,
             context,
-            // The batch node has no data overlay to reconcile against, so no
-            // stale-row block is applied (see `ANNIvfSubIndexExec::overlay_block`).
-            None,
-            // The batch node does not support an external row-address mask.
-            None,
+            // Batch queries have no overlay or external row-address mask.
+            PreFilterMasks {
+                overlay_block: None,
+                external_mask: None,
+            },
+            &self.metrics,
         )?;
 
         let result_schema = schema.clone();
@@ -2654,9 +2723,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); query_count];
 
             for index_meta in &indices {
-                let index = ds
-                    .open_vector_index(&column, &index_meta.uuid, &metrics.index_metrics)
-                    .await?;
+                let index = {
+                    let _open_timer =
+                        IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
+                    ds.open_vector_index(&column, &index_meta.uuid, &metrics.index_metrics)
+                        .await?
+                };
                 // The scanner's `batch_index_search_supported` gate decides which
                 // indices reach this node; this check only guards against that
                 // gate and the index implementation disagreeing (an internal
@@ -3695,8 +3767,10 @@ mod tests {
     #[rstest]
     #[case::l2("l2", true)]
     #[case::cosine("cosine", true)]
-    #[case::dot("dot", false)]
+    #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
+    #[case::bounded_dot("bounded_dot", false)]
+    #[case::large_k_dot("large_k_dot", false)]
     #[case::hamming("hamming", false)]
     #[case::float16_column("f16", false)]
     #[case::float64_query("query_f64", false)]
@@ -3715,14 +3789,18 @@ mod tests {
         #[case] reads_config: bool,
     ) {
         let mut query = base_query();
-        query.k = if scenario == "large_k" { 101 } else { 1 };
+        query.k = if matches!(scenario, "large_k" | "large_k_dot") {
+            101
+        } else {
+            1
+        };
         query.key = match scenario {
             "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
             "null" => Arc::new(Float32Array::from(vec![None::<f32>])),
             "nonfinite" => Arc::new(Float32Array::from(vec![f32::NAN])),
             _ => Arc::new(Float32Array::from(vec![0.0])),
         };
-        if scenario == "bounded" {
+        if matches!(scenario, "bounded" | "bounded_dot") {
             query.maximum_nprobes = Some(2);
         } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
@@ -3743,7 +3821,7 @@ mod tests {
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
                 "cosine" => DistanceType::Cosine,
-                "dot" | "fixed_dot" => DistanceType::Dot,
+                "dot" | "fixed_dot" | "bounded_dot" | "large_k_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },
@@ -4368,6 +4446,51 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_with_k_rebuilds_the_cut_and_keeps_the_schema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
+        let query = Arc::new(Float32Array::from(vec![
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+        ])) as ArrayRef;
+        let plan = KNNVectorDistanceExec::try_new_batch(
+            input,
+            "vec",
+            query,
+            KnnBatchParams {
+                is_batch: true,
+                query_count: 2,
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+                distance_type: DistanceType::L2,
+                retain_vector: false,
+            },
+        )
+        .unwrap();
+
+        let widened = plan.with_k(7).unwrap();
+        assert_eq!(widened.k, 7);
+        assert_eq!(widened.query_count, 2);
+        assert!(widened.is_batch);
+        assert_eq!(widened.schema(), plan.schema());
+        assert_eq!(plan.k, 2, "the original node is left alone");
+
+        assert!(plan.with_k(0).is_err(), "batch k must stay positive");
+    }
+
+    #[test]
     fn test_batch_partition_statistics_aligns_with_output_schema() {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
@@ -4922,6 +5045,90 @@ mod tests {
             "warm search should report no index-file I/O, got bytes_read={}",
             warm.bytes_read
         );
+        // Cache hits eliminate I/O, not query preparation or distance/TopK work.
+        for stats in [&cold, &warm] {
+            for name in [
+                "ANNSubIndexExec_elapsed_compute",
+                "index_partition_load_time",
+                "index_partition_prepare_time",
+                "index_cpu_queue_wait_time",
+                "index_search_time",
+                "index_query_prepare_time",
+                "index_distance_topk_time",
+                "index_result_materialize_time",
+            ] {
+                assert!(
+                    stats.all_times.get(name).is_some_and(|time| *time > 0),
+                    "missing timing {name}: {:?}",
+                    stats.all_times
+                );
+            }
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_partition_prepare_metrics_cold_vs_warm(#[values(false, true)] is_prepared: bool) {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let indices = fixture.dataset.load_indices().await.unwrap();
+        let index = fixture
+            .dataset
+            .open_vector_index(
+                "vector",
+                &indices[0].uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let query = Query {
+            column: "vector".to_owned(),
+            key: fixture.get_centroid(0),
+            ..base_query()
+        };
+        let mut previous = None;
+        for is_warm in [false, true] {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let collector = IndexMetrics::new(&metrics, 0);
+            let prefilter = Arc::new(lance_index::prefilter::NoFilter);
+            // Call both entry points directly so CPU/session limits cannot silently
+            // turn the parallel-path regression into another sequential search.
+            let batch = if is_prepared {
+                let handle = index
+                    .prepare_partition_search(0, &query, prefilter, &collector)
+                    .await
+                    .unwrap();
+                index.search_prepared_partition(handle, &collector).unwrap()
+            } else {
+                index
+                    .search_in_partition(0, &query, prefilter, &collector)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(batch.num_rows(), query.k);
+            if let Some(previous) = &previous {
+                assert_eq!(&batch, previous);
+            }
+            previous = Some(batch);
+            let timings = metrics.clone_inner();
+            let prepare = timings
+                .sum_by_name("index_partition_prepare_time")
+                .unwrap()
+                .as_usize();
+            let load = timings
+                .sum_by_name("index_partition_load_time")
+                .unwrap()
+                .as_usize();
+            assert!(
+                prepare > 0,
+                "missing preparation time: prepared={is_prepared}, warm={is_warm}"
+            );
+            // DataFusion rounds zero-duration updates up to 1ns, so positivity
+            // alone cannot detect a missing preparation timer.
+            assert!(
+                prepare >= load,
+                "preparation must include partition loading"
+            );
+        }
     }
 
     /// The new I/O metrics must actually surface in `EXPLAIN ANALYZE` text on

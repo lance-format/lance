@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>13.0.0-beta.1</version>
+    <version>14.0.0-beta.8</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -505,7 +505,7 @@
                     <plugin>
                         <groupId>org.sonatype.central</groupId>
                         <artifactId>central-publishing-maven-plugin</artifactId>
-                        <version>0.8.0</version>
+                        <version>0.11.0</version>
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>ossrh</publishingServerId>

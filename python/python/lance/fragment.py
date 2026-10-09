@@ -46,6 +46,8 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
+    from pyarrow._compute import Expression
+
     from .dataset import (
         ColumnOrdering,
         DatasetBasePath,
@@ -516,9 +518,7 @@ class LanceFragment(pa.dataset.Fragment):
     def fragment_id(self):
         return self._fragment.id()
 
-    def count_rows(
-        self, filter: Optional[Union[pa.compute.Expression, str]] = None
-    ) -> int:
+    def count_rows(self, filter: Optional[Union[Expression, str]] = None) -> int:
         if isinstance(filter, pa.compute.Expression):
             return self.scanner(
                 with_row_id=True, columns=[], filter=filter
@@ -568,7 +568,7 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -586,7 +586,14 @@ class LanceFragment(pa.dataset.Fragment):
         strict_batch_size: Optional[bool] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
-        filter_str = str(filter) if filter is not None else None
+        from .dataset import LanceScanner, _serialize_expression
+
+        if isinstance(filter, pa.compute.Expression):
+            filter_str = None
+            substrait_filter = _serialize_expression(filter, self._ds._ds.schema)
+        else:
+            filter_str = str(filter) if filter is not None else None
+            substrait_filter = None
 
         columns_arg = {}
         if isinstance(columns, dict):
@@ -598,6 +605,7 @@ class LanceFragment(pa.dataset.Fragment):
         s = self._fragment.scanner(
             batch_size=batch_size,
             filter=filter_str,
+            substrait_filter=substrait_filter,
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
@@ -613,13 +621,11 @@ class LanceFragment(pa.dataset.Fragment):
             strict_batch_size=strict_batch_size,
             **columns_arg,
         )
-        from .dataset import LanceScanner
-
         snapshot = {
             "_limit": limit,
             "_filter": filter_str,
             "_search_filter": None,
-            "_substrait_filter": None,
+            "_substrait_filter": substrait_filter,
             "_prefilter": False,
             "_late_materialization": late_materialization,
             "_blob_handling": blob_handling,
@@ -687,7 +693,7 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -726,7 +732,7 @@ class LanceFragment(pa.dataset.Fragment):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -762,7 +768,7 @@ class LanceFragment(pa.dataset.Fragment):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         batch_size: Optional[int] = None,
@@ -870,8 +876,7 @@ class LanceFragment(pa.dataset.Fragment):
             right_on = left_on
 
         reader = _coerce_reader(data_obj, schema)
-        max_field_id = self._ds.max_field_id
-        metadata, schema = self._fragment.merge(reader, left_on, right_on, max_field_id)
+        metadata, schema = self._fragment.merge(reader, left_on, right_on)
         return metadata, schema
 
     @overload
@@ -1304,10 +1309,12 @@ def write_fragments(
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
     enable_stable_row_ids: bool
-        Experimental: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        Has no effect. Row ids are not assigned by this function; they are
+        assigned when the fragments are committed to a dataset (e.g. via
+        :class:`lance.LanceOperation.Append`, or
+        :class:`lance.LanceOperation.Merge` when merging staged fragments
+        with existing ones, together with :meth:`lance.LanceDataset.commit`),
+        based on whether the target dataset uses stable row ids.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.

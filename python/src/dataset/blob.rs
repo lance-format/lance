@@ -126,6 +126,18 @@ impl LanceBlobFile {
             Ok(data.len())
         }
     }
+
+    /// Sequential read-ahead size in bytes. `0` disables read-ahead.
+    pub fn set_buffer_size(&self, py: Python<'_>, buffer_size: usize) -> PyResult<()> {
+        let inner = self.inner.clone();
+        rt().block_on(Some(py), inner.set_buffer_size(buffer_size))?
+            .infer_error()
+    }
+
+    #[pyo3(name = "_range_submission_count")]
+    pub fn range_submission_count(&self) -> usize {
+        self.inner.range_submission_count()
+    }
 }
 
 impl From<InnerBlobFile> for LanceBlobFile {

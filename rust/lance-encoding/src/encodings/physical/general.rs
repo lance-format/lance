@@ -6,7 +6,9 @@ use log::trace;
 use crate::{
     Result,
     buffer::LanceBuffer,
-    compression::MiniBlockDecompressor,
+    compression::{
+        BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+    },
     data::DataBlock,
     encodings::{
         logical::primitive::miniblock::{
@@ -16,6 +18,77 @@ use crate::{
     },
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
 };
+use lance_core::Error;
+
+/// General-purpose compressor that wraps one payload-bearing block codec.
+#[derive(Debug)]
+pub struct GeneralBlockCompressor {
+    child: Box<dyn BlockCompressor>,
+    compression: CompressionConfig,
+}
+
+impl GeneralBlockCompressor {
+    pub fn new(child: Box<dyn BlockCompressor>, compression: CompressionConfig) -> Self {
+        Self { child, compression }
+    }
+}
+
+impl BlockCompressor for GeneralBlockCompressor {
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let (payload, child_encoding) = self.child.compress(data)?;
+        let payload = payload.ok_or_else(|| {
+            Error::invalid_input("General block compression requires a payload-bearing child")
+        })?;
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
+        let mut compressed = Vec::new();
+        compressor.compress(&payload, &mut compressed)?;
+        Ok((
+            Some(LanceBuffer::from(compressed)),
+            ProtobufUtils21::wrapped(self.compression, child_encoding)?,
+        ))
+    }
+}
+
+/// Bounded fixed-width decoder for a general-compressed block payload.
+#[derive(Debug)]
+pub(crate) struct FixedWidthGeneralBlockDecompressor {
+    child: Box<dyn BlockDecompressor>,
+    compression: CompressionConfig,
+    bits_per_value: u64,
+}
+
+impl FixedWidthGeneralBlockDecompressor {
+    pub(crate) fn new(
+        child: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+        bits_per_value: u64,
+    ) -> Self {
+        Self {
+            child,
+            compression,
+            bits_per_value,
+        }
+    }
+}
+
+impl BlockDecompressor for FixedWidthGeneralBlockDecompressor {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "General fixed-width block")?;
+        let expected_bytes = usize::try_from(num_values)
+            .ok()
+            .and_then(|num_values| {
+                num_values.checked_mul(usize::try_from(self.bits_per_value / 8).ok()?)
+            })
+            .ok_or_else(|| {
+                Error::invalid_input("General fixed-width output length overflows usize")
+            })?;
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
+        let mut decompressed = Vec::new();
+        compressor.decompress_exact(&data, &mut decompressed, expected_bytes)?;
+        self.child
+            .decompress(Some(LanceBuffer::from(decompressed)), num_values)
+    }
+}
 
 /// A miniblock compressor that wraps another miniblock compressor and applies
 /// general-purpose compression (LZ4, Zstd) to the resulting buffers.
