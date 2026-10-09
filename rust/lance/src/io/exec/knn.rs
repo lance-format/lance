@@ -2538,6 +2538,47 @@ pub struct ANNIvfBatchExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
+#[derive(Debug)]
+struct AnnBatchCandidate {
+    distance: f32,
+    row_id: u64,
+}
+
+impl Ord for AnnBatchCandidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl PartialOrd for AnnBatchCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for AnnBatchCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for AnnBatchCandidate {}
+
+fn push_ann_batch_candidate(
+    heap: &mut BinaryHeap<AnnBatchCandidate>,
+    candidate: AnnBatchCandidate,
+    k: usize,
+) {
+    if heap.len() < k {
+        heap.push(candidate);
+    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+        heap.pop();
+        heap.push(candidate);
+    }
+}
+
 impl ANNIvfBatchExec {
     pub fn try_new(
         dataset: Arc<Dataset>,
@@ -2719,8 +2760,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
         let result_schema = schema.clone();
         let fut = async move {
             let dim = query.key.len() / query_count;
-            // Per-query candidate (distance, row_id) pairs accumulated across deltas.
-            let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); query_count];
+            // Each max-heap retains only the best k candidates across deltas.
+            let mut candidates = (0..query_count)
+                .map(|_| BinaryHeap::<AnnBatchCandidate>::with_capacity(query.k))
+                .collect::<Vec<_>>();
 
             for index_meta in &indices {
                 let index = {
@@ -2821,13 +2864,18 @@ impl ExecutionPlan for ANNIvfBatchExec {
                             ))
                         })?
                         .as_primitive::<UInt64Type>();
-                    candidates[query_index].extend(
-                        dists
-                            .values()
-                            .iter()
-                            .copied()
-                            .zip(row_ids.values().iter().copied()),
-                    );
+                    for (distance, row_id) in dists
+                        .values()
+                        .iter()
+                        .copied()
+                        .zip(row_ids.values().iter().copied())
+                    {
+                        push_ann_batch_candidate(
+                            &mut candidates[query_index],
+                            AnnBatchCandidate { distance, row_id },
+                            query.k,
+                        );
+                    }
                 }
             }
 
@@ -2835,13 +2883,11 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut query_index_builder = Int32Builder::new();
             let mut distance_builder = Float32Builder::new();
             let mut row_id_builder = UInt64Builder::new();
-            for (query_index, cands) in candidates.iter_mut().enumerate() {
-                cands.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                cands.truncate(query.k);
-                for (distance, row_id) in cands.iter() {
+            for (query_index, heap) in candidates.into_iter().enumerate() {
+                for AnnBatchCandidate { distance, row_id } in heap.into_sorted_vec() {
                     query_index_builder.append_value(query_index as i32);
-                    distance_builder.append_value(*distance);
-                    row_id_builder.append_value(*row_id);
+                    distance_builder.append_value(distance);
+                    row_id_builder.append_value(row_id);
                 }
             }
             let batch = RecordBatch::try_new(
@@ -3120,6 +3166,37 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::single_segment(3, vec![vec![(3.0, 3), (1.0, 1), (2.0, 2)]])]
+    #[case::multiple_segments(2, vec![vec![(4.0, 4), (1.0, 3)], vec![(2.0, 2), (0.0, 1)]])]
+    #[case::empty_segment(2, vec![vec![], vec![(2.0, 2)], vec![]])]
+    #[case::fewer_than_k(4, vec![vec![(2.0, 2)], vec![(1.0, 1)]])]
+    #[case::zero_k(0, vec![vec![(1.0, 1)]])]
+    #[case::ties_and_duplicates(3, vec![vec![(1.0, 7), (1.0, 3)], vec![(1.0, 3), (1.0, 5)]])]
+    #[case::float_total_order(3, vec![vec![(f32::NAN, 1), (-0.0, 2)], vec![(0.0, 3), (f32::NEG_INFINITY, 4)]])]
+    fn test_ann_batch_candidate_merge_matches_sort(
+        #[case] k: usize,
+        #[case] segments: Vec<Vec<(f32, u64)>>,
+    ) {
+        let mut expected = segments.iter().flatten().copied().collect::<Vec<_>>();
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        expected.truncate(k);
+
+        let mut heap = BinaryHeap::with_capacity(k);
+        for segment in segments {
+            for (distance, row_id) in segment {
+                push_ann_batch_candidate(&mut heap, AnnBatchCandidate { distance, row_id }, k);
+                assert!(heap.len() <= k);
+            }
+        }
+        let actual = heap.into_sorted_vec();
+        assert_eq!(actual.len(), expected.len());
+        for (candidate, (distance, row_id)) in actual.iter().zip(expected) {
+            assert_eq!(candidate.distance.to_bits(), distance.to_bits());
+            assert_eq!(candidate.row_id, row_id);
         }
     }
 
