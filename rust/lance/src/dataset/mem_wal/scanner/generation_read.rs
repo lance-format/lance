@@ -38,14 +38,12 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 ///
 /// # Invariant
 ///
-/// A field id must keep identifying the same column while any generation holds
-/// it. A dataset migrated with
+/// A field id must name the same column for as long as any generation holds it.
+/// A dataset migrated with
 /// [`Dataset::migrate_to_non_reusable_field_ids`](crate::Dataset::migrate_to_non_reusable_field_ids)
-/// never reuses an id. Otherwise `max_field_id` is a maximum over the current
-/// schema and base fragments, so dropping a column can lower it and let the next
-/// added column reuse the id. Reads then serve the dropped column's values as
-/// the new one. Callers that retain generations must drain them before a
-/// drop/add can reuse an id.
+/// never reuses ids. Without that, a column added after a drop can get the
+/// dropped column's id, and reads then return the dropped column's values for
+/// it. Drain generations before such a drop and add.
 pub(super) struct GenerationRead {
     /// The generation's own schema, carrying its field ids.
     stored_schema: Schema,

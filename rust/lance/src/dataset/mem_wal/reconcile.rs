@@ -302,8 +302,8 @@ fn resolve_field(
     if source.data_type() == field.data_type() {
         return Ok(Source::Take(index));
     }
-    // The same column under a different scalar type. A table with a MemWAL
-    // refuses a cast, so this is a disagreement to surface rather than paper over.
+    // Same column, different type. A MemWAL table refuses type changes, so
+    // report it rather than convert.
     Err(Error::invalid_input(format!(
         "column `{name}` is stored as {} and the schema declares {}; a column's type \
          cannot change on a table with a MemWAL",
