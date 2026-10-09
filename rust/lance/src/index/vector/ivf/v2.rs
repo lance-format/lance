@@ -68,9 +68,8 @@ use lance_index::vector::storage::{
     IndexFileKey, LayeredLazyConfig, OriginLatencyClass, PlaneAccessTracker, QueryResidual,
     QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach,
     ResidentColumns, ResidentColumnsSetting, ResidentPreopen, ResidentStoreSize, VectorStore,
-    entry_columns_setting, origin_latency_setting, resident_attach_setting,
-    resident_columns_setting, resident_lifetime_setting, resident_store_fits,
-    shares_resident_store, sign_bounds_setting,
+    entry_columns_setting, origin_latency_setting, resident_columns_setting,
+    resident_lifetime_setting, resident_store_fits, shares_resident_store, sign_bounds_setting,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -1744,7 +1743,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_resident_columns(resident_store)
             .with_resident_columns_enabled(resident_columns)
             .with_entry_columns(Self::entry_columns_at_open()?)
-            .with_resident_attach(Self::resident_attach_at_open()?)
             .with_index_file(index_file);
         // Load the store before any read needs it. The scheduler records the
         // load's requests with the rest of the open's I/O, so the load adds
@@ -2066,20 +2064,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         entry_columns_setting()
     }
 
-    /// How an opening index's reads attach the resident rows to the whole
-    /// partitions and planes they never cache: an IVF_RQ index reads (and
-    /// validates) `LANCE_RQ_RESIDENT_ATTACH`; any other index keeps no
-    /// resident store and takes the default.
-    fn resident_attach_at_open() -> Result<ResidentAttach> {
-        if Q::quantization_type() != QuantizationType::Rabit {
-            return Ok(ResidentAttach::default());
-        }
-        resident_attach_setting()
-    }
-
     /// How reads attach the resident rows to the whole partitions and
-    /// planes they never cache, resolved when the index opened; see
-    /// `LANCE_RQ_RESIDENT_ATTACH` and
+    /// planes they never cache; see
     /// [`IvfQuantizationStorage::resident_attach`].
     pub fn resident_attach(&self) -> ResidentAttach {
         self.storage.resident_attach()
@@ -4062,7 +4048,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         .with_resident_columns(resident_columns)
         .with_resident_columns_enabled(resident)
         .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?)
-        .with_resident_attach(IVFIndex::<S, Q>::resident_attach_at_open()?)
         .with_index_file(index_file);
     // Load the store, unless a live index or the cache holds it, as an open
     // does. A reconstruction reports no open I/O, so the load's requests go
@@ -7909,9 +7894,9 @@ mod tests {
             IndexFileKey, LayeredLazyConfig, LazyOriginGap, LazyPromotion, OriginLatencyClass,
             PlaneSource, ResidentAttach, ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey,
             ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize, ResidentStoreViews,
-            entry_columns_setting, origin_latency_setting, resident_attach_setting,
-            resident_columns_setting, resident_lifetime_setting, resident_store_is_live,
-            resident_store_views, shares_resident_store, sign_bounds_setting,
+            entry_columns_setting, origin_latency_setting, resident_columns_setting,
+            resident_lifetime_setting, resident_store_is_live, resident_store_views,
+            shares_resident_store, sign_bounds_setting,
         };
         use lance_index::vector::{ApproxMode, PartitionSearchControl, VECTOR_RESULT_SCHEMA};
         use lance_io::ReadBatchParams;
@@ -13798,7 +13783,6 @@ mod tests {
             let _serial = LAZY_TEST_LOCK.lock().await;
             if resident_columns_setting().unwrap() != ResidentColumnsSetting::Auto
                 || entry_columns_setting().unwrap() != EntryColumns::Codes
-                || resident_attach_setting().unwrap() != ResidentAttach::Share
                 || resident_lifetime_setting().unwrap() != ResidentLifetime::Index
             {
                 return;

@@ -13,10 +13,10 @@
 //! hold that batch, or only the columns reads fetch from the file
 //! (`EntryColumns::Codes`), and every read of such an entry attaches the
 //! resident rows again: a whole partition or plane gets views of the store's
-//! buffers, each of exactly its rows' bytes, unless
-//! `LANCE_RQ_RESIDENT_ATTACH=copy`; gathered rows, and whole reads that
-//! become cache entries, get copies. A view keeps its store column's whole
-//! allocation alive until it drops, so views live within a read and never
+//! buffers, each of exactly its rows' bytes. Gathered rows, whole reads that
+//! become cache entries, and partitions streamed out of the index get
+//! copies. A view keeps its store column's whole allocation alive until it
+//! drops, so views live within a read and never
 //! reach a cache entry; [`resident_store_views`] counts the live ones and
 //! [`shares_resident_store`] tells whether a batch holds store memory.
 //!

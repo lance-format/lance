@@ -361,13 +361,12 @@ layered_lazy_counters! {
         /// on a query's critical path.
         resident_attach_ns,
         /// Of those batches, whole partitions and planes in which every
-        /// resident column shares the store's buffers
-        /// (`LANCE_RQ_RESIDENT_ATTACH=share`).
+        /// resident column shares the store's buffers.
         resident_attach_shares,
-        /// Whole partitions and planes that copied a resident column: every
-        /// one under `LANCE_RQ_RESIDENT_ATTACH=copy`, whole reads that become
-        /// cache entries (full entries, or partitions of a native index with
-        /// a graph), and columns a view cannot cover.
+        /// Whole partitions and planes that copied a resident column: reads
+        /// that become cache entries (full entries, or partitions of a native
+        /// index with a graph), partitions streamed out of the index, and
+        /// columns a view cannot cover.
         resident_attach_whole_copies,
         /// Sparse gathers, whose rows are always copied.
         resident_attach_gathers,

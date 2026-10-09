@@ -1280,7 +1280,7 @@ fn resident_lifetime_from(value: Option<&str>) -> Result<ResidentLifetime> {
 /// flat index's partition entries ([`PartitionCodes`]) hold only the columns
 /// reads fetch from the file, and every read attaches the resident rows:
 /// views of the store for whole partitions and planes, copies for gathered
-/// rows (see [`RESIDENT_ATTACH_ENV`]), so the cache keeps no second copy of
+/// rows (see [`ResidentAttach`]), so the cache keeps no second copy of
 /// the row ids and factors. An index without a resident store keeps `all`,
 /// whatever the setting (see [`EntryColumns::resolve`]). Results are the
 /// same either way. Read once per process; resolved when an index opens.
@@ -1316,14 +1316,9 @@ fn entry_columns_from(value: Option<&str>) -> Result<EntryColumns> {
 
 /// How a read of an IVF_RQ index with resident small columns attaches the
 /// store's rows to a batch of a whole partition or plane that is never
-/// cached: `share` (default) or `copy`. Gathered rows, whole reads that
+/// cached: share (default) or copy. Gathered rows, whole reads that
 /// become cache entries, and partitions streamed out of the index to its
-/// caller are always copied. An ablation and diagnostic knob: results are
-/// the same either way. Read once per process; an invalid value fails every
-/// IVF_RQ index open.
-pub const RESIDENT_ATTACH_ENV: &str = "LANCE_RQ_RESIDENT_ATTACH";
-
-/// The value of [`RESIDENT_ATTACH_ENV`].
+/// caller are always copied.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ResidentAttach {
     /// A whole partition or plane gets views of the store's buffers, each
@@ -1339,7 +1334,7 @@ pub enum ResidentAttach {
 }
 
 impl ResidentAttach {
-    /// The knob's spelling of the mode: `share` or `copy`.
+    /// The mode's name in diagnostics: `share` or `copy`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Share => "share",
@@ -1351,32 +1346,6 @@ impl ResidentAttach {
 impl std::fmt::Display for ResidentAttach {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// [`RESIDENT_ATTACH_ENV`], read once per process.
-static RESIDENT_ATTACH: LazyLock<std::result::Result<ResidentAttach, String>> =
-    LazyLock::new(|| {
-        resident_attach_from(std::env::var(RESIDENT_ATTACH_ENV).ok().as_deref())
-            .map_err(|err| err.to_string())
-    });
-
-/// The setting of [`RESIDENT_ATTACH_ENV`]. The variable is read once per
-/// process; an invalid value fails here and every IVF_RQ index open.
-pub fn resident_attach_setting() -> Result<ResidentAttach> {
-    RESIDENT_ATTACH.clone().map_err(Error::invalid_input)
-}
-
-fn resident_attach_from(value: Option<&str>) -> Result<ResidentAttach> {
-    let Some(value) = value else {
-        return Ok(ResidentAttach::default());
-    };
-    match value.trim() {
-        "share" => Ok(ResidentAttach::Share),
-        "copy" => Ok(ResidentAttach::Copy),
-        _ => Err(Error::invalid_input(format!(
-            "{RESIDENT_ATTACH_ENV}={value:?} is invalid, expected share or copy"
-        ))),
     }
 }
 
@@ -2277,9 +2246,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// Attach the resident rows to the batches of whole partitions and
-    /// planes that reads build and never cache as `resident_attach`
-    /// resolved when the index opened ([`RESIDENT_ATTACH_ENV`]); see
-    /// [`Self::resident_attach`].
+    /// planes that reads build and never cache as `resident_attach`; see
+    /// [`Self::resident_attach`]. This lets tests compare both ownership modes.
     pub fn with_resident_attach(mut self, resident_attach: ResidentAttach) -> Self {
         self.resident_attach = resident_attach;
         self
@@ -3831,12 +3799,11 @@ mod tests {
         LAZY_ORIGIN_GAP_BYTES_ENV, LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PARTIAL_PUBLISH_ENV,
         LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig,
         LazyFarPermits, LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV, OriginLatencyClass,
-        PlaneSource, QueryScratchCapacity, QueryScratchPool, RESIDENT_ATTACH_ENV,
-        RESIDENT_COLUMNS_ENV, RESIDENT_LIFETIME_ENV, ResidentAttach, ResidentColumnsSetting,
-        ResidentLifetime, ResidentStoreSize, SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV,
-        SignBounds, compact_prewarm_batches, entry_columns_from, entry_columns_setting,
-        origin_latency_from, origin_latency_setting, origin_reads_whole_plane, plan_plane_gather,
-        resident_attach_from, resident_attach_setting, resident_columns_from,
+        PlaneSource, QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV,
+        RESIDENT_LIFETIME_ENV, ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize,
+        SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches,
+        entry_columns_from, entry_columns_setting, origin_latency_from, origin_latency_setting,
+        origin_reads_whole_plane, plan_plane_gather, resident_columns_from,
         resident_columns_setting, resident_lifetime_from, resident_lifetime_setting,
         resident_store_fits, sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from,
         sign_bounds_setting, spawn_prewarm_materialization,
@@ -4705,36 +4672,6 @@ mod tests {
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             let message = error.to_string();
             assert!(message.contains(ENTRY_COLUMNS_ENV), "{error}");
-            assert!(message.contains(&format!("{value:?}")), "{error}");
-        }
-    }
-
-    /// `share` by default; `copy` is the only other spelling.
-    #[test]
-    fn test_resident_attach_knob() {
-        let process = std::env::var(RESIDENT_ATTACH_ENV).ok();
-        assert_eq!(
-            resident_attach_setting().ok(),
-            resident_attach_from(process.as_deref()).ok()
-        );
-        assert_eq!(ResidentAttach::default(), ResidentAttach::Share);
-        assert_eq!(resident_attach_from(None).unwrap(), ResidentAttach::Share);
-        assert_eq!(
-            resident_attach_from(Some(" copy ")).unwrap(),
-            ResidentAttach::Copy
-        );
-        for setting in [ResidentAttach::Share, ResidentAttach::Copy] {
-            assert_eq!(
-                resident_attach_from(Some(setting.as_str())).unwrap(),
-                setting
-            );
-            assert_eq!(setting.to_string(), setting.as_str());
-        }
-        for value in ["on", "SHARE", "views", ""] {
-            let error = resident_attach_from(Some(value)).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-            let message = error.to_string();
-            assert!(message.contains(RESIDENT_ATTACH_ENV), "{error}");
             assert!(message.contains(&format!("{value:?}")), "{error}");
         }
     }
