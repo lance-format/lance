@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
@@ -89,6 +90,7 @@ pub struct ObjectWriter {
     state: UploadState,
     path: Arc<Path>,
     cursor: usize,
+    upload_parallelism: NonZeroUsize,
     buffer: Vec<u8>,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
@@ -290,10 +292,26 @@ impl UploadState {
 }
 
 impl ObjectWriter {
+    /// Creates a writer, rejecting `LANCE_UPLOAD_CONCURRENCY=0` before allocating
+    /// an upload buffer or issuing any requests.
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
+        Self::with_upload_parallelism(object_store, path, max_upload_parallelism())
+    }
+
+    fn with_upload_parallelism(
+        object_store: &LanceObjectStore,
+        path: &Path,
+        upload_parallelism: usize,
+    ) -> Result<Self> {
+        let upload_parallelism = NonZeroUsize::new(upload_parallelism).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "LANCE_UPLOAD_CONCURRENCY must be greater than zero, got {upload_parallelism}"
+            ))
+        })?;
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
+            upload_parallelism,
             path: Arc::new(path.clone()),
             buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
@@ -493,7 +511,7 @@ impl AsyncWrite for ObjectWriter {
                     part_idx,
                     futures,
                     ..
-                } if futures.len() < max_upload_parallelism() => {
+                } if futures.len() < mut_self.upload_parallelism.get() => {
                     // Read before the buffer is swapped out: capacity is the
                     // part size this body was filled to, which grows as the
                     // upload progresses.
@@ -578,7 +596,9 @@ impl AsyncWrite for ObjectWriter {
                     part_idx,
                 } => {
                     // Flush final batch
-                    if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
+                    if !mut_self.buffer.is_empty()
+                        && futures.len() < mut_self.upload_parallelism.get()
+                    {
                         // We can just use `take` since we don't need the buffer anymore.
                         let part_size = mut_self.buffer.capacity();
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
@@ -602,6 +622,17 @@ impl AsyncWrite for ObjectWriter {
 
                     // We handle the transition from in progress to completing here.
                     if futures.is_empty() {
+                        // No task can wake this writer if the tail could not be submitted.
+                        // Never report success while accepted bytes remain buffered.
+                        if !mut_self.buffer.is_empty() {
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "cannot complete multipart upload of {}: {} bytes remain buffered \
+                                 with no outstanding parts (LANCE_UPLOAD_CONCURRENCY={})",
+                                mut_self.path,
+                                mut_self.buffer.len(),
+                                mut_self.upload_parallelism
+                            ))));
+                        }
                         let path = mut_self.path.clone();
                         let bytes_written = mut_self.cursor;
                         self.state.in_progress_to_completing(path, bytes_written);
@@ -862,6 +893,7 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
         PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult, UploadPart,
     };
+    use rstest::rstest;
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -1401,6 +1433,92 @@ mod tests {
             message.contains(FAILING_UPLOAD_PATH),
             "should name the object being written: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_zero_upload_parallelism_rejected_before_upload() {
+        let store = LanceObjectStore::memory();
+        let path = Path::from("zero-concurrency.lance");
+        let error = ObjectWriter::with_upload_parallelism(&store, &path, 0)
+            .err()
+            .expect("zero concurrency must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("LANCE_UPLOAD_CONCURRENCY"));
+        assert!(error.to_string().contains("got 0"));
+        assert_eq!(store.io_stats_snapshot().write_iops, 0);
+        assert!(matches!(
+            store.inner.head(&path).await.unwrap_err(),
+            object_store::Error::NotFound { .. }
+        ));
+    }
+
+    #[rstest]
+    #[case::empty(0, 0)]
+    #[case::below_boundary(1, -1)]
+    #[case::at_boundary(1, 0)]
+    #[case::above_boundary(1, 16)]
+    #[case::multipart_tail(2, 1)]
+    #[tokio::test]
+    async fn test_upload_parallelism_round_trip(
+        #[case] full_parts: usize,
+        #[case] tail: isize,
+        #[values(Some(1), None)] upload_parallelism: Option<usize>,
+    ) {
+        let store = LanceObjectStore::memory();
+        let path = Path::from("round-trip.lance");
+        let mut writer = match upload_parallelism {
+            Some(upload_parallelism) => {
+                ObjectWriter::with_upload_parallelism(&store, &path, upload_parallelism).unwrap()
+            }
+            None => ObjectWriter::new(&store, &path).await.unwrap(),
+        };
+        let size = (initial_upload_size() * full_parts)
+            .checked_add_signed(tail)
+            .unwrap();
+        let payload = (0..size).map(|i| i as u8).collect::<Vec<_>>();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
+            writer.write_all(&payload).await.unwrap();
+            Writer::shutdown(&mut writer).await.unwrap()
+        })
+        .await
+        .expect("valid concurrency must not stall writes or shutdown");
+        assert_eq!(result.size, payload.len());
+        let persisted = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(persisted.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_tail_at_concurrency_one() {
+        let (store, gate) = FailingUploadStore::gated(FailAt::Nothing);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+        let mut writer =
+            ObjectWriter::with_upload_parallelism(&lance_store, &Path::from("gated-tail.lance"), 1)
+                .unwrap();
+        let payload = (0..initial_upload_size() + 16)
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        writer.write_all(&payload).await.unwrap();
+        await_part_in_flight(&observations).await;
+
+        assert!(futures::poll!(Box::pin(AsyncWriteExt::shutdown(&mut writer))).is_pending());
+        assert_eq!(writer.buffer.len(), 16);
+        assert!(matches!(writer.state, UploadState::InProgress { .. }));
+
+        gate.add_permits(GATE_RELEASE);
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, payload.len());
+        let mut parts = observations.parts.lock().unwrap().clone();
+        parts.sort_by_key(|(part_idx, _)| *part_idx);
+        assert_eq!(parts.len(), 2);
+        let assembled = parts
+            .into_iter()
+            .flat_map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(assembled, payload);
     }
 
     #[tokio::test]
