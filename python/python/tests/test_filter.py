@@ -8,6 +8,7 @@ import random
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import lance
 import numpy as np
@@ -75,6 +76,23 @@ def test_simple_predicates(dataset):
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
 
 
+def test_pyarrow_predicate_with_default_row_id(tmp_path: Path):
+    table = pa.table({"uid": [1, 2, 3], "number": [10, 20, 10]})
+    lance.write_dataset(table, tmp_path)
+    dataset = lance.dataset(tmp_path, default_scan_options={"with_row_id": True})
+
+    actual = dataset.to_table(filter=pc.field("number") == 10)
+
+    expected = pa.table(
+        {
+            "uid": [1, 3],
+            "number": [10, 10],
+            "_rowid": pa.array([0, 2], pa.uint64()),
+        }
+    )
+    assert actual == expected
+
+
 def test_sql_predicates(dataset):
     # Predicate and expected number of rows
     predicates_nrows = [
@@ -106,6 +124,28 @@ def test_sql_predicates(dataset):
 
     for expr, expected_num_rows in predicates_nrows:
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us"])
+@pytest.mark.parametrize("timezone", [None, "UTC", "America/New_York"])
+def test_timestamp_pyarrow_predicates(tmp_path: Path, unit: str, timezone: str | None):
+    # PyArrow filters reach Lance as Substrait, where the timestamp literal used to be
+    # decoded in the wrong unit.
+    tz = ZoneInfo(timezone) if timezone else None
+    start = datetime(2021, 1, 1, tzinfo=tz)
+    ts_type = pa.timestamp(unit, timezone)
+    table = pa.table(
+        {"ts": pa.array([start + timedelta(hours=i) for i in range(100)], ts_type)}
+    )
+    dataset = lance.write_dataset(table, tmp_path / f"{unit}_{timezone}")
+
+    cutoff = pa.scalar(start + timedelta(hours=50), ts_type)
+    for expr in [
+        pc.field("ts") > cutoff,
+        pc.field("ts") < cutoff,
+        pc.field("ts") == cutoff,
+    ]:
+        assert dataset.to_table(filter=expr) == table.filter(expr)
 
 
 def test_sql_current_date(tmp_path: Path):

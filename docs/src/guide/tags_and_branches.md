@@ -15,10 +15,12 @@ The `reference` parameter (used in `create`, `update`, and `checkout_version`) a
 - An **integer**: version number in the **current branch** (e.g., `1`)
 - A **string**: tag name (e.g., `"stable"`)
 - A **tuple** `(branch_name, version)`: a specific version in a named branch
-  - `(None, 2)` means version 2 on the main branch
-  - `("main", 2)` means version 2 on the main branch (explicit)
+  - `(None, 2)` means version 2 on the default branch
+  - `("main", 2)` means version 2 on the default branch (explicit)
   - `("experiment", 3)` means version 3 on the experiment branch
   - `("branch-name", None)` means the latest version on that branch
+
+In reference contexts, `"main"` is an alias for the default branch and is equivalent to `None`.
 
 !!! note
 
@@ -77,7 +79,7 @@ The `reference` parameter works the same as for Tags (see above).
 
     Each branch maintains its own linear version history, so version numbers may overlap across branches. Use `(branch_name, version_number)` tuples as global identifiers for operations like `checkout_version` and `tags.create`.
 
-    "main" is a reserved branch name. Lance uses "main" to identify the default branch.
+    `"main"` is reserved for the default branch. Use `"main"` or `None` when referring to the default branch in reference tuples or checkout APIs, but choose a different name when creating, deleting, or updating branches.
 
 ### Create and checkout branches
 ```python
@@ -99,6 +101,8 @@ ds.tags.create("experiment-rc", ("experiment", None))
 experiment_rc = ds.checkout_version("experiment-rc")
 # Checkout the latest version of the experimental branch by tuple
 experiment_latest = ds.checkout_version(("experiment", None))
+# Checkout the latest version of the default branch explicitly
+main_latest = ds.checkout_version(("main", None))
 
 # Create a new branch from a tag
 new_experiment = ds.create_branch("new-experiment", "experiment-rc")

@@ -7,6 +7,8 @@
 //! vector dimension as a u8 after linearly mapping [min, max] → [0, 255].
 //! Distance computation between SQ-encoded vectors reduces to a u8 × u8
 //! dot product plus precomputed per-vector scalar terms.
+//! The u32 entry points return the low 32 bits, while [`dot_u8_u64`] chunks
+//! those kernels to produce the full result used by SQ.
 //!
 //! Backends (selected at runtime, best available wins):
 //!   1. scalar     — portable reference, also used for tails
@@ -28,16 +30,18 @@
 
 use std::sync::OnceLock;
 
-use super::assert_equal_lengths;
+use super::{U8_U32_ACCUMULATOR_MAX_LEN, assert_equal_lengths};
 
 /// Portable scalar u8 dot product, also used for SIMD tail elements.
+///
+/// The result is the low 32 bits of the exact dot product. Use
+/// [`dot_u8_u64`] when the full result is required.
 #[inline]
 pub fn dot_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
     a.iter()
         .zip(b.iter())
-        .map(|(&x, &y)| x as u32 * y as u32)
-        .sum()
+        .fold(0, |sum, (&x, &y)| sum.wrapping_add(x as u32 * y as u32))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -76,7 +80,7 @@ mod x86 {
         let mut result = _mm_cvtsi128_si32(sum128) as u32;
 
         while i < n {
-            result += a[i] as u32 * b[i] as u32;
+            result = result.wrapping_add(a[i] as u32 * b[i] as u32);
             i += 1;
         }
         result
@@ -112,7 +116,7 @@ mod x86 {
         let mut result = (biased_dot as i64 + 128 * sum_a) as u32;
 
         while i < n {
-            result += a[i] as u32 * b[i] as u32;
+            result = result.wrapping_add(a[i] as u32 * b[i] as u32);
             i += 1;
         }
         result
@@ -146,10 +150,37 @@ fn select_backend() -> DotU8Fn {
 }
 
 /// Dispatched u8 dot product, selecting the best available SIMD backend.
+///
+/// The result is the low 32 bits of the exact dot product. Use
+/// [`dot_u8_u64`] when the full result is required.
 #[inline]
 pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
     (DISPATCH.get_or_init(select_backend))(a, b)
+}
+
+/// Calculates the exact u8 dot product with a u64 accumulator.
+///
+/// This retains the runtime-selected SIMD kernel and widens its result between
+/// chunks that are guaranteed to fit in a u32.
+///
+/// # Example
+///
+/// ```
+/// use lance_linalg::distance::dot_u8::dot_u8_u64;
+///
+/// assert_eq!(dot_u8_u64(&[2, 3], &[4, 5]), 23);
+/// ```
+#[inline]
+pub fn dot_u8_u64(a: &[u8], b: &[u8]) -> u64 {
+    assert_equal_lengths(a.len(), b.len());
+    if a.len() <= U8_U32_ACCUMULATOR_MAX_LEN {
+        return dot_u8(a, b) as u64;
+    }
+    a.chunks(U8_U32_ACCUMULATOR_MAX_LEN)
+        .zip(b.chunks(U8_U32_ACCUMULATOR_MAX_LEN))
+        .map(|(a, b)| dot_u8(a, b) as u64)
+        .sum()
 }
 
 #[cfg(test)]
@@ -264,5 +295,18 @@ mod tests {
             check_all_backends(&a[..n], &b[..n], "1*1");
             assert_eq!(dot_u8_scalar(&a[..n], &b[..n]), n as u32);
         }
+    }
+
+    #[test]
+    fn overflow_is_backend_independent_and_wide_result_is_exact() {
+        let len = U8_U32_ACCUMULATOR_MAX_LEN + 1;
+        let a = vec![u8::MAX; len];
+        let b = vec![u8::MAX; len];
+        let exact = u8::MAX as u64 * u8::MAX as u64 * len as u64;
+
+        check_all_backends(&a, &b, "u32 overflow");
+        assert_eq!(dot_u8_scalar(&a, &b), exact as u32);
+        assert_eq!(dot_u8_u64(&a, &b), exact);
+        assert_eq!(crate::distance::dot::dot::<u8>(&a, &b), exact as f32);
     }
 }

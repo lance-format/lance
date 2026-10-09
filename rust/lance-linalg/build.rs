@@ -19,6 +19,7 @@ fn main() -> Result<(), String> {
     println!(
         "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
     );
+    println!("cargo::rustc-check-cfg=cfg(simd_fallback)");
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/bf16.c");
@@ -31,6 +32,11 @@ fn main() -> Result<(), String> {
     // target_os.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+
+    // Architectures without SIMD kernels back the vector types with plain arrays.
+    if !matches!(target_arch.as_str(), "x86_64" | "aarch64" | "loongarch64") {
+        println!("cargo:rustc-cfg=simd_fallback");
+    }
 
     if target_os == "windows" {
         println!(
@@ -112,7 +118,12 @@ fn main() -> Result<(), String> {
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
         // We use haswell since it's the oldest CPUs on AWS.
-        if let Err(err) = build_f16_with_flags("avx2", &["-march=haswell"]) {
+        // Keep the AVX2 L2 reductions lane-partitioned. A single reassociated
+        // float accumulator can exceed the public 1e-6 relative-error contract
+        // for long f16 vectors.
+        if let Err(err) =
+            build_f16_with_flags("avx2", &["-march=haswell", "-DPRECISE_F16_REDUCTION"])
+        {
             return Err(format!(
                 "Unable to build AVX2 f16 kernels.  Please use Clang >= 6 or GCC >= 12 or remove the fp16kernels feature.  Received error: {}",
                 err

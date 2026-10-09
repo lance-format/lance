@@ -84,6 +84,11 @@ impl std::fmt::Debug for u8x16 {
 }
 
 impl From<&[u8]> for u8x16 {
+    /// Loads the first 16 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 16 values.
     fn from(value: &[u8]) -> Self {
         assert!(
             value.len() >= 16,

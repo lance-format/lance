@@ -9,6 +9,7 @@ import pyarrow.compute as pc
 import pytest
 
 NUM_ROWS = 10_000
+READER_BRIDGE_ROWS = 100_000
 
 
 @pytest.mark.parametrize(
@@ -74,6 +75,28 @@ def sample_dataset(tmpdir_factory):
     )
 
     return lance.write_dataset(table, tmp_path)
+
+
+@pytest.fixture(scope="module")
+def reader_bridge_dataset(tmpdir_factory):
+    tmp_path = Path(tmpdir_factory.mktemp("reader_bridge"))
+    table = pa.table({"value": pa.array(range(READER_BRIDGE_ROWS), type=pa.int32())})
+    return lance.write_dataset(table, tmp_path)
+
+
+@pytest.mark.parametrize("batch_size", [64, 1024, 8192, 65536])
+@pytest.mark.parametrize(
+    "columns",
+    [pytest.param([], id="zero_columns"), pytest.param(["value"], id="i32")],
+)
+@pytest.mark.benchmark(group="scan_reader_bridge")
+def test_scan_reader_bridge(benchmark, reader_bridge_dataset, columns, batch_size):
+    scanner = reader_bridge_dataset.scanner(columns=columns, batch_size=batch_size)
+
+    def consume_reader():
+        return sum(batch.num_rows for batch in scanner.to_reader())
+
+    assert benchmark(consume_reader) == READER_BRIDGE_ROWS
 
 
 @pytest.mark.benchmark(group="scan_table")

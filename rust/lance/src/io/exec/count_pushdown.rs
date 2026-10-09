@@ -46,14 +46,12 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-#[allow(deprecated)]
-use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     coalesce_partitions::CoalescePartitionsExec,
     projection::ProjectionExec,
-    repartition::RepartitionExec,
     union::UnionExec,
 };
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
@@ -165,6 +163,12 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     }
     // LIMIT/OFFSET would change the count.
     if options.scan_range_before_filter.is_some() || options.scan_range_after_filter.is_some() {
+        return Ok(None);
+    }
+    // A physical row selection is already represented in FilteredReadExec's planned ranges.
+    // CountFromMaskExec only understands fragment scope, deletion masks, and scalar-index masks,
+    // so replacing the read would count rows outside the selected fragment-local ranges.
+    if options.physical_row_addr_prefilter.is_some() {
         return Ok(None);
     }
     // We rely on the deletion mask being applied; with_deleted_rows changes
@@ -378,52 +382,44 @@ fn build_scan_branch(
     Ok(Arc::new(partial))
 }
 
-/// Walk through row-preserving wrappers (`RepartitionExec`,
-/// `CoalesceBatchesExec`, and identity-or-empty `ProjectionExec`) that
-/// DataFusion's planner inserts between an `AggregateExec` and the leaf, and
-/// return the underlying `FilteredReadExec` if one is reached.
+/// Walk through row-preserving wrappers between an `AggregateExec` and the
+/// leaf, and return the underlying `FilteredReadExec` if one is reached.
 ///
-/// "Row-preserving" here means the wrapper changes neither the number of rows
-/// nor the predicate applied to them — it may reshape partitions, batches, or
-/// drop unused columns, but the row population at the bottom is what reaches
-/// the aggregate. That's all the rule needs from these layers, so it's safe to
-/// look past them.
+/// A wrapper qualifies by reporting [`CardinalityEffect::Equal`] with no fetch:
+/// DataFusion's `RepartitionExec` and `CoalesceBatchesExec`, or a custom node a
+/// `TableProvider` wraps around the scan. `CoalescePartitionsExec` and
+/// `CoalesceBatchesExec` report `Equal` even when a fetch caps their rows,
+/// hence the fetch check. Projections must also be identity-or-empty, so no
+/// expression is skipped.
 fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&FilteredReadExec> {
     let mut current: &dyn ExecutionPlan = plan.as_ref();
     loop {
         if let Some(filtered_read) = current.downcast_ref::<FilteredReadExec>() {
             return Some(filtered_read);
         }
-        let next: &Arc<dyn ExecutionPlan> =
-            if let Some(inner) = current.downcast_ref::<RepartitionExec>() {
-                inner.input()
-            } else if let Some(inner) = {
-                #[allow(deprecated)]
-                current.downcast_ref::<CoalesceBatchesExec>()
-            } {
-                inner.input()
-            } else if let Some(inner) = current.downcast_ref::<CoalescePartitionsExec>() {
-                inner.input()
-            } else {
-                let proj = current.downcast_ref::<ProjectionExec>()?;
-                // Only walk through projections that are row-preserving: every
-                // output expression is a direct column reference back to the
-                // input. (Empty projections trivially qualify — DataFusion uses
-                // one when a `COUNT(*)`'s argument no longer needs any actual
-                // columns.)
-                let input_schema = proj.input().schema();
-                let identity = proj.expr().iter().all(|projection_expr| {
-                    projection_expr
-                        .expr
-                        .downcast_ref::<Column>()
-                        .is_some_and(|c| c.name() == input_schema.field(c.index()).name())
-                });
-                if !identity {
-                    return None;
-                }
-                proj.input()
-            };
-        current = next.as_ref();
+        if let Some(proj) = current.downcast_ref::<ProjectionExec>() {
+            // Empty projections qualify: DataFusion uses one when a `COUNT(*)`'s
+            // argument no longer needs any columns.
+            let input_schema = proj.input().schema();
+            let identity = proj.expr().iter().all(|projection_expr| {
+                projection_expr
+                    .expr
+                    .downcast_ref::<Column>()
+                    .is_some_and(|c| c.name() == input_schema.field(c.index()).name())
+            });
+            if !identity {
+                return None;
+            }
+        }
+        if current.fetch().is_some()
+            || !matches!(current.cardinality_effect(), CardinalityEffect::Equal)
+        {
+            return None;
+        }
+        let [input] = current.children()[..] else {
+            return None;
+        };
+        current = input.as_ref();
     }
 }
 

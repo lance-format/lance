@@ -308,7 +308,8 @@ class LanceFileSession:
             If provided, creates a schema-bound writer; otherwise a lazy writer is
             created.
         data_cache_bytes : int, optional
-            Size of the row-group/page write cache in bytes.
+            Total bytes to buffer for column data before writing pages. The
+            budget is divided evenly across top-level columns.
         version : str, optional
             Lance file format version (e.g. "2"). Parsed by the Rust layer.
         keep_original_array : bool, optional
@@ -517,8 +518,9 @@ class LanceFileWriter:
             the schema will be inferred from the first batch.  If the schema
             is not specified and no data is written then the write will fail.
         data_cache_bytes: int
-            How many bytes (per column) to cache before writing a page.  The
-            default is an appropriate value based on the filesystem.
+            Total bytes to buffer for column data before writing pages. The
+            budget is divided evenly across top-level columns. By default,
+            each column uses 8 MiB.
         version: str
             The version of the file format to write.  If not specified then
             the latest stable version will be used.  Newer versions are more

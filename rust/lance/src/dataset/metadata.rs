@@ -189,6 +189,25 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 
+    /// A dataset whose columns are all **non-nullable**, so a primary key can be
+    /// installed on one. `gen_batch` produces nullable columns, and a primary
+    /// key column must not be nullable.
+    async fn dataset_with_non_nullable_columns(uri: &str, names: &[&str]) -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(
+            names
+                .iter()
+                .map(|name| ArrowField::new(*name, DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let columns: Vec<ArrayRef> = names
+            .iter()
+            .map(|_| Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(reader, uri, None).await.unwrap()
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_update_config() {
@@ -548,10 +567,7 @@ mod tests {
 
         let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
         let uri = tmp_dir.as_str();
-        let data = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+        let mut dataset = dataset_with_non_nullable_columns(uri, &["a"]).await;
         assert!(dataset.schema().unenforced_primary_key().is_empty());
 
         dataset
@@ -578,10 +594,7 @@ mod tests {
         use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 
         for truthy in ["true", "1", "yes", "TRUE", "Yes"] {
-            let data = gen_batch()
-                .col("a", array::step::<Int32Type>())
-                .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-            let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+            let mut dataset = dataset_with_non_nullable_columns("memory://", &["a"]).await;
             dataset
                 .update_field_metadata()
                 .replace("a", [(LANCE_UNENFORCED_PRIMARY_KEY, truthy)])
@@ -606,10 +619,7 @@ mod tests {
             LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
         };
 
-        let data = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let mut dataset = dataset_with_non_nullable_columns("memory://", &["a"]).await;
         dataset
             .update_field_metadata()
             .replace(
@@ -633,11 +643,7 @@ mod tests {
         // alters the set of primary key columns, is rejected.
         use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 
-        let data = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .col("b", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let mut dataset = dataset_with_non_nullable_columns("memory://", &["a", "b"]).await;
 
         // The first install of the primary key is allowed.
         dataset
@@ -682,6 +688,31 @@ mod tests {
         assert_eq!(pk[0].name, "a");
     }
 
+    /// Installing the key by field metadata skips the Arrow-schema conversion
+    /// that validates one, so a nullable target must be rejected here.
+    #[tokio::test]
+    async fn test_unenforced_primary_key_rejects_a_nullable_column() {
+        use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+
+        // `gen_batch` columns are nullable.
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let err = dataset
+            .update_field_metadata()
+            .update("a", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be nullable"),
+            "got {err:?}"
+        );
+        assert!(dataset.schema().unenforced_primary_key().is_empty());
+    }
+
     #[tokio::test]
     async fn test_unenforced_primary_key_rejects_invalid_marker() {
         // Writing a reserved primary key metadata key with a value that is not
@@ -689,10 +720,7 @@ mod tests {
         // silently ignored.
         use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 
-        let data = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let mut dataset = dataset_with_non_nullable_columns("memory://", &["a"]).await;
 
         for invalid in ["no", "false", "0", "anything-else"] {
             let err = dataset
@@ -741,10 +769,7 @@ mod tests {
 
         let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
         let uri = tmp_dir.as_str();
-        let data = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+        let mut dataset = dataset_with_non_nullable_columns(uri, &["a"]).await;
         assert!(dataset.schema().unenforced_clustering_key().is_empty());
 
         dataset
@@ -856,10 +881,7 @@ mod tests {
         // not a valid position is rejected rather than silently ignored.
         use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
 
-        let data = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let mut dataset = dataset_with_non_nullable_columns("memory://", &["a"]).await;
 
         for invalid in ["not-a-number", "", "1.5"] {
             let err = dataset
@@ -876,5 +898,59 @@ mod tests {
             );
             assert!(dataset.schema().unenforced_clustering_key().is_empty());
         }
+    }
+
+    /// A table that already carries a nullable primary key must stay writable,
+    /// including through the delete that repairs it.
+    ///
+    /// Released versions could install a key on a nullable column through this
+    /// metadata path, so such tables exist. Validating every manifest write
+    /// would make them read-only on upgrade and leave a full overwrite as the
+    /// only repair.
+    #[tokio::test]
+    async fn nullable_primary_key_stays_repairable() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri: &str = &test_dir;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), uri, None)
+            .await
+            .unwrap();
+
+        // Forge the state a released version could persist: a key on a
+        // nullable column, without passing the checks that now prevent it.
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            let field = manifest
+                .schema
+                .fields
+                .iter_mut()
+                .find(|f| f.name == "id")
+                .unwrap();
+            field.unenforced_primary_key_position = Some(1);
+        }
+
+        // Unrelated writes must still go through.
+        dataset
+            .update_config([("unrelated".to_string(), "value".to_string())])
+            .await
+            .expect("an unrelated write must not be blocked by a pre-existing bad key");
+
+        // And so must the delete that removes the offending rows -- without it
+        // there is no way to tighten the column afterwards.
+        dataset
+            .delete("id IS NULL")
+            .await
+            .expect("the repairing delete must not be blocked");
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
     }
 }

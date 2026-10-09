@@ -141,6 +141,13 @@ struct DirectDictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
+    fn variable_width_bytes(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<Option<u64>> {
+        // The decoded batch shares this page's dictionary values; Arrow
+        // concatenation may merge each page's values into one array, so charge
+        // the whole dictionary once per page.
+        Ok(Some(self.decoded_dict.data_size()))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let indices = self
             .indices_decoder
@@ -161,6 +168,37 @@ struct DictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DictionaryPageDecoder {
+    fn variable_width_bytes(&self, rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        // Decoding materializes each row's dictionary value into a plain string
+        // array.  The u8 indices are cheap to decode, so compute the exact value
+        // bytes by summing each requested row's dictionary entry length (index 0
+        // is the in-band null and contributes nothing).
+        let Some(strings) = self.decoded_dict.as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+        let indices = self.indices_decoder.decode(rows_to_skip, num_rows)?;
+        let indices = match &indices {
+            DataBlock::FixedWidth(fixed) => fixed,
+            DataBlock::Nullable(nullable) => {
+                let Some(fixed) = nullable.data.as_fixed_width_ref() else {
+                    return Ok(None);
+                };
+                fixed
+            }
+            _ => return Ok(None),
+        };
+        if indices.bits_per_value != 8 {
+            return Ok(None);
+        }
+        let mut bytes = 0u64;
+        for &code in indices.data.as_ref() {
+            if code != 0 {
+                bytes += strings.value_length((code - 1) as usize) as u64;
+            }
+        }
+        Ok(Some(bytes))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         // Decode the indices
         let indices_data = self.indices_decoder.decode(rows_to_skip, num_rows)?;
@@ -422,7 +460,10 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
+    use rstest::rstest;
 
     use super::encode_dict_indices_and_items;
 
@@ -450,28 +491,29 @@ mod tests {
         assert_eq!(&dict_items, &expected_items);
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_utf8() {
-        let field = Field::new("", DataType::Utf8, false);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_binary() {
-        let field = Field::new("", DataType::Binary, false);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_binary() {
-        let field = Field::new("", DataType::LargeBinary, true);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_utf8() {
-        let field = Field::new("", DataType::LargeUtf8, true);
-        check_basic_random(field).await;
+    async fn test_random_dictionary(
+        #[values(
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::LargeUtf8
+        )]
+        data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let nullable = matches!(data_type, DataType::LargeBinary | DataType::LargeUtf8);
+        let field = Field::new("", data_type, nullable);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -570,14 +612,25 @@ mod tests {
 
     // These tests cover the case where the input is already dictionary encoded
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_random_dictionary_input() {
+    async fn test_random_dictionary_input(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let dict_field = Field::new(
             "",
             DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
             false,
         );
-        check_basic_random(dict_field).await;
+        check_basic_random_case(dict_field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]
