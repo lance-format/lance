@@ -11,7 +11,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::ROW_ID;
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
 use lance_datagen::{RowCount, array};
 use lance_index::metrics::NoOpMetricsCollector;
@@ -54,7 +54,7 @@ fn bench_ngram(c: &mut Criterion) {
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("doc", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
         ])
         .into(),
         vec![doc_col, row_id_col],

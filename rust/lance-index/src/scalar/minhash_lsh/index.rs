@@ -167,9 +167,9 @@ fn check_index_file(
     let index_version: u32 = metadata_value(metadata, file, INDEX_VERSION_META_KEY)?
         .parse()
         .map_err(|err| corrupt(format!("invalid {INDEX_VERSION_META_KEY}: {err}")))?;
-    if index_version > MINHASH_LSH_INDEX_VERSION {
+    if index_version != MINHASH_LSH_INDEX_VERSION {
         return Err(Error::not_supported(format!(
-            "MinHash LSH index version {index_version} is newer than the supported version {MINHASH_LSH_INDEX_VERSION}"
+            "MinHash LSH index version {index_version} is not the supported version {MINHASH_LSH_INDEX_VERSION}; rebuild the index with replace=true"
         )));
     }
     let file_params =
@@ -321,11 +321,45 @@ impl MinHashLshIndex {
 
     /// Like [`Self::search_text`] for a signature computed by
     /// [`Self::query_signature`] on any segment with the same parameters.
+    ///
+    /// The index stores physical row addresses, so `mask` selects addresses
+    /// and the hits report them.
     pub async fn search_signature(
         &self,
         query: &QuerySignature,
         limit: usize,
         mask: &RowAddrMask,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<MinHashHit>> {
+        self.search_signature_impl(query, limit, mask, None, metrics)
+            .await
+    }
+
+    /// Like [`Self::search_signature`] for a caller whose `mask` and results
+    /// are in the row-id domain (a dataset with stable row ids).
+    ///
+    /// `row_addr_to_row_id` translates each candidate's stored row address,
+    /// before `mask` is applied, into the row id it is filtered and reported
+    /// by; a candidate it translates to `None` (e.g. a deleted row) is
+    /// skipped, so it never displaces a live row from the top `limit`.
+    pub async fn search_signature_as_row_ids(
+        &self,
+        query: &QuerySignature,
+        limit: usize,
+        mask: &RowAddrMask,
+        row_addr_to_row_id: &RowAddrToRowId,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<MinHashHit>> {
+        self.search_signature_impl(query, limit, mask, Some(row_addr_to_row_id), metrics)
+            .await
+    }
+
+    async fn search_signature_impl(
+        &self,
+        query: &QuerySignature,
+        limit: usize,
+        mask: &RowAddrMask,
+        row_addr_to_row_id: Option<&RowAddrToRowId>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         if query.signature.len() != self.params.num_hashes as usize {
@@ -342,8 +376,15 @@ impl MinHashLshIndex {
         if buckets.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.refine(&mut buckets, &query.signature, limit, mask, metrics)
-            .await
+        self.refine(
+            &mut buckets,
+            &query.signature,
+            limit,
+            mask,
+            row_addr_to_row_id,
+            metrics,
+        )
+        .await
     }
 
     /// Locate the bucket of every band key and position a cursor at its
@@ -673,6 +714,7 @@ impl MinHashLshIndex {
         query: &[SignatureValue],
         limit: usize,
         mask: &RowAddrMask,
+        row_addr_to_row_id: Option<&RowAddrToRowId>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         let num_hashes = query.len();
@@ -683,6 +725,7 @@ impl MinHashLshIndex {
             query,
             mask,
             remapper: self.frag_reuse_index.as_deref(),
+            row_addr_to_row_id,
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
         let missing = scorer.hits.missing();
@@ -1047,16 +1090,24 @@ struct Scorer<'a> {
     query: &'a [SignatureValue],
     mask: &'a RowAddrMask,
     remapper: Option<&'a dyn RowIdRemapper>,
+    row_addr_to_row_id: Option<&'a RowAddrToRowId>,
 }
 
 impl Scorer<'_> {
-    fn score(&mut self, row_id: u64, signature: &[SignatureValue]) {
-        let row_id = match self.remapper {
-            Some(remapper) => match remapper.remap_row_id(row_id) {
+    fn score(&mut self, row_addr: u64, signature: &[SignatureValue]) {
+        let row_addr = match self.remapper {
+            Some(remapper) => match remapper.remap_row_id(row_addr) {
+                Some(row_addr) => row_addr,
+                None => return,
+            },
+            None => row_addr,
+        };
+        let row_id = match self.row_addr_to_row_id {
+            Some(row_addr_to_row_id) => match row_addr_to_row_id(row_addr) {
                 Some(row_id) => row_id,
                 None => return,
             },
-            None => row_id,
+            None => row_addr,
         };
         if !self.mask.selected(row_id) {
             return;
@@ -1095,9 +1146,9 @@ pub(super) fn signature_columns(
 ) -> Result<(&UInt64Array, &[SignatureValue])> {
     let corrupt = |message: String| Error::corrupt_file_named(SIGNATURES_FILENAME, message);
     let row_ids = batch
-        .column_by_name(ROW_ID)
+        .column_by_name(ROW_ADDR)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
-        .ok_or_else(|| corrupt(format!("missing UInt64 column {ROW_ID}")))?;
+        .ok_or_else(|| corrupt(format!("missing UInt64 column {ROW_ADDR}")))?;
     let signatures = batch
         .column_by_name(SIGNATURE_COL)
         .and_then(|column| column.as_fixed_size_list_opt())
@@ -1281,8 +1332,12 @@ impl ScalarIndex for MinHashLshIndex {
         self.created_index(files)
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        true
+    }
+
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {

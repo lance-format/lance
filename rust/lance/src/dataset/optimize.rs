@@ -5865,7 +5865,7 @@ mod tests {
 
     /// Regression test for https://github.com/lance-format/lance/issues/8076
     ///
-    /// Zone map, bloom filter, and FM indices report matches as physical row addresses, so
+    /// Zone map, bloom filter, FM, and NGram indices report matches as physical row addresses, so
     /// compaction invalidates it even under stable row ids. Reusing it for the rewritten
     /// fragments made a filtered scan fail with an internal error (a fragment referenced
     /// by the index no longer existed) or, once translation tolerated that, silently drop
@@ -5876,6 +5876,13 @@ mod tests {
     #[case::fm(
         BuiltinIndexType::Fm,
         IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        100
+    )]
+    #[case::ngram(
+        BuiltinIndexType::NGram,
+        IndexType::NGram,
         "text",
         "contains(text, 'needle')",
         100
@@ -8625,10 +8632,84 @@ mod tests {
         assert_zonemap_is_used(&dataset).await;
     }
 
+    /// NGram stores row addresses too, so -- like the zone map above -- it
+    /// coexists with the FRI a deferred compaction writes on a stable-row-id
+    /// dataset, answering through it on load and after it is drained.
+    #[tokio::test]
+    async fn test_defer_index_remap_ngram_with_stable_row_ids() {
+        async fn assert_ngram_answers(dataset: &Dataset) {
+            let filter = "contains(cat, 'cat-1')";
+            for use_scalar_index in [false, true] {
+                let mut scanner = dataset.scan();
+                scanner.filter(filter).unwrap();
+                scanner.project(&["id"]).unwrap();
+                scanner.use_scalar_index(use_scalar_index);
+                let mut ids = scanner.try_into_batch().await.unwrap()["id"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec();
+                ids.sort_unstable();
+                assert_eq!(ids, vec![1, 10, 11], "use_scalar_index={use_scalar_index}");
+            }
+            let mut scanner = dataset.scan();
+            scanner.filter(filter).unwrap();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery") && plan.contains("cat_idx(NGram)"),
+                "Expected NGram index query in plan: {plan}"
+            );
+        }
+
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::NGram,
+                Some("cat_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_ngram_answers(&dataset).await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "a deferred compaction over an address-domain index must write an FRI"
+        );
+        assert_ngram_answers(&dataset).await;
+
+        // Draining the FRI into the index must not change any answer.
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("cat_idx", "cat", vec![merged])
+            .await
+            .unwrap();
+        assert_ngram_answers(&dataset).await;
+    }
+
     /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
     /// dataset: the FRI is applied to every index on load, and a stable row id
     /// is numerically indistinguishable from an address into fragment 0, so it
-    /// would silently rewrite the NGram index's valid row ids.
+    /// would silently rewrite the Inverted index's valid row ids.
     ///
     /// Compaction refuses to create that pair, at the plan boundary and again at
     /// the commit boundary.
@@ -8638,9 +8719,9 @@ mod tests {
         dataset
             .create_index(
                 &["cat"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
                 false,
             )
             .await
@@ -8695,9 +8776,9 @@ mod tests {
         let err = dataset
             .create_index(
                 &["cat"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
                 false,
             )
             .await
@@ -8735,9 +8816,9 @@ mod tests {
     /// at a snapshot taken before the other committed.
     ///
     /// The compaction plans and rewrites while no row-id-domain index exists, so
-    /// its plan-time guard passes. An NGram index is then created and commits: no
+    /// its plan-time guard passes. An Inverted index is then created and commits: no
     /// FRI exists yet, so its guard passes too. The compaction finally commits
-    /// from the handle it planned on, which still cannot see the NGram index,
+    /// from the handle it planned on, which still cannot see the Inverted index,
     /// and the rewrite rebases on top of the `CreateIndex`.
     ///
     /// The result is the combination both guards exist to prevent: stable row
@@ -8769,9 +8850,9 @@ mod tests {
         concurrent
             .create_index(
                 &["cat"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
                 false,
             )
             .await
@@ -8961,10 +9042,9 @@ mod tests {
     /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
     ///
     /// `cat` is a Utf8 column alongside the numeric `id`/`value` ones so a test
-    /// can build a row-id-domain index (e.g. NGram) over it -- every remaining
-    /// row-id-domain scalar index type requires a text column, unlike BTree and
-    /// Bitmap, which moved to row-address domain and no longer serve as that
-    /// fixture.
+    /// can build a row-id-domain index over it -- the only remaining
+    /// row-id-domain scalar index type, Inverted, requires a text column; the
+    /// others moved to row-address domain and no longer serve as that fixture.
     async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
         let batch = arrow_array::record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),

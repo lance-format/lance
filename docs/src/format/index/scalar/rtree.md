@@ -2,7 +2,7 @@
 
 The R-Tree index is a static, immutable 2D spatial index. It is built on bounding boxes to organize the data. This index is intended to accelerate rectangle-based pruning.
 
-It is designed as a multi-level hierarchical structure: leaf pages store tuples `(bbox, id=rowid)` for indexed geometries; branch pages aggregate child bounding boxes and store `id=pageid` pointing to child pages; a single root page encloses the entire tree. Conceptually, it can be thought of as an extension of the B+-tree to multidimensional objects, where bounding boxes act as keys for spatial pruning.
+It is designed as a multi-level hierarchical structure: leaf pages store tuples `(bbox, id=rowaddr)` for indexed geometries; branch pages aggregate child bounding boxes and store `id=pageid` pointing to child pages; a single root page encloses the entire tree. Conceptually, it can be thought of as an extension of the B+-tree to multidimensional objects, where bounding boxes act as keys for spatial pruning.
 
 The index uses a packed-build strategy where items are first sorted and then grouped into fixed-size leaf pages.
 
@@ -71,7 +71,7 @@ The R-Tree index consists of two files:
 | Column | Type     | Nullable | Description                                                                                                                                                                                                                                                     |
 |:-------|:---------|:---------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `bbox` | RectType | false    | Type is Rect defined by [geoarrow-rs](https://github.com/geoarrow/geoarrow-rs) RectType; physical storage is Struct<xmin: Float64, ymin: Float64, xmax: Float64, ymax: Float64>. Represents the node bounding box (leaf: item bbox; branch: child aggregation). |
-| `id`   | UInt64   | false    | Reuse the `id` column to store `rowid` in leaf pages and `pageid` in branch pages                                                                                                                                                                               |
+| `id`   | UInt64   | false    | Reuse the `id` column to store the physical row address (`fragment_id << 32 \| offset`) in leaf pages and `pageid` in branch pages. A segment persisted before format version 1 (`IndexMetadata::index_version`) stores row ids in leaf pages instead. |
 
 ### Nulls File Schema
 
@@ -103,9 +103,9 @@ Offsets are derived from `num_items` and `page_size` of metadata as follows:
 
 Traversal starts from the root (`pageid = num_pages - 1`):
 
-- If `page_offset < num_items` (leaf), read items `[page_offset .. page_offset + page_len)` and emit candidate `rowid`s matching the query bbox.
+- If `page_offset < num_items` (leaf), read items `[page_offset .. page_offset + page_len)` and emit candidate row addresses matching the query bbox.
 - Otherwise (branch), descend into children whose bounding boxes match the query bbox.
-- Continue until there are no more pages to visit; the union of emitted `rowid`s forms the candidate set for evaluation.
+- Continue until there are no more pages to visit; the union of emitted row addresses forms the candidate set for evaluation.
 
 ## Accelerated Queries
 

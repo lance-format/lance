@@ -30,7 +30,7 @@ use lance_index::prefilter::PreFilter;
 use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::minhash_lsh::{
     MinHashHit, MinHashLshIndex, MinHashLshIndexParams, MinHashQuery, QuerySignature,
-    SignatureGenerator, SignatureValue, TopHits, estimate_jaccard,
+    RowAddrToRowId, SignatureGenerator, SignatureValue, TopHits, estimate_jaccard,
 };
 use lance_index::vector::graph::OrderedFloat;
 use lance_select::RowAddrMask;
@@ -41,6 +41,7 @@ use super::PreFilterSource;
 use super::knn::KNN_INDEX_SCHEMA;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
 use crate::Dataset;
+use crate::dataset::rowids::live_row_addr_to_row_id_lookup;
 use crate::index::{DatasetIndexInternalExt, validate_segment_params_compatible};
 
 async fn open_minhash_segment(
@@ -223,6 +224,15 @@ impl ExecutionPlan for MinHashSearchExec {
                 open_minhash_segment(&dataset, &query.column, segment, &index_metrics)
             }))
             .await?;
+            // The prefilter and the output are in the row-id domain, which on a
+            // stable-row-id dataset differs from the row addresses an index
+            // stores, so each segment translates its candidates before
+            // filtering them.
+            let row_addr_to_row_ids =
+                try_join_all(indices.iter().zip(segments.iter()).map(|(index, segment)| {
+                    segment_row_addr_to_row_id(&dataset, index.as_ref(), segment)
+                }))
+                .await?;
             let Some(first_index) = indices.first() else {
                 return empty();
             };
@@ -251,16 +261,32 @@ impl ExecutionPlan for MinHashSearchExec {
             // Built with a loop rather than `map` so the futures own their
             // `Arc<dyn ScalarIndex>` without a higher-ranked closure lifetime.
             let mut searches = Vec::with_capacity(indices.len());
-            for index in &indices {
+            for (index, row_addr_to_row_id) in indices.iter().zip(row_addr_to_row_ids) {
                 let index: Arc<dyn ScalarIndex> = index.clone();
                 let mask = mask.clone();
                 let query_signature = query_signature.clone();
                 let metrics = index_metrics.clone();
                 searches.push(async move {
-                    minhash_segment(index.as_ref())?
-                        .search_signature(&query_signature, limit, &mask, metrics.as_ref())
-                        .await
-                        .map_err(DataFusionError::from)
+                    let segment = minhash_segment(index.as_ref())?;
+                    match row_addr_to_row_id {
+                        Some(row_addr_to_row_id) => {
+                            segment
+                                .search_signature_as_row_ids(
+                                    &query_signature,
+                                    limit,
+                                    &mask,
+                                    row_addr_to_row_id.as_ref(),
+                                    metrics.as_ref(),
+                                )
+                                .await
+                        }
+                        None => {
+                            segment
+                                .search_signature(&query_signature, limit, &mask, metrics.as_ref())
+                                .await
+                        }
+                    }
+                    .map_err(DataFusionError::from)
                 });
             }
             let mut merged = TopHits::new(limit);
@@ -293,6 +319,29 @@ impl ExecutionPlan for MinHashSearchExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+/// The translation from `segment`'s stored row addresses to row ids, or
+/// `None` when the two coincide (no stable row ids).
+async fn segment_row_addr_to_row_id(
+    dataset: &Dataset,
+    index: &dyn ScalarIndex,
+    segment: &IndexMetadata,
+) -> Result<Option<Arc<RowAddrToRowId>>> {
+    if !index.results_are_row_addresses() || !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    let fragment_ids = match &segment.fragment_bitmap {
+        Some(fragment_bitmap) => fragment_bitmap.iter().collect::<Vec<_>>(),
+        None => dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect(),
+    };
+    let lookup = live_row_addr_to_row_id_lookup(dataset, fragment_ids).await?;
+    Ok(Some(Arc::new(lookup)))
 }
 
 fn hits_batch(hits: &[MinHashHit]) -> DataFusionResult<RecordBatch> {
@@ -529,7 +578,7 @@ mod tests {
     use lance_select::{RowAddrMask, RowAddrTreeMap};
 
     use crate::dataset::scanner::Scanner;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::{Dataset, Result};
 
@@ -574,12 +623,17 @@ mod tests {
 
     /// Twelve rows split over three fragments with a MinHash index on `text`.
     async fn indexed_dataset() -> Dataset {
+        indexed_dataset_with(false).await
+    }
+
+    async fn indexed_dataset_with(enable_stable_row_ids: bool) -> Dataset {
         let reader = RecordBatchIterator::new(vec![Ok(batch(0, &texts()))], schema());
         let mut dataset = Dataset::write(
             reader,
             "memory://",
             Some(WriteParams {
                 max_rows_per_file: 4,
+                enable_stable_row_ids,
                 ..Default::default()
             }),
         )
@@ -715,6 +769,39 @@ mod tests {
         assert_eq!(dataset.fragments().len(), 2);
         assert!(ids(&dataset, dropped, 2, |_| {}).await.is_empty());
         assert_eq!(ids(&dataset, BASE, 3, |_| {}).await, vec![0, 1]);
+    }
+
+    /// With stable row ids the index stores row addresses, which the search
+    /// translates to the row ids its prefilter and output use.
+    #[tokio::test]
+    async fn test_minhash_search_with_stable_row_ids() {
+        let dataset = indexed_dataset_with(true).await;
+        // Row 6 lives in the second fragment, where its address and its row id
+        // differ.
+        let moved = texts()[6];
+        assert_eq!(ids(&dataset, moved, 2, |_| {}).await, vec![6]);
+        let prefiltered = ids(&dataset, BASE, 2, |scan| {
+            scan.filter("id >= 1").unwrap().prefilter(true);
+        })
+        .await;
+        assert_eq!(prefiltered, vec![3, 1]);
+
+        // An update moves row 6 to a new fragment under the same row id and
+        // deletes its old slot, which the index still lists. That slot must
+        // not resolve to the moved row, whose new text is unrelated.
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 6")
+            .unwrap()
+            .set("text", "'nothing shares any shingle with the old text'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        assert!(ids(&dataset, moved, 2, |_| {}).await.is_empty());
+        assert_eq!(ids(&dataset, BASE, 3, |_| {}).await, vec![0, 3, 1]);
     }
 
     #[tokio::test]

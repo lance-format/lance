@@ -26,11 +26,11 @@ struct SignedBatch {
 
 fn sign_batch(mut generator: SignatureGenerator, batch: RecordBatch) -> Result<SignedBatch> {
     let row_ids = batch
-        .column_by_name(ROW_ID)
+        .column_by_name(ROW_ADDR)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
         .ok_or_else(|| {
             Error::invalid_input(format!(
-                "MinHash LSH training data must contain a non-null UInt64 column {ROW_ID}"
+                "MinHash LSH training data must contain a non-null UInt64 column {ROW_ADDR}"
             ))
         })?;
     let values = batch.column_by_name(VALUE_COLUMN_NAME).ok_or_else(|| {

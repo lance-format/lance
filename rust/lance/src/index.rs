@@ -14051,10 +14051,10 @@ mod tests {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        // A text column alongside `two_column_reader`'s numeric ones: every
-        // remaining row-id-domain scalar index type (NGram here) requires text,
-        // unlike BTree and Bitmap, which moved to row-address domain and no
-        // longer exercise this test.
+        // A text column alongside `two_column_reader`'s numeric ones: the only
+        // remaining row-id-domain scalar index type (Inverted) requires text;
+        // the others moved to row-address domain and no longer exercise this
+        // test.
         fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
             lance_datagen::gen_batch()
                 .col("id", array::step::<Int32Type>())
@@ -14076,11 +14076,11 @@ mod tests {
 
         // Row-id-domain: its coverage is recalculated (not dropped) across a
         // rewrite under stable row ids, which is exactly the property this test
-        // checks. BTree and Bitmap moved to row-address domain and no longer
-        // exercise it.
-        let ngram_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        // checks. The other scalar index types moved to row-address domain and
+        // no longer exercise it.
+        let inverted_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
         dataset
-            .create_index_builder(&["text"], IndexType::NGram, &ngram_params)
+            .create_index_builder(&["text"], IndexType::Inverted, &inverted_params)
             .name("id_idx".to_string())
             .train(false)
             .await

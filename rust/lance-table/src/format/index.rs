@@ -168,12 +168,27 @@ impl IndexMetadata {
             // support (`LABEL_LIST_NULLS_MIN_VERSION`), not address domain.
             let is_label_list_addr_domain =
                 details.type_url.ends_with("LabelListIndexDetails") && self.index_version >= 2;
+            // Likewise for NGram and RTree, from format version 1 onward
+            // (`lance_index::scalar::ngram::NGRAM_ROW_ADDR_DOMAIN_VERSION`,
+            // `lance_index::scalar::rtree::RTREE_ROW_ADDR_DOMAIN_VERSION`).
+            let is_ngram_addr_domain =
+                details.type_url.ends_with("NGramIndexDetails") && self.index_version >= 1;
+            let is_rtree_addr_domain =
+                details.type_url.ends_with("RTreeIndexDetails") && self.index_version >= 1;
+            // MinHash LSH is an unstable format that only reads its current
+            // version (`lance_index::scalar::minhash_lsh::MINHASH_LSH_INDEX_VERSION`),
+            // which stores row addresses.
+            let is_minhash_addr_domain =
+                details.type_url.ends_with("MinHashLshIndexDetails") && self.index_version >= 1;
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
                 || is_btree_addr_domain
                 || is_bitmap_addr_domain
                 || is_label_list_addr_domain
+                || is_ngram_addr_domain
+                || is_rtree_addr_domain
+                || is_minhash_addr_domain
         })
     }
 
@@ -684,24 +699,31 @@ mod tests {
         assert_eq!(metadata.results_are_row_addrs(), expected);
     }
 
-    #[test]
-    fn test_results_are_row_addrs_btree_is_version_gated() {
+    #[rstest]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", 1)]
+    #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", 1)]
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", 1)]
+    #[case::minhash_lsh("type.googleapis.com/lance.index.pb.MinHashLshIndexDetails", 1)]
+    fn test_results_are_row_addrs_is_version_gated(
+        #[case] type_url: &str,
+        #[case] row_addr_domain_version: i32,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
+            type_url: type_url.to_string(),
             value: Vec::new(),
         }));
 
-        metadata.index_version = 0;
+        metadata.index_version = row_addr_domain_version - 1;
         assert!(
             !metadata.results_are_row_addrs(),
-            "a legacy BTree segment stores row ids directly"
+            "a legacy segment stores row ids directly"
         );
 
-        metadata.index_version = 1;
+        metadata.index_version = row_addr_domain_version;
         assert!(
             metadata.results_are_row_addrs(),
-            "a BTree segment built with address-domain support stores row addresses"
+            "a segment built with address-domain support stores row addresses"
         );
     }
 

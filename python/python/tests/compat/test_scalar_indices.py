@@ -833,6 +833,97 @@ class NgramIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
+@compat_test(min_version="0.39.0")
+class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
+    """Test NGRAM forward/backward compatibility across the row-address-domain
+    format change.
+
+    min_version is 0.39.0, not NgramIndex's 0.36.0, because this test's whole
+    point is an old build correctly ignoring an index format version newer
+    than it understands -- and that mechanism itself was only introduced in
+    0.39.0 (#4906).
+
+    NGRAM was changed to store physical row addresses (``_rowaddr``) instead
+    of row ids, which bumped its on-disk format version to 1. This dataset
+    enables stable row ids, so the two domains genuinely differ and updating
+    a pre-change segment must rebuild it rather than merge new data into it.
+    An older build must ignore an index the current build has touched (its
+    format version is too new) but still answer every query correctly via a
+    full scan, and must not error out when writing to the dataset afterwards.
+
+    Without stable row ids the current build keeps writing format version 0,
+    which NgramIndex above checks every build keeps using.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create a stable-row-id dataset with an NGRAM index."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "ngram": pa.array([f"word{i}" for i in range(1000)]),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+            enable_stable_row_ids=True,
+        )
+        dataset.create_scalar_index("ngram", "NGRAM")
+
+    def _assert_queryable(self, expect_index_used: bool):
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="contains(ngram, 'word7')")
+        # word7, word70-79, word700-799 = 111 results
+        assert table.num_rows == 111
+
+        explain = ds.scanner(filter="contains(ngram, 'word7')").explain_plan()
+        used_index = "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+        if expect_index_used:
+            assert used_index, "expected the NGRAM index to be used"
+        else:
+            assert not used_index, (
+                "an older build must not use an NGRAM index in a format it "
+                "does not understand -- it should fall back to a full scan"
+            )
+
+    def check_read(self):
+        """An old-format index must be used by the current build; a
+        too-new one must be safely ignored (but answers must stay correct)
+        by an older build."""
+        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+
+    def check_write(self):
+        """Insert a row and update the index, then verify old and new rows
+        both stay correct -- whether or not this build can even see the
+        index."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "ngram": pa.array(["word1000"]),
+            }
+        )
+        ds.insert(data)
+        # For the current build updating a legacy row-id-domain segment,
+        # this must rebuild (not merge) the index -- see the class docstring.
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="contains(ngram, 'word7')")
+        assert table.num_rows == 111
+        # `check_write` runs more than once across the upgrade/downgrade
+        # round trip, each time inserting another `word1000` row.
+        table = ds.to_table(filter="contains(ngram, 'word1000')")
+        assert table.num_rows >= 1
+
+
 @compat_test(min_version="0.36.0")
 class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
     """Test ZONEMAP and BLOOMFILTER index compatibility (introduced in 0.36.0)."""

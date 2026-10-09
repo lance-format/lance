@@ -30,7 +30,7 @@ fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
 fn text_stream(rows: &[(Option<&str>, u64)], batch_rows: usize) -> SendableRecordBatchStream {
     let schema = Arc::new(Schema::new(vec![
         Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     let batches: Vec<datafusion::error::Result<RecordBatch>> = rows
         .chunks(batch_rows.max(1))

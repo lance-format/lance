@@ -343,6 +343,68 @@ impl IndexDetails {
     }
 }
 
+/// The format version of `index_type` from before it moved to the row-address
+/// domain, for the index types that did so with a version bump.
+fn row_id_domain_version(index_type: &str) -> Option<u32> {
+    use lance_index::scalar::{bitmap, btree, label_list, ngram};
+    let is = |builtin: BuiltinIndexType| index_type.eq_ignore_ascii_case(builtin.as_str());
+    #[cfg(feature = "geo")]
+    if is(BuiltinIndexType::RTree) {
+        return Some(lance_index::scalar::rtree::RTREE_ROW_ID_DOMAIN_VERSION);
+    }
+    if is(BuiltinIndexType::BTree) {
+        Some(btree::BTREE_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::Bitmap) {
+        Some(bitmap::BITMAP_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::LabelList) {
+        Some(label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION)
+    } else if is(BuiltinIndexType::NGram) {
+        Some(ngram::NGRAM_ROW_ID_DOMAIN_VERSION)
+    } else {
+        None
+    }
+}
+
+/// The domain (see [`IndexMetadata::results_are_row_addrs`]) shared by
+/// `segments`, for a merge that reuses their stored data without a rescan and
+/// so writes its result in that same domain.
+///
+/// Refuses segments that disagree, since their stored identifiers would be
+/// combined as-is, and -- on a dataset with stable row ids -- a segment
+/// persisted before its type moved to the row-address domain: its row ids
+/// differ from the row addresses newly scanned data holds. Such a segment
+/// must be rebuilt first (e.g. with `create_index(..., replace: true)`).
+pub(in crate::index) fn shared_segment_domain(
+    dataset: &Dataset,
+    index_type: &str,
+    segments: &[&IndexMetadata],
+) -> Result<bool> {
+    let Some(first) = segments.first() else {
+        return Ok(true);
+    };
+    let results_are_row_addrs = first.results_are_row_addrs();
+    if let Some(other) = segments
+        .iter()
+        .find(|segment| segment.results_are_row_addrs() != results_are_row_addrs)
+    {
+        return Err(Error::invalid_input(format!(
+            "{index_type} segments {} and {} disagree on whether they store row ids or row \
+             addresses and cannot be merged; rebuild the index first (e.g. with \
+             create_index(..., replace: true))",
+            first.uuid, other.uuid,
+        )));
+    }
+    if !results_are_row_addrs && dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(format!(
+            "{index_type} segment {} predates row-address-domain support and cannot be merged \
+             on a dataset with stable row IDs; rebuild it first (e.g. with \
+             create_index(..., replace: true))",
+            first.uuid,
+        )));
+    }
+    Ok(results_are_row_addrs)
+}
+
 /// Build a Scalar Index (returns details to store in the manifest)
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
@@ -440,36 +502,20 @@ pub(super) async fn build_scalar_index(
         )
         .await?;
 
-    // BTree, Bitmap, and LabelList always train on physical row addresses --
-    // the plugins' TrainingCriteria has no per-dataset awareness to vary
-    // that -- but a row address and a row id are the same value on a
-    // dataset that does not use stable row ids, so the trained page data is
-    // identical either way there. Label it with the pre-migration version in
-    // that case: an old build already understands it, so a user who never
-    // turns on stable row ids sees no forward-compatibility impact from the
-    // address-domain migration (see BTREE_ROW_ID_DOMAIN_VERSION,
-    // BITMAP_ROW_ID_DOMAIN_VERSION, and LABEL_LIST_ROW_ID_DOMAIN_VERSION).
-    // Only a stable-row-id dataset -- where the two domains genuinely
-    // diverge -- needs the address-domain version these plugins actually
-    // trained.
-    if !dataset.manifest.uses_stable_row_ids() {
-        if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
-        {
-            created_index.index_version = lance_index::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION;
-        } else if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::Bitmap.as_str())
-        {
-            created_index.index_version = lance_index::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION;
-        } else if params
-            .index_type
-            .eq_ignore_ascii_case(BuiltinIndexType::LabelList.as_str())
-        {
-            created_index.index_version =
-                lance_index::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION;
-        }
+    // BTree, Bitmap, LabelList, NGram, and RTree always train on physical
+    // row addresses -- the plugins' TrainingCriteria has no per-dataset
+    // awareness to vary that -- but a row address and a row id are the same
+    // value on a dataset that does not use stable row ids, so the trained
+    // data is identical either way there. Label it with the pre-migration
+    // version in that case: an old build already understands it, so a user
+    // who never turns on stable row ids sees no forward-compatibility impact
+    // from the address-domain migration. Only a stable-row-id dataset --
+    // where the two domains genuinely diverge -- needs the address-domain
+    // version these plugins actually trained.
+    if !dataset.manifest.uses_stable_row_ids()
+        && let Some(version) = row_id_domain_version(&params.index_type)
+    {
+        created_index.index_version = version;
     }
 
     Ok(created_index)

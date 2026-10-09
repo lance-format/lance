@@ -44,8 +44,12 @@ pub(in crate::index) async fn merge_segments(
         .min()
         .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
+    // Without stable row ids the two domains coincide, so once a row-id-domain
+    // segment is refused on a stable-row-id dataset the filters can always be
+    // address-domain. `merge_rtree_indices` keeps the sources' own domain.
+    super::shared_segment_domain(dataset, "RTree", &segment_refs)?;
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
             .await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());

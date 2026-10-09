@@ -313,6 +313,40 @@ pub(crate) async fn live_row_addrs_to_row_ids(
     row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
 }
 
+/// A synchronous version of [`live_row_addrs_to_row_ids`] for the rows of
+/// `fragment_ids`, for a caller that must translate addresses one at a time
+/// (e.g. inside a scoring loop) rather than in a batch.
+///
+/// The returned lookup yields `None` for an address in a fragment outside
+/// `fragment_ids` or no longer in the dataset, past the end of its fragment,
+/// or at a deleted physical slot. Requires stable row ids.
+pub(crate) async fn live_row_addr_to_row_id_lookup(
+    dataset: &Dataset,
+    fragment_ids: impl IntoIterator<Item = u32>,
+) -> Result<impl Fn(u64) -> Option<u64> + Send + Sync + 'static> {
+    let mut fragments = std::collections::HashMap::new();
+    for fragment_id in fragment_ids {
+        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            continue;
+        };
+        let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+        let deletion_vector = fragment.get_deletion_vector().await?;
+        fragments.insert(fragment_id, (sequence, deletion_vector));
+    }
+    Ok(move |row_addr: u64| {
+        let row_addr = RowAddress::from(row_addr);
+        let (sequence, deletion_vector) = fragments.get(&row_addr.fragment_id())?;
+        let offset = row_addr.row_offset();
+        if deletion_vector
+            .as_ref()
+            .is_some_and(|deletions| deletions.contains(offset))
+        {
+            return None;
+        }
+        sequence.get(offset as usize)
+    })
+}
+
 #[derive(Clone, Copy)]
 enum DeletedRowBehavior {
     Include,
