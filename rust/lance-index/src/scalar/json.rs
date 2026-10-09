@@ -49,7 +49,82 @@ use crate::{
     },
 };
 
-const JSON_INDEX_VERSION: u32 = 0;
+/// A JSON segment whose target index stores row ids (or, for details written
+/// before `JsonIndexDetails::target_index_version` existed, whose target's domain
+/// is whatever a build from that time wrote; see [`legacy_target_index_version`]).
+pub const JSON_ROW_ID_DOMAIN_VERSION: u32 = 0;
+
+/// A JSON segment whose target index stores physical row addresses.
+///
+/// The wrapper's own version carries its target's domain so that
+/// `IndexMetadata::results_are_row_addrs` (which only sees the wrapper's details
+/// and version) can classify the segment, and so that a build predating this
+/// version, which would load the target as row-id domain, ignores the segment
+/// instead of misreading it.
+pub const JSON_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
+
+const JSON_INDEX_VERSION: u32 = JSON_ROW_ADDR_DOMAIN_VERSION;
+
+/// The version a build predating `JsonIndexDetails::target_index_version` used
+/// when loading the target, for the targets whose format has changed since.
+///
+/// Those builds loaded the target at the target plugin's then-current version,
+/// which for BTree and Bitmap was the row-id-domain format. `None` for every
+/// other target, whose format has not changed since: its plugin's current
+/// version is still correct.
+fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32> {
+    if target_details.type_url.ends_with("BTreeIndexDetails") {
+        Some(super::btree::BTREE_ROW_ID_DOMAIN_VERSION)
+    } else if target_details.type_url.ends_with("BitmapIndexDetails") {
+        Some(super::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION)
+    } else {
+        None
+    }
+}
+
+/// Whether `index_details` belong to a JSON index whose target type moved from
+/// row ids to row addresses, so that a segment of it written before that move
+/// stores row ids while a freshly trained one stores row addresses.
+pub fn wraps_row_addr_migrated_target(index_details: &prost_types::Any) -> bool {
+    index_details.type_url.ends_with("JsonIndexDetails")
+        && crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())
+            .ok()
+            .and_then(|details| details.target_details)
+            .is_some_and(|target_details| legacy_target_index_version(&target_details).is_some())
+}
+
+/// The JSON segment version that matches the domain of a target persisted with
+/// `target_details` at `target_index_version`.
+fn json_index_version_for_target(
+    target_details: &prost_types::Any,
+    target_index_version: u32,
+) -> u32 {
+    if lance_table::format::index_details_are_row_addrs(target_details, target_index_version as i32)
+    {
+        JSON_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        JSON_ROW_ID_DOMAIN_VERSION
+    }
+}
+
+/// Relabel a freshly trained JSON segment in the pre-migration row-id-domain
+/// format.
+///
+/// Only valid on a dataset without stable row ids, where a row address and a row
+/// id are the same value, so the target's trained data is identical in either
+/// domain. Mirrors the plain BTree/Bitmap relabeling in `build_scalar_index`, and
+/// keeps such segments readable by builds that predate
+/// [`JSON_ROW_ADDR_DOMAIN_VERSION`].
+pub fn relabel_as_row_id_domain(created: &mut CreatedIndex) -> Result<()> {
+    let mut details = crate::pb::JsonIndexDetails::decode(created.index_details.value.as_slice())?;
+    let target_details = details.target_details.as_ref().expect_ok()?;
+    if let Some(row_id_version) = legacy_target_index_version(target_details) {
+        details.target_index_version = Some(row_id_version);
+    }
+    created.index_details = prost_types::Any::from_msg(&details)?;
+    created.index_version = JSON_ROW_ID_DOMAIN_VERSION;
+    Ok(())
+}
 
 /// A JSON index that indexes a field in a JSON column
 ///
@@ -58,11 +133,36 @@ const JSON_INDEX_VERSION: u32 = 0;
 pub struct JsonIndex {
     target_index: Arc<dyn ScalarIndex>,
     path: String,
+    /// This segment's own persisted version, kept through `update`/`remap` (the
+    /// target keeps its own domain through those too).
+    index_version: u32,
 }
 
 impl JsonIndex {
     pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
-        Self { target_index, path }
+        let index_version = if target_index.results_are_row_addresses() {
+            JSON_ROW_ADDR_DOMAIN_VERSION
+        } else {
+            JSON_ROW_ID_DOMAIN_VERSION
+        };
+        Self {
+            target_index,
+            path,
+            index_version,
+        }
+    }
+
+    fn created_index(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
+        let json_details = crate::pb::JsonIndexDetails {
+            path: self.path.clone(),
+            target_details: Some(target_created.index_details),
+            target_index_version: Some(target_created.index_version),
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&json_details)?,
+            index_version: self.index_version,
+            files: target_created.files,
+        })
     }
 }
 
@@ -134,16 +234,7 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.created_index(target_created)
     }
 
     async fn update(
@@ -172,16 +263,7 @@ impl ScalarIndex for JsonIndex {
             .target_index
             .update(new_data, dest_store, old_data_filter)
             .await?;
-        let json_details = crate::pb::JsonIndexDetails {
-            path: self.path.clone(),
-            target_details: Some(target_created.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
-            index_version: JSON_INDEX_VERSION,
-            files: target_created.files,
-        })
+        self.created_index(target_created)
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
@@ -211,6 +293,10 @@ impl ScalarIndex for JsonIndex {
 
     fn training_data_type(&self) -> Option<DataType> {
         self.target_index.training_data_type()
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        self.target_index.results_are_row_addresses()
     }
 }
 
@@ -1004,13 +1090,16 @@ impl BasicTrainer for JsonIndexPlugin {
             )
             .await?;
 
+        let index_version =
+            json_index_version_for_target(&target_index.index_details, target_index.index_version);
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
+            target_index_version: Some(target_index.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
-            index_version: JSON_INDEX_VERSION,
+            index_version,
             files: target_index.files,
         })
     }
@@ -1069,7 +1158,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1077,23 +1166,27 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
-        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
-        // the target's; `JsonIndexDetails` does not yet record the target's own
-        // version. Every target this wrapper builds comes from a fresh training
-        // pass in this same codebase, so it is always at that plugin's current
-        // format; passing the target's own max version is the accurate stand-in
-        // until the target's version is recorded here directly.
+        // `index_version` is this wrapper's version; the target's own is recorded
+        // separately. Details written before it was recorded get the version the
+        // writing build would itself have loaded the target at.
+        let target_index_version = json_details
+            .target_index_version
+            .or_else(|| legacy_target_index_version(target_details))
+            .unwrap_or_else(|| target_plugin.version());
         let target_index = target_plugin
             .load_index(
                 index_store,
                 target_details,
-                target_plugin.version(),
+                target_index_version,
                 frag_reuse_index,
                 cache,
             )
             .await?;
-        Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
+        Ok(Arc::new(JsonIndex {
+            target_index,
+            path: json_details.path,
+            index_version,
+        }))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -1155,6 +1248,7 @@ mod tests {
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
             path: "$.value".to_string(),
             target_details: Some(target_details),
+            target_index_version: None,
         })
         .unwrap();
 
@@ -1187,6 +1281,7 @@ mod tests {
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
             path: "$.value".to_string(),
             target_details: Some(target_details),
+            target_index_version: None,
         })
         .unwrap();
 
@@ -1347,6 +1442,43 @@ mod tests {
         path: &str,
         json_docs: &[&str],
     ) -> Arc<dyn ScalarIndex> {
+        let created = train_json_index(
+            store.as_ref(),
+            target_index_type,
+            expected_ordering,
+            path,
+            json_docs,
+        )
+        .await;
+        load_json_index(store, &created).await
+    }
+
+    async fn load_json_index(
+        store: Arc<dyn IndexStore>,
+        created: &CreatedIndex,
+    ) -> Arc<dyn ScalarIndex> {
+        IndexPluginRegistry::with_default_plugins()
+            .get_plugin_by_name("json")
+            .unwrap()
+            .load_index(
+                store,
+                &created.index_details,
+                created.index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The training half of [`train_and_load_json_index`].
+    async fn train_json_index(
+        store: &dyn IndexStore,
+        target_index_type: &str,
+        expected_ordering: TrainingOrdering,
+        path: &str,
+        json_docs: &[&str],
+    ) -> CreatedIndex {
         use crate::progress::noop_progress;
         use arrow_array::{LargeBinaryArray, UInt64Array};
         use futures::stream;
@@ -1399,19 +1531,8 @@ mod tests {
             stream::iter(vec![Ok(batch)]),
         )) as SendableRecordBatchStream;
 
-        let created = trainer
-            .train_index(data, store.as_ref(), request, None, noop_progress())
-            .await
-            .unwrap();
-
-        plugin
-            .load_index(
-                store,
-                &created.index_details,
-                0,
-                None,
-                &LanceCache::no_cache(),
-            )
+        trainer
+            .train_index(data, store, request, None, noop_progress())
             .await
             .unwrap()
     }
@@ -1518,18 +1639,7 @@ mod tests {
             .await
             .unwrap();
 
-        let registry = IndexPluginRegistry::with_default_plugins();
-        let plugin = registry.get_plugin_by_name("json").unwrap();
-        let updated = plugin
-            .load_index(
-                dest_store,
-                &created.index_details,
-                0,
-                None,
-                &LanceCache::no_cache(),
-            )
-            .await
-            .unwrap();
+        let updated = load_json_index(dest_store, &created).await;
         let result = updated
             .search(
                 &JsonQuery::new(Arc::new(query), "v".to_string()),
@@ -1686,6 +1796,137 @@ mod tests {
             parameters.target_data_type,
             Some(JsonIndexTargetType::Int64)
         );
+    }
+
+    fn decode_json_details(created: &CreatedIndex) -> crate::pb::JsonIndexDetails {
+        crate::pb::JsonIndexDetails::decode(created.index_details.value.as_slice()).unwrap()
+    }
+
+    /// The wrapper's version carries its target's domain, and the target's own
+    /// version is recorded so the target loads in the format it was written in.
+    #[rstest]
+    #[case::btree("btree", TrainingOrdering::None, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
+    #[case::bitmap("bitmap", TrainingOrdering::None, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
+    #[case::zonemap("zonemap", TrainingOrdering::Addresses, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
+    #[case::ngram("ngram", TrainingOrdering::None, &[r#"{"v": "alpha"}"#, r#"{"v": "bravo"}"#], false)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_index_version_tracks_target_domain(
+        #[case] target_index_type: &str,
+        #[case] expected_ordering: TrainingOrdering,
+        #[case] json_docs: &[&str],
+        #[case] address_domain: bool,
+    ) {
+        let (store, _tmpdir) = local_json_index_store();
+        let created = train_json_index(
+            store.as_ref(),
+            target_index_type,
+            expected_ordering,
+            "v",
+            json_docs,
+        )
+        .await;
+
+        let expected_version = if address_domain {
+            JSON_ROW_ADDR_DOMAIN_VERSION
+        } else {
+            JSON_ROW_ID_DOMAIN_VERSION
+        };
+        assert_eq!(created.index_version, expected_version);
+        assert!(decode_json_details(&created).target_index_version.is_some());
+
+        let index = load_json_index(store, &created).await;
+        assert_eq!(index.results_are_row_addresses(), address_domain);
+    }
+
+    /// Details written before the target's version was recorded came from builds
+    /// whose BTree and Bitmap stored row ids, and must still load that way.
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::bitmap("bitmap")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_legacy_details_load_target_as_row_ids(#[case] target_index_type: &str) {
+        let (store, _tmpdir) = local_json_index_store();
+        let mut created = train_json_index(
+            store.as_ref(),
+            target_index_type,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#, r#"{"v": 2}"#],
+        )
+        .await;
+        let mut details = decode_json_details(&created);
+        details.target_index_version = None;
+        created.index_details = prost_types::Any::from_msg(&details).unwrap();
+        created.index_version = JSON_ROW_ID_DOMAIN_VERSION;
+
+        let index = load_json_index(store, &created).await;
+        assert!(!index.results_are_row_addresses());
+    }
+
+    /// Relabeling (for a dataset without stable row ids) moves both the wrapper
+    /// and its target to their row-id-domain versions, and `update` keeps the
+    /// relabeled segment there rather than bumping it back.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_relabel_as_row_id_domain() {
+        let (store, _tmpdir) = local_json_index_store();
+        let mut created = train_json_index(
+            store.as_ref(),
+            "btree",
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#, r#"{"v": 2}"#],
+        )
+        .await;
+        relabel_as_row_id_domain(&mut created).unwrap();
+        assert_eq!(created.index_version, JSON_ROW_ID_DOMAIN_VERSION);
+        assert_eq!(
+            decode_json_details(&created).target_index_version,
+            Some(crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION)
+        );
+
+        let index = load_json_index(store, &created).await;
+        assert!(!index.results_are_row_addresses());
+
+        let (dest_store, _dest_dir) = local_json_index_store();
+        let updated = index
+            .update(
+                json_update_stream(&[r#"{"v": 3}"#], vec![2]),
+                dest_store.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.index_version, JSON_ROW_ID_DOMAIN_VERSION);
+        assert_eq!(
+            decode_json_details(&updated).target_index_version,
+            Some(crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION)
+        );
+    }
+
+    #[test]
+    fn test_wraps_row_addr_migrated_target() {
+        let json_over = |target: prost_types::Any| {
+            prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+                path: "v".to_string(),
+                target_details: Some(target),
+                target_index_version: None,
+            })
+            .unwrap()
+        };
+        let btree =
+            prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap();
+        let bitmap =
+            prost_types::Any::from_msg(&crate::pbold::BitmapIndexDetails::default()).unwrap();
+        let ngram =
+            prost_types::Any::from_msg(&crate::pbold::NGramIndexDetails::default()).unwrap();
+
+        assert!(wraps_row_addr_migrated_target(&json_over(btree.clone())));
+        assert!(wraps_row_addr_migrated_target(&json_over(bitmap)));
+        assert!(!wraps_row_addr_migrated_target(&json_over(ngram)));
+        assert!(!wraps_row_addr_migrated_target(&btree));
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/7859.

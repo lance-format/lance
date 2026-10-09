@@ -970,6 +970,103 @@ class JsonIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
+@compat_test(min_version="0.39.0")
+class JsonRowAddressDomainIndex(UpgradeDowngradeTest):
+    """Test JSON (over BTREE) forward/backward compatibility across the
+    row-address-domain format change.
+
+    min_version is 0.39.0, not JsonIndex's 0.36.0, because this test relies on
+    an old build ignoring an index format version newer than it understands,
+    which was only introduced in 0.39.0 (#4906).
+
+    A JSON index now records its target's own format version, and is itself
+    stamped with format version 1 when that target stores physical row
+    addresses (``_rowaddr``). This dataset enables stable row ids, so the two
+    domains genuinely differ:
+
+    - An old-format JSON index (whose BTREE target stores row ids) is loaded
+      and used correctly by the current build.
+    - Updating it with the current build rebuilds it, keeping both old and
+      new rows queryable.
+    - An older build must then ignore the rebuilt index, but still answer
+      every query correctly via a full scan, and still write to the dataset.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create a stable-row-id dataset with a JSON index over BTREE."""
+        from lance.indices import IndexConfig
+
+        shutil.rmtree(self.path, ignore_errors=True)
+        data = pa.table(
+            {
+                "idx": pa.array(range(1000)),
+                "json": pa.array([f'{{"val": {i}}}' for i in range(1000)], pa.json_()),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            max_rows_per_file=100,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+            enable_stable_row_ids=True,
+        )
+        dataset.create_scalar_index(
+            "json",
+            IndexConfig(
+                index_type="json",
+                parameters={"target_index_type": "btree", "path": "val"},
+            ),
+        )
+
+    def _assert_queryable(self, expect_index_used: bool):
+        ds = lance.dataset(self.path)
+        # Row 107 lives past the first fragment, where a row id and a row
+        # address differ.
+        table = ds.to_table(filter="json_get_int(json, 'val') == 107")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [107]
+
+        explain = ds.scanner(filter="json_get_int(json, 'val') == 107").explain_plan()
+        used_index = "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
+        if expect_index_used:
+            assert used_index, "expected the JSON index to be used"
+        else:
+            assert not used_index, (
+                "an older build must not use a JSON index in a format it "
+                "does not understand -- it should fall back to a full scan"
+            )
+
+    def check_read(self):
+        """An old-format index must be used by the current build; a too-new
+        one must be safely ignored by an older build."""
+        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+
+    def check_write(self):
+        """Insert a row and update the index, then verify old and new rows
+        both stay correct."""
+        ds = lance.dataset(self.path)
+        data = pa.table(
+            {
+                "idx": pa.array([1000]),
+                "json": pa.array(['{"val": 1000}'], pa.json_()),
+            }
+        )
+        ds.insert(data)
+        ds.optimize.optimize_indices()
+        ds.optimize.compact_files()
+
+        ds = lance.dataset(self.path)
+        table = ds.to_table(filter="json_get_int(json, 'val') == 107")
+        assert table.num_rows == 1
+        # `check_write` runs more than once across the upgrade/downgrade round
+        # trip, each time inserting another `val == 1000` row.
+        table = ds.to_table(filter="json_get_int(json, 'val') == 1000")
+        assert table.num_rows >= 1
+
+
 @compat_test(min_version="0.36.0")
 class FtsIndex(UpgradeDowngradeTest):
     """Test FTS (full-text search) index compatibility (introduced in 0.36.0)."""

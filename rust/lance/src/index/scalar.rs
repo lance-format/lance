@@ -469,6 +469,11 @@ pub(super) async fn build_scalar_index(
         {
             created_index.index_version =
                 lance_index::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION;
+        } else if params.index_type.eq_ignore_ascii_case("json") {
+            // A JSON index trains its target the same way the target's own
+            // plugin would, so the same relabeling applies to a wrapped BTree
+            // or Bitmap.
+            lance_index::scalar::json::relabel_as_row_id_domain(&mut created_index)?;
         }
     }
 
