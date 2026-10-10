@@ -6,6 +6,7 @@
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
+use crate::numeric_coercion::rewrite as rewrite_numeric;
 use datafusion::logical_expr::{Between, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::prelude::*;
@@ -96,6 +97,9 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+    if let Some(rewritten) = rewrite_numeric(expr, schema) {
+        return Ok(rewritten);
+    }
     match expr {
         Expr::Between(Between {
             expr: inner_expr,
