@@ -78,7 +78,13 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import _coerce_reader, _is_materialized
+from .types import (
+    SourceStrategy,
+    _coerce_lance_dataset,
+    _coerce_lance_scanner,
+    _coerce_reader,
+    coerce_source,
+)
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -390,19 +396,28 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The new data to use as the source table for the operation.  This parameter
             can be any source of data (e.g. table / dataset) that
             :func:`~lance.write_dataset` accepts.
+            Repeatable LanceDataset and LanceScanner sources retain their
+            dataset version and scan options across conflict retries. Scans
+            whose values or encounter order may change, including default scan
+            options on a LanceDataset, are buffered for replay instead.
+            Arrow FileSystemDataset sources without an attached filter are
+            also re-scanned; their files must remain unchanged until the merge
+            completes, including retries. Filtered FileSystemDataset sources
+            are buffered for replay because filters may be non-deterministic.
+            To buffer a repeatable source instead of reading it again on each
+            retry, pass a reader, for example ``source.scanner().to_reader()``
+            for a dataset or ``scanner.to_reader()`` for a scanner.
         schema: Optional[pa.Schema]
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        reader = _coerce_reader(data_obj, schema)
-
-        # Materialized sources are wrapped in an in-memory table so retries never
-        # spill and the source's statistics can drive the join; everything else is
-        # treated as a one-shot stream.
-        if _is_materialized(data_obj):
-            return super(MergeInsertBuilder, self).execute_batches(reader)
-
-        return super(MergeInsertBuilder, self).execute(reader)
+        source = coerce_source(data_obj, schema)
+        if source.strategy is SourceStrategy.RESCANNABLE:
+            return super().execute_rescannable(source.reader_factory, source.schema)
+        reader = source.reader_factory()
+        if source.strategy is SourceStrategy.MATERIALIZED:
+            return super().execute_batches(reader)
+        return super().execute(reader)
 
     def execute_uncommitted(
         self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
@@ -424,12 +439,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        reader = _coerce_reader(data_obj, schema)
-
-        if _is_materialized(data_obj):
-            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
-
-        return super(MergeInsertBuilder, self).execute_uncommitted(reader)
+        source = coerce_source(data_obj, schema)
+        reader = source.reader_factory()
+        if source.strategy is SourceStrategy.MATERIALIZED:
+            return super().execute_uncommitted_batches(reader)
+        # Uncommitted merges do not retry, so one reader is sufficient.
+        return super().execute_uncommitted(reader)
 
     # These next three overrides exist only to document the methods
 
@@ -819,15 +834,15 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - iops: number of I/O operations performed
         - requests: number of storage requests made
         """  # noqa: E501
-        reader = _coerce_reader(data_obj, schema)
-
-        # Route exactly as execute() does, so the reported plan is the one that
-        # would run. A materialized source reports exact statistics where a stream
-        # reports none, which can change which side of the join is collected.
-        if _is_materialized(data_obj):
-            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
-
-        return super(MergeInsertBuilder, self).analyze_plan(reader)
+        source = coerce_source(data_obj, schema)
+        if source.strategy is SourceStrategy.RESCANNABLE:
+            return super().analyze_plan_rescannable(
+                source.reader_factory, source.schema
+            )
+        reader = source.reader_factory()
+        if source.strategy is SourceStrategy.MATERIALIZED:
+            return super().analyze_plan_batches(reader)
+        return super().analyze_plan(reader)
 
     def mark_sstables_as_compacted(
         self, sstables: "List[mem_wal.CompactedSsTable]"
@@ -7623,6 +7638,10 @@ class LanceScanner(pa.dataset.Scanner):
         """
 
         return self._scanner.analyze_plan(count_rows=count_rows)
+
+
+coerce_source.register(LanceDataset)(_coerce_lance_dataset)
+coerce_source.register(LanceScanner)(_coerce_lance_scanner)
 
 
 class DatasetOptimizer:

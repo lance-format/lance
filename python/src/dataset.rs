@@ -109,6 +109,7 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::session::Session;
 use crate::storage_options::PyStorageOptionsAccessor;
 use crate::utils::PyLance;
+use crate::write_source::reader_factory_provider;
 use crate::{LanceReader, Scanner};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
@@ -492,6 +493,33 @@ impl MergeInsertBuilder {
         Ok(Self::build_stats(&stats, py)?.into())
     }
 
+    /// Execute from a source that opens a fresh reader for each scan.
+    pub fn execute_rescannable(
+        &mut self,
+        reader_factory: &Bound<PyAny>,
+        schema: PyArrowType<ArrowSchema>,
+    ) -> PyResult<Py<PyAny>> {
+        let py = reader_factory.py();
+        if !reader_factory.is_callable() {
+            return Err(PyTypeError::new_err(format!(
+                "reader_factory must be callable, got {}",
+                reader_factory.get_type().name()?
+            )));
+        }
+        let provider = reader_factory_provider(Arc::new(schema.0), reader_factory.clone().unbind())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (new_dataset, stats) = rt()
+            .spawn(Some(py), job.execute_provider(provider))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.dataset.bind(py).borrow_mut().ds = new_dataset;
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
     pub fn execute_uncommitted<'a>(
         &mut self,
         new_data: &Bound<'a, PyAny>,
@@ -617,6 +645,32 @@ impl MergeInsertBuilder {
 
         rt().block_on(None, job.analyze_plan_batches(batches))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    /// Analyze the same re-scannable source used by `execute_rescannable`.
+    pub fn analyze_plan_rescannable(
+        &mut self,
+        reader_factory: &Bound<PyAny>,
+        schema: PyArrowType<ArrowSchema>,
+    ) -> PyResult<String> {
+        let py = reader_factory.py();
+        if !reader_factory.is_callable() {
+            return Err(PyTypeError::new_err(format!(
+                "reader_factory must be callable, got {}",
+                reader_factory.get_type().name()?
+            )));
+        }
+        let provider = reader_factory_provider(Arc::new(schema.0), reader_factory.clone().unbind())
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        rt().spawn(Some(py), async move {
+            job.analyze_plan_provider(provider).await
+        })?
+        .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     /// Mark MemWAL SSTables as compacted into the base table.
