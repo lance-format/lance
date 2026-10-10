@@ -183,6 +183,12 @@ historical-index behavior and does not change the defaults in this PR.
 
 ## IVF_RQ 5bit recall
 
+[RQ5_RESULTS.md](RQ5_RESULTS.md) records the complete 30-group RQ5 Auto
+matrix and its three matched controls. Mean final recall is 86.719%–96.227%;
+6/30 groups reach 95%. All 15,360 paired Auto queries use the same partition
+counts in RQ5 and FLAT. Raw-ID audits and float64 checks of every full-RQ
+top-1 miss preserve the original strict-ID scores.
+
 [RQ5_PROTOCOL.md](RQ5_PROTOCOL.md) freezes the comparison of FLAT Auto, RQ5
 Auto, RQ5 full-partition search and the original RQ probing heuristic. The
 default Auto profiles are unchanged. RQ5 indices reuse the original centroids
