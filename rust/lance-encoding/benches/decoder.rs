@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, hint::black_box, sync::Arc};
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{RecordBatch, StringArray, UInt32Array};
 #[cfg(feature = "bitpacking")]
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -24,6 +24,7 @@ use lance_encoding::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 #[cfg(feature = "bitpacking")]
 use lance_encoding::encodings::physical::bitpacking::{ELEMS_PER_CHUNK, InlineBitpacking};
 use lance_encoding::{
+    BufferScheduler, EncodingsIo,
     decoder::{
         DecodeBatchScheduler, DecoderConfig, DecoderPlugins, EncodedBatchLayout, FilterExpression,
         create_decode_stream,
@@ -69,9 +70,9 @@ const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[DataType::Int8, DataType::Float32
 fn encoded_batch_layout(encoding: BenchEncoding) -> EncodedBatchLayout {
     match encoding {
         BenchEncoding::Array => EncodedBatchLayout::Array,
-        BenchEncoding::StructuralU16 | BenchEncoding::StructuralU32 => {
-            EncodedBatchLayout::Structural
-        }
+        BenchEncoding::StructuralU16
+        | BenchEncoding::StructuralU32
+        | BenchEncoding::StructuralSparse => EncodedBatchLayout::Structural,
     }
 }
 
@@ -589,6 +590,140 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
     }
 }
 
+async fn decode_take(
+    encoded: &lance_encoding::encoder::EncodedBatch,
+    indices: &[u64],
+    cache: Arc<LanceCache>,
+) -> RecordBatch {
+    let io_scheduler = Arc::new(BufferScheduler::new(encoded.data.clone())) as Arc<dyn EncodingsIo>;
+    let filter = FilterExpression::no_filter();
+    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+        encoded.schema.as_ref(),
+        &encoded.top_level_columns,
+        &encoded.page_table,
+        &vec![],
+        encoded.num_rows,
+        Arc::<DecoderPlugins>::default(),
+        io_scheduler.clone(),
+        cache,
+        &filter,
+        &DecoderConfig::default(),
+    )
+    .await
+    .unwrap();
+    let (tx, rx) = unbounded_channel();
+    decode_scheduler.schedule_take(indices, &filter, tx, io_scheduler);
+    let mut stream = create_decode_stream(
+        &encoded.schema,
+        indices.len() as u64,
+        indices.len() as u32,
+        true,
+        false,
+        true,
+        rx,
+        None,
+    )
+    .unwrap();
+    stream.next().await.unwrap().task.await.unwrap()
+}
+
+fn bench_variable_offsets_decode(c: &mut Criterion) {
+    const NUM_ROWS: usize = 262_144;
+    const NUM_TAKES: usize = 512;
+
+    let metadata = HashMap::from([
+        (
+            "lance-encoding:structural-encoding".to_string(),
+            "miniblock".to_string(),
+        ),
+        (
+            "lance-encoding:dict-divisor".to_string(),
+            "100000".to_string(),
+        ),
+        ("lance-encoding:compression".to_string(), "none".to_string()),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
+    let corpora = [
+        (
+            "range",
+            Arc::new(StringArray::from_iter_values(
+                (0..NUM_ROWS).map(|index| format!("row_{index:012}")),
+            )) as Arc<dyn arrow_array::Array>,
+        ),
+        (
+            "delta",
+            Arc::new(StringArray::from_iter_values(
+                (0..NUM_ROWS).map(|index| "x".repeat(4 + index % 64)),
+            )) as Arc<dyn arrow_array::Array>,
+        ),
+    ];
+    let mut take_indices = (0..NUM_TAKES)
+        .map(|index| (index as u64).wrapping_mul(104_729).wrapping_add(8_191) % NUM_ROWS as u64)
+        .collect::<Vec<_>>();
+    take_indices.sort_unstable();
+    take_indices.dedup();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("variable_offsets_decode");
+
+    for (workload, array) in corpora {
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        for (version, encoding) in [
+            ("v2.2", BenchEncoding::StructuralU32),
+            ("v2.3", BenchEncoding::StructuralSparse),
+        ] {
+            let strategy = encoding_strategy(encoding);
+            let options = EncodingOptions::default();
+            let encoded = rt
+                .block_on(encode_batch(
+                    &batch,
+                    lance_schema.clone(),
+                    strategy.as_ref(),
+                    &options,
+                ))
+                .unwrap();
+            let encoded_bytes = encoded.data.len();
+            let benchmark_suffix = format!("{workload}/{version}/{encoded_bytes}B");
+
+            group.throughput(criterion::Throughput::Elements(NUM_ROWS as u64));
+            group.bench_function(format!("scan/{benchmark_suffix}"), |bencher| {
+                bencher.iter(|| {
+                    let decoded = rt
+                        .block_on(lance_encoding::decoder::decode_batch(
+                            &encoded,
+                            &FilterExpression::no_filter(),
+                            Arc::<DecoderPlugins>::default(),
+                            false,
+                            encoded_batch_layout(encoding),
+                            Some(Arc::new(LanceCache::no_cache())),
+                        ))
+                        .unwrap();
+                    assert_eq!(decoded.num_rows(), NUM_ROWS);
+                })
+            });
+
+            for cache_mode in ["cold", "warm"] {
+                let cache = if cache_mode == "cold" {
+                    Arc::new(LanceCache::no_cache())
+                } else {
+                    Arc::new(LanceCache::with_capacity(64 * 1024 * 1024))
+                };
+                group.throughput(criterion::Throughput::Elements(take_indices.len() as u64));
+                group.bench_function(format!("take/{benchmark_suffix}/{cache_mode}"), |bencher| {
+                    bencher.iter(|| {
+                        let decoded =
+                            rt.block_on(decode_take(&encoded, &take_indices, cache.clone()));
+                        assert_eq!(decoded.num_rows(), take_indices.len());
+                    })
+                });
+            }
+        }
+    }
+}
+
 #[cfg(feature = "bitpacking")]
 fn make_inline_bitpacking_chunk<T>(bit_width: usize) -> LanceBuffer
 where
@@ -726,7 +861,8 @@ criterion_group!(
         .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding, bench_decode_compressed,
-                bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
+                bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk,
+                bench_variable_offsets_decode);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -734,5 +870,6 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
-                bench_decode_compressed, bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
+                bench_decode_compressed, bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk,
+                bench_variable_offsets_decode);
 criterion_main!(benches);

@@ -32,7 +32,7 @@ use lance::dataset::mem_wal::scanner::{
 use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
-    evaluate_sharding_spec_with_source_columns,
+    arrow_schema_with_field_ids, evaluate_sharding_spec_with_source_columns,
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
@@ -774,8 +774,13 @@ fn inner_create_lookup_planner(
         None => get_pk_columns(&dataset)?,
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    // A sealed generation stores the names it was written with, so the planner
+    // resolves its columns by id; `base_schema` carries none. Built before the
+    // collector takes the dataset.
+    let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
     let collector = LsmDataSourceCollector::new(dataset, snapshots);
-    let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone());
+    let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?
+        .with_identity_schema(identity_schema);
 
     let blocking = BlockingLsmPointLookupPlanner {
         planner,
@@ -892,6 +897,8 @@ fn inner_create_vector_planner(
         None => get_pk_columns(&dataset)?,
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    // See the point-lookup planner: a rename moves a name and keeps the id.
+    let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
     let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
     let vector_dim = get_vector_dim(&dataset, &vector_column)?;
     let filter = filter
@@ -907,6 +914,7 @@ fn inner_create_vector_planner(
         vector_column,
         dist_type,
     )
+    .with_identity_schema(identity_schema)
     .with_dataset(dataset);
     if let Some(filter) = filter {
         planner = planner.with_filter(Some(filter));
@@ -1028,10 +1036,10 @@ pub extern "system" fn Java_org_lance_Dataset_nativeInitializeMemWal(
 }
 
 fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject) -> Result<()> {
-    let maintained_list = env
-        .call_method(&params, "maintainedIndexes", "()Ljava/util/List;", &[])?
-        .l()?;
-    let maintained_indexes = env.get_strings(&maintained_list)?;
+    let maintained_indexes =
+        env.get_optional_from_method(&params, "maintainedIndexes", |env, list| {
+            env.get_strings(&list)
+        })?;
     let bucket_column = env.get_optional_string_from_method(&params, "bucketColumn")?;
     let num_buckets = env.get_optional_u32_from_method(&params, "numBuckets")?;
     let identity_column = env.get_optional_string_from_method(&params, "identityColumn")?;
@@ -1070,7 +1078,11 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
     } else if unsharded {
         builder = builder.unsharded();
     }
-    builder = builder.maintained_indexes(maintained_indexes);
+    // Flattening an absent list to an empty one here would ask for no index
+    // at all rather than every one.
+    if let Some(maintained_indexes) = maintained_indexes {
+        builder = builder.maintained_indexes(maintained_indexes);
+    }
     if let Some(config) = writer_config {
         builder = builder.writer_config_defaults(config);
     }
@@ -1417,10 +1429,11 @@ fn index_details_to_java<'a>(
 
     Ok(env.new_object(
         "org/lance/memwal/MemWalIndexDetails",
-        "(JLjava/util/List;Ljava/util/Map;Ljava/util/List;)V",
+        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;)V",
         &[
             JValueGen::Long(details.num_shards as i64),
             JValueGen::Object(&maintained_indexes),
+            JValueGen::Bool(u8::from(details.maintain_all_indexes)),
             JValueGen::Object(&writer_config_defaults),
             JValueGen::Object(&sharding_specs),
         ],

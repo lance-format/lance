@@ -82,6 +82,10 @@ impl PostingReader {
 
 pub struct PostingListReader {
     pub(super) reader: PostingReader,
+    /// Row count of the posting file. Kept here because every query term
+    /// needs it to find its cache group, and asking `reader` costs a dynamic
+    /// call into file metadata that is usually cold.
+    num_rows: usize,
 
     /// Layout-specific metadata. V2 keeps its per-token max-score and
     /// length columns lazy so opening a partition doesn't drag O(num_tokens)
@@ -102,7 +106,10 @@ pub struct PostingListReader {
     /// Modern postings contain dense DocIds into the partition document table.
     /// Cache successful boundary validation per immutable token so repeated
     /// queries do not decode the final posting block again.
-    pub(super) modern_doc_id_validations: Option<Arc<[OnceCell<()>]>>,
+    /// One byte per token: a synchronizing cell here costs 56 bytes per token,
+    /// which dominates memory when every partition is opened at once (segment
+    /// merge). Validation is a pure check, so a racing duplicate is harmless.
+    pub(super) modern_doc_id_validations: Option<Arc<[AtomicBool]>>,
     /// Skips per-token readiness checks once the whole immutable table is validated.
     pub(super) modern_postings_validated: Arc<AtomicBool>,
     pub(super) modern_num_docs: Option<usize>,
@@ -194,7 +201,7 @@ impl DeepSizeOf for PostingListReader {
             .map(|validations| {
                 validations
                     .len()
-                    .saturating_mul(std::mem::size_of::<OnceCell<()>>())
+                    .saturating_mul(std::mem::size_of::<AtomicBool>())
             })
             .unwrap_or(0);
         metadata_size + self.grouping.deep_size_of_children(context) + validation_size
@@ -233,12 +240,13 @@ impl PostingListReader {
         let grouping = PostingGrouping::for_reader(is_legacy_layout, reader.num_rows());
         let modern_doc_id_validations = (!is_legacy_layout).then(|| {
             (0..reader.num_rows())
-                .map(|_| OnceCell::new())
+                .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
                 .into()
         });
 
         Ok(Self {
+            num_rows: reader.num_rows(),
             reader: PostingReader::Opened {
                 reader,
                 metadata: OnceLock::new(),
@@ -268,6 +276,7 @@ impl PostingListReader {
         };
         Ok(Self {
             reader: self.reader.with_store(store, path),
+            num_rows: self.num_rows,
             metadata: PostingMetadata::V2 {
                 metadata: metadata.clone(),
             },
@@ -307,7 +316,7 @@ impl PostingListReader {
     pub fn len(&self) -> usize {
         match &self.metadata {
             PostingMetadata::LegacyV1 { offsets, .. } => offsets.len(),
-            PostingMetadata::V2 { .. } => self.reader.num_rows(),
+            PostingMetadata::V2 { .. } => self.num_rows,
         }
     }
 
@@ -720,12 +729,12 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        validation
-            .get_or_try_init(|| async {
-                Self::validate_modern_posting(token_id, posting, num_docs)
-            })
-            .await
-            .map(|_| ())
+        if validation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Self::validate_modern_posting(token_id, posting, num_docs)?;
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[inline]
@@ -743,7 +752,7 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        Ok(validation.get().is_some())
+        Ok(validation.load(Ordering::Acquire))
     }
 
     pub(super) fn validate_modern_posting(
@@ -764,10 +773,8 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        validation
-            .get_or_try_init(|| async { Result::Ok(()) })
-            .await
-            .map(|_| ())
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn modern_posting_validation_ready(&self) -> bool {
@@ -777,7 +784,11 @@ impl PostingListReader {
         let ready = self
             .modern_doc_id_validations
             .as_ref()
-            .is_none_or(|validations| validations.iter().all(|state| state.get().is_some()));
+            .is_none_or(|validations| {
+                validations
+                    .iter()
+                    .all(|state| state.load(Ordering::Acquire))
+            });
         if ready {
             self.modern_postings_validated
                 .store(true, Ordering::Release);

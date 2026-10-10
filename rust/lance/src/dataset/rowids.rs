@@ -1,21 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod spill;
 mod validate;
 
 use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
-use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
+use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
-    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
+    format::{
+        Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
+        RowIdMeta,
+    },
+    rowids::{
+        FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids,
+        version::{LoadedRowLineage, SpilledRowLineage},
+    },
 };
 use std::sync::Arc;
 
+pub(crate) use spill::place_carried_row_lineage;
+pub use spill::{
+    DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
+    PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
+    place_row_lineage, read_spilled_row_ids, read_spilled_versions,
+};
+pub(crate) use spill::{RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -29,6 +44,7 @@ pub async fn load_row_id_sequence(
     let key = RowIdSequenceKey {
         fragment_id: fragment.id,
         row_id_meta,
+        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
         .metadata_cache
@@ -41,19 +57,134 @@ async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
         Some(RowIdMeta::Inline(data)) => read_row_ids(data),
-        Some(RowIdMeta::External(file_slice)) => {
-            let path = dataset.base.clone().join(file_slice.path.as_str());
-            let range =
-                file_slice.offset as usize..(file_slice.offset as usize + file_slice.size as usize);
-            let data = dataset
-                .object_store
-                .open(&path)
-                .await?
-                .get_range(range)
-                .await?;
-            read_row_ids(&data)
+        Some(RowIdMeta::Column) => spill::read_spilled_row_ids(dataset, fragment).await,
+    }
+}
+
+/// Which of a fragment's two per-row version sequences is meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowVersionKind {
+    /// The dataset version each row first appeared at.
+    CreatedAt,
+    /// The dataset version each row was last written at.
+    LastUpdatedAt,
+}
+
+impl RowVersionKind {
+    fn meta(self, fragment: &Fragment) -> Option<&RowDatasetVersionMeta> {
+        match self {
+            Self::CreatedAt => fragment.created_at_version_meta.as_ref(),
+            Self::LastUpdatedAt => fragment.last_updated_at_version_meta.as_ref(),
         }
     }
+
+    /// The reserved field id of the hidden column a spilled sequence lives in.
+    pub fn field_id(self) -> i32 {
+        match self {
+            Self::CreatedAt => ROW_CREATED_AT_VERSION_FIELD_ID,
+            Self::LastUpdatedAt => ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        }
+    }
+}
+
+/// Load one of `fragment`'s per-row version sequences, wherever it is stored.
+///
+/// `None` when the fragment carries no such metadata, which readers treat as
+/// every row being at version 1. A sequence spilled to a data file is cached
+/// per fragment and file; an inline one is decoded from the manifest bytes.
+pub async fn load_row_version_sequence(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    kind: RowVersionKind,
+) -> Result<Option<Arc<RowDatasetVersionSequence>>> {
+    let Some(meta) = kind.meta(fragment) else {
+        return Ok(None);
+    };
+    match meta {
+        RowDatasetVersionMeta::Column => {
+            let data_file = fragment.row_lineage_file(kind.field_id())?.ok_or_else(|| {
+                Error::corrupt_file(
+                    dataset.base.clone(),
+                    format!(
+                        "fragment {} marks its {kind:?} versions as spilled but none of its \
+                         data files carries field {}",
+                        fragment.id,
+                        kind.field_id()
+                    ),
+                )
+            })?;
+            let key = RowVersionSequenceKey {
+                fragment_id: fragment.id,
+                field_id: kind.field_id(),
+                data_file,
+            };
+            dataset
+                .metadata_cache
+                .get_or_insert_with_key(key, || {
+                    spill::read_spilled_versions(dataset, fragment, kind.field_id())
+                })
+                .await
+                .map(Some)
+        }
+        RowDatasetVersionMeta::Inline(_) => meta
+            .load_sequence()
+            .map(|sequence| Some(Arc::new(sequence))),
+    }
+}
+
+/// Read ahead every lineage sequence of `fragments` that lives outside the
+/// manifest, for a commit that will need to consult them.
+///
+/// Building a manifest is synchronous and cannot read a data file, so the
+/// commit path calls this first, over the whole manifest, and hands the result
+/// over in `ManifestBuildConfig::spilled_row_lineage`. Only spilled sequences
+/// are loaded; when none is, this returns an empty map without IO.
+pub async fn load_spilled_row_lineage<'a>(
+    dataset: &Dataset,
+    fragments: impl IntoIterator<Item = &'a Fragment>,
+) -> Result<Arc<SpilledRowLineage>> {
+    // A `for` loop rather than `map`: a closure returning a future that borrows
+    // its argument trips the higher-ranked lifetime check on the outer future.
+    let mut loads = Vec::new();
+    for fragment in fragments {
+        if fragment.has_spilled_row_lineage() {
+            loads.push(load_fragment_spilled_lineage(dataset, fragment));
+        }
+    }
+    let loaded: SpilledRowLineage = futures::stream::iter(loads)
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+    Ok(Arc::new(loaded))
+}
+
+/// The spilled sequences of one fragment, for [`load_spilled_row_lineage`].
+async fn load_fragment_spilled_lineage(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<(u64, LoadedRowLineage)> {
+    let row_ids = match &fragment.row_id_meta {
+        Some(RowIdMeta::Column) => Some(load_row_id_sequence(dataset, fragment).await?),
+        _ => None,
+    };
+    let mut versions = [None, None];
+    for (slot, kind) in versions
+        .iter_mut()
+        .zip([RowVersionKind::CreatedAt, RowVersionKind::LastUpdatedAt])
+    {
+        if let Some(RowDatasetVersionMeta::Column) = kind.meta(fragment) {
+            *slot = load_row_version_sequence(dataset, fragment, kind).await?;
+        }
+    }
+    let [created_at, last_updated_at] = versions;
+    Ok((
+        fragment.id,
+        LoadedRowLineage {
+            row_ids,
+            created_at,
+            last_updated_at,
+        },
+    ))
 }
 
 /// Load row id sequences from the given dataset and fragments.
@@ -241,10 +372,25 @@ async fn row_addrs_to_row_ids_impl(
 /// keyed by the fragment's content; the index is keyed by manifest generation
 /// and cannot stand in for it.
 async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
+    load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments).await
+}
+
+/// Build a row id index covering only `fragments`, not the whole dataset.
+///
+/// A caller that already knows the row ids it will look up were all read from
+/// a known, small set of fragments -- compaction rewriting a handful of
+/// fragments out of a much larger table, for instance -- gets no benefit from
+/// [`get_row_id_index`]'s whole-dataset index and pays for reading every other
+/// fragment's row id sequence and deletion vector for nothing. This builds an
+/// index scoped to just those fragments instead.
+pub(crate) async fn load_row_id_index_for_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<RowIdIndex> {
     // A `for` loop rather than `map`: a closure returning a future that borrows
     // its argument trips the higher-ranked lifetime check on the outer future.
-    let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
-    for fragment in dataset.manifest.fragments.iter() {
+    let mut loads = Vec::with_capacity(fragments.len());
+    for fragment in fragments.iter() {
         loads.push(read_fragment_row_id_index(dataset, fragment));
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)

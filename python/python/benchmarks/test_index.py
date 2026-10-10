@@ -8,8 +8,45 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance.indices import IndicesBuilder, IvfModel, PqModel
+from lance.vector import find_duplicate_pairs
 
 N_DIMS = 512
+
+
+@pytest.mark.benchmark(group="duplicate_pairs")
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_PQ"])
+@pytest.mark.parametrize("num_rows", [1024, 1025, 8192])
+def test_duplicate_pairs_exhaust_partition(tmp_path, benchmark, index_type, num_rows):
+    rng = np.random.default_rng(9493)
+    vectors = rng.normal(size=(num_rows, 64)).astype(np.float32)
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "vector": pa.array(vectors.tolist(), pa.list_(pa.float32(), 64)),
+            }
+        ),
+        tmp_path,
+    )
+    params = {}
+    if index_type == "IVF_PQ":
+        params = dict(
+            num_bits=8,
+            num_sub_vectors=16,
+            pq_codebook=rng.normal(size=(16, 256, 4)).astype(np.float32),
+        )
+    dataset.create_index(
+        "vector",
+        index_type,
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 64), dtype=np.float32),
+        **params,
+    )
+
+    def exhaust():
+        with find_duplicate_pairs(dataset, "vector", 0.0) as reader:
+            return sum(batch.num_rows for batch in reader)
+
+    assert benchmark(exhaust) == 0
 
 
 def gen_table(num_rows):

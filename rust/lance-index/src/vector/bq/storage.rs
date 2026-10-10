@@ -2127,8 +2127,10 @@ where
     T::Native: AsPrimitive<f32>,
 {
     debug_assert_eq!(dist_table.len(), qc.len() * 4);
-    qc.chunks_exact(SEGMENT_LENGTH)
-        .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
+    qc.as_chunks::<SEGMENT_LENGTH>()
+        .0
+        .iter()
+        .zip(dist_table.as_chunks_mut::<SEGMENT_NUM_CODES>().0)
         .for_each(|(sub_vec, dist_table)| {
             dist_table[0] = 0.0;
             build_dist_table_for_subvec::<T>(sub_vec, dist_table);
@@ -3266,7 +3268,11 @@ fn compute_single_rq_distance(
     dist_table: &[f32],
 ) -> f32 {
     let remainder = num_vectors % BATCH_SIZE;
-    let mut dist_table_iter = dist_table.chunks_exact(SEGMENT_NUM_CODES).tuples();
+    let mut dist_table_iter = dist_table
+        .as_chunks::<SEGMENT_NUM_CODES>()
+        .0
+        .iter()
+        .tuples();
 
     if id < num_vectors - remainder {
         let batch_codes = &codes[id / BATCH_SIZE * BATCH_SIZE * num_code_bytes
@@ -3277,7 +3283,7 @@ fn compute_single_rq_distance(
         let is_lower = id_in_batch < 16;
 
         let mut dist = 0.0f32;
-        for block in batch_codes.chunks_exact(BATCH_SIZE) {
+        for block in batch_codes.as_chunks::<BATCH_SIZE>().0 {
             let code_byte = if is_lower {
                 (block[idx] & 0xF) | (block[idx + 16] << 4)
             } else {
@@ -3324,7 +3330,9 @@ fn get_rq_code(
         if id_in_batch < 16 {
             let idx = PERM0_INVERSE[id_in_batch];
             codes
-                .chunks_exact(BATCH_SIZE)
+                .as_chunks::<BATCH_SIZE>()
+                .0
+                .iter()
                 .map(|block| (block[idx] & 0xF) | (block[idx + 16] << 4))
                 .exact_size(num_code_bytes)
                 .collect_vec()
@@ -3332,7 +3340,9 @@ fn get_rq_code(
         } else {
             let idx = PERM0_INVERSE[id_in_batch - 16];
             codes
-                .chunks_exact(BATCH_SIZE)
+                .as_chunks::<BATCH_SIZE>()
+                .0
+                .iter()
                 .map(|block| (block[idx] >> 4) | (block[idx + 16] & 0xF0))
                 .exact_size(num_code_bytes)
                 .collect_vec()

@@ -21,6 +21,7 @@ use std::iter::once;
 
 use roaring::RoaringBitmap;
 
+use lance::dataset::NewColumnTransform;
 use lance::dataset::fragment::write::FragmentCreateBuilder;
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
@@ -481,13 +482,10 @@ fn inner_merge_column<'local>(
     left_on: JString,
     right_on: JString,
 ) -> Result<JObject<'local>> {
-    let (fragment_opt, max_field_id) = {
+    let fragment_opt = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        (
-            dataset.inner.get_fragment(fragment_id as usize),
-            dataset.inner.manifest().max_field_id(),
-        )
+        dataset.inner.get_fragment(fragment_id as usize)
     };
     let mut fragment = match fragment_opt {
         Some(fragment) => fragment,
@@ -504,7 +502,7 @@ fn inner_merge_column<'local>(
     let right_on_str: String = right_on.extract(env)?;
 
     let (new_frag, new_schema) =
-        block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
+        block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str))?;
     let result = FragmentMergeResult {
         fragment: new_frag,
         schema: new_schema,
@@ -691,6 +689,72 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
     let meta = RowIdMeta::Inline(write_row_ids(&seq).into());
     let json = serde_json::to_string(&meta)?;
     Ok(json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Fragment_nativeAddColumnsByReader<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,              // Java DataSet
+    fragment_id: jlong,             // FragmentID
+    arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
+    batch_size: JObject,            // Optional<Long>
+) -> JObject<'a> {
+    ok_or_throw_with_return!(
+        env,
+        inner_add_columns_by_reader(
+            &mut env,
+            jdataset,
+            fragment_id,
+            arrow_array_stream_addr,
+            batch_size
+        ),
+        JObject::null()
+    )
+}
+
+fn inner_add_columns_by_reader<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jlong,
+    arrow_array_stream_addr: jlong,
+    batch_size: JObject,
+) -> Result<JObject<'local>> {
+    let fragment_opt = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.get_fragment(fragment_id as usize)
+    };
+    let fragment = match fragment_opt {
+        Some(fragment) => fragment,
+        None => {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        }
+    };
+
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batch_size = match env.get_long_opt(&batch_size)? {
+        Some(value) => Some(
+            value
+                .try_into()
+                .map_err(|_| Error::input_error(format!("Invalid batch size: {value}")))?,
+        ),
+        None => None,
+    };
+
+    let (new_frag, new_schema) = block_on(fragment.add_columns(
+        NewColumnTransform::Reader(Box::new(reader)),
+        None,
+        batch_size,
+    ))?;
+    let result = FragmentMergeResult {
+        fragment: new_frag,
+        schema: new_schema,
+    };
+    result.into_java(env)
 }
 
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
