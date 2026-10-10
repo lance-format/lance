@@ -92,9 +92,9 @@ impl Dataset {
 ///    version is still in its bitmap. A missing bitmap counts as caught up, else
 ///    the version could never be cleaned up.
 ///
-/// Note that there could be a race condition that an index is being added during the cleanup,
-/// This will make that specific index not efficient until the next reindex,
-/// but it will not cause any correctness problem.
+/// An index committed concurrently that still needs a retired version fails
+/// whichever commit lands second with a retryable conflict: the cleanup if the
+/// index landed first, the index build (which must be rebuilt) otherwise.
 ///
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
@@ -143,20 +143,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
-        let check_results = indices
-            .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-            .collect::<Vec<_>>();
-
-        if check_results
-            .iter()
-            .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-        {
-            // If the check fails, the reuse version is likely corrupted, do not retain it.
-            continue;
-        }
-
-        if !check_results.into_iter().all(|r| r.unwrap()) {
+        if index_needing_reuse_version(version, &indices, &chain_frag_bitmap).is_some() {
             fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
@@ -205,6 +192,65 @@ fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
         bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
     }
     bitmap
+}
+
+/// An index that keeps [`cleanup_frag_reuse_index`] from retiring `version`.
+fn index_needing_reuse_version<'a>(
+    version: &FragReuseVersion,
+    indices: &'a [IndexMetadata],
+    chain_frag_bitmap: &RoaringBitmap,
+) -> Option<&'a IndexMetadata> {
+    let mut needed_by = None;
+    for index in indices {
+        match is_index_remap_caught_up(version, index, chain_frag_bitmap) {
+            // If the check fails, the reuse version is likely corrupted, do not retain it.
+            Err(_) => return None,
+            Ok(false) => needed_by = needed_by.or(Some(index)),
+            Ok(true) => {}
+        }
+    }
+    needed_by
+}
+
+/// One of `indices` that still needs a v0 reuse version retired by an index
+/// change replacing the entries in `removed` with those in `new`, judged by the
+/// rule [`cleanup_frag_reuse_index`] applies. The conflict resolver uses it
+/// when such a change races an index build.
+pub(crate) async fn index_needing_retired_reuse_version<'a>(
+    dataset: &Dataset,
+    new: &[IndexMetadata],
+    removed: &[IndexMetadata],
+    indices: &'a [IndexMetadata],
+) -> Result<Option<&'a IndexMetadata>> {
+    use lance_table::system_index::frag_reuse::metadata::is_tagged;
+
+    let mut retained = Vec::new();
+    for entry in new.iter().filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+        retained.extend(
+            load_frag_reuse_index_details(dataset, entry)
+                .await?
+                .versions
+                .iter()
+                .cloned(),
+        );
+    }
+    for entry in removed
+        .iter()
+        .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME && !is_tagged(idx))
+    {
+        let details = load_frag_reuse_index_details(dataset, entry).await?;
+        let chain_frag_bitmap = reuse_chain_frag_bitmap(&details.versions);
+        for version in details
+            .versions
+            .iter()
+            .filter(|version| !retained.contains(version))
+        {
+            if let Some(index) = index_needing_reuse_version(version, indices, &chain_frag_bitmap) {
+                return Ok(Some(index));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn is_index_remap_caught_up(
@@ -2810,5 +2856,100 @@ mod tests {
             );
             assert_eq!(frag_reuse_index.remap_row_id(before[&i]), Some(after[&i]));
         }
+    }
+
+    /// An index built before a deferred-remap compaction still needs the reuse
+    /// version a concurrent cleanup or drop retires, so whichever of the two
+    /// commits second must fail rather than strand the index.
+    #[rstest::rstest]
+    #[case::index_then_cleanup(true, false)]
+    #[case::cleanup_then_index(false, false)]
+    #[case::index_then_drop(true, true)]
+    #[case::drop_then_index(false, true)]
+    #[tokio::test]
+    async fn test_fri_maintenance_handles_concurrent_index(
+        #[case] index_first: bool,
+        #[case] drop_fri: bool,
+    ) {
+        async fn retire_reuse(dataset: &mut Dataset, drop_fri: bool) -> Result<()> {
+            if drop_fri {
+                dataset.drop_index(FRAG_REUSE_INDEX_NAME).await
+            } else {
+                cleanup_frag_reuse_index(dataset).await
+            }
+        }
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col("j", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1_000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("current".to_owned()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Shares the session, so the late build rebases over the compaction.
+        let mut stale = dataset.clone();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        remapping::remap_column_index(&mut dataset, &["j"], Some("current".to_owned()))
+            .await
+            .unwrap();
+        let mut maintenance = dataset.clone();
+
+        if !index_first {
+            retire_reuse(&mut maintenance, drop_fri).await.unwrap();
+        }
+        let index_result = stale
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("late".to_owned()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await;
+        let (error, expected) = if index_first {
+            index_result.unwrap();
+            (
+                retire_reuse(&mut maintenance, drop_fri).await.unwrap_err(),
+                "retires fragment reuse mappings that index 'late'",
+            )
+        } else {
+            (
+                index_result.unwrap_err(),
+                "Rebuild the index from the latest version",
+            )
+        };
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains(expected), "{error}");
+
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(
+            dataset
+                .count_rows(Some("i >= 2000 AND i < 3000".to_owned()))
+                .await
+                .unwrap(),
+            1_000
+        );
     }
 }

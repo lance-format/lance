@@ -3,7 +3,7 @@
 
 use crate::dataset::index::frag_reuse::{
     TaggedTrimOutcome, derive_superseded_segments, derive_tagged_trim,
-    is_superseded_prune_transaction, is_tagged_trim_operation,
+    index_needing_retired_reuse_version, is_superseded_prune_transaction, is_tagged_trim_operation,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
@@ -82,6 +82,12 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// Concurrent CreateIndex commits `(version, new, removed)` that add
+    /// regular indices while this CreateIndex retires v0 fragment reuse
+    /// versions, or retire them while this one adds regular indices.
+    /// `finish_create_index` loads the reuse details to check that no index
+    /// is left needing a retired version.
+    reuse_retirement_races: Vec<(u64, Vec<IndexMetadata>, Vec<IndexMetadata>)>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -288,6 +294,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
+                    reuse_retirement_races: Vec::new(),
                 })
             }
             Operation::Delete {
@@ -325,6 +332,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        reuse_retirement_races: Vec::new(),
                     });
                 }
 
@@ -346,6 +354,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    reuse_retirement_races: Vec::new(),
                 })
             }
             Operation::Rewrite {
@@ -385,6 +394,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
+                    reuse_retirement_races: Vec::new(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -408,6 +418,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    reuse_retirement_races: Vec::new(),
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -431,6 +442,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    reuse_retirement_races: Vec::new(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -453,6 +465,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    reuse_retirement_races: Vec::new(),
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
@@ -1180,6 +1193,23 @@ impl<'a> TransactionRebase<'a> {
                     } else {
                         has_regular_name_conflict || has_append_drop_conflict
                     };
+                    let retires_v0_reuse = |indices: &[IndexMetadata]| {
+                        indices
+                            .iter()
+                            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && !is_tagged(idx))
+                    };
+                    let adds_regular =
+                        |indices: &[IndexMetadata]| indices.iter().any(|idx| !is_system_index(idx));
+                    if (retires_v0_reuse(removed_indices) && adds_regular(created_indices))
+                        || (retires_v0_reuse(committed_removed_indices)
+                            && adds_regular(new_indices))
+                    {
+                        self.reuse_retirement_races.push((
+                            other_version,
+                            created_indices.clone(),
+                            committed_removed_indices.clone(),
+                        ));
+                    }
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
                         || name_conflict
@@ -1262,11 +1292,9 @@ impl<'a> TransactionRebase<'a> {
                     // A merge that removed or retyped a field our index keys
                     // on (an `alter_columns` cast rewrites the column under a
                     // new field id) leaves the index describing a column that
-                    // no longer exists on a tagged table's destinations; the
-                    // build is redone against the new field.
-                    if self.current_lineage.is_some()
-                        && let Some(read_schema) = self.read_schema.as_ref()
-                    {
+                    // no longer exists; the build is redone against the new
+                    // field.
+                    if let Some(read_schema) = self.read_schema.as_ref() {
                         let gone: HashSet<i32> = read_schema
                             .fields_pre_order()
                             .filter(|field| {
@@ -1334,7 +1362,22 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                // A project can drop fields. The Project's own build drops
+                // indices on them (`retain_relevant_indices`); one committed
+                // over it would key on a field the schema no longer has.
+                Operation::Project { schema, .. } => {
+                    if new_indices.iter().any(|index| {
+                        !is_system_index(index)
+                            && index
+                                .fields
+                                .iter()
+                                .any(|field| schema.field_by_id(*field).is_none())
+                    }) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
@@ -2907,6 +2950,50 @@ impl<'a> TransactionRebase<'a> {
                         current.as_ref(),
                         dataset,
                         "Run the cleanup again on the latest version.",
+                    ));
+                }
+            }
+
+            for (other_version, other_new, other_removed) in
+                std::mem::take(&mut self.reuse_retirement_races)
+            {
+                if let Some(index) = index_needing_retired_reuse_version(
+                    dataset,
+                    new_indices,
+                    removed_indices,
+                    &other_new,
+                )
+                .await?
+                {
+                    return Err(Error::retryable_commit_conflict_source(
+                        other_version,
+                        format!(
+                            "This CreateIndex transaction, based on version {}, retires fragment \
+                             reuse mappings that index '{}' ({}), committed at version \
+                             {other_version}, still needs. Reload the latest version and run it \
+                             again.",
+                            self.transaction.read_version, index.name, index.uuid
+                        )
+                        .into(),
+                    ));
+                }
+                if let Some(index) = index_needing_retired_reuse_version(
+                    dataset,
+                    &other_new,
+                    &other_removed,
+                    new_indices,
+                )
+                .await?
+                {
+                    return Err(Error::retryable_commit_conflict_source(
+                        other_version,
+                        format!(
+                            "Index '{}' ({}), built at version {}, needs fragment reuse mappings \
+                             retired at version {other_version}. Rebuild the index from the \
+                             latest version.",
+                            index.name, index.uuid, index.dataset_version
+                        )
+                        .into(),
                     ));
                 }
             }
@@ -4612,6 +4699,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
 
             let result = rebase.check_txn(&unknown, 1);
@@ -4832,6 +4920,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4899,6 +4988,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5048,6 +5138,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5098,6 +5189,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -5121,6 +5213,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -5209,6 +5302,7 @@ mod tests {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        reuse_retirement_races: Vec::new(),
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -5267,8 +5361,87 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
+        assert_eq!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            expect_conflict,
+            "got {result:?}"
+        );
+    }
+
+    /// Nor can an index land on a schema change that took away the field it
+    /// keys on: every filtered scan would fail to resolve the index's field.
+    /// A projection drops fields; a merge drops or retypes them (an
+    /// `alter_columns` cast rewrites the column under a new field id).
+    #[rstest::rstest]
+    #[case::field_survives_the_projection(false, Some(DataType::Int32), false)]
+    #[case::field_dropped_by_the_projection(false, None, true)]
+    #[case::field_survives_the_merge(true, Some(DataType::Int32), false)]
+    #[case::field_retyped_by_the_merge(true, Some(DataType::Int64), true)]
+    #[case::field_dropped_by_the_merge(true, None, true)]
+    fn test_create_index_conflicts_with_a_schema_change_that_dropped_its_field(
+        #[case] merge: bool,
+        #[case] indexed_type_after: Option<DataType>,
+        #[case] expect_conflict: bool,
+    ) {
+        let create_index = Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "test".to_string(),
+                // Field 1 is `b` below.
+                fields: vec![1],
+                covering_fields: vec![],
+                dataset_version: 0,
+                fragment_bitmap: Some(RoaringBitmap::from_iter([0])),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }],
+            removed_indices: vec![],
+        };
+        let a = Field::new("a", DataType::Int32, true);
+        let b = Field::new("b", DataType::Int32, true);
+        let read_schema: lance_core::datatypes::Schema = (&Schema::new(vec![a.clone(), b.clone()]))
+            .try_into()
+            .unwrap();
+        let fields_after = std::iter::once(a)
+            .chain(indexed_type_after.map(|data_type| b.with_data_type(data_type)))
+            .collect::<Vec<_>>();
+        let schema: lance_core::datatypes::Schema =
+            (&Schema::new(fields_after)).try_into().unwrap();
+        let schema_change = if merge {
+            Operation::Merge {
+                fragments: vec![],
+                schema,
+                preserves_nullability: true,
+            }
+        } else {
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            }
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, create_index, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            frag_reuse_base: None,
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            current_lineage: None,
+            current_live: None,
+            current_schema: None,
+            read_fragments: None,
+            read_schema: Some(read_schema),
+            reuse: Default::default(),
+            staged_replay: false,
+            reuse_retirement_races: Vec::new(),
+        };
+        let result = rebase.check_txn(&Transaction::new(0, schema_change, None), 1);
         assert_eq!(
             matches!(result, Err(Error::RetryableCommitConflict { .. })),
             expect_conflict,
@@ -5406,6 +5579,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
         let update = Transaction::new(
             1,
@@ -5474,6 +5648,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5536,6 +5711,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5565,6 +5741,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -5617,6 +5794,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let same_name = Transaction::new(
@@ -5680,6 +5858,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -5746,6 +5925,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -5795,6 +5975,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -5845,6 +6026,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -5922,6 +6104,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -6006,6 +6189,7 @@ mod tests {
                 reuse: Default::default(),
 
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
             // Disjoint from the rewritten fragment, so this only exercises the
             // stable-row-ids check and not the group-straddling check below it.
@@ -6708,6 +6892,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                reuse_retirement_races: Vec::new(),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -6779,6 +6964,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6825,6 +7011,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6872,6 +7059,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6919,6 +7107,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6977,6 +7166,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7010,6 +7200,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -7064,6 +7255,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            reuse_retirement_races: Vec::new(),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

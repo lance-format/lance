@@ -779,7 +779,9 @@ impl Transaction {
                     if i == group.old_fragments.len() {
                         break Some(start..start + i);
                     }
-                    if final_fragments[start + i].id != group.old_fragments[i].id {
+                    if final_fragments.get(start + i).map(|f| f.id)
+                        != Some(group.old_fragments[i].id)
+                    {
                         break None;
                     }
                     i += 1;
@@ -902,6 +904,22 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+
+        // Listing the last fragment first is a non-contiguous group, too.
+        let mut final_fragments: Vec<Fragment> = (0..2).map(Fragment::new).collect();
+        let reversed_group = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1), Fragment::new(0)],
+            new_fragments: vec![Fragment::new(2)],
+        }];
+        Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &reversed_group,
+            &mut fragment_id,
+            version,
+            None,
+        )
+        .unwrap();
+        assert_eq!(final_fragments, vec![Fragment::new(2)]);
     }
 
     #[test]

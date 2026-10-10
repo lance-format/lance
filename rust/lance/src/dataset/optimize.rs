@@ -3293,6 +3293,18 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
+    // Results are replayable input, so check every payload this commit will
+    // consume before any fragment id is reserved for it.
+    if index_remapper.is_some() || options.defer_index_remap {
+        for (task_index, task) in completed_tasks.iter_mut().enumerate() {
+            if options.defer_index_remap {
+                task.original_fragments =
+                    normalize_source_fragments(dataset, &task.original_fragments).await?;
+            }
+            validate_rewritten_row_addrs(task_index, task)?;
+        }
+    }
+
     // Collect the rewritten fragments' file paths up front so every failure
     // path below can clean them up (or deliberately keep them). Fragment ids
     // may still be reassigned by reserve_fragment_ids; cleanup only needs the
@@ -3364,15 +3376,11 @@ pub async fn commit_compaction(
 
     for task in completed_tasks {
         metrics += task.metrics;
-        // One source of truth: the deferred branch normalizes the source
-        // metadata (materialized physical and deleted row counts) and BOTH
-        // the rewrite group and the reuse digests are built from it, so the
+        // One source of truth: the deferred source metadata was normalized
+        // above (materialized physical and deleted row counts) and BOTH the
+        // rewrite group and the reuse digests are built from it, so the
         // commit-side binding validation compares like with like.
-        let old_fragments = if index_remapper.is_none() && options.defer_index_remap {
-            normalize_source_fragments(dataset, &task.original_fragments).await?
-        } else {
-            task.original_fragments.clone()
-        };
+        let old_fragments = task.original_fragments.clone();
         let rewrite_group = RewriteGroup {
             old_fragments: old_fragments.clone(),
             new_fragments: task.new_fragments.clone(),
@@ -3727,6 +3735,76 @@ async fn normalize_source_fragments(
         normalized.push(fragment);
     }
     Ok(normalized)
+}
+
+/// Reject row addresses that are not exactly the live rows of the task's source
+/// fragments, in the number its new fragments hold. A consumed payload that
+/// contradicts its task would remap indices onto the wrong rows, or record a
+/// fragment reuse version that no reader can open.
+fn validate_rewritten_row_addrs(task_index: usize, task: &RewriteResult) -> Result<()> {
+    let Some(bytes) = task.row_addrs.as_deref() else {
+        return Ok(());
+    };
+    let invalid = |reason: String| {
+        Error::invalid_input(format!(
+            "compaction task {task_index} has invalid row addresses: {reason}"
+        ))
+    };
+    let row_addrs = RoaringTreemap::deserialize_from(&mut Cursor::new(bytes))
+        .map_err(|error| invalid(error.to_string()))?;
+    let mut rewritten = row_addrs.bitmaps().collect::<HashMap<_, _>>();
+    for fragment in &task.original_fragments {
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            invalid(format!(
+                "source fragment {} has no physical row count",
+                fragment.id
+            ))
+        })?;
+        let offsets = u32::try_from(fragment.id)
+            .ok()
+            .and_then(|id| rewritten.remove(&id));
+        if offsets
+            .and_then(|offsets| offsets.max())
+            .is_some_and(|offset| offset as usize >= physical_rows)
+        {
+            return Err(invalid(format!(
+                "an address is past the {physical_rows} rows of source fragment {}",
+                fragment.id
+            )));
+        }
+        let num_rewritten = offsets.map_or(0, |offsets| offsets.len());
+        let num_deleted = fragment
+            .deletion_file
+            .as_ref()
+            .map_or(Some(0), |deletion| deletion.num_deleted_rows);
+        if let Some(num_deleted) = num_deleted
+            && num_rewritten != physical_rows.saturating_sub(num_deleted) as u64
+        {
+            return Err(invalid(format!(
+                "source fragment {} has {} live rows but {num_rewritten} addresses",
+                fragment.id,
+                physical_rows.saturating_sub(num_deleted)
+            )));
+        }
+    }
+    if let Some(fragment_id) = rewritten.keys().next() {
+        return Err(invalid(format!(
+            "they include fragment {fragment_id}, which is not a source of the task"
+        )));
+    }
+    let new_rows = task
+        .new_fragments
+        .iter()
+        .map(|fragment| fragment.physical_rows)
+        .sum::<Option<usize>>()
+        .ok_or_else(|| invalid("a new fragment has no physical row count".to_owned()))?;
+    if new_rows as u64 != row_addrs.len() {
+        return Err(invalid(format!(
+            "{} rows were rewritten but the new fragments hold {new_rows}",
+            row_addrs.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Remove rewritten files after fragment-id reservation fails. Reservation
@@ -5702,6 +5780,159 @@ mod tests {
         assert!(
             result.row_addrs.is_none(),
             "eager stable-row-id compaction must not capture row addresses it will never use"
+        );
+    }
+
+    #[rstest]
+    #[case::direct(IndexRemapMode::Direct)]
+    #[case::compact(IndexRemapMode::Compact)]
+    #[tokio::test]
+    async fn test_compaction_task_accepts_unsorted_fragments(
+        #[case] index_remap_mode: IndexRemapMode,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        create_scalar_index(&mut dataset, "i", false).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4,
+            index_remap_mode,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let mut task = plan.compaction_tasks().next().unwrap();
+        task.task.fragments.reverse();
+        assert_eq!(
+            task.task
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        let result = task.execute(&dataset).await.unwrap();
+        let row_addrs =
+            RoaringTreemap::deserialize_from(&mut Cursor::new(result.row_addrs.as_ref().unwrap()))
+                .unwrap();
+        let expected = RoaringTreemap::from_iter(task.task.fragments.iter().flat_map(|fragment| {
+            (0..fragment.physical_rows.unwrap() as u32)
+                .map(|offset| u64::from(RowAddress::new_from_parts(fragment.id as u32, offset)))
+        }));
+        assert_eq!(row_addrs, expected);
+        assert_eq!(result.original_fragments, task.task.fragments);
+
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let new_fragment_id = dataset.get_fragments()[0].id() as u32;
+        let index = dataset.load_index_by_name("scalar").await.unwrap().unwrap();
+        assert!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.contains(new_fragment_id))
+        );
+        for value in 0..4 {
+            let batch = dataset
+                .scan()
+                .filter(&format!("i = {value}"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                batch["i"].as_primitive::<Int32Type>().values(),
+                &[value],
+                "indexed lookup of i = {value} returned the wrong row"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::direct(false, IndexRemapMode::Direct)]
+    #[case::compact(false, IndexRemapMode::Compact)]
+    #[case::deferred(true, IndexRemapMode::Direct)]
+    #[tokio::test]
+    async fn test_commit_compaction_validates_before_reserving_fragment_ids(
+        #[case] defer_index_remap: bool,
+        #[case] index_remap_mode: IndexRemapMode,
+    ) {
+        let test_dir = TempStrDir::default();
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 200))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        create_scalar_index(&mut dataset, "a", false).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            defer_index_remap,
+            index_remap_mode,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let version_before = dataset.manifest.version;
+        let max_fragment_id_before = dataset.manifest.max_fragment_id;
+        let files_before = count_data_files_in(test_dir.as_str());
+        let result = plan
+            .compaction_tasks()
+            .next()
+            .unwrap()
+            .execute(&dataset)
+            .await
+            .unwrap();
+        let files_with_result = count_data_files_in(test_dir.as_str());
+        assert!(files_with_result > files_before);
+        let mut invalid_result = result.clone();
+        let mut empty = Vec::new();
+        RoaringTreemap::new().serialize_into(&mut empty).unwrap();
+        invalid_result.row_addrs = Some(empty);
+
+        let error = commit_compaction(
+            &mut dataset,
+            vec![invalid_result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+
+        let latest = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert_eq!(latest.manifest.version, version_before);
+        assert_eq!(latest.manifest.max_fragment_id, max_fragment_id_before);
+        assert_eq!(count_data_files_in(test_dir.as_str()), files_with_result);
+
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(
+            dataset
+                .count_rows(Some("a = 150".to_owned()))
+                .await
+                .unwrap(),
+            1
         );
     }
 

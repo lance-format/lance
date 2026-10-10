@@ -124,9 +124,12 @@ impl CapturedRowIds {
     pub fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
         match self {
             Self::AddressStyle(ids) => {
-                // Assume they are sorted
-                ids.append(row_ids.iter().cloned())
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                // A compaction task may list its fragments in any id order, so a
+                // batch can start below the current max; `append` only covers
+                // the sorted case.
+                if let Err(unsorted) = ids.append(row_ids.iter().copied()) {
+                    ids.extend(&row_ids[unsorted.valid_until() as usize..]);
+                }
             }
             Self::SequenceStyle {
                 row_ids: sequence, ..
