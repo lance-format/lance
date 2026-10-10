@@ -291,7 +291,7 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
         &[index],
         empty_doc_stream(),
         dest_store.as_ref(),
-        None,
+        &[None],
         crate::progress::noop_progress(),
     )
     .await?;
@@ -347,7 +347,7 @@ async fn test_merge_segments_preserves_format_version(
         &[index],
         empty_doc_stream(),
         dest_store.as_ref(),
-        None,
+        &[None],
         crate::progress::noop_progress(),
     )
     .await?;
@@ -408,7 +408,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
         &segments,
         empty_doc_stream(),
         dest_store.as_ref(),
-        None,
+        &vec![None; segments.len()],
         crate::progress::noop_progress(),
     )
     .await?;
@@ -471,7 +471,7 @@ async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()
             empty_doc_stream(),
             dest_store.as_ref(),
             &[first, second],
-            None,
+            &[None, None],
         )
         .await?;
 

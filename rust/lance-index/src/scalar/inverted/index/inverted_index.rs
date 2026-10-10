@@ -34,6 +34,9 @@ pub struct InvertedIndex {
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
     pub(super) deleted_fragments: RoaringBitmap,
+    /// Rows this segment may report, intersected into every mask it searches with.
+    /// See [`Self::with_allowed_rows`].
+    pub(super) allowed_rows: Option<Arc<RowAddrMask>>,
 }
 
 impl Debug for InvertedIndex {
@@ -146,11 +149,32 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
+    /// Only report rows that `allowed` selects.
+    ///
+    /// A segment's postings describe rows as they were when it covered their fragments.
+    /// Under stable row ids a rewritten row keeps its row id while it moves to a fragment
+    /// another segment may cover, so the old segment still lists it under its old tokens
+    /// and a prefilter built over the union of all segments lets it through. The opener
+    /// passes the live rows currently stored in the fragments this segment covers.
+    pub fn with_allowed_rows(mut self, allowed: Arc<RowAddrMask>) -> Self {
+        self.allowed_rows = Some(allowed);
+        self
+    }
+
+    /// The mask this segment searches with: `mask` restricted to its allowed rows.
+    pub(crate) fn restrict_mask(&self, mask: Arc<RowAddrMask>) -> Arc<RowAddrMask> {
+        match &self.allowed_rows {
+            None => mask,
+            Some(allowed) if mask.is_select_all() => allowed.clone(),
+            Some(allowed) => Arc::new(mask.as_ref().clone() & allowed.as_ref().clone()),
+        }
+    }
+
     pub async fn merge_segments(
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
@@ -190,7 +214,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
         let files = builder
-            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .update_from_segments(new_data, dest_store, segments, old_data_filters)
             .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
@@ -246,6 +270,7 @@ impl InvertedIndex {
             prewarm_state: self.prewarm_state.clone(),
             document_projections_resident: self.document_projections_resident.clone(),
             deleted_fragments: self.deleted_fragments.clone(),
+            allowed_rows: self.allowed_rows.clone(),
         }))
     }
 
@@ -313,6 +338,7 @@ impl InvertedIndex {
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
+            allowed_rows: None,
         }))
     }
 
@@ -382,6 +408,7 @@ impl InvertedIndex {
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
+            allowed_rows: None,
         }))
     }
 
@@ -537,6 +564,7 @@ impl InvertedIndex {
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
+                    allowed_rows: None,
                 }))
             }
             Err(_) => {
@@ -649,6 +677,7 @@ impl InvertedIndex {
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
+                    allowed_rows: None,
                 }))
             }
             Err(_) => {

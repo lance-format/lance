@@ -263,41 +263,71 @@ impl ExecutionPlan for FtsDocumentExec {
 }
 
 /// Open one FTS segment as an [`InvertedIndex`].
+///
+/// With `restrict_rows` the segment may only report live rows currently stored in the
+/// fragments it covers (see [`open_fts_segments`]).
 async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
+    restrict_rows: bool,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
-    let index = dataset
-        .open_scalar_index(column, &segment.uuid, metrics)
-        .await?;
-    let inverted = index
-        .as_any()
-        .downcast_ref::<InvertedIndex>()
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Index for column {} and segment {} is not an inverted index",
-                column, segment.uuid
-            ))
-        })?;
-    Ok(Arc::new(inverted.clone()))
+    let open = async {
+        let index = dataset
+            .open_scalar_index(column, &segment.uuid, metrics)
+            .await?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .cloned()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Index for column {} and segment {} is not an inverted index",
+                    column, segment.uuid
+                ))
+            })
+    };
+    let allowed_rows = async {
+        let coverage = if restrict_rows {
+            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
+        } else {
+            None
+        };
+        match coverage.and_then(|coverage| {
+            DatasetPreFilter::create_restricted_deletion_mask(Arc::new(dataset.clone()), coverage)
+        }) {
+            Some(mask) => Ok(Some(mask.await?)),
+            None => Ok(None),
+        }
+    };
+    let (inverted, allowed_rows) = futures::try_join!(open, allowed_rows)?;
+    Ok(Arc::new(match allowed_rows {
+        Some(allowed_rows) => inverted.with_allowed_rows(allowed_rows),
+        None => inverted,
+    }))
 }
 
 /// Open all committed FTS segments for a column.
 ///
 /// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
 /// current correctness-first path opens each committed segment before scoring.
+///
+/// Under stable row ids a rewritten row keeps its row id while it moves to a fragment
+/// another segment may cover, so the old segment still lists it under its old tokens. The
+/// shared prefilter only knows the union of all segments, so each segment is restricted to
+/// the live rows currently stored in the fragments it covers.
 async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
+    let restrict_rows = dataset.manifest.uses_stable_row_ids() && segments.len() > 1;
     try_join_all(
         segments
             .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
+            .map(|segment| open_fts_segment(dataset, column, segment, restrict_rows, metrics)),
     )
     .await
 }
@@ -3715,9 +3745,11 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(open_fts_segment(dataset, column, index_meta, metrics)
-                .await?
-                .tokenizer());
+            return Ok(
+                open_fts_segment(dataset, column, index_meta, false, metrics)
+                    .await?
+                    .tokenizer(),
+            );
         }
         Ok(default_text_tokenizer())
     }
@@ -3731,9 +3763,11 @@ impl FlatMatchFilterExec {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(open_fts_segment(dataset, column, index_meta, metrics)
-            .await?
-            .tokenizer())
+        Ok(
+            open_fts_segment(dataset, column, index_meta, false, metrics)
+                .await?
+                .tokenizer(),
+        )
     }
 
     pub fn new(
@@ -5801,7 +5835,7 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
-        UInt64Array,
+        UInt64Array, record_batch,
     };
     use arrow_schema::DataType;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -5816,6 +5850,7 @@ mod tests {
     };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
         BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, FtsSearchParams, MatchQuery,
@@ -5836,6 +5871,7 @@ mod tests {
         Dataset,
         dataset::WriteParams,
         dataset::transaction::{Operation, TransactionBuilder},
+        dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
         index::DatasetIndexInternalExt,
         io::exec::PreFilterSource,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
@@ -7935,5 +7971,146 @@ mod tests {
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
+    }
+
+    /// `(id, score)` of every hit, sorted by id. The limit lets a query over several
+    /// columns use the cross-column scorer, which is skipped without one.
+    async fn fts_hits(dataset: &Dataset, query: FtsQuery) -> Vec<(String, f32)> {
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap();
+        scan.project(&["id"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<StringArray>().unwrap();
+        let scores = batch[SCORE_COL]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let mut hits = ids
+            .iter()
+            .zip(scores.values())
+            .map(|(id, score)| (id.unwrap().to_string(), *score))
+            .collect::<Vec<_>>();
+        hits.sort_by(|a, b| a.0.cmp(&b.0));
+        hits
+    }
+
+    /// Every FTS search path reports only current rows: the old segment still lists `a1`
+    /// under "graph engines", but `a1` now lives in a fragment the newer segment covers.
+    async fn assert_no_stale_rows(dataset: &Dataset) {
+        let ids = |hits: Vec<(String, f32)>| hits.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let text = |terms: &str| -> FtsQuery {
+            MatchQuery::new(terms.into())
+                .with_column(Some("text".into()))
+                .into()
+        };
+        assert_eq!(
+            ids(fts_hits(dataset, text("graph")).await),
+            ["a2", "a3", "a5"]
+        );
+        // Listed once, not once per segment.
+        assert_eq!(ids(fts_hits(dataset, text("engines")).await), ["a1", "a4"]);
+        let phrase = PhraseQuery::new("graph engines".into()).with_column(Some("text".into()));
+        assert_eq!(fts_hits(dataset, phrase.into()).await, []);
+        // `tag:zeta` (3 postings, stale `a1` included) is cheaper than `text:graph` (4),
+        // so it generates the candidates and `text:graph` is only loaded for them.
+        let tag_zeta = MatchQuery::new("zeta".into()).with_column(Some("tag".into()));
+        let cross =
+            BooleanQuery::new([(Occur::Must, tag_zeta.into()), (Occur::Must, text("graph"))]);
+        assert_eq!(fts_hits(dataset, FtsQuery::Boolean(cross)).await, []);
+        // `a1` and `a4` hold identical text, so `a1`'s old length must not count.
+        let combined =
+            CombinedFieldsQuery::try_new("zeta".into(), vec!["text".into(), "tag".into()]).unwrap();
+        let hits = fts_hits(dataset, FtsQuery::CombinedFields(combined)).await;
+        assert_eq!(ids(hits.clone()), ["a1", "a4"]);
+        assert_eq!(hits[0].1, hits[1].1);
+    }
+
+    /// https://github.com/lance-format/lance/issues/9817: under stable row ids an
+    /// in-place update moves `a1` to a new fragment with the same row id, and an
+    /// append-only optimize gives that fragment its own segment. Merging the segments
+    /// must drop the stale posting rather than carry it into one segment.
+    #[rstest::rstest]
+    #[case::optimize_indices(true)]
+    #[case::merge_existing_index_segments(false)]
+    #[tokio::test]
+    async fn stale_posting_after_in_place_update_with_stable_row_ids(
+        #[case] merge_by_optimize: bool,
+    ) {
+        let base = record_batch!(
+            ("id", Utf8, ["a1", "a2", "a3", "a4", "a5"]),
+            (
+                "text",
+                Utf8,
+                [
+                    "graph engines",
+                    "graph search",
+                    "graph databases",
+                    "omega engines",
+                    "graph theory"
+                ]
+            ),
+            ("tag", Utf8, ["zeta", "misc", "misc", "zeta", "misc"])
+        )
+        .unwrap();
+        let schema = base.schema();
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(base)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", Some(params))
+            .await
+            .unwrap();
+        let index_params = InvertedIndexParams::default().with_position(true);
+        for column in ["text", "tag"] {
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &index_params, true)
+                .await
+                .unwrap();
+        }
+
+        let update = record_batch!(
+            ("id", Utf8, ["a1"]),
+            ("text", Utf8, ["omega engines"]),
+            ("tag", Utf8, ["zeta"])
+        )
+        .unwrap();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let reader = RecordBatchIterator::new(vec![Ok(update)], schema);
+        let (dataset, _) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_no_stale_rows(&dataset).await;
+
+        if merge_by_optimize {
+            let options = OptimizeOptions::default().num_indices_to_merge(Some(2));
+            dataset.optimize_indices(&options).await.unwrap();
+        } else {
+            let merged = dataset
+                .merge_existing_index_segments(segments)
+                .await
+                .unwrap();
+            dataset
+                .commit_existing_index_segments("text_idx", "text", vec![merged])
+                .await
+                .unwrap();
+        }
+        let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_no_stale_rows(&dataset).await;
     }
 }

@@ -1558,8 +1558,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .await?;
 
                     let mut frag_bitmap = base_unindexed_bitmap;
-                    let mut effective_old_frags = RoaringBitmap::new();
                     let mut selected_indices = Vec::with_capacity(selected_old_indices.len());
+                    // Each segment keeps only its old rows still stored in the
+                    // fragments it covers. Under stable row ids a rewritten row
+                    // keeps its row id while it moves into a fragment a sibling
+                    // covers, so a filter over the union of all coverage would
+                    // keep the old segment's stale posting for it.
+                    let mut old_data_filters = Vec::with_capacity(selected_old_indices.len());
                     // On a tagged table a selected segment's old data is the
                     // coverage the reader derives for it (translated, live)
                     // and the merged segment keeps the stored provenance,
@@ -1569,24 +1574,29 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         tagged_segment_coverage(dataset.as_ref(), &selected_old_indices, None)
                             .await?;
                     for idx in &selected_old_indices {
-                        match &tagged_coverage {
+                        let effective_old_frags = match &tagged_coverage {
                             Some(coverage) => {
-                                if let Some(derived) = coverage.get(&idx.uuid) {
-                                    effective_old_frags |= derived;
-                                }
                                 if let Some(stored) = &idx.fragment_bitmap {
                                     frag_bitmap |= stored;
                                 }
+                                coverage.get(&idx.uuid).cloned().unwrap_or_default()
                             }
                             None => {
-                                if let Some(effective) =
-                                    idx.effective_fragment_bitmap(&dataset.fragment_bitmap)
-                                {
-                                    frag_bitmap |= &effective;
-                                    effective_old_frags |= &effective;
-                                }
+                                let effective = idx
+                                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                                    .unwrap_or_default();
+                                frag_bitmap |= &effective;
+                                effective
                             }
-                        }
+                        };
+                        old_data_filters.push(
+                            build_old_data_filter(
+                                dataset.as_ref(),
+                                &effective_old_frags,
+                                &RoaringBitmap::new(),
+                            )
+                            .await?,
+                        );
                         let scalar_index = dataset
                             .open_scalar_index_for_maintenance(
                                 &field_path,
@@ -1606,20 +1616,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             })?;
                         selected_indices.push(Arc::new(inverted_index.clone()));
                     }
-
-                    let old_data_filter = if selected_indices.is_empty() {
-                        None
-                    } else if dataset.manifest.uses_stable_row_ids() {
-                        let valid_old_row_ids =
-                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
-                                .await?;
-                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
-                    } else {
-                        Some(OldIndexDataFilter::Fragments {
-                            to_keep: effective_old_frags,
-                            to_remove: RoaringBitmap::new(),
-                        })
-                    };
 
                     let new_uuid = Uuid::new_v4();
                     let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
@@ -1644,7 +1640,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 &selected_indices,
                                 new_data_stream,
                                 &new_store,
-                                old_data_filter,
+                                &old_data_filters,
                                 options.progress.clone(),
                             )
                             .await?,

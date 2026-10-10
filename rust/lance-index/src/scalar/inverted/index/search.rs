@@ -762,7 +762,7 @@ impl InvertedIndex {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mask = prefilter.mask();
+        let mask = self.restrict_mask(prefilter.mask());
         if self.is_legacy() {
             let (row_ids, scores) = self
                 .bm25_search_legacy(

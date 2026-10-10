@@ -239,6 +239,8 @@ struct SourceDescriptor {
     column_ordinal: usize,
     segment_ordinal: usize,
     partition: Arc<InvertedPartition>,
+    /// The query mask restricted to the rows the segment may report.
+    mask: Arc<RowAddrMask>,
 }
 
 fn staged_candidate_budget(num_docs: usize, limit: usize) -> usize {
@@ -697,13 +699,13 @@ async fn load_masked_cross_column_source_for_leaves(
     descriptor: SourceDescriptor,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     leaf_ordinals: Vec<usize>,
-    mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<Option<LoadedCrossColumnSource>> {
     let SourceDescriptor {
         column_ordinal,
         segment_ordinal,
         partition,
+        mask,
     } = descriptor;
     let viable_leaf_ordinals = viable_leaf_ordinals(
         column_ordinal,
@@ -763,13 +765,13 @@ async fn load_masked_generator_source(
     descriptor: SourceDescriptor,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     leaf_ordinals: Vec<usize>,
-    mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<Option<LoadedGeneratorSource>> {
     let SourceDescriptor {
         column_ordinal,
         segment_ordinal,
         partition,
+        mask,
     } = descriptor;
     let viable_leaf_ordinals = viable_leaf_ordinals(
         column_ordinal,
@@ -811,21 +813,14 @@ async fn load_masked_cross_column_source(
     descriptor: SourceDescriptor,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     leaves_by_column: Arc<Vec<Vec<usize>>>,
-    mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<Option<LoadedCrossColumnSource>> {
     let leaf_ordinals = leaves_by_column
         .get(descriptor.column_ordinal)
         .cloned()
         .ok_or_else(|| Error::internal("cross-column FTS source references a missing column"))?;
-    load_masked_cross_column_source_for_leaves(
-        descriptor,
-        prepared_leaves,
-        leaf_ordinals,
-        mask,
-        metrics,
-    )
-    .await
+    load_masked_cross_column_source_for_leaves(descriptor, prepared_leaves, leaf_ordinals, metrics)
+        .await
 }
 
 async fn load_candidate_cross_column_source(
@@ -839,7 +834,21 @@ async fn load_candidate_cross_column_source(
         column_ordinal,
         segment_ordinal,
         partition,
+        mask,
     } = descriptor;
+    // Candidates come from every segment; this source may only score the ones its
+    // segment is allowed to report.
+    let candidates = if mask.is_select_all() {
+        candidates
+    } else {
+        Arc::new(
+            candidates
+                .iter()
+                .copied()
+                .filter(|address| mask.selected(*address))
+                .collect(),
+        )
+    };
     let leaf_ordinals = leaves_by_column
         .get(column_ordinal)
         .ok_or_else(|| Error::internal("cross-column FTS source references a missing column"))?;
@@ -1481,10 +1490,12 @@ pub async fn cross_column_compound_search(
         .iter()
         .enumerate()
         .flat_map(|(column_ordinal, (_, indices))| {
+            let mask = mask.clone();
             indices
                 .iter()
                 .enumerate()
                 .flat_map(move |(segment_ordinal, index)| {
+                    let mask = index.restrict_mask(mask.clone());
                     index
                         .partitions
                         .iter()
@@ -1493,6 +1504,7 @@ pub async fn cross_column_compound_search(
                             column_ordinal,
                             segment_ordinal,
                             partition,
+                            mask: mask.clone(),
                         })
                 })
         })
@@ -1535,7 +1547,6 @@ pub async fn cross_column_compound_search(
                 descriptor,
                 prepared_leaves.clone(),
                 leaf_ordinals,
-                mask.clone(),
                 metrics.clone(),
             )
         }))
@@ -1629,7 +1640,6 @@ pub async fn cross_column_compound_search(
                 descriptor,
                 prepared_leaves.clone(),
                 leaves_by_column.clone(),
-                mask.clone(),
                 metrics.clone(),
             )
         }))

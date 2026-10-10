@@ -317,7 +317,7 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
-        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        old_data_filters: &[Option<crate::scalar::OldIndexDataFilter>],
     ) -> Result<Vec<IndexFile>> {
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
@@ -330,7 +330,7 @@ impl InvertedIndexBuilder {
         }
 
         let mut files = self
-            .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
+            .merge_existing_segments(dest_store, old_segments, old_data_filters)
             .await?;
 
         let new_data = document_input(new_data, doc_col)?;
@@ -349,13 +349,21 @@ impl InvertedIndexBuilder {
         &mut self,
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
-        old_data_filter: Option<&crate::scalar::OldIndexDataFilter>,
+        old_data_filters: &[Option<crate::scalar::OldIndexDataFilter>],
     ) -> Result<Vec<IndexFile>> {
+        if old_data_filters.len() != old_segments.len() {
+            return Err(Error::invalid_input(format!(
+                "inverted merge: expected one old-data filter per source segment \
+                 (segments={}, filters={})",
+                old_segments.len(),
+                old_data_filters.len()
+            )));
+        }
         let num_workers = resolve_num_workers(&self.params);
         let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let mut merged: Option<InnerBuilder> = None;
         let mut files = Vec::new();
-        for index in old_segments {
+        for (index, old_data_filter) in old_segments.iter().zip(old_data_filters) {
             if old_data_filter.is_none() {
                 self.deleted_fragments
                     .extend(index.deleted_fragments().iter());
@@ -1088,6 +1096,10 @@ impl InnerBuilder {
             if !keep {
                 mapping.insert(*row_id, None);
             }
+        }
+        // Remapping rebuilds every posting list, which is wasted work when nothing is dropped.
+        if mapping.is_empty() {
+            return Ok(());
         }
         self.remap(&RowAddrRemap::direct(mapping)).await
     }
