@@ -1197,6 +1197,9 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    /// Scalar indices that must not participate in expression-filter planning.
+    ignored_scalar_index_names: HashSet<String>,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1688,6 +1691,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            ignored_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -2257,6 +2261,45 @@ impl Scanner {
         self
     }
 
+    /// Ignore named scalar indices from expression-filter planning.
+    ///
+    /// Other scalar indices remain eligible, and the original filter is still
+    /// evaluated for rows selected by the remaining scan plan. Names that do
+    /// not identify an available scalar index have no effect. This option is
+    /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// Inverted index names are also honored for expression filters such as
+    /// `contains_tokens`, which fall back to evaluating the function without that
+    /// index. This does not control vector index segments or the index selected
+    /// by an explicit full-text search query.
+    ///
+    /// With [`Self::fast_search`], only a filter plan that still uses an index
+    /// skips unindexed fragments. If ignoring indices removes every index query,
+    /// the scan falls back to evaluating the filter over all selected fragments,
+    /// potentially returning more matching rows. Explicit fragment and row
+    /// selections still apply; use them to preserve a caller-defined scan scope.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn scan_without_one_index(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .filter("id = 42")?
+    ///     .with_ignored_scalar_indices(["id_zonemap"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_ignored_scalar_indices<I, S>(&mut self, index_names: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ignored_scalar_index_names = index_names.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Set whether to use strict batch size.
     ///
     /// If this is true then output batches (except the last batch) will have exactly `batch_size` rows.
@@ -2525,6 +2568,11 @@ impl Scanner {
     /// Default value is false.
     ///
     /// This is essentially a weak consistency search, only on the indexed data.
+    /// For scalar expression filters, this applies only when the filter plan
+    /// uses an index. If no index query remains, including after
+    /// [`Self::with_ignored_scalar_indices`], the scan falls back to all selected
+    /// fragments while retaining the original filter and explicit row selections.
+    ///
     /// Row IDs are used internally but are only returned when explicitly requested.
     pub fn fast_search(&mut self) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
@@ -3399,10 +3447,17 @@ impl Scanner {
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
-                        .scalar_index_info_for_segments(selection.segments.as_ref())
+                        .scalar_index_info_for_segments(
+                            selection.segments.as_ref(),
+                            &self.ignored_scalar_index_names,
+                        )
                         .await?
                 }
-                None => self.dataset.scalar_index_info().await?,
+                None => {
+                    self.dataset
+                        .scalar_index_info_ignoring(&self.ignored_scalar_index_names)
+                        .await?
+                }
             };
             let filter_plan =
                 planner.create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
@@ -15850,6 +15905,82 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         );
     }
 
+    #[rstest]
+    #[case::known_names(false)]
+    #[case::unknown_name(true)]
+    #[tokio::test]
+    async fn test_ignored_scalar_indices(#[case] include_unknown_name: bool) {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                Some("a_zonemap".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["b"],
+                IndexType::BTree,
+                Some("b_btree".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut default_scan = dataset.scan();
+        default_scan.filter("a < 50 AND b < 50").unwrap();
+        let default_plan = default_scan.explain_plan(true).await.unwrap();
+        assert!(
+            default_plan.contains("@a_zonemap(ZoneMap)"),
+            "{default_plan}"
+        );
+        assert!(default_plan.contains("@b_btree(BTree)"), "{default_plan}");
+
+        let mut ignore_a = dataset.scan();
+        ignore_a
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_ignored_scalar_indices(if include_unknown_name {
+                vec!["a_zonemap", "missing_index"]
+            } else {
+                vec!["a_zonemap"]
+            });
+        let ignore_a_plan = ignore_a.explain_plan(true).await.unwrap();
+        assert!(
+            !ignore_a_plan.contains("@a_zonemap(ZoneMap)"),
+            "{ignore_a_plan}"
+        );
+        assert!(ignore_a_plan.contains("@b_btree(BTree)"), "{ignore_a_plan}");
+
+        let result = ignore_a.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+
+        let mut ignore_both = dataset.scan();
+        ignore_both
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_ignored_scalar_indices(["a_zonemap", "b_btree"]);
+        let ignore_both_plan = ignore_both.explain_plan(true).await.unwrap();
+        assert!(
+            !ignore_both_plan.contains("ScalarIndexQuery"),
+            "{ignore_both_plan}"
+        );
+        let result = ignore_both.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+    }
+
     #[tokio::test]
     async fn test_like_prefix_correctness_with_btree_index() {
         // Create dataset with deterministic string data for exact result verification
@@ -18515,6 +18646,55 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             project_first_scanner.try_into_batch().await.unwrap(),
             fast_batch
         );
+    }
+
+    #[rstest]
+    #[case::no_ignored_indices(vec![], false, 5)]
+    #[case::remaining_index(vec!["a_btree"], false, 5)]
+    #[case::all_ignored(vec!["a_btree", "b_btree"], false, 15)]
+    #[case::explicit_rows(vec!["a_btree", "b_btree"], true, 2)]
+    #[case::unknown_name(vec!["missing_index"], false, 5)]
+    #[tokio::test]
+    async fn test_fast_search_ignored_scalar_indices(
+        #[case] ignored_names: Vec<&str>,
+        #[case] restrict_rows: bool,
+        #[case] expected_rows: usize,
+    ) {
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(LanceFileVersion::Stable).await;
+        for column in ["a", "b"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    Some(format!("{column}_btree")),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+
+        let mut scanner = dataset.scan();
+        scanner
+            .filter("a >= 95 AND b >= 95")
+            .unwrap()
+            .with_ignored_scalar_indices(ignored_names)
+            .fast_search();
+        if restrict_rows {
+            // The caller's selection must survive fallback, and its rows must
+            // still be refined by the original expression (which excludes 90).
+            scanner.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+                90u64, 97, 99,
+            ])));
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        if restrict_rows {
+            let values = batch["a"].as_primitive::<Int32Type>();
+            assert_eq!(values.values().as_ref(), &[97, 99]);
+        }
     }
 
     fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
