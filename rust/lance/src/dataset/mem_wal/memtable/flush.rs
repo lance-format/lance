@@ -846,6 +846,7 @@ async fn build_scalar_index(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
