@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::{MultipartUpload, ObjectStoreExt};
+use object_store::{MultipartUpload, PutMode, PutMultipartOptions, PutOptions};
 use object_store::{ObjectStore, path::Path};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
@@ -90,6 +90,7 @@ pub struct ObjectWriter {
     path: Arc<Path>,
     cursor: usize,
     buffer: Vec<u8>,
+    put_mode: PutMode,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
 }
@@ -223,7 +224,7 @@ enum UploadState {
 
 /// Methods for state transitions.
 impl UploadState {
-    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>) {
+    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>, put_mode: PutMode) {
         // To get owned self, we temporarily swap with Done.
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
@@ -232,16 +233,26 @@ impl UploadState {
                 let started_at = Instant::now();
                 let fut = async move {
                     let size = buffer.len();
-                    let res = store.put(&path, buffer.into()).await.map_err(|source| {
-                        UploadFailure::new(
-                            format!(
-                                "single PUT of {path} failed after {:?} ({size} bytes, {})",
-                                started_at.elapsed(),
-                                upload_settings()
-                            ),
-                            source,
+                    let res = store
+                        .put_opts(
+                            &path,
+                            buffer.into(),
+                            PutOptions {
+                                mode: put_mode,
+                                ..Default::default()
+                            },
                         )
-                    })?;
+                        .await
+                        .map_err(|source| {
+                            UploadFailure::new(
+                                format!(
+                                    "single PUT of {path} failed after {:?} ({size} bytes, {})",
+                                    started_at.elapsed(),
+                                    upload_settings()
+                                ),
+                                source,
+                            )
+                        })?;
                     Ok(WriteResult {
                         size,
                         e_tag: res.e_tag,
@@ -266,17 +277,28 @@ impl UploadState {
                 tracing::Span::current().record("part_count", part_idx as u64);
                 let started_at = Instant::now();
                 let fut = async move {
-                    let res = upload.complete().await.map_err(|source| {
-                        UploadFailure::new(
-                            format!(
-                                "completing multipart upload of {path} failed after {:?} \
+                    let res = match upload.complete().await {
+                        Ok(result) => result,
+                        Err(source) => {
+                            let elapsed = started_at.elapsed();
+                            if let Err(error) = upload.abort().await {
+                                tracing::warn!(
+                                    path = %path,
+                                    error = %error,
+                                    "Failed to abort multipart upload after completion error"
+                                );
+                            }
+                            return Err(UploadFailure::new(
+                                format!(
+                                    "completing multipart upload of {path} failed after {:?} \
                                  ({part_idx} parts, {bytes_written} bytes, {})",
-                                started_at.elapsed(),
-                                upload_settings()
-                            ),
-                            source,
-                        )
-                    })?;
+                                    elapsed,
+                                    upload_settings()
+                                ),
+                                source,
+                            ));
+                        }
+                    };
                     Ok(WriteResult {
                         size: 0, // This will be set properly later.
                         e_tag: res.e_tag,
@@ -291,11 +313,20 @@ impl UploadState {
 
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
+        Self::new_with_mode(object_store, path, PutMode::Overwrite).await
+    }
+
+    pub(crate) async fn new_with_mode(
+        object_store: &LanceObjectStore,
+        path: &Path,
+        put_mode: PutMode,
+    ) -> Result<Self> {
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
             path: Arc::new(path.clone()),
             buffer: Vec::with_capacity(initial_upload_size()),
+            put_mode,
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
     }
@@ -472,18 +503,28 @@ impl AsyncWrite for ObjectWriter {
                 UploadState::Started(store) => {
                     let path = mut_self.path.clone();
                     let store = store.clone();
+                    let put_mode = mut_self.put_mode.clone();
                     let started_at = Instant::now();
                     let fut = Box::pin(async move {
-                        store.put_multipart(path.as_ref()).await.map_err(|source| {
-                            UploadFailure::new(
-                                format!(
-                                    "failed to create multipart upload for {path} after {:?} ({})",
-                                    started_at.elapsed(),
-                                    upload_settings()
-                                ),
-                                source,
+                        store
+                            .put_multipart_opts(
+                                path.as_ref(),
+                                PutMultipartOptions {
+                                    mode: put_mode,
+                                    ..Default::default()
+                                },
                             )
-                        })
+                            .await
+                            .map_err(|source| {
+                                UploadFailure::new(
+                                    format!(
+                                        "failed to create multipart upload for {path} after {:?} ({})",
+                                        started_at.elapsed(),
+                                        upload_settings()
+                                    ),
+                                    source,
+                                )
+                            })
                     });
                     self.state = UploadState::CreatingUpload(fut);
                 }
@@ -570,7 +611,8 @@ impl AsyncWrite for ObjectWriter {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = std::mem::take(&mut mut_self.buffer);
                     let path = mut_self.path.clone();
-                    self.state.started_to_putting_single(path, part);
+                    let put_mode = mut_self.put_mode.clone();
+                    self.state.started_to_putting_single(path, part, put_mode);
                 }
                 UploadState::InProgress {
                     upload,

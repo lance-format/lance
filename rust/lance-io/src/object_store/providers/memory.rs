@@ -28,6 +28,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
+            supports_conditional_multipart_put: true,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,

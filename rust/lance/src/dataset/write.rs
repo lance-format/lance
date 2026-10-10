@@ -2136,38 +2136,9 @@ pub(in crate::dataset) struct FilePromotion {
 
 impl FilePromotion {
     async fn promote(&self) -> Result<()> {
-        match self
-            .object_store
-            .inner
+        self.object_store
             .copy_if_not_exists(&self.staging_path, &self.final_path)
-            .await
-        {
-            Ok(()) => {}
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => {
-                let staged = self
-                    .object_store
-                    .inner
-                    .head(&self.staging_path)
-                    .await
-                    .map_err(|error| Error::io(error.to_string()))?;
-                let existing = self
-                    .object_store
-                    .inner
-                    .head(&self.final_path)
-                    .await
-                    .map_err(|error| Error::io(error.to_string()))?;
-                if staged.size != existing.size {
-                    return Err(Error::io(format!(
-                        "fixed data file {} already exists with size {}, but the staged retry has size {}",
-                        self.final_path, existing.size, staged.size
-                    )));
-                }
-            }
-            Err(error) => return Err(Error::io(error.to_string())),
-        }
+            .await?;
         self.object_store
             .inner
             .delete(&self.staging_path)

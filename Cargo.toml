@@ -177,7 +177,7 @@ mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
-object_store = { version = "0.14.1" }
+object_store = { version = "0.14.2" }
 opendal = { version = "0.59.2" }
 object_store_opendal = { version = "0.60.2" }
 # Pin 0.2.2 so Cargo unifies past OpenDAL 0.59.2's `^0.2.1` req. 0.2.2 keeps
@@ -284,3 +284,6 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }

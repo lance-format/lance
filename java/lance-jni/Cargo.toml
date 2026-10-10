@@ -39,7 +39,7 @@ arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
 datafusion = { version = "54.0.0", default-features = false }
 datafusion-common = "54.0.0"
-object_store = { version = "0.14.1" }
+object_store = { version = "0.14.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
     "macros",
@@ -79,3 +79,6 @@ strip = true
 
 [lints.clippy]
 disallowed_macros = "deny"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }

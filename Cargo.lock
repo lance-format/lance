@@ -4530,7 +4530,7 @@ dependencies = [
  "lzma-sys",
  "mock_instant",
  "moka",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "parquet",
  "permutation",
  "pin-project",
@@ -4646,7 +4646,7 @@ dependencies = [
  "log",
  "moka",
  "num_cpus",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "pin-project",
  "proptest",
  "prost",
@@ -4791,7 +4791,7 @@ dependencies = [
  "lance-datagen",
  "lance-index",
  "lance-linalg",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "parquet",
  "rand 0.9.5",
  "tempfile",
@@ -4826,7 +4826,7 @@ dependencies = [
  "libc",
  "log",
  "num-traits",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "pretty_assertions",
  "proptest",
  "prost",
@@ -4915,7 +4915,7 @@ dependencies = [
  "log",
  "ndarray",
  "num-traits",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4989,7 +4989,7 @@ dependencies = [
  "mock_instant",
  "mockall",
  "moka",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "object_store_opendal",
  "opendal",
  "opendal-service-goosefs",
@@ -5112,7 +5112,7 @@ dependencies = [
  "lance-namespace",
  "lance-table",
  "log",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "quick-xml 0.40.1",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -5188,7 +5188,7 @@ dependencies = [
  "lance-select",
  "lance-testing",
  "log",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "pretty_assertions",
  "proptest",
  "prost",
@@ -5252,7 +5252,7 @@ dependencies = [
  "lance-core",
  "lance-file",
  "lance-io",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "tokio",
  "url",
 ]
@@ -6084,13 +6084,12 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
+version = "0.14.2"
+source = "git+https://github.com/apache/arrow-rs-object-store.git?rev=c10758c207c0103355f940f0c736fb8ecb157b04#c10758c207c0103355f940f0c736fb8ecb157b04"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "crc-fast",
@@ -6136,7 +6135,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "opendal",
  "pin-project",
  "tokio",
@@ -7251,7 +7250,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9562,7 +9561,7 @@ version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 dependencies = [
- "rand 0.10.1",
+ "rand 0.9.5",
 ]
 
 [[package]]

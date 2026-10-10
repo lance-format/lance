@@ -93,7 +93,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -104,7 +104,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1222,7 +1222,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2330,7 +2330,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2435,7 +2435,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3875,7 +3875,7 @@ dependencies = [
  "lance-tokenizer",
  "log",
  "moka",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "permutation",
  "pin-project",
  "prost",
@@ -3971,7 +3971,7 @@ dependencies = [
  "log",
  "moka",
  "num_cpus",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "pin-project",
  "prost",
  "quick_cache",
@@ -4084,7 +4084,7 @@ dependencies = [
  "lance-io",
  "log",
  "num-traits",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4159,7 +4159,7 @@ dependencies = [
  "log",
  "ndarray",
  "num-traits",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4223,7 +4223,7 @@ dependencies = [
  "log",
  "metrics",
  "moka",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "object_store_opendal",
  "opendal",
  "opendal-service-goosefs",
@@ -4271,7 +4271,7 @@ dependencies = [
  "log",
  "metrics",
  "metrics-util",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-types",
  "roaring",
@@ -4348,7 +4348,7 @@ dependencies = [
  "lance-namespace",
  "lance-table",
  "log",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "rand 0.9.5",
  "reqwest 0.12.28",
  "roaring",
@@ -4410,7 +4410,7 @@ dependencies = [
  "lance-io",
  "lance-select",
  "log",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4931,7 +4931,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5093,13 +5093,12 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
+version = "0.14.2"
+source = "git+https://github.com/apache/arrow-rs-object-store.git?rev=c10758c207c0103355f940f0c736fb8ecb157b04#c10758c207c0103355f940f0c736fb8ecb157b04"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "crc-fast",
@@ -5145,7 +5144,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "opendal",
  "pin-project",
  "tokio",
@@ -6654,7 +6653,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6712,7 +6711,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7200,7 +7199,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7465,7 +7464,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7929,7 +7928,7 @@ version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 dependencies = [
- "rand 0.10.1",
+ "rand 0.9.5",
 ]
 
 [[package]]
@@ -8305,7 +8304,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

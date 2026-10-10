@@ -24,7 +24,7 @@ arrow-array = "58.0.0"
 arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
-object_store = "0.14.1"
+object_store = "0.14.2"
 url = "2.5.7"
 datafusion = { version = "54.0.0", default-features = false }
 datafusion-ffi = "54.0.0"
@@ -104,6 +104,9 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[patch.crates-io]
+object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }
 
 [lints.clippy]
 disallowed_macros = "deny"

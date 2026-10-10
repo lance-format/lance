@@ -90,7 +90,7 @@ pub struct MemTable {
     /// Reserved SSTable/data-file identity for this generation.
     target: Option<MemTableDataTarget>,
 
-    /// Shared across the per-put Blob preprocessors for this target.
+    /// Shared by the generation-scoped Blob preprocessor and replay recovery.
     blob_id_allocator: BlobIdAllocator,
 
     /// Primary key bloom filter for staleness detection.
