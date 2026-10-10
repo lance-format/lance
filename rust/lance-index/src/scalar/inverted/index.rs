@@ -2376,16 +2376,15 @@ impl InvertedPartition {
         let mut decoded_positions = HashMap::<usize, V3DecodedPositionBlock>::new();
         let mut visited_blocks = HashSet::new();
         let mut num_comparisons = 0usize;
-        let refinement = block_wand::refinement_blocks(&term_plans);
-        let mut refinement = (!refinement.is_empty()).then_some(refinement);
-        let mut seed_docs = HashSet::new();
+        let mut can_refine = term_plans.len() > 1 && limit < self.docs.len();
+        let mut scored_windows = BTreeMap::<u32, u32>::new();
         let mut windows = windows.into_iter().peekable();
         while windows.peek().is_some() {
             threshold =
                 threshold.max(self.v3_shared_threshold(params.wand_factor, &shared_threshold));
             // Establish a threshold before widening I/O. Later batches amortize
             // remote request latency without materializing whole posting lists.
-            let batch_size = if candidates.len() < limit { 1 } else { 16 };
+            let batch_size = if scored_windows.is_empty() { 1 } else { 16 };
             let mut batch_windows = Vec::with_capacity(batch_size);
             for _ in 0..batch_size {
                 let Some(window) = windows.peek() else { break };
@@ -2419,6 +2418,7 @@ impl InvertedPartition {
                 if candidates.len() >= limit && window.upper_bound <= threshold {
                     continue;
                 }
+                scored_windows.insert(window.first_doc_id, window.last_doc_id);
                 let window_blocks = term_plans
                     .iter()
                     .flat_map(|term| {
@@ -2449,13 +2449,6 @@ impl InvertedPartition {
                 let mut docs_in_window = docs_in_window.into_iter().collect::<Vec<_>>();
                 docs_in_window.sort_unstable_by_key(|(doc_id, _)| *doc_id);
                 for (doc_id, acc) in docs_in_window {
-                    // Refinement rebuilds the disjoint windows. Documents already
-                    // scored to establish the initial threshold must not reenter.
-                    if refinement.is_some() {
-                        seed_docs.insert(doc_id);
-                    } else if seed_docs.contains(&doc_id) {
-                        continue;
-                    }
                     if !acc.matches_operator(candidate_operator) {
                         continue;
                     }
@@ -2525,11 +2518,21 @@ impl InvertedPartition {
                     }
                 }
             }
-            if windows
-                .peek()
-                .is_some_and(|window| candidates.len() < limit || window.upper_bound > threshold)
-                && let Some(refinement) = refinement.take()
+            if can_refine
+                && windows.peek().is_some_and(|window| {
+                    candidates.len() < limit || window.upper_bound > threshold
+                })
             {
+                let refinement = block_wand::refinement_blocks(
+                    &term_plans,
+                    windows.clone().take_while(|window| {
+                        candidates.len() < limit || window.upper_bound > threshold
+                    }),
+                );
+                if refinement.is_empty() {
+                    can_refine = false;
+                    continue;
+                }
                 self.load_v3_blocks(
                     &term_plans,
                     &refinement,
@@ -2538,10 +2541,13 @@ impl InvertedPartition {
                     metrics,
                 )
                 .await?;
+                metrics.record_fts_refinement_batches(1);
                 for term in &mut term_plans {
                     let query_weight = idf(term.posting_len as usize, self.docs.len());
                     for block_idx in 0..term.blocks.len() {
-                        if let Some(block) = decoded_blocks.get(&(term.block_start + block_idx)) {
+                        if !term.refined_blocks.contains_key(&block_idx)
+                            && let Some(block) = decoded_blocks.get(&(term.block_start + block_idx))
+                        {
                             term.refined_blocks.insert(
                                 block_idx,
                                 block
@@ -2561,6 +2567,17 @@ impl InvertedPartition {
                     }
                 }
                 windows = block_wand::search_windows(&term_plans, candidate_operator)
+                    .into_iter()
+                    // Refinement only adds boundaries, so every new window is
+                    // contained in one original window. Exclude scored regions
+                    // without retaining every visited document id.
+                    .filter(|window| {
+                        !scored_windows
+                            .range(..=window.first_doc_id)
+                            .next_back()
+                            .is_some_and(|(_, last)| *last >= window.last_doc_id)
+                    })
+                    .collect::<Vec<_>>()
                     .into_iter()
                     .peekable();
             }

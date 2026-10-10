@@ -101,10 +101,23 @@ pub(super) fn search_windows(terms: &[V3TermPlan], operator: Operator) -> Vec<V3
 /// Resolve the widest sparse bounds in one bounded I/O batch. Rare terms are
 /// preferred because their exact document ids can exclude large regions of
 /// frequent postings. Dense blocks already have useful interval bounds.
-pub(super) fn refinement_blocks(terms: &[V3TermPlan]) -> Vec<V3BlockMeta> {
+pub(super) fn refinement_blocks(
+    terms: &[V3TermPlan],
+    windows: impl Iterator<Item = V3Window>,
+) -> Vec<V3BlockMeta> {
     const MAX_REFINEMENT_BLOCKS: usize = 128;
     if terms.len() < 2 {
         return Vec::new();
+    }
+    let mut active_rows = HashSet::new();
+    for window in windows {
+        for term in terms {
+            for block in term.overlapping_blocks(window.first_doc_id, window.last_doc_id) {
+                if !term.refined_blocks.contains_key(&block.block_idx) {
+                    active_rows.insert(block.block_row);
+                }
+            }
+        }
     }
     let mut terms = terms.iter().collect::<Vec<_>>();
     terms.sort_unstable_by_key(|term| term.posting_len);
@@ -122,7 +135,10 @@ pub(super) fn refinement_blocks(terms: &[V3TermPlan]) -> Vec<V3BlockMeta> {
             let count = (term.posting_len as usize - block_idx * BLOCK_SIZE).min(BLOCK_SIZE);
             let span = u64::from(block.last_doc_id) - u64::from(block.first_doc_id) + 1;
             let block_row = term.block_start + block_idx;
-            if span <= count as u64 * 8 || !seen.insert(block_row) {
+            if span <= count as u64 * 8
+                || !active_rows.contains(&block_row)
+                || !seen.insert(block_row)
+            {
                 continue;
             }
             selected.push(V3BlockMeta {

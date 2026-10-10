@@ -12,6 +12,7 @@ pub const FTS_PAYLOAD_BLOCKS_READ_METRIC: &str = "fts_payload_blocks_read";
 pub const FTS_POSITION_BLOCKS_READ_METRIC: &str = "fts_position_blocks_read";
 pub const FTS_BLOCKS_PRUNED_METRIC: &str = "fts_blocks_pruned";
 pub const FTS_PAYLOAD_READ_RANGES_METRIC: &str = "fts_payload_read_ranges";
+pub const FTS_REFINEMENT_BATCHES_METRIC: &str = "fts_refinement_batches";
 
 /// A trait used by the index to report metrics
 ///
@@ -78,6 +79,8 @@ pub trait MetricsCollector: Send + Sync {
 
     fn record_fts_payload_read_ranges(&self, _num_ranges: usize) {}
 
+    fn record_fts_refinement_batches(&self, _num_batches: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///
@@ -111,6 +114,7 @@ pub struct LocalMetricsCollector {
     pub fts_position_blocks_read: AtomicUsize,
     pub fts_blocks_pruned: AtomicUsize,
     pub fts_payload_read_ranges: AtomicUsize,
+    pub fts_refinement_batches: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -124,6 +128,7 @@ impl LocalMetricsCollector {
             .record_fts_position_blocks_read(self.fts_position_blocks_read.load(Ordering::Relaxed));
         other.record_fts_blocks_pruned(self.fts_blocks_pruned.load(Ordering::Relaxed));
         other.record_fts_payload_read_ranges(self.fts_payload_read_ranges.load(Ordering::Relaxed));
+        other.record_fts_refinement_batches(self.fts_refinement_batches.load(Ordering::Relaxed));
     }
 }
 
@@ -164,5 +169,10 @@ impl MetricsCollector for LocalMetricsCollector {
     fn record_fts_payload_read_ranges(&self, num_ranges: usize) {
         self.fts_payload_read_ranges
             .fetch_add(num_ranges, Ordering::Relaxed);
+    }
+
+    fn record_fts_refinement_batches(&self, num_batches: usize) {
+        self.fts_refinement_batches
+            .fetch_add(num_batches, Ordering::Relaxed);
     }
 }
