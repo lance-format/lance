@@ -4398,18 +4398,26 @@ mod tests {
     #[case::no_limit(None, vec![3, 13, 23, 33])]
     #[case::limit_fallback(Some(0..10), vec![3, 13, 23, 33])]
     #[case::offset_fallback(Some(1..10), vec![13, 23, 33])]
+    #[case::partial_limit_fallback(Some(0..3), vec![3, 13, 23])]
+    #[case::partial_offset_fallback(Some(1..3), vec![13, 23])]
     #[case::limit_pushdown(Some(0..1), vec![3])]
     #[tokio::test]
     async fn test_at_least_index_preserves_candidates(
         #[case] scan_range: Option<Range<u64>>,
         #[case] expected_values: Vec<u32>,
         #[values(false, true)] uses_stable_row_ids: bool,
+        #[values(false, true)] has_guaranteed_matches: bool,
     ) {
         let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
-        // Only row 3 is guaranteed by the index; matches in the other fragments
-        // require a recheck unless that one row satisfies the requested limit.
+        // An empty lower bound models untokenizable NGram needles; other results
+        // can guarantee a match while leaving further rows to recheck.
+        let guaranteed_rows = if has_guaranteed_matches {
+            RowAddrTreeMap::from_iter([3])
+        } else {
+            RowAddrTreeMap::new()
+        };
         let index_input = index_result_input(
-            IndexExprResult::at_least(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([3]))),
+            IndexExprResult::at_least(RowAddrMask::from_allowed(guaranteed_rows)),
             dataset.fragments(),
         );
         let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));

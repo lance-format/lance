@@ -15584,32 +15584,53 @@ mod test {
         assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
     }
 
+    #[rstest]
+    #[case::short_unicode("éé", vec![0, 1], false)]
+    #[case::tokenizable_unicode("ééb", vec![0], true)]
+    #[case::punctuation("_k7", vec![5, 6, 7, 8], true)]
+    #[case::all_windows_filtered("_k7_", vec![8], true)]
+    #[case::partly_tokenizable("_k77", vec![6], true)]
+    #[case::only_punctuation("!!!", vec![9], true)]
+    #[case::no_matches("_x7", vec![], true)]
     #[tokio::test]
-    async fn test_ngram_contains_untokenizable_needle() {
-        // A needle the tokenizer cannot turn into a trigram must fall back to a
-        // full recheck rather than silently matching nothing.  Byte length is
-        // not a usable proxy for this: "éé" is two characters but four bytes.
-        let unit = ["ééb", "aéé", "abc", "dog", "éab"];
-        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
-        let array = StringArray::from_iter_values(values);
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "text",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    async fn test_ngram_contains_untokenizable_needle(
+        #[case] needle: &str,
+        #[case] expected_ids: Vec<u32>,
+        #[case] is_index_used: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", UInt32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            (
+                "text",
+                Utf8,
+                vec![
+                    Some("ééb"),
+                    Some("aéé"),
+                    Some("abc"),
+                    Some("dog"),
+                    Some("éab"),
+                    Some("user_k7"),
+                    Some("user_k77"),
+                    Some("_k7"),
+                    Some("_k7_"),
+                    Some("!!!"),
+                    Some(""),
+                    None,
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            max_rows_per_file: 4,
+            enable_stable_row_ids: has_stable_row_ids,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(
-            reader,
-            "memory://test_ngram_contains_utf8",
-            Some(write_params),
-        )
-        .await
-        .unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
         dataset
             .create_index(
                 &["text"],
@@ -15621,46 +15642,29 @@ mod test {
             .await
             .unwrap();
 
-        async fn count(dataset: &Dataset, filter: &str) -> usize {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let batches = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            batches.iter().map(|b| b.num_rows()).sum()
+        let filter = format!("contains(text, '{needle}')");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(&filter).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), is_index_used, "{plan}");
+        if is_index_used {
+            assert!(plan.contains("NGram"), "{plan}");
         }
 
-        async fn plan_of(dataset: &Dataset, filter: &str) -> String {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let plan = scan.create_plan().await.unwrap();
-            format!(
-                "{}",
-                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-            )
-        }
-
-        // Each unit value appears 12 times in the 60 rows.
-        // Two characters (four bytes): shorter than a trigram, so the index is
-        // bypassed and "ééb" / "aéé" are still found.
-        assert_eq!(count(&dataset, "contains(text, 'éé')").await, 24);
-        let plan_str = plan_of(&dataset, "contains(text, 'éé')").await;
-        assert!(
-            !plan_str.contains("ScalarIndexQuery"),
-            "expected NO ngram index usage for a two character needle, got plan:\n{plan_str}"
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let unindexed = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter(&filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            unindexed["id"].as_primitive::<UInt32Type>().values(),
+            &expected_ids,
         );
-
-        // Three characters: long enough to tokenize, so the index is used.
-        assert_eq!(count(&dataset, "contains(text, 'ééb')").await, 12);
-        let plan_str = plan_of(&dataset, "contains(text, 'ééb')").await;
-        assert!(
-            plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
-            "expected ngram index usage for a three character needle, got plan:\n{plan_str}"
-        );
+        assert_eq!(indexed, unindexed);
     }
 
     #[tokio::test]
