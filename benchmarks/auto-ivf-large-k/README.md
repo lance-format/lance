@@ -260,3 +260,37 @@ query coverage, unique valid IDs and zero measured storage reads.
 operating point, the matched old-binary control, measured partition counts,
 environment and validation. [search-effort-results.csv](search-effort-results.csv)
 contains all 180 groups, including recall and latency distributions.
+
+## COYO search-effort evaluation
+
+[COYO_SEARCH_EFFORT_RESULTS.md](COYO_SEARCH_EFFORT_RESULTS.md) adds full
+COYO-VE (15,380,795 rows, 2048 dimensions, cosine) using the same effort/k
+grid and runtime. Its [protocol](COYO_SEARCH_EFFORT_PROTOCOL.md) freezes
+128 evaluation queries and a new 3,756-partition RQ5 index without changing
+Auto parameters. The original five-corpus results keep their identities.
+
+Download the pinned source revision in the protocol and verify each file's
+size and Hub LFS SHA256 or Git blob hash. Preserve a JSON verification
+manifest at `$COYO_SOURCE/../coyo-source-verified.json` with `repo`, `revision`
+and the per-file identities in `files`. The published manifest is included in
+[coyo-search-effort-identities.json](coyo-search-effort-identities.json).
+Use a fresh `$COYO_STUDY`; preparation preserves the original dataset and
+creates a separate shallow clone, compact queries and exact top-100000 truth.
+
+```bash
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/prepare_coyo.py "$COYO_SOURCE" "$COYO_STUDY"
+```
+
+Before measurement, create `$COYO_STUDY/measurement` with the preserved
+`candidate-binary.sha256` and `baseline-binary.sha256` files. Select the
+candidate runtime and the same 16-thread timing environment as above:
+
+```bash
+taskset -c 0-15 uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/search_effort.py measure "$COYO_STUDY/measurement" coyo-ve-qwen3vl-2048 --indices "$COYO_STUDY/indices" --baseline-runtime "$BASELINE_RUNTIME"
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/search_effort.py audit "$COYO_STUDY/measurement" coyo-ve-qwen3vl-2048 --indices "$COYO_STUDY/indices"
+```
+
+Select COYO explicitly: `all` retains the original five-corpus campaign.
+Query-selection metadata maps compact positions to public query IDs. The
+preparation cross-checks every selected public top-1000 set and score,
+retaining any numerical differences without changing the float64 oracle.

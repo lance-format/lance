@@ -16,12 +16,14 @@ from pathlib import Path
 
 import lance
 import numpy as np
-from common import DATASETS, emit, save, summary
+from common import DATASETS as CALIBRATION_DATASETS
+from common import emit, save, summary
 from measure import configure_override, run_query
 from prepare_large import sha256
 from rq5 import inputs
 
 EFFORTS = {"e0": 0.0, "e025": 0.25, "e05": 0.5, "e075": 0.75, "e1": 1.0}
+DATASETS = {**CALIBRATION_DATASETS, "coyo-ve-qwen3vl-2048": "cosine"}
 ARMS = [*EFFORTS, "baseline"]
 K_VALUES = [1, 10, 100, 1000, 10000, 100000]
 CODE_FILES = [
@@ -36,6 +38,12 @@ CODE_FILES = [
     "benchmarks/auto-ivf-large-k/search_effort.py",
     "benchmarks/auto-ivf-large-k/measure.py",
     "benchmarks/auto-ivf-large-k/SEARCH_EFFORT_PROTOCOL.md",
+    "benchmarks/auto-ivf-large-k/COYO_SEARCH_EFFORT_PROTOCOL.md",
+    "benchmarks/auto-ivf-large-k/prepare_coyo.py",
+    "benchmarks/auto-ivf-large-k/prepare.py",
+    "benchmarks/auto-ivf-large-k/prepare_large.py",
+    "benchmarks/auto-ivf-large-k/common.py",
+    "benchmarks/auto-ivf-large-k/rq5.py",
 ]
 FIELDS = [
     "ordinal",
@@ -434,7 +442,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--label", default="native")
     args = parser.parse_args()
-    names = list(DATASETS) if args.name == "all" else [args.name]
+    # Keep the original five-corpus calibration campaign reproducible.
+    names = list(CALIBRATION_DATASETS) if args.name == "all" else [args.name]
     if args.command == "audit":
         audit(args, names)
     else:
