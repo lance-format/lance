@@ -164,6 +164,7 @@ pub enum FtsQuery {
     // compound queries
     Boost(BoostQuery),
     MultiMatch(MultiMatchQuery),
+    CombinedFields(CombinedFieldsQuery),
     Boolean(BooleanQuery),
 }
 
@@ -178,6 +179,7 @@ impl std::fmt::Display for FtsQuery {
                 query.positive, query.negative, query.negative_boost
             ),
             Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
+            Self::CombinedFields(query) => write!(f, "CombinedFields({:?})", query),
             Self::Boolean(query) => {
                 write!(
                     f,
@@ -206,6 +208,7 @@ impl FtsQueryNode for FtsQuery {
                 }
                 columns
             }
+            Self::CombinedFields(query) => query.columns(),
             Self::Boolean(query) => query.columns(),
         }
     }
@@ -218,6 +221,7 @@ impl FtsQuery {
             Self::Phrase(query) => format!("\"{}\"", query.terms), // Phrase queries are quoted
             Self::Boost(query) => query.positive.query(),
             Self::MultiMatch(query) => query.match_queries[0].terms.clone(),
+            Self::CombinedFields(query) => query.terms().to_string(),
             Self::Boolean(_) => {
                 // Bool queries don't have a single query string, they are composed of multiple queries
                 String::new()
@@ -233,6 +237,9 @@ impl FtsQuery {
                 query.positive.is_missing_column() || query.negative.is_missing_column()
             }
             Self::MultiMatch(query) => query.match_queries.iter().any(|q| q.column.is_none()),
+            // `try_new` rejects an empty column list, so the target columns of a
+            // combined_fields query are always known.
+            Self::CombinedFields(_) => false,
             Self::Boolean(query) => {
                 query.must.iter().any(|q| q.is_missing_column())
                     || query.should.iter().any(|q| q.is_missing_column())
@@ -261,6 +268,11 @@ impl FtsQuery {
                     .map(|q| q.with_column(Some(column.clone())))
                     .collect();
                 Self::MultiMatch(MultiMatchQuery { match_queries })
+            }
+            Self::CombinedFields(query) => {
+                // combined_fields carries all target columns (and their per-column
+                // boosts) at construction, so a single-column override is a no-op.
+                Self::CombinedFields(query)
             }
             Self::Boolean(query) => {
                 let must = query
@@ -309,6 +321,12 @@ impl From<BoostQuery> for FtsQuery {
 impl From<MultiMatchQuery> for FtsQuery {
     fn from(query: MultiMatchQuery) -> Self {
         Self::MultiMatch(query)
+    }
+}
+
+impl From<CombinedFieldsQuery> for FtsQuery {
+    fn from(query: CombinedFieldsQuery) -> Self {
+        Self::CombinedFields(query)
     }
 }
 
@@ -536,33 +554,43 @@ pub struct MultiMatchQuery {
     pub match_queries: Vec<MatchQuery>,
 }
 
+/// Serializes every leaf under `match_queries`. The legacy `query`, `columns`
+/// and `boost` keys are also written when every leaf names a column, so a reader
+/// that predates `match_queries` degrades as before: it rebuilds default leaves
+/// from the first leaf's terms.
 impl Serialize for MultiMatchQuery {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_map(Some(3))?;
-
-        let query = self.match_queries.first().ok_or(serde::ser::Error::custom(
+        let first = self.match_queries.first().ok_or(serde::ser::Error::custom(
             "MultiMatchQuery must have at least one MatchQuery".to_string(),
         ))?;
-        map.serialize_entry("query", &query.terms)?;
-        let columns = self
+        let legacy_columns = self
             .match_queries
             .iter()
-            .map(|q| q.column.as_ref().unwrap().clone())
-            .collect::<Vec<String>>();
-        map.serialize_entry("columns", &columns)?;
-        let boosts = self
-            .match_queries
-            .iter()
-            .map(|q| q.boost)
-            .collect::<Vec<f32>>();
-        map.serialize_entry("boost", &boosts)?;
+            .map(|q| q.column.as_deref())
+            .collect::<Option<Vec<&str>>>();
+
+        let mut map =
+            serializer.serialize_map(Some(if legacy_columns.is_some() { 4 } else { 1 }))?;
+        if let Some(columns) = legacy_columns {
+            map.serialize_entry("query", &first.terms)?;
+            map.serialize_entry("columns", &columns)?;
+            let boosts = self
+                .match_queries
+                .iter()
+                .map(|q| q.boost)
+                .collect::<Vec<f32>>();
+            map.serialize_entry("boost", &boosts)?;
+        }
+        map.serialize_entry("match_queries", &self.match_queries)?;
         map.end()
     }
 }
 
+/// Reads `match_queries` when present. Otherwise falls back to the legacy
+/// `{query, columns, boost}` shape, which carries no per-leaf settings.
 impl<'de> Deserialize<'de> for MultiMatchQuery {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -570,15 +598,30 @@ impl<'de> Deserialize<'de> for MultiMatchQuery {
     {
         #[derive(Deserialize)]
         struct MultiMatchQueryData {
-            query: String,
-            columns: Vec<String>,
+            match_queries: Option<Vec<MatchQuery>>,
+            query: Option<String>,
+            columns: Option<Vec<String>>,
             boost: Option<Vec<f32>>,
         }
 
         let data = MultiMatchQueryData::deserialize(deserializer)?;
-        let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
+        if let Some(match_queries) = data.match_queries {
+            if match_queries.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "Cannot create MultiMatchQuery with no match queries",
+                ));
+            }
+            return Ok(Self { match_queries });
+        }
 
-        Self::try_new(data.query, data.columns)
+        let query = data
+            .query
+            .ok_or_else(|| serde::de::Error::missing_field("query"))?;
+        let columns = data
+            .columns
+            .ok_or_else(|| serde::de::Error::missing_field("columns"))?;
+        let boosts = data.boost.unwrap_or(vec![1.0; columns.len()]);
+        Self::try_new(query, columns)
             .map_err(serde::de::Error::custom)?
             .try_with_boosts(boosts)
             .map_err(serde::de::Error::custom)
@@ -628,6 +671,202 @@ impl FtsQueryNode for MultiMatchQuery {
             columns.extend(query.columns());
         }
         columns
+    }
+}
+
+/// A cross-field (BM25F) full-text query, exposing Elasticsearch's
+/// `combined_fields` semantics: the target columns are treated as one virtual
+/// field so term statistics (document frequency, term frequency, and document
+/// length) are blended across fields rather than scored independently.
+///
+/// This contrasts with [`MultiMatchQuery`], which fans out into one
+/// [`MatchQuery`] per column and fuses the per-field scores by taking the
+/// maximum (Elasticsearch `best_fields`). A `CombinedFieldsQuery` stays a single
+/// node and is scored once over the blended statistics.
+///
+/// Per-column weights follow Lucene's `CombinedFieldQuery`; see
+/// [`Self::try_with_boosts`] for the accepted range.
+///
+/// Each column is stored together with its weight and every field is private, so
+/// the pairing cannot go out of sync: [`Self::try_new`] and
+/// [`Self::try_with_boosts`] are the only constructors and no accessor hands out a
+/// `&mut`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CombinedFieldsQuery {
+    /// The columns combined into the virtual field, each paired with its BM25F
+    /// weight `w_f`. Non-empty, column names unique, weights in
+    /// `[MIN_BOOST, MAX_BOOST]`.
+    weighted_columns: Vec<(String, f32)>,
+    /// The query string, tokenized once and matched against every target column.
+    terms: String,
+    /// How to combine terms: `And` (all terms must match) or `Or` (default).
+    operator: Operator,
+}
+
+impl CombinedFieldsQuery {
+    /// Minimum allowed per-column weight (Lucene `CombinedFieldQuery` constraint).
+    const MIN_BOOST: f32 = 1.0;
+
+    /// Maximum allowed per-column weight.
+    ///
+    /// The blended length `dl'(d) = Σ_f w_f · dl_f(d)` and the identically shaped
+    /// `tf'` are accumulated in `f32`, and a per-column document length is a `u32`
+    /// token count. One term of that sum is therefore at most
+    /// `2^20 · (2^32 - 1) < 2^52`, so with `f32::MAX ≈ 2^128` it would take more
+    /// than `2^76` maximally long columns to reach infinity. The column count is
+    /// bounded by the schema, many orders of magnitude below that, so an accepted
+    /// weight cannot turn a score into `Inf`/`NaN`.
+    const MAX_BOOST: f32 = 1_048_576.0; // 2^20
+
+    /// Create a combined-fields query over `columns`, with every weight
+    /// defaulting to `1.0` and the `Or` operator.
+    ///
+    /// Returns an error if `columns` is empty or contains duplicates.
+    pub fn try_new(terms: String, columns: Vec<String>) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot create CombinedFieldsQuery with no columns".to_string(),
+            ));
+        }
+        // A duplicate column would double-count its postings and inflate
+        // sum_total_term_freq, skewing the blended BM25F statistics.
+        let mut seen = HashSet::with_capacity(columns.len());
+        for column in &columns {
+            if !seen.insert(column.as_str()) {
+                return Err(Error::invalid_input(format!(
+                    "CombinedFieldsQuery columns must be unique, but '{}' is duplicated",
+                    column
+                )));
+            }
+        }
+        Ok(Self {
+            weighted_columns: columns
+                .into_iter()
+                .map(|column| (column, Self::MIN_BOOST))
+                .collect(),
+            terms,
+            operator: Operator::Or,
+        })
+    }
+
+    /// Set per-column weights, positionally aligned with the columns passed to
+    /// [`Self::try_new`].
+    ///
+    /// Returns an error if the number of boosts does not match the number of
+    /// columns, or if any weight falls outside `[1, 2^20]`. The lower bound
+    /// mirrors Lucene's `CombinedFieldQuery`, which requires `weight >= 1` so the
+    /// combined length norm stays additive; the upper bound keeps the blended
+    /// length finite in `f32`. `NaN` and infinities are outside the range and so
+    /// rejected too.
+    pub fn try_with_boosts(mut self, boosts: Vec<f32>) -> Result<Self> {
+        if boosts.len() != self.weighted_columns.len() {
+            return Err(Error::invalid_input(format!(
+                "The number of boosts ({}) must match the number of columns ({})",
+                boosts.len(),
+                self.weighted_columns.len()
+            )));
+        }
+        for ((column, _), &boost) in self.weighted_columns.iter().zip(&boosts) {
+            if !(Self::MIN_BOOST..=Self::MAX_BOOST).contains(&boost) {
+                return Err(Error::invalid_input(format!(
+                    "combined_fields boost for column '{}' must be a finite value in [{}, {}], got {}",
+                    column,
+                    Self::MIN_BOOST,
+                    Self::MAX_BOOST,
+                    boost
+                )));
+            }
+        }
+        for ((_, weight), boost) in self.weighted_columns.iter_mut().zip(boosts) {
+            *weight = boost;
+        }
+        Ok(self)
+    }
+
+    /// Set the operator used to combine terms.
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        self.operator = operator;
+        self
+    }
+
+    /// The query string, tokenized once and matched against every target column.
+    pub fn terms(&self) -> &str {
+        &self.terms
+    }
+
+    /// How the query terms are combined.
+    pub fn operator(&self) -> Operator {
+        self.operator
+    }
+
+    /// The target columns in query order.
+    pub fn column_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.weighted_columns
+            .iter()
+            .map(|(column, _)| column.as_str())
+    }
+
+    /// Each target column paired with its BM25F weight, in query order.
+    ///
+    /// Iterating the pairs is the only way to read the weights, so an execution
+    /// path cannot pair a column with the wrong weight or silently drop a column
+    /// that has no weight.
+    pub fn weighted_columns(&self) -> impl ExactSizeIterator<Item = (&str, f32)> {
+        self.weighted_columns
+            .iter()
+            .map(|(column, weight)| (column.as_str(), *weight))
+    }
+}
+
+impl Serialize for CombinedFieldsQuery {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("query", &self.terms)?;
+        map.serialize_entry("columns", &self.column_names().collect::<Vec<_>>())?;
+        map.serialize_entry(
+            "boost",
+            &self
+                .weighted_columns()
+                .map(|(_, weight)| weight)
+                .collect::<Vec<_>>(),
+        )?;
+        map.serialize_entry("operator", &self.operator)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CombinedFieldsQuery {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CombinedFieldsQueryData {
+            query: String,
+            columns: Vec<String>,
+            boost: Option<Vec<f32>>,
+            #[serde(default)]
+            operator: Operator,
+        }
+
+        let data = CombinedFieldsQueryData::deserialize(deserializer)?;
+        let query = Self::try_new(data.query, data.columns).map_err(serde::de::Error::custom)?;
+        let query = match data.boost {
+            Some(boosts) => query
+                .try_with_boosts(boosts)
+                .map_err(serde::de::Error::custom)?,
+            None => query,
+        };
+        Ok(query.with_operator(data.operator))
+    }
+}
+
+impl FtsQueryNode for CombinedFieldsQuery {
+    fn columns(&self) -> HashSet<String> {
+        self.column_names().map(String::from).collect()
     }
 }
 
@@ -882,18 +1121,52 @@ impl<'a> IntoIterator for &'a Tokens {
 
 pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
-    let mut stream = tokenizer.token_stream_for_search(text);
+    let stream = tokenizer.token_stream_for_search(text);
+    collect_tokens(stream, token_type)
+}
+
+/// Tokenize search text, returning tokenizer-specific query syntax errors.
+pub fn try_collect_query_tokens(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+) -> Result<Tokens> {
+    let token_type = tokenizer.doc_type();
+    let stream = tokenizer.token_stream_for_search(text);
+    try_collect_tokens(stream, token_type)
+}
+
+fn collect_tokens(mut stream: lance_tokenizer::BoxTokenStream<'_>, token_type: DocType) -> Tokens {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
     while let Some(token) = stream.next() {
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
-    if let Some(first_position) = positions.first().copied() {
-        // Phrase positions are relative to the first retained query token. This preserves gaps
-        // between retained tokens without requiring documents to contain filtered leading terms.
+    finish_tokens(tokens, positions, token_type)
+}
+
+fn try_collect_tokens(
+    mut stream: lance_tokenizer::BoxTokenStream<'_>,
+    token_type: DocType,
+) -> Result<Tokens> {
+    let mut tokens = Vec::new();
+    let mut positions = Vec::new();
+    while let Some(token) = stream
+        .try_next()
+        .map_err(lance_core::Error::invalid_input)?
+    {
+        tokens.push(token.text.clone());
+        positions.push(token.position as u32);
+    }
+    Ok(finish_tokens(tokens, positions, token_type))
+}
+
+fn finish_tokens(tokens: Vec<String>, mut positions: Vec<u32>, token_type: DocType) -> Tokens {
+    if let Some(min_position) = positions.iter().copied().min() {
+        // Token streams such as Jieba's search mode may emit overlapping terms out of position
+        // order. Rebase from the minimum so every position remains valid while preserving gaps.
         for position in &mut positions {
-            *position -= first_position;
+            *position -= min_position;
         }
     }
     Tokens::with_positions(tokens, positions, token_type)
@@ -984,6 +1257,11 @@ pub fn fill_fts_query_column(
                 .collect();
             Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
        }
+        FtsQuery::CombinedFields(combined_query) => {
+            // combined_fields carries its target columns (and per-column boosts)
+            // at construction, so there is nothing to fill or replace.
+            Ok(FtsQuery::CombinedFields(combined_query.clone()))
+        }
         FtsQuery::Boolean(bool_query) => {
             let must = bool_query
                 .must
@@ -1008,6 +1286,27 @@ pub fn fill_fts_query_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tokenizer-jieba")]
+    #[test]
+    fn test_collect_query_tokens_normalizes_unordered_jieba_positions() {
+        let mut jieba = jieba_rs::Jieba::empty();
+        jieba.add_word("NGP渗透率", Some(1_000_000), None);
+        jieba.add_word("渗透", Some(10_000), None);
+        jieba.add_word("透率", Some(10_000), None);
+        let analyzer = lance_tokenizer::JiebaTokenizer::new(jieba).analyzer();
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(
+            crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer::new(analyzer),
+        );
+
+        let query = "NGP渗透率";
+        let tokens = collect_query_tokens(query, &mut tokenizer);
+        let positions = (0..tokens.len())
+            .map(|index| tokens.position(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(positions, vec![3, 4, 0]);
+    }
 
     #[test]
     fn test_fuzzy_expansion_mode_and_unicode_auto_boundaries() {
@@ -1317,5 +1616,294 @@ mod tests {
 
         let query = MatchQuery::new("hello".to_string());
         assert!(BooleanMatchPlan::try_build(&FtsQuery::Match(query)).is_none());
+    }
+
+    #[test]
+    fn test_combined_fields_query_serde() {
+        use super::*;
+        use serde_json::json;
+
+        let query = CombinedFieldsQuery::try_new(
+            "hello world".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![2.0, 1.0])
+        .unwrap()
+        .with_operator(Operator::And);
+
+        // Serializes with multi_match-style keys, plus a round-tripped operator.
+        let serialized = serde_json::to_value(&query).unwrap();
+        let expected = json!({
+            "query": "hello world",
+            "columns": ["title", "body"],
+            "boost": [2.0, 1.0],
+            "operator": "And",
+        });
+        assert_eq!(serialized, expected);
+
+        // The wire format is a contract, so pin the exact bytes (key order
+        // included), not just the equivalent `Value`.
+        assert_eq!(
+            serde_json::to_string(&query).unwrap(),
+            r#"{"query":"hello world","columns":["title","body"],"boost":[2.0,1.0],"operator":"And"}"#
+        );
+
+        let deserialized: CombinedFieldsQuery = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized, query);
+
+        // Round-trips as a wrapped FtsQuery variant under the "combined_fields" tag.
+        let wrapped = FtsQuery::CombinedFields(query);
+        let value = serde_json::to_value(&wrapped).unwrap();
+        assert!(value.get("combined_fields").is_some());
+        let round_trip: FtsQuery = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip, wrapped);
+    }
+
+    fn per_leaf_multi_match() -> MultiMatchQuery {
+        MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("alpha beta".to_string())
+                    .with_column(Some("title".to_string()))
+                    .with_operator(Operator::And)
+                    .with_boost(2.0)
+                    .with_fuzziness(None)
+                    .with_document_granularity(DocumentGranularity::Row),
+                MatchQuery::new("gamma delta".to_string())
+                    .with_column(Some("body".to_string()))
+                    .with_operator(Operator::And)
+                    .with_fuzziness(Some(2))
+                    .with_max_expansions(7)
+                    .with_prefix_length(3),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_multi_match_query_serde_round_trip() {
+        let query = FtsQuery::MultiMatch(per_leaf_multi_match());
+        let json = serde_json::to_string(&query).unwrap();
+        let round_trip: FtsQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, query);
+    }
+
+    #[test]
+    fn test_multi_match_query_serde_nested_round_trip() {
+        let query = FtsQuery::Boost(BoostQuery::new(
+            FtsQuery::Boolean(BooleanQuery::new([
+                (Occur::Must, FtsQuery::MultiMatch(per_leaf_multi_match())),
+                (
+                    Occur::MustNot,
+                    FtsQuery::Match(
+                        MatchQuery::new("epsilon".to_string())
+                            .with_column(Some("body".to_string())),
+                    ),
+                ),
+            ])),
+            FtsQuery::MultiMatch(per_leaf_multi_match()),
+            Some(0.3),
+        ));
+        let json = serde_json::to_string(&query).unwrap();
+        let round_trip: FtsQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, query);
+    }
+
+    #[test]
+    fn test_multi_match_query_legacy_serde() {
+        use serde_json::json;
+
+        // Writers predating `match_queries` send only these keys; every leaf is
+        // a default `MatchQuery` over the shared terms.
+        let legacy = json!({
+            "query": "alpha beta",
+            "columns": ["title", "body"],
+            "boost": [2.0, 1.0],
+        });
+        let query: MultiMatchQuery = serde_json::from_value(legacy).unwrap();
+        let expected = MultiMatchQuery::try_new(
+            "alpha beta".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![2.0, 1.0])
+        .unwrap();
+        assert_eq!(query, expected);
+
+        let without_boost: MultiMatchQuery =
+            serde_json::from_value(json!({"query": "alpha", "columns": ["title"]})).unwrap();
+        assert_eq!(without_boost.match_queries[0].boost, 1.0);
+
+        let error = serde_json::from_value::<MultiMatchQuery>(json!({"columns": ["title"]}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing field `query`"), "{error}");
+        let error = serde_json::from_value::<MultiMatchQuery>(json!({"match_queries": []}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no match queries"), "{error}");
+
+        // A reader predating `match_queries` still finds the legacy keys and
+        // degrades as before: the first leaf's terms over every column.
+        let serialized = serde_json::to_value(per_leaf_multi_match()).unwrap();
+        assert_eq!(serialized["query"], "alpha beta");
+        assert_eq!(serialized["columns"], json!(["title", "body"]));
+        assert_eq!(serialized["boost"], json!([2.0, 1.0]));
+    }
+
+    #[test]
+    fn test_combined_fields_query_defaults() {
+        use super::*;
+        use serde_json::json;
+
+        // Omitting boost + operator defaults weights to 1.0 and the operator to Or.
+        let value = json!({
+            "query": "hello",
+            "columns": ["title", "body"],
+        });
+        let query: CombinedFieldsQuery = serde_json::from_value(value).unwrap();
+        assert_eq!(query.terms(), "hello");
+        assert_eq!(
+            query.weighted_columns().collect::<Vec<_>>(),
+            vec![("title", 1.0), ("body", 1.0)]
+        );
+        assert_eq!(query.operator(), Operator::Or);
+    }
+
+    #[test]
+    fn test_combined_fields_query_validation() {
+        use super::*;
+
+        // Assert the result is an invalid-input error whose message names the
+        // rejected cause, not just that it failed.
+        let assert_invalid_input = |result: Result<CombinedFieldsQuery>, needle: &str| {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidInput { .. }),
+                "expected InvalidInput, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(needle),
+                "error {err:?} should mention {needle:?}"
+            );
+        };
+
+        // Empty columns are rejected.
+        assert_invalid_input(
+            CombinedFieldsQuery::try_new("hello".to_string(), vec![]),
+            "no columns",
+        );
+
+        // Duplicate columns are rejected (they would double-count postings).
+        assert_invalid_input(
+            CombinedFieldsQuery::try_new(
+                "hello".to_string(),
+                vec!["title".to_string(), "title".to_string()],
+            ),
+            "duplicated",
+        );
+
+        let query = CombinedFieldsQuery::try_new(
+            "hello".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap();
+
+        // A boost count that does not match the column count is rejected in both
+        // directions, and the message names both lengths.
+        assert_invalid_input(
+            query.clone().try_with_boosts(vec![1.0]),
+            "number of boosts (1) must match the number of columns (2)",
+        );
+        assert_invalid_input(
+            query.clone().try_with_boosts(vec![1.0, 1.0, 1.0]),
+            "number of boosts (3) must match the number of columns (2)",
+        );
+
+        // Weights outside [1, 2^20] are rejected: below 1 breaks Lucene's
+        // additive length norm, above 2^20 could overflow the blended length.
+        // NaN and the infinities fall outside the range as well.
+        let out_of_range = "must be a finite value in [1, 1048576]";
+        for boosts in [
+            vec![1.0, 0.5],
+            vec![0.0, 1.0],
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 1.0],
+            vec![f32::NEG_INFINITY, 1.0],
+            vec![1.0, f32::MAX],
+            vec![1.0, 1_048_577.0],
+        ] {
+            assert_invalid_input(query.clone().try_with_boosts(boosts), out_of_range);
+        }
+        // The message names the offending column and its value.
+        assert_invalid_input(query.clone().try_with_boosts(vec![1.0, 0.5]), "'body'");
+        assert_invalid_input(query.clone().try_with_boosts(vec![1.0, 0.5]), "got 0.5");
+
+        // Fractional weights >= 1 are accepted, and so is the upper bound itself.
+        assert!(query.clone().try_with_boosts(vec![1.5, 2.0]).is_ok());
+        assert!(query.try_with_boosts(vec![1.0, 1_048_576.0]).is_ok());
+    }
+
+    /// The columns and their weights cannot be desynced by any operation the type
+    /// permits, which is what the execution boundary relies on when it iterates
+    /// [`CombinedFieldsQuery::weighted_columns`].
+    ///
+    /// Field privacy carries the structural half and the compiler enforces it, so
+    /// the only thing left to check at runtime is that `try_new` and
+    /// `try_with_boosts`, the sole mutation paths, keep the pairs aligned.
+    #[test]
+    fn test_combined_fields_query_pairing_is_stable() {
+        use super::*;
+
+        let query = CombinedFieldsQuery::try_new(
+            "hello".to_string(),
+            vec!["title".to_string(), "body".to_string(), "tags".to_string()],
+        )
+        .unwrap();
+        // Defaults: one weight per column, in query order.
+        assert_eq!(
+            query.weighted_columns().collect::<Vec<_>>(),
+            vec![("title", 1.0), ("body", 1.0), ("tags", 1.0)]
+        );
+
+        let query = query.try_with_boosts(vec![3.0, 1.0, 2.5]).unwrap();
+        assert_eq!(
+            query.weighted_columns().collect::<Vec<_>>(),
+            vec![("title", 3.0), ("body", 1.0), ("tags", 2.5)]
+        );
+        // The name-only view and the pair view agree on order and length, so a
+        // consumer that reads either sees the same columns.
+        assert_eq!(
+            query.column_names().collect::<Vec<_>>(),
+            query
+                .weighted_columns()
+                .map(|(column, _)| column)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(query.column_names().len(), 3);
+        // The `FtsQueryNode` set view still reports the target columns, and is not
+        // shadowed by the inherent accessors.
+        assert_eq!(
+            FtsQueryNode::columns(&query),
+            HashSet::from(["title".to_string(), "body".to_string(), "tags".to_string()])
+        );
+
+        // A rejected boost list leaves no partially updated query behind: the
+        // builder consumes `self`, so the caller keeps the validated value.
+        let rejected = query.clone().try_with_boosts(vec![1.0, f32::MAX, 1.0]);
+        assert!(rejected.is_err());
+        assert_eq!(
+            query.weighted_columns().collect::<Vec<_>>(),
+            vec![("title", 3.0), ("body", 1.0), ("tags", 2.5)]
+        );
+
+        // Clone/PartialEq compare the pairs, so a differing weight is a differing
+        // query even when the column lists match.
+        assert_eq!(query.clone(), query);
+        let reweighted = query.clone().try_with_boosts(vec![3.0, 1.0, 2.0]).unwrap();
+        assert_ne!(reweighted, query);
+        // Debug renders the columns with their weights.
+        let debug = format!("{:?}", query);
+        assert!(debug.contains("title"), "unexpected Debug output: {debug}");
+        assert!(debug.contains("2.5"), "unexpected Debug output: {debug}");
     }
 }

@@ -102,11 +102,17 @@ def test_eda_btree_search(
 BASIC_LARGE_IN_FILTER = (
     "row_number IN (" + ", ".join([str(i) for i in range(100000, 100100)]) + ")"
 )
+# row_number runs 0..10M, so this selects 7M rows (70% of the dataset).  Both
+# bounds land mid-page, so the scan has to walk the great majority of the
+# btree's leaves and union their row id lists
+BASIC_LARGE_RANGE_FILTER = "row_number >= 1000000 AND row_number < 8000000"
+
 BASIC_BTREE_FILTERS = [
     None,
     "row_number = 100000",
     "row_number != 100000",
     "row_number >= 100000 AND row_number <= 100007",
+    BASIC_LARGE_RANGE_FILTER,
     BASIC_LARGE_IN_FILTER,
 ]
 
@@ -115,6 +121,7 @@ BASIC_BTREE_FILTER_LABELS = [
     "equal",
     "not_equal",
     "small_range",
+    "large_range",
     "large_in",
 ]
 

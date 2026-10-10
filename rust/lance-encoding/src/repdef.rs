@@ -2845,7 +2845,7 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 
     use crate::encodings::logical::primitive::sparse::{
-        SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
+        SparsePositionPlan, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
         SparseValiditySet,
     };
     use crate::repdef::{
@@ -2908,13 +2908,12 @@ mod tests {
                         positions,
                     },
                 }],
-                num_items: 2,
                 num_visible_items: 2,
             })
         };
-        let mut repdef = CompositeRepDefUnraveler::new(vec![sparse(SparsePositionSet::Empty)]);
+        let mut repdef = CompositeRepDefUnraveler::new(vec![sparse(SparsePositionPlan::Empty)]);
         repdef.add_compatibility_check(CompositeRepDefUnraveler::new(vec![sparse(
-            SparsePositionSet::Explicit(vec![0]),
+            SparsePositionPlan::Explicit(vec![0]),
         )]));
 
         let err = repdef.unravel_validity(2).unwrap_err();

@@ -38,6 +38,7 @@ pub mod index;
 mod manifest;
 pub mod memtable;
 pub mod observer;
+pub(crate) mod reconcile;
 pub mod scanner;
 pub mod sharding;
 #[cfg(test)]
@@ -48,7 +49,16 @@ pub mod write;
 
 use std::sync::Arc;
 
+use lance_core::Result;
+use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
+
+use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use object_store::path::Path;
+use uuid::Uuid;
+
+use self::util::{generate_random_hash, shard_base_path};
+use crate::dataset::fragment::write::generate_random_filename;
 
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
 ///
@@ -63,6 +73,70 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 /// lance injects the column on the write path ([`write::ShardWriter::put`] /
 /// [`write::ShardWriter::delete`]), so no caller ever constructs or names it.
 pub const TOMBSTONE: &str = "_tombstone";
+
+/// The storage identity reserved for one MemTable generation.
+///
+/// Managed Blob v2 payloads are written beneath `data_file_name` before the
+/// corresponding Lance data file exists, so this identity follows the
+/// MemTable through WAL persistence, recovery, and SSTable flush. A successor
+/// writer may continue a recovered target after reserving its persisted Blob
+/// IDs; `creator_epoch` identifies the writer that originally created the
+/// target, not necessarily the writer currently appending to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MemTableDataTarget {
+    pub generation: u64,
+    pub generation_dir: String,
+    pub data_file_name: String,
+    pub creator_epoch: u64,
+    pub batch_capacity: usize,
+}
+
+impl MemTableDataTarget {
+    pub fn new(generation: u64, creator_epoch: u64, batch_capacity: usize) -> Self {
+        let random_hash = generate_random_hash();
+        Self {
+            generation,
+            generation_dir: format!("{random_hash}_gen_{generation}"),
+            data_file_name: format!("{}.lance", generate_random_filename()),
+            creator_epoch,
+            batch_capacity,
+        }
+    }
+
+    pub fn generation_path(&self, base_path: &Path, shard_id: &Uuid) -> Path {
+        shard_base_path(base_path, shard_id).join(self.generation_dir.as_str())
+    }
+
+    pub fn data_file_key(&self) -> &str {
+        self.data_file_name
+            .strip_suffix(".lance")
+            .unwrap_or(&self.data_file_name)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let simple_component = |value: &str| {
+            !value.is_empty()
+                && value != "."
+                && value != ".."
+                && !value.contains('/')
+                && !value.contains('\\')
+        };
+        if !simple_component(&self.generation_dir)
+            || !simple_component(&self.data_file_name)
+            || !self.data_file_name.ends_with(".lance")
+            || self.batch_capacity == 0
+            || !self
+                .generation_dir
+                .ends_with(format!("_gen_{}", self.generation).as_str())
+        {
+            return Err(lance_core::Error::io(format!(
+                "invalid MemTable data target for generation {}: directory {:?}, file {:?}",
+                self.generation, self.generation_dir, self.data_file_name
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// The mem_wal tombstone field appended to the logical schema on the way to the
 /// storage schema.
@@ -113,6 +187,75 @@ pub fn relax_non_pk_nullability(
     ))
 }
 
+/// The schema's Arrow form, with each field's id carried in its metadata.
+///
+/// `From<&Field> for ArrowField` drops the id, leaving everything downstream
+/// matching on name — which loses a column across a rename. Arrow IPC preserves
+/// field metadata, so entries written under this schema carry the id too.
+///
+/// Scoped to the memtable path on purpose: emitting ids from the global Arrow
+/// conversion would change every schema Lance hands out, including for callers
+/// that compare schemas for equality.
+pub fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
+    let arrow: ArrowSchema = schema.into();
+    let fields: Vec<ArrowField> = arrow
+        .fields()
+        .iter()
+        .map(|field| stamp_field_id(field, &schema.fields))
+        .collect();
+    ArrowSchema::new_with_metadata(fields, arrow.metadata().clone())
+}
+
+/// One field carrying its lance id, and its struct children carrying theirs.
+///
+/// A struct's children are fields in their own right: they have ids, a rename
+/// moves one child's name and not the parent's, and a reader that cannot see a
+/// child's id has only its name to go on.
+fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
+    let Some(source) = among.iter().find(|f| f.name == *field.name()) else {
+        return field.clone();
+    };
+    let field = match source.id {
+        id if id >= 0 => {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
+            field.clone().with_metadata(metadata)
+        }
+        _ => field.clone(),
+    };
+    // A container carries its children inside its own type, and each of them is
+    // a field with an id of its own: a list's element, and that element's
+    // children in turn.
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let children: Vec<ArrowField> = children
+                .iter()
+                .map(|child| stamp_field_id(child, &source.children))
+                .collect();
+            field.with_data_type(DataType::Struct(children.into()))
+        }
+        DataType::List(element) => {
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::List(Arc::new(element)))
+        }
+        DataType::LargeList(element) => {
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::LargeList(Arc::new(element)))
+        }
+        DataType::FixedSizeList(element, size) => {
+            let size = *size;
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::FixedSizeList(Arc::new(element), size))
+        }
+        DataType::Map(entries, sorted) => {
+            let sorted = *sorted;
+            let entries = stamp_field_id(entries, &source.children);
+            field.with_data_type(DataType::Map(Arc::new(entries), sorted))
+        }
+        _ => field,
+    }
+}
+
 /// Extend the logical schema with the trailing `_tombstone` column — the
 /// intermediate [`relax_non_pk_nullability`] widens into the storage schema.
 ///
@@ -131,8 +274,52 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
     ))
 }
 
-pub use api::{DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes};
-pub use index::{MemIndexKind, MemTableVisibility};
+/// `batches`, written under `source_schema`, brought to `target_schema`.
+///
+/// Columns match by field id where both sides carry one, by name otherwise, at
+/// every level including inside structs, so a rename is followed. A column the
+/// target declares and the batches lack is filled with typed nulls, `_tombstone`
+/// with `false`; a column the target does not declare is dropped; a missing
+/// primary key is an error.
+///
+/// `batches` must be in `source_schema` order. The result is in `target_schema`
+/// order, without field ids.
+pub fn reconcile_batches(
+    source_schema: &ArrowSchema,
+    target_schema: &Arc<ArrowSchema>,
+    pk_columns: &[String],
+    batches: Vec<RecordBatch>,
+) -> lance_core::Result<Vec<RecordBatch>> {
+    // A generation numbers its own columns -- `_tombstone`, and anything the
+    // table has since dropped -- in its own schema, so those ids collide with
+    // whatever the table gave those numbers. Stripped before resolution, or a
+    // column added to the table resolves to whichever of them shares its id.
+    let source = ArrowSchema::new_with_metadata(
+        source_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                match field.name() != TOMBSTONE && !lance_core::is_system_column(field.name()) {
+                    true => field.as_ref().clone(),
+                    false => reconcile::without_field_id(field),
+                }
+            })
+            .collect::<Vec<_>>(),
+        source_schema.metadata().clone(),
+    );
+    let plan =
+        reconcile::Plan::resolve(&source, target_schema, pk_columns)?.emitting_plain_schema();
+    if plan.is_identity() {
+        return Ok(batches);
+    }
+    batches.iter().map(|batch| plan.apply(batch)).collect()
+}
+
+pub use api::{
+    DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes,
+    validate_maintained_indexes_with,
+};
+pub use index::{MemIndexRegistry, MemIndexSpec, MemTableVisibility};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};
@@ -157,6 +344,123 @@ mod tests {
             ArrowField::new("count", DataType::Int64, false),
             ArrowField::new("note", DataType::Utf8, true),
         ])
+    }
+
+    fn stamped(name: &str, data_type: DataType, id: i32) -> ArrowField {
+        ArrowField::new(name, data_type, true).with_metadata(
+            [(LANCE_FIELD_ID_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// A generation numbers `_tombstone` in its own schema, so its id is
+    /// whatever that generation reached -- and the table has given that same
+    /// number to a column of its own. Honouring it would resolve the two to
+    /// each other and refuse the merge on their types.
+    #[test]
+    fn a_generations_tombstone_does_not_answer_for_a_column_sharing_its_id() {
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped(TOMBSTONE, DataType::Boolean, 1),
+        ]);
+        // The table gave id 1 to a column added after that generation sealed.
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("extra", DataType::Int64, 1),
+            ArrowField::new(TOMBSTONE, DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(arrow_array::BooleanArray::from(vec![false])),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
+            .expect("the tombstone's id must not be honoured");
+        let out = &out[0];
+        assert!(
+            out.column_by_name("extra").expect("extra").is_null(0),
+            "the added column has no value in a generation sealed before it"
+        );
+        let tombstone = out
+            .column_by_name(TOMBSTONE)
+            .expect("_tombstone")
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("boolean");
+        assert!(!tombstone.value(0), "and the row is still live");
+    }
+
+    /// Two children exchanging names is the case a name match cannot survive:
+    /// both sides carry the same two names, so only the ids say which values
+    /// belong to which. Each child's values must follow its id to the name the
+    /// target now gives it.
+    #[test]
+    fn a_pair_of_children_that_swapped_names_follow_their_ids() {
+        let struct_of = |first: &str, second: &str, ids: (i32, i32)| {
+            DataType::Struct(Fields::from(vec![
+                stamped(first, DataType::Int64, ids.0),
+                stamped(second, DataType::Int64, ids.1),
+            ]))
+        };
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("info", struct_of("a", "b", (1, 2)), 3),
+        ]);
+        // The table has since exchanged the two children's names; the ids stay.
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("info", struct_of("b", "a", (1, 2)), 3),
+        ]));
+
+        let info = arrow_array::StructArray::new(
+            match source.field(1).data_type() {
+                DataType::Struct(fields) => fields.clone(),
+                _ => unreachable!("info is a struct"),
+            },
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10])) as arrow_array::ArrayRef,
+                Arc::new(arrow_array::Int64Array::from(vec![20])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(info),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
+            .expect("reconcile");
+        let info = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .expect("info is a struct");
+
+        // `b` is the name id 1 now wears, so it must hold id 1's value.
+        let b = info
+            .column_by_name("b")
+            .expect("b")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64");
+        assert_eq!(b.value(0), 10, "id 1's value follows its id to `b`");
+
+        let a = info
+            .column_by_name("a")
+            .expect("a")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64");
+        assert_eq!(a.value(0), 20, "id 2's value follows its id to `a`");
     }
 
     #[test]
