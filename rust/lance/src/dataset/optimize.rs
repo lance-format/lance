@@ -2956,7 +2956,10 @@ async fn compute_row_lineage(
 /// lineage file, as the table's spill policy and their size call for. This is
 /// the path for tables that cannot spill, and for binary copy, whose output
 /// files cannot take the lineage as extra columns.
-async fn rechunk_row_lineage(
+///
+/// Visible to the crate so tests that assemble an [`Operation::Rewrite`] by hand
+/// can transfer row lineage the way compaction does, rather than reimplementing it.
+pub(crate) async fn rechunk_row_lineage(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
