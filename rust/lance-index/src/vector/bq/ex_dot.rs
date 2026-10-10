@@ -307,6 +307,30 @@ pub fn ex_dot_kernel(ex_bits: u8) -> ExDotFn {
     KERNELS[usize::from(ex_bits) - 1]
 }
 
+/// Available native kernels for controlled profiling and parity tests.
+pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
+    // `mut` is only exercised on x86_64 where extra kernels may be pushed.
+    #[allow(unused_mut)]
+    let mut kernels = vec![
+        ("scalar", scalar_kernel(ex_bits)),
+        ("dispatched", ex_dot_kernel(ex_bits)),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            kernels.push(("avx2", x86::avx2_kernel(ex_bits)));
+        }
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            kernels.push(("avx512", x86::avx512_baseline_kernel(ex_bits)));
+            if matches!(ex_bits, 2 | 6) {
+                kernels.push(("avx512_four_chain", x86::four_chain_kernel(ex_bits)));
+            }
+        }
+    }
+    kernels
+}
+
 fn select_ex_dot_kernel(ex_bits: u8) -> ExDotFn {
     #[cfg(target_arch = "x86_64")]
     {
@@ -601,6 +625,13 @@ mod x86 {
 
     pub(super) fn avx512_kernel(ex_bits: u8) -> ExDotFn {
         match ex_bits {
+            2 | 6 => four_chain_kernel(ex_bits),
+            _ => avx512_baseline_kernel(ex_bits),
+        }
+    }
+
+    pub(super) fn avx512_baseline_kernel(ex_bits: u8) -> ExDotFn {
+        match ex_bits {
             1 => dot_u1_avx512_dispatch,
             2 => dot_u2_avx512_dispatch,
             3 => dot_u3_avx512_dispatch,
@@ -880,6 +911,60 @@ mod x86 {
                 unsafe { $name(ex_query, codes) }
             }
         };
+    }
+
+    macro_rules! four_chain_kernel {
+        ($name:ident, $dispatch:ident, $unpack:ident, $bits:expr, $fallback:ident) => {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn $name(query: &[f32], codes: &[u8]) -> f32 {
+                if !query.len().is_multiple_of(64) || codes.len() != query.len() * $bits / 8 {
+                    return unsafe { $fallback(query, codes) };
+                }
+                let mut acc = [_mm512_setzero_ps(); 4];
+                for group in 0..query.len() / 64 {
+                    let runs = unsafe { $unpack(codes.as_ptr().add(group * 8 * $bits)) };
+                    for (run, bytes) in runs.into_iter().enumerate() {
+                        unsafe {
+                            fma16_avx512(
+                                bytes,
+                                query.as_ptr().add(group * 64 + run * 16),
+                                &mut acc[run],
+                            );
+                        }
+                    }
+                }
+                _mm512_reduce_add_ps(_mm512_add_ps(
+                    _mm512_add_ps(acc[0], acc[1]),
+                    _mm512_add_ps(acc[2], acc[3]),
+                ))
+            }
+            fn $dispatch(query: &[f32], codes: &[u8]) -> f32 {
+                // SAFETY: the dispatcher checks AVX-512F first.
+                unsafe { $name(query, codes) }
+            }
+        };
+    }
+    four_chain_kernel!(
+        dot_u2_four_chain,
+        dot_u2_four_chain_dispatch,
+        unpack_u2,
+        2,
+        dot_u2_avx512
+    );
+    four_chain_kernel!(
+        dot_u6_four_chain,
+        dot_u6_four_chain_dispatch,
+        unpack_u6,
+        6,
+        dot_u6_avx512
+    );
+
+    pub(super) fn four_chain_kernel(bits: u8) -> super::ExDotFn {
+        match bits {
+            2 => dot_u2_four_chain_dispatch,
+            6 => dot_u6_four_chain_dispatch,
+            _ => avx512_kernel(bits),
+        }
     }
 
     x86_dot_kernel!(dot_u1_avx2, dot_u1_avx2_dispatch, unpack_u1, 1, 1);
@@ -1604,27 +1689,6 @@ mod tests {
         out
     }
 
-    fn available_kernels(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
-        // `mut` is only exercised on x86_64 where extra kernels may be pushed.
-        #[allow(unused_mut)]
-        let mut kernels = vec![
-            ("scalar", scalar_kernel(ex_bits)),
-            ("dispatched", ex_dot_kernel(ex_bits)),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
-                kernels.push(("avx2", x86::avx2_kernel(ex_bits)));
-            }
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                kernels.push(("avx512", x86::avx512_kernel(ex_bits)));
-            }
-        }
-        kernels
-    }
-
     #[rstest]
     fn test_ex_dot_matches_reference(
         #[values(1, 2, 3, 4, 5, 6, 7, 8)] ex_bits: u8,
@@ -1650,7 +1714,7 @@ mod tests {
         pad_query_into(&query, &mut ex_query);
 
         let tolerance = 1e-3 * expected.abs().max(1.0);
-        for (name, kernel) in available_kernels(ex_bits) {
+        for (name, kernel) in ex_dot_kernel_variants(ex_bits) {
             let actual = kernel(&ex_query, &codes) as f64;
             assert!(
                 (actual - expected).abs() <= tolerance,
@@ -1820,7 +1884,7 @@ mod tests {
             let mut ex_query = vec![0.0; padded_query_len(dim)];
             pad_query_into(&query, &mut ex_query);
             let tolerance = 1e-3 * expected.abs().max(1.0);
-            for (name, kernel) in available_kernels(ex_bits) {
+            for (name, kernel) in ex_dot_kernel_variants(ex_bits) {
                 let actual = kernel(&ex_query, &codes) as f64;
                 assert!(
                     (actual - expected).abs() <= tolerance,
