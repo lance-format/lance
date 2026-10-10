@@ -5,7 +5,6 @@
 //! reads nothing from the table but its keys and row locators.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ use roaring::RoaringBitmap;
 use super::planning_context::{PlanningContext, lance_dataset, lance_table_scan};
 use crate::io::exec::index_join::{IndexJoinExec, IndexJoinSpec, TargetColumn};
 
-/// Above this many bytes of keys in rows the indices do not cover, an index
+/// Above this many bytes of keys in rows the index does not cover, an index
 /// join is not planned: holding them in memory costs more than the full scan
 /// it saves, and `optimize_indices` would bring them under the index.
 const MAX_UNCOVERED_KEY_BYTES: u64 = 50 * 1024 * 1024;
@@ -37,10 +36,10 @@ const VARIABLE_WIDTH_KEY_BYTES: u64 = 32;
 
 /// Rewrites `Join(Lance table, input)` into an [`IndexJoinNode`].
 ///
-/// The join must be an inner or right equi-join on plain columns with
-/// [`NullEquality::NullEqualsNothing`] and no extra filter, every table key must
-/// have a lookup index in the [`PlanningContext`], and the table scan must read
-/// only key columns, `_rowid` and `_rowaddr`. Run it after projection pushdown
+/// The join must be an inner or right equi-join on one plain column with
+/// [`NullEquality::NullEqualsNothing`] and no extra filter, the table's key
+/// must have a lookup index in the [`PlanningContext`], and the table scan must
+/// read only the key, `_rowid` and `_rowaddr`. Run it after projection pushdown
 /// has pruned the scan.
 #[derive(Debug)]
 pub struct IndexJoinRule {
@@ -77,30 +76,26 @@ impl IndexJoinRule {
         let dataset = lance_dataset(scan)?;
         let table = self.context.table(&dataset)?;
 
-        let mut target_keys = Vec::with_capacity(join.on.len());
-        let mut keys = Vec::with_capacity(join.on.len());
-        let mut input_keys = Vec::with_capacity(join.on.len());
-        for (left, right) in &join.on {
-            let (Expr::Column(target_key), Expr::Column(input_key)) = (left, right) else {
-                return None;
-            };
-            let (_, target_field) = join
-                .left
-                .schema()
-                .qualified_field_from_column(target_key)
-                .ok()?;
-            let (_, input_field) = join
-                .right
-                .schema()
-                .qualified_field_from_column(input_key)
-                .ok()?;
-            if target_field.data_type() != input_field.data_type() {
-                return None;
-            }
-            keys.push(table.lookup_index(&target_key.name)?.clone());
-            target_keys.push(target_key.name.clone());
-            input_keys.push(input_key.clone());
+        // A composite key would need every column looked up and the matches
+        // intersected. A low-cardinality column then matches most of the
+        // table per key, so composite keys keep the hash join.
+        let [(Expr::Column(target_key), Expr::Column(input_key))] = join.on.as_slice() else {
+            return None;
+        };
+        let (_, target_field) = join
+            .left
+            .schema()
+            .qualified_field_from_column(target_key)
+            .ok()?;
+        let (_, input_field) = join
+            .right
+            .schema()
+            .qualified_field_from_column(input_key)
+            .ok()?;
+        if target_field.data_type() != input_field.data_type() {
+            return None;
         }
+        let key = table.lookup_index(&target_key.name)?.clone();
 
         let output_columns = join
             .left
@@ -110,31 +105,19 @@ impl IndexJoinRule {
             .map(|field| match field.name().as_str() {
                 ROW_ID => Some(TargetColumn::RowId),
                 ROW_ADDR => Some(TargetColumn::RowAddr),
-                name => target_keys
-                    .iter()
-                    .position(|key| key == name)
-                    .map(TargetColumn::Key),
+                name if name == target_key.name => Some(TargetColumn::Key),
+                _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
 
-        let mut coverage = keys[0].coverage.clone();
-        for key in &keys[1..] {
-            coverage &= &key.coverage;
-        }
+        let coverage = key.coverage.clone();
         let uncovered_fragments = dataset
             .fragments()
             .iter()
             .filter(|fragment| !coverage.contains(fragment.id as u32))
             .cloned()
             .collect::<Vec<_>>();
-        let mut stale_rows: HashMap<u32, RoaringBitmap> = HashMap::new();
-        for key in &keys {
-            for (fragment_id, offsets) in &key.stale_rows {
-                if coverage.contains(*fragment_id) {
-                    *stale_rows.entry(*fragment_id).or_default() |= offsets;
-                }
-            }
-        }
+        let stale_rows = key.stale_rows.clone();
 
         let uncovered_rows = uncovered_fragments
             .iter()
@@ -148,26 +131,19 @@ impl IndexJoinRule {
             })
             .chain(stale_rows.values().map(RoaringBitmap::len))
             .fold(0u64, u64::saturating_add);
-        let bytes_per_row = keys
-            .iter()
-            .map(|key| {
-                dataset
-                    .schema()
-                    .field(&key.column)
-                    .and_then(|field| field.data_type().primitive_width())
-                    .map_or(VARIABLE_WIDTH_KEY_BYTES, |width| width as u64)
-            })
-            // The row id and address kept per row.
-            .sum::<u64>()
-            + 16;
-        let uncovered_bytes = uncovered_rows.saturating_mul(bytes_per_row);
+        let key_bytes = target_field
+            .data_type()
+            .primitive_width()
+            .map_or(VARIABLE_WIDTH_KEY_BYTES, |width| width as u64);
+        // Plus the row id and address kept per row.
+        let uncovered_bytes = uncovered_rows.saturating_mul(key_bytes + 16);
         if uncovered_bytes > self.max_uncovered_key_bytes {
             log::warn!(
-                "Not joining on the scalar indices of {:?}: about {uncovered_rows} rows are \
-                 not covered by them (~{uncovered_bytes} bytes of keys, above the \
+                "Not joining on the scalar index of '{}': about {uncovered_rows} rows are \
+                 not covered by it (~{uncovered_bytes} bytes of keys, above the \
                  {}-byte limit), so the join scans the table instead. \
                  Run optimize_indices to bring them under the index.",
-                target_keys,
+                target_key.name,
                 self.max_uncovered_key_bytes,
             );
             return None;
@@ -176,7 +152,7 @@ impl IndexJoinRule {
         let spec = IndexJoinSpec {
             dataset,
             join_type: join.join_type,
-            keys,
+            key,
             output_columns,
             coverage,
             uncovered_fragments,
@@ -185,7 +161,7 @@ impl IndexJoinRule {
         Some(IndexJoinNode {
             input: join.right.as_ref().clone(),
             spec: Arc::new(spec),
-            input_keys,
+            input_key: input_key.clone(),
             schema: join.schema.clone(),
         })
     }
@@ -223,7 +199,7 @@ impl OptimizerRule for IndexJoinRule {
 pub struct IndexJoinNode {
     input: LogicalPlan,
     spec: Arc<IndexJoinSpec>,
-    input_keys: Vec<datafusion::common::Column>,
+    input_key: datafusion::common::Column,
     schema: DFSchemaRef,
 }
 
@@ -231,7 +207,7 @@ impl PartialEq for IndexJoinNode {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.spec, &other.spec)
             && self.input == other.input
-            && self.input_keys == other.input_keys
+            && self.input_key == other.input_key
             && self.schema == other.schema
     }
 }
@@ -242,7 +218,7 @@ impl Hash for IndexJoinNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         Arc::as_ptr(&self.spec).hash(state);
         self.input.hash(state);
-        self.input_keys.hash(state);
+        self.input_key.hash(state);
     }
 }
 
@@ -274,15 +250,11 @@ impl UserDefinedLogicalNodeCore for IndexJoinNode {
     }
 
     fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let keys = self
-            .spec
-            .keys
-            .iter()
-            .zip(&self.input_keys)
-            .map(|(key, input_key)| format!("{} = {input_key}", key.column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        write!(f, "IndexJoin: type={}, on=[{keys}]", self.spec.join_type)
+        write!(
+            f,
+            "IndexJoin: type={}, on=[{} = {}]",
+            self.spec.join_type, self.spec.key.column, self.input_key
+        )
     }
 
     fn with_exprs_and_inputs(
@@ -298,7 +270,7 @@ impl UserDefinedLogicalNodeCore for IndexJoinNode {
         Ok(Self {
             input: inputs.remove(0),
             spec: self.spec.clone(),
-            input_keys: self.input_keys.clone(),
+            input_key: self.input_key.clone(),
             schema: self.schema.clone(),
         })
     }
@@ -326,16 +298,11 @@ impl ExtensionPlanner for IndexJoinPlanner {
         let Some(node) = node.as_any().downcast_ref::<IndexJoinNode>() else {
             return Ok(None);
         };
-        let input_schema = node.input.schema();
-        let input_keys = node
-            .input_keys
-            .iter()
-            .map(|column| input_schema.index_of_column(column))
-            .collect::<DFResult<Vec<_>>>()?;
+        let input_key = node.input.schema().index_of_column(&node.input_key)?;
         Ok(Some(Arc::new(IndexJoinExec::try_new(
             physical_inputs[0].clone(),
             node.spec.clone(),
-            input_keys,
+            input_key,
             Arc::new(node.schema.as_arrow().clone()),
         )?)))
     }

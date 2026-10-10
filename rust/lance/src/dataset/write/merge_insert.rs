@@ -2707,9 +2707,9 @@ impl MergeInsertJob {
     ///
     /// The fast path is available when:
     /// - `when_matched` is `UpdateAll`, `UpdateIf`, `Fail`, `Delete`, or `DoNothing`
-    /// - The source covers the full dataset schema and `when_matched` is not
-    ///   `UpdateIf`/`UpdateIfExpr`, OR `use_index` is false, OR some join key
-    ///   has no scalar index
+    /// - The source covers the full dataset schema, the join is on one column
+    ///   and `when_matched` is not `UpdateIf`/`UpdateIfExpr`, OR `use_index` is
+    ///   false, OR some join key has no scalar index
     /// - The source schema is either (a) the full dataset schema, or (b) a
     ///   subset of it (partial-schema upsert), or (c) just the key columns for
     ///   delete-only operations
@@ -2799,11 +2799,13 @@ impl MergeInsertJob {
                 WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
             );
 
-        // A full-schema merge reads nothing from the target but its keys and
+        // A full-schema merge reads nothing from the target but its key and
         // row locators, so the v2 plan joins it through the index
         // (`IndexJoinRule`). An `UpdateIf` condition reads target columns,
-        // which the index cannot supply.
+        // which the index cannot supply, and the rule leaves composite keys
+        // to the hash join, which is slower than the legacy indexed path.
         let index_join_on_v2 = is_full_schema
+            && self.params.on.len() == 1
             && !matches!(
                 self.params.when_matched,
                 WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
@@ -12657,9 +12659,9 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(updated_count, 3);
     }
 
-    /// A target for index-join tests: `id` (nullable) and `bucket = id % 4`,
-    /// both indexed, over three fragments with a deletion in the middle one,
-    /// plus a fourth fragment appended after the indices were built.
+    /// A target for index-join tests: an indexed, nullable `id` and an
+    /// unindexed `bucket = id % 4`, over three fragments with a deletion in the
+    /// middle one, plus a fourth fragment appended after the index was built.
     async fn index_join_target(index_type: IndexType, stable_row_ids: bool) -> Dataset {
         let write_params = WriteParams {
             max_rows_per_file: 10,
@@ -12688,17 +12690,15 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         )
         .await
         .unwrap();
-        for column in ["id", "bucket"] {
-            ds.create_index(
-                &[column],
-                index_type,
-                None,
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
-        }
+        ds.create_index(
+            &["id"],
+            index_type,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
         ds.delete("id = 13").await.unwrap();
         ds.append(
             RecordBatchIterator::new([Ok(batch(30..40))], index_join_schema()),
@@ -12730,7 +12730,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         scanner.try_into_batch().await.unwrap()
     }
 
-    /// A full-schema merge on indexed keys joins through the index and leaves
+    /// A full-schema merge on an indexed key joins through the index and leaves
     /// the same table as the hash join: deleted rows and null keys never
     /// match, and rows in the unindexed fragment are still found.
     #[rstest::rstest]
@@ -12745,17 +12745,11 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         )]
         when_matched: WhenMatched,
         #[values(false, true)] insert: bool,
-        #[values(1, 2)] num_keys: usize,
     ) {
         if when_matched == WhenMatched::DoNothing && !insert {
             return;
         }
-        let keys = ["id", "bucket"][..num_keys]
-            .iter()
-            .map(|key| key.to_string())
-            .collect::<Vec<_>>();
-        // 13 is deleted, 35 is unindexed, 50 and null are new, and 7 has a
-        // bucket that does not match, so it is new under the composite key.
+        // 13 is deleted, 35 is unindexed, and 50 and null are new.
         let source = RecordBatch::try_new(
             index_join_schema(),
             vec![
@@ -12787,7 +12781,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let mut results = Vec::new();
         for use_index in [true, false] {
             let ds = Arc::new(index_join_target(index_type, stable_row_ids).await);
-            let job = MergeInsertBuilder::try_new(ds, keys.clone())
+            let job = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
                 .unwrap()
                 .when_matched(when_matched.clone())
                 .when_not_matched(if insert {
@@ -13013,11 +13007,22 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
+    /// Looking up each column of a composite key materializes every row
+    /// matching each column, so composite keys do not take the index join.
+    /// Fully indexed ones keep the legacy indexed path.
     #[tokio::test]
-    async fn test_index_join_partially_indexed_composite_key_uses_hash_join() {
+    async fn test_index_join_skips_composite_keys() {
         let mut ds = index_join_target(IndexType::BTree, false).await;
-        ds.drop_index("bucket_idx").await.unwrap();
-        let plan =
+        ds.create_index(
+            &["bucket"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let error =
             MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string(), "bucket".to_string()])
                 .unwrap()
                 .when_matched(WhenMatched::UpdateAll)
@@ -13025,9 +13030,11 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap()
                 .explain_plan(None, false)
                 .await
-                .unwrap();
-        assert!(plan.contains("HashJoinExec"), "{plan}");
-        assert!(!plan.contains("IndexJoin"), "{plan}");
+                .unwrap_err();
+        assert!(
+            matches!(&error, Error::NotSupported { source, .. } if source.to_string().contains("scalar-index execution path")),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
