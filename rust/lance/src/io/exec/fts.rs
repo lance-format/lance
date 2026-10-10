@@ -1017,6 +1017,7 @@ pub struct HybridCompoundQueryExec {
     column: String,
     segments: Arc<[IndexMetadata]>,
     residual_input: Arc<dyn ExecutionPlan>,
+    indexed_input: Option<(Arc<dyn ExecutionPlan>, Arc<MemBM25Scorer>)>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1037,6 +1038,7 @@ impl HybridCompoundQueryExec {
             column,
             segments: Arc::from(segments),
             residual_input,
+            indexed_input: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -1071,6 +1073,56 @@ impl HybridCompoundQueryExec {
         &self.segments
     }
 
+    /// Replace the indexed search with an externally computed bounded top-k.
+    ///
+    /// `input` must search exactly [`Self::segments`] with the complete query
+    /// and the supplied corpus-wide committed-index scorer. It must produce
+    /// at most [`FtsSearchParams::limit`] rows, ordered by score descending and
+    /// row ID ascending. The residual arm extends the same scorer with its
+    /// query-local statistics, preserving the mixed-search scoring contract.
+    ///
+    /// A distributed planner can merge bounded per-worker [`CompoundQueryExec`]
+    /// results before passing that single-partition input to this method.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use datafusion::physical_plan::ExecutionPlan;
+    /// # use lance::io::exec::fts::HybridCompoundQueryExec;
+    /// # use lance_index::scalar::inverted::MemBM25Scorer;
+    /// # fn replace_indexed_search(
+    /// #     hybrid: &HybridCompoundQueryExec,
+    /// #     merged: Arc<dyn ExecutionPlan>,
+    /// #     scorer: Arc<MemBM25Scorer>,
+    /// # ) -> datafusion::error::Result<HybridCompoundQueryExec> {
+    /// hybrid.with_indexed_input(merged, scorer)
+    /// # }
+    /// ```
+    pub fn with_indexed_input(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        committed_scorer: Arc<MemBM25Scorer>,
+    ) -> DataFusionResult<Self> {
+        if input.schema() != self.schema()
+            || input.output_partitioning().partition_count() != 1
+            || self.params.limit.is_none()
+        {
+            return Err(DataFusionError::Plan(
+                "hybrid indexed input requires the FTS schema, one partition, and a bounded limit"
+                    .to_string(),
+            ));
+        }
+        let mut result = Self::new(
+            self.dataset.clone(),
+            self.query.clone(),
+            self.params.clone(),
+            self.column.clone(),
+            self.segments.to_vec(),
+            self.residual_input.clone(),
+        );
+        result.indexed_input = Some((input, committed_scorer));
+        Ok(result)
+    }
+
     /// The scan over the fragments no segment covers.
     pub fn residual_input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.residual_input
@@ -1093,34 +1145,50 @@ impl ExecutionPlan for HybridCompoundQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.residual_input]
+        let mut children = vec![&self.residual_input];
+        if let Some((input, _)) = &self.indexed_input {
+            children.push(input);
+        }
+        children
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        vec![Distribution::SinglePartition; self.children().len()]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
+        if children.len() != self.children().len() {
             return Err(DataFusionError::Internal(format!(
-                "hybrid compound FTS expected one residual child, got {}",
+                "hybrid compound FTS expected {} children, got {}",
+                self.children().len(),
                 children.len()
             )));
         }
+        let indexed_input = if self.indexed_input.is_some() {
+            children.pop()
+        } else {
+            None
+        };
         let residual_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("hybrid compound FTS lost its residual child".to_string())
         })?;
-        Ok(Arc::new(Self::new(
+        let result = Self::new(
             self.dataset.clone(),
             self.query.clone(),
             self.params.clone(),
             self.column.clone(),
             self.segments.to_vec(),
             residual_input,
-        )))
+        );
+        match (indexed_input, &self.indexed_input) {
+            (Some(input), Some((_, scorer))) => {
+                Ok(Arc::new(result.with_indexed_input(input, scorer.clone())?))
+            }
+            _ => Ok(Arc::new(result)),
+        }
     }
 
     #[instrument(name = "hybrid_compound_fts_exec", level = "debug", skip_all)]
@@ -1135,14 +1203,27 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let column = self.column.clone();
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
+        let indexed_input = self.indexed_input.clone();
         let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let schema = self.schema();
 
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            // An external indexed arm supplies the committed statistics and
+            // candidates. Only the representative tokenizer is needed here.
+            let segments_to_open = if indexed_input.is_some() {
+                segments.get(..1).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "hybrid FTS for column {column} requires a committed segment"
+                    ))
+                })?
+            } else {
+                &segments
+            };
             let indices =
-                open_fts_segments(&dataset, &column, &segments, &metrics.index_metrics).await?;
+                open_fts_segments(&dataset, &column, segments_to_open, &metrics.index_metrics)
+                    .await?;
             let first_index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {column} has no committed segments"
@@ -1175,6 +1256,9 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 index_query_local_residual(residual_input, residual_seed, allowed_terms).await
             };
             let scorer_build = async {
+                if let Some((_, scorer)) = &indexed_input {
+                    return Ok(scorer.clone());
+                }
                 let scorer = build_global_bm25_scorer(
                     &indices,
                     &query_tokens,
@@ -1196,26 +1280,34 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 )
             })?;
 
-            let prefilter = build_prefilter(
-                context,
-                partition,
-                &PreFilterSource::None,
-                dataset,
-                &segments,
-                PreFilterMasks {
-                    overlay_block: None,
-                    external_mask: None,
-                },
-                &metrics_set,
-            )?;
-            let indexed_search = compound_search_with_base_scorer(
-                &indices,
-                &query,
-                &params,
-                prefilter,
-                metrics.clone(),
-                committed_scorer,
-            );
+            let indexed_search = async {
+                if let Some((input, _)) = &indexed_input {
+                    let stream = input.execute(0, context.clone())?;
+                    return collect_bounded_fts_input(stream, limit).await;
+                }
+                let prefilter = build_prefilter(
+                    context,
+                    partition,
+                    &PreFilterSource::None,
+                    dataset,
+                    &segments,
+                    PreFilterMasks {
+                        overlay_block: None,
+                        external_mask: None,
+                    },
+                    &metrics_set,
+                )?;
+                compound_search_with_base_scorer(
+                    &indices,
+                    &query,
+                    &params,
+                    prefilter,
+                    metrics.clone(),
+                    committed_scorer,
+                )
+                .await
+                .map_err(DataFusionError::from)
+            };
             let residual_query = query.clone();
             let residual_search = async move {
                 let residual_leaves = query_local_residual_leaves(
@@ -1228,6 +1320,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     materialized_compound_top_k(&residual_query, residual_leaves, limit)
                 })
                 .await
+                .map_err(DataFusionError::from)
             };
             let ((indexed_row_ids, indexed_scores), (residual_row_ids, residual_scores)) =
                 futures::future::try_join(indexed_search, residual_search).await?;
@@ -1262,6 +1355,41 @@ impl ExecutionPlan for HybridCompoundQueryExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+}
+
+async fn collect_bounded_fts_input(
+    mut input: SendableRecordBatchStream,
+    limit: usize,
+) -> DataFusionResult<(Vec<u64>, Vec<f32>)> {
+    let mut row_ids = Vec::new();
+    let mut scores = Vec::new();
+    while let Some(batch) = input.try_next().await? {
+        if batch.num_rows() > limit.saturating_sub(row_ids.len()) {
+            return Err(DataFusionError::Execution(format!(
+                "hybrid indexed input exceeded its bounded result limit of {limit} rows"
+            )));
+        }
+        let ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| {
+                DataFusionError::Execution("hybrid indexed input is missing row IDs".to_string())
+            })?
+            .as_primitive::<UInt64Type>();
+        let values = batch
+            .column_by_name(SCORE_COL)
+            .ok_or_else(|| {
+                DataFusionError::Execution("hybrid indexed input is missing scores".to_string())
+            })?
+            .as_primitive::<Float32Type>();
+        if ids.null_count() != 0 || values.null_count() != 0 {
+            return Err(DataFusionError::Execution(
+                "hybrid indexed input contains null row IDs or scores".to_string(),
+            ));
+        }
+        row_ids.extend_from_slice(ids.values());
+        scores.extend_from_slice(values.values());
+    }
+    Ok((row_ids, scores))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5804,6 +5932,7 @@ mod tests {
         UInt64Array,
     };
     use arrow_schema::DataType;
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
@@ -5824,7 +5953,7 @@ mod tests {
     };
     use lance_index::scalar::inverted::{
         CombinedCorpusStats, CombinedFieldColumn, DocumentGranularity, FTS_SCHEMA, InvertedIndex,
-        Language, SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer,
+        Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer,
         prepare_bm25_query,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
@@ -5844,10 +5973,11 @@ mod tests {
     use super::{
         BoolSlot, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
         CrossColumnCompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC, FlatCombinedFieldsExec,
-        FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage, FlatStatsScope, MatchQueryExec,
-        PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
-        build_boolean_query_children, classify_wand_exactness_certificate, default_text_tokenizer,
-        open_fts_segments, tokenizer_for_match_query,
+        FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage, FlatStatsScope,
+        HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET,
+        WandExactnessCertificate, build_boolean_query_children,
+        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
+        tokenizer_for_match_query,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -6010,6 +6140,190 @@ mod tests {
         .unwrap();
         assert_eq!(committed.len(), fragment_ids.len());
         (Arc::new(dataset), committed, fragment_ids)
+    }
+
+    async fn create_hybrid_indexed_input_fixture(
+        term: &str,
+        limit: usize,
+    ) -> (
+        HybridCompoundQueryExec,
+        Arc<MemBM25Scorer>,
+        Arc<dyn ExecutionPlan>,
+    ) {
+        let (dataset, segments, _) = create_segment_selection_fixture().await;
+        let mut dataset = dataset.as_ref().clone();
+        let appended = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["quick fresh", "fresh"]),
+            )
+            .col(
+                "other",
+                lance_datagen::array::cycle_utf8_literals(&["not indexed"]),
+            )
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+        dataset.append(appended, None).await.unwrap();
+        let tail = dataset.fragments().last().unwrap().clone();
+        let dataset = Arc::new(dataset);
+        let mut scanner = dataset.scan();
+        scanner.project(&["text"]).unwrap();
+        scanner.with_row_id().with_fragments(vec![tail]);
+        let residual = scanner.create_plan().await.unwrap();
+        let query = FtsQuery::Match(
+            MatchQuery::new(term.to_string())
+                .with_column(Some("text".to_string()))
+                .with_fuzziness(Some(0)),
+        );
+        let params = FtsSearchParams::default().with_limit(Some(limit));
+        let metrics = IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let indices = open_fts_segments(&dataset, "text", &segments, &metrics)
+            .await
+            .unwrap();
+        let tokens = super::Tokens::new(vec![term.to_string()], indices[0].tokenizer().doc_type());
+        let scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &tokens, &params, None)
+                .await
+                .unwrap(),
+        );
+        let indexed = Arc::new(
+            CompoundQueryExec::new_with_segments(
+                dataset.clone(),
+                query.clone(),
+                params.clone(),
+                PreFilterSource::None,
+                segments.clone(),
+            )
+            .with_base_scorer(scorer.clone()),
+        );
+        (
+            HybridCompoundQueryExec::new(
+                dataset,
+                query,
+                params,
+                "text".to_string(),
+                segments,
+                residual,
+            ),
+            scorer,
+            indexed,
+        )
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_hybrid_indexed_input_matches_native(
+        #[values("quick", "fresh")] term: &str,
+        #[values(1, 4)] limit: usize,
+    ) {
+        let (hybrid, scorer, indexed) = create_hybrid_indexed_input_fixture(term, limit).await;
+        let expected = hybrid
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let replaced: Arc<dyn ExecutionPlan> =
+            Arc::new(hybrid.with_indexed_input(indexed, scorer).unwrap());
+        assert_eq!(replaced.children().len(), 2);
+        assert_eq!(replaced.required_input_distribution().len(), 2);
+        // Scanner plans retain execution state, so the comparison needs an
+        // independent residual scan over the same immutable dataset snapshot.
+        let mut scanner = hybrid.dataset().scan();
+        scanner.project(&[hybrid.column()]).unwrap();
+        scanner
+            .with_row_id()
+            .with_fragments(vec![hybrid.dataset().fragments().last().unwrap().clone()]);
+        let mut children = replaced.children().into_iter().cloned().collect::<Vec<_>>();
+        children[0] = scanner.create_plan().await.unwrap();
+        let rewritten = replaced.with_new_children(children).unwrap();
+        let actual = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "indexed replacement must preserve scores and order"
+        );
+        assert!(actual.iter().map(RecordBatch::num_rows).sum::<usize>() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_indexed_input_rejects_invalid_plan() {
+        let (hybrid, scorer, indexed) = create_hybrid_indexed_input_fixture("quick", 3).await;
+        let wrong_schema = Arc::new(EmptyExec::new(Arc::new(arrow_schema::Schema::empty())));
+        let error = hybrid
+            .with_indexed_input(wrong_schema, scorer.clone())
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("FTS schema"));
+
+        let multiple_partitions =
+            MemorySourceConfig::try_new_exec(&[vec![], vec![]], FTS_SCHEMA.clone(), None).unwrap();
+        let error = hybrid
+            .with_indexed_input(multiple_partitions, scorer.clone())
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("one partition"));
+
+        let unbounded = HybridCompoundQueryExec::new(
+            hybrid.dataset().clone(),
+            hybrid.query().clone(),
+            hybrid.params().clone().with_limit(None),
+            hybrid.column().to_string(),
+            hybrid.segments().to_vec(),
+            hybrid.residual_input().clone(),
+        );
+        let error = unbounded.with_indexed_input(indexed, scorer).unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("bounded limit"));
+
+        let error = Arc::new(hybrid).with_new_children(vec![]).unwrap_err();
+        assert!(matches!(error, DataFusionError::Internal(_)));
+        assert!(error.to_string().contains("expected 1 children"));
+    }
+
+    #[rstest::rstest]
+    #[case::too_many_rows(false, "exceeded its bounded result limit")]
+    #[case::null_score(true, "null row IDs or scores")]
+    #[tokio::test]
+    async fn test_hybrid_indexed_input_rejects_invalid_results(
+        #[case] null_score: bool,
+        #[case] message: &str,
+    ) {
+        let (hybrid, scorer, _) = create_hybrid_indexed_input_fixture("quick", 3).await;
+        let scores = if null_score {
+            vec![None, Some(1.0)]
+        } else {
+            vec![Some(1.0), Some(1.0)]
+        };
+        let batch = RecordBatch::try_new(
+            FTS_SCHEMA.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0, 1])),
+                Arc::new(Float32Array::from(scores)),
+            ],
+        )
+        .unwrap();
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone(), batch]],
+            FTS_SCHEMA.clone(),
+            None,
+        )
+        .unwrap();
+        let replaced: Arc<dyn ExecutionPlan> =
+            Arc::new(hybrid.with_indexed_input(input, scorer).unwrap());
+        let children = replaced.children().into_iter().cloned().collect();
+        let rewritten = replaced.with_new_children(children).unwrap();
+        let error = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     fn tokenized_query_index_params() -> InvertedIndexParams {
