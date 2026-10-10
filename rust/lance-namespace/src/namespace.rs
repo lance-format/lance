@@ -176,7 +176,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         Err(Error::not_supported("declare_table not implemented"))
     }
 
-    /// Insert data into a table.
+    /// Insert data into a table, returning the inserted row count and commit version.
     async fn insert_into_table(
         &self,
         _request: InsertIntoTableRequest,
