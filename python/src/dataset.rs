@@ -2166,7 +2166,7 @@ impl Dataset {
 
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
-        Ok(self.ds.version().version)
+        Ok(self.ds.version_id())
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
@@ -4773,7 +4773,7 @@ impl Dataset {
         } else {
             Ok(Ref::Version(
                 self.ds.manifest.branch.clone(),
-                Some(self.ds.version().version),
+                Some(self.ds.version_id()),
             ))
         }
     }
