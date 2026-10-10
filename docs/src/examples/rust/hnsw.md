@@ -8,6 +8,11 @@ This example will show how to:
 2. Build a hierarchical graph structure for efficient vector search using Lance API
 3. Perform vector search with different parameters and compute the ground truth using L2 distance search
 
+The example sets the search beam width `ef` explicitly. A query that leaves it
+unset gets `1.5 * k * refine_factor`, floored at 256; the floor is what keeps
+recall usable on a single large partition, which is the layout
+`IVF_HNSW_*` builds by default.
+
 ## Complete Example
 
 ```rust
