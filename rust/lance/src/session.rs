@@ -11,7 +11,7 @@ use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::spill::{LocalSpillStore, SpillStore};
 
-pub use lance_index::vector::storage::OriginLatencyClass;
+pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -81,6 +81,10 @@ pub struct Session {
     /// this session opens; see [`Self::with_index_origin_latency`]. `None`
     /// leaves each index the class of its object store.
     index_origin_latency: Option<OriginLatencyClass>,
+
+    /// Whether the IVF_RQ indexes this session opens keep their small columns
+    /// resident; see [`Self::with_index_resident_columns`].
+    index_resident_columns: ResidentColumnsSetting,
 }
 
 impl DeepSizeOf for Session {
@@ -112,6 +116,7 @@ impl std::fmt::Debug for Session {
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
             .field("index_origin_latency", &self.index_origin_latency)
+            .field("index_resident_columns", &self.index_resident_columns)
             .finish()
     }
 }
@@ -147,6 +152,7 @@ impl Session {
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
+            index_resident_columns: ResidentColumnsSetting::Auto,
         }
     }
 
@@ -169,6 +175,7 @@ impl Session {
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
+            index_resident_columns: ResidentColumnsSetting::Auto,
         }
     }
 
@@ -218,6 +225,35 @@ impl Session {
     /// [`Self::with_index_origin_latency`].
     pub fn index_origin_latency(&self) -> Option<OriginLatencyClass> {
         self.index_origin_latency
+    }
+
+    /// Set whether the IVF_RQ indexes this session opens keep the small
+    /// columns of their storage files (row ids and factors) resident in a
+    /// store charged in the index cache, so that reads fetch only the code
+    /// columns from the files. [`ResidentColumnsSetting::Auto`] (the default)
+    /// keeps them when the store's charge fits the cache entry limit,
+    /// whatever the origin;
+    /// [`ResidentColumnsSetting::On`] keeps them always and
+    /// [`ResidentColumnsSetting::Off`] never. Each index resolves the setting
+    /// when it opens; results do not depend on it. Other index types ignore
+    /// it, and `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides it.
+    ///
+    /// ```rust,no_run
+    /// # use lance::session::{ResidentColumnsSetting, Session};
+    /// let session =
+    ///     Session::default().with_index_resident_columns(ResidentColumnsSetting::Off);
+    /// assert_eq!(session.index_resident_columns(), ResidentColumnsSetting::Off);
+    /// ```
+    pub fn with_index_resident_columns(mut self, setting: ResidentColumnsSetting) -> Self {
+        self.index_resident_columns = setting;
+        self
+    }
+
+    /// Whether the IVF_RQ indexes this session opens keep their small
+    /// columns resident, [`ResidentColumnsSetting::Auto`] unless set; see
+    /// [`Self::with_index_resident_columns`].
+    pub fn index_resident_columns(&self) -> ResidentColumnsSetting {
+        self.index_resident_columns
     }
 
     /// Return a reference to the session's spill store.
@@ -280,6 +316,7 @@ impl Session {
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
+            index_resident_columns: ResidentColumnsSetting::Auto,
         }
     }
 
@@ -643,6 +680,50 @@ mod tests {
                 );
                 let cleared = hinted.with_index_origin_latency(None);
                 assert_eq!(cleared.index_origin_latency(), None);
+            }
+        }
+    }
+
+    /// A session leaves IVF_RQ residency to `auto` unless built with a
+    /// setting, whichever constructor built it; its clones keep the
+    /// setting, and its debug output shows it.
+    #[test]
+    fn test_index_resident_columns_setting() {
+        let sessions = [
+            Session::default(),
+            Session::new(0, 0, Default::default()),
+            Session::with_index_cache_backend(
+                Arc::new(QuickCacheBackend::with_capacity(0)),
+                0,
+                Default::default(),
+            ),
+            Session::with_cache_backends(
+                CacheSpec::Default,
+                CacheSpec::Default,
+                Default::default(),
+            ),
+        ];
+        for session in sessions {
+            assert_eq!(
+                session.index_resident_columns(),
+                ResidentColumnsSetting::Auto
+            );
+            assert!(
+                format!("{session:?}").contains("index_resident_columns: Auto"),
+                "{session:?}"
+            );
+            for setting in [
+                ResidentColumnsSetting::On,
+                ResidentColumnsSetting::Off,
+                ResidentColumnsSetting::Auto,
+            ] {
+                let set = session.clone().with_index_resident_columns(setting);
+                assert_eq!(set.index_resident_columns(), setting);
+                assert_eq!(set.clone().index_resident_columns(), setting);
+                assert!(
+                    format!("{set:?}").contains(&format!("index_resident_columns: {setting:?}")),
+                    "{set:?}"
+                );
             }
         }
     }

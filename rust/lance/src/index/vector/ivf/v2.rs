@@ -1075,6 +1075,11 @@ pub(crate) struct IvfOpenContext {
     /// it opens (`Session::index_origin_latency`), `None` when it declares
     /// none; see [`IVFIndex::origin_latency_at_open`].
     pub(crate) origin_latency_hint: Option<OriginLatencyClass>,
+    /// Whether the session keeps the small columns of the IVF_RQ indexes it
+    /// opens resident (`Session::index_resident_columns`), `auto` unless it
+    /// sets one; `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides
+    /// it. See [`IVFIndex::resident_columns_at_open`].
+    pub(crate) resident_columns: ResidentColumnsSetting,
     /// The index's namespace of the index cache without a fragment reuse
     /// segment, where an IVF_RQ index with resident small columns charges
     /// their store (see [`ResidentColumns::in_index_cache`]), so
@@ -1084,6 +1089,12 @@ pub(crate) struct IvfOpenContext {
     /// A strong reference acquired before opening the index can evict the
     /// cached store. Dropped if the index does not use resident columns.
     pub(crate) resident_columns_handle: Option<ResidentColumns>,
+    /// The opening query's I/O stats, which a load of the resident store in
+    /// a reconstruction from a cached [`IvfIndexState`] adds to; `None` when
+    /// the opener records none. [`IVFIndex::try_new`] ignores it: its own
+    /// scheduler records the load with the rest of the open's I/O
+    /// ([`VectorIndex::open_io_stats`]).
+    pub(crate) io_stats: Option<IoStats>,
 }
 
 /// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
@@ -1719,8 +1730,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
             }
         };
-        let resident_columns =
-            Self::resident_columns_at_open(origin_latency, &storage, context.file_cache.as_ref())?;
+        let resident_columns = Self::resident_columns_at_open(
+            &storage,
+            context.file_cache.as_ref(),
+            context.resident_columns,
+        )?;
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
@@ -1729,6 +1743,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_resident_columns_enabled(resident_columns)
             .with_entry_columns(Self::entry_columns_at_open()?)
             .with_index_file(index_file);
+        // Load the store before any read needs it. The scheduler records the
+        // load's requests with the rest of the open's I/O, so the load adds
+        // them to no other stats.
+        storage.load_resident_store(None).await?;
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -1748,8 +1766,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
         // The scheduler is freshly created above and, at this point, has served
         // only the open-time reads (file footers, IVF centroids, quantization
-        // metadata) -- partition reads happen later, during queries.  So its
-        // cumulative stats are exactly the one-time index-open I/O.
+        // metadata, and the resident store's load) -- partition reads happen
+        // later, during queries.  So its cumulative stats are exactly the
+        // one-time index-open I/O.
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
@@ -1892,48 +1911,52 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Replace the origin latency class resolved at open, and what the
-    /// index resolves from it when it opens (residency and the lazy scan
-    /// settings), so tests can open both classes over one store in one
-    /// process.
+    /// index resolves from it when it opens (the lazy scan settings), so
+    /// tests can open both classes over one store in one process.
     #[cfg(test)]
     pub(crate) fn with_origin_latency_for_test(
         mut self,
         origin_latency: OriginLatencyClass,
     ) -> Result<Self> {
-        let resident_columns = Self::resident_columns_at_open(origin_latency, &self.storage, None)?;
         let layered_lazy = Self::layered_lazy_config_at_open(self.layered_rq, origin_latency)?;
         self.origin_latency = origin_latency;
-        self.storage = self
-            .storage
-            .with_origin_latency(origin_latency)
-            .with_resident_columns_enabled(resident_columns);
+        self.storage = self.storage.with_origin_latency(origin_latency);
         self.layered_lazy = Mutex::new(layered_lazy);
         Ok(self)
     }
 
-    /// Whether an index opened with origin latency `class` keeps the small
-    /// columns of `storage`'s file resident in `file_cache`: when the setting
-    /// resolves for the class and admits the store for the cache's largest
-    /// entry (see [`ResidentColumnsSetting::admits`]), which `auto` sizes by
-    /// what the cache would charge for the store against its entry limit.
-    /// Only IVF_RQ indexes read (and validate) `LANCE_RQ_RESIDENT_COLUMNS`
-    /// and `LANCE_RQ_RESIDENT_LIFETIME`: the resident columns are told apart
+    /// Whether an index keeps the small columns of `storage`'s file
+    /// resident in `file_cache`, whatever its origin latency class: when the
+    /// setting admits the store (see [`ResidentColumnsSetting::admits`]).
+    /// The setting is `LANCE_RQ_RESIDENT_COLUMNS` when it is `on` or `off`,
+    /// and otherwise `session`, the opening session's
+    /// ([`ResidentColumnsSetting::resolve_with_session`]). `off` keeps none
+    /// and sizes nothing. `auto` keeps one when its charged bytes fit the
+    /// cache entry limit; without a cache, only `on` keeps one, shared and
+    /// uncharged. A store that does not fit counts
+    /// `resident_columns_oversize`. Only IVF_RQ
+    /// indexes read (and validate) `LANCE_RQ_RESIDENT_COLUMNS` and
+    /// `LANCE_RQ_RESIDENT_LIFETIME`: the resident columns are told apart
     /// from the RaBitQ code columns, so other storages keep none.
     fn resident_columns_at_open(
-        class: OriginLatencyClass,
         storage: &IvfQuantizationStorage<Q>,
         file_cache: Option<&LanceCache>,
+        session: ResidentColumnsSetting,
     ) -> Result<bool> {
         if Q::quantization_type() != QuantizationType::Rabit {
             return Ok(false);
         }
         resident_lifetime_setting()?;
-        let setting = resident_columns_setting()?;
-        if !setting.resolve(class) {
+        let setting =
+            ResidentColumnsSetting::resolve_with_session(resident_columns_setting()?, session);
+        if setting == ResidentColumnsSetting::Off {
             return Ok(false);
         }
         let store = storage.resident_store_size()?;
-        let max_entry_bytes = file_cache.and_then(LanceCache::max_entry_bytes);
+        let Some(cache) = file_cache else {
+            return Ok(setting == ResidentColumnsSetting::On && store.bytes > 0);
+        };
+        let max_entry_bytes = cache.max_entry_bytes();
         if store.bytes > 0 && !resident_store_fits(store.charge, max_entry_bytes) {
             layered_stats::counters().resident_columns_oversize.incr();
             if setting == ResidentColumnsSetting::On {
@@ -1949,6 +1972,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// The opener's strong reference bridges eviction during index opening.
     /// Otherwise use an independent store that loads only if residency is
     /// enabled later.
+    /// The opening index loads the bound store next, unless it is loaded already.
     async fn resident_store_at_open(
         resident: bool,
         file: &IndexFileKey,
@@ -1987,7 +2011,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     /// The size of the index's resident store, whether or not it keeps
     /// one, and what an index cache charges for it once loaded, which the
-    /// open compared with the cache's pinned cap; see
+    /// open compared with the cache's entry limit; see
     /// [`ResidentColumnsSetting::admits`]. Zero for a plane-row file.
     pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
         self.storage.resident_store_size()
@@ -2001,11 +2025,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Replace whether reads keep the small columns resident, so tests can
-    /// open both in one process.
+    /// open both in one process. Enabling loads the store through the
+    /// index's handle unless it is loaded, as an open that keeps the columns
+    /// resident does: a store of the index's own when the open kept none.
+    /// Disabling also gives the index a store handle of its own, so that it
+    /// never shares the store the open bound.
     #[cfg(test)]
-    pub(crate) fn with_resident_columns_for_test(mut self, enabled: bool) -> Self {
+    pub(crate) async fn with_resident_columns_for_test(mut self, enabled: bool) -> Result<Self> {
+        if !enabled {
+            self.storage = self
+                .storage
+                .with_resident_columns(ResidentColumns::default());
+        }
         self.storage = self.storage.with_resident_columns_enabled(enabled);
-        self
+        self.storage.load_resident_store(None).await?;
+        Ok(self)
     }
 
     /// The entry columns an opening index asks its storage for: an IVF_RQ
@@ -2840,7 +2874,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// [`Self::prewarm_partition_window`] of an index that caches its
     /// partitions as code-only entries: one read of the window's code
     /// columns, cut into the entries of its partitions. The flat sub-index
-    /// holds nothing to warm, and the resident store loads on first use.
+    /// holds nothing to warm, and the index loaded the resident store when
+    /// it opened.
     async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
         let projection = self.storage.partition_codes_projection()?;
         let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
@@ -2886,6 +2921,55 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             }
             partition_id = run_end;
         }
+        Ok(())
+    }
+
+    /// [`Index::prewarm`] of an index that is not layered: its partitions,
+    /// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
+    /// parallelism.
+    async fn prewarm_partitions(&self) -> Result<()> {
+        let cpu_parallelism = get_num_compute_intensive_cpus();
+        let target_bytes = prewarm_window_size_bytes()?;
+        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
+        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
+        let windows = plan_partition_windows(
+            PrewarmFileLayout {
+                ivf: &self.ivf,
+                encoded_bytes: self.reader.metadata().num_data_bytes,
+                num_rows: self.reader.num_rows(),
+            },
+            PrewarmFileLayout {
+                ivf: self.storage.ivf(),
+                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
+                num_rows: self.storage.reader().num_rows(),
+            },
+            target_bytes,
+            max_partitions,
+        )?;
+        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
+        info!(
+            uuid = %self.uuid,
+            windows = windows.len(),
+            planned_bytes,
+            window_bytes = target_bytes,
+            parallelism,
+            io_parallelism = self.io_parallelism,
+            "prewarming IVF partitions in byte windows"
+        );
+        let started = std::time::Instant::now();
+        stream::iter(windows)
+            .map(Ok)
+            .try_for_each_concurrent(Some(parallelism), |window| async move {
+                self.prewarm_partition_window(window.partitions).await
+            })
+            .await?;
+        let elapsed = started.elapsed();
+        info!(
+            uuid = %self.uuid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
+            "prewarmed IVF partitions"
+        );
         Ok(())
     }
 
@@ -2943,51 +3027,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
+        // Every IVF index loaded its resident store when it opened, and its
+        // handle keeps it for the index's life, so prewarm has none to load.
+        debug_assert!(
+            !self.storage.resident_columns_enabled()
+                || self.storage.resident_columns().loaded_bytes().is_some(),
+            "IVF_RQ index {} prewarms with a resident store its open did not load",
+            self.uuid
+        );
         if self.storage.is_layered_rq() {
-            return self.storage.prewarm_planes(&self.index_cache).await;
+            self.storage.prewarm_planes(&self.index_cache).await?;
+        } else {
+            self.prewarm_partitions().await?;
         }
-        let cpu_parallelism = get_num_compute_intensive_cpus();
-        let target_bytes = prewarm_window_size_bytes()?;
-        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
-        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
-        let windows = plan_partition_windows(
-            PrewarmFileLayout {
-                ivf: &self.ivf,
-                encoded_bytes: self.reader.metadata().num_data_bytes,
-                num_rows: self.reader.num_rows(),
-            },
-            PrewarmFileLayout {
-                ivf: self.storage.ivf(),
-                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
-                num_rows: self.storage.reader().num_rows(),
-            },
-            target_bytes,
-            max_partitions,
-        )?;
-        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
-        info!(
-            uuid = %self.uuid,
-            windows = windows.len(),
-            planned_bytes,
-            window_bytes = target_bytes,
-            parallelism,
-            io_parallelism = self.io_parallelism,
-            "prewarming IVF partitions in byte windows"
-        );
-        let started = std::time::Instant::now();
-        stream::iter(windows)
-            .map(Ok)
-            .try_for_each_concurrent(Some(parallelism), |window| async move {
-                self.prewarm_partition_window(window.partitions).await
-            })
-            .await?;
-        let elapsed = started.elapsed();
-        info!(
-            uuid = %self.uuid,
-            elapsed_ms = elapsed.as_millis() as u64,
-            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
-            "prewarmed IVF partitions"
-        );
         Ok(())
     }
 
@@ -4033,10 +4085,11 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     // back from a persistent tier binds to the one the index cache holds or
     // the file's live indexes share, and any state pins nothing.
     let resident = IVFIndex::<S, Q>::resident_columns_at_open(
-        origin_latency,
         &storage,
         context.file_cache.as_ref(),
+        context.resident_columns,
     )?;
+    let io_stats = context.io_stats.clone();
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
@@ -4044,6 +4097,10 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         .with_resident_columns_enabled(resident)
         .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?)
         .with_index_file(index_file);
+    // Load the store, unless a live index or the cache holds it, as an open
+    // does. A reconstruction reports no open I/O, so the load's requests go
+    // to the opening query's stats.
+    storage.load_resident_store(io_stats.as_ref()).await?;
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
@@ -7650,8 +7707,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_layered_plane_promotion_survives_query_reconstruction() {
-        use lance_index::vector::bq::layered::{EntryColumns, PlaneKey, SignBounds};
-
         let dir = TempStrDir::default();
         let (mut dataset, vectors) =
             generate_test_dataset::<Float32Type>(dir.as_str(), 0.0..1.0).await;
@@ -7675,6 +7730,16 @@ mod tests {
             .unwrap();
         let index_id = cold.load_indices().await.unwrap()[0].uuid;
         let cache = cold.index_cache.for_index(&index_id, None);
+        // The plane keys the queries' reconstructions use: entry columns
+        // follow the residency the index resolved when it opened.
+        let index = cold
+            .open_vector_index("vector", &index_id, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf = index
+            .as_any()
+            .downcast_ref::<super::IVFIndex<FlatIndex, RabitQuantizer>>()
+            .unwrap();
         let query = vectors.value(0);
         let num_rows = cold.count_rows(None).await.unwrap();
         for pass in 0..3 {
@@ -7691,15 +7756,7 @@ mod tests {
             assert_eq!(result.num_rows(), num_rows);
             for partition in 0..4 {
                 for plane in [1, 2] {
-                    // Ex plane keys do not depend on the bounds placement.
-                    // A local index keeps no resident store, so its entries
-                    // hold every column.
-                    let key = PlaneKey {
-                        partition,
-                        plane,
-                        sign_bounds: SignBounds::default(),
-                        entry_columns: EntryColumns::All,
-                    };
+                    let key = ivf.storage.plane_key(partition, plane);
                     let resident = cache.get_resident_with_key(&key).await;
                     assert_eq!(
                         resident.is_some(),
@@ -8263,6 +8320,9 @@ mod tests {
     /// state, filter, bound and scan setting.
     mod layered_lazy {
         use super::*;
+        use crate::io::exec::utils::IndexMetrics;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+        use lance_index::metrics::MetricsCollector;
         use std::sync::LazyLock;
         use std::sync::atomic::AtomicU64;
         use std::time::Duration;
@@ -8291,8 +8351,8 @@ mod tests {
         use lance_index::vector::storage::{
             DenseGatherMode, DenseToEager, GatherPlan, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
             IndexFileKey, LayeredLazyConfig, LazyOriginGap, LazyPromotion, OriginLatencyClass,
-            PlaneSource, ResidentColumnsKey, ResidentColumnsSetting, ResidentLifetime,
-            ResidentStoreSize, entry_columns_setting, origin_latency_setting,
+            PlaneSource, ResidentColumnsEntry, ResidentColumnsKey, ResidentColumnsSetting,
+            ResidentLifetime, ResidentStoreSize, entry_columns_setting, origin_latency_setting,
             resident_columns_setting, resident_lifetime_setting, resident_store_is_live,
             sign_bounds_setting,
         };
@@ -9972,12 +10032,13 @@ mod tests {
 
         /// A session's origin latency hint is the class of the IVF_RQ indexes
         /// it opens, when they open and when they are reconstructed from the
-        /// cached state, and residency, the lazy origin gap and the promotion
-        /// policy follow it. Without a hint an index takes its store's class,
-        /// low for the test's local files, and an IVF_PQ index the session
-        /// opens keeps its store's class whatever the hint. Results do not
-        /// depend on the class. A class the environment sets overrides every
-        /// hint, so the hint takes effect only where it sets none.
+        /// cached state, and the lazy origin gap and the promotion policy
+        /// follow it; residency does not. Without a hint an index takes its
+        /// store's class, low for the test's local files, and an IVF_PQ
+        /// index the session opens keeps its store's class whatever the
+        /// hint. Results do not depend on the class. A class the environment
+        /// sets overrides every hint, so the hint takes effect only where it
+        /// sets none.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_session_origin_latency_hint_reaches_rq_index() {
             let _serial = LAZY_TEST_LOCK.lock().await;
@@ -10054,12 +10115,17 @@ mod tests {
                     let ivf = lazy_index(index);
                     assert_eq!(ivf.origin_latency(), expected, "{context}");
                     assert_eq!(ivf.storage.origin_latency(), expected, "{context}");
+                    // Residency does not depend on the class: the cache
+                    // decides it, whatever the hint.
                     assert_eq!(
                         ivf.resident_columns_enabled(),
-                        resident_setting.resolve(expected),
+                        resident_setting.admits(
+                            ivf.resident_store_size().unwrap(),
+                            dataset.index_cache.max_entry_bytes(),
+                        ),
                         "{context}"
                     );
-                    // Code-only entries follow residency, so the hint.
+                    // Code-only entries follow residency.
                     assert_eq!(
                         ivf.entry_columns(),
                         entry_setting.resolve(ivf.resident_columns_enabled()),
@@ -11535,7 +11601,9 @@ mod tests {
             )
             .await
             .unwrap()
-            .with_resident_columns_for_test(resident);
+            .with_resident_columns_for_test(resident)
+            .await
+            .unwrap();
             Arc::new(ivf)
         }
 
@@ -11726,10 +11794,12 @@ mod tests {
             assert_eq!(stats.resident_columns_bytes, 0, "{stats:?}");
         }
 
-        /// First reads issued at once, as by queries that miss together, load
-        /// the resident store once, and a storage that shares the store, as a
-        /// reconstruction of the index does, does not load it again. The load
-        /// holds the bytes that `resident_columns_bytes` gives without I/O.
+        /// First reads issued at once through a storage built outside an index
+        /// open, which loaded no store for it, load the resident store once,
+        /// as a fallback counted as a read load, and a storage that shares
+        /// the store, as a reconstruction of the index does, does not load it
+        /// again. The load holds the bytes that `resident_columns_bytes`
+        /// gives without I/O.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_resident_columns_load_once() {
             let _serial = LAZY_TEST_LOCK.lock().await;
@@ -11780,6 +11850,7 @@ mod tests {
             }
             let stats = layered_stats::snapshot_and_reset();
             assert_eq!(stats.resident_columns_bytes, bytes, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 1, "{stats:?}");
             // The arrays hold at least their values.
             assert!(stats.resident_columns_alloc_bytes >= bytes, "{stats:?}");
             assert!(stats.resident_columns_load_requests > 0, "{stats:?}");
@@ -11811,9 +11882,9 @@ mod tests {
                 write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
             let vectors = batch["vector"].as_fixed_size_list();
             let (dataset, _, _) = open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
+            layered_stats::snapshot_and_reset();
             let file = open_with_resident_columns(&dataset, false).await;
             let resident = open_with_resident_columns(&dataset, true).await;
-            layered_stats::snapshot_and_reset();
             for key in [vectors.value(0), vectors.value(777)] {
                 let queries = if layered {
                     sign_bounds_test_queries(&key)
@@ -11850,9 +11921,10 @@ mod tests {
         }
 
         /// Whether the small columns are resident is what the environment
-        /// resolves for the index's origin and index cache, when the index
-        /// opens and when it is reconstructed from the cached state, and a
-        /// reconstruction while the index lives shares its store.
+        /// resolves for the index cache, whatever the origin, when the index
+        /// opens, which loads the store it keeps, and when it is
+        /// reconstructed from the cached state, and a reconstruction while
+        /// the index lives shares its store.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_resident_columns_survive_reconstruction() {
             let _serial = LAZY_TEST_LOCK.lock().await;
@@ -11865,20 +11937,11 @@ mod tests {
             let size = ivf.storage.resident_store_size().unwrap();
             assert_eq!(size.bytes, bytes);
             let setting = resident_columns_setting().unwrap();
-            let expected = setting.resolve(ivf.origin_latency())
-                && setting.admits(size, dataset.index_cache.max_entry_bytes());
+            let expected = setting.admits(size, dataset.index_cache.max_entry_bytes());
             assert_eq!(ivf.resident_columns_enabled(), expected);
             assert_eq!(ivf.storage.resident_columns_enabled(), expected);
-            // Load the store through the index's handle.
-            let partition = (0..LAZY_PARTITIONS)
-                .find(|&partition| ivf.storage.partition_size(partition) > 0)
-                .unwrap();
-            rq_storage_over(&ivf.storage, ivf.storage.reader(), true)
-                .with_resident_columns(ivf.storage.resident_columns().clone())
-                .load_partition(partition, None)
-                .await
-                .unwrap();
-            assert_eq!(ivf.storage.resident_columns().loaded_bytes(), Some(bytes));
+            let loaded = expected.then_some(bytes);
+            assert_eq!(ivf.storage.resident_columns().loaded_bytes(), loaded);
 
             let uuid = dataset.load_indices().await.unwrap()[0].uuid;
             let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
@@ -11897,11 +11960,7 @@ mod tests {
             // A resident store is the one the live index loaded; an index
             // that keeps none resident reads the file.
             let store = reopened.storage.resident_columns();
-            assert_eq!(
-                store.loaded_bytes(),
-                expected.then_some(bytes),
-                "shared store"
-            );
+            assert_eq!(store.loaded_bytes(), loaded, "shared store");
         }
 
         /// Scheme of the stores [`CloudTestStoreProvider`] makes.
@@ -12003,13 +12062,14 @@ mod tests {
 
         /// Indexes of one file opened at once on a fresh session, as a
         /// benchmark's workers open a cold index, bind to one resident store
-        /// and one far gather pool: their first searches load the store once,
-        /// the index cache charges and pins it while they live, and a permit
-        /// taken through one index is taken from every index's pool. The file
-        /// is on a store that `auto` takes for a cloud object store, so the
-        /// index opens as class high and keeps its small columns resident,
-        /// unless the environment sets otherwise; an index cache with no room
-        /// admits no store, so there `auto` keeps them in the file.
+        /// and one far gather pool: the opens load the store once, before any
+        /// search, the index cache charges and pins it while they live, their
+        /// searches load nothing, and a permit taken through one index is
+        /// taken from every index's pool. The file is on a store that `auto`
+        /// takes for a cloud object store, so the index opens as class high.
+        /// It keeps its small columns resident unless the environment sets
+        /// otherwise; an index cache with no room admits no store, so there
+        /// `auto` keeps them in the file.
         #[rstest]
         #[case::charged(LAZY_LARGE_CACHE_BYTES)]
         #[case::zero_capacity(0)]
@@ -12022,7 +12082,9 @@ mod tests {
             let (uri, batch) = write_cloud_lazy_test_dataset(registry.clone()).await;
             let session = Session::new(cache_bytes, LAZY_METADATA_CACHE_BYTES, registry);
             let dataset = open_with_session(&uri, session).await;
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+            let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+            let uuid = index_meta.uuid;
+            let file = index_file_key(&dataset, &index_meta);
             let key = batch["vector"].as_fixed_size_list().value(0);
             let query = lazy_test_query(key, 10, 8);
             let config = LayeredLazyConfig {
@@ -12031,14 +12093,16 @@ mod tests {
                 ..Default::default()
             };
 
+            assert!(!resident_store_is_live(&file));
             layered_stats::snapshot_and_reset();
             let indexes = futures::future::try_join_all(
-                (0..OPENS).map(|_| open_and_search(&dataset, &uuid, &query, config)),
+                (0..OPENS)
+                    .map(|_| dataset.open_vector_index("vector", &uuid, &NoOpMetricsCollector)),
             )
             .await
             .unwrap();
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.lazy_queries, OPENS as u64, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
             let first = lazy_index(&indexes[0]);
             if origin_latency_setting().unwrap().is_none() {
                 assert_eq!(first.origin_latency(), OriginLatencyClass::High);
@@ -12050,37 +12114,44 @@ mod tests {
             let resident = first.resident_columns_enabled();
             assert_eq!(
                 resident,
-                setting.resolve(first.origin_latency())
-                    && setting.admits(
-                        first.storage.resident_store_size().unwrap(),
-                        max_entry_bytes
-                    )
+                setting.admits(
+                    first.storage.resident_store_size().unwrap(),
+                    max_entry_bytes,
+                )
             );
             if cache_bytes == 0 && setting == ResidentColumnsSetting::Auto {
                 assert!(!resident);
                 assert!(stats.resident_columns_oversize > 0, "{stats:?}");
             }
             let loaded = resident.then_some(bytes);
-            // One load, however many indexes read the file at once.
-            assert_eq!(
-                stats.resident_columns_loads,
-                u64::from(resident),
+            // The opens loaded the file's store, live nowhere before them,
+            // exactly when the index keeps it. Other tests open IVF_RQ indexes
+            // at the same time, so the process-wide counters only bound this
+            // load from below; the file's store is this test's alone.
+            assert_eq!(resident_store_is_live(&file), resident);
+            assert!(
+                stats.resident_columns_loads >= u64::from(resident),
                 "{stats:?}"
             );
-            assert_eq!(
-                stats.resident_columns_bytes,
-                loaded.unwrap_or(0),
-                "{stats:?}"
-            );
-            assert_eq!(
-                stats.resident_columns_load_requests > 0,
-                resident,
-                "{stats:?}"
-            );
+            if resident {
+                assert!(stats.resident_columns_bytes >= bytes, "{stats:?}");
+                assert!(stats.resident_columns_load_requests > 0, "{stats:?}");
+            }
             for index in &indexes {
                 let store = lazy_index(index).storage.resident_columns();
                 assert_eq!(store.loaded_bytes(), loaded);
             }
+            // The searches read through the loaded store, and load nothing.
+            futures::future::try_join_all(indexes.iter().map(|index| {
+                lazy_index(index).set_layered_lazy_config_for_test(config);
+                search_global(index, &query, Arc::new(NoFilter))
+            }))
+            .await
+            .unwrap();
+            let stats = layered_stats::snapshot_and_reset();
+            assert_eq!(stats.lazy_queries, OPENS as u64, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+
             let pools: Vec<_> = indexes
                 .iter()
                 .map(|index| lazy_index(index).storage.lazy_far_permits(&config).unwrap())
@@ -12112,7 +12183,11 @@ mod tests {
                 registry,
             );
             let dataset = open_with_session(&uri, session).await;
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+            let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+            let uuid = index_meta.uuid;
+            let file = index_file_key(&dataset, &index_meta);
+            let store_key = ResidentColumnsKey::new(&file);
+            let file_cache = dataset.index_cache.for_index(&uuid, None);
             let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
             let state_key =
                 crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
@@ -12124,6 +12199,7 @@ mod tests {
                 ..config
             };
 
+            assert!(!resident_store_is_live(&file));
             layered_stats::snapshot_and_reset();
             let old = open_and_search(&dataset, &uuid, &query, config)
                 .await
@@ -12132,12 +12208,12 @@ mod tests {
             let loaded = ivf
                 .resident_columns_enabled()
                 .then(|| ivf.resident_columns_bytes());
+            // Other tests open IVF_RQ indexes at the same time, so what the
+            // opens load is checked on the file's store, this test's alone:
+            // `old` loaded it, and later opens reused it without loading.
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(
-                stats.resident_columns_bytes,
-                loaded.unwrap_or(0),
-                "{stats:?}"
-            );
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert_eq!(resident_store_is_live(&file), loaded.is_some());
             assert_eq!(ivf.storage.resident_columns().loaded_bytes(), loaded);
             let pool = ivf.storage.lazy_far_permits(&far).unwrap();
             let held = pool.try_acquire().unwrap();
@@ -12148,14 +12224,24 @@ mod tests {
             let reopened = open_and_search(&dataset, &uuid, &query, config)
                 .await
                 .unwrap();
+            // The open found the store gone from the cleared RAM and admitted
+            // it again.
+            assert_eq!(
+                file_cache.peek_resident_with_key(&store_key).await,
+                loaded.is_some()
+            );
             // Evicted from RAM only: the next open reads the state back.
             assert_eq!(tiered.persisted_entries(IvfStateEntryBox::TYPE_ID), 1);
             tiered.ram.clear().await;
             let read_back = open_and_search(&dataset, &uuid, &query, config)
                 .await
                 .unwrap();
+            assert_eq!(
+                file_cache.peek_resident_with_key(&store_key).await,
+                loaded.is_some()
+            );
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_bytes, 0, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
             for (label, index) in [("reopened", &reopened), ("read back", &read_back)] {
                 let storage = &lazy_index(index).storage;
                 assert_eq!(storage.resident_columns().loaded_bytes(), loaded, "{label}");
@@ -12164,20 +12250,22 @@ mod tests {
             }
             drop(held);
 
+            // The cache holds the store idle, though no index does.
             drop((old, reopened, read_back, pool));
+            assert_eq!(resident_store_is_live(&file), loaded.is_some());
             let again = open_and_search(&dataset, &uuid, &query, config)
                 .await
                 .unwrap();
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_bytes, 0, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
             let store = lazy_index(&again).storage.resident_columns();
             assert_eq!(store.loaded_bytes(), loaded);
         }
 
         /// RAM of the tiered backend the resident store lifecycle tests use:
         /// room for the lazy test index's store under `auto`, which takes at
-        /// most its entry limit, and for a query's planes, and small enough that
-        /// churn evicts idle entries quickly.
+        /// most its entry limit, whatever the origin, and for a query's planes,
+        /// and small enough that churn evicts idle entries quickly.
         const RESIDENT_TEST_RAM_BYTES: usize = 4 * 1024 * 1024;
         /// Bytes of the lazy test index's resident store: row ids and seven
         /// four-byte factors per row.
@@ -12185,20 +12273,16 @@ mod tests {
         /// Room a store's cache entry may take beyond its arrays' buffers.
         const RESIDENT_ENTRY_OVERHEAD_BYTES: u64 = 64 * 1024;
 
-        /// Whether the lazy test index opened as class high, as on S3, over
-        /// an index cache admitting entries up to `max_entry_bytes`, keeps
-        /// its small columns resident as the environment resolves it, for
-        /// the default `index` lifetime. The resident store lifecycle tests
-        /// have nothing to check when the environment keeps the columns in
-        /// the file, and check the `process` lifetime elsewhere.
-        fn resident_as_high(max_entry_bytes: Option<u64>) -> bool {
-            let class = origin_latency_setting()
-                .unwrap()
-                .unwrap_or(OriginLatencyClass::High);
+        /// Whether the lazy test index, opened over an index cache admitting
+        /// entries up to `max_entry_bytes` keeps its small columns resident as the
+        /// environment resolves it, for the default `index` lifetime. The
+        /// origin plays no part. The resident store lifecycle tests have
+        /// nothing to check when the environment keeps the columns in the
+        /// file, and check the `process` lifetime elsewhere.
+        fn keeps_resident_store(max_entry_bytes: Option<u64>) -> bool {
             let setting = resident_columns_setting().unwrap();
             let index_lifetime = resident_lifetime_setting().unwrap() == ResidentLifetime::Index;
             index_lifetime
-                && setting.resolve(class)
                 && setting.admits(
                     ResidentStoreSize {
                         bytes: LAZY_RESIDENT_BYTES,
@@ -12208,23 +12292,50 @@ mod tests {
                 )
         }
 
-        /// The layered lazy test index at `uri`, opened by a session that
-        /// declares class high over the index cache `backend`: the dataset,
-        /// the index's UUID and the key of its storage file.
+        /// Whether the lazy test index keeps its small columns resident in
+        /// an index cache over `backend`; see [`keeps_resident_store`].
+        fn keeps_resident_store_in(backend: &dyn CacheBackend) -> bool {
+            keeps_resident_store(backend.max_entry_bytes())
+        }
+
+        /// The layered lazy test index at `uri`, opened by a session over
+        /// the index cache `backend` that declares class high, as on S3, for
+        /// the lazy scan's policies (residency does not depend on the
+        /// class): the dataset, the index's UUID and the key of its storage
+        /// file.
         struct ResidentTestIndex {
             dataset: Dataset,
             uuid: Uuid,
             file: IndexFileKey,
+            open_metrics: IndexMetrics,
         }
 
         impl ResidentTestIndex {
             async fn open(uri: &str, backend: Arc<dyn CacheBackend>) -> Self {
+                Self::open_with(
+                    uri,
+                    backend,
+                    Some(OriginLatencyClass::High),
+                    ResidentColumnsSetting::Auto,
+                )
+                .await
+            }
+
+            /// [`Self::open`] by a session that declares `hint` and sets
+            /// `resident_columns` instead.
+            async fn open_with(
+                uri: &str,
+                backend: Arc<dyn CacheBackend>,
+                hint: Option<OriginLatencyClass>,
+                resident_columns: ResidentColumnsSetting,
+            ) -> Self {
                 let session = Session::with_index_cache_backend(
                     backend,
                     LAZY_METADATA_CACHE_BYTES,
                     Arc::new(ObjectStoreRegistry::default()),
                 )
-                .with_index_origin_latency(Some(OriginLatencyClass::High));
+                .with_index_origin_latency(hint)
+                .with_index_resident_columns(resident_columns);
                 let dataset = open_with_session(uri, session).await;
                 let index = dataset.load_indices().await.unwrap()[0].clone();
                 let index_dir = dataset.indice_files_dir(&index).unwrap();
@@ -12234,12 +12345,13 @@ mod tests {
                     dataset,
                     uuid: index.uuid,
                     file,
+                    open_metrics: IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
                 }
             }
 
             async fn open_index(&self) -> Arc<dyn VectorIndex> {
                 self.dataset
-                    .open_vector_index("vector", &self.uuid, &NoOpMetricsCollector)
+                    .open_vector_index("vector", &self.uuid, &self.open_metrics)
                     .await
                     .unwrap()
             }
@@ -12263,6 +12375,34 @@ mod tests {
                 self.file_cache()
                     .peek_resident_with_key(&ResidentColumnsKey::new(&self.file))
                     .await
+            }
+
+            /// The store's cache entry, held weakly so that the cache alone
+            /// keeps it: an eviction drops it, and a reload or an admission
+            /// again caches another.
+            async fn cached_store_entry(&self) -> std::sync::Weak<ResidentColumnsEntry> {
+                let entry = self
+                    .file_cache()
+                    .get_resident_with_key(&ResidentColumnsKey::new(&self.file))
+                    .await
+                    .expect("the store is cached");
+                Arc::downgrade(&entry)
+            }
+
+            /// Assert that RAM still holds `entry`, the entry
+            /// [`Self::cached_store_entry`] took: the store was never evicted
+            /// since, and so never reloaded or admitted again. Unlike the
+            /// process-wide counters, other tests cannot move this.
+            async fn assert_store_entry_kept(&self, entry: &std::sync::Weak<ResidentColumnsEntry>) {
+                let kept = entry
+                    .upgrade()
+                    .expect("the cache never dropped the store's entry");
+                let cached = self
+                    .file_cache()
+                    .get_resident_with_key(&ResidentColumnsKey::new(&self.file))
+                    .await
+                    .expect("the store is cached");
+                assert!(Arc::ptr_eq(&cached, &kept));
             }
         }
 
@@ -12289,7 +12429,7 @@ mod tests {
         async fn test_resident_store_charged_in_index_cache() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12297,25 +12437,33 @@ mod tests {
             let test = ResidentTestIndex::open(dir.as_str(), backend.clone()).await;
             let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 10, 8);
 
+            assert!(!resident_store_is_live(&test.file));
             layered_stats::snapshot_and_reset();
             let index = test.open_index().await;
             search_global(&index, &query, Arc::new(NoFilter))
                 .await
                 .unwrap();
+            // Other tests open IVF_RQ indexes at the same time, so the load is
+            // checked on the file's store, this test's alone, and the
+            // process-wide counters only bound it from below.
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
-            assert_eq!(
-                stats.resident_columns_bytes, LAZY_RESIDENT_BYTES,
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert!(stats.resident_columns_loads >= 1, "{stats:?}");
+            assert!(
+                stats.resident_columns_alloc_bytes >= LAZY_RESIDENT_BYTES,
                 "{stats:?}"
             );
-            // The store holds exactly its values.
-            let alloc = stats.resident_columns_alloc_bytes;
-            assert_eq!(alloc, LAZY_RESIDENT_BYTES, "{stats:?}");
+            let ivf = lazy_index(&index);
+            assert_eq!(
+                ivf.storage.resident_columns().loaded_bytes(),
+                Some(LAZY_RESIDENT_BYTES)
+            );
             let entry = test
                 .file_cache()
                 .get_resident_with_key(&ResidentColumnsKey::new(&test.file))
                 .await
                 .expect("the store is cached");
+            assert_eq!(entry.loaded_bytes(), Some(LAZY_RESIDENT_BYTES));
             // Measure the entry through ordinary cache admission, including
             // the key and Arc overhead, independently of the other entries.
             let accounting_cache = LanceCache::with_capacity(RESIDENT_TEST_RAM_BYTES);
@@ -12323,12 +12471,12 @@ mod tests {
                 .insert_with_key(&ResidentColumnsKey::new(&test.file), entry.clone())
                 .await;
             let charged = accounting_cache.size_bytes().await as u64;
-            assert!(charged >= alloc, "{charged} < {alloc}");
+            assert!(charged >= LAZY_RESIDENT_BYTES, "{charged}");
+            drop(accounting_cache);
             assert!(
-                charged <= alloc + RESIDENT_ENTRY_OVERHEAD_BYTES,
+                charged <= LAZY_RESIDENT_BYTES + RESIDENT_ENTRY_OVERHEAD_BYTES,
                 "{charged}"
             );
-            let ivf = lazy_index(&index);
             assert!((ivf.storage.deep_size_of() as u64) < LAZY_RESIDENT_BYTES);
             assert_eq!(charged, ivf.storage.resident_store_size().unwrap().charge);
             assert!(test.dataset.index_cache.size_bytes().await as u64 >= charged);
@@ -12347,7 +12495,7 @@ mod tests {
         async fn test_state_promotion_from_nvme_keeps_store() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12355,12 +12503,20 @@ mod tests {
             let test = ResidentTestIndex::open(dir.as_str(), backend.clone()).await;
             let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 10, 8);
 
+            assert!(!resident_store_is_live(&test.file));
             layered_stats::snapshot_and_reset();
             let expected = test.search(&query).await;
-            assert!(test.store_cached().await);
+            let entry = test.cached_store_entry().await;
+            let open_io = test.open_metrics.io_stats().unwrap();
+            let opened_bytes = open_io.snapshot().bytes_read;
             backend.evict_states_from_ram();
             backend.churn_on_next_admission(10 * RESIDENT_TEST_RAM_BYTES);
             let index = test.open_index().await;
+            assert_eq!(
+                open_io.snapshot().bytes_read,
+                opened_bytes,
+                "the cached state must reuse the live store without I/O"
+            );
             assert_eq!(
                 lazy_index(&index).storage.resident_columns().loaded_bytes(),
                 Some(LAZY_RESIDENT_BYTES),
@@ -12372,8 +12528,11 @@ mod tests {
             );
             assert_eq!(actual, expected);
             assert_eq!(backend.churned_admissions.load(Ordering::SeqCst), 1);
+            // Churn evicts the entry while the opener holds its allocation.
+            assert!(entry.upgrade().is_none());
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert!(stats.resident_columns_loads >= 1, "{stats:?}");
             assert!(stats.resident_store_evictions > 0, "{stats:?}");
             assert!(resident_store_is_live(&test.file));
             drop(index);
@@ -12388,7 +12547,7 @@ mod tests {
         async fn test_state_eviction_keeps_store() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12396,15 +12555,28 @@ mod tests {
             let test = ResidentTestIndex::open(dir.as_str(), backend.clone()).await;
             let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 100, 16);
 
+            assert!(!resident_store_is_live(&test.file));
             layered_stats::snapshot_and_reset();
             let expected = test.search(&query).await;
+            let entry = test.cached_store_entry().await;
+            let open_io = test.open_metrics.io_stats().unwrap();
+            let opened_bytes = open_io.snapshot().bytes_read;
             for _ in 0..3 {
                 backend.evict_states_from_ram();
-                assert_eq!(test.search(&query).await, expected);
+                let index = test.open_index().await;
+                assert_eq!(open_io.snapshot().bytes_read, opened_bytes);
+                let actual = search_global(&index, &query, Arc::new(NoFilter))
+                    .await
+                    .unwrap();
+                assert_eq!(result_bits(&actual), expected);
             }
+            // As in `test_state_promotion_from_nvme_keeps_store`: the store is
+            // the entry the first search cached, never evicted, reloaded or
+            // admitted again.
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
-            assert_eq!(stats.resident_store_evictions, 0, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert!(stats.resident_columns_loads >= 1, "{stats:?}");
+            test.assert_store_entry_kept(&entry).await;
         }
 
         /// Cached index state does not own resident buffers: after every query
@@ -12414,7 +12586,7 @@ mod tests {
             const CONCURRENT_QUERIES: usize = 4;
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12459,13 +12631,13 @@ mod tests {
 
         /// An idle store is an ordinary entry: another index's churn evicts
         /// it once no index of its file is live, freeing it, and the next
-        /// query that reads the file loads it once more, with the same
-        /// results.
+        /// open of the file loads it once more, before its query reads, with
+        /// the same results.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_idle_store_evicted_by_other_index_reloads_once() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12473,8 +12645,13 @@ mod tests {
             let test = ResidentTestIndex::open(dir.as_str(), backend.clone()).await;
             let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 10, 8);
 
+            // Other tests open IVF_RQ indexes at the same time, so the
+            // process-wide counters only bound the loads and the eviction
+            // from below; the file's store, this test's alone, shows them.
+            assert!(!resident_store_is_live(&test.file));
             layered_stats::snapshot_and_reset();
             let expected = test.search(&query).await;
+            assert!(test.store_cached().await);
             backend.churn_ram(10 * RESIDENT_TEST_RAM_BYTES).await;
             assert!(!test.store_cached().await);
             assert!(wait_until_store_freed(&test.file).await);
@@ -12482,13 +12659,322 @@ mod tests {
             // too, so the next query reads them from the file.
             backend.disk.lock().unwrap().clear();
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
-            assert_eq!(stats.resident_store_evictions, 1, "{stats:?}");
+            assert!(stats.resident_columns_loads >= 1, "{stats:?}");
+            assert!(stats.resident_store_evictions >= 1, "{stats:?}");
 
-            assert_eq!(test.search(&query).await, expected);
+            // The open loads the freed store again, before any read: no store
+            // of the file was live or cached for it to bind.
+            let index = test.open_index().await;
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
-            assert!(test.store_cached().await);
+            assert!(stats.resident_columns_loads >= 1, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert!(resident_store_is_live(&test.file));
+            let store = lazy_index(&index).storage.resident_columns();
+            assert_eq!(store.loaded_bytes(), Some(LAZY_RESIDENT_BYTES));
+            // The cache may refuse readmission after pressure; the index's
+            // Arc still owns the loaded store for the query.
+            let result = search_global(&index, &query, Arc::new(NoFilter))
+                .await
+                .unwrap();
+            assert_eq!(result_bits(&result), expected);
+            let stats = layered_stats::snapshot_and_reset();
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            drop(index);
+            backend.ram.clear().await;
+            assert!(wait_until_store_freed(&test.file).await);
+        }
+
+        /// The key of the storage file of the index of `dataset` with
+        /// metadata `index`, which the index's resident store is shared by.
+        fn index_file_key(dataset: &Dataset, index: &IndexMetadata) -> IndexFileKey {
+            let index_dir = dataset.indice_files_dir(index).unwrap();
+            super::super::aux_file_key(&dataset.object_store, &index_dir, &index.uuid)
+        }
+
+        /// An index loads its resident store when it opens, whatever origin
+        /// class its session declares: before any search the store of its
+        /// file, live nowhere before the open, is loaded and shared, and the
+        /// searches then load nothing, with the results of an open that keeps
+        /// no store. Other tests open IVF_RQ indexes at the same time, so
+        /// only the read loads, which no open counts, are counted exactly;
+        /// the file is this test's alone.
+        #[rstest]
+        #[case::native_no_hint(false, None)]
+        #[case::native_low(false, Some(OriginLatencyClass::Low))]
+        #[case::native_high(false, Some(OriginLatencyClass::High))]
+        #[case::layered_no_hint(true, None)]
+        #[case::layered_low(true, Some(OriginLatencyClass::Low))]
+        #[case::layered_high(true, Some(OriginLatencyClass::High))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_resident_store_loads_at_open(
+            #[case] layered: bool,
+            #[case] hint: Option<OriginLatencyClass>,
+        ) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            if resident_columns_setting().unwrap() != ResidentColumnsSetting::Auto
+                || resident_lifetime_setting().unwrap() != ResidentLifetime::Index
+            {
+                return;
+            }
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let queries = [
+                lazy_test_query(vectors.value(0), 10, 8),
+                lazy_test_query(vectors.value(777), 100, LAZY_PARTITIONS),
+            ];
+            let mut results = Vec::with_capacity(2);
+            for setting in [ResidentColumnsSetting::Auto, ResidentColumnsSetting::Off] {
+                let resident = setting == ResidentColumnsSetting::Auto;
+                let context = format!("layered={layered} hint={hint:?} {setting}");
+                let session = Session::new(
+                    LAZY_LARGE_CACHE_BYTES,
+                    LAZY_METADATA_CACHE_BYTES,
+                    Arc::new(ObjectStoreRegistry::default()),
+                )
+                .with_index_origin_latency(hint)
+                .with_index_resident_columns(setting);
+                let dataset = open_with_session(dir.as_str(), session).await;
+                let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+                let file = index_file_key(&dataset, &index_meta);
+                assert!(!resident_store_is_live(&file), "{context}");
+
+                layered_stats::snapshot_and_reset();
+                let index = dataset
+                    .open_vector_index("vector", &index_meta.uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let opened = layered_stats::snapshot_and_reset();
+                let ivf = lazy_index(&index);
+                assert_eq!(ivf.resident_columns_enabled(), resident, "{context}");
+                assert!(
+                    opened.resident_columns_loads >= u64::from(resident),
+                    "{context} {opened:?}"
+                );
+                assert_eq!(
+                    opened.resident_columns_read_loads, 0,
+                    "{context} {opened:?}"
+                );
+                let store = ivf.storage.resident_columns();
+                assert_eq!(
+                    store.loaded_bytes(),
+                    resident.then(|| ivf.resident_columns_bytes()),
+                    "{context}"
+                );
+                assert_eq!(resident_store_is_live(&file), resident, "{context}");
+
+                let mut bits = Vec::with_capacity(queries.len());
+                for query in &queries {
+                    let result = search_global(&index, query, Arc::new(NoFilter))
+                        .await
+                        .unwrap();
+                    bits.push(result_bits(&result));
+                }
+                // A search of an opened index could load a store only as a
+                // read's fallback.
+                let searched = layered_stats::snapshot_and_reset();
+                assert_eq!(
+                    searched.resident_columns_read_loads, 0,
+                    "{context} {searched:?}"
+                );
+                if resident {
+                    assert!(searched.resident_attach_calls > 0, "{context} {searched:?}");
+                }
+                results.push(bits);
+                // The next open loads a store of its own.
+                drop((index, dataset));
+                assert!(wait_until_store_freed(&file).await, "{context}");
+            }
+            assert!(!results[0][0].0.is_empty());
+            assert_eq!(results[0], results[1]);
+        }
+
+        /// The open loads the store, not prewarm: an index's prewarm loads
+        /// nothing and leaves the store and the entries cached, and a
+        /// dataset's prewarm on a cold cache loads the store through the open
+        /// it starts with, after which a query binds the prewarmed store and
+        /// loads nothing. Only the read loads are counted exactly, as in
+        /// `test_resident_store_loads_at_open`.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_resident_store_loads_at_open_not_prewarm(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            if resident_columns_setting().unwrap() != ResidentColumnsSetting::Auto
+                || entry_columns_setting().unwrap() != EntryColumns::Codes
+                || resident_lifetime_setting().unwrap() != ResidentLifetime::Index
+            {
+                return;
+            }
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let query = lazy_test_query(
+                batch["vector"].as_fixed_size_list().value(0),
+                100,
+                LAZY_PARTITIONS,
+            );
+            let session = Session::new(
+                LAZY_LARGE_CACHE_BYTES,
+                LAZY_METADATA_CACHE_BYTES,
+                Arc::new(ObjectStoreRegistry::default()),
+            );
+            let dataset = open_with_session(dir.as_str(), session).await;
+            let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+            let file = index_file_key(&dataset, &index_meta);
+            let store_key = ResidentColumnsKey::new(&file);
+            let file_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
+
+            assert!(!resident_store_is_live(&file));
+            layered_stats::snapshot_and_reset();
+            let index = dataset
+                .open_generic_index("vector", &index_meta.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let opened = layered_stats::snapshot_and_reset();
+            assert!(opened.resident_columns_loads >= 1, "{opened:?}");
+            assert_eq!(opened.resident_columns_read_loads, 0, "{opened:?}");
+            let ivf = index.as_any().downcast_ref::<IvfRq>().unwrap();
+            let bytes = ivf.resident_columns_bytes();
+            assert_eq!(ivf.storage.resident_columns().loaded_bytes(), Some(bytes));
+            index.prewarm().await.unwrap();
+            let prewarmed = layered_stats::snapshot_and_reset();
+            assert_eq!(prewarmed.resident_columns_read_loads, 0, "{prewarmed:?}");
+            assert!(file_cache.peek_resident_with_key(&store_key).await);
+            for partition in 0..LAZY_PARTITIONS {
+                if ivf.storage.partition_size(partition) == 0 {
+                    continue;
+                }
+                let cached = if layered {
+                    let key = ivf.storage.plane_key(partition, 0);
+                    ivf.index_cache.peek_resident_with_key(&key).await
+                } else {
+                    let key = PartitionCodesKey { partition };
+                    ivf.index_cache.peek_resident_with_key(&key).await
+                };
+                assert!(cached, "layered={layered} partition={partition}");
+            }
+
+            // A cold cache: no index of the file live and nothing cached.
+            drop(index);
+            dataset.index_cache.clear().await;
+            assert!(wait_until_store_freed(&file).await);
+            layered_stats::snapshot_and_reset();
+            dataset.prewarm_index(&index_meta.name).await.unwrap();
+            let prewarmed = layered_stats::snapshot_and_reset();
+            assert!(prewarmed.resident_columns_loads >= 1, "{prewarmed:?}");
+            assert_eq!(prewarmed.resident_columns_read_loads, 0, "{prewarmed:?}");
+            let cached = file_cache
+                .get_resident_with_key(&store_key)
+                .await
+                .expect("the prewarm's open loaded and cached the store");
+            assert_eq!(cached.loaded_bytes(), Some(bytes));
+
+            // The query's open binds the store the prewarm's open loaded and
+            // cached, so it has none to load.
+            let index = dataset
+                .open_vector_index("vector", &index_meta.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert_eq!(
+                lazy_index(&index).storage.resident_columns().loaded_bytes(),
+                cached.loaded_bytes()
+            );
+            let result = search_global(&index, &query, Arc::new(NoFilter))
+                .await
+                .unwrap();
+            assert!(result.num_rows() > 0);
+            let queried = layered_stats::snapshot_and_reset();
+            assert_eq!(queried.resident_columns_read_loads, 0, "{queried:?}");
+        }
+
+        /// A resident store that fails to load fails the index open, which
+        /// leaves the store neither cached nor live, and the next open loads
+        /// it, with the results of the first. The opens after the first
+        /// reconstruct the index from its cached state and the files'
+        /// cached metadata, so the store's load is their only read of the
+        /// storage file.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_resident_store_load_failure_fails_open() {
+            const INJECTED: &str = "injected resident store load failure";
+            const READS: [&str; 2] = ["get_opts", "get_ranges"];
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
+            if !keeps_resident_store_in(backend.as_ref()) {
+                return;
+            }
+            let dir = TempStrDir::default();
+            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
+            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 10, 8);
+            // Reads through the object store crate's local store, which the
+            // wrapper sees.
+            let path_prefix = if dir.as_str().starts_with('/') {
+                ""
+            } else {
+                "/"
+            };
+            let uri = format!("file-object-store://{path_prefix}{}", dir.as_str());
+            let failing = Arc::new(crate::utils::test::FailingProxyStore::new());
+            let session = Session::with_index_cache_backend(
+                backend.clone(),
+                LAZY_METADATA_CACHE_BYTES,
+                Arc::new(ObjectStoreRegistry::default()),
+            );
+            let dataset = crate::DatasetBuilder::from_uri(&uri)
+                .with_session(Arc::new(session))
+                .with_store_params(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                })
+                .load()
+                .await
+                .unwrap();
+            let index_meta = dataset.load_indices().await.unwrap()[0].clone();
+            let file = index_file_key(&dataset, &index_meta);
+            let store_key = ResidentColumnsKey::new(&file);
+            let file_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
+            let open =
+                || dataset.open_vector_index("vector", &index_meta.uuid, &NoOpMetricsCollector);
+
+            let index = open().await.unwrap();
+            let expected = result_bits(
+                &search_global(&index, &query, Arc::new(NoFilter))
+                    .await
+                    .unwrap(),
+            );
+            // RAM loses the store; the state stays on the persistent tier.
+            drop(index);
+            backend.ram.clear().await;
+            assert!(wait_until_store_freed(&file).await);
+
+            for read in READS {
+                failing.fail_when(read, INDEX_AUXILIARY_FILE_NAME, INJECTED);
+            }
+            layered_stats::snapshot_and_reset();
+            let error = open().await.unwrap_err();
+            assert!(error.to_string().contains(INJECTED), "{error}");
+            // The open bound the store, then failed to load it.
+            let failed = layered_stats::snapshot_and_reset();
+            assert!(failed.resident_columns_binds >= 1, "{failed:?}");
+            assert!(!file_cache.peek_resident_with_key(&store_key).await);
+            assert!(!resident_store_is_live(&file));
+
+            for read in READS {
+                failing.clear_fail_when(read, INDEX_AUXILIARY_FILE_NAME);
+            }
+            let index = open().await.unwrap();
+            let reopened = layered_stats::snapshot_and_reset();
+            assert!(reopened.resident_columns_loads >= 1, "{reopened:?}");
+            assert_eq!(reopened.resident_columns_read_loads, 0, "{reopened:?}");
+            let store = lazy_index(&index).storage.resident_columns();
+            assert_eq!(store.loaded_bytes(), Some(LAZY_RESIDENT_BYTES));
+            assert!(file_cache.peek_resident_with_key(&store_key).await);
+            let result = search_global(&index, &query, Arc::new(NoFilter))
+                .await
+                .unwrap();
+            assert_eq!(result_bits(&result), expected);
         }
 
         /// A state read back from the persistent tier after RAM lost both it
@@ -12499,7 +12985,7 @@ mod tests {
         async fn test_state_from_persistent_tier_binds_resident_store() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12516,14 +13002,20 @@ mod tests {
             backend.ram.clear().await;
             assert!(!test.store_cached().await);
             layered_stats::snapshot_and_reset();
+            let open_io = test.open_metrics.io_stats().unwrap();
+            let opened_bytes = open_io.snapshot().bytes_read;
             let read_back = test.open_index().await;
+            assert_eq!(open_io.snapshot().bytes_read, opened_bytes);
             let actual = search_global(&read_back, &query, Arc::new(NoFilter))
                 .await
                 .unwrap();
             assert_eq!(result_bits(&actual), expected);
+            // Other tests open IVF_RQ indexes at the same time, so the
+            // process-wide counters only bound the reuse and the admission
+            // from below; loaded bytes and unchanged load counts verify reuse.
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 0, "{stats:?}");
-            assert_eq!(stats.resident_columns_registry_reuses, 1, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert!(stats.resident_columns_registry_reuses >= 1, "{stats:?}");
             assert!(test.store_cached().await);
             assert_eq!(
                 lazy_index(&read_back)
@@ -12542,7 +13034,7 @@ mod tests {
         async fn test_resident_store_survives_frag_reuse_change() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12551,13 +13043,17 @@ mod tests {
             let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 10, 8);
             let index = test.dataset.load_indices().await.unwrap()[0].clone();
 
+            assert!(!resident_store_is_live(&test.file));
             layered_stats::snapshot_and_reset();
             let mut results = Vec::new();
+            let mut loaded_stores = Vec::new();
             for frag_reuse_uuid in [Uuid::new_v4(), Uuid::new_v4()] {
                 let context = IvfOpenContext {
                     origin_latency_hint: Some(OriginLatencyClass::High),
+                    resident_columns: ResidentColumnsSetting::Auto,
                     file_cache: Some(test.file_cache()),
                     resident_columns_handle: None,
+                    io_stats: None,
                 };
                 let opened: Arc<dyn VectorIndex> = Arc::new(
                     IvfRq::try_new(
@@ -12579,11 +13075,18 @@ mod tests {
                     .await
                     .unwrap();
                 results.push(result_bits(&result));
+                let store = lazy_index(&opened).storage.resident_columns();
+                loaded_stores.push(store.loaded_bytes());
             }
             assert_eq!(results[0], results[1]);
+            // Other tests open IVF_RQ indexes at the same time, so the
+            // process-wide counters only bound the loads and binds from
+            // below; both opens have the expected resident data.
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.resident_columns_loads, 1, "{stats:?}");
-            assert_eq!(stats.resident_columns_binds, 2, "{stats:?}");
+            assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
+            assert!(stats.resident_columns_loads >= 1, "{stats:?}");
+            assert!(stats.resident_columns_binds >= 2, "{stats:?}");
+            assert_eq!(loaded_stores, vec![Some(LAZY_RESIDENT_BYTES); 2]);
             assert!(test.store_cached().await);
         }
 
@@ -12593,7 +13096,7 @@ mod tests {
         async fn test_resident_store_freed_on_session_drop() {
             let _serial = LAZY_TEST_LOCK.lock().await;
             let backend = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
-            if !resident_as_high(backend.max_entry_bytes()) {
+            if !keeps_resident_store_in(backend.as_ref()) {
                 return;
             }
             let dir = TempStrDir::default();
@@ -12609,45 +13112,267 @@ mod tests {
 
         /// A store that exceeds the index cache's
         /// largest admissible entry stays in the file under `auto`, which
-        /// counts it, with the same results as a resident store.
+        /// counts it, whatever the origin class the session declares, with
+        /// the same results as a resident store; a session that turns the
+        /// store off counts nothing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_oversize_store_resolves_off_under_auto() {
             const SMALL_RAM_BYTES: usize = 512 * 1024;
             let _serial = LAZY_TEST_LOCK.lock().await;
-            let small = Arc::new(TieredPlaneTestBackend::new(SMALL_RAM_BYTES, false));
-            let large = Arc::new(TieredPlaneTestBackend::new(RESIDENT_TEST_RAM_BYTES, false));
+            let backend = |ram_bytes| Arc::new(TieredPlaneTestBackend::new(ram_bytes, false));
             let setting = resident_columns_setting().unwrap();
-            if setting != ResidentColumnsSetting::Auto || !resident_as_high(large.max_entry_bytes())
+            if setting != ResidentColumnsSetting::Auto
+                || !keeps_resident_store_in(backend(RESIDENT_TEST_RAM_BYTES).as_ref())
             {
                 return;
             }
+            let small = backend(SMALL_RAM_BYTES);
             assert!(LAZY_RESIDENT_BYTES > small.max_entry_bytes().unwrap());
             let dir = TempStrDir::default();
             let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
             let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 100, 16);
             let mut results = Vec::new();
-            for (backend, resident) in [(small, false), (large, true)] {
-                let test = ResidentTestIndex::open(dir.as_str(), backend).await;
+            for hint in [
+                Some(OriginLatencyClass::High),
+                Some(OriginLatencyClass::Low),
+                None,
+            ] {
+                for (ram_bytes, resident_columns) in [
+                    (SMALL_RAM_BYTES, ResidentColumnsSetting::Auto),
+                    (RESIDENT_TEST_RAM_BYTES, ResidentColumnsSetting::Auto),
+                    // A session that turns the store off sizes nothing, so
+                    // it counts nothing on the cache the store overflows.
+                    (SMALL_RAM_BYTES, ResidentColumnsSetting::Off),
+                ] {
+                    let resident = ram_bytes == RESIDENT_TEST_RAM_BYTES;
+                    let oversize = !resident && resident_columns == ResidentColumnsSetting::Auto;
+                    let context = format!("hint={hint:?} {resident_columns} ram={ram_bytes}");
+                    let test = ResidentTestIndex::open_with(
+                        dir.as_str(),
+                        backend(ram_bytes),
+                        hint,
+                        resident_columns,
+                    )
+                    .await;
+                    assert!(!resident_store_is_live(&test.file), "{context}");
+                    layered_stats::snapshot_and_reset();
+                    let index = test.open_index().await;
+                    let ivf = lazy_index(&index);
+                    assert_eq!(ivf.resident_columns_enabled(), resident, "{context}");
+                    // The open loaded the file's store, live nowhere before
+                    // it, exactly when it keeps one.
+                    assert_eq!(resident_store_is_live(&test.file), resident, "{context}");
+                    assert_eq!(
+                        ivf.storage.resident_columns().loaded_bytes(),
+                        resident.then_some(LAZY_RESIDENT_BYTES),
+                        "{context}"
+                    );
+                    let result = search_global(&index, &query, Arc::new(NoFilter))
+                        .await
+                        .unwrap();
+                    results.push(result_bits(&result));
+                    // Other tests open IVF_RQ indexes at the same time, so
+                    // the process-wide counters only bound this open's from
+                    // below; the off session is also checked through its loaded store.
+                    let stats = layered_stats::snapshot_and_reset();
+                    assert!(
+                        stats.resident_columns_oversize >= u64::from(oversize),
+                        "{context} {stats:?}"
+                    );
+                    assert!(
+                        stats.resident_columns_loads >= u64::from(resident),
+                        "{context} {stats:?}"
+                    );
+                    assert_eq!(stats.resident_columns_read_loads, 0, "{context} {stats:?}");
+                    // The next open loads a store of its own.
+                    let file = test.file.clone();
+                    drop((index, test));
+                    assert!(wait_until_store_freed(&file).await, "{context}");
+                }
+            }
+            for result in &results {
+                assert_eq!(result, &results[0]);
+            }
+        }
+
+        /// `auto` uses the ordinary entry limit on both QuickCache and Moka.
+        /// With zero capacity it keeps columns in the file; explicit `on`
+        /// still holds the store through the index. Results are identical.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_auto_residency_follows_the_cache_backend(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            if resident_columns_setting().unwrap() != ResidentColumnsSetting::Auto
+                || entry_columns_setting().unwrap() != EntryColumns::Codes
+            {
+                return;
+            }
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 100, 16);
+            let moka = |backend: lance_core::cache::MokaCacheBackend| {
+                Session::with_index_cache_backend(
+                    Arc::new(backend),
+                    LAZY_METADATA_CACHE_BYTES,
+                    Arc::new(ObjectStoreRegistry::default()),
+                )
+            };
+            let moka_with_capacity = || {
+                moka(lance_core::cache::MokaCacheBackend::with_capacity(
+                    LAZY_LARGE_CACHE_BYTES,
+                ))
+            };
+            let sessions = [
+                ("quick", Session::default(), true),
+                ("moka", moka_with_capacity(), true),
+                (
+                    "moka without capacity",
+                    moka(lance_core::cache::MokaCacheBackend::no_cache()),
+                    false,
+                ),
+                (
+                    "moka without capacity with on",
+                    moka(lance_core::cache::MokaCacheBackend::no_cache())
+                        .with_index_resident_columns(ResidentColumnsSetting::On),
+                    true,
+                ),
+            ];
+            let mut results = Vec::new();
+            for (label, session, resident) in sessions {
+                let context = format!("layered={layered} {label}");
+                let dataset = open_with_session(dir.as_str(), session).await;
+                let uuid = dataset.load_indices().await.unwrap()[0].uuid;
                 layered_stats::snapshot_and_reset();
-                let index = test.open_index().await;
-                assert_eq!(lazy_index(&index).resident_columns_enabled(), resident);
+                let index = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let opened = layered_stats::snapshot_and_reset();
+                let ivf = lazy_index(&index);
+                assert_eq!(ivf.resident_columns_enabled(), resident, "{context}");
+                let entry_columns = if resident {
+                    EntryColumns::Codes
+                } else {
+                    EntryColumns::All
+                };
+                assert_eq!(ivf.entry_columns(), entry_columns, "{context}");
+                // Other tests open IVF_RQ indexes at the same time, so the
+                // process-wide counters only bound this open's from below; the
+                // zero cases are left to the harness, whose helper runs one
+                // case per process.
+                assert_eq!(
+                    opened.resident_columns_read_loads, 0,
+                    "{context} {opened:?}"
+                );
+                // The open loaded the store before any search.
+                let loaded = ivf.storage.resident_columns().loaded_bytes();
+                let bytes = ivf.resident_columns_bytes();
+                assert_eq!(loaded, resident.then_some(bytes), "{context}");
                 let result = search_global(&index, &query, Arc::new(NoFilter))
                     .await
                     .unwrap();
                 results.push(result_bits(&result));
-                let stats = layered_stats::snapshot_and_reset();
+                // A search of an opened index could load a store only as a
+                // read's fallback.
+                let searched = layered_stats::snapshot_and_reset();
                 assert_eq!(
-                    stats.resident_columns_oversize,
-                    u64::from(!resident),
-                    "{stats:?}"
-                );
-                assert_eq!(
-                    stats.resident_columns_loads,
-                    u64::from(resident),
-                    "{stats:?}"
+                    searched.resident_columns_read_loads, 0,
+                    "{context} {searched:?}"
                 );
             }
-            assert_eq!(results[0], results[1]);
+            assert!(!results[0].0.is_empty());
+            for result in &results {
+                assert_eq!(result, &results[0]);
+            }
+        }
+
+        /// A session's residency setting reaches the IVF_RQ indexes it
+        /// opens, when they open and when they are reconstructed from the
+        /// cached state: `off` keeps the small columns in the file, with
+        /// full entries, and `auto`, the default, keeps them resident, with
+        /// code-only entries, when the store fits the cache entry limit. Results
+        /// do not depend on it. The environment's `on` or `off` overrides
+        /// every session, so the test checks the sessions only where it
+        /// sets none.
+        #[rstest]
+        #[case::native(false)]
+        #[case::layered(true)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_session_resident_columns_reach_rq_index(#[case] layered: bool) {
+            let _serial = LAZY_TEST_LOCK.lock().await;
+            if resident_columns_setting().unwrap() != ResidentColumnsSetting::Auto
+                || entry_columns_setting().unwrap() != EntryColumns::Codes
+            {
+                return;
+            }
+            let dir = TempStrDir::default();
+            let (_, batch) =
+                write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
+            let vectors = batch["vector"].as_fixed_size_list();
+            let queries = [
+                lazy_test_query(vectors.value(0), 10, 8),
+                lazy_test_query(vectors.value(777), 100, LAZY_PARTITIONS),
+            ];
+            let mut first_results = vec![None; queries.len()];
+            for (setting, resident) in [
+                (ResidentColumnsSetting::Off, false),
+                (ResidentColumnsSetting::Auto, true),
+            ] {
+                let session = Session::new(
+                    LAZY_LARGE_CACHE_BYTES,
+                    LAZY_METADATA_CACHE_BYTES,
+                    Arc::new(ObjectStoreRegistry::default()),
+                );
+                assert_eq!(
+                    session.index_resident_columns(),
+                    ResidentColumnsSetting::Auto
+                );
+                let session = session.with_index_resident_columns(setting);
+                let dataset = open_with_session(dir.as_str(), session).await;
+                let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+                let opened = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+                let state_key =
+                    crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
+                assert!(
+                    dataset.index_cache.get_with_key(&state_key).await.is_some(),
+                    "the reopen must reconstruct from the cached state"
+                );
+                let reconstructed = dataset
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                for (path, index) in [("open", &opened), ("reconstruct", &reconstructed)] {
+                    let context = format!("layered={layered} {setting} {path}");
+                    let ivf = lazy_index(index);
+                    assert_eq!(ivf.resident_columns_enabled(), resident, "{context}");
+                    let entry_columns = if resident {
+                        EntryColumns::Codes
+                    } else {
+                        EntryColumns::All
+                    };
+                    assert_eq!(ivf.entry_columns(), entry_columns, "{context}");
+                    for (position, query) in queries.iter().enumerate() {
+                        let context = format!("{context} query={position}");
+                        let result = search_global(index, query, Arc::new(NoFilter))
+                            .await
+                            .unwrap();
+                        let bits = result_bits(&result);
+                        assert!(!bits.0.is_empty(), "{context}");
+                        let first = first_results[position].get_or_insert_with(|| bits.clone());
+                        assert_eq!(&bits, first, "{context}");
+                    }
+                    let loaded = ivf.storage.resident_columns().loaded_bytes();
+                    let bytes = ivf.resident_columns_bytes();
+                    assert_eq!(loaded, resident.then_some(bytes), "{context}");
+                }
+            }
         }
 
         /// Open the index of the dataset at `uri` over a new session whose
@@ -12687,6 +13412,8 @@ mod tests {
                 .with_origin_latency_for_test(class)
                 .unwrap()
                 .with_resident_columns_for_test(resident)
+                .await
+                .unwrap()
                 .with_entry_columns_for_test(entry_columns);
             Arc::new(ivf)
         }
@@ -13911,7 +14638,12 @@ mod tests {
             .unwrap()
         }
 
-        /// [`open_rq_index`], as if the index's origin were of `class`.
+        /// [`open_rq_index`], as if the index's origin were of `class`. The
+        /// twins these tests open stand for an index on a cloud object store
+        /// that keeps its small columns resident, in a store of its own, and
+        /// a local one that reads them from the file, whatever the
+        /// environment: residency does not follow the class, so the twins
+        /// pin it.
         async fn open_with_origin_latency(
             dataset: &Dataset,
             store: Arc<ObjectStore>,
@@ -13921,6 +14653,9 @@ mod tests {
             let ivf = open_rq_index(dataset, store, index_dir)
                 .await
                 .with_origin_latency_for_test(class)
+                .unwrap()
+                .with_resident_columns_for_test(class == OriginLatencyClass::High)
+                .await
                 .unwrap();
             Arc::new(ivf)
         }
@@ -14038,12 +14773,16 @@ mod tests {
             let (cloud_store, cloud_dir) = cloud_index_files(&dataset).await;
             let cloud = open_rq_index(&dataset, cloud_store.clone(), cloud_dir).await;
             // `auto` makes the cloud store's class high unless the environment
-            // sets it; pin it high for the promotions below.
+            // sets it; pin it high for the promotions below, with a resident
+            // store as `open_with_origin_latency` gives a high twin.
             let class =
                 OriginLatencyClass::resolve(origin_latency_setting().unwrap(), &cloud_store);
             assert_eq!(cloud.origin_latency(), class);
             let cloud = cloud
                 .with_origin_latency_for_test(OriginLatencyClass::High)
+                .unwrap()
+                .with_resident_columns_for_test(true)
+                .await
                 .unwrap();
             let cloud: Arc<dyn VectorIndex> = Arc::new(cloud);
             let (local_store, local_dir) = index_files(&dataset).await;

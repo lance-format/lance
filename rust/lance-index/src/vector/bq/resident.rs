@@ -14,6 +14,7 @@
 //! (`EntryColumns::Codes`), and every read of such an entry attaches the
 //! resident rows again.
 //!
+//! An index loads the store when it opens, so that no read waits for it.
 //! The store is an entry of the index cache ([`ResidentColumnsKey`]),
 //! charged what its arrays allocate and evictable under ordinary cache
 //! pressure. Each live index holds an `Arc` to its store independently of
@@ -106,8 +107,21 @@ static RESIDENT_SLOTS: LazyLock<WeakRegistry<IndexFileKey, ResidentSlot>> =
 static PROCESS_STORES: LazyLock<Mutex<HashMap<IndexFileKey, Arc<ResidentSlot>>>> =
     LazyLock::new(Default::default);
 
+/// What starts a load of a resident store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentLoadTrigger {
+    /// An index opening on the file, which loads its store before it serves
+    /// any read.
+    Open,
+    /// A read through a storage whose store has not loaded: one built
+    /// outside an index open, such as a test's, since every index loads its
+    /// store when it opens. Counted in `resident_columns_read_loads`.
+    Read,
+}
+
 /// One index file's store, shared by every handle of the file and by its
-/// index cache entry, and loaded on first use.
+/// index cache entry, and loaded by the first index of the file to open (or,
+/// as a fallback, by the first read).
 #[derive(Default)]
 struct ResidentSlot {
     store: OnceCell<ResidentColumnStore>,
@@ -123,18 +137,20 @@ impl std::fmt::Debug for ResidentSlot {
 }
 
 impl ResidentSlot {
-    /// The store of `reader`'s file, loaded on first use. Concurrent first
-    /// callers share one load, whose I/O is added to the loading caller's
-    /// `io_stats`; a failed or dropped load leaves the store for the next
-    /// caller to load. The load runs once per store, so it is boxed rather
-    /// than inlined into every read's future.
+    /// The store of `reader`'s file, loaded by the first caller, which
+    /// `trigger` says started the load. Concurrent first callers share one
+    /// load, whose I/O is added to the loading caller's `io_stats`; a failed
+    /// or dropped load leaves the store for the next caller to load. The
+    /// load runs once per store, so it is boxed rather than inlined into
+    /// every read's future.
     async fn get_or_load(
         &self,
         reader: &FileReader,
         io_stats: Option<&IoStats>,
+        trigger: ResidentLoadTrigger,
     ) -> Result<&ResidentColumnStore> {
         self.store
-            .get_or_try_init(|| Box::pin(ResidentColumnStore::load(reader, io_stats)))
+            .get_or_try_init(|| Box::pin(ResidentColumnStore::load(reader, io_stats, trigger)))
             .await
     }
 
@@ -285,8 +301,8 @@ struct ResidentCharge {
     lifetime: ResidentLifetime,
 }
 
-/// A storage's handle on the resident columns of its file, loaded on first
-/// use. A handle bound to an index cache
+/// A storage's handle on the resident columns of its file, which the index
+/// loads when it opens. A handle bound to an index cache
 /// ([`in_index_cache`](Self::in_index_cache)) shares the store with every
 /// live handle of the file and caches it once loaded. The handle's strong
 /// reference keeps the data alive through cache eviction. A default handle
@@ -317,7 +333,7 @@ impl ResidentColumns {
     /// charged in `cache`, the index's namespace of the index cache without
     /// a fragment reuse segment. `preopen` holds the shared store through
     /// cache accesses performed while opening the index. Loaded stores are
-    /// cached now; otherwise the first read loads and caches the store.
+    /// cached now; otherwise the opening index loads and caches the store.
     /// Under [`ResidentLifetime::Process`] a separate strong reference keeps
     /// the loaded store alive until the process exits.
     pub async fn in_index_cache(
@@ -394,8 +410,9 @@ impl ResidentColumns {
         &self,
         reader: &FileReader,
         io_stats: Option<&IoStats>,
+        trigger: ResidentLoadTrigger,
     ) -> Result<&ResidentColumnStore> {
-        let store = self.slot.get_or_load(reader, io_stats).await?;
+        let store = self.slot.get_or_load(reader, io_stats, trigger).await?;
         self.cache_loaded().await;
         Ok(store)
     }
@@ -423,7 +440,11 @@ impl std::fmt::Debug for ResidentColumnStore {
 }
 
 impl ResidentColumnStore {
-    async fn load(reader: &FileReader, io_stats: Option<&IoStats>) -> Result<Self> {
+    async fn load(
+        reader: &FileReader,
+        io_stats: Option<&IoStats>,
+        trigger: ResidentLoadTrigger,
+    ) -> Result<Self> {
         let started = Instant::now();
         let schema = Schema::from(reader.schema().as_ref());
         let fields: Vec<(&Field, usize)> = schema
@@ -489,6 +510,9 @@ impl ResidentColumnStore {
         let loaded = load_stats.snapshot();
         let stats = layered_stats::counters();
         stats.resident_columns_loads.incr();
+        if trigger == ResidentLoadTrigger::Read {
+            stats.resident_columns_read_loads.incr();
+        }
         stats.resident_columns_bytes.add(bytes);
         stats.resident_columns_alloc_bytes.add(alloc_bytes);
         stats.resident_columns_load_requests.add(loaded.iops);
@@ -707,6 +731,13 @@ mod tests {
     use arrow_array::{Float32Array, cast::AsArray, types::Float32Type};
     use arrow_schema::DataType;
     use lance_core::cache::QuickCacheBackend;
+    use lance_encoding::decoder::DecoderPlugins;
+    use lance_file::reader::FileReaderOptions;
+    use lance_file::version::LanceFileVersion;
+    use lance_file::writer::FileWriterOptions;
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
 
     use crate::vector::bq::layered::{HIGH_ADD_FACTORS_COLUMN, HIGH_SCALE_FACTORS_COLUMN};
     use crate::vector::bq::transform::{
@@ -1110,5 +1141,62 @@ mod tests {
             assert_eq!(copied.as_ref(), read.as_ref(), "{rows:?}");
             assert_eq!(copied.get_buffer_memory_size(), rows.len() * 4, "{rows:?}");
         }
+    }
+
+    /// A reader of a file of `rows` rows of one four-byte column the store
+    /// keeps, in memory.
+    async fn factor_file(rows: usize) -> FileReader {
+        let values: Vec<f32> = (0..rows).map(|row| row as f32).collect();
+        let factors: ArrayRef = Arc::new(Float32Array::from(values));
+        let batch = RecordBatch::try_from_iter([("factor", factors)]).unwrap();
+        let store = Arc::new(ObjectStore::memory());
+        let path = object_store::path::Path::from("resident/factors.lance");
+        let mut writer = lance_file::versions::create_writer(
+            LanceFileVersion::default().resolve(),
+            store.create(&path).await.unwrap(),
+            lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+        let scheduler = ScanScheduler::new(store, SchedulerConfig::default_for_testing());
+        FileReader::try_open(
+            scheduler
+                .open_file(&path, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A read that finds the store not loaded loads it, as a fallback for
+    /// a storage no index open loaded it for, and counts that load in
+    /// `resident_columns_read_loads` too. The counters are process-wide, so
+    /// only their growth is bounded here; the index tests check that opens
+    /// count no read loads.
+    #[tokio::test]
+    async fn read_triggered_load_counts_a_read_load() {
+        const ROWS: usize = 100;
+        let reader = factor_file(ROWS).await;
+        let counters = layered_stats::counters();
+        let (loads, read_loads) = (
+            counters.resident_columns_loads.get(),
+            counters.resident_columns_read_loads.get(),
+        );
+        let handle = ResidentColumns::default();
+        let store = handle
+            .get_or_load(&reader, None, ResidentLoadTrigger::Read)
+            .await
+            .unwrap();
+        assert_eq!(store.num_rows(), ROWS as u64);
+        assert_eq!(handle.loaded_bytes(), Some(4 * ROWS as u64));
+        assert!(counters.resident_columns_loads.get() > loads);
+        assert!(counters.resident_columns_read_loads.get() > read_loads);
     }
 }
