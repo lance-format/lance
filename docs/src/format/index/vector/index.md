@@ -221,6 +221,10 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
     `__ex_codes`, sized `ceil(dimension * (num_bits - 1) / 8)`. Readers still
     accept that column and repack it at load time; writers no longer emit it.
 
+These are the columns of the default column layout. The
+[plane-row layout](#rabitq-plane-row-layout) stores the same fields packed into
+fixed-width row columns.
+
 #### Arrow Schema Metadata
 
 The auxiliary file also contains metadata in its Arrow schema metadata for vector storage configuration.
@@ -282,9 +286,10 @@ For **RabitQ (RQ)**:
 | --------------------- | ---- | ---------------------------------------------------- |
 | `rotate_mat_position` | u32  | Position of the rotation matrix in the global buffer |
 | `num_bits`            | u8   | Number of bits per dimension, in the range 1..=9     |
-| `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
+| `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code. Older matrix-rotation indexes may store 0; their rotated dimension is then the rotation matrix's dimension. |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
 | `query_estimator`     | string | Distance estimator layout: `residual_query` or `raw_query`. Missing values are read as `residual_query` for compatibility with released 1-bit IVF_RQ indexes. |
+| `row_layout`          | string | Row layout of the internal columns: `columns` or `plane_rows`. Missing values are read as `columns`. See [RaBitQ plane-row layout](#rabitq-plane-row-layout). |
 
 #### Lance File Global Buffer
 
@@ -434,3 +439,189 @@ if storage_metadata:
         # Parse the tensor protobuf
         # codebook_tensor = parse_tensor_protobuf(codebook_buffer)
 ```
+
+### Layered RaBitQ prefix planes
+
+Layered storage is opt-in (`layered: true` in `lance:rabit`) and requires a
+reader supporting the layered layout. The default, including missing `layered`,
+is the existing single-plane layout. A layered index supports exactly these
+fixed widths: 5 bits stores sign + 2 + 2, 7 bits stores sign + 4 + 2, and 9 bits
+stores sign + 4 + 4. Widths are derived from `num_bits`; no list of planes is
+persisted. Older readers reject the shorter `__blocked_ex_codes` column with a
+byte-width mismatch instead of decoding it as the full ex code.
+
+The auxiliary file retains its IVF partition row ranges and rotation metadata.
+For a rotated dimension `d`, let `p = 64 * ceil(d / 64)` and `(h, l)` be the fixed
+high and low widths. Each partition has this schema:
+
+```python
+pa.schema([
+    pa.field("_rowid", pa.uint64()),
+    pa.field("_rabit_codes", pa.list_(pa.uint8(), (d + 7) // 8)),
+    pa.field("__add_factors", pa.float32()),
+    pa.field("__scale_factors", pa.float32()),
+    pa.field("__error_factors", pa.float32()),
+    pa.field("__rq_bounds_hi", pa.list_(pa.float32(), 3)),
+    pa.field("__rq_bounds_full", pa.list_(pa.float32(), 3)),
+    pa.field("__blocked_ex_codes", pa.list_(pa.uint8(), p * h // 8)),
+    pa.field("__add_factors_ex_hi", pa.float32()),
+    pa.field("__scale_factors_ex_hi", pa.float32()),
+    pa.field("__blocked_ex_codes_lo", pa.list_(pa.uint8(), p * l // 8)),
+    pa.field("__add_factors_ex", pa.float32()),
+    pa.field("__scale_factors_ex", pa.float32()),
+])
+```
+
+All fields retain the existing nullable schema convention. Null codes or factors
+are not valid encoded rows.
+
+Column order is resolved by name. Each ex plane uses its width's existing blocked
+packing, including zero padding to a 64-dimensional boundary. The sign plane
+retains its existing partition-local transposition. Selecting sign rows requires
+undoing that transposition before gathering rows and repacking the result.
+
+For each rotated residual, the encoder chooses the rescale factor `t` and
+quantizes at `(h+l)` ex bits exactly as the native index does. Splitting that
+code must preserve the full code values, binary factors and full factors.
+The high code is `code >> l`; the low code is
+`code & (2^l-1)`. Negative components use the existing complemented encoding
+`!code & (2^(h+l)-1)`, so truncation also preserves their prefix. The high code
+is the code obtained at `h` bits with scale `t / 2^l`. The scale is build-time
+state and is not stored; a change to the search policy does not change decoding.
+
+Full-precision queries use the native binary error factors and query error for
+pruning, including the native approximation-mode policy. Storage layout must
+not change that policy. High and full levels each store their own raw-query add/scale factors, computed with their own
+code bias and quantized residual/centroid inner products. Full scoring combines
+codes before accumulation as `2^l * high + low`; high scoring omits the low code
+and uses the high factor pair. Reusing full-level factors for a prefix is invalid.
+
+The two `__rq_bounds_*` columns belong to the sign-plane projection. For a
+level with `b` ex bits, let `s_j` be its sign bit, `e_j` its ex code,
+`w_j = scale_level * (2^b*s_j + e_j - (2^b - 1/2))`, and
+`w_sign_j = scale_sign * (s_j - 1/2)`. Each row stores three nonnegative
+float32 values, rounded upwards: `||w-w_sign||_2`,
+`|add_level-add_sign|`, and `|scale_sign| + 2^b*|scale_level|`.
+Nonfinite or negative bound hints disable pruning for the affected row; the
+code and factor columns still determine its score.
+
+For a rotated query `q` and the metric's add-factor multiplier `a`, the
+real-arithmetic score difference is bounded by
+`||w-w_sign||_2 * ||q||_2 + |a| * |add_level-add_sign|`.
+Readers must additionally allow for their sign-LUT quantization and floating
+point reconstruction error, using the third coefficient. Accurate mode uses
+the conservative norm bound. Normal mode applies the native RaBitQ angular
+confidence policy to the norm term, multiplying it by
+`min(1, 1.9 / sqrt(d - 1))` for `d > 1`. This statistical bound can lose
+candidates and must be evaluated together with recall; the add-factor and
+arithmetic margins are not multiplied by the angular confidence factor. When
+the rotated centroid is available, Normal L2/cosine mode may use the equivalent
+centered query `q-c`: the encoder's add-factor difference cancels the centroid dot of
+`w-w_sign`, with a separate floating-point margin for that cancellation.
+Dot and Accurate mode retain the generic norm-plus-add-factor bound. A reader skips a row when its chosen
+lower bound cannot beat the current top-k threshold or falls above the
+query's upper distance bound. A high-prefix query uses its estimator-difference
+bound instead of the native `__error_factors`, which bounds error relative to
+the original vector. Full queries retain native pruning and do not use
+`__rq_bounds_full`; that column does not determine full-query semantics.
+Neither policy reads original vectors or requires a fixed candidate expansion
+factor.
+
+Appending, merging, splitting, reassigning and remapping an index must preserve
+the layout flag and every plane's factors. All segments merged into a single
+index must agree on the layout and shared rotation. A missing required plane,
+factor column, or mismatched plane byte width is an invalid index.
+
+### RaBitQ plane-row layout
+
+An IVF_RQ auxiliary file stores its internal columns in one of two row layouts.
+The layout is recorded as `row_layout` in the RabitQ storage metadata and in
+`VectorIndexDetails.RabitQuantization`:
+
+- `columns` (`COLUMNS`), the default, also when the value is missing: one column
+  per field, as described in [RQ](#rq) and
+  [Layered RaBitQ prefix planes](#layered-rabitq-prefix-planes).
+- `plane_rows` (`PLANE_ROWS`): one fixed-width row column per plane. A plane of a
+  partition, or a run of its rows, is then one contiguous byte range instead of
+  one range per field.
+
+Both layouts hold the same values: the same rows in the same order, the same
+partition offsets and lengths, and the same rotation and global buffers. A reader
+unpacks plane rows into the column layout's fields, so decoding, scoring and
+pruning do not depend on the layout.
+
+Each packed column has type `list<uint8>[stride]`. Its value at a row is the
+concatenation, in the order listed below and without padding, of the values the
+column layout stores in the packed fields at that row. Here `d` is the rotated
+dimension (`code_dim`, or the rotation matrix's dimension when `code_dim` is 0;
+see [RQ](#rq)), `p = 64 * ceil(d / 64)`, `h` and `l` are the layered high and
+low widths, and `f` is 3 when the index stores `__error_factors` and 2 otherwise.
+
+| Packed column      | Index   | Packed fields, in order                                                                                                               | Stride in bytes                                                               |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `__rq_rows`        | native  | `_rowid`, `_rabit_codes`, `__add_factors`, `__scale_factors`, then `__error_factors`, `__blocked_ex_codes`, `__add_factors_ex` and `__scale_factors_ex` when present | `8 + ceil(d / 8) + 4 * f`, plus `p * (num_bits - 1) / 8 + 8` when `num_bits > 1` |
+| `__rq_sign_rows`   | layered | `_rowid`, `_rabit_codes`, `__add_factors`, `__scale_factors`, `__error_factors`                                                       | `20 + ceil(d / 8)`                                                            |
+| `__rq_bounds_rows` | layered | `__rq_bounds_hi`, `__rq_bounds_full`                                                                                                  | `24`                                                                          |
+| `__rq_high_rows`   | layered | `__blocked_ex_codes`, `__add_factors_ex_hi`, `__scale_factors_ex_hi`                                                                  | `p * h / 8 + 8`                                                               |
+| `__rq_low_rows`    | layered | `__blocked_ex_codes_lo`, `__add_factors_ex`, `__scale_factors_ex`                                                                     | `p * l / 8 + 8`                                                               |
+
+Fields are encoded as follows:
+
+- `uint64` and `float32` values: 8 and 4 bytes, little-endian.
+- `list<uint8>[n]` values: their `n` bytes.
+- `list<float32>[3]` values: three little-endian float32 values, 12 bytes.
+
+Code bytes are copied as the column layout stores them. Ex codes keep their
+blocked packing, and sign codes keep their partition-local transposition: when
+`packed` is true, the `_rabit_codes` bytes of a row are not that row's own code,
+and selecting sign rows still requires undoing the transposition first. The
+legacy `__ex_codes` column has no plane-row form.
+
+For example, with `d = 1024` a layered 7-bit index has strides of 148 (sign),
+24 (bounds), 520 (high) and 264 (low) bytes, and a native 7-bit index with
+raw-query factors has a 924-byte `__rq_rows`.
+
+A layered plane-row file starts with `__rq_sign_rows`, `__rq_bounds_rows`,
+`__rq_high_rows` and `__rq_low_rows`, in that order; a native one starts with
+`__rq_rows`. The packed columns replace the fields they pack: a plane-row file
+has none of the column layout's internal columns, and every packed column its
+index needs is present with exactly the stride above. The packed columns and
+their `uint8` items are non-nullable. A Lance file schema does not keep a list
+item's nullability, so readers reject null items rather than rely on the schema
+to declare them non-nullable. Carried columns are not packed; they follow
+the packed columns unchanged and are still discovered by exclusion. A reader
+treats a schema that does not match `row_layout` as an invalid index.
+
+On Lance file version 2.1 and later, writers request the full-zip structural
+encoding for each packed column (field metadata
+`lance-encoding:structural-encoding` set to `fullzip`) and apply no general
+compression to it. A fixed-width value without validity is then a flat buffer,
+so a page holds `rows * stride` bytes and any run of rows is one byte range.
+Without that request, rows narrower than the 256-byte full-zip cutoff, such as
+sign and bounds rows, would be written as mini-blocks, which are read whole.
+Writers write one partition per write batch, in partition order. Page boundaries
+need not align with partitions, so a reader must handle a partition whose rows
+span pages.
+
+A plane-row IVF_RQ segment is committed with `index_version` 3, while a
+column-layout segment keeps version 2, so a reader that supports only version 2
+leaves plane-row indexes out of its usable indexes instead of misreading them.
+Every writer derives the version from the layout it writes. Appending,
+optimizing and remapping keep the layout of the index they extend or rewrite,
+and its version: a delta segment of a plane-row index is written in plane rows
+with version 3, and a column-layout index never becomes version 3. The rule
+covers native and layered indexes alike. All segments merged into one segment
+must share a layout, both the row layout and whether the index is layered;
+merging segments of different layouts is an error. In the reference
+implementation, optimize reads the segments it merges or rewrites through the
+index and writes in their layout, so plane-row segments merge into a plane-row
+segment with version 3. Its distributed merger, which merges segments or partial
+auxiliary files built apart, does not handle packed columns yet and rejects any
+plane-row input, a single one included, as not supported.
+
+Because both layouts hold the same values, an index can be converted between
+them without re-encoding. A conversion rewrites only the auxiliary file's
+internal columns and its `row_layout`, and commits the result as a new segment
+with the matching version. The index file, the partition offsets and lengths,
+the global buffers and their positions, and every other auxiliary-file metadata
+value stay unchanged.
