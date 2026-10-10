@@ -78,6 +78,11 @@ impl NullableRowAddrSet {
         self.selected.clone() - self.nulls.clone()
     }
 
+    /// Split into the raw `selected` and `nulls` sets, the inverse of [`Self::new`].
+    pub fn into_parts(self) -> (RowAddrTreeMap, RowAddrTreeMap) {
+        (self.selected, self.nulls)
+    }
+
     pub fn union_all(selections: &[Self]) -> Self {
         let selected = RowAddrTreeMap::union_all(
             &selections
