@@ -1290,21 +1290,36 @@ impl ZoneMapIndexBuilder {
     }
 }
 
+/// Per-zone accumulator behind [`ZoneMapProcessor`].
+#[derive(Debug)]
+enum ZoneStatsAccumulator {
+    /// min, max, null_count and nan_count for scalar types.
+    Full(StatisticsAccumulator),
+    /// Parent-level null count only. Nested bounds are never consulted, so the
+    /// child values are not read at all.
+    NullOnly { null_count: u64 },
+}
+
 /// Index-specific processor that computes zone statistics while the trainer
 /// handles chunking and fragment boundaries.
 ///
 /// For non-nested types, tracks min, max, null_count, and nan_count.
-/// For nested types (List, FixedSizeList, Struct, Map, etc.), tracks only
-/// null_count; min and max are stored as typed null values.
+/// For nested types (List, FixedSizeList, Struct, Map, etc.), tracks only the
+/// parent-level null_count without inspecting child values; min and max are
+/// stored as typed null values.
 #[derive(Debug)]
 struct ZoneMapProcessor {
     data_type: DataType,
-    statistics: StatisticsAccumulator,
+    statistics: ZoneStatsAccumulator,
 }
 
 impl ZoneMapProcessor {
     fn new(data_type: DataType) -> Result<Self> {
-        let statistics = StatisticsAccumulator::new(&data_type);
+        let statistics = if data_type.is_nested() {
+            ZoneStatsAccumulator::NullOnly { null_count: 0 }
+        } else {
+            ZoneStatsAccumulator::Full(StatisticsAccumulator::new(&data_type))
+        };
         Ok(Self {
             data_type,
             statistics,
@@ -1360,24 +1375,36 @@ impl ZoneProcessor for ZoneMapProcessor {
     type ZoneStatistics = ZoneMapStatistics;
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
-        self.statistics.update(array)?;
+        match &mut self.statistics {
+            ZoneStatsAccumulator::Full(statistics) => statistics.update(array)?,
+            ZoneStatsAccumulator::NullOnly { null_count } => {
+                if array.data_type() != &self.data_type {
+                    return Err(Error::invalid_input(format!(
+                        "Type mismatch: expected {:?}, got {:?}",
+                        self.data_type,
+                        array.data_type()
+                    )));
+                }
+                *null_count += array.null_count() as u64;
+            }
+        }
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
-        let statistics = self.statistics.statistics();
+        let statistics = match &self.statistics {
+            ZoneStatsAccumulator::Full(statistics) => statistics.statistics(),
+            ZoneStatsAccumulator::NullOnly { null_count } => {
+                return Ok(ZoneMapStatistics {
+                    min: ScalarValue::try_new_null(&self.data_type)?,
+                    max: ScalarValue::try_new_null(&self.data_type)?,
+                    null_count: Self::stat_count_to_u32("null_count", *null_count)?,
+                    nan_count: 0,
+                    bound,
+                });
+            }
+        };
         let null_count = Self::stat_count_to_u32("null_count", statistics.null_count)?;
-
-        // For nested types, only null_count is meaningful; store null min/max.
-        if self.data_type.is_nested() {
-            return Ok(ZoneMapStatistics {
-                min: ScalarValue::try_new_null(&self.data_type)?,
-                max: ScalarValue::try_new_null(&self.data_type)?,
-                null_count,
-                nan_count: 0,
-                bound,
-            });
-        }
 
         let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
         Ok(ZoneMapStatistics {
@@ -1397,7 +1424,10 @@ impl ZoneProcessor for ZoneMapProcessor {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.statistics.reset();
+        match &mut self.statistics {
+            ZoneStatsAccumulator::Full(statistics) => statistics.reset(),
+            ZoneStatsAccumulator::NullOnly { null_count } => *null_count = 0,
+        }
         Ok(())
     }
 }
@@ -2047,14 +2077,17 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
 
+    use crate::scalar::zoned::ZoneProcessor;
     use crate::scalar::{
         RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
             ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
-            merge_zonemap_indices, remap_zone,
+            ZoneMapProcessor, ZoneMapSeedWriter, merge_zonemap_indices, remap_zone,
         },
     };
+    use arrow_array::Int32Array;
+    use lance_core::Error;
 
     // Add missing imports for the tests
     use crate::Index; // Import Index trait to access calculate_included_frags
@@ -4166,8 +4199,6 @@ mod tests {
     #[test]
     fn test_zone_map_seed_writer_null_runs_match_positions() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
-        use arrow_array::{ArrayRef, Int32Array};
 
         // Validity patterns: scattered, a long run, leading and trailing nulls.
         let values: Vec<Option<i32>> = (0..1000)
@@ -4211,8 +4242,6 @@ mod tests {
     #[tokio::test]
     async fn test_zone_map_seed_writer_round_trip() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
-        use arrow_array::{ArrayRef, Int32Array};
         use datafusion_common::ScalarValue;
 
         let rows_per_zone = 4u64;
@@ -4275,8 +4304,6 @@ mod tests {
     #[tokio::test]
     async fn test_zone_map_seed_writer_spanning_batches() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
-        use arrow_array::{ArrayRef, Int32Array};
         use datafusion_common::ScalarValue;
 
         let rows_per_zone = 5u64;
@@ -4313,7 +4340,6 @@ mod tests {
     #[tokio::test]
     async fn test_zone_map_seed_writer_empty() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
 
         let mut writer = ZoneMapSeedWriter::new("col", 8, DataType::Int32).unwrap();
         let result = writer.finish().unwrap();
@@ -4326,7 +4352,6 @@ mod tests {
     #[tokio::test]
     async fn test_seed_null_bitmap_round_trip() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
         use arrow_array::Int32Array;
         use lance_select::RowSetOps;
 
@@ -5143,5 +5168,265 @@ mod tests {
         let mut exact_nulls = RowAddrTreeMap::new();
         exact_nulls.insert(0); // only row 0 is null
         assert_eq!(result, SearchResult::exact(exact_nulls));
+    }
+    /// Builds a `List<Int32>` with one parent-null row, an empty list, a list
+    /// containing a null child and a plain list: exactly one null row.
+    fn nested_list_fixture() -> ArrayRef {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_null();
+        builder.append(true);
+        builder.values().append_null();
+        builder.values().append_value(1);
+        builder.append(true);
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+        Arc::new(builder.finish())
+    }
+
+    fn zone_bound(length: usize) -> ZoneBound {
+        ZoneBound {
+            fragment_id: 0,
+            start: 0,
+            length,
+        }
+    }
+
+    fn process_one_zone(array: &ArrayRef) -> ZoneMapStatistics {
+        let mut processor = ZoneMapProcessor::new(array.data_type().clone()).unwrap();
+        processor.process_chunk(array).unwrap();
+        processor.finish_zone(zone_bound(array.len())).unwrap()
+    }
+
+    /// Nested zone statistics count parent-level nulls only: empty lists,
+    /// null children and NaN children leave null_count and nan_count alone.
+    #[test]
+    fn test_nested_zone_stats_count_parent_nulls_only() {
+        use arrow::buffer::NullBuffer;
+        use arrow_array::StructArray;
+        use arrow_array::builder::{
+            FixedSizeListBuilder, Float32Builder, Int32Builder, LargeListBuilder, MapBuilder,
+            StringBuilder,
+        };
+
+        let mut cases: Vec<(&str, ArrayRef)> = vec![("list", nested_list_fixture())];
+
+        let mut large = LargeListBuilder::new(Int32Builder::new());
+        large.append_null();
+        large.append(true);
+        large.values().append_null();
+        large.values().append_value(1);
+        large.append(true);
+        large.values().append_value(2);
+        large.append(true);
+        cases.push(("large_list", Arc::new(large.finish())));
+
+        // [null, [NaN, 1.0], [null, null]]
+        let mut fsl = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        fsl.values().append_null();
+        fsl.values().append_null();
+        fsl.append(false);
+        fsl.values().append_value(f32::NAN);
+        fsl.values().append_value(1.0);
+        fsl.append(true);
+        fsl.values().append_null();
+        fsl.values().append_null();
+        fsl.append(true);
+        cases.push(("fixed_size_list", Arc::new(fsl.finish())));
+
+        // Row 0 is a null struct, row 1 is a valid struct whose field is null.
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let x: ArrayRef = Arc::new(Int32Array::from(vec![None, None, Some(5)]));
+        let strukt = StructArray::try_new(
+            vec![x_field].into(),
+            vec![x],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .unwrap();
+        cases.push(("struct", Arc::new(strukt)));
+
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.append(false).unwrap();
+        map.keys().append_value("k");
+        map.values().append_null();
+        map.append(true).unwrap();
+        map.append(true).unwrap();
+        cases.push(("map", Arc::new(map.finish())));
+
+        for (name, array) in cases {
+            assert!(array.data_type().is_nested(), "{name}");
+            let stats = process_one_zone(&array);
+            assert_eq!(stats.null_count, 1, "{name}: only the parent null counts");
+            assert_eq!(stats.nan_count, 0, "{name}: nested NaN is not tracked");
+            assert!(stats.min.is_null(), "{name}: nested min is a typed null");
+            assert!(stats.max.is_null(), "{name}: nested max is a typed null");
+            assert_eq!(stats.min.data_type(), *array.data_type(), "{name}");
+            assert_eq!(stats.bound.length, array.len(), "{name}");
+        }
+
+        // The count accumulates across chunks and is cleared by reset.
+        let list = nested_list_fixture();
+        let mut processor = ZoneMapProcessor::new(list.data_type().clone()).unwrap();
+        processor.process_chunk(&list).unwrap();
+        processor.process_chunk(&list.slice(0, 2)).unwrap();
+        assert_eq!(processor.finish_zone(zone_bound(6)).unwrap().null_count, 2);
+        processor.reset().unwrap();
+        processor.process_chunk(&list.slice(1, 3)).unwrap();
+        assert_eq!(processor.finish_zone(zone_bound(3)).unwrap().null_count, 0);
+    }
+
+    /// The null-only path keeps the accumulator's type guard.
+    #[test]
+    fn test_nested_zone_stats_reject_type_mismatch() {
+        use crate::scalar::seed::IndexSeedWriter;
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+
+        let list_i32 = nested_list_fixture();
+        let mut wide = ListBuilder::new(Int64Builder::new());
+        wide.values().append_value(1);
+        wide.append(true);
+        let list_i64: ArrayRef = Arc::new(wide.finish());
+        let plain: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+
+        let mut processor = ZoneMapProcessor::new(list_i32.data_type().clone()).unwrap();
+        for wrong in [&list_i64, &plain] {
+            let err = processor.process_chunk(wrong).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "unexpected error: {err:?}"
+            );
+            assert!(err.to_string().contains("Type mismatch"), "{err}");
+        }
+        // A rejected chunk leaves no trace.
+        processor.process_chunk(&list_i32).unwrap();
+        assert_eq!(processor.finish_zone(zone_bound(4)).unwrap().null_count, 1);
+
+        let mut writer = ZoneMapSeedWriter::new("c", 4, list_i32.data_type().clone()).unwrap();
+        let err = writer.observe_batch(&plain).unwrap_err();
+        assert!(err.to_string().contains("Type mismatch"), "{err}");
+    }
+
+    /// Seeds for a nested column carry parent-level null counts per zone and
+    /// exact parent-null positions, regardless of how the rows are batched.
+    #[test]
+    fn test_nested_seed_writer_null_only_round_trip() {
+        use crate::scalar::seed::IndexSeedWriter;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        // Row shapes: N = null row, E = empty list, C = list with a null child, V = values.
+        let shapes = ['N', 'E', 'C', 'V', 'N', 'N', 'N', 'V', 'E', 'C', 'N'];
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for (i, shape) in shapes.iter().enumerate() {
+            match shape {
+                'N' => builder.append_null(),
+                'E' => builder.append(true),
+                'C' => {
+                    builder.values().append_null();
+                    builder.values().append_value(i as i32);
+                    builder.append(true);
+                }
+                _ => {
+                    builder.values().append_value(i as i32);
+                    builder.values().append_value(i as i32 + 1);
+                    builder.append(true);
+                }
+            }
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let expected_nulls: RoaringBitmap = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == 'N')
+            .map(|(i, _)| i as u32)
+            .collect();
+
+        let rows_per_zone = 4;
+        let mut whole =
+            ZoneMapSeedWriter::new("c", rows_per_zone, array.data_type().clone()).unwrap();
+        whole.observe_batch(&array).unwrap();
+        let mut sliced =
+            ZoneMapSeedWriter::new("c", rows_per_zone, array.data_type().clone()).unwrap();
+        for (start, len) in [(0, 3), (3, 2), (5, 6)] {
+            sliced.observe_batch(&array.slice(start, len)).unwrap();
+        }
+        let whole_bytes = whole.finish().unwrap().unwrap();
+        let sliced_bytes = sliced.finish().unwrap().unwrap();
+        assert_eq!(
+            whole_bytes, sliced_bytes,
+            "batching must not change the seed"
+        );
+
+        let (zones, bitmap) =
+            ZoneMapSeedWriter::deserialize_seed(7, &whole_bytes, rows_per_zone).unwrap();
+        assert_eq!(bitmap, Some(expected_nulls));
+        let lengths: Vec<usize> = zones.iter().map(|z| z.bound.length).collect();
+        assert_eq!(lengths, vec![4, 4, 3]);
+        let null_counts: Vec<u32> = zones.iter().map(|z| z.null_count).collect();
+        assert_eq!(null_counts, vec![1, 3, 1]);
+        for zone in &zones {
+            assert_eq!(zone.bound.fragment_id, 7);
+            assert_eq!(zone.nan_count, 0);
+            assert!(zone.min.is_null() && zone.max.is_null());
+            assert_eq!(zone.min.data_type(), *array.data_type());
+        }
+    }
+
+    /// Training on a list column ignores empty lists and null children when
+    /// deciding which rows are null.
+    #[tokio::test]
+    async fn test_list_zonemap_training_ignores_child_nulls() {
+        let list_arr = nested_list_fixture();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, list_arr.data_type().clone(), true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let row_addr: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..4));
+        let batch = RecordBatch::try_new(schema.clone(), vec![list_arr, row_addr]).unwrap();
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(std::future::ready(Ok(batch))),
+        ));
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(10)),
+        )
+        .await
+        .unwrap();
+
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+        assert_eq!(index.zones.len(), 1);
+        assert_eq!(index.zones[0].null_count, 1, "only the null list row");
+        assert_eq!(index.zones[0].nan_count, 0);
+        assert!(index.zones[0].min.is_null() && index.zones[0].max.is_null());
+
+        let mut exact_nulls = RowAddrTreeMap::new();
+        exact_nulls.insert(0);
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(result, SearchResult::exact(exact_nulls));
+
+        // Bounds are unknown, so value predicates stay conservative.
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &SargableQuery::Equals(SV::Int32(Some(99)))
+                )
+                .unwrap()
+        );
+        assert_eq!(index.value_range(), None);
     }
 }
