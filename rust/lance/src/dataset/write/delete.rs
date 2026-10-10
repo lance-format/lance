@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
     dataset::transaction::{Operation, Transaction},
-    dataset::utils::make_rowid_capture_stream,
+    dataset::utils::{RowCapture, make_row_capture_stream},
 };
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
@@ -269,7 +268,10 @@ impl RetryExecutor for DeleteJob {
     async fn execute_impl(&self) -> Result<Self::Data> {
         // Create a single scanner for the entire dataset
         let mut scanner = self.dataset.scan();
-        scanner.with_row_id().project(&[ROW_ID])?;
+        // The capture accumulates addresses, so it needs no row id index to
+        // resolve them. They can arrive in any order: an index-served predicate
+        // walks the rows the index's way, not the fragments'.
+        scanner.with_row_address().project(&[ROW_ADDR])?;
         match &self.filter {
             ExprFilter::Sql(s) => {
                 scanner.filter(s)?;
@@ -309,24 +311,18 @@ impl RetryExecutor for DeleteJob {
                 } else {
                     // Regular predicate - scan and collect row addresses to delete
                     let stream = scanner.try_into_stream().await?.into();
-                    let (stream, row_id_rx) = make_rowid_capture_stream(
-                        stream,
-                        self.dataset.manifest.uses_stable_row_ids(),
-                    )?;
+                    let (stream, row_addr_rx) =
+                        make_row_capture_stream(stream, RowCapture::RowAddr)?;
 
-                    // Process the stream to capture row addresses
-                    // We need to consume the stream to trigger the capture
+                    // Consuming the stream is what triggers the capture.
                     futures::pin_mut!(stream);
-                    while let Some(_batch) = stream.try_next().await? {
-                        // The row addresses are captured automatically by make_rowid_capture_stream
-                    }
+                    while let Some(_batch) = stream.try_next().await? {}
 
-                    // Extract the row addresses from the receiver
-                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| {
-                        Error::internal(format!("Failed to receive row ids: {}", err))
+                    let captured = row_addr_rx.try_recv().map_err(|err| {
+                        Error::internal(format!("Failed to receive row addresses: {}", err))
                     })?;
-                    let row_id_index = get_row_id_index(&self.dataset).await?;
-                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
+                    // Address-style captures resolve without an index.
+                    let removed_row_addrs = captured.row_addrs(None)?;
 
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;
@@ -1035,6 +1031,132 @@ mod tests {
             .unwrap();
         // All rows should be deleted, including the updated ones
         assert_eq!(final_result.new_dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_delete_with_scalar_index_after_rows_moved_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // An update rewrites the first fragment's rows into a new fragment with
+        // a higher id, so the low row ids end up at high addresses. Deleting
+        // with an indexed predicate after that hands the capture addresses out
+        // of order, which it has to accept: on legacy storage this reproduces,
+        // and an accumulator that insists on ascending input fails the delete.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::UInt32, false),
+            ArrowField::new("v", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..10u32)),
+                Arc::new(UInt32Array::from_iter_values(0..10u32)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 5,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Move the low row ids into a new, higher-numbered fragment.
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 5")
+            .unwrap()
+            .set("v", "v + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = (*updated.new_dataset).clone();
+
+        let result = dataset.delete("i >= 3").await.unwrap();
+        assert_eq!(result.num_deleted_rows, 7);
+
+        let surviving = dataset.scan().try_into_batch().await.unwrap();
+        let mut ids: Vec<u32> = surviving["i"]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_under_stable_row_ids_keeps_surviving_ids() {
+        // Delete captures row addresses directly (it never needs the ids of
+        // the removed rows), so the deletion vector must land on exactly the
+        // matching rows: surviving rows keep their stable ids and the deleted
+        // ids stop resolving.
+        use arrow::datatypes::UInt64Type;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..10u32))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                // Several fragments, and the predicate spans more than one of
+                // them, so the captured addresses cover multiple fragments.
+                max_rows_per_file: 3,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        let dataset = (*dataset.delete("i >= 5").await.unwrap().new_dataset).clone();
+
+        let surviving: Vec<u64> = dataset.scan().with_row_id().try_into_batch().await.unwrap()
+            [crate::dataset::ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        assert_eq!(surviving, vec![0, 1, 2, 3, 4]);
+
+        let index = crate::dataset::rowids::get_row_id_index(&dataset)
+            .await
+            .unwrap()
+            .expect("stable row id index");
+        for id in 5..10u64 {
+            assert!(
+                index.get(id).unwrap().is_none(),
+                "deleted id {id} must no longer resolve"
+            );
+        }
     }
 
     #[tokio::test]
