@@ -5721,11 +5721,55 @@ mod tests {
         assert_eq!(frags.len(), 2, "Index should cover both fragments");
     }
 
+    /// Counts the `plan_run` execution events emitted while it is the default
+    /// subscriber. A seed harvest never executes a plan; the fallback column
+    /// scan does, so the count tells which path an index update took.
+    #[derive(Clone, Default)]
+    struct PlanRunCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PlanRunCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use lance_core::utils::tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION};
+
+            #[derive(Default)]
+            struct TypeField(Option<String>);
+            impl tracing::field::Visit for TypeField {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "type" {
+                        self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+                    }
+                }
+            }
+
+            if event.metadata().target() != TRACE_EXECUTION {
+                return;
+            }
+            let mut ty = TypeField::default();
+            event.record(&mut ty);
+            if ty.0.as_deref() == Some(EXECUTION_PLAN_RUN) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     /// Seeds for a nested column record parent-level nulls only, so after an
     /// incremental update the index answers `IS NULL` exactly and agrees with
-    /// a plain scan, even when lists carry null or NaN children.
+    /// a plain scan, even when lists carry null or NaN children. With seeds
+    /// the update harvests them (no column scan is executed); the same
+    /// scenario without seeds is the control that proves the scan is visible.
+    #[rstest]
+    #[case::seeds(true)]
+    #[case::scan(false)]
     #[tokio::test]
-    async fn test_zone_map_seeds_for_nested_column_track_parent_nulls() {
+    async fn test_zone_map_seeds_for_nested_column_track_parent_nulls(#[case] use_seeds: bool) {
         use crate::Dataset;
         use crate::index::DatasetIndexExt;
         use crate::index::scalar::open_scalar_index;
@@ -5735,6 +5779,7 @@ mod tests {
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::{SargableQuery, SearchResult};
         use lance_select::RowAddrTreeMap;
+        use tracing_subscriber::layer::SubscriberExt;
 
         const DIM: i32 = 4;
         // Row `i` is a null vector when `null_at(i)`; other rows carry NaN and
@@ -5783,13 +5828,13 @@ mod tests {
             .await
             .unwrap();
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
-            .with_params(&serde_json::json!({"use_seeds": true, "rows_per_zone": 8}));
+            .with_params(&serde_json::json!({"use_seeds": use_seeds, "rows_per_zone": 8}));
         dataset
             .create_index(&["vec"], IndexType::ZoneMap, None, &params, false)
             .await
             .unwrap();
 
-        // Appending writes a seed for the new fragment; optimize harvests it.
+        // Appending writes a seed for the new fragment when seeds are on.
         Dataset::write(
             reader(vectors(60)),
             uri,
@@ -5801,8 +5846,26 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // Count plan executions during the update: a harvest runs none, the
+        // fallback scan runs at least one. tracing caches each callsite's
+        // interest from the firing thread's default dispatcher while exactly
+        // one dispatcher is registered; a second live dispatcher makes it
+        // consult every registered dispatcher, including this thread-local one.
+        let plan_runs = PlanRunCounter::default();
+        let subscriber = tracing_subscriber::registry().with(plan_runs.clone());
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let mut dataset = Dataset::open(uri).await.unwrap();
-        dataset.optimize_indices(&Default::default()).await.unwrap();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+        }
+        let plan_runs = plan_runs.0.load(std::sync::atomic::Ordering::SeqCst);
+        if use_seeds {
+            assert_eq!(plan_runs, 0, "seed harvest must not scan the column");
+        } else {
+            assert!(plan_runs >= 1, "fallback update must scan the column");
+        }
         let dataset = Dataset::open(uri).await.unwrap();
 
         // Ground truth from a scan without the index.
