@@ -2391,6 +2391,7 @@ impl InvertedPartition {
         let mut visited_blocks = HashSet::new();
         let mut num_comparisons = 0usize;
         let mut can_refine = term_plans.len() > 1 && limit < self.docs.len();
+        let mut position_batch_size = limit.clamp(16, 128);
         let mut scored_windows = BTreeMap::<u32, u32>::new();
         let mut windows = windows.into_iter().peekable();
         while windows.peek().is_some() {
@@ -2401,7 +2402,10 @@ impl InvertedPartition {
             // counting windows alone causes many tiny sequential remote reads.
             let max_windows = if scored_windows.is_empty() {
                 1
-            } else if limit < self.docs.len() && candidates.len() < limit {
+            } else if candidate_operator == Operator::Or
+                && limit < self.docs.len()
+                && candidates.len() < limit
+            {
                 (limit - candidates.len()).min(16)
             } else {
                 4096
@@ -2511,25 +2515,47 @@ impl InvertedPartition {
                     .total_cmp(&left.score)
                     .then_with(|| left.doc_id.cmp(&right.doc_id))
             });
-            for chunk in batch_candidates.chunks(16) {
-                if candidates.len() >= limit && chunk[0].score <= threshold {
+            let mut candidate_offset = 0;
+            while candidate_offset < batch_candidates.len() {
+                if candidates.len() >= limit
+                    && batch_candidates[candidate_offset].score <= threshold
+                {
                     break;
                 }
+                let batch_size = if phrase_slop.is_some() {
+                    position_batch_size
+                } else {
+                    16
+                };
+                let mut candidate_end = (candidate_offset + batch_size).min(batch_candidates.len());
                 if phrase_slop.is_some() {
                     // These candidates already passed term, mask and score
-                    // checks. Fetch their positions together, not one remote
-                    // round trip for every document tested by the phrase filter.
-                    let rows = chunk
+                    // checks. Bound each read by new position blocks, allowing
+                    // many candidates to reuse the same resident block.
+                    let mut rows = HashSet::new();
+                    for (offset, candidate) in batch_candidates[candidate_offset..candidate_end]
                         .iter()
-                        .take_while(|candidate| {
-                            candidates.len() < limit || candidate.score > threshold
-                        })
-                        .flat_map(|candidate| candidate.acc.block_rows.iter().flatten().copied())
-                        .collect::<Vec<_>>();
+                        .enumerate()
+                    {
+                        if candidates.len() >= limit && candidate.score <= threshold {
+                            candidate_end = candidate_offset + offset;
+                            break;
+                        }
+                        for &row in candidate.acc.block_rows.iter().flatten() {
+                            if !decoded_positions.contains_key(&row) {
+                                rows.insert(row);
+                            }
+                        }
+                        if rows.len() >= 128 {
+                            candidate_end = candidate_offset + offset + 1;
+                            break;
+                        }
+                    }
+                    let rows = rows.into_iter().collect::<Vec<_>>();
                     self.load_v3_positions(&rows, &decoded_blocks, &mut decoded_positions, metrics)
                         .await?;
                 }
-                for candidate in chunk {
+                for candidate in &batch_candidates[candidate_offset..candidate_end] {
                     let V3ScoredCandidate {
                         doc_id,
                         row_id_slot,
@@ -2580,6 +2606,12 @@ impl InvertedPartition {
                             &shared_threshold,
                         );
                     }
+                }
+                candidate_offset = candidate_end;
+                if phrase_slop.is_some() && candidates.len() < limit {
+                    // A selective phrase may never fill top-k. Grow the probe
+                    // instead of paying one remote round trip per few rejects.
+                    position_batch_size = (position_batch_size * 2).min(4096);
                 }
             }
             if can_refine
