@@ -5721,6 +5721,150 @@ mod tests {
         assert_eq!(frags.len(), 2, "Index should cover both fragments");
     }
 
+    /// Seeds for a nested column record parent-level nulls only, so after an
+    /// incremental update the index answers `IS NULL` exactly and agrees with
+    /// a plain scan, even when lists carry null or NaN children.
+    #[tokio::test]
+    async fn test_zone_map_seeds_for_nested_column_track_parent_nulls() {
+        use crate::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::open_scalar_index;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Array, UInt64Array};
+        use lance_core::ROW_ADDR;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        use lance_select::RowAddrTreeMap;
+
+        const DIM: i32 = 4;
+        // Row `i` is a null vector when `null_at(i)`; other rows carry NaN and
+        // null children on purpose, which must not count as null rows.
+        fn null_at(i: usize) -> bool {
+            i % 7 == 3 || (20..26).contains(&i)
+        }
+        fn vectors(rows: usize) -> RecordBatch {
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), DIM);
+            for i in 0..rows {
+                if null_at(i) {
+                    for _ in 0..DIM {
+                        builder.values().append_null();
+                    }
+                    builder.append(false);
+                    continue;
+                }
+                builder.values().append_value(i as f32);
+                builder
+                    .values()
+                    .append_value(if i % 5 == 0 { f32::NAN } else { 1.0 });
+                if i % 4 == 0 {
+                    builder.values().append_null();
+                } else {
+                    builder.values().append_value(2.0);
+                }
+                builder.values().append_value(3.0);
+                builder.append(true);
+            }
+            let array = builder.finish();
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "vec",
+                array.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
+        }
+        fn reader(batch: RecordBatch) -> impl RecordBatchReader + Send + 'static {
+            let schema = batch.schema();
+            RecordBatchIterator::new(vec![Ok(batch)], schema)
+        }
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmpdir.as_str();
+        let mut dataset = Dataset::write(reader(vectors(40)), uri, None)
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true, "rows_per_zone": 8}));
+        dataset
+            .create_index(&["vec"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+
+        // Appending writes a seed for the new fragment; optimize harvests it.
+        Dataset::write(
+            reader(vectors(60)),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+        let dataset = Dataset::open(uri).await.unwrap();
+
+        // Ground truth from a scan without the index.
+        async fn row_addrs(dataset: &Dataset, filter: &str, use_index: bool) -> Vec<u64> {
+            let batches = dataset
+                .scan()
+                .filter(filter)
+                .unwrap()
+                .with_row_address()
+                .project::<&str>(&[])
+                .unwrap()
+                .use_scalar_index(use_index)
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut addrs: Vec<u64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name(ROW_ADDR)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            addrs.sort_unstable();
+            addrs
+        }
+        let null_rows = row_addrs(&dataset, "vec IS NULL", false).await;
+        let expected_nulls =
+            (0..40).filter(|i| null_at(*i)).count() + (0..60).filter(|i| null_at(*i)).count();
+        assert_eq!(null_rows.len(), expected_nulls);
+        assert_eq!(row_addrs(&dataset, "vec IS NULL", true).await, null_rows);
+        assert_eq!(
+            row_addrs(&dataset, "vec IS NOT NULL", true).await,
+            row_addrs(&dataset, "vec IS NOT NULL", false).await
+        );
+
+        // The merged index knows the exact null rows of both fragments.
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|i| i.name.contains("vec")).unwrap();
+        let scalar_index = open_scalar_index(&dataset, "vec", index, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_index.calculate_included_frags().await.unwrap().len(),
+            2
+        );
+        let result = scalar_index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected = RowAddrTreeMap::from_iter(null_rows.iter().copied());
+        assert_eq!(result, SearchResult::exact(expected));
+    }
+
     /// Seed observers see the values the data file stores, so appending a
     /// view array to a seeded string column succeeds.
     #[tokio::test]
