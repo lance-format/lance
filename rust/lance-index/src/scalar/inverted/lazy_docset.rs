@@ -15,6 +15,7 @@
 //! only partitions that actually contribute hits pay
 //! `ensure_num_tokens_loaded`/`ensure_loaded`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -78,6 +79,24 @@ struct DocSetKey {
 }
 
 struct DocRowIdsKey;
+
+// Keep cold candidate resolution bounded while retaining useful adjacent IDs
+// for later queries. Each page costs 8 KiB before cache-entry overhead.
+const ROW_IDS_PER_PAGE: usize = 1024;
+
+struct DocRowIdsPageKey(usize);
+
+impl CacheKey for DocRowIdsPageKey {
+    type ValueType = Vec<u64>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("docs-row-ids-page-{}", self.0).into()
+    }
+
+    fn type_name() -> &'static str {
+        "FtsDocRowIdsPage"
+    }
+}
 
 impl CacheKey for DocRowIdsKey {
     type ValueType = Vec<u64>;
@@ -354,13 +373,49 @@ impl DeferredDocSet {
         if let Some(row_ids) = self.cache.get_with_key(&DocRowIdsKey).await {
             return Ok(doc_ids.iter().map(|&d| row_ids[d as usize]).collect());
         }
-        let ranges: Vec<std::ops::Range<usize>> = doc_ids
+        let mut pages = BTreeMap::<usize, Arc<Vec<u64>>>::new();
+        let mut page_ids = doc_ids
             .iter()
-            .map(|&d| d as usize..d as usize + 1)
-            .collect();
-        let reader = self.reader().await?;
-        let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
-        let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
-        Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+            .map(|&doc| doc as usize / ROW_IDS_PER_PAGE)
+            .collect::<Vec<_>>();
+        page_ids.sort_unstable();
+        page_ids.dedup();
+        let mut missing = Vec::new();
+        for page in page_ids {
+            if let Some(row_ids) = self.cache.get_with_key(&DocRowIdsPageKey(page)).await {
+                pages.insert(page, row_ids);
+            } else {
+                missing.push(page);
+            }
+        }
+        if !missing.is_empty() {
+            let ranges = missing
+                .iter()
+                .map(|&page| {
+                    let start = page * ROW_IDS_PER_PAGE;
+                    start..(start + ROW_IDS_PER_PAGE).min(self.num_rows)
+                })
+                .collect::<Vec<_>>();
+            let batch = self
+                .reader()
+                .await?
+                .read_ranges(&ranges, Some(&[ROW_ID]))
+                .await?;
+            let values = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+            let mut offset = 0;
+            for (page, range) in missing.into_iter().zip(ranges) {
+                let end = offset + range.len();
+                let row_ids = Arc::new(values[offset..end].to_vec());
+                self.cache
+                    .insert_with_key(&DocRowIdsPageKey(page), row_ids.clone())
+                    .await;
+                pages.insert(page, row_ids);
+                offset = end;
+            }
+        }
+        Ok(doc_ids
+            .iter()
+            .map(|&doc| pages[&(doc as usize / ROW_IDS_PER_PAGE)][doc as usize % ROW_IDS_PER_PAGE])
+            .collect())
     }
 }

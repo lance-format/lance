@@ -281,6 +281,7 @@ struct V3TermPlan {
     position: u32,
     term_index: u32,
     posting_len: u32,
+    query_weight: f32,
     term_idx: usize,
     block_start: usize,
     blocks: Arc<Vec<V3BlockSkipMeta>>,
@@ -2337,6 +2338,7 @@ impl InvertedPartition {
                         position,
                         term_index: position,
                         posting_len,
+                        query_weight: idf(posting_len as usize, self.docs.len()),
                         term_idx,
                         block_start: self.inverted_list.posting_list_range(token_id).start,
                         blocks,
@@ -2371,7 +2373,13 @@ impl InvertedPartition {
         } else {
             operator
         };
-        let windows = block_wand::search_windows(&term_plans, candidate_operator);
+        let mut scored_windows = BTreeMap::<u32, u32>::new();
+        let windows = block_wand::search_windows(
+            &term_plans,
+            candidate_operator,
+            f32::NEG_INFINITY,
+            &scored_windows,
+        );
         let total_blocks = term_plans
             .iter()
             .unique_by(|term| term.token_id)
@@ -2392,9 +2400,8 @@ impl InvertedPartition {
         let mut num_comparisons = 0usize;
         let mut can_refine = term_plans.len() > 1 && limit < self.docs.len();
         let mut position_batch_size = limit.clamp(16, 128);
-        let mut scored_windows = BTreeMap::<u32, u32>::new();
-        let mut windows = windows.into_iter().peekable();
-        while windows.peek().is_some() {
+        let mut windows = windows;
+        while !windows.is_empty() {
             threshold =
                 threshold.max(self.v3_shared_threshold(params.wand_factor, &shared_threshold));
             // Seed the threshold with one window, then budget batches by new
@@ -2418,7 +2425,7 @@ impl InvertedPartition {
                 if candidates.len() >= limit && window.upper_bound <= threshold {
                     break;
                 }
-                if let Some(window) = windows.next() {
+                if let Some(window) = windows.pop() {
                     for term in &term_plans {
                         for block in
                             term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
@@ -2621,7 +2628,7 @@ impl InvertedPartition {
             {
                 let refinement = block_wand::refinement_blocks(
                     &term_plans,
-                    windows.clone().take_while(|window| {
+                    windows.iter().copied().filter(|window| {
                         candidates.len() < limit || window.upper_bound > threshold
                     }),
                 );
@@ -2639,7 +2646,7 @@ impl InvertedPartition {
                 .await?;
                 metrics.record_fts_refinement_batches(1);
                 for term in &mut term_plans {
-                    let query_weight = idf(term.posting_len as usize, self.docs.len());
+                    let query_weight = term.query_weight;
                     for block_idx in 0..term.blocks.len() {
                         if !term.refined_blocks.contains_key(&block_idx)
                             && let Some(block) = decoded_blocks.get(&(term.block_start + block_idx))
@@ -2662,20 +2669,16 @@ impl InvertedPartition {
                         }
                     }
                 }
-                windows = block_wand::search_windows(&term_plans, candidate_operator)
-                    .into_iter()
-                    // Refinement only adds boundaries, so every new window is
-                    // contained in one original window. Exclude scored regions
-                    // without retaining every visited document id.
-                    .filter(|window| {
-                        scored_windows
-                            .range(..=window.first_doc_id)
-                            .next_back()
-                            .is_none_or(|(_, last)| *last < window.last_doc_id)
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .peekable();
+                windows = block_wand::search_windows(
+                    &term_plans,
+                    candidate_operator,
+                    if candidates.len() >= limit {
+                        threshold
+                    } else {
+                        f32::NEG_INFINITY
+                    },
+                    &scored_windows,
+                );
             }
         }
         metrics.record_comparisons(num_comparisons);
@@ -2773,8 +2776,7 @@ impl InvertedPartition {
             .enumerate()
             .filter_map(|(term_idx, freq)| freq.map(|freq| (term_idx, freq)))
             .map(|(term_idx, freq)| {
-                idf(term_plans[term_idx].posting_len as usize, self.docs.len())
-                    * scorer.doc_weight(freq, doc_length)
+                term_plans[term_idx].query_weight * scorer.doc_weight(freq, doc_length)
             })
             .sum()
     }

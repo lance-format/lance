@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 
 use super::{BLOCK_SIZE, Operator, V3BlockMeta, V3TermPlan, V3Window};
 
@@ -25,44 +26,90 @@ impl V3TermPlan {
     }
 }
 
+impl PartialEq for V3Window {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for V3Window {}
+
+impl PartialOrd for V3Window {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for V3Window {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.upper_bound
+            .total_cmp(&other.upper_bound)
+            .then_with(|| other.first_doc_id.cmp(&self.first_doc_id))
+            .then_with(|| other.last_doc_id.cmp(&self.last_doc_id))
+    }
+}
+
 /// Partition the document space into disjoint windows. Every term contributes
 /// at most one block to each window. Refined sparse blocks contribute only at
 /// their actual document ids, rather than inflating the bound across gaps.
-pub(super) fn search_windows(terms: &[V3TermPlan], operator: Operator) -> Vec<V3Window> {
-    let mut events = Vec::new();
+pub(super) fn search_windows(
+    terms: &[V3TermPlan],
+    operator: Operator,
+    threshold: f32,
+    scored_windows: &BTreeMap<u32, u32>,
+) -> BinaryHeap<V3Window> {
+    let mut term_events = Vec::with_capacity(terms.len());
+    let mut next_events = BinaryHeap::new();
     for (term_idx, term) in terms.iter().enumerate() {
+        let mut events = Vec::new();
         for (block_idx, block) in term.blocks.iter().enumerate() {
             if let Some(points) = term.refined_blocks.get(&block_idx) {
                 for &(doc, score) in points {
-                    events.push((u64::from(doc), term_idx, Some(score)));
-                    events.push((u64::from(doc) + 1, term_idx, None));
+                    events.push((u64::from(doc), Some(score)));
+                    events.push((u64::from(doc) + 1, None));
                 }
             } else {
-                events.push((
-                    u64::from(block.first_doc_id),
-                    term_idx,
-                    Some(block.block_max_score),
-                ));
-                events.push((u64::from(block.last_doc_id) + 1, term_idx, None));
+                events.push((u64::from(block.first_doc_id), Some(block.block_max_score)));
+                events.push((u64::from(block.last_doc_id) + 1, None));
             }
         }
+        if let Some(&(doc, _)) = events.first() {
+            next_events.push(Reverse((doc, term_idx, 0usize)));
+        }
+        term_events.push(events);
     }
-    // Sweep each term's changes once. Ends precede starts at the same id, so
-    // adjacent blocks and adjacent refined documents preserve their bounds.
-    events.sort_unstable_by_key(|(doc, term, bound)| (*doc, *term, bound.is_some()));
+    // Each term is already ordered by document id, with an end preceding the
+    // next start at adjacent ids. Merge these streams instead of sorting every
+    // refined document again after each payload batch.
     let mut bounds = vec![None; terms.len()];
     let mut windows = Vec::new();
-    let mut offset = 0;
-    while offset < events.len() {
-        let first = events[offset].0;
-        while offset < events.len() && events[offset].0 == first {
-            let (_, term, bound) = events[offset];
-            bounds[term] = bound;
-            offset += 1;
+    let mut scored = scored_windows.iter().peekable();
+    while let Some(&Reverse((first, _, _))) = next_events.peek() {
+        while let Some(&Reverse((_, term, offset))) =
+            next_events.peek().filter(|event| event.0.0 == first)
+        {
+            next_events.pop();
+            bounds[term] = term_events[term][offset].1;
+            if let Some(&(doc, _)) = term_events[term].get(offset + 1) {
+                next_events.push(Reverse((doc, term, offset + 1)));
+            }
         }
-        let Some(&(next, _, _)) = events.get(offset) else {
+        let Some(&Reverse((next, _, _))) = next_events.peek() else {
             break;
         };
+        while scored
+            .peek()
+            .is_some_and(|(_, last)| u64::from(**last) < first)
+        {
+            scored.next();
+        }
+        // Refinement adds boundaries but never crosses a previously scored
+        // window. Both streams are doc ordered, so exclusion needs no tree lookup.
+        if scored.peek().is_some_and(|(start, last)| {
+            u64::from(**start) <= first && u64::from(**last) >= next - 1
+        }) {
+            continue;
+        }
         let mut upper_bound = 0.0;
         let mut matching_terms = 0;
         // Sum in query-term order, matching candidate scoring and avoiding
@@ -74,20 +121,18 @@ pub(super) fn search_windows(terms: &[V3TermPlan], operator: Operator) -> Vec<V3
         if matching_terms == 0 || (operator == Operator::And && matching_terms != terms.len()) {
             continue;
         }
+        if upper_bound <= threshold {
+            continue;
+        }
         windows.push(V3Window {
             first_doc_id: first as u32,
             last_doc_id: (next - 1) as u32,
             upper_bound,
         });
     }
-    windows.sort_unstable_by(|left, right| {
-        right
-            .upper_bound
-            .total_cmp(&left.upper_bound)
-            .then_with(|| left.first_doc_id.cmp(&right.first_doc_id))
-            .then_with(|| left.last_doc_id.cmp(&right.last_doc_id))
-    });
-    windows
+    // Heap construction is linear; only competitive windows pay the cost of
+    // ordered extraction. Most windows are discarded once top-k is established.
+    BinaryHeap::from(windows)
 }
 
 /// Resolve the widest sparse bounds in one bounded I/O batch. Rare terms are
