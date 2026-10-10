@@ -50,8 +50,9 @@ impl Dataset {
     /// * Mapped destinations are not checked against the manifest and can be
     ///   stale, for example after every row of the destination fragment is deleted.
     /// * Not every compaction records an FRI: it requires `defer_index_remap`,
-    ///   fresh index-free tables do not receive one automatically, and datasets
-    ///   with stable row ids reject the option.
+    ///   and fresh index-free tables without stable row ids do not receive one
+    ///   automatically. Release builds reject the option on datasets with stable
+    ///   row ids.
     /// * Says nothing about deletion files, source-value changes, or whether an
     ///   address belongs to this table or branch.
     ///

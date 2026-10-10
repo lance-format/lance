@@ -1526,11 +1526,8 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     transitions: &[pb_fri::Transition],
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
-    // The spec excludes tagged histories on stable-row-id tables: the FRI is
-    // address-based, and under stable row ids a rewrite's rows keep their
-    // ids, so there is no address translation to record. The planner blocks
-    // the deferred-compaction combination already; this covers a hand-built
-    // rewrite committed directly.
+    // Deferred compaction records v0 entries on stable-row-id tables, so only a
+    // hand-built tagged rewrite committed directly reaches this.
     if dataset.manifest.uses_stable_row_ids() {
         return Err(Error::not_supported(
             "Tagged fragment reuse histories are address-based and excluded on \

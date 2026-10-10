@@ -713,8 +713,7 @@ impl Transaction {
         let mut final_indices = prepared_indices;
 
         // Release builds refuse to publish a stable-row-id dataset with a fragment
-        // reuse index, and nothing needs it: compaction rejects deferred index
-        // remap there.
+        // reuse index, and no index needs it.
         if config.migration_next_row_id.is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
