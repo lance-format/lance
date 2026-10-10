@@ -14,6 +14,7 @@ pub const FTS_BLOCKS_PRUNED_METRIC: &str = "fts_blocks_pruned";
 pub const FTS_PAYLOAD_READ_RANGES_METRIC: &str = "fts_payload_read_ranges";
 pub const FTS_REFINEMENT_BATCHES_METRIC: &str = "fts_refinement_batches";
 pub const FTS_PAYLOAD_READ_BATCHES_METRIC: &str = "fts_payload_read_batches";
+pub const FTS_POSITION_READ_BATCHES_METRIC: &str = "fts_position_read_batches";
 
 /// A trait used by the index to report metrics
 ///
@@ -84,6 +85,8 @@ pub trait MetricsCollector: Send + Sync {
 
     fn record_fts_payload_read_batches(&self, _num_batches: usize) {}
 
+    fn record_fts_position_read_batches(&self, _num_batches: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///
@@ -119,6 +122,7 @@ pub struct LocalMetricsCollector {
     pub fts_payload_read_ranges: AtomicUsize,
     pub fts_refinement_batches: AtomicUsize,
     pub fts_payload_read_batches: AtomicUsize,
+    pub fts_position_read_batches: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -133,6 +137,9 @@ impl LocalMetricsCollector {
         other.record_fts_blocks_pruned(self.fts_blocks_pruned.load(Ordering::Relaxed));
         other.record_fts_payload_read_ranges(self.fts_payload_read_ranges.load(Ordering::Relaxed));
         other.record_fts_refinement_batches(self.fts_refinement_batches.load(Ordering::Relaxed));
+        other.record_fts_position_read_batches(
+            self.fts_position_read_batches.load(Ordering::Relaxed),
+        );
         other
             .record_fts_payload_read_batches(self.fts_payload_read_batches.load(Ordering::Relaxed));
     }
@@ -184,6 +191,11 @@ impl MetricsCollector for LocalMetricsCollector {
 
     fn record_fts_payload_read_batches(&self, num_batches: usize) {
         self.fts_payload_read_batches
+            .fetch_add(num_batches, Ordering::Relaxed);
+    }
+
+    fn record_fts_position_read_batches(&self, num_batches: usize) {
+        self.fts_position_read_batches
             .fetch_add(num_batches, Ordering::Relaxed);
     }
 }

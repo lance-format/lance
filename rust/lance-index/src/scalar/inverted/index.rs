@@ -334,6 +334,14 @@ struct V3DocAccumulator {
     doc_offsets: Vec<Option<usize>>,
 }
 
+struct V3ScoredCandidate {
+    doc_id: u32,
+    row_id_slot: u64,
+    doc_length: u32,
+    score: f32,
+    acc: V3DocAccumulator,
+}
+
 impl V3DocAccumulator {
     fn new(num_terms: usize) -> Self {
         Self {
@@ -2386,7 +2394,7 @@ impl InvertedPartition {
             // counting windows alone causes many tiny sequential remote reads.
             let max_windows = if scored_windows.is_empty() {
                 1
-            } else if candidates.len() < limit {
+            } else if limit < self.docs.len() && candidates.len() < limit {
                 (limit - candidates.len()).min(16)
             } else {
                 4096
@@ -2428,6 +2436,7 @@ impl InvertedPartition {
                 metrics,
             )
             .await?;
+            let mut batch_candidates = Vec::new();
             for window in batch_windows {
                 if candidates.len() >= limit && window.upper_bound <= threshold {
                     continue;
@@ -2460,54 +2469,88 @@ impl InvertedPartition {
                     }
                 }
 
-                let mut docs_in_window = docs_in_window.into_iter().collect::<Vec<_>>();
-                docs_in_window.sort_unstable_by_key(|(doc_id, _)| *doc_id);
                 for (doc_id, acc) in docs_in_window {
                     if !acc.matches_operator(candidate_operator) {
                         continue;
                     }
                     num_comparisons += 1;
 
-                    let addr = if docs_has_row_ids {
+                    let row_id_slot = if docs_has_row_ids {
                         let row_id = docs.row_id(doc_id);
                         if row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id) {
                             continue;
                         }
-                        CandidateAddr::RowId(row_id)
+                        row_id
                     } else {
-                        CandidateAddr::Pending(doc_id)
+                        doc_id as u64
                     };
                     let doc_length = docs.num_tokens(doc_id);
                     let score = self.v3_score_candidate(&acc, &term_plans, doc_length, &scorer);
                     if candidates.len() >= limit && score <= threshold {
                         continue;
                     }
+                    batch_candidates.push(V3ScoredCandidate {
+                        doc_id,
+                        row_id_slot,
+                        doc_length,
+                        score,
+                        acc,
+                    });
+                }
+            }
+            batch_candidates.sort_unstable_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.doc_id.cmp(&right.doc_id))
+            });
+            for chunk in batch_candidates.chunks(16) {
+                if candidates.len() >= limit && chunk[0].score <= threshold {
+                    break;
+                }
+                if phrase_slop.is_some() {
+                    // These candidates already passed term, mask and score
+                    // checks. Fetch their positions together, not one remote
+                    // round trip for every document tested by the phrase filter.
+                    let rows = chunk
+                        .iter()
+                        .take_while(|candidate| {
+                            candidates.len() < limit || candidate.score > threshold
+                        })
+                        .flat_map(|candidate| candidate.acc.block_rows.iter().flatten().copied())
+                        .collect::<Vec<_>>();
+                    self.load_v3_positions(&rows, &decoded_blocks, &mut decoded_positions, metrics)
+                        .await?;
+                }
+                for candidate in chunk {
+                    let V3ScoredCandidate {
+                        doc_id,
+                        row_id_slot,
+                        doc_length,
+                        score,
+                        acc,
+                    } = candidate;
+                    if candidates.len() >= limit && *score <= threshold {
+                        break;
+                    }
                     if let Some(slop) = phrase_slop
-                        && !self
-                            .v3_candidate_matches_phrase(
-                                &term_plans,
-                                &acc,
-                                &decoded_blocks,
-                                &mut decoded_positions,
-                                metrics,
-                                slop,
-                            )
-                            .await?
+                        && !Self::v3_candidate_matches_phrase(
+                            &term_plans,
+                            acc,
+                            &decoded_positions,
+                            slop,
+                        )?
                     {
                         continue;
                     }
 
-                    let row_id_slot = match &addr {
-                        CandidateAddr::RowId(row_id) => *row_id,
-                        CandidateAddr::Pending(doc_id) => *doc_id as u64,
-                    };
                     let term_freqs = acc.term_freqs(&term_plans);
                     if candidates.len() < limit {
                         candidates.push(Reverse((
-                            ScoredDoc::new(row_id_slot, score),
+                            ScoredDoc::new(*row_id_slot, *score),
                             term_freqs,
-                            doc_length,
-                            doc_id,
+                            *doc_length,
+                            *doc_id,
                         )));
                         if candidates.len() == limit {
                             threshold = self.v3_update_threshold(
@@ -2516,13 +2559,13 @@ impl InvertedPartition {
                                 &shared_threshold,
                             );
                         }
-                    } else if score > candidates.peek().unwrap().0.0.score.0 {
+                    } else if *score > candidates.peek().unwrap().0.0.score.0 {
                         candidates.pop();
                         candidates.push(Reverse((
-                            ScoredDoc::new(row_id_slot, score),
+                            ScoredDoc::new(*row_id_slot, *score),
                             term_freqs,
-                            doc_length,
-                            doc_id,
+                            *doc_length,
+                            *doc_id,
                         )));
                         threshold = self.v3_update_threshold(
                             candidates.peek().unwrap().0.0.score.0,
@@ -2697,28 +2740,18 @@ impl InvertedPartition {
             .sum()
     }
 
-    async fn v3_candidate_matches_phrase(
+    async fn load_v3_positions(
         &self,
-        term_plans: &[V3TermPlan],
-        acc: &V3DocAccumulator,
+        rows: &[usize],
         decoded_blocks: &HashMap<usize, V3DecodedPostingBlock>,
         decoded_positions: &mut HashMap<usize, V3DecodedPositionBlock>,
         metrics: &dyn MetricsCollector,
-        slop: i32,
-    ) -> Result<bool> {
-        let mut rows = Vec::with_capacity(term_plans.len());
-        for term_idx in 0..term_plans.len() {
-            rows.push(
-                acc.block_rows[term_idx].ok_or_else(|| {
-                    Error::internal("phrase candidate is missing a term block row")
-                })?,
-            );
-        }
-
+    ) -> Result<()> {
         let missing_rows = rows
             .iter()
             .filter(|row| !decoded_positions.contains_key(row))
             .copied()
+            .unique()
             .collect::<Vec<_>>();
         if !missing_rows.is_empty() {
             let payloads = self
@@ -2752,7 +2785,15 @@ impl InvertedPartition {
                 decoded_positions.insert(row, V3DecodedPositionBlock { values, offsets });
             }
         }
+        Ok(())
+    }
 
+    fn v3_candidate_matches_phrase(
+        term_plans: &[V3TermPlan],
+        acc: &V3DocAccumulator,
+        decoded_positions: &HashMap<usize, V3DecodedPositionBlock>,
+        slop: i32,
+    ) -> Result<bool> {
         let mut term_positions = Vec::with_capacity(term_plans.len());
         for (term_idx, term) in term_plans.iter().enumerate() {
             let row = acc.block_rows[term_idx]
@@ -4022,6 +4063,7 @@ impl PostingListReader {
         if !missing_rows.is_empty() {
             let missing_ranges = ranges_from_sorted_rows(&missing_rows);
             metrics.record_fts_position_blocks_read(missing_rows.len());
+            metrics.record_fts_position_read_batches(1);
             let batch = self
                 .v3_position_reader()?
                 .read_ranges(&missing_ranges, Some(&[COMPRESSED_POSITION_COL]))
