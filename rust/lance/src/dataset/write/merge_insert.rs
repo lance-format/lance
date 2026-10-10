@@ -51,6 +51,7 @@ use super::{
 use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
@@ -1860,16 +1861,18 @@ impl MergeInsertJob {
                         versions::open_update_writer(write_version, &dataset, &write_schema, false)
                             .await?;
 
-                    // We need to remove rowaddr before writing.
-                    batches
-                        .iter_mut()
-                        .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
-                            Ok(b) => {
-                                *batch = b;
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        })?;
+                    // We need to remove rowaddr before writing. The data file
+                    // writer and the seed collector must then see the same
+                    // representation: a Utf8View or BinaryView source is stored
+                    // as its classic offset type, and the writer's own
+                    // conversion never reaches these batches, so normalize once
+                    // here for both.
+                    batches.iter_mut().try_for_each(|batch| {
+                        let without_addr = batch.drop_column(ROW_ADDR)?;
+                        *batch = SchemaAdapter::new(without_addr.schema())
+                            .to_physical_batch(without_addr)?;
+                        Ok::<_, Error>(())
+                    })?;
 
                     let source_version = metadata
                         .referenced_lance_files()

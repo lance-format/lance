@@ -15,6 +15,7 @@ use lance_table::utils::stream::ReadBatchFutStream;
 use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
+use super::utils::SchemaAdapter;
 use super::versions;
 use super::write::seeds::SeedCollector;
 use super::write::{GenericWriter, cleanup_data_fragments};
@@ -272,6 +273,11 @@ impl Updater {
             self.writer = Some(self.new_writer(write_schema).await?);
         }
 
+        // The data file writer and the seed collector must see the same
+        // representation: a Utf8View or BinaryView input is stored as its
+        // classic offset type, and the writer's own conversion never reaches
+        // the caller's batch, so normalize once here for both.
+        let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch)?;
         self.writer
             .as_mut()
             .ok_or_else(|| Error::internal("Fragment Updater: missing writer"))?

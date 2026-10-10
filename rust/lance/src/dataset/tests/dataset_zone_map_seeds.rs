@@ -12,7 +12,10 @@
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
-use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, BinaryViewArray, Int32Array, RecordBatch, RecordBatchIterator,
+    StringArray, StringViewArray,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
@@ -561,4 +564,199 @@ async fn test_merge_insert_inserted_fragments_get_seeds() {
     let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
     let dataset = dataset.as_ref().clone();
     assert_new_files_seed_physical_rows(&dataset, &before, "val").await;
+}
+
+fn view_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("name", DataType::Utf8, true),
+        ArrowField::new("blob", DataType::Binary, true),
+    ]))
+}
+
+fn name_value(i: i32) -> Option<String> {
+    (i % 5 != 0).then(|| format!("n{i:03}"))
+}
+
+fn blob_value(i: i32) -> Option<Vec<u8>> {
+    (i % 6 != 2).then(|| format!("b{i:03}").into_bytes())
+}
+
+/// Twenty rows in two fragments with seeded zone maps on a Utf8 and a
+/// Binary column, written from classic (non-view) arrays.
+async fn dataset_with_seeded_view_targets(uri: &str) -> Dataset {
+    let batch = RecordBatch::try_new(
+        view_schema(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..20)),
+            Arc::new(StringArray::from_iter(
+                (0..20).map(|i| name_value(i).map(|s| s.to_lowercase())),
+            )),
+            Arc::new(BinaryArray::from_iter((0..20).map(blob_value))),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], view_schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FILE,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for column in ["name", "blob"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::ZoneMap,
+                None,
+                &zone_map_params(true),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+/// The data file serving `column` in every fragment carries a seed matching
+/// the file's physical content, which for a view input is the classic
+/// offset-based column the file stores.
+async fn assert_all_fragments_seed_physical_rows(dataset: &Dataset, column: &str) {
+    let field = field_id(dataset, column);
+    for fragment in dataset.fragments().iter() {
+        let file = serving_file(fragment, field);
+        let physical = physical_column(dataset, &file.path, column).await;
+        assert_eq!(physical.len(), fragment.physical_rows.unwrap());
+        assert!(
+            physical.null_count() > 0,
+            "the test data must contain nulls"
+        );
+        let stored = seed_in_file(dataset, &file.path, column)
+            .await
+            .unwrap_or_else(|| panic!("fragment {} has no seed for {column}", fragment.id));
+        assert_eq!(
+            stored,
+            seed_from_values(column, &physical, 1),
+            "fragment {}",
+            fragment.id
+        );
+    }
+}
+
+/// A full-fragment merge_insert fed Utf8View values for a seeded Utf8
+/// column: the data file stores classic Utf8, and the seed must describe
+/// that stored column, built from the same normalized batches the writer
+/// received.
+#[tokio::test]
+async fn test_merge_insert_rewrite_with_view_input_seeds_stored_column() {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_view_targets(dir.as_str()).await;
+
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("name", DataType::Utf8View, true),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..20)),
+            Arc::new(StringViewArray::from_iter(
+                (0..20).map(|i| name_value(i).map(|s| s.to_uppercase())),
+            )),
+        ],
+    )
+    .unwrap();
+    let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new([Ok(source)], source_schema));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let dataset = dataset.as_ref().clone();
+
+    // The written values are the uppercase names, stored as classic Utf8.
+    let name = field_id(&dataset, "name");
+    for fragment in dataset.fragments().iter() {
+        let file = serving_file(fragment, name);
+        let physical = physical_column(&dataset, &file.path, "name").await;
+        assert_eq!(physical.data_type(), &DataType::Utf8);
+        let start = fragment.id as i32 * ROWS_PER_FILE as i32;
+        let expected: Vec<Option<String>> = (start..start + physical.len() as i32)
+            .map(|i| name_value(i).map(|s| s.to_uppercase()))
+            .collect();
+        let actual: Vec<Option<String>> = physical
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(str::to_string))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+    assert_all_fragments_seed_physical_rows(&dataset, "name").await;
+}
+
+/// A full-fragment merge_insert fed BinaryView values for a seeded Binary
+/// column, in three-row source batches whose edges do not line up with the
+/// four-row zones: the stored seed describes the classic Binary column the
+/// file holds.
+#[tokio::test]
+async fn test_merge_insert_rewrite_with_binary_view_input_seeds_stored_column() {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_view_targets(dir.as_str()).await;
+
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("blob", DataType::BinaryView, true),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..20)),
+            Arc::new(BinaryViewArray::from_iter(
+                (0..20).map(|i| blob_value(i + 1000)),
+            )),
+        ],
+    )
+    .unwrap();
+    let chunks: Vec<_> = (0..source.num_rows())
+        .step_by(3)
+        .map(|offset| Ok(source.slice(offset, 3.min(source.num_rows() - offset))))
+        .collect();
+    let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(chunks, source_schema));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let dataset = dataset.as_ref().clone();
+
+    let blob = field_id(&dataset, "blob");
+    for fragment in dataset.fragments().iter() {
+        let file = serving_file(fragment, blob);
+        let physical = physical_column(&dataset, &file.path, "blob").await;
+        assert_eq!(physical.data_type(), &DataType::Binary);
+        let start = fragment.id as i32 * ROWS_PER_FILE as i32;
+        let expected: Vec<Option<Vec<u8>>> = (start..start + physical.len() as i32)
+            .map(|i| blob_value(i + 1000))
+            .collect();
+        let actual: Vec<Option<Vec<u8>>> = physical
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(<[u8]>::to_vec))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+    assert_all_fragments_seed_physical_rows(&dataset, "blob").await;
 }
