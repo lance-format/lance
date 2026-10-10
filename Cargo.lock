@@ -132,7 +132,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -143,7 +143,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -849,9 +849,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-json"
-version = "0.62.4"
+version = "0.62.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27b3a779093e18cad88bbae08dc4261e1d95018c4c5b9356a52bcae7c0b6e9bb"
+checksum = "9648b0bb82a2eedd844052c6ad2a1a822d1f8e3adee5fbf668366717e428856a"
 dependencies = [
  "aws-smithy-types",
 ]
@@ -919,9 +919,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.4.5"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ca2734c16913a45343b37313605d84e7d8b34a4611598ce1d25b35860a2bed3"
+checksum = "32b42fcf341259d85ca10fac9a2f6448a8ec691c6955a18e45bc3b71a85fab85"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -1482,7 +1482,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2763,7 +2763,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2906,7 +2906,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3130,7 +3130,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3485,6 +3485,19 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "goldenfile"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "206600f27ef687e85a572315eb297c79f66620b2b3eeb3a6cde17f25e049ae5b"
+dependencies = [
+ "scopeguard",
+ "similar-asserts",
+ "static_assertions",
+ "tempfile",
+ "yansi",
 ]
 
 [[package]]
@@ -4215,7 +4228,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4412,23 +4425,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonb"
-version = "0.5.6"
+name = "json-five"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb98fb29636087c40ad0d1274d9a30c0c1e83e03ae93f6e7e89247b37fcc6953"
+checksum = "865f2d01a4549c1fd8c60640c03ae5249eb374cd8cde8b905628d4b1af95c87c"
 dependencies = [
- "byteorder",
- "ethnum",
- "fast-float2",
- "itoa",
- "jiff",
- "nom 8.0.0",
- "num-traits",
- "ordered-float 5.3.0",
- "rand 0.9.5",
  "serde",
- "serde_json",
- "zmij",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -4459,7 +4462,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4481,6 +4484,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "blake3",
  "byteorder",
  "bytes",
  "chrono",
@@ -4562,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4576,7 +4580,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "half",
- "jsonb",
+ "lance-jsonb",
  "num-traits",
  "rand 0.9.5",
 ]
@@ -4611,7 +4615,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4622,7 +4626,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4644,6 +4648,7 @@ dependencies = [
  "num_cpus",
  "object_store 0.14.1",
  "pin-project",
+ "proptest",
  "prost",
  "quick_cache",
  "rand 0.9.5",
@@ -4662,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4680,11 +4685,11 @@ dependencies = [
  "datafusion-substrait",
  "futures",
  "half",
- "jsonb",
  "lance-arrow",
  "lance-core",
  "lance-datagen",
  "lance-geo",
+ "lance-jsonb",
  "log",
  "pin-project",
  "prost",
@@ -4697,7 +4702,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4717,7 +4722,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4726,7 +4731,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4770,7 +4775,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4796,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4838,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4852,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4884,9 +4889,10 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
+ "hashbrown 0.16.1",
+ "hex",
  "itertools 0.14.0",
  "jieba-rs",
- "jsonb",
  "lance-arrow",
  "lance-arrow-stats",
  "lance-bitpacking",
@@ -4898,6 +4904,7 @@ dependencies = [
  "lance-geo",
  "lance-index-core",
  "lance-io",
+ "lance-jsonb",
  "lance-linalg",
  "lance-select",
  "lance-table",
@@ -4928,12 +4935,13 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "twox-hash",
  "uuid",
 ]
 
 [[package]]
 name = "lance-index-core"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4951,11 +4959,12 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "lance-io"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5006,8 +5015,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-jsonb"
+version = "14.0.0-beta.10"
+dependencies = [
+ "byteorder",
+ "ethnum",
+ "fast-float2",
+ "goldenfile",
+ "itoa",
+ "jiff",
+ "json-five",
+ "nom 8.0.0",
+ "num-traits",
+ "ordered-float 5.3.0",
+ "proptest",
+ "serde",
+ "serde_json",
+ "zmij",
+]
+
+[[package]]
 name = "lance-linalg"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "approx",
  "arrow-array",
@@ -5028,7 +5057,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5042,7 +5071,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5058,8 +5087,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
+ "arc-swap",
  "arrow",
  "arrow-ipc",
  "arrow-schema",
@@ -5104,9 +5134,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d23e54b1634d5bbb434f8dd33dc3c05f6e58d876a9a27b3b4aef58ddbe11af"
+checksum = "828f291764feda98898452bea4ce3756b73e5d5c7c67b62edda27456b7cc72c1"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -5118,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5134,7 +5164,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5181,7 +5211,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5190,7 +5220,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5203,7 +5233,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5216,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "13.0.0-beta.9"
+version = "14.0.0-beta.10"
 dependencies = [
  "clap",
  "lance-core",
@@ -5867,7 +5897,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7984,7 +8014,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8043,7 +8073,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8528,6 +8558,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+dependencies = [
+ "bstr",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "similar-asserts"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5b441962c817e33508847a22bd82f03a30cff43642dc2fae8b050566121eb9a"
+dependencies = [
+ "console",
+ "similar",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8579,7 +8629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8916,7 +8966,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9593,6 +9643,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b12e05d9e06373163a9bb6bb8c263c261b396643a99445fe6b9811fd376581b"
 
 [[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9962,7 +10018,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

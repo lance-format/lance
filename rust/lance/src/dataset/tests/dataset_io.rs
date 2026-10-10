@@ -33,8 +33,8 @@ use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int8DictionaryArray, Int32Array, Int64Array,
-    RecordBatchIterator, StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int8DictionaryArray, Int32Array,
+    Int64Array, RecordBatchIterator, StringArray, UInt8Array, UInt8DictionaryArray,
     cast::as_string_array,
     types::{Float32Type, Int32Type},
 };
@@ -1356,7 +1356,7 @@ async fn test_write_manifest(
     let write_fut = require_send(write_fut);
     let mut dataset = write_fut.await.unwrap();
 
-    // Check it has no flags
+    // New datasets retain legacy field-ID allocation until explicitly migrated.
     let manifest = read_manifest(
         dataset.object_store.as_ref(),
         &dataset
@@ -1379,6 +1379,7 @@ async fn test_write_manifest(
         "stable" | "next"
     ));
     assert_eq!(manifest.reader_feature_flags, 0);
+    assert_eq!(manifest.writer_feature_flags, 0);
 
     // Create one with deletions
     dataset.delete("i < 10").await.unwrap();
@@ -1424,6 +1425,8 @@ async fn test_write_manifest(
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            activate_non_reusable_field_ids: false,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1458,6 +1461,59 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_clone_rejects_unknown_writer_requirements() {
+    let source_uri = TempStrDir::default();
+    let shallow_clone_uri = TempStrDir::default();
+    let deep_clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &source_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unknown_writer = dataset.manifest.as_ref().clone();
+    unknown_writer.version += 1;
+    unknown_writer.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_writer,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut source = Dataset::open(&source_uri).await.unwrap();
+    let error = source
+        .shallow_clone(shallow_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    let error = source
+        .deep_clone(deep_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
 }
 
 #[tokio::test]
@@ -1981,6 +2037,9 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
     )
     .await
     .unwrap();
+
+    assert!(dataset.manifest.base_paths.is_empty());
+    assert!(!dataset.manifest.has_managed_blobs());
 
     let clone = dataset
         .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
@@ -3132,6 +3191,35 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
     );
 }
 
+/// `dict:{value}:{index}:false` cannot express a value type whose own logical
+/// string carries ':', so `Schema::try_from` used to panic on the way in rather
+/// than rejecting the write.
+#[tokio::test]
+async fn write_rejects_dictionary_value_type_that_has_no_logical_type() {
+    let values = Decimal128Array::from(vec![Some(100), Some(200), Some(300)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+    let indices = UInt8Array::from(vec![0, 1, 2, 1]);
+    let dictionary = UInt8DictionaryArray::try_new(indices, Arc::new(values)).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        dictionary.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .expect_err("a decimal-valued dictionary has no parseable logical type");
+
+    assert!(matches!(error, Error::Schema { .. }));
+    assert!(error.to_string().contains("does not parse back"));
+}
+
 #[rstest]
 #[tokio::test]
 async fn overwrite_dataset(
@@ -3954,6 +4042,8 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            activate_non_reusable_field_ids: false,
+            tagged_frag_reuse_trim: false,
         },
         dataset.manifest_location.naming_scheme,
         None,

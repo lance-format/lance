@@ -3,7 +3,7 @@
 
 //! FtsIndexExec - Full-text search with MVCC visibility.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -27,8 +27,11 @@ use lance_core::{Error, Result};
 use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
 use super::super::builder::FtsQuery;
-use super::newest_pk_positions;
-use crate::dataset::mem_wal::index::{SearchOptions, search_cross_column};
+use super::{newest_pk_positions, scan_record_batch};
+use crate::dataset::mem_wal::index::{
+    FtsEntry, FtsMemQuery, MemMatches, SearchContext, SearchOptions, search_cross_column,
+};
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -113,18 +116,11 @@ impl FtsIndexExec {
         base_schema: SchemaRef,
         with_row_id: bool,
     ) -> Result<Self> {
-        // Every queried column must resolve an index. A cross-column predicate
-        // is one predicate: a column with no arm is a missing answer rather
-        // than a narrower one.
-        for column in query.columns() {
-            if indexes
-                .get_fts_by_column_and_granularity(column, query.document_granularity)
-                .is_none()
-            {
-                return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{column}'"
-                )));
-            }
+        if !query.is_answered_by(&indexes) {
+            return Err(Error::invalid_input(format!(
+                "no full-text index answers this search over {:?}",
+                query.columns()
+            )));
         }
         let with_doc_index = query.document_granularity.is_list_element();
 
@@ -226,19 +222,17 @@ impl FtsIndexExec {
     fn query_index(&self) -> Result<Vec<FtsHit>> {
         let columns = self.query.columns();
         if columns.len() > 1 {
-            return self.query_across_columns(&columns);
+            return self.query_across_columns();
         }
-        let Some(&column) = columns.first() else {
+        let Some((column, question)) = self.query.index_questions().into_iter().next() else {
             return Err(Error::invalid_input(
                 "full-text search names no column to search".to_string(),
             ));
         };
-        let Some(index) = self
+        let index = self
             .indexes
-            .get_fts_by_column_and_granularity(column, self.query.document_granularity)
-        else {
-            return Ok(vec![]);
-        };
+            .index_answering(column, &question)
+            .ok_or_else(|| declined(column))?;
 
         // The scanner carries the tree the index evaluates, so there is nothing
         // to translate here.
@@ -262,12 +256,22 @@ impl FtsIndexExec {
                 options = options.with_limit(limit);
             }
         }
-        let entries = index.search_with_options(&query_expr, options);
-
-        // Convert to (row_position, element ordinal, score) tuples.
-        Ok(entries
+        let query = FtsMemQuery {
+            expr: query_expr,
+            options,
+            granularity: self.query.document_granularity,
+        };
+        let Some(max_visible) = self.max_readable_row else {
+            return Ok(vec![]);
+        };
+        let Some(MemMatches::Ranked(ranked)) =
+            index.search(&query, &SearchContext::new(max_visible))?
+        else {
+            return Err(declined(column));
+        };
+        Ok(ranked
             .into_iter()
-            .map(|entry| (entry.row_position, entry.doc_index, entry.score))
+            .map(|hit| (hit.position, hit.element, hit.score))
             .collect())
     }
 
@@ -278,25 +282,29 @@ impl FtsIndexExec {
     /// visibility ceiling goes *in* rather than being applied after, so leaves
     /// read from indexes whose tails have advanced differently still meet over
     /// one cut.
-    fn query_across_columns(&self, columns: &[&str]) -> Result<Vec<FtsHit>> {
-        let mut indexes = HashMap::with_capacity(columns.len());
-        for &column in columns {
-            let Some(index) = self
-                .indexes
-                .get_fts_by_column_and_granularity(column, self.query.document_granularity)
-            else {
-                return Err(Error::invalid_input(format!(
-                    "No FTS index found for column '{column}'"
-                )));
+    fn query_across_columns(&self) -> Result<Vec<FtsHit>> {
+        let Some(max_visible) = self.max_readable_row else {
+            return Ok(vec![]);
+        };
+        let options = SearchOptions::new().with_include_tail(self.query.include_tail);
+        let ctx = SearchContext::new(max_visible);
+        Ok(search_cross_column(&self.query.expr, |column, leaf| {
+            let query = FtsMemQuery {
+                expr: leaf.clone(),
+                options: options.clone(),
+                granularity: self.query.document_granularity,
             };
-            indexes.insert(column, index);
-        }
-        Ok(search_cross_column(
-            &self.query.expr,
-            &indexes,
-            self.query.include_tail,
-            self.max_readable_row,
-        )?
+            let index = self
+                .indexes
+                .index_answering(column, &query)
+                .ok_or_else(|| declined(column))?;
+            match index.search(&query, &ctx)? {
+                Some(MemMatches::Ranked(ranked)) => {
+                    Ok(ranked.into_iter().map(FtsEntry::from).collect())
+                }
+                _ => Err(declined(column)),
+            }
+        })?
         .into_iter()
         .map(|entry| (entry.row_position, entry.doc_index, entry.score))
         .collect())
@@ -328,6 +336,7 @@ impl FtsIndexExec {
         let mut all_row_positions: Vec<u64> = Vec::with_capacity(results.len());
         let mut all_doc_indices: Vec<Option<Vec<u32>>> = Vec::with_capacity(results.len());
         let mut all_columns: Vec<Vec<Arc<dyn arrow_array::Array>>> = Vec::new();
+        let mut scan_batches = HashMap::<usize, RecordBatch>::new();
 
         // Initialize column vectors based on first batch's schema
         let first_batch = self.batch_store.get(0);
@@ -343,11 +352,15 @@ impl FtsIndexExec {
             if let Some(batch_range) = self.find_batch(pos as usize)
                 && let Some(stored) = self.batch_store.get(batch_range.batch_id)
             {
+                let data = match scan_batches.entry(batch_range.batch_id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(scan_record_batch(&stored.data)?),
+                };
                 let row_in_batch = (pos as usize - batch_range.start) as u32;
                 let indices = UInt32Array::from(vec![row_in_batch]);
 
                 // Take each column value
-                for (col_idx, col) in stored.data.columns().iter().enumerate() {
+                for (col_idx, col) in data.columns().iter().enumerate() {
                     let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
                     if all_columns.len() <= col_idx {
                         all_columns.push(Vec::new());
@@ -388,7 +401,8 @@ impl FtsIndexExec {
                 let Some(first) = self.batch_store.get(0) else {
                     return Ok(vec![]);
                 };
-                let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+                let data_batch =
+                    RecordBatch::try_new(scan_record_batch(&first.data)?.schema(), final_columns)?;
                 let mask = predicate
                     .evaluate(&data_batch)?
                     .into_array(data_batch.num_rows())?;
@@ -480,14 +494,32 @@ impl FtsIndexExec {
         }
 
         // Add score column
+        let n_hits = all_scores.len();
         final_columns.push(Arc::new(Float32Array::from(all_scores)));
 
         // Apply projection if needed
         let mut projected_columns = if let Some(ref proj_indices) = self.projection {
-            let mut projected: Vec<_> = proj_indices
-                .iter()
-                .map(|&i| final_columns[i].clone())
-                .collect();
+            // Source shape comes from the memtable's own batches; `final_columns`
+            // holds one entry per source column, concatenated across hits.
+            let source_fields = self
+                .batch_store
+                .get(0)
+                .map(|stored| scan_record_batch(&stored.data))
+                .transpose()?
+                .map(|batch| batch.schema().fields().clone());
+            let mut projected: Vec<_> = match source_fields {
+                Some(fields) => take_projected_columns(
+                    &final_columns,
+                    &fields,
+                    proj_indices,
+                    self.output_schema.as_ref(),
+                    n_hits,
+                )?,
+                None => proj_indices
+                    .iter()
+                    .map(|&i| final_columns[i].clone())
+                    .collect(),
+            };
             if self.with_doc_index {
                 projected.push(final_columns[final_columns.len() - 2].clone());
             }
@@ -565,7 +597,8 @@ impl FtsIndexExec {
             )?)
         };
 
-        let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+        let data_batch =
+            RecordBatch::try_new(scan_record_batch(&first.data)?.schema(), final_columns)?;
         let pk_indices = resolve_pk_indices(&data_batch, pk_columns)?;
         let keep = (0..data_batch.num_rows())
             .map(|row| {
@@ -693,7 +726,7 @@ impl ExecutionPlan for FtsIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 
@@ -708,6 +741,14 @@ impl ExecutionPlan for FtsIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
+}
+
+/// The error for a full-text index that declined, while searching, a query it
+/// accepted while planning.
+fn declined(column: &str) -> Error {
+    Error::internal(format!(
+        "the full-text index on '{column}' accepted a search, then did not answer it"
+    ))
 }
 
 #[cfg(test)]

@@ -108,7 +108,10 @@ async fn test_request_wrappers_preserve_prewarmed_index_state() {
         }
         assert!(inverted.prewarmed_query_state_ready(false));
         assert_eq!(
-            inverted.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+            inverted
+                .bm25_stats_for_terms_if_loaded(&terms)
+                .unwrap()
+                .map(|loaded| loaded.stats),
             Some((4, 2, vec![2, 1]))
         );
     }
@@ -207,7 +210,7 @@ async fn write_partition_spanning_many_batches(store: &dyn IndexStore) {
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for i in 0..MANY_BATCH_TOKENS {
         // Zero-padded so tokens are inserted in sorted order, as the set expects.
-        builder.tokens.add(format!("tok{i:05}"));
+        builder.tokens.get_or_add(&format!("tok{i:05}"));
         let doc_id = builder.docs.append(MANY_BATCH_ROW_ID_BASE + i, 1);
         let mut posting_list = PostingListBuilder::new(false);
         posting_list.add(doc_id, PositionRecorder::Count(1));
@@ -284,15 +287,15 @@ async fn test_and_query_skips_partition_missing_required_term() {
     ));
 
     let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder0.tokens.add("alpha".to_owned());
+    builder0.tokens.get_or_add("alpha");
     builder0.posting_lists.push(PostingListBuilder::new(false));
     builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
     builder0.docs.append(100, 1);
     builder0.write(store.as_ref()).await.unwrap();
 
     let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
-    builder1.tokens.add("alpha".to_owned());
-    builder1.tokens.add("beta".to_owned());
+    builder1.tokens.get_or_add("alpha");
+    builder1.tokens.get_or_add("beta");
     builder1.posting_lists.push(PostingListBuilder::new(false));
     builder1.posting_lists.push(PostingListBuilder::new(false));
     builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -340,9 +343,9 @@ async fn test_fuzzy_and_groups_expansions_by_original_position() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("alphi".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("alphi");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
@@ -437,7 +440,7 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token in ["alpha", "alphi", "beta", "beti"] {
-        builder.tokens.add(token.to_owned());
+        builder.tokens.get_or_add(token);
         builder.posting_lists.push(PostingListBuilder::new(false));
     }
     for token_id in 0..4 {
@@ -483,7 +486,7 @@ async fn write_variant_partition(
 ) {
     let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
     for token in variants {
-        builder.tokens.add((*token).to_owned());
+        builder.tokens.get_or_add(token);
         builder.posting_lists.push(PostingListBuilder::new(false));
     }
     for (local_idx, row_id) in row_ids.iter().enumerate() {
@@ -498,19 +501,35 @@ async fn write_pair_partition(
     partition_id: u64,
     documents: &[(&str, &str, u64)],
 ) {
-    let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+    write_pair_partition_with_position(store, partition_id, documents, false).await;
+}
+
+/// [`write_pair_partition`] that, with `with_position`, records each
+/// document's left token at position 0 and its right token at position 1.
+async fn write_pair_partition_with_position(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    documents: &[(&str, &str, u64)],
+    with_position: bool,
+) {
+    let mut builder = InnerBuilder::new(partition_id, with_position, TokenSetFormat::default());
     let mut postings = BTreeMap::<String, PostingListBuilder>::new();
     for (left, right, row_id) in documents {
         let doc_id = builder.docs.append(*row_id, 2);
-        for token in [left, right] {
+        for (position, token) in [left, right].into_iter().enumerate() {
+            let recorder = if with_position {
+                PositionRecorder::Position(vec![position as u32].into())
+            } else {
+                PositionRecorder::Count(1)
+            };
             postings
                 .entry((*token).to_owned())
-                .or_insert_with(|| PostingListBuilder::new(false))
-                .add(doc_id, PositionRecorder::Count(1));
+                .or_insert_with(|| PostingListBuilder::new(with_position))
+                .add(doc_id, recorder);
         }
     }
     for (token, posting) in postings {
-        builder.tokens.add(token);
+        builder.tokens.get_or_add(&token);
         builder.posting_lists.push(posting);
     }
     builder.write(store.as_ref()).await.unwrap();
@@ -636,10 +655,18 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         .prewarm_with_options(&FtsPrewarmOptions::default())
         .await
         .unwrap();
-    let fast =
+    let (fast, token_ids) =
         crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
             .unwrap()
             .unwrap();
+    for (index, token_ids) in indices.iter().zip(&token_ids) {
+        let expected = index
+            .partitions
+            .iter()
+            .flat_map(|partition| terms.iter().map(|term| partition.tokens.get(term)))
+            .collect::<Vec<_>>();
+        assert_eq!(token_ids.as_ref(), expected, "ids must be partition-major");
+    }
     let mut async_stats = Vec::with_capacity(indices.len());
     for index in &indices {
         async_stats.push(index.bm25_stats_for_terms(&terms, None).await.unwrap());
@@ -687,6 +714,7 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         .unwrap(),
     );
     assert_eq!(fast_prepared.scorer().token_docs, fast.token_docs);
+    assert!(fast_prepared.term_ids().is_some());
     let slow_prepared = Arc::new(
         crate::scalar::inverted::prepare_bm25_query(
             &indices,
@@ -698,10 +726,210 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         .await
         .unwrap(),
     );
+    assert!(
+        slow_prepared.term_ids().is_none(),
+        "an injected scorer resolves no dictionary ids"
+    );
     assert_eq!(
         prepared_results(&indices, fast_prepared, params.clone()).await,
         prepared_results(&indices, slow_prepared, params).await,
         "the synchronous scorer must preserve final score bits"
+    );
+}
+
+async fn prepared_documents(
+    index: &InvertedIndex,
+    prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+    params: FtsSearchParams,
+    operator: Operator,
+) -> Vec<(u64, u32)> {
+    let mut results = index
+        .bm25_search_prepared_documents(
+            prepared,
+            Arc::new(params),
+            operator,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|document| (document.row_id, document.score.0.to_bits()))
+        .collect::<Vec<_>>();
+    results.sort_unstable();
+    results
+}
+
+/// Load and fully prewarm an index. The index only holds a weak cache
+/// reference, so the caller keeps the returned cache alive.
+async fn load_prewarmed_index(
+    store: Arc<LanceIndexStore>,
+    partition_ids: Vec<u64>,
+    params: InvertedIndexParams,
+) -> (Arc<InvertedIndex>, LanceCache) {
+    write_test_metadata(&store, partition_ids, params).await;
+    let cache = LanceCache::with_capacity(1 << 20);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    index
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap();
+    (index, cache)
+}
+
+/// The same prepared statistics without recorded dictionary ids, so every
+/// partition looks its tokens up again.
+fn without_term_ids(
+    prepared: &crate::scalar::inverted::PreparedBm25Query,
+) -> Arc<crate::scalar::inverted::PreparedBm25Query> {
+    Arc::new(crate::scalar::inverted::PreparedBm25Query::from_parts(
+        prepared.tokens().clone(),
+        prepared.scorer().clone(),
+        true,
+    ))
+}
+
+#[rstest::rstest]
+// The repeated "alpha" maps two query positions to one unique term.
+#[case::and(&["alpha", "beta", "alpha"], Operator::And, 0, None, vec![0, 8])]
+#[case::or(&["alpha", "beta", "alpha"], Operator::Or, 0, None, vec![0, 1, 2, 3, 4, 5, 6, 8])]
+#[case::phrase(&["alpha", "beta"], Operator::And, 0, Some(0), vec![0])]
+// "alphx" expands to "alpha" and "alphb" at one query position.
+#[case::fuzzy_and(&["alphx", "beta"], Operator::And, 1, None, vec![0, 2, 6, 8])]
+#[case::fuzzy_or(&["alphx", "beta"], Operator::Or, 1, None, vec![0, 1, 2, 3, 4, 5, 6, 7, 8])]
+#[case::fuzzy_phrase(&["alphx", "beta"], Operator::And, 1, Some(0), vec![0, 2, 6])]
+#[tokio::test]
+async fn test_prepared_term_ids_search_like_dictionary_lookups(
+    #[case] query: &[&str],
+    #[case] operator: Operator,
+    #[case] edit_distance: u32,
+    #[case] phrase_slop: Option<u32>,
+    #[case] expected_rows: Vec<u64>,
+) {
+    let dir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    // Partition 0 holds both expansions of "alphx", so fuzzy leaves union two
+    // postings at one position; row 8 has both terms but not as a phrase.
+    // AND and phrase leaves must skip partition 1 (no "beta") and partition 2
+    // (neither expansion). Partition 3 holds only "alphb": exact leaves skip
+    // it, fuzzy leaves must not.
+    let partitions: [&[(&str, &str, u64)]; 4] = [
+        &[
+            ("alpha", "beta", 0),
+            ("alpha", "gamma", 1),
+            ("alphb", "beta", 2),
+            ("beta", "alpha", 8),
+        ],
+        &[("alpha", "gamma", 3)],
+        &[("beta", "delta", 4), ("beta", "gamma", 5)],
+        &[("alphb", "beta", 6), ("alphb", "gamma", 7)],
+    ];
+    for (partition_id, documents) in partitions.into_iter().enumerate() {
+        write_pair_partition_with_position(&store, partition_id as u64, documents, true).await;
+    }
+    let (index, _cache) = load_prewarmed_index(
+        store,
+        vec![0, 1, 2, 3],
+        InvertedIndexParams::default().with_position(true),
+    )
+    .await;
+    let params = FtsSearchParams::new()
+        .with_limit(Some(10))
+        .with_fuzziness(Some(edit_distance))
+        .with_phrase_slop(phrase_slop);
+    let tokens = Tokens::new(
+        query.iter().map(|token| (*token).to_owned()).collect(),
+        DocType::Text,
+    );
+    let prepared = crate::scalar::inverted::prepare_bm25_query(
+        std::slice::from_ref(&index),
+        tokens,
+        &params,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(prepared.term_ids().is_some());
+
+    let resolved =
+        prepared_documents(&index, Arc::new(prepared.clone()), params.clone(), operator).await;
+    let looked_up = prepared_documents(&index, without_term_ids(&prepared), params, operator).await;
+    assert_eq!(resolved, looked_up);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>(),
+        expected_rows
+    );
+}
+
+#[tokio::test]
+async fn test_prepared_term_ids_apply_only_to_their_segment() {
+    let prepared_dir = TempObjDir::default();
+    let prepared_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        prepared_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(&prepared_store, 0, &[("alpha", "beta", 0)]).await;
+    let (prepared_index, _prepared_cache) =
+        load_prewarmed_index(prepared_store, vec![0], InvertedIndexParams::default()).await;
+
+    // "aaa" shifts every id, so reusing the prepared segment's id for "alpha"
+    // here would match the "aaa beta" document instead.
+    let other_dir = TempObjDir::default();
+    let other_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        other_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(
+        &other_store,
+        0,
+        &[("aaa", "beta", 10), ("alpha", "beta", 11)],
+    )
+    .await;
+    let other_index = load_test_index(other_store, vec![0]).await;
+
+    let prepared = crate::scalar::inverted::prepare_bm25_query(
+        std::slice::from_ref(&prepared_index),
+        Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+        &FtsSearchParams::new().with_limit(Some(10)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(prepared.term_ids().is_some());
+
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let resolved = prepared_documents(
+        &other_index,
+        Arc::new(prepared.clone()),
+        params.clone(),
+        Operator::And,
+    )
+    .await;
+    let looked_up = prepared_documents(
+        &other_index,
+        without_term_ids(&prepared),
+        params,
+        Operator::And,
+    )
+    .await;
+    assert_eq!(resolved, looked_up);
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>(),
+        vec![11]
     );
 }
 
@@ -1259,9 +1487,9 @@ async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("alphi".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("alphi");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
@@ -1328,8 +1556,8 @@ async fn test_grouped_scoring_keeps_exact_winner_outside_proxy_window(#[case] op
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("common".to_owned());
-    builder.tokens.add("rare".to_owned());
+    builder.tokens.get_or_add("common");
+    builder.tokens.get_or_add("rare");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     for doc_id in 0..3 {
@@ -1382,9 +1610,9 @@ async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
 
     let num_docs = BLOCK_SIZE * 2 + 4;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("alphi".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("alphi");
+    builder.tokens.get_or_add("beta");
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
     builder.posting_lists.push(PostingListBuilder::new(false));
@@ -1456,8 +1684,8 @@ async fn test_phrase_query_reads_legacy_per_doc_positions() {
         TokenSetFormat::default(),
         InvertedListFormatVersion::V1,
     );
-    builder.tokens.add("hello".to_owned());
-    builder.tokens.add("world".to_owned());
+    builder.tokens.get_or_add("hello");
+    builder.tokens.get_or_add("world");
     builder
         .posting_lists
         .push(PostingListBuilder::new_with_posting_tail_codec(

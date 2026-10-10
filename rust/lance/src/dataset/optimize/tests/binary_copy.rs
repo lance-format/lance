@@ -971,7 +971,8 @@ async fn test_can_use_binary_copy_reject_deletions() {
 #[case(LanceFileVersion::V2_3)]
 #[tokio::test]
 async fn test_binary_copy_compaction_with_complex_schema(#[case] version: LanceFileVersion) {
-    do_test_binary_copy_compaction_with_complex_schema(version).await;
+    // Boxed for CI clippy `large_futures`: the compaction future grew past 16 KiB.
+    Box::pin(do_test_binary_copy_compaction_with_complex_schema(version)).await;
 }
 
 #[test]

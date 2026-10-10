@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! VectorIndexExec - HNSW vector search with MVCC visibility.
+//! VectorIndexExec - a vector search answered by a memtable index, with MVCC
+//! visibility.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
+use arrow_array::{Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -23,13 +24,15 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::VectorQuery;
+use crate::dataset::mem_wal::index::{MemMatches, SearchContext};
+use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance column name in output.
 pub const DISTANCE_COLUMN: &str = "_distance";
 
-/// ExecutionPlan node that queries the in-memory HNSW vector index with
-/// MVCC visibility.
+/// ExecutionPlan node that answers a vector search from the memtable index
+/// planning chose, with MVCC visibility.
 pub struct VectorIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
@@ -70,7 +73,7 @@ impl VectorIndexExec {
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing data
-    /// * `indexes` - Index registry with HNSW vector indexes
+    /// * `indexes` - The memtable's indexes, one of which answers `query`
     /// * `query` - Vector query parameters
     /// * `readable_count` - Exclusive count of batch positions this scan may read
     /// * `projection` - Optional column indices to project
@@ -86,10 +89,12 @@ impl VectorIndexExec {
         with_row_id: bool,
     ) -> Result<Self> {
         let column = &query.column;
-        if indexes.get_hnsw_by_column(column).is_none() {
+        if indexes
+            .index_answering(column, &query.mem_query()?)
+            .is_none()
+        {
             return Err(Error::invalid_input(format!(
-                "No HNSW vector index found for column '{}'",
-                column
+                "no index on column '{column}' answers this vector search"
             )));
         }
 
@@ -146,36 +151,36 @@ impl VectorIndexExec {
         }
     }
 
-    /// Query the HNSW index and return matching rows with exact distances.
-    ///
-    /// Distances are exact because the in-memory HNSW is backed by FLAT
-    /// (uncompressed) vectors; no refine step is needed.
+    /// Search the index planning chose and return `(distance, position)` pairs.
+    /// Planning chose an index that accepted this query, so none now, or a
+    /// decline, is an error.
     fn query_index(&self) -> Result<Vec<(f32, u64)>> {
-        let Some(index) = self.indexes.get_hnsw_by_column(&self.query.column) else {
-            return Ok(vec![]);
-        };
-
         let Some(max_readable_row) = self.compute_max_readable_row() else {
             return Ok(vec![]);
         };
-
-        // Normalize the query vector to a single-row FixedSizeListArray.
-        let query_array = self.query.query_vector.as_ref();
-        let fsl = if let Some(fsl) = query_array.as_fixed_size_list_opt() {
-            fsl.clone()
-        } else {
-            let values = self.query.query_vector.clone();
-            let dim = values.len() as i32;
-            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
-            FixedSizeListArray::try_new(field, dim, values, None).map_err(|e| {
-                Error::invalid_input(format!(
-                    "Failed to wrap vector query into FixedSizeListArray (dim={}): {}",
-                    dim, e
+        let query = self.query.mem_query()?;
+        let column = &self.query.column;
+        let index = self
+            .indexes
+            .index_answering(column, &query)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "no index on '{column}' answers the vector search planning routed to it"
                 ))
-            })?
+            })?;
+        let Some(MemMatches::Ranked(matches)) =
+            index.search(&query, &SearchContext::new(max_readable_row))?
+        else {
+            return Err(Error::internal(format!(
+                "the index on '{column}' accepted a vector search, then did not answer it"
+            )));
         };
-
-        let mut results = index.search(&fsl, self.query.k, self.query.ef, max_readable_row)?;
+        // A row past the readable count may still fail its append.
+        let mut results: Vec<(f32, u64)> = matches
+            .into_iter()
+            .filter(|m| m.position <= max_readable_row)
+            .map(|m| (m.score, m.position))
+            .collect();
 
         if self.query.distance_lower_bound.is_some() || self.query.distance_upper_bound.is_some() {
             results.retain(|&(dist, _)| {
@@ -228,6 +233,7 @@ impl VectorIndexExec {
 
         for (batch_id, rows_with_dist) in batches_data {
             if let Some(stored) = self.batch_store.get(batch_id) {
+                let data = scan_record_batch(&stored.data)?;
                 let rows: Vec<u32> = rows_with_dist.iter().map(|&(r, _, _)| r as u32).collect();
                 let distances: Vec<f32> = rows_with_dist.iter().map(|&(_, d, _)| d).collect();
                 let row_positions: Vec<u64> =
@@ -235,8 +241,7 @@ impl VectorIndexExec {
 
                 let indices = arrow_array::UInt32Array::from(rows);
 
-                let mut columns: Vec<Arc<dyn arrow_array::Array>> = stored
-                    .data
+                let mut columns: Vec<Arc<dyn arrow_array::Array>> = data
                     .columns()
                     .iter()
                     .map(|col| arrow_select::take::take(col.as_ref(), &indices, None).unwrap())
@@ -246,9 +251,15 @@ impl VectorIndexExec {
                 columns.push(Arc::new(Float32Array::from(distances)));
 
                 // Apply projection if needed (excluding distance column which is always included)
+                let source_schema = data.schema();
                 let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
+                    let mut projected: Vec<_> = take_projected_columns(
+                        &columns,
+                        source_schema.fields(),
+                        proj_indices,
+                        self.output_schema.as_ref(),
+                        row_positions.len(),
+                    )?;
                     // Always include distance as last column
                     projected.push(columns.last().unwrap().clone());
                     projected
@@ -349,7 +360,7 @@ impl ExecutionPlan for VectorIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 

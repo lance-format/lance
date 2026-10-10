@@ -54,21 +54,20 @@ fn dot_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
-    let x_chunks = to.chunks_exact(LANES);
-    let y_chunks = from.chunks_exact(LANES);
-    let sum = if x_chunks.remainder().is_empty() {
+    let (x_chunks, x_remainder) = to.as_chunks::<LANES>();
+    let (y_chunks, y_remainder) = from.as_chunks::<LANES>();
+    let sum = if x_remainder.is_empty() {
         Output::zero()
     } else {
-        x_chunks
-            .remainder()
+        x_remainder
             .iter()
-            .zip(y_chunks.remainder().iter())
+            .zip(y_remainder.iter())
             .map(|(&x, &y)| x.as_() * y.as_())
             .sum::<Output>()
     };
     // Use known size to allow LLVM to kick in auto-vectorization.
     let mut sums = [Output::zero(); LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             sums[i] += x[i].as_() * y[i].as_();
         }
@@ -381,7 +380,7 @@ impl BatchOperation for DotBatch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let product = _mm256_mul_ps(key_values, vector_values);
                 f(acc, unsafe { hsum256_ps(product) })
@@ -405,7 +404,7 @@ impl BatchOperation for DotBatch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let product = _mm256_mul_ps(key_values, vector_values);
                 f(acc, unsafe { hsum256_ps(product) })
