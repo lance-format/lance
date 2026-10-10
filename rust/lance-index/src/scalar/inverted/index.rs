@@ -285,6 +285,7 @@ struct V3TermPlan {
     term_idx: usize,
     block_start: usize,
     blocks: Arc<Vec<V3BlockSkipMeta>>,
+    cached_posting: Option<Arc<PostingList>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2210,7 +2211,7 @@ impl InvertedPartition {
             .collect::<Vec<_>>();
         if self
             .inverted_list
-            .v3_posting_lists_cached(&cache_token_ids)
+            .v3_posting_lists_cached(&cache_token_ids, params.phrase_slop.is_some())
             .await
         {
             return Ok(None);
@@ -2310,6 +2311,14 @@ impl InvertedPartition {
                     .inverted_list
                     .v3_block_metadata(token_id, metrics)
                     .await?;
+                let cached_posting = if v3_bypass_posting_list_cache_enabled() {
+                    None
+                } else {
+                    self.inverted_list
+                        .index_cache
+                        .get_with_key(&PostingListKey { token_id })
+                        .await
+                };
                 Ok(V3TermPlan {
                     token_id,
                     token,
@@ -2319,6 +2328,7 @@ impl InvertedPartition {
                     term_idx,
                     block_start: self.inverted_list.posting_list_range(token_id).start,
                     blocks,
+                    cached_posting,
                 })
             })
             .buffered(16)
@@ -2388,17 +2398,38 @@ impl InvertedPartition {
             if batch_windows.is_empty() {
                 break;
             }
-            let block_rows = batch_windows
+            let batch_blocks = batch_windows
                 .iter()
                 .flat_map(|window| {
                     term_plans.iter().flat_map(move |term| {
                         term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
                     })
                 })
+                .collect::<Vec<_>>();
+            visited_blocks.extend(batch_blocks.iter().map(|block| block.block_row));
+            // A posting-only prewarm must still load phrase positions lazily,
+            // without fetching the already resident posting payload again.
+            for block in &batch_blocks {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    decoded_blocks.entry(block.block_row)
+                    && let Some(PostingList::Compressed(posting)) =
+                        term_plans[block.term_idx].cached_posting.as_deref()
+                {
+                    let docs_in_block = (posting.length as usize)
+                        .saturating_sub(block.block_idx * BLOCK_SIZE)
+                        .min(BLOCK_SIZE);
+                    entry.insert(PostingListReader::decode_v3_block(
+                        posting.blocks.value(block.block_idx),
+                        docs_in_block,
+                        posting.posting_tail_codec,
+                    )?);
+                }
+            }
+            let block_rows = batch_blocks
+                .iter()
                 .filter(|block| !decoded_blocks.contains_key(&block.block_row))
                 .map(|block| block.block_row)
                 .collect::<Vec<_>>();
-            visited_blocks.extend(block_rows.iter().copied());
             let block_batches = self
                 .inverted_list
                 .v3_payload_block_batches(&block_rows, metrics)
@@ -3782,7 +3813,7 @@ impl PostingListReader {
         concat_batches(batches[0].schema_ref(), batches.iter()).map_err(Error::from)
     }
 
-    async fn v3_posting_lists_cached(&self, token_ids: &[u32]) -> bool {
+    async fn v3_posting_lists_cached(&self, token_ids: &[u32], with_position: bool) -> bool {
         if !self.is_v3_block_row_layout() || v3_bypass_posting_list_cache_enabled() {
             return false;
         }
@@ -3792,6 +3823,15 @@ impl PostingListReader {
                 .get_with_key(&PostingListKey { token_id })
                 .await
                 .is_none()
+            {
+                return false;
+            }
+            if with_position
+                && self
+                    .index_cache
+                    .get_with_key(&PositionKey { token_id })
+                    .await
+                    .is_none()
             {
                 return false;
             }
@@ -4010,19 +4050,27 @@ impl PostingListReader {
         }
         block.extend_from_slice(payload);
 
+        Self::decode_v3_block(&block, docs_in_block, self.posting_tail_codec)
+    }
+
+    fn decode_v3_block(
+        block: &[u8],
+        docs_in_block: usize,
+        posting_tail_codec: PostingTailCodec,
+    ) -> Result<V3DecodedPostingBlock> {
         let mut doc_ids = Vec::with_capacity(docs_in_block);
         let mut freqs = Vec::with_capacity(docs_in_block);
-        if is_remainder_block {
+        if docs_in_block != BLOCK_SIZE {
             decompress_posting_remainder(
-                &block,
+                block,
                 docs_in_block,
-                self.posting_tail_codec,
+                posting_tail_codec,
                 &mut doc_ids,
                 &mut freqs,
             );
         } else {
             let mut buffer = Box::new([0u32; BLOCK_SIZE]);
-            decompress_posting_block(&block, &mut buffer, &mut doc_ids, &mut freqs);
+            decompress_posting_block(block, &mut buffer, &mut doc_ids, &mut freqs);
         }
         if doc_ids.len() != docs_in_block || freqs.len() != docs_in_block {
             return Err(Error::index(format!(
