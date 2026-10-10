@@ -2572,10 +2572,10 @@ impl InvertedPartition {
                     // contained in one original window. Exclude scored regions
                     // without retaining every visited document id.
                     .filter(|window| {
-                        !scored_windows
+                        scored_windows
                             .range(..=window.first_doc_id)
                             .next_back()
-                            .is_some_and(|(_, last)| *last >= window.last_doc_id)
+                            .is_none_or(|(_, last)| *last < window.last_doc_id)
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
