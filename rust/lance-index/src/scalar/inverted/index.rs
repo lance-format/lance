@@ -19,7 +19,6 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::array::{FixedSizeListBuilder, Float32Builder};
-use arrow::compute::concat_batches;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
@@ -2617,20 +2616,18 @@ impl InvertedPartition {
             .filter(|block| !decoded.contains_key(&block.block_row))
             .map(|block| block.block_row)
             .collect::<Vec<_>>();
-        let batches = self
-            .inverted_list
-            .v3_payload_block_batches(&rows, metrics)
-            .await?;
+        let payloads = self.inverted_list.v3_payload_blocks(&rows, metrics).await?;
         for block in blocks {
             if let std::collections::hash_map::Entry::Vacant(entry) = decoded.entry(block.block_row)
             {
-                let batch = batches.get(&block.block_row).ok_or_else(|| {
+                let payload = payloads.get(&block.block_row).ok_or_else(|| {
                     Error::internal(format!("missing V3 payload block row {}", block.block_row))
                 })?;
                 entry.insert(self.inverted_list.decode_v3_payload_block(
                     terms[block.term_idx].token_id,
                     block.block_idx,
-                    batch,
+                    &terms[block.term_idx].blocks[block.block_idx],
+                    payload,
                 )?);
             }
         }
@@ -3775,7 +3772,7 @@ impl PostingListReader {
         let payload_ranges = self.v3_payload_ranges_from_skip(block_range, &skip_batch)?;
         if v3_block_row_cache_enabled() {
             return self
-                .posting_batch_v3_cached(&payload_ranges, with_position)
+                .posting_batch_v3_cached(&payload_ranges, &skip_batch, with_position)
                 .await;
         }
         self.read_v3_payload_ranges(&payload_ranges, with_position)
@@ -3811,69 +3808,46 @@ impl PostingListReader {
     async fn posting_batch_v3_cached(
         &self,
         payload_ranges: &[Range<usize>],
+        skip_batch: &RecordBatch,
         with_position: bool,
     ) -> Result<RecordBatch> {
         let row_ids = row_ids_from_ranges(payload_ranges);
-        if row_ids.is_empty() {
-            return self
-                .read_v3_payload_ranges(payload_ranges, with_position)
-                .await;
-        }
-        let mut row_batches = Vec::with_capacity(row_ids.len());
-        let mut missing_rows = Vec::new();
-        for row_id in &row_ids {
-            let key = V3PostingBlockKey {
-                block_row: *row_id,
-                with_position,
-            };
-            if let Some(batch) = self.index_cache.get_with_key(&key).await {
-                row_batches.push(Some((*batch).clone()));
-            } else {
-                missing_rows.push(*row_id);
-                row_batches.push(None);
-            }
-        }
-
-        if !missing_rows.is_empty() {
-            let cache_missed_rows = !v3_bypass_posting_list_cache_enabled();
-            let row_to_slot = row_ids
-                .iter()
-                .enumerate()
-                .map(|(slot, row_id)| (*row_id, slot))
-                .collect::<HashMap<_, _>>();
-            let missing_ranges = ranges_from_sorted_rows(&missing_rows);
-            let missing_batch = self
-                .read_v3_payload_ranges(&missing_ranges, with_position)
+        let payloads = self
+            .v3_payload_blocks(&row_ids, &NoOpMetricsCollector)
+            .await?;
+        let mut fields = vec![
+            Field::new(POSTING_COL, DataType::LargeBinary, false),
+            Field::new(FIRST_DOC_ID_COL, DataType::UInt32, false),
+            Field::new(BLOCK_MAX_SCORE_COL, DataType::Float32, false),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(LargeBinaryArray::from_iter_values(
+                row_ids.iter().map(|row| payloads[row].as_ref()),
+            )),
+            skip_batch[FIRST_DOC_ID_COL].clone(),
+            skip_batch[BLOCK_MAX_SCORE_COL].clone(),
+        ];
+        if with_position && matches!(self.positions_layout, PositionsLayout::SharedStream(_)) {
+            let positions = self
+                .v3_position_block_payloads(&row_ids, &NoOpMetricsCollector)
                 .await?;
-            let mut offset = 0;
-            for range in missing_ranges {
-                for row_id in range {
-                    let row_batch = missing_batch.slice(offset, 1).shrink_to_fit()?;
-                    offset += 1;
-                    if cache_missed_rows {
-                        self.index_cache
-                            .insert_with_key(
-                                &V3PostingBlockKey {
-                                    block_row: row_id,
-                                    with_position,
-                                },
-                                Arc::new(row_batch.clone()),
-                            )
-                            .await;
-                    }
-                    let slot = *row_to_slot.get(&row_id).ok_or_else(|| {
-                        Error::internal(format!("missing V3 block row {row_id} has no output slot"))
-                    })?;
-                    row_batches[slot] = Some(row_batch);
-                }
-            }
+            fields.push(Field::new(
+                COMPRESSED_POSITION_COL,
+                DataType::LargeBinary,
+                false,
+            ));
+            columns.push(Arc::new(LargeBinaryArray::from_iter_values(
+                row_ids.iter().map(|row| positions[row].as_ref()),
+            )));
         }
-
-        let batches = row_batches
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::internal("V3 block-row cache assembly missed rows"))?;
-        concat_batches(batches[0].schema_ref(), batches.iter()).map_err(Error::from)
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                skip_batch.schema().metadata().clone(),
+            )),
+            columns,
+        )
+        .map_err(Error::from)
     }
 
     async fn v3_posting_lists_cached(&self, token_ids: &[u32], with_position: bool) -> bool {
@@ -3934,11 +3908,11 @@ impl PostingListReader {
         Ok(skip)
     }
 
-    async fn v3_payload_block_batches(
+    async fn v3_payload_blocks(
         &self,
         rows: &[usize],
         metrics: &dyn MetricsCollector,
-    ) -> Result<HashMap<usize, RecordBatch>> {
+    ) -> Result<HashMap<usize, bytes::Bytes>> {
         let mut rows = rows.to_vec();
         rows.sort_unstable();
         rows.dedup();
@@ -3946,15 +3920,12 @@ impl PostingListReader {
             return Ok(HashMap::new());
         }
 
-        let mut batches = HashMap::with_capacity(rows.len());
+        let mut payloads = HashMap::with_capacity(rows.len());
         let mut missing_rows = Vec::new();
         for row in rows {
-            let key = V3PostingBlockKey {
-                block_row: row,
-                with_position: false,
-            };
-            if let Some(batch) = self.index_cache.get_with_key(&key).await {
-                batches.insert(row, (*batch).clone());
+            let key = V3PostingBlockKey { block_row: row };
+            if let Some(payload) = self.index_cache.get_with_key(&key).await {
+                payloads.insert(row, (*payload).clone());
             } else {
                 missing_rows.push(row);
             }
@@ -3966,34 +3937,31 @@ impl PostingListReader {
             metrics.record_fts_payload_read_ranges(missing_ranges.len());
             let missing_batch = self
                 .v3_block_reader()?
-                .read_ranges(
-                    &missing_ranges,
-                    Some(&[POSTING_COL, FIRST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
-                )
+                .read_ranges(&missing_ranges, Some(&[POSTING_COL]))
                 .await?;
             let cache_missed_rows = !v3_bypass_posting_list_cache_enabled();
+            let postings = missing_batch[POSTING_COL].as_binary::<i64>();
             let mut offset = 0;
             for range in missing_ranges {
                 for row in range {
-                    let row_batch = missing_batch.slice(offset, 1).shrink_to_fit()?;
+                    // Copy one compressed payload so a small cache entry cannot
+                    // retain the entire fetched Arrow page or its schema.
+                    let payload = bytes::Bytes::copy_from_slice(postings.value(offset));
                     offset += 1;
                     if cache_missed_rows {
                         self.index_cache
                             .insert_with_key(
-                                &V3PostingBlockKey {
-                                    block_row: row,
-                                    with_position: false,
-                                },
-                                Arc::new(row_batch.clone()),
+                                &V3PostingBlockKey { block_row: row },
+                                Arc::new(payload.clone()),
                             )
                             .await;
                     }
-                    batches.insert(row, row_batch);
+                    payloads.insert(row, payload);
                 }
             }
         }
 
-        Ok(batches)
+        Ok(payloads)
     }
 
     async fn v3_position_block_payloads(
@@ -4054,14 +4022,9 @@ impl PostingListReader {
         &self,
         token_id: u32,
         block_idx: usize,
-        batch: &RecordBatch,
+        metadata: &V3BlockSkipMeta,
+        payload: &[u8],
     ) -> Result<V3DecodedPostingBlock> {
-        if batch.num_rows() != 1 {
-            return Err(Error::index(format!(
-                "V3 payload block decode expects 1 row, got {}",
-                batch.num_rows()
-            )));
-        }
         let PostingMetadata::V3 {
             block_starts,
             lengths,
@@ -4096,13 +4059,8 @@ impl PostingListReader {
             )));
         }
 
-        let payload = batch[POSTING_COL].as_binary::<i64>().value(0);
-        let first_doc_id = batch[FIRST_DOC_ID_COL]
-            .as_primitive::<UInt32Type>()
-            .value(0);
-        let block_max_score = batch[BLOCK_MAX_SCORE_COL]
-            .as_primitive::<Float32Type>()
-            .value(0);
+        let first_doc_id = metadata.first_doc_id;
+        let block_max_score = metadata.block_max_score;
         let is_remainder_block = docs_in_block != BLOCK_SIZE;
         let mut block = Vec::with_capacity(payload.len() + 8);
         block.extend_from_slice(&block_max_score.to_le_bytes());
@@ -4620,8 +4578,7 @@ impl PostingListReader {
         // Chunking bounds transient memory even when the cache is much smaller
         // than the selected blocks.
         for rows in selected_rows.chunks(4096) {
-            self.v3_payload_block_batches(rows, &NoOpMetricsCollector)
-                .await?;
+            self.v3_payload_blocks(rows, &NoOpMetricsCollector).await?;
             if with_position {
                 self.v3_position_block_payloads(rows, &NoOpMetricsCollector)
                     .await?;
@@ -5296,19 +5253,13 @@ impl CacheKey for PostingMetadataKey {
 #[derive(Debug, Clone)]
 struct V3PostingBlockKey {
     block_row: usize,
-    with_position: bool,
 }
 
 impl CacheKey for V3PostingBlockKey {
-    type ValueType = RecordBatch;
+    type ValueType = bytes::Bytes;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!(
-            "v3-posting-block-{}-{}",
-            self.block_row,
-            if self.with_position { "pos" } else { "nopos" }
-        )
-        .into()
+        format!("v3-posting-block-{}", self.block_row).into()
     }
 
     fn type_name() -> &'static str {
