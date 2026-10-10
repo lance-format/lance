@@ -36,6 +36,10 @@ use super::{U8_U32_ACCUMULATOR_MAX_LEN, assert_equal_lengths};
 ///
 /// The result is the low 32 bits of the exact dot product. Use
 /// [`dot_u8_u64`] when the full result is required.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn dot_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
@@ -153,6 +157,10 @@ fn select_backend() -> DotU8Fn {
 ///
 /// The result is the low 32 bits of the exact dot product. Use
 /// [`dot_u8_u64`] when the full result is required.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
