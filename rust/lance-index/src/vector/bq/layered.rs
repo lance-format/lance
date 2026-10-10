@@ -288,7 +288,8 @@ pub enum EntryColumns {
     All,
     /// Only the columns the index's resident store does not keep: the codes
     /// and the estimator bounds (see [`plane_entry_columns`]). Every read
-    /// attaches copies of the store's rows of the others, so the scored
+    /// attaches the store's rows of the others, views of the store for a
+    /// whole plane or partition and copies for gathered rows, so the scored
     /// batch is the one an `All` entry holds. Only an index whose small
     /// columns are resident keeps such entries.
     Codes,
