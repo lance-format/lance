@@ -69,6 +69,7 @@ pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 roaring.workspace = true
+hex.workspace = true
 tokio.workspace = true
 url.workspace = true
 rand.workspace = true

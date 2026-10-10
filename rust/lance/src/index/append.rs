@@ -55,6 +55,26 @@ pub struct IndexMergeResults<'a> {
     pub files: Vec<lance_table::format::IndexFile>,
 }
 
+impl IndexMergeResults<'_> {
+    /// The new segment as manifest metadata, named and keyed like `template`
+    /// (the segment it replaces or extends).
+    pub fn into_metadata(self, template: &IndexMetadata) -> IndexMetadata {
+        IndexMetadata {
+            uuid: self.new_uuid,
+            name: template.name.clone(),
+            fields: template.fields.clone(),
+            covering_fields: template.covering_fields.clone(),
+            dataset_version: self.new_dataset_version,
+            fragment_bitmap: Some(self.new_fragment_bitmap),
+            index_details: Some(Arc::new(self.new_index_details)),
+            index_version: self.new_index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(self.files),
+        }
+    }
+}
+
 async fn build_stable_row_id_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
@@ -487,7 +507,7 @@ async fn rebuild_scalar_segment(
 /// The deletion check is conservative (any current deletion vector on a covered
 /// fragment), so a segment built after those deletions may be rewritten as a
 /// harmless no-op; it never leaves a stale segment behind (PR #7359).
-fn select_segments_to_merge<'a>(
+pub fn select_segments_to_merge<'a>(
     dataset: &Dataset,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
@@ -786,40 +806,9 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     object_store.exists(&index_file).await
 }
 
-/// Merge in-inflight unindexed data, with a specific number of previous indices
-/// into a new index, to improve the query performance.
-///
-/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
-///
-/// Returns
-/// -------
-/// - the UUID of the new index
-/// - merged indices,
-/// - Bitmap of the fragments that covered in the newly created index.
-pub async fn merge_indices<'a>(
-    dataset: Arc<Dataset>,
-    old_indices: &[&'a IndexMetadata],
-    options: &OptimizeOptions,
-) -> Result<Option<IndexMergeResults<'a>>> {
-    if old_indices.is_empty() {
-        return Err(Error::index(
-            "Append index: no previous index found".to_string(),
-        ));
-    };
-
-    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    Box::pin(merge_indices_with_unindexed_frags(
-        dataset,
-        old_indices,
-        &unindexed,
-        options,
-    ))
-    .await
-}
-
 /// Whether a rebuild of `params` should expect the definition alone, because
 /// the column does not hold the vectors its quantizer needs.
-async fn expects_definition_only(
+pub async fn expects_definition_only(
     dataset: &Dataset,
     field_path: &str,
     params: &VectorIndexParams,
@@ -854,7 +843,7 @@ async fn rebuild_vector_segment(
 ///
 /// Happens when an index is created against an empty table, or one without
 /// enough rows to justify training it.
-fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
+pub fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
     let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
         .fragment_bitmap
@@ -984,6 +973,148 @@ fn fresh_vector_segment_result<'a>(
     })
 }
 
+/// The column path an index is maintained under: the keyed field's path, or
+/// for a full-text index the canonical path its document granularity resolves
+/// to (returned alongside, for the inverted merge).
+pub async fn index_field_path(
+    dataset: &Dataset,
+    metadata: &IndexMetadata,
+) -> Result<(
+    String,
+    Option<crate::index::scalar::inverted::ResolvedFtsField>,
+)> {
+    let field_id = *metadata.fields.first().ok_or_else(|| {
+        Error::index(format!(
+            "Append index: segment {} is missing field ids",
+            metadata.uuid
+        ))
+    })?;
+    let raw_field_path = dataset.schema().field_path(field_id)?;
+    let details = super::scalar::fetch_index_details(dataset, &raw_field_path, metadata).await?;
+    let resolved_fts = if details.type_url.ends_with("InvertedIndexDetails") {
+        let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
+            .map_err(|error| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {error}"
+                ))
+            })?;
+        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
+            details.document_granularity,
+        )?;
+        Some(crate::index::scalar::inverted::resolve_fts_field_by_id(
+            dataset.schema(),
+            field_id,
+            granularity,
+        )?)
+    } else {
+        None
+    };
+    let field_path = resolved_fts
+        .as_ref()
+        .map(|resolved| resolved.canonical_path.clone())
+        .unwrap_or(raw_field_path);
+    Ok((field_path, resolved_fts))
+}
+
+/// Build one new vector segment over `fragments`, encoded against the model
+/// (IVF centroids and quantizer) of `reference`, without touching any existing
+/// segment. The reference is opened by the caller, so it need not be in the
+/// manifest.
+pub async fn append_vector_segment<'a>(
+    dataset: &Dataset,
+    field_path: &str,
+    column_nullable: bool,
+    reference_metadata: &IndexMetadata,
+    reference_index: &Arc<dyn lance_index::vector::VectorIndex>,
+    fragments: &[Fragment],
+    options: &OptimizeOptions,
+) -> Result<IndexMergeResults<'a>> {
+    let reference_logical_index = LogicalVectorIndex::try_new(
+        reference_metadata.name.clone(),
+        field_path.to_string(),
+        vec![(reference_metadata.clone(), reference_index.clone())],
+    )?;
+    let reference_ivf_view = reference_logical_index.as_ivf()?;
+    let new_data_stream =
+        scan_vector_fragments(dataset, field_path, column_nullable, fragments).await?;
+    let mut append_options = options.clone();
+    append_options.num_indices_to_merge = Some(0);
+    append_options.retrain = false;
+    let (new_uuid, indices_merged, files) = optimize_vector_indices(
+        dataset.clone(),
+        Some(new_data_stream),
+        field_path,
+        &reference_ivf_view,
+        &append_options,
+    )
+    .boxed()
+    .await?;
+    if indices_merged != 0 {
+        return Err(Error::index(format!(
+            "Optimize vector index append unexpectedly merged {indices_merged} existing segments"
+        )));
+    }
+    Ok(IndexMergeResults {
+        new_uuid,
+        removed_indices: Vec::new(),
+        new_fragment_bitmap: fragments.iter().map(|frag| frag.id as u32).collect(),
+        new_dataset_version: dataset.manifest.version,
+        new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?.version(),
+        new_index_details: reference_metadata
+            .index_details
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(vector_index_details_default),
+        files,
+    })
+}
+
+/// Split vector segments into the live ones and the dormant ones.
+///
+/// Segments with stored rows (raw coverage) but no live coverage (e.g. a
+/// definition retained through a full rewrite) are dormant. With stable row
+/// ids their stored postings still share ids with live rows, so merging them
+/// would resurrect stale vectors; they may only be replaced. A born-empty
+/// segment (deferred build) has no stored rows and stays mergeable.
+///
+/// Under a tagged history an empty bitmap does not mean empty pages: an
+/// in-place rewrite withdraws a segment's whole coverage and leaves its files.
+/// Such a segment is dormant too, rebuilt from the live fragments; only a
+/// definition without files (the deferred build) stays mergeable there.
+/// Elsewhere an index initialized on an empty table has files and no rows and
+/// keeps merging as before.
+///
+/// On a tagged table a segment's stored bitmap is provenance: its rows
+/// translate to the coverage the tagged reader derives for it, so THAT is its
+/// live coverage. A segment the reader excludes (derived coverage empty) is
+/// the dormant one.
+///
+/// `tagged_coverage` is [`tagged_segment_coverage`] of `segments`.
+pub fn partition_dormant_vector_segments<'a>(
+    dataset: &Dataset,
+    segments: &[&'a IndexMetadata],
+    tagged_coverage: Option<&HashMap<Uuid, RoaringBitmap>>,
+) -> (Vec<&'a IndexMetadata>, Vec<&'a IndexMetadata>) {
+    segments.iter().copied().partition(|idx| {
+        let has_stored_rows = match tagged_coverage {
+            Some(_) => !is_definition_only_segment(idx),
+            None => idx
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| !bitmap.is_empty()),
+        };
+        let has_live_coverage = match tagged_coverage {
+            Some(coverage) => coverage
+                .get(&idx.uuid)
+                .is_some_and(|bitmap| !bitmap.is_empty()),
+            None => idx
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .is_none_or(|bitmap| !bitmap.is_empty()),
+        };
+        !has_stored_rows || has_live_coverage
+    })
+}
+
 /// Merge a list of provided unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
 pub async fn merge_indices_with_unindexed_frags<'a>(
@@ -1006,33 +1137,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             old_indices[0].fields[0]
         )))?;
 
-    let raw_field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
-    let first_details =
-        super::scalar::fetch_index_details(dataset.as_ref(), &raw_field_path, old_indices[0])
-            .await?;
-    let resolved_fts = if first_details.type_url.ends_with("InvertedIndexDetails") {
-        let details =
-            lance_index::pbold::InvertedIndexDetails::decode(first_details.value.as_slice())
-                .map_err(|error| {
-                    Error::io(format!(
-                        "failed to decode InvertedIndexDetails payload: {error}"
-                    ))
-                })?;
-        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
-            details.document_granularity,
-        )?;
-        Some(crate::index::scalar::inverted::resolve_fts_field_by_id(
-            dataset.schema(),
-            old_indices[0].fields[0],
-            granularity,
-        )?)
-    } else {
-        None
-    };
-    let field_path = resolved_fts
-        .as_ref()
-        .map(|resolved| resolved.canonical_path.clone())
-        .unwrap_or(raw_field_path);
+    let (field_path, resolved_fts) = index_field_path(dataset.as_ref(), old_indices[0]).await?;
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
@@ -1051,44 +1156,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
-            // Segments with stored rows (raw coverage) but no live coverage
-            // (e.g. a definition retained through a full rewrite) are dormant.
-            // With stable row ids their stored postings still share ids with
-            // live rows, so merging them would resurrect stale vectors; they
-            // may only be replaced. A born-empty segment (deferred build) has
-            // no stored rows and stays mergeable.
-            // Under a tagged history an empty bitmap does not mean empty
-            // pages: an in-place rewrite withdraws a segment's whole coverage
-            // and leaves its files. Such a segment is dormant too, rebuilt
-            // from the live fragments; only a definition without files (the
-            // deferred build) stays mergeable there. Elsewhere an index
-            // initialized on an empty table has files and no rows and keeps
-            // merging as before.
-            // On a tagged table a segment's stored bitmap is provenance: its
-            // rows translate to the coverage the tagged reader derives for
-            // it, so THAT is its live coverage. A segment the reader excludes
-            // (derived coverage empty) is the dormant one.
             let tagged_coverage =
                 tagged_segment_coverage(dataset.as_ref(), old_indices, None).await?;
-            let (live_segments, dormant_segments): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
-                old_indices.iter().copied().partition(|idx| {
-                    let has_stored_rows = match &tagged_coverage {
-                        Some(_) => !is_definition_only_segment(idx),
-                        None => idx
-                            .fragment_bitmap
-                            .as_ref()
-                            .is_some_and(|bitmap| !bitmap.is_empty()),
-                    };
-                    let has_live_coverage = match &tagged_coverage {
-                        Some(coverage) => coverage
-                            .get(&idx.uuid)
-                            .is_some_and(|bitmap| !bitmap.is_empty()),
-                        None => idx
-                            .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                            .is_none_or(|bitmap| !bitmap.is_empty()),
-                    };
-                    !has_stored_rows || has_live_coverage
-                });
+            let (live_segments, dormant_segments) = partition_dormant_vector_segments(
+                dataset.as_ref(),
+                old_indices,
+                tagged_coverage.as_ref(),
+            );
             if !dormant_segments.is_empty() && !live_segments.is_empty() && !options.retrain {
                 // Optimize the live segments as usual; the dormant segments
                 // are superseded by whatever that produces.
@@ -1210,50 +1284,17 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             logical_index.name()
                         ))
                     })?;
-                let reference_logical_index = LogicalVectorIndex::try_new(
-                    logical_index.name().to_string(),
-                    field_path.clone(),
-                    vec![(reference_metadata.clone(), reference_index.clone())],
-                )?;
-                let reference_ivf_view = reference_logical_index.as_ivf()?;
-                let new_data_stream = scan_vector_fragments(
+                return append_vector_segment(
                     dataset.as_ref(),
                     &field_path,
                     column.nullable,
+                    reference_metadata,
+                    reference_index,
                     unindexed,
+                    options,
                 )
-                .await?;
-                let mut append_options = options.clone();
-                append_options.num_indices_to_merge = Some(0);
-                append_options.retrain = false;
-                let (new_uuid, indices_merged, files) = optimize_vector_indices(
-                    dataset.as_ref().clone(),
-                    Some(new_data_stream),
-                    &field_path,
-                    &reference_ivf_view,
-                    &append_options,
-                )
-                .boxed()
-                .await?;
-                if indices_merged != 0 {
-                    return Err(Error::index(format!(
-                        "Optimize vector index append unexpectedly merged {indices_merged} existing segments"
-                    )));
-                }
-                return Ok(Some(IndexMergeResults {
-                    new_uuid,
-                    removed_indices: Vec::new(),
-                    new_fragment_bitmap: base_unindexed_bitmap,
-                    new_dataset_version: dataset.manifest.version,
-                    new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
-                        .version(),
-                    new_index_details: reference_metadata
-                        .index_details
-                        .as_deref()
-                        .cloned()
-                        .unwrap_or_else(vector_index_details_default),
-                    files,
-                }));
+                .await
+                .map(Some);
             }
 
             // Append is a steady-state no-op when every fragment is already

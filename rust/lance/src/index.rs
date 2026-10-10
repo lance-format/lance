@@ -86,12 +86,12 @@ pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 pub mod mem_wal;
+pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
 pub mod vector;
 
-use self::append::merge_indices;
 use self::frag_reuse_with_stable_row_ids::{
     has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
     warn_about_indices_hidden_by_frag_reuse,
@@ -100,7 +100,7 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
@@ -1557,6 +1557,18 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
     }
 
     Ok(())
+}
+
+/// Whether optimize can fold several segments of this kind into one without
+/// rescanning the table: the kinds the single-process optimize merges rather
+/// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
+/// Inverted (`InvertedIndex::merge_segments`).
+pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
+    segment_has_vector_details(segment)
+        || segment_has_btree_details(segment)
+        || segment_has_bitmap_details(segment)
+        || segment_has_ngram_details(segment)
+        || segment_has_inverted_details(segment)
 }
 
 /// Detect vector segments while preserving the legacy pre-details fallback.
@@ -3228,182 +3240,6 @@ impl DatasetIndexExt for Dataset {
         return Ok(None);
     }
 
-    #[instrument(skip_all)]
-
-    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
-        let dataset = Arc::new(self.clone());
-        // Grouped from the complete list so a name's segments are all accounted
-        // for. A segment this build cannot read is still coverage, and merging
-        // against a group whose coverage is only partly visible would commit a
-        // new segment claiming fragments an existing one already holds.
-        let indices = load_all_indices(self).await?;
-
-        // Under a history this build cannot interpret the reader lists no
-        // user segment, so every fragment looks unindexed and each optimize
-        // would rebuild the whole table only to have the result excluded
-        // again. Trim, superseded pruning and remap refuse such a history;
-        // optimize leaves the table alone the same way.
-        if let Some(entry) = indices
-            .iter()
-            .find(|idx| lance_table::system_index::frag_reuse::metadata::is_tagged(idx))
-            && frag_reuse::decode_frag_reuse_ledger(self, entry)
-                .await?
-                .has_unsupported_transitions()
-        {
-            log::warn!(
-                "Skipping index optimization: the tagged fragment reuse history carries \
-                 transitions this build cannot interpret; upgrade to a newer version of Lance"
-            );
-            return Ok(());
-        }
-
-        let indices_to_optimize = options
-            .index_names
-            .as_ref()
-            .map(|names| names.iter().collect::<HashSet<_>>());
-        let name_to_indices = indices
-            .iter()
-            .filter(|idx| {
-                indices_to_optimize
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&idx.name))
-                    && !is_system_index(idx)
-            })
-            .map(|idx| (idx.name.clone(), idx))
-            .into_group_map();
-
-        let mut new_indices = vec![];
-        let mut removed_indices = vec![];
-        for (name, deltas) in name_to_indices.iter() {
-            if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
-                let type_url = index
-                    .index_details
-                    .as_ref()
-                    .map(|details| details.type_url.as_str())
-                    .unwrap_or("<legacy>");
-                log::warn!(
-                    "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
-                    index.name,
-                    type_url
-                );
-                continue;
-            }
-
-            // Optimizing a covered index would republish its declaration on a
-            // segment rebuilt without the carried values: `scan_vector_fragments`
-            // projects the keyed field and `_rowid` only, and the scalar merges
-            // reconstruct value plus row id.
-            //
-            // What decides is the caller's intent, not whether this group is
-            // stale. An unfiltered `optimize_indices()` is a table-wide
-            // maintenance request, and erroring aborts the loop before the
-            // replacements accumulated for the other groups are committed -- so
-            // one index this build cannot rebuild would leave every other index
-            // on the table stale. Skip it with a warning instead.
-            //
-            // A caller that listed this index in `index_names` asked for it
-            // specifically, so refuse out loud. The loop is already filtered by
-            // that list, so reaching here with it set means this group was named.
-            if let Some(covered) = deltas
-                .iter()
-                .find(|index| !index.covering_fields.is_empty())
-            {
-                if options.index_names.is_none() {
-                    log::warn!(
-                        "Skipping index '{}': it declares covering fields {:?}, \
-                         which no index builder writes or preserves yet.",
-                        covered.name,
-                        covered.covering_fields,
-                    );
-                    continue;
-                }
-                return Err(Error::index(format!(
-                    "Optimizing index '{}' is not supported: it declares \
-                     covering fields {:?}, which no index builder writes or \
-                     preserves yet",
-                    covered.name, covered.covering_fields,
-                )));
-            }
-
-            // Optimizing a name means replacing its segments with one that
-            // covers their union, which this build cannot compute when it
-            // cannot read one of them: the merged segment would overlap the
-            // segment left behind, and `Dataset::validate` calls that
-            // corruption. Leave the whole name to a build that can read it.
-            if let Some(max_supported_version) =
-                deltas.iter().find_map(|idx| unsupported_index_version(idx))
-            {
-                log::warn!(
-                    "Index {} has a segment newer than version {}, which this build cannot read; \
-                     skipping its optimization",
-                    name,
-                    max_supported_version,
-                );
-                continue;
-            }
-            // Scalar indices have no rebalance concept, so skip them entirely
-            // when every fragment is already covered and the caller hasn't
-            // asked for retrain or an explicit delta merge. Vector indices
-            // fall through and use a rebalance-aware no-op check inside
-            // merge_indices_with_unindexed_frags.
-            if !options.retrain
-                && options.num_indices_to_merge.is_none_or(|n| n == 0)
-                && index_group_is_scalar(self, deltas)
-                && index_group_has_no_unindexed(self, deltas)
-            {
-                continue;
-            }
-
-            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
-            else {
-                continue;
-            };
-
-            let last_idx = deltas.last().expect("Delta indices should not be empty");
-            let new_idx = IndexMetadata {
-                uuid: res.new_uuid,
-                name: last_idx.name.clone(), // Keep the same name
-                fields: last_idx.fields.clone(),
-                covering_fields: last_idx.covering_fields.clone(),
-                dataset_version: res.new_dataset_version,
-                fragment_bitmap: Some(res.new_fragment_bitmap),
-                index_details: Some(Arc::new(res.new_index_details)),
-                index_version: res.new_index_version,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None, // New merged index file locates in the cloned dataset.
-                files: Some(res.files),
-            };
-            removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            new_indices.push(new_idx);
-        }
-
-        // A no-work optimize still has to commit on a table that requires
-        // catch-up. Coverage is derived at commit time, so an index that
-        // already spans the table records its position only if there is a
-        // commit to record it on -- and that is the ordinary case after a
-        // remap or a compaction that advanced a generation without changing
-        // fragments. Returning early there leaves the position missing forever
-        // and the repair rescheduling itself.
-        if new_indices.is_empty() && !self.mem_wal_catch_up_would_advance(&indices)? {
-            return Ok(());
-        }
-
-        let transaction = TransactionBuilder::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
-        )
-        .transaction_properties(options.transaction_properties.clone())
-        .build();
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
-    }
-
     async fn index_statistics(&self, index_name: &str) -> Result<String> {
         let metadatas = self.load_indices_by_name(index_name).await?;
         if metadatas.is_empty() {
@@ -3443,6 +3279,155 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+
+    #[instrument(skip_all)]
+
+    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
+        // Grouped from the complete list so a name's segments are all accounted
+        // for. A segment this build cannot read is still coverage, and merging
+        // against a group whose coverage is only partly visible would commit a
+        // new segment claiming fragments an existing one already holds.
+        let indices = load_all_indices(self).await?;
+
+        // The stages a distributed optimize runs across workers, run here in
+        // turn: without row bounds every index is one task that does the
+        // whole single-process optimize, and every merge passes it through.
+        let Some(plan) = optimize::plan_optimize_indices_or_skip(self, &indices, options).await?
+        else {
+            return Ok(());
+        };
+        let mut built = Vec::with_capacity(plan.tasks.len());
+        for task in &plan.tasks {
+            built.extend(
+                task.execute_with_progress(self, options.progress.clone())
+                    .await?,
+            );
+        }
+        let mut merged = Vec::with_capacity(plan.merges.len());
+        for merge in &plan.merges {
+            merged.extend(
+                merge
+                    .execute_with_progress(self, &built, options.progress.clone())
+                    .await?,
+            );
+        }
+
+        // Without results this still commits when MemWAL catch-up needs it.
+        optimize::commit_optimize_indices(self, merged, options).await
+    }
+}
+
+/// The indices an optimize pass may rewrite: each entry is one index name
+/// with all of its segments, in name order.
+///
+/// An index this build cannot rewrite is skipped with a warning: an index type
+/// it does not recognize, a segment newer than it reads, a covered index, or a
+/// scalar index with nothing to do. A covered index the caller named in
+/// `index_names` is refused instead.
+pub(crate) fn optimizable_indices<'a>(
+    dataset: &Dataset,
+    indices: &'a [IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<Vec<(String, Vec<&'a IndexMetadata>)>> {
+    let indices_to_optimize = options
+        .index_names
+        .as_ref()
+        .map(|names| names.iter().collect::<HashSet<_>>());
+    let name_to_indices = indices
+        .iter()
+        .filter(|idx| {
+            indices_to_optimize
+                .as_ref()
+                .is_none_or(|names| names.contains(&idx.name))
+                && !is_system_index(idx)
+        })
+        .map(|idx| (idx.name.clone(), idx))
+        .into_group_map();
+
+    let mut optimizable = Vec::with_capacity(name_to_indices.len());
+    for (name, deltas) in name_to_indices {
+        if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
+            let type_url = index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str())
+                .unwrap_or("<legacy>");
+            log::warn!(
+                "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
+                index.name,
+                type_url
+            );
+            continue;
+        }
+
+        // Optimizing a covered index would republish its declaration on a
+        // segment rebuilt without the carried values: `scan_vector_fragments`
+        // projects the keyed field and `_rowid` only, and the scalar merges
+        // reconstruct value plus row id.
+        //
+        // What decides is the caller's intent, not whether this group is
+        // stale. An unfiltered `optimize_indices()` is a table-wide
+        // maintenance request, and erroring aborts the loop before the
+        // replacements accumulated for the other groups are committed -- so
+        // one index this build cannot rebuild would leave every other index
+        // on the table stale. Skip it with a warning instead.
+        //
+        // A caller that listed this index in `index_names` asked for it
+        // specifically, so refuse out loud. The loop is already filtered by
+        // that list, so reaching here with it set means this group was named.
+        if let Some(covered) = deltas
+            .iter()
+            .find(|index| !index.covering_fields.is_empty())
+        {
+            if options.index_names.is_none() {
+                log::warn!(
+                    "Skipping index '{}': it declares covering fields {:?}, \
+                     which no index builder writes or preserves yet.",
+                    covered.name,
+                    covered.covering_fields,
+                );
+                continue;
+            }
+            return Err(Error::index(format!(
+                "Optimizing index '{}' is not supported: it declares \
+                 covering fields {:?}, which no index builder writes or \
+                 preserves yet",
+                covered.name, covered.covering_fields,
+            )));
+        }
+
+        // Optimizing a name means replacing its segments with one that
+        // covers their union, which this build cannot compute when it
+        // cannot read one of them: the merged segment would overlap the
+        // segment left behind, and `Dataset::validate` calls that
+        // corruption. Leave the whole name to a build that can read it.
+        if let Some(max_supported_version) =
+            deltas.iter().find_map(|idx| unsupported_index_version(idx))
+        {
+            log::warn!(
+                "Index {} has a segment newer than version {}, which this build cannot read; \
+                 skipping its optimization",
+                name,
+                max_supported_version,
+            );
+            continue;
+        }
+        // Scalar indices have no rebalance concept, so skip them entirely
+        // when every fragment is already covered and the caller hasn't
+        // asked for retrain or an explicit delta merge. Vector indices
+        // fall through and use a rebalance-aware no-op check inside
+        // merge_indices_with_unindexed_frags.
+        if !options.retrain
+            && options.num_indices_to_merge.is_none_or(|n| n == 0)
+            && index_group_is_scalar(dataset, &deltas)
+            && index_group_has_no_unindexed(dataset, &deltas)
+        {
+            continue;
+        }
+        optimizable.push((name, deltas));
+    }
+    optimizable.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(optimizable)
 }
 
 fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
