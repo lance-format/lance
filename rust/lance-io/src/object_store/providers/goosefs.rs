@@ -485,7 +485,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         Ok(ObjectStore {
             scheme: "goosefs".to_string(),
             inner: opendal_store,
-            local_dir_operations: None,
+            directory_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,

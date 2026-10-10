@@ -53,6 +53,7 @@ reqsign-google = { version = "3.0.3", optional = true }
 io-uring = { workspace = true }
 
 [dev-dependencies]
+serde_json.workspace = true
 criterion.workspace = true
 lance-testing.workspace = true
 test-log.workspace = true

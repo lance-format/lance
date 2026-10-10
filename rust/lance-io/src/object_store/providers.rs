@@ -219,6 +219,10 @@ impl ObjectStoreRegistry {
             store.block_size = block_size;
         }
 
+        let has_native_listing = store
+            .directory_operations
+            .as_ref()
+            .is_some_and(|operations| operations.has_native_listing(&store.inner));
         store.inner = store.inner.traced();
 
         // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
@@ -232,6 +236,13 @@ impl ObjectStoreRegistry {
 
         // Always wrap with IO tracking
         store.inner = store.io_tracker.wrap("", store.inner);
+        // Built-in decorators preserve listings; custom wrappers must remain authoritative.
+        if has_native_listing
+            && params.object_store_wrapper.is_none()
+            && let Some(operations) = &mut store.directory_operations
+        {
+            operations.native_listing_store = Some(Arc::downgrade(&store.inner));
+        }
 
         Ok(Arc::new(store))
     }

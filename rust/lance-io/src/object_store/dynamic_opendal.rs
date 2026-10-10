@@ -16,8 +16,8 @@ use object_store::{
 };
 use tokio::sync::RwLock;
 
-use crate::object_store::StorageOptionsAccessor;
 use crate::object_store::opendal_store::OpendalStore;
+use crate::object_store::{DirectoryOperations, ObjectStore, StorageOptionsAccessor};
 use lance_core::Result;
 
 type NormalizeConfigFn = fn(&HashMap<String, String>) -> Result<HashMap<String, String>>;
@@ -130,6 +130,16 @@ impl DynamicOpenDalStore {
 impl fmt::Display for DynamicOpenDalStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DynamicOpenDalStore({})", self.name)
+    }
+}
+
+#[async_trait::async_trait]
+impl DirectoryOperations for DynamicOpenDalStore {
+    async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()> {
+        self.current_store()
+            .await?
+            .remove_dir_all(path, store)
+            .await
     }
 }
 
@@ -254,9 +264,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use object_store::ObjectStoreExt as _;
     use opendal::{Operator, services::Memory};
 
     use super::*;
+    use crate::object_store::DirectoryRemoval;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
 
     #[tokio::test]
@@ -292,6 +304,26 @@ mod tests {
             .expect("second store should reuse cache");
 
         assert!(Arc::ptr_eq(&first, &second));
+        let dynamic = Arc::new(store);
+        let (mut object_store, _) = ObjectStore::from_uri("memory://").await.unwrap();
+        let object_store_mut = Arc::get_mut(&mut object_store).unwrap();
+        object_store_mut.inner = dynamic.clone();
+        object_store_mut.directory_operations = Some(DirectoryRemoval {
+            operations: dynamic,
+            native_listing_store: Some(Arc::downgrade(&object_store_mut.inner)),
+        });
+        first
+            .put(
+                &Path::from("dataset/file"),
+                Bytes::from_static(b"test").into(),
+            )
+            .await
+            .unwrap();
+        object_store.remove_dir_all("dataset").await.unwrap();
+        assert!(matches!(
+            first.head(&Path::from("dataset/file")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[test]
