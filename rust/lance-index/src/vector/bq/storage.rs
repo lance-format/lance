@@ -14,7 +14,8 @@ use std::sync::{
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
@@ -58,7 +59,7 @@ use crate::vector::bq::transform::{
     SCALE_FACTORS_COLUMN,
 };
 use crate::vector::bq::{
-    RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
+    RQRotationType, layered_stats, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
     validate_rq_num_bits,
 };
 use crate::vector::graph::{OrderedFloat, OrderedNode};
@@ -633,8 +634,17 @@ impl RabitQuantizationStorage {
                  Rebuild the index."
             )));
         }
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+        // Columns are looked up by name and checked, so that a batch missing
+        // one, such as a code-only cache entry read without its resident
+        // columns, is an error rather than a panic.
+        let row_ids = required_column(&batch, ROW_ID)?
+            .as_primitive_opt::<UInt64Type>()
+            .ok_or_else(|| invalid_column_type(ROW_ID, "uint64"))?
+            .clone();
+        let codes = required_column(&batch, RABIT_CODE_COLUMN)?
+            .as_fixed_size_list_opt()
+            .ok_or_else(|| invalid_column_type(RABIT_CODE_COLUMN, "a fixed-size list"))?
+            .clone();
         // `rotated_dim() == 0` means the metadata never recorded a code
         // dimension, so the width check below could only ever report that the
         // column needs 0 bytes. Reject up front with the real cause.
@@ -658,18 +668,21 @@ impl RabitQuantizationStorage {
                 expected_code_bytes
             )));
         }
-        let add_factors = batch[ADD_FACTORS_COLUMN]
-            .as_primitive::<Float32Type>()
-            .clone();
-        let scale_factors = batch[SCALE_FACTORS_COLUMN]
-            .as_primitive::<Float32Type>()
-            .clone();
+        let factors = |name: &str| -> Result<Float32Array> {
+            Ok(required_column(&batch, name)?
+                .as_primitive_opt::<Float32Type>()
+                .ok_or_else(|| invalid_column_type(name, "float32"))?
+                .clone())
+        };
+        let add_factors = factors(ADD_FACTORS_COLUMN)?;
+        let scale_factors = factors(SCALE_FACTORS_COLUMN)?;
         // Full precision preserves native binary pruning regardless of how
         // the ex codes are stored. Projected prefixes remove these factors and
         // use their own estimator-difference bounds instead.
         let error_factors = batch
             .column_by_name(ERROR_FACTORS_COLUMN)
-            .map(|factors| factors.as_primitive::<Float32Type>().clone());
+            .map(|_| factors(ERROR_FACTORS_COLUMN))
+            .transpose()?;
         let ex_bits = rabit_ex_bits(metadata.num_bits)?;
         let mut batch = batch;
         let mut ex_codes = None;
@@ -726,6 +739,15 @@ impl RabitQuantizationStorage {
             return Err(Error::invalid_input(
                 "RabitQ low plane requires layered metadata",
             ));
+        }
+        // Codes a file stores unpacked or in the legacy sequential ex layout
+        // are rewritten below on every construction, including each one
+        // from a cache entry that kept them as stored.
+        let repacks_ex = ex_bits != 0
+            && scope == PlaneScope::All
+            && repacks_sequential_ex_codes(&batch, rotated_dim, ex_bits);
+        if !metadata.packed || repacks_ex {
+            layered_stats::counters().storage_construct_repacks.incr();
         }
         if ex_bits != 0 && scope == PlaneScope::SignOnlyForFull {
             // The ex planes are gathered per query; see `ExRows`.
@@ -2842,6 +2864,23 @@ fn maybe_pack_ex_codes(
     }
 }
 
+/// Whether legacy sequential ex-code rows of `seq_codes`' width are already
+/// in the blocked layout, so they are used as stored.
+fn sequential_rows_are_blocked(seq_codes: &FixedSizeListArray, dim: usize, ex_bits: u8) -> bool {
+    sequential_matches_blocked(ex_bits)
+        && seq_codes.value_length() as usize == blocked_ex_code_bytes(dim, ex_bits)
+}
+
+/// Whether loading the ex codes of `batch` repacks rows: it holds only the
+/// legacy sequential column, in a layout the blocked one does not match.
+fn repacks_sequential_ex_codes(batch: &RecordBatch, dim: usize, ex_bits: u8) -> bool {
+    batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_none()
+        && batch
+            .column_by_name(RABIT_EX_CODE_COLUMN)
+            .and_then(|codes| codes.as_fixed_size_list_opt())
+            .is_some_and(|codes| !sequential_rows_are_blocked(codes, dim, ex_bits))
+}
+
 /// Bring legacy sequential ex codes into the blocked kernel layout: rows are
 /// repacked, except for the widths whose layouts agree byte-for-byte (then
 /// the column is used as stored).
@@ -2850,9 +2889,7 @@ fn blocked_ex_codes_from_sequential(
     dim: usize,
     ex_bits: u8,
 ) -> Result<FixedSizeListArray> {
-    if sequential_matches_blocked(ex_bits)
-        && seq_codes.value_length() as usize == blocked_ex_code_bytes(dim, ex_bits)
-    {
+    if sequential_rows_are_blocked(seq_codes, dim, ex_bits) {
         return Ok(seq_codes.clone());
     }
     let seq_code_len = seq_codes.value_length() as usize;
@@ -2869,6 +2906,56 @@ fn blocked_ex_codes_from_sequential(
         UInt8Array::from(blocked_values),
         blocked_code_len as i32,
     )?)
+}
+
+/// Column `name` of a batch a storage is built from.
+fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef> {
+    batch.column_by_name(name).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "RabitQ storage batch missing column {name}; it has {:?}",
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>()
+        ))
+    })
+}
+
+fn invalid_column_type(name: &str, expected: &str) -> Error {
+    Error::invalid_input(format!("RabitQ storage column {name} must be {expected}"))
+}
+
+/// The code columns of a code-only cache entry in the form storages use:
+/// sign codes packed and ex codes in the blocked layout, rewritten here once
+/// when the entry is read from the file rather than on every construction
+/// from it (see `storage_construct_repacks`). A storage built from such an
+/// entry takes `metadata` with `packed` set. Other columns are kept, and a
+/// file whose codes are stored packed and blocked, as the index builder
+/// writes them, is kept whole.
+pub(crate) fn normalize_entry_codes(
+    batch: RecordBatch,
+    metadata: &RabitQuantizationMetadata,
+) -> Result<RecordBatch> {
+    let mut batch = batch;
+    if !metadata.packed
+        && let Some(codes) = batch.column_by_name(RABIT_CODE_COLUMN)
+    {
+        let codes = codes
+            .as_fixed_size_list_opt()
+            .ok_or_else(|| invalid_column_type(RABIT_CODE_COLUMN, "a fixed-size list"))?;
+        let packed = Arc::new(pack_codes(codes));
+        batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, packed)?;
+    }
+    let ex_bits = rabit_ex_bits(metadata.num_bits)?;
+    if ex_bits != 0
+        && batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
+        && batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_none()
+    {
+        batch = load_blocked_ex_codes(batch, metadata.rotated_dim(), metadata.num_bits)?.0;
+    }
+    Ok(batch)
 }
 
 /// Load the ex-code planes of an index batch. A layered `1 + 4 + 4` batch
@@ -5929,6 +6016,155 @@ mod tests {
             64
         );
         assert!(stored_batch.column_by_name(ERROR_FACTORS_COLUMN).is_some());
+    }
+
+    /// A storage built from codes stored packed and blocked, as the index
+    /// builder writes them and cache entries keep them, uses them as stored.
+    /// Unpacked sign codes and sequential ex codes are rewritten, and
+    /// counted, on every construction.
+    #[test]
+    fn test_storage_construct_does_not_repack() {
+        const ROWS: usize = 50;
+        const CONSTRUCTIONS: u64 = 3;
+        // 6 ex bits: the sequential and blocked row layouts differ.
+        const NUM_BITS: u8 = 7;
+        let codes = make_test_codes(ROWS, 64);
+        let code_dim = codes.value_length() as usize * 8;
+        let ex_bits = rabit_ex_bits(NUM_BITS).unwrap();
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = NUM_BITS;
+        assert!(!metadata.packed);
+        let file_batch =
+            make_test_batch_with_ex(codes, make_test_ex_codes(ROWS, code_dim, NUM_BITS));
+        assert!(repacks_sequential_ex_codes(&file_batch, code_dim, ex_bits));
+
+        let repacks = || layered_stats::counters().storage_construct_repacks.get();
+        let before = repacks();
+        let construct = |batch: &RecordBatch, metadata: &RabitQuantizationMetadata| {
+            RabitQuantizationStorage::try_from_batch(
+                batch.clone(),
+                metadata,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap()
+        };
+        for _ in 1..CONSTRUCTIONS {
+            construct(&file_batch, &metadata);
+        }
+        let storage = construct(&file_batch, &metadata);
+        // Other tests construct storages concurrently: only a lower bound holds.
+        assert!(repacks() - before >= CONSTRUCTIONS);
+
+        let cached = storage.to_batches().unwrap().next().unwrap();
+        assert!(storage.metadata().packed);
+        assert!(!repacks_sequential_ex_codes(&cached, code_dim, ex_bits));
+        let rebuilt = construct(&cached, storage.metadata());
+        let rebuilt_batch = rebuilt.to_batches().unwrap().next().unwrap();
+        assert_eq!(rebuilt_batch, cached);
+        for column in [RABIT_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_COLUMN] {
+            let values_ptr = |batch: &RecordBatch| {
+                batch[column]
+                    .as_fixed_size_list()
+                    .values()
+                    .to_data()
+                    .buffers()[0]
+                    .as_ptr()
+            };
+            assert_eq!(
+                values_ptr(&rebuilt_batch),
+                values_ptr(&cached),
+                "{column} was rewritten"
+            );
+        }
+
+        // A code-only cache entry keeps the codes normalized once, when it
+        // is read from the file: every storage built from it, with packed
+        // metadata, holds the storage built from the file's codes and uses
+        // the entry's codes as they are.
+        let values_ptr = |batch: &RecordBatch, column: &str| {
+            batch[column]
+                .as_fixed_size_list()
+                .values()
+                .to_data()
+                .buffers()[0]
+                .as_ptr()
+        };
+        let normalized = normalize_entry_codes(file_batch, &metadata).unwrap();
+        assert!(!repacks_sequential_ex_codes(&normalized, code_dim, ex_bits));
+        let mut packed = metadata;
+        packed.packed = true;
+        for _ in 0..CONSTRUCTIONS {
+            let from_entry = construct(&normalized, &packed);
+            let entry_batch = from_entry.to_batches().unwrap().next().unwrap();
+            assert_eq!(entry_batch, cached);
+            for column in [RABIT_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_COLUMN] {
+                assert_eq!(
+                    values_ptr(&entry_batch, column),
+                    values_ptr(&normalized, column),
+                    "{column} was rewritten"
+                );
+            }
+        }
+        // Codes stored packed and blocked are kept as they are.
+        let kept = normalize_entry_codes(cached.clone(), &packed).unwrap();
+        for column in [RABIT_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_COLUMN] {
+            assert_eq!(
+                values_ptr(&kept, column),
+                values_ptr(&cached, column),
+                "{column}"
+            );
+        }
+    }
+
+    /// A batch missing a column a storage needs, as a code-only cache entry
+    /// that was not attached to its resident columns would, or holding one
+    /// of the wrong type, is an error.
+    #[test]
+    fn test_storage_batch_missing_columns_is_an_error() {
+        let codes = make_test_codes(50, 64);
+        let metadata = make_test_metadata(codes.value_length() as usize * 8);
+        let batch = make_test_batch(codes);
+        for column in [
+            ROW_ID,
+            RABIT_CODE_COLUMN,
+            ADD_FACTORS_COLUMN,
+            SCALE_FACTORS_COLUMN,
+        ] {
+            let error = RabitQuantizationStorage::try_from_batch(
+                batch.drop_column(column).unwrap(),
+                &metadata,
+                DistanceType::L2,
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains(column), "{error}");
+        }
+        let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .map(|(field, column)| {
+                if field.name() == ADD_FACTORS_COLUMN {
+                    let integers: ArrayRef = Arc::new(UInt64Array::from(vec![0u64; column.len()]));
+                    (
+                        Field::new(ADD_FACTORS_COLUMN, DataType::UInt64, true),
+                        integers,
+                    )
+                } else {
+                    (field.as_ref().clone(), column.clone())
+                }
+            })
+            .unzip();
+        let wrong_type =
+            RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap();
+        let error =
+            RabitQuantizationStorage::try_from_batch(wrong_type, &metadata, DistanceType::L2, None)
+                .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(ADD_FACTORS_COLUMN), "{error}");
     }
 
     #[test]

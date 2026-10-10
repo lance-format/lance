@@ -25,8 +25,10 @@ pub mod layered_stats;
 #[cfg(test)]
 mod lazy_tests;
 pub(crate) mod pairwise;
+pub mod partition_codes;
 mod plane_cache;
 pub mod prune;
+pub mod raw_body;
 pub mod resident;
 pub mod rotation;
 pub mod storage;
