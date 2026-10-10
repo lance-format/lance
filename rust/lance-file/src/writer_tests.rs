@@ -814,6 +814,115 @@ mod tests {
         );
     }
 
+    /// The 2.1+ preflight must pair each field with the array encoding will select for
+    /// it. Pairing `batch.columns()` positionally against the schema misreads a batch
+    /// whose column order differs: it rejects a legal null in the nullable field while
+    /// naming the non-nullable one, and lets a null through in the non-nullable field.
+    #[rstest]
+    #[case::null_in_nullable_field(true, true)]
+    #[case::null_in_non_nullable_field(false, false)]
+    #[tokio::test]
+    async fn test_structural_writer_verifies_name_selected_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[case] null_in_nullable: bool,
+        #[case] should_succeed: bool,
+    ) {
+        // The schema declares "a" non-nullable; the batch puts "b" first. The batch's
+        // own schema marks both nullable -- the writer's schema is the contract being
+        // checked, and Arrow would refuse to build a batch that contradicts itself.
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+        ]));
+        let with_null = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let without_null = Arc::new(Int32Array::from(vec![4, 5, 6]));
+        let (b, a): (ArrayRef, ArrayRef) = if null_in_nullable {
+            (with_null, without_null)
+        } else {
+            (without_null, with_null)
+        };
+        let batch = RecordBatch::try_new(batch_schema, vec![b, a]).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if should_succeed {
+            result.expect("a null in the nullable field must be accepted");
+            writer.finish().await.unwrap();
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("non-null") && err.contains('a'),
+                "expected the error to name field \"a\" as non-null, got: {err}"
+            );
+        }
+    }
+
+    /// With two batch columns named `a`, encoding selects the first via
+    /// `column_by_name`, so the nullability preflight must check that same first
+    /// column. Non-nullable `a` sits at schema index 1, where a positional pairing
+    /// would line it up with the second `a` (which carries a null) and wrongly
+    /// reject; name selection validates the first `a` that is actually written.
+    /// Guards against a future positional fast path reintroducing the mismatch.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_checks_first_duplicate_column_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("z", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, false),
+        ]));
+        // Two columns named "a": the first is what `column_by_name` (and the
+        // encoder) selects and is null-free; the second carries a null and must
+        // be ignored by the name-selected check.
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("z", DataType::Int32, true),
+        ]));
+        let first_a = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let second_a = Arc::new(Int32Array::from(vec![Some(4), None, Some(6)])) as ArrayRef;
+        let z = Arc::new(Int32Array::from(vec![7, 8, 9])) as ArrayRef;
+        let batch = RecordBatch::try_new(batch_schema, vec![first_a, second_a, z]).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        writer
+            .write_batch(&batch)
+            .await
+            .expect("the first \"a\" is null-free, so the name-selected check accepts it");
+        writer.finish().await.unwrap();
+    }
+
     /// V2.0 null-struct validation applies only to list values that are logically
     /// encoded, excluding unselected backing values and values under null lists.
     #[rstest]
