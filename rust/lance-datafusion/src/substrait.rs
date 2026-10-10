@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use datafusion::{execution::SessionState, logical_expr::Expr};
+use datafusion::{
+    execution::{FunctionRegistry, SessionState},
+    logical_expr::Expr,
+};
 
 use crate::aggregate::Aggregate;
+use crate::signed_zero::NORMALIZE_NAN_SIGN_UDF;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -526,9 +530,13 @@ pub async fn parse_substrait(
         ..envelope
     };
 
+    // Optimized filters carry this internal function even when the caller uses
+    // a plain DataFusion state. Preserve their registry without modifying it.
+    let mut state = state.clone();
+    state.register_udf(NORMALIZE_NAN_SIGN_UDF.clone())?;
     let mut expr_container =
         datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
-            state,
+            &state,
             &extended_expr,
         )
         .await?;
@@ -617,7 +625,9 @@ pub async fn parse_aggregate_rel_with_extensions(
     extensions: &Extensions,
 ) -> Result<Aggregate> {
     let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
-    let consumer = DefaultSubstraitConsumer::new(extensions, state);
+    let mut state = state.clone();
+    state.register_udf(NORMALIZE_NAN_SIGN_UDF.clone())?;
+    let consumer = DefaultSubstraitConsumer::new(extensions, &state);
     let group_by = parse_groupings(aggregate_rel, &df_schema, &consumer).await?;
     let aggregates = parse_measures(aggregate_rel, &df_schema, &consumer).await?;
 
@@ -733,6 +743,7 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::{ArrayRef, BooleanArray, Float64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
@@ -761,11 +772,155 @@ mod tests {
     use prost::Message;
     use rstest::rstest;
 
+    use crate::planner::Planner;
     use crate::substrait::{encode_substrait, parse_substrait};
 
     fn session_state() -> SessionState {
         let ctx = SessionContext::new();
         ctx.state()
+    }
+
+    #[rstest]
+    #[case::scalar_float32(DataType::Float32, false)]
+    #[case::scalar_float64(DataType::Float64, false)]
+    #[case::aggregate_float32(DataType::Float32, true)]
+    #[case::aggregate_float64(DataType::Float64, true)]
+    #[tokio::test]
+    async fn optimized_float_comparison_survives_substrait(
+        #[case] data_type: DataType,
+        #[case] aggregate: bool,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", data_type.clone(), true),
+            Field::new("b", data_type.clone(), true),
+        ]));
+        let planner = Planner::new(schema.clone());
+        let expr = planner.parse_filter("a < b").unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let state = session_state();
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &state).unwrap();
+        let decoded = if aggregate {
+            let envelope = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+            let Some(ExprType::Expression(grouping)) = &envelope.referred_expr[0].expr_type else {
+                panic!("expected a scalar expression");
+            };
+            let count_anchor = envelope
+                .extensions
+                .iter()
+                .filter_map(|extension| match &extension.mapping_type {
+                    Some(MappingType::ExtensionFunction(function)) => {
+                        Some(function.function_anchor)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let mut extensions = envelope.extensions.clone();
+            extensions.push(agg_extension(count_anchor, "count"));
+            let mut count = count_star_measure(count_anchor);
+            count.filter = Some(grouping.clone());
+            let bytes = create_aggregate_plan(
+                vec![count],
+                vec![grouping.clone()],
+                vec![Grouping {
+                    expression_references: vec![0],
+                    ..Default::default()
+                }],
+                extensions,
+            );
+            let aggregate =
+                crate::substrait::parse_substrait_aggregate(&bytes, schema.clone(), &state)
+                    .await
+                    .unwrap();
+            assert_eq!(aggregate.aggregates.len(), 1);
+            aggregate.group_by[0].clone()
+        } else {
+            parse_substrait(&bytes, schema.clone(), &state)
+                .await
+                .unwrap()
+        };
+        assert_eq!(decoded, expr);
+        assert!(
+            !state
+                .scalar_functions()
+                .contains_key("_lance_normalize_nan_sign")
+        );
+
+        let left: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(3.0),
+            Some(-f64::NAN),
+            Some(f64::NAN),
+            None,
+        ]));
+        let right: ArrayRef = Arc::new(Float64Array::from(vec![Some(2.0); 5]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                arrow_cast::cast(&left, &data_type).unwrap(),
+                arrow_cast::cast(&right, &data_type).unwrap(),
+            ],
+        )
+        .unwrap();
+        let result = planner
+            .create_physical_expr(&decoded)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(
+            result.as_ref(),
+            &BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+            ])
+        );
+    }
+
+    #[rstest]
+    #[case::finite("x BETWEEN 1.0 AND 2.0", &[Some(false), Some(false), Some(false), Some(true), Some(false), None])]
+    #[case::negative_infinity("x BETWEEN CAST('-inf' AS DOUBLE) AND 2.0", &[Some(false), Some(true), Some(true), Some(true), Some(false), None])]
+    #[tokio::test]
+    async fn bounded_float_filter_survives_substrait_reoptimization(
+        #[case] filter: &str,
+        #[case] expected: &[Option<bool>],
+    ) {
+        let batch = arrow_array::record_batch!((
+            "x",
+            Float64,
+            vec![
+                Some(-f64::NAN),
+                Some(f64::NEG_INFINITY),
+                Some(0.0),
+                Some(1.5),
+                Some(3.0),
+                None,
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let state = session_state();
+        let mut expr = planner.parse_filter(filter).unwrap();
+        for _ in 0..3 {
+            expr = planner.optimize_expr(expr).unwrap();
+            let bytes = encode_substrait(expr, batch.schema(), &state).unwrap();
+            expr = parse_substrait(&bytes, batch.schema(), &state)
+                .await
+                .unwrap();
+            let result = planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(result.as_ref(), &BooleanArray::from(expected.to_vec()));
+        }
     }
 
     #[tokio::test]

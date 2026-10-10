@@ -3450,7 +3450,7 @@ mod tests {
     }
 
     /// Twelve rows in three batches of the values a comparison most often gets
-    /// wrong: nulls, NaN, both zeros, the infinities, empty and non-ASCII text.
+    /// wrong: nulls, both NaN signs, both zeros, the infinities, empty and non-ASCII text.
     /// Each `indexed` column has a B-tree, one on a `declining` column declines
     /// every filter, and `rid` names each row with no index.
     fn differential_memtable(
@@ -3491,7 +3491,7 @@ mod tests {
             Some(1.5),
             None,
             Some(3.0),
-            Some(-0.0),
+            Some(-f64::NAN),
         ];
         let strs = [
             Some("apple"),
@@ -3593,6 +3593,42 @@ mod tests {
             .to_vec();
         rids.sort_unstable();
         rids
+    }
+
+    #[rstest::rstest]
+    #[case::float_zero("f = 0.0", &[0, 1])]
+    #[case::integer_zero("f = 0", &[0, 1])]
+    #[case::zero_list("f IN (0.0, 1.5)", &[0, 1, 4, 8])]
+    #[case::finite_list("f IN (1.5, 3.0)", &[4, 8, 10])]
+    #[case::repeated_zero("f = -0.0 OR f = 0.0", &[0, 1])]
+    #[case::upper_bound("f < 0.0", &[5, 7])]
+    #[case::lower_bound("f > 1.0", &[3, 4, 6, 8, 10, 11])]
+    #[case::nan_literal("f = 'NaN'", &[3, 11])]
+    #[tokio::test]
+    async fn indexed_float_filters_ignore_sign_encodings(
+        #[case] filter: &str,
+        #[case] expected: &[i32],
+    ) {
+        let memtable = differential_memtable(&["f"], &[]);
+        let (batch_store, indexes, schema) = &memtable;
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.filter(filter).unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(plan.contains("ScalarMemIndexExec"), "{filter}: {plan}");
+
+        // Assert the rows, since a scan and an index can agree on the same wrong
+        // total-order comparison. The fixture spans three memtable batches.
+        for use_index in [false, true] {
+            assert_eq!(
+                filtered_rids(&memtable, filter, use_index).await,
+                expected,
+                "{filter} with use_index={use_index}"
+            );
+        }
     }
 
     /// Every filter returns the same rows through the indexes as reading every

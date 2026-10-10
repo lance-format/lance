@@ -2650,18 +2650,28 @@ impl PlannerIndexExt for Planner {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering as AtomicOrdering;
 
     use arrow_array::Array;
+    use arrow_array::types::{Float64Type, UInt64Type};
     use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
+    use lance_core::cache::LanceCache;
+    use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+    use lance_io::object_store::ObjectStore;
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
+    use crate::metrics::LocalMetricsCollector;
+    use crate::scalar::btree::{BTreeIndexPlugin, train_btree_index};
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
+    use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::registry::ScalarIndexPlugin;
 
     use super::*;
 
@@ -2825,6 +2835,158 @@ mod tests {
     }
 
     #[rstest]
+    #[case::between("x BETWEEN 1.0 AND 2.0", 1.0, 2.0, true)]
+    #[case::reversed("x <= 2.0 AND x >= 1.0", 1.0, 2.0, true)]
+    #[case::open("x > 1.0 AND x < 2.0", 1.0, 2.0, false)]
+    #[case::zero("x BETWEEN 0.0 AND 2.0", -0.0, 2.0, true)]
+    #[case::negative_infinity(
+        "x BETWEEN CAST('-inf' AS DOUBLE) AND 2.0",
+        f64::NEG_INFINITY,
+        2.0,
+        true
+    )]
+    fn bounded_float_filter_remains_a_single_index_range(
+        #[case] filter: &str,
+        #[case] lower: f64,
+        #[case] upper: f64,
+        #[case] inclusive: bool,
+        #[values(DataType::Float16, DataType::Float32, DataType::Float64)] data_type: DataType,
+    ) {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", data_type.clone(), true)]));
+        let planner = Planner::new(schema);
+        let info = MockIndexInfoProvider::new(vec![(
+            "x",
+            ColInfo::new(
+                data_type.clone(),
+                Box::new(SargableQueryParser::new(
+                    "x_idx".into(),
+                    "BTree".into(),
+                    false,
+                )),
+            ),
+        )]);
+        // A DOUBLE cast would widen a narrow column and bypass its index. Use
+        // the column's type to test an explicit -inf bound for every float type.
+        let mut expr = if lower.is_infinite() {
+            datafusion::prelude::col("x").between(
+                Expr::Literal(
+                    ScalarValue::Float64(Some(lower))
+                        .cast_to(&data_type)
+                        .unwrap(),
+                    None,
+                ),
+                Expr::Literal(
+                    ScalarValue::Float64(Some(upper))
+                        .cast_to(&data_type)
+                        .unwrap(),
+                    None,
+                ),
+            )
+        } else {
+            planner.parse_filter(filter).unwrap()
+        };
+        for _ in 0..3 {
+            let plan = planner
+                .create_filter_plan(expr.clone(), &info, true)
+                .unwrap();
+            let query = plan.index_query.unwrap().optimize();
+            let ScalarIndexExpr::Query(search) = &query else {
+                panic!("expected one bounded range for {filter}, got {query:?}");
+            };
+            let lower = ScalarValue::Float64(Some(lower))
+                .cast_to(&data_type)
+                .unwrap();
+            let upper = ScalarValue::Float64(Some(upper))
+                .cast_to(&data_type)
+                .unwrap();
+            let expected = if inclusive {
+                SargableQuery::Range(Bound::Included(lower), Bound::Included(upper))
+            } else {
+                SargableQuery::Range(Bound::Excluded(lower), Bound::Excluded(upper))
+            };
+            assert_eq!(
+                search
+                    .query
+                    .as_any()
+                    .downcast_ref::<SargableQuery>()
+                    .unwrap(),
+                &expected
+            );
+            expr = planner.optimize_expr(expr).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_float_filter_retains_selective_btree_io() {
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Float64,
+            false,
+        )])));
+        let info = MockIndexInfoProvider::new(vec![(
+            "x",
+            ColInfo::new(
+                DataType::Float64,
+                Box::new(SargableQueryParser::new(
+                    "x_idx".into(),
+                    "BTree".into(),
+                    false,
+                )),
+            ),
+        )]);
+        let expr = planner.parse_filter("x BETWEEN 1.0 AND 2.0").unwrap();
+        let query = planner
+            .create_filter_plan(expr, &info, true)
+            .unwrap()
+            .index_query
+            .unwrap()
+            .optimize();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            object_store::path::Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let data = gen_batch()
+            .col("value", array::step::<Float64Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(64), BatchCount::from(8));
+        train_btree_index(data, store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndexPlugin
+            .load_index(
+                store,
+                &prost_types::Any::default(),
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        let metrics = LocalMetricsCollector::default();
+        let mut pending = vec![query];
+        while let Some(query) = pending.pop() {
+            match query {
+                ScalarIndexExpr::Query(search) => {
+                    index
+                        .search_with_options(
+                            search.query.as_ref(),
+                            SearchOptions::default().with_track_nulls(false),
+                            &metrics,
+                        )
+                        .await
+                        .unwrap();
+                }
+                ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
+                    pending.extend([*left, *right]);
+                }
+                ScalarIndexExpr::Not(_) => panic!("unexpected negated bounded range"),
+            }
+        }
+        assert_eq!(metrics.parts_loaded.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[rstest]
     #[case::list(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))]
     #[case::large_list(DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))))]
     fn test_label_list_query_parser(#[case] label_type: DataType) {
@@ -2953,7 +3115,10 @@ mod tests {
     #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
     #[case(
         "temp < 1.0",
-        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+        SargableQuery::Range(
+            Bound::Included(f16_scalar(f32::NEG_INFINITY)),
+            Bound::Excluded(f16_scalar(1.0))
+        )
     )]
     #[case(
         // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
