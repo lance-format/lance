@@ -3860,18 +3860,16 @@ def test_merge_insert_use_index():
     # Should use hash join, not index scan
     assert "HashJoinExec" in plan or "Join" in plan
 
-    # Test 2: use_index=True (default) should fail explain_plan with index present
+    # Test 2: use_index=True (default) joins through the index
     builder_with_index = (
         dataset.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
         .use_index(True)  # Explicitly set to use index (though it's the default)
     )
-
-    # With use_index=True and an index present, explain_plan should fail
-    with pytest.raises(Exception) as exc_info:
-        builder_with_index.explain_plan()
-    assert "does not support explain_plan" in str(exc_info.value)
+    plan = builder_with_index.explain_plan()
+    assert "IndexJoin" in plan
+    assert "HashJoinExec" not in plan
 
     # Test 3: Verify actual execution works with no index
     result = builder_no_index.execute(source_data)

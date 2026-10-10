@@ -14,6 +14,7 @@ pub mod filtered_read;
 #[cfg(feature = "substrait")]
 pub mod filtered_read_proto;
 pub mod fts;
+pub(crate) mod index_join;
 pub(crate) mod knn;
 pub mod minhash;
 mod optimizer;
