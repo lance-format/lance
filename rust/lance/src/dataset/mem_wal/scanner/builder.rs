@@ -238,6 +238,8 @@ pub struct LsmScanner {
     /// Over-fetch multiple for block-listed sources in search plans
     /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
     overfetch_factor: Option<f64>,
+    /// See [`Self::with_memtable_filter_indexes`].
+    memtable_filter_indexes: bool,
 }
 
 impl LsmScanner {
@@ -285,6 +287,7 @@ impl LsmScanner {
             sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -331,6 +334,7 @@ impl LsmScanner {
             sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -410,6 +414,15 @@ impl LsmScanner {
     /// default, so behavior is unchanged unless opted in.
     pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
+        self
+    }
+
+    /// Answer a filtered scan of in-memory memtables from their filter indexes,
+    /// keeping a match only when it is its key's newest visible version. A
+    /// filter matching too many rows to check one by one reads every in-memory
+    /// row instead. Off by default: every in-memory row is read.
+    pub fn with_memtable_filter_indexes(mut self, enabled: bool) -> Self {
+        self.memtable_filter_indexes = enabled;
         self
     }
 
@@ -775,6 +788,7 @@ impl LsmScanner {
             base_schema,
             Arc::clone(&self.identity_schema),
         );
+        planner = planner.with_memtable_filter_indexes(self.memtable_filter_indexes);
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
@@ -2172,8 +2186,15 @@ mod tests {
         use arrow_array::{Int32Array, StringArray};
 
         let store = BatchStore::with_capacity(8);
-        let mut index = IndexStore::new();
-        index.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let index = IndexStore::from_specs(
+            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+                "id_idx", 0, "id",
+            )],
+            &lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+            100,
+            8,
+        )
+        .unwrap();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

@@ -28,7 +28,7 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Int32Array, RecordBatchIterator, StringArray, StructArray,
+    Int32Array, Int64Array, RecordBatchIterator, StringArray, StructArray, record_batch,
     types::{Int32Type, Int64Type},
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1407,6 +1407,60 @@ async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset>
     .await
 }
 
+#[rstest::rstest]
+#[tokio::test]
+async fn test_alter_columns_rename_and_cast(
+    #[values(false, true)] non_reusable_field_ids: bool,
+    #[values(false, true)] rename_first: bool,
+) -> Result<()> {
+    let batch = record_batch!(
+        ("id", Int32, [1, 2, 3]),
+        ("name", Utf8, [Some("a"), None, Some("c")])
+    )?;
+    let uri = "memory://";
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    if non_reusable_field_ids {
+        dataset.migrate_to_non_reusable_field_ids().await?;
+    }
+    let version = dataset.version().version;
+    let name_id = dataset.schema().field("name").unwrap().id;
+    let max_field_id = dataset.manifest.max_field_id();
+    let original = dataset.clone();
+
+    let mut alterations = [
+        ColumnAlteration::new("id".into()).cast_to(DataType::Int64),
+        ColumnAlteration::new("name".into()).rename("full_name".into()),
+    ];
+    if rename_first {
+        alterations.reverse();
+    }
+    dataset.alter_columns(&alterations).await?;
+    dataset.validate().await?;
+
+    assert_eq!(dataset.version().version, version + 1);
+    assert!(dataset.schema().field("name").is_none());
+    assert_eq!(dataset.schema().field("full_name").unwrap().id, name_id);
+    let id_field = dataset.schema().field("id").unwrap();
+    assert!(id_field.id > max_field_id);
+    assert_eq!(id_field.data_type(), DataType::Int64);
+
+    let reopened = original.checkout_version(version + 1).await?;
+    assert_eq!(reopened.schema(), dataset.schema());
+    let data = reopened.scan().try_into_batch().await?;
+    assert_eq!(data["id"].as_ref(), &Int64Array::from(vec![1, 2, 3]));
+    assert_eq!(data["full_name"].as_ref(), batch["name"].as_ref());
+    Ok(())
+}
+
 // Which clause rejects the lossy round-trip depends on the hole's
 // position: a hole before the last field remaps a shared id, while a
 // hole at the end reuses the dropped id for the new field.
@@ -1495,6 +1549,55 @@ async fn test_merge_rejects_renumbered_nested_field_ids() {
         "unexpected error: {}",
         message
     );
+}
+
+#[rstest::rstest]
+#[case::dropped_parent(false)]
+#[case::retained_parent(true)]
+#[tokio::test]
+async fn test_merge_rejects_move_with_stale_parent_id(#[case] retain_parent: bool) -> Result<()> {
+    let nested = StructArray::from(record_batch!(
+        ("x", Int32, [Some(1), None, Some(3)]),
+        ("y", Int32, [10, 20, 30])
+    )?);
+    let batch = RecordBatch::try_from_iter([("s", Arc::new(nested) as Arc<dyn Array>)])?;
+    let uri = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    let version = dataset.version().version;
+
+    let mut moved = dataset.schema().clone();
+    let mut child = moved.fields[0].children.remove(0);
+    assert_eq!(child.parent_id, moved.fields[0].id);
+    if !retain_parent {
+        moved.fields.clear();
+    }
+    child.name = "renamed".into();
+    moved.fields.push(child);
+    moved.validate()?;
+
+    let err = commit_merge(&dataset, moved).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("inconsistent parent ids for field id 1"),
+        "{err}"
+    );
+
+    // A rejected merge must leave the persisted version readable with its original schema.
+    let reopened = Dataset::open(&uri).await?;
+    assert_eq!(reopened.version().version, version);
+    assert_eq!(reopened.schema(), dataset.schema());
+    assert_eq!(reopened.scan().try_into_batch().await?, batch);
+    Ok(())
 }
 
 #[rstest::rstest]

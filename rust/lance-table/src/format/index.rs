@@ -259,6 +259,19 @@ impl DeepSizeOf for IndexMetadata {
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
             + self.files.deep_size_of_children(context)
+            + self
+                .index_details
+                .as_ref()
+                .map(|details| {
+                    if context.mark_seen(Arc::as_ptr(details) as usize) {
+                        std::mem::size_of::<prost_types::Any>()
+                            + details.type_url.capacity()
+                            + details.value.capacity()
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
     }
 }
 
@@ -481,6 +494,55 @@ mod tests {
 
         let recovered = IndexMetadata::try_from(proto).unwrap();
         assert_eq!(recovered.fragment_bitmap, Some(bitmap));
+    }
+
+    #[test]
+    fn test_deep_size_counts_index_details() {
+        // Spare capacity on both buffers, so counting `len()` instead of `capacity()` fails.
+        fn details() -> Arc<prost_types::Any> {
+            let mut type_url = String::with_capacity(128);
+            type_url.push_str("/lance.table.FragmentReuseIndexDetails");
+            let mut value = Vec::with_capacity(12_000);
+            value.resize(10_000, 0u8);
+            assert_eq!((type_url.capacity(), value.capacity()), (128, 12_000));
+            Arc::new(prost_types::Any { type_url, value })
+        }
+        // `Any` struct + `type_url` heap + `value` heap.
+        let details_size = std::mem::size_of::<prost_types::Any>() + 128 + 12_000;
+
+        let meta = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "__lance_frag_reuse".to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let with = |details: Arc<prost_types::Any>| IndexMetadata {
+            index_details: Some(details),
+            ..meta.clone()
+        };
+
+        assert_eq!(
+            with(details()).deep_size_of() - meta.deep_size_of(),
+            details_size
+        );
+
+        let two_without = vec![meta.clone(), meta.clone()].deep_size_of();
+
+        // A shared Arc is charged once per measured value.
+        let shared = details();
+        let shared = vec![with(shared.clone()), with(shared)];
+        assert_eq!(shared.deep_size_of() - two_without, details_size);
+
+        // Independent Arcs are each charged.
+        let independent = vec![with(details()), with(details())];
+        assert_eq!(independent.deep_size_of() - two_without, 2 * details_size);
     }
 
     /// Demonstrates the pattern a disk-backed cache backend would use:

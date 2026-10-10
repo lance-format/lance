@@ -243,25 +243,29 @@ async fn index_off_the_rewritten_fragments_lands_directly() {
     assert_eq!(assert_index_serves(&dataset, "i = 9").await, vec![9]);
 }
 
-/// Between the build and the commit, an in-place rewrite of the indexed
-/// column landed on a destination (rows did not move, so the rewrite is
-/// admitted while no committed index covers the column). The index still
-/// lands: the resolver withdraws the transition's sources from it, so it
-/// claims nothing and the rows are scanned until `optimize_indices`
-/// rebuilds it.
+/// Between the build and the commit, a payload rewrite landed on a
+/// destination. A stale index on that payload loses the transition's
+/// coverage until `optimize_indices` rebuilds it; an index on the preserved
+/// join key still translates to the live destinations.
+#[rstest::rstest]
+#[case::payload("text", true)]
+#[case::join_key("i", false)]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdrawn() {
+async fn index_built_before_a_stable_partition_and_a_column_rewrite_preserves_valid_coverage(
+    #[case] indexed_column: &str,
+    #[case] withdrawn: bool,
+) {
     use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
     use lance_index::optimize::OptimizeOptions;
 
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
-    let (mut stale, segment) = stage(&dataset, "i", IndexType::BTree, vec![0, 1]).await;
+    let (mut stale, segment) = stage(&dataset, indexed_column, IndexType::BTree, vec![0, 1]).await;
     let tagged = make_tagged(dataset).await;
 
-    // Patch `text` of the row `i = 3` (fragment 11) in place; the source
-    // carries the key column, so `i` is rewritten in place as well.
+    // Patch `text` of the row `i = 3` (fragment 11) in place. The payload
+    // index becomes stale, while the preserved join key remains indexed.
     let schema = Arc::new(ArrowSchema::from(
         &tagged.schema().project(&["i", "text"]).unwrap(),
     ));
@@ -290,7 +294,7 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
     );
 
     stale
-        .commit_existing_index_segments("idx", "i", vec![segment.clone()])
+        .commit_existing_index_segments("idx", indexed_column, vec![segment.clone()])
         .await
         .unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
@@ -299,14 +303,25 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
         stored.iter().find(|idx| idx.name == "idx").unwrap().uuid,
         segment.uuid
     );
-    assert!(
-        stored_bitmap(&stored).is_empty(),
-        "{:?}",
-        stored_bitmap(&stored)
-    );
     assert_eq!(
-        i_values(&dataset, Some("i = 3"), true).await,
-        i_values(&dataset, Some("i = 3"), false).await
+        stored_bitmap(&stored),
+        if withdrawn {
+            RoaringBitmap::new()
+        } else {
+            RoaringBitmap::from_iter([0u32, 1])
+        }
+    );
+    if !withdrawn {
+        let derived = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            stored_bitmap(&derived),
+            RoaringBitmap::from_iter([10u32, 11])
+        );
+        assert_eq!(assert_index_serves(&dataset, "i = 3").await, vec![3]);
+    }
+    assert_eq!(
+        i_values(&dataset, Some("text = 'patched'"), true).await,
+        i_values(&dataset, Some("text = 'patched'"), false).await
     );
     assert_eq!(
         i_values(&dataset, None, true).await,
@@ -327,7 +342,12 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_lands_withdr
             .fold(RoaringBitmap::new(), |acc, b| acc | b),
         RoaringBitmap::from_iter([10u32, 11])
     );
-    assert_eq!(assert_index_serves(&dataset, "i = 3").await, vec![3]);
+    let predicate = if withdrawn {
+        "text = 'patched'"
+    } else {
+        "i = 3"
+    };
+    assert_eq!(assert_index_serves(&dataset, predicate).await, vec![3]);
 }
 
 /// The same race with `alter_columns`: a cast of the indexed column landed

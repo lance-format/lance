@@ -8,24 +8,23 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use bytes::Bytes;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::cache::LanceCache;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
-use lance_index::IndexType;
+use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::{ShardManifest, SsTable};
-use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use log::{info, warn};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use tracing::instrument;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
-use super::super::index::MemIndexConfig;
+use super::super::index::{FlushContext, FlushOutcome, GenerationWrite, IndexStore, MemIndexSpec};
 use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
@@ -34,7 +33,7 @@ use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
 use crate::dataset::write::InsertBuilder;
-use crate::index::vector::details::vector_index_details_default;
+use crate::index::CreateIndexBuilder;
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -123,6 +122,9 @@ impl FlushedSize {
         }
     }
 }
+
+/// Rows per training batch handed to an index builder at flush.
+const TRAINING_BATCH_SIZE: usize = 8192;
 
 impl MemTableFlusher {
     pub fn new(
@@ -262,7 +264,7 @@ impl MemTableFlusher {
     /// `base_uri` (e.g. flusher unit tests that run without a committed base).
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
-    async fn base_storage_version(&self) -> Result<lance_file::version::ConcreteFileVersion> {
+    async fn base_storage_version(&self) -> Result<ConcreteFileVersion> {
         match self.open_base().await {
             Ok(dataset) => Ok(dataset.manifest().data_storage_format.lance_file_format()),
             Err(Error::DatasetNotFound { .. }) => Ok(lance_file::version::stable_file_version()),
@@ -311,7 +313,12 @@ impl MemTableFlusher {
         );
 
         let (rows_flushed, deleted) = self
-            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .write_data_file(
+                &gen_path,
+                memtable,
+                preassigned_data_file_name.as_deref(),
+                self.base_storage_version().await?,
+            )
             .await?;
 
         // Persist the within-generation deletion vector so the
@@ -371,6 +378,7 @@ impl MemTableFlusher {
         path: &Path,
         memtable: &MemTable,
         preassigned_data_file_name: Option<&str>,
+        storage_version: ConcreteFileVersion,
     ) -> Result<(usize, RoaringBitmap)> {
         use arrow_array::RecordBatchIterator;
 
@@ -449,7 +457,7 @@ impl MemTableFlusher {
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
-            data_storage_version: Some(self.base_storage_version().await?.to_selector()),
+            data_storage_version: Some(storage_version.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -538,12 +546,12 @@ impl MemTableFlusher {
     ///
     /// See [`MemTableFlusher::flush`] for `covered_wal_entry_position`
     /// semantics.
-    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
+    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_specs.len()))]
     pub async fn flush_with_indexes(
         &self,
         memtable: &MemTable,
         epoch: u64,
-        index_configs: &[MemIndexConfig],
+        index_specs: &[MemIndexSpec],
         covered_wal_entry_position: u64,
         durable: usize,
     ) -> Result<FlushResult> {
@@ -572,84 +580,35 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
+        let storage_version = self.base_storage_version().await?;
         let (total_rows, deleted) = self
-            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .write_data_file(
+                &gen_path,
+                memtable,
+                preassigned_data_file_name.as_deref(),
+                storage_version,
+            )
             .await?;
 
-        // Open the dataset once for all index building. Dataset::write already
-        // created a v1 manifest with the fragment data.
+        // Dataset::write already committed the data; the indexes join it in
+        // one manifest below.
         let uri = self.path_to_uri(&gen_path);
         let mut dataset = self.open_generation(&uri).await?;
-
-        // Collect all index metadata without committing individually.
-        // We write a single manifest containing both data and all indexes.
-        let mut all_indexes: Vec<IndexMetadata> = Vec::new();
-
-        let btree_indexes = self
-            .create_indexes(&mut dataset, index_configs, memtable.indexes())
+        let all_indexes = self
+            .create_indexes(
+                &mut dataset,
+                &gen_path,
+                index_specs,
+                memtable.indexes(),
+                total_rows,
+                crate::dataset::versions::index_file_version(storage_version),
+            )
             .await?;
-        if !btree_indexes.is_empty() {
-            info!(
-                "Created {} BTree indexes on SSTable {}",
-                btree_indexes.len(),
-                generation
-            );
-        }
-        all_indexes.extend(btree_indexes);
-
-        if let Some(registry) = memtable.indexes() {
-            for config in index_configs {
-                if let MemIndexConfig::Hnsw(hnsw_config) = config
-                    && let Some(mem_index) = registry.get_hnsw(&hnsw_config.name)
-                {
-                    // `None` → the generation has no indexable vectors (e.g. all
-                    // tombstones); flush the data without an HNSW index for it.
-                    let Some(mut index_meta) = self
-                        .create_hnsw_index(&gen_path, hnsw_config, mem_index)
-                        .await?
-                    else {
-                        info!(
-                            "Skipped empty HNSW index '{}' on SSTable {} (no vectors)",
-                            hnsw_config.name, generation
-                        );
-                        continue;
-                    };
-
-                    let schema = dataset.schema();
-                    let field_idx = schema
-                        .field(&hnsw_config.column)
-                        .map(|f| f.id)
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "HNSW index '{}' references column '{}' which is not in the dataset schema",
-                                hnsw_config.name, hnsw_config.column
-                            ))
-                        })?;
-                    index_meta.fields = vec![field_idx];
-                    index_meta.dataset_version = dataset.version().version;
-                    let fragment_ids: roaring::RoaringBitmap =
-                        dataset.fragment_bitmap.as_ref().clone();
-                    index_meta.fragment_bitmap = Some(fragment_ids);
-                    all_indexes.push(index_meta);
-
-                    info!(
-                        "Created HNSW index '{}' on SSTable {}",
-                        hnsw_config.name, generation
-                    );
-                }
-            }
-
-            let fts_indexes = self
-                .create_fts_indexes(
-                    &dataset,
-                    &gen_path,
-                    index_configs,
-                    memtable.indexes(),
-                    total_rows,
-                )
-                .await?;
-            all_indexes.extend(fts_indexes);
-        }
+        info!(
+            generation,
+            index_count = all_indexes.len(),
+            "created indexes on SSTable"
+        );
 
         // Write the standalone primary-key dedup index (sidecar, not a manifest
         // index — the block-list opens it directly by path).
@@ -691,64 +650,66 @@ impl MemTableFlusher {
         })
     }
 
-    /// Create BTree indexes on the SSTable dataset (uncommitted).
+    /// Build every index in `index_specs` the memtable holds into the flushed
+    /// generation, one at a time.
     ///
-    /// Returns index metadata without committing to the dataset manifest.
-    /// The caller is responsible for writing a single manifest with all indexes.
+    /// Returns index metadata without committing; the caller writes a single
+    /// manifest with all of it.
     async fn create_indexes(
         &self,
         dataset: &mut Dataset,
-        index_configs: &[MemIndexConfig],
-        mem_indexes: Option<&super::super::index::IndexStore>,
+        gen_path: &Path,
+        index_specs: &[MemIndexSpec],
+        mem_indexes: Option<&IndexStore>,
+        total_rows: usize,
+        storage_version: ConcreteFileVersion,
     ) -> Result<Vec<IndexMetadata>> {
-        use arrow_array::RecordBatchIterator;
-
-        use crate::index::CreateIndexBuilder;
-
-        let btree_configs: Vec<_> = index_configs
-            .iter()
-            .filter_map(|c| match c {
-                MemIndexConfig::BTree(cfg) => Some(cfg),
-                MemIndexConfig::Hnsw(_) => None,
-                MemIndexConfig::Fts(_) => None,
-            })
-            .collect();
-
-        if btree_configs.is_empty() {
+        let Some(store) = mem_indexes else {
             return Ok(vec![]);
-        }
+        };
 
-        let mut created_indexes = Vec::new();
-
-        for btree_cfg in btree_configs {
-            let params = ScalarIndexParams::default();
-            let mut builder = CreateIndexBuilder::new(
+        let mut created = Vec::new();
+        for spec in index_specs {
+            let Some(index) = store.get_index(&spec.name) else {
+                debug!(index = %spec.name, "memtable does not hold this index; not flushed");
+                continue;
+            };
+            let generation = GenerationWrite {
+                path: gen_path,
+                object_store: &self.object_store,
                 dataset,
-                &[btree_cfg.column.as_str()],
-                IndexType::BTree,
-                &params,
-            )
-            .name(btree_cfg.name.clone());
-
-            if let Some(registry) = mem_indexes
-                && let Some(btree_index) = registry.get_btree(&btree_cfg.name)
+                total_rows,
+                name: &spec.name,
+                storage_version,
+            };
+            let training_data = match index
+                .flush(&FlushContext {
+                    batch_size: TRAINING_BATCH_SIZE,
+                    generation: Some(&generation),
+                })
+                .await?
             {
-                // Forward-written data: index row positions line up 1:1 with
-                // the data file, no remap needed.
-                let training_batches = btree_index.to_training_batches(8192)?;
-                if !training_batches.is_empty() {
-                    let schema = training_batches[0].schema();
-                    let reader =
-                        RecordBatchIterator::new(training_batches.into_iter().map(Ok), schema);
-                    builder = builder.preprocessed_data(Box::new(reader));
+                FlushOutcome::Skip => {
+                    debug!(index = %spec.name, "index holds nothing to flush");
+                    continue;
                 }
-            }
-
-            let index_meta = builder.execute_uncommitted().await?;
-            created_indexes.push(index_meta);
+                FlushOutcome::Wrote(index_meta) => {
+                    // Queries find a generation's index by name and field.
+                    if index_meta.name != spec.name || index_meta.fields != spec.field_ids {
+                        return Err(Error::internal(format!(
+                            "index '{}' on fields {:?} recorded its file as '{}' on fields {:?}",
+                            spec.name, spec.field_ids, index_meta.name, index_meta.fields
+                        )));
+                    }
+                    created.push(*index_meta);
+                    continue;
+                }
+                FlushOutcome::TrainingData(stream) => Some(stream),
+                FlushOutcome::BuildFromGeneration => None,
+            };
+            created.push(build_scalar_index(dataset, spec, training_data).await?);
         }
-
-        Ok(created_indexes)
+        Ok(created)
     }
 
     /// Write the standalone primary-key dedup index for this generation.
@@ -763,7 +724,7 @@ impl MemTableFlusher {
     async fn create_pk_index(
         &self,
         gen_path: &Path,
-        mem_indexes: Option<&super::super::index::IndexStore>,
+        mem_indexes: Option<&IndexStore>,
     ) -> Result<()> {
         use datafusion::physical_plan::SendableRecordBatchStream;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -775,7 +736,7 @@ impl MemTableFlusher {
         let Some(registry) = mem_indexes else {
             return Ok(());
         };
-        let batches = registry.pk_training_batches(8192)?;
+        let batches = registry.pk_training_batches(TRAINING_BATCH_SIZE)?;
         if batches.is_empty() {
             return Ok(());
         }
@@ -790,432 +751,8 @@ impl MemTableFlusher {
             schema,
             futures::stream::iter(batches.into_iter().map(Ok)),
         ));
-        train_btree_index(stream, &store, 8192, None, None).await?;
+        train_btree_index(stream, &store, TRAINING_BATCH_SIZE as u64, None, None).await?;
         Ok(())
-    }
-
-    /// Create FTS (Full-Text Search) indexes from in-memory data (uncommitted).
-    ///
-    /// Writes the FTS index files and returns index metadata without committing.
-    /// The caller is responsible for writing a single manifest with all indexes.
-    async fn create_fts_indexes(
-        &self,
-        dataset: &Dataset,
-        gen_path: &Path,
-        index_configs: &[MemIndexConfig],
-        mem_indexes: Option<&super::super::index::IndexStore>,
-        total_rows: usize,
-    ) -> Result<Vec<IndexMetadata>> {
-        use lance_index::pbold;
-        use lance_index::scalar::lance_format::LanceIndexStore;
-
-        let fts_configs: Vec<_> = index_configs
-            .iter()
-            .filter_map(|c| match c {
-                MemIndexConfig::Fts(cfg) => Some(cfg),
-                _ => None,
-            })
-            .collect();
-
-        if fts_configs.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let Some(registry) = mem_indexes else {
-            return Ok(vec![]);
-        };
-
-        let mut created_indexes = Vec::new();
-
-        for fts_cfg in fts_configs {
-            let Some(fts_index) = registry.get_fts(&fts_cfg.name) else {
-                continue;
-            };
-
-            if fts_index.is_empty() {
-                continue;
-            }
-
-            let partition_id = uuid::Uuid::new_v4().as_u64_pair().0;
-
-            let mut inner_builder = fts_index.to_index_builder(partition_id, total_rows)?;
-
-            let index_uuid = uuid::Uuid::new_v4();
-            let index_dir = gen_path
-                .clone()
-                .join("_indices")
-                .join(index_uuid.to_string());
-            let index_store = LanceIndexStore::new(
-                self.object_store.clone(),
-                index_dir.clone(),
-                Arc::new(LanceCache::no_cache()),
-            );
-
-            inner_builder.write(&index_store).await?;
-
-            self.write_fts_metadata(&index_store, partition_id, fts_cfg)
-                .await?;
-
-            let details = pbold::InvertedIndexDetails::try_from(&fts_cfg.params)?;
-            let index_details = prost_types::Any::from_msg(&details)
-                .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
-
-            let field_idx = fts_cfg.field_id;
-
-            let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
-            let format_version = fts_cfg.params.resolved_format_version();
-            let index_version = if fts_cfg.params.get_document_granularity().is_list_element() {
-                lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3
-            } else {
-                format_version.index_version()
-            };
-
-            let index_meta = IndexMetadata {
-                uuid: index_uuid,
-                name: fts_cfg.name.clone(),
-                fields: vec![field_idx],
-                covering_fields: vec![],
-                dataset_version: dataset.version().version,
-                fragment_bitmap: Some(fragment_ids),
-                index_details: Some(Arc::new(index_details)),
-                index_version: index_version as i32,
-                created_at: None,
-                base_id: None,
-                files: None,
-            };
-            created_indexes.push(index_meta);
-
-            info!(
-                "Created FTS index '{}' on column '{}' (direct flush)",
-                fts_cfg.name, fts_cfg.column
-            );
-        }
-
-        Ok(created_indexes)
-    }
-
-    /// Write FTS index metadata file.
-    async fn write_fts_metadata(
-        &self,
-        index_store: &lance_index::scalar::lance_format::LanceIndexStore,
-        partition_id: u64,
-        config: &super::super::index::FtsIndexConfig,
-    ) -> Result<()> {
-        use arrow_array::{RecordBatch, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-        use std::sync::Arc;
-
-        use lance_index::scalar::inverted::{
-            FTS_FORMAT_VERSION_KEY, POSITIONS_CODEC_KEY, POSITIONS_CODEC_PACKED_DELTA_V1,
-            POSITIONS_LAYOUT_KEY, POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_BLOCK_SIZE_KEY,
-            POSTING_TAIL_CODEC_KEY, TokenSetFormat,
-        };
-
-        // Create metadata with params and partitions in schema metadata (this is what InvertedIndex expects)
-        let params_json = serde_json::to_string(&config.params)?;
-        let partitions_json = serde_json::to_string(&[partition_id])?;
-        let token_set_format = TokenSetFormat::default().to_string();
-        let format_version = config.params.resolved_format_version();
-        let mut metadata = [
-            ("params".to_string(), params_json),
-            ("partitions".to_string(), partitions_json),
-            ("token_set_format".to_string(), token_set_format),
-            (
-                POSTING_TAIL_CODEC_KEY.to_string(),
-                format_version.posting_tail_codec().as_str().to_string(),
-            ),
-            (
-                FTS_FORMAT_VERSION_KEY.to_string(),
-                format_version.index_version().to_string(),
-            ),
-            (
-                POSTING_BLOCK_SIZE_KEY.to_string(),
-                config.params.posting_block_size().to_string(),
-            ),
-        ]
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
-        if config.params.has_positions() && format_version.uses_shared_position_stream() {
-            metadata.insert(
-                POSITIONS_LAYOUT_KEY.to_string(),
-                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_string(),
-            );
-            metadata.insert(
-                POSITIONS_CODEC_KEY.to_string(),
-                POSITIONS_CODEC_PACKED_DELTA_V1.to_string(),
-            );
-        }
-
-        let schema = Arc::new(
-            Schema::new(vec![Field::new("_placeholder", DataType::Utf8, true)])
-                .with_metadata(metadata),
-        );
-
-        // Create a minimal batch (schema metadata is what matters)
-        let placeholder_array = Arc::new(StringArray::from(vec![None::<&str>]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![placeholder_array])?;
-
-        let mut writer = index_store.new_index_file("metadata.lance", schema).await?;
-        writer.write_record_batch(batch).await?;
-        writer.finish().await?;
-
-        Ok(())
-    }
-
-    /// Create an HNSW + SQ8 index from the in-memory HNSW.
-    ///
-    /// Writes:
-    /// - `auxiliary.idx`: SQ8-quantized vector storage (`_rowid`, `__sq_code`).
-    ///   Bounds learned from the full memtable in one pass.
-    /// - `index.idx`: HNSW graph (`__vector_id`, `__neighbors`, `_distance`).
-    ///
-    /// Both files use a single placeholder IVF partition so they conform to
-    /// the existing Lance `IVF_HNSW_SQ` reader path.
-    ///
-    /// # Arguments
-    /// * `gen_path` - Path to the SSTable folder
-    /// * `config` - HNSW index configuration
-    /// * `mem_index` - In-memory HNSW index (snapshotted, not consumed)
-    ///
-    /// # Returns
-    ///
-    /// `Ok(None)` when the memtable holds no indexable vectors — e.g. a
-    /// generation of only tombstones (delete nulls the vector column and the
-    /// HNSW skips nulls), or an all-null vector column. The generation still
-    /// flushes its data; it simply carries no HNSW index, and an index-only
-    /// (`fast_search`) query over it returns empty — no brute-force scan.
-    /// Erroring here would fail the whole flush drain.
-    async fn create_hnsw_index(
-        &self,
-        gen_path: &Path,
-        config: &super::super::index::HnswIndexConfig,
-        mem_index: &super::super::index::HnswMemIndex,
-    ) -> Result<Option<IndexMetadata>> {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::Float32Type;
-        use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch as ArrowRecordBatch};
-        use arrow_schema::Schema as ArrowSchema;
-        use lance_arrow::FixedSizeListArrayExt;
-        use lance_core::ROW_ID;
-        use lance_file::versions as file_versions;
-        use lance_file::writer::FileWriterOptions;
-        use lance_index::pb;
-        use lance_index::vector::DISTANCE_TYPE_KEY;
-        use lance_index::vector::SQ_CODE_COLUMN;
-        use lance_index::vector::hnsw::HNSW;
-        use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
-        use lance_index::vector::sq::ScalarQuantizer;
-        use lance_index::vector::storage::STORAGE_METADATA_KEY;
-        use lance_index::vector::v3::subindex::IvfSubIndex;
-        use lance_index::{
-            INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
-            IndexMetadata as IndexMetaSchema,
-        };
-        use prost::Message;
-        use std::ops::Range;
-        use std::sync::Arc;
-
-        // Write the index files at the base dataset's storage version (matches
-        // the flushed data fragments; 2.2 avoids the v2.1 miniblock chunk cap).
-        let storage_version =
-            crate::dataset::versions::index_file_version(self.base_storage_version().await?);
-
-        let index_uuid = uuid::Uuid::new_v4();
-        let index_dir = gen_path
-            .clone()
-            .join("_indices")
-            .join(index_uuid.to_string());
-
-        let distance_type = mem_index.distance_type();
-        let dim = mem_index.dim();
-        if dim == 0 {
-            // No vector was ever inserted (e.g. an all-tombstone generation):
-            // skip the index, keep the data flush.
-            return Ok(None);
-        }
-        // Forward-written data: HNSW row ids line up 1:1 with the data file, so
-        // no position reversal (pass `None`).
-        let Some((hnsw, flat_storage_batch)) = mem_index.to_lance_hnsw(None)? else {
-            // Every vector in the generation is null → empty graph; skip the
-            // index rather than failing the flush.
-            return Ok(None);
-        };
-
-        // Train SQ8 on the full memtable in one pass: learn global min/max
-        // from every flushed vector, then quantize all rows in one shot.
-        let row_id_col = flat_storage_batch
-            .column_by_name(ROW_ID)
-            .ok_or_else(|| Error::invalid_input("_rowid missing from HNSW storage batch"))?
-            .clone();
-        let flat_col = flat_storage_batch
-            .column_by_name(lance_index::vector::flat::storage::FLAT_COLUMN)
-            .ok_or_else(|| Error::invalid_input("flat column missing from HNSW storage batch"))?
-            .clone();
-        let flat_fsl = flat_col.as_fixed_size_list();
-        let mut sq = ScalarQuantizer::new(8, dim);
-        let bounds: Range<f64> = sq.update_bounds::<Float32Type>(flat_fsl)?;
-        let sq_codes = sq.transform::<Float32Type>(flat_fsl as &dyn arrow_array::Array)?;
-
-        let storage_schema = ArrowSchema::new(vec![
-            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new(
-                SQ_CODE_COLUMN,
-                arrow_schema::DataType::FixedSizeList(
-                    Arc::new(arrow_schema::Field::new(
-                        "item",
-                        arrow_schema::DataType::UInt8,
-                        true,
-                    )),
-                    dim as i32,
-                ),
-                true,
-            ),
-        ]);
-        let storage_batch = ArrowRecordBatch::try_new(
-            Arc::new(storage_schema.clone()),
-            vec![row_id_col, sq_codes],
-        )?;
-
-        // Single-partition IVF for both the storage and graph files. We need
-        // *some* centroid because the on-disk read path routes every query
-        // through `IvfModel::find_partitions` before HNSW search; that call
-        // unwraps `centroids`. With one partition the centroid value is
-        // irrelevant for routing — every query goes to partition 0 — so use
-        // a zero vector.
-        let zero_centroid_values = Float32Array::from(vec![0.0f32; dim]);
-        let zero_centroid_fsl =
-            FixedSizeListArray::try_new_from_values(zero_centroid_values, dim as i32)?;
-        let mut storage_ivf =
-            lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl.clone(), None);
-        storage_ivf.add_partition(storage_batch.num_rows() as u32);
-
-        let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut storage_writer = file_versions::create_writer(
-            storage_version,
-            self.object_store.create(&storage_path).await?,
-            (&storage_schema).try_into()?,
-            FileWriterOptions::default(),
-        )?;
-        storage_writer.write_batch(&storage_batch).await?;
-
-        let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
-        storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
-        let ivf_buffer_pos = storage_writer
-            .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
-            .await?;
-        storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
-
-        // The reader needs the SQ metadata in two forms: a single
-        // ScalarQuantizationMetadata under SQ_METADATA_KEY (whole-file path),
-        // and a JSON array of per-partition ScalarQuantizationMetadata strings
-        // under STORAGE_METADATA_KEY (per-partition path). With one partition
-        // we serialize the same value twice.
-        let sq_meta = lance_index::vector::sq::storage::ScalarQuantizationMetadata {
-            dim,
-            num_bits: 8,
-            bounds,
-        };
-        let sq_meta_json = serde_json::to_string(&sq_meta)?;
-        storage_writer.add_schema_metadata(
-            STORAGE_METADATA_KEY,
-            serde_json::to_string(&[&sq_meta_json])?,
-        );
-        storage_writer.add_schema_metadata(
-            lance_index::vector::sq::storage::SQ_METADATA_KEY,
-            sq_meta_json,
-        );
-        storage_writer.finish().await?;
-
-        // Write the HNSW graph batch to index.idx. The graph file uses the
-        // same single-partition IVF model with zero centroid for the same
-        // reason as the storage file.
-        let hnsw_batch = hnsw.to_batch()?;
-        let hnsw_metadata_json = hnsw_batch
-            .schema_ref()
-            .metadata()
-            .get(lance_index::vector::hnsw::builder::HNSW_METADATA_KEY)
-            .cloned()
-            .unwrap_or_default();
-        // Force fullzip structural encoding for the graph's List<u32>/List<f32>
-        // columns. The HNSW graph has dense level-0 neighbor lists followed by
-        // many empty higher-level lists; the v2.x miniblock List codec decodes
-        // the row count incorrectly for that shape at scale (the locally-sparse
-        // empty block is not captured by the global levels-per-value average),
-        // and at 2.1 it also overflows the 32 KiB miniblock cap. Fullzip
-        // round-trips it correctly.
-        let fullzip_meta = std::collections::HashMap::from([(
-            lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
-            lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
-        )]);
-        let index_schema: ArrowSchema = {
-            let base = HNSW::schema();
-            let fields = base
-                .fields()
-                .iter()
-                .map(|f| {
-                    if matches!(f.data_type(), arrow_schema::DataType::List(_)) {
-                        Arc::new(f.as_ref().clone().with_metadata(fullzip_meta.clone()))
-                    } else {
-                        f.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            ArrowSchema::new(fields)
-        };
-        let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-        let mut index_writer = file_versions::create_writer(
-            storage_version,
-            self.object_store.create(&index_path).await?,
-            (&index_schema).try_into()?,
-            FileWriterOptions::default(),
-        )?;
-        index_writer.write_batch(&hnsw_batch).await?;
-
-        let mut index_ivf =
-            lance_index::vector::ivf::storage::IvfModel::new(zero_centroid_fsl, None);
-        index_ivf.add_partition(hnsw_batch.num_rows() as u32);
-        let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;
-        // The on-disk type string matches Lance's index loader vocabulary —
-        // an HNSW sub-index over SQ8-quantized vector storage, registered
-        // under the same name as the standard IVF_HNSW_SQ path even though
-        // our IVF layer is a single-partition placeholder.
-        let index_metadata = IndexMetaSchema {
-            index_type: "IVF_HNSW_SQ".to_string(),
-            distance_type: distance_type.to_string(),
-        };
-        index_writer.add_schema_metadata(
-            INDEX_METADATA_SCHEMA_KEY,
-            serde_json::to_string(&index_metadata)?,
-        );
-        let ivf_buffer_pos = index_writer
-            .add_global_buffer(index_ivf_pb.encode_to_vec().into())
-            .await?;
-        index_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
-        // Per-partition HNSW metadata: a JSON array with one entry.
-        index_writer.add_schema_metadata(
-            HNSW::metadata_key(),
-            serde_json::to_string(&[hnsw_metadata_json])?,
-        );
-        index_writer.finish().await?;
-
-        // Packed the same way index creation does; hand-building the `Any` here
-        // produced a `type.googleapis.com/` url no other writer in lance emits.
-        let index_details = Some(Arc::new(vector_index_details_default()));
-        let index_meta = IndexMetadata {
-            uuid: index_uuid,
-            name: config.name.clone(),
-            fields: vec![0], // updated by caller
-            covering_fields: vec![],
-            dataset_version: 0,
-            fragment_bitmap: None,
-            index_details,
-            base_id: None,
-            created_at: Some(chrono::Utc::now()),
-            index_version: 1,
-            files: None,
-        };
-
-        Ok(Some(index_meta))
     }
 
     /// Update the shard manifest with the new SSTable.
@@ -1255,6 +792,9 @@ pub enum TriggerMemTableFlush {
     Flush {
         /// The frozen memtable to flush.
         memtable: Arc<MemTable>,
+        /// The indexes the memtable was built with. Not read from the writer,
+        /// whose set changes with the schema while this memtable keeps the old one.
+        index_specs: Arc<[MemIndexSpec]>,
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
@@ -1263,19 +803,52 @@ pub enum TriggerMemTableFlush {
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flush { memtable, done } => f
+            Self::Flush {
+                memtable,
+                index_specs,
+                done,
+            } => f
                 .debug_struct("TriggerMemTableFlush::Flush")
                 .field("memtable_gen", &memtable.generation())
                 .field("memtable_rows", &memtable.row_count())
+                .field("index_count", &index_specs.len())
                 .field("has_done", &done.is_some())
                 .finish(),
         }
     }
 }
 
+/// Build a scalar index on the generation from `training_data`, or from its
+/// rows without any.
+async fn build_scalar_index(
+    dataset: &mut Dataset,
+    spec: &MemIndexSpec,
+    training_data: Option<SendableRecordBatchStream>,
+) -> Result<IndexMetadata> {
+    let index_type = spec.plugin.flush_index_type();
+    if !index_type.is_scalar() {
+        return Err(Error::invalid_input(format!(
+            "index '{}' asked the flush to build a {index_type} index, but the flush builds \
+             only scalar types; plugin '{}' must write it and return FlushOutcome::Wrote",
+            spec.name,
+            spec.plugin.name()
+        )));
+    }
+    let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
+    let params = spec.plugin.flush_params(spec)?;
+    let mut builder =
+        CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
+    if let Some(stream) = training_data {
+        // Memtable positions are the flushed file's row ids, so no remap.
+        builder = builder.preprocessed_stream(stream, spec.plugin.training_criteria());
+    }
+    builder.execute_uncommitted().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
@@ -1341,6 +914,11 @@ mod tests {
                 .find(|sstable| sstable.generation == result.sstable.generation)
                 .expect("the flush recorded its generation")
         }
+    }
+
+    /// The shard schema these tests build their memtables against.
+    fn test_lance_schema() -> lance_core::datatypes::Schema {
+        lance_core::datatypes::Schema::try_from(create_test_schema().as_ref()).unwrap()
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1911,7 +1489,7 @@ mod tests {
     /// paths are exercised by sibling tests.
     #[tokio::test]
     async fn test_flush_with_indexes_and_dedup_deletion_vector() {
-        use super::super::super::index::{BTreeIndexConfig, IndexStore};
+        use super::super::super::index::IndexStore;
         use crate::index::DatasetIndexExt;
         use futures::TryStreamExt;
 
@@ -1926,15 +1504,12 @@ mod tests {
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         // BTree on the non-PK `name` column so the index sees the dedup set.
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "name_btree".to_string(),
-            field_id: 1,
-            column: "name".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("name_btree", 1, "name")];
 
         let schema = create_pk_schema();
         let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
-        let registry = IndexStore::from_configs(&index_configs, 100_000, 1_000).unwrap();
+        let registry =
+            IndexStore::from_specs(&index_specs, &test_lance_schema(), 100_000, 1_000).unwrap();
         memtable.set_indexes(registry);
 
         // Duplicate PKs in append order: id=1 a->a2, id=2 b, id=3 c->c2.
@@ -1957,7 +1532,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
+            .flush_with_indexes(&memtable, epoch, &index_specs, 1, durable)
             .await
             .unwrap();
         assert_eq!(result.rows_flushed, 5, "all physical rows are written");
@@ -2044,7 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_flusher_with_btree_index() {
-        use super::super::super::index::{BTreeIndexConfig, IndexStore};
+        use super::super::super::index::IndexStore;
         use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -2060,17 +1635,14 @@ mod tests {
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
 
         // Create index config for the 'id' column (field_id = 0)
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_btree".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_btree", 0, "id")];
 
         let schema = create_test_schema();
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry so preprocessed data path is used
-        let registry = IndexStore::from_configs(&index_configs, 100_000, 1_000).unwrap();
+        let registry =
+            IndexStore::from_specs(&index_specs, &test_lance_schema(), 100_000, 1_000).unwrap();
         memtable.set_indexes(registry);
 
         let frag_id = memtable
@@ -2089,7 +1661,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
+            .flush_with_indexes(&memtable, epoch, &index_specs, 1, durable)
             .await
             .unwrap();
 
@@ -2182,15 +1754,16 @@ mod tests {
         let vectors_array = Float32Array::from(vectors);
 
         // Create HNSW index config (field_id = 1 for vector column)
-        let index_configs = vec![MemIndexConfig::hnsw(
-            "vector_hnsw".to_string(),
+        let index_specs = vec![MemIndexSpec::hnsw(
+            "vector_hnsw",
             1,
-            "vector".to_string(),
+            "vector",
             DistanceType::L2,
         )];
 
         let mut memtable = MemTable::new(vector_schema.clone(), 1, vec![]).unwrap();
-        let registry = IndexStore::from_configs(&index_configs, num_vectors, 100).unwrap();
+        let registry =
+            IndexStore::from_specs(&index_specs, &test_lance_schema(), num_vectors, 100).unwrap();
         memtable.set_indexes(registry);
 
         // Create test batch with vectors
@@ -2223,7 +1796,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
+            .flush_with_indexes(&memtable, epoch, &index_specs, 1, durable)
             .await
             .unwrap();
 
@@ -2306,7 +1879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_flusher_with_fts_index() {
-        use super::super::super::index::{FtsIndexConfig, IndexStore};
+        use super::super::super::index::IndexStore;
         use crate::index::DatasetIndexExt;
         use arrow_array::StringArray;
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -2331,16 +1904,13 @@ mod tests {
         ]));
 
         // Create FTS index config (field_id = 1 for text column)
-        let index_configs = vec![MemIndexConfig::Fts(FtsIndexConfig::new(
-            "text_fts".to_string(),
-            1,
-            "text".to_string(),
-        ))];
+        let index_specs = vec![MemIndexSpec::fts("text_fts", 1, "text")];
 
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry
-        let registry = IndexStore::from_configs(&index_configs, 100_000, 1_000).unwrap();
+        let registry =
+            IndexStore::from_specs(&index_specs, &test_lance_schema(), 100_000, 1_000).unwrap();
         memtable.set_indexes(registry);
 
         // Create test batch with text data
@@ -2370,7 +1940,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
+            .flush_with_indexes(&memtable, epoch, &index_specs, 1, durable)
             .await
             .unwrap();
 
@@ -2448,5 +2018,231 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Flush one memtable holding `batch`, maintaining `spec`, and return the
+    /// indexes the generation records.
+    async fn flush_one(spec: MemIndexSpec, batch: RecordBatch) -> Result<Vec<IndexMetadata>> {
+        use crate::index::DatasetIndexExt;
+
+        let (generation, _dir) = flush_generation(spec, batch).await?;
+        Ok(generation.load_indices().await?.as_ref().clone())
+    }
+
+    /// The generation written by flushing `batch` with the index `spec`, and the
+    /// directory holding it.
+    async fn flush_generation(
+        spec: MemIndexSpec,
+        batch: RecordBatch,
+    ) -> Result<(Dataset, TempDir)> {
+        use crate::dataset::mem_wal::index::IndexStore;
+
+        let (store, base_path, base_uri, temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+        let specs = vec![spec];
+        let lance_schema =
+            lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
+        let mut memtable = MemTable::new(batch.schema(), 1, vec![]).unwrap();
+        memtable.set_indexes(IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap());
+        let durable = memtable.insert(batch).await.unwrap() + 1;
+        let result =
+            MemTableFlusher::new(store, base_path, base_uri.clone(), shard_id, manifest_store)
+                .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+                .await?;
+        let generation = Dataset::open(&format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri.trim_end_matches('/'),
+            shard_id,
+            result.sstable.path
+        ))
+        .await?;
+        Ok((generation, temp_dir))
+    }
+
+    /// An index holding nothing writes no index: an empty list-element
+    /// full-text index is not rebuilt as a whole-row one.
+    #[tokio::test]
+    async fn an_empty_index_is_left_out_of_the_generation() {
+        use arrow_array::Array;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use lance_index::scalar::InvertedIndexParams;
+        use lance_index::scalar::inverted::DocumentGranularity;
+
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.append(false);
+        tags.append(true);
+        let tags = tags.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tags", tags.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(tags)],
+        )
+        .unwrap();
+        let spec = MemIndexSpec::fts_with_params(
+            "tags_fts",
+            1,
+            "tags",
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
+        );
+        assert!(flush_one(spec, batch).await.unwrap().is_empty());
+    }
+
+    /// The flush builds only scalar indexes; a vector plugin asking it to is
+    /// refused by name.
+    #[tokio::test]
+    async fn a_vector_plugin_asking_the_flush_to_build_it_is_an_error() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_linalg::distance::DistanceType;
+
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", DataType::FixedSizeList(item.clone(), 2), false),
+        ]));
+        let vectors = FixedSizeListArray::try_new(
+            item,
+            2,
+            Arc::new(Float32Array::from_iter_values((0..20).map(|i| i as f32))),
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let spec = wrapped(
+            MemIndexSpec::hnsw("vector_hnsw", 1, "vector", DistanceType::L2),
+            Deviation::AsksForABuild,
+        );
+        let error = flush_one(spec, batch).await.unwrap_err();
+        assert!(
+            error.to_string().contains("vector_hnsw") && error.to_string().contains("Wrote"),
+            "{error}"
+        );
+    }
+
+    fn text_batch(texts: &[&str]) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..texts.len() as i32)),
+                Arc::new(StringArray::from(texts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A failed index flush fails the generation, and an index recorded under
+    /// a name or fields other than its own is refused.
+    #[rstest::rstest]
+    #[case::fails(Deviation::FailsToFlush, "flush failed")]
+    #[case::another_name(Deviation::RecordsAnotherName, "another_name")]
+    #[tokio::test]
+    async fn an_index_that_does_not_flush_as_itself_fails_the_flush(
+        #[case] deviation: Deviation,
+        #[case] message: &str,
+    ) {
+        let spec = wrapped(MemIndexSpec::fts("text_fts", 1, "text"), deviation);
+        let error = flush_one(spec, text_batch(&["hello world"]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    /// A flushed full-text index with word positions answers a phrase query.
+    #[tokio::test]
+    async fn a_full_text_index_with_positions_answers_phrases_once_flushed() {
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::InvertedIndexParams;
+        use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+
+        let spec = MemIndexSpec::fts_with_params(
+            "text_fts",
+            1,
+            "text",
+            InvertedIndexParams::default().with_position(true),
+        );
+        let (generation, _dir) =
+            flush_generation(spec, text_batch(&["quick brown fox", "brown quick"]))
+                .await
+                .unwrap();
+        let found = generation
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("quick brown".to_string()).with_column(Some("text".to_string())),
+            )))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = found
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![0]);
+    }
+
+    /// A scalar build uses the plugin's flush parameters, whether the index
+    /// hands over its rows or asks the flush to read the generation.
+    #[rstest::rstest]
+    #[case::training_data(Deviation::None)]
+    #[case::build_from_generation(Deviation::AsksForABuild)]
+    #[tokio::test]
+    async fn a_scalar_build_uses_the_plugin_flush_params(#[case] deviation: Deviation) {
+        use crate::dataset::mem_wal::index::test_plugin::wrapped_with_flush_params;
+        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::btree::BTreeParameters;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        const ZONE_SIZE: u64 = 4;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree)
+            .with_params(&serde_json::json!({ "zone_size": ZONE_SIZE }));
+        let spec = wrapped_with_flush_params(
+            MemIndexSpec::btree("id_btree", 0, "id"),
+            deviation,
+            Some(params),
+        );
+        let (generation, _dir) =
+            flush_generation(spec, create_test_batch(&create_test_schema(), 10))
+                .await
+                .unwrap();
+
+        let indices = generation.load_indices().await.unwrap();
+        let built = indices
+            .iter()
+            .find(|index| index.name == "id_btree")
+            .expect("the flush built the index");
+        let derived = generation
+            .open_scalar_index("id", &built.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .derive_index_params()
+            .unwrap();
+        let derived: BTreeParameters =
+            serde_json::from_str(&derived.params.expect("B-tree parameters")).unwrap();
+        assert_eq!(derived.zone_size, Some(ZONE_SIZE));
     }
 }

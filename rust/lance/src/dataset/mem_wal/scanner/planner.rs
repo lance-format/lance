@@ -18,7 +18,7 @@ use crate::dataset::mem_wal::TOMBSTONE;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -58,6 +58,8 @@ pub struct LsmScanPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
+    /// See [`super::LsmScanner::with_memtable_filter_indexes`].
+    memtable_filter_indexes: bool,
 }
 
 impl LsmScanPlanner {
@@ -77,7 +79,14 @@ impl LsmScanPlanner {
             store_params: None,
             sstable_cache: None,
             warmer: None,
+            memtable_filter_indexes: false,
         }
+    }
+
+    /// See [`super::LsmScanner::with_memtable_filter_indexes`].
+    pub fn with_memtable_filter_indexes(mut self, enabled: bool) -> Self {
+        self.memtable_filter_indexes = enabled;
+        self
     }
 
     /// Set the session used to open SSTables.
@@ -424,11 +433,7 @@ impl LsmScanPlanner {
                 // generation's own planning nests deeply enough that leaving
                 // this future inlined pushes the `Send` proof past rustc's
                 // recursion limit for callers stacked above it.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -440,37 +445,60 @@ impl LsmScanPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-
-                // Asked for under the table's own names, which is what a
-                // memtable stores them under: a memtable is created from the
-                // schema its writer holds, so a reader planning against that
-                // same schema needs no resolution. Pairing a memtable with a
-                // schema it was not created from is outside this contract --
-                // pass the memtable its own schema, or reopen the writer.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+
+                // `Some` only for a memtable created before a schema change;
+                // it resolves like a flushed generation.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(filter),
+                    None => (filter.cloned(), None),
+                };
+
+                match &generation {
+                    Some(generation) => {
+                        scanner.project(&generation.stored_projection())?;
+                    }
+                    None => {
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
+                }
                 scanner.with_row_address();
 
-                // The dedup scan applies the filter post-dedup; pushing it
-                // into the raw scan would resurrect older versions of PKs
-                // whose newest version fails the predicate. Folding
-                // `NOT _tombstone` here is correct: a tombstone wins the
-                // position-based dedup (suppressing the older real row) and is
-                // then dropped by this predicate. A memtable without the column
-                // (legacy / test) gets no fold.
+                // Filter after dedup: filtering the raw scan would bring back an
+                // older version of a key whose newest version fails the filter.
+                // Adding `NOT _tombstone` is safe: a tombstone still wins the
+                // dedup, hiding the older row, and is then dropped.
                 let folded;
                 let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
-                    folded = fold_not_tombstone(filter);
+                    folded = fold_not_tombstone(stored_filter.as_ref());
                     Some(&folded)
                 } else {
-                    filter
+                    stored_filter.as_ref()
                 };
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
+                scanner.with_memtable_filter_indexes(self.memtable_filter_indexes);
 
-                scanner.create_dedup_plan(&self.pk_columns).await
+                let pk_columns = match &generation {
+                    Some(generation) => generation.stored_pk_columns()?,
+                    None => self.pk_columns.clone(),
+                };
+                let deduped = Box::pin(scanner.create_dedup_plan(&pk_columns)).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(deduped, &above),
+                    None => Ok(deduped),
+                }
             }
         }
     }
@@ -558,9 +586,10 @@ mod integration_tests {
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
+    use lance_core::datatypes::Schema as LanceSchema;
 
     /// Create test schema with id as primary key.
     fn create_pk_schema() -> Arc<ArrowSchema> {
@@ -1421,9 +1450,13 @@ mod integration_tests {
 
         // Create active memtable with BTree index
         let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let mut index_store = IndexStore::new();
-        // Add BTree index on id column (field_id=0)
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let mut index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &LanceSchema::try_from(schema.as_ref()).unwrap(),
+            100,
+            4,
+        )
+        .unwrap();
         // Reuse it as the PK index so the block-list can dedup this generation.
         index_store.enable_pk_index(&[("id".to_string(), 0)]);
 
@@ -1482,7 +1515,7 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan structure with BTree index optimization.
+        // Verify plan structure with a B-tree on the memtable.
         // Instead of complex pattern matching, verify key components directly:
         use datafusion::physical_plan::displayable;
         let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
@@ -1499,16 +1532,16 @@ mod integration_tests {
         );
 
         // 2. The active arm uses the fused dedup scan: it deduplicates to
-        //    newest-per-PK *before* applying the predicate, so it deliberately
-        //    forgoes the in-memory BTree skip (the dedup must see every
-        //    version). See MemTableDedupScanExec.
+        //    newest-per-PK *before* applying the predicate, so by default it
+        //    forgoes the index route (the dedup must see every version). See
+        //    MemTableDedupScanExec.
         assert!(
             plan_str.contains("MemTableDedupScanExec"),
             "Active memtable should use the fused dedup scan"
         );
         assert!(
-            !plan_str.contains("BTreeIndexExec"),
-            "Active filtered read no longer uses the BTree skip"
+            !plan_str.contains("ScalarMemIndexExec"),
+            "the active memtable's filtered read reads every row unless its filter indexes are turned on"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets
@@ -2216,6 +2249,271 @@ mod integration_tests {
             vec![1, 3, 4],
             "id=2 deleted; tombstone row not surfaced"
         );
+    }
+
+    /// Across a base table, a flushed generation, and frozen and active
+    /// memtables, a scan from the memtables' filter indexes returns what
+    /// reading every row returns, whatever the filter, projection, limit and
+    /// offset.
+    #[tokio::test]
+    async fn test_lsm_scan_from_memtable_filter_indexes_answers_like_a_full_read() {
+        use crate::dataset::mem_wal::TOMBSTONE;
+        use crate::dataset::mem_wal::index::MemIndexSpec;
+        use crate::dataset::mem_wal::memtable::scanner::newest_checks;
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use arrow_array::BooleanArray;
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        const FILTERS: [&str; 11] = [
+            "cat BETWEEN 30 AND 10",
+            "cat > 20 AND cat <= 20",
+            "cat = 3",
+            "cat IN (1, 2)",
+            "name = 'n2'",
+            "cat > 30 AND name = 'n1'",
+            "cat = 3 OR name = 'n4'",
+            "name IS NULL",
+            "cat < 3",
+            "cat = 3 AND id > 100",
+            "cat = 3 AND name LIKE 'n%'",
+        ];
+        let pk_field = || {
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            )]))
+        };
+        let disk_schema = Arc::new(ArrowSchema::new(vec![
+            pk_field(),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("cat", DataType::Int32, true),
+        ]));
+        let mem_schema = Arc::new(ArrowSchema::new(vec![
+            pk_field(),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("cat", DataType::Int32, true),
+            Field::new(TOMBSTONE, DataType::Boolean, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(mem_schema.as_ref()).unwrap();
+
+        let mut seed: u64 = 0x15a;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        // (id, name, cat, deleted) rows.
+        type Row = (i32, Option<String>, Option<i32>, bool);
+        let rows = |next: &mut dyn FnMut(u64) -> u64, count: usize, deletes: bool| -> Vec<Row> {
+            (0..count)
+                .map(|_| {
+                    let deleted = deletes && next(6) == 0;
+                    let name = (!deleted && next(12) != 0).then(|| format!("n{}", next(30)));
+                    let cat = (!deleted && next(12) != 0).then(|| next(40) as i32);
+                    (next(400) as i32, name, cat, deleted)
+                })
+                .collect()
+        };
+        let disk_batch = |rows: &[Row]| {
+            RecordBatch::try_new(
+                disk_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(StringArray::from_iter(rows.iter().map(|r| r.1.clone()))),
+                    Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.2))),
+                ],
+            )
+            .unwrap()
+        };
+        let mem_batch = |rows: &[Row]| {
+            RecordBatch::try_new(
+                mem_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(StringArray::from_iter(rows.iter().map(|r| r.1.clone()))),
+                    Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.2))),
+                    Arc::new(BooleanArray::from_iter(rows.iter().map(|r| Some(r.3)))),
+                ],
+            )
+            .unwrap()
+        };
+        let memtable = |batches: &[RecordBatch], durable: Option<usize>| {
+            let mut indexes = IndexStore::from_specs(
+                &[
+                    MemIndexSpec::btree("name_idx", 1, "name"),
+                    MemIndexSpec::btree("cat_idx", 2, "cat"),
+                ],
+                &lance_schema,
+                1024,
+                64,
+            )
+            .unwrap();
+            indexes.enable_pk_index(&[("id".to_string(), 0)]);
+            let cursors = Arc::new(WriterCursors::new(true));
+            indexes.set_durability(cursors.clone(), 0);
+            let store = Arc::new(BatchStore::with_capacity(64));
+            for (position, batch) in batches.iter().enumerate() {
+                let (_, offset, _) = store.append(batch.clone()).unwrap();
+                indexes
+                    .insert_with_batch_position(batch, offset, Some(position))
+                    .unwrap();
+            }
+            cursors.advance_durable(durable.unwrap_or(batches.len()));
+            (store, Arc::new(indexes))
+        };
+
+        let (mut checked, mut index_reads) = (0, 0);
+        for round in 0..12 {
+            let temp = tempfile::tempdir().unwrap();
+            let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+            let base_rows = rows(&mut next, 300, false);
+            let base = Arc::new(create_dataset(&base_uri, vec![disk_batch(&base_rows)]).await);
+            let shard_id = Uuid::new_v4();
+            let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+            create_dataset(&gen1_uri, vec![disk_batch(&rows(&mut next, 100, false))]).await;
+            let snapshot = ShardSnapshot::new(shard_id)
+                .with_current_generation(3)
+                .with_sstable(1, "gen_1".to_string());
+
+            let frozen_batches: Vec<RecordBatch> = (0..4)
+                .map(|_| mem_batch(&rows(&mut next, 60, true)))
+                .collect();
+            let active_count = 1 + next(4) as usize;
+            let active_batches: Vec<RecordBatch> = (0..active_count)
+                .map(|_| mem_batch(&rows(&mut next, 60, true)))
+                .collect();
+            let durable = next(active_count as u64 + 1) as usize;
+            let (frozen_store, frozen_index) = memtable(&frozen_batches, None);
+            let (active_store, active_index) = memtable(&active_batches, Some(durable));
+            let in_memory = InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store: active_store,
+                    index_store: active_index,
+                    schema: mem_schema.clone(),
+                    generation: 3,
+                },
+                frozen: vec![InMemoryMemTableRef {
+                    batch_store: frozen_store,
+                    index_store: frozen_index,
+                    schema: mem_schema.clone(),
+                    generation: 2,
+                }],
+            };
+
+            for filter in FILTERS {
+                for projection in [None, Some(vec!["id", "cat"])] {
+                    for (limit, offset) in [(None, None), (Some(3), None), (Some(4), Some(2))] {
+                        let read = |enabled: bool| {
+                            let mut scanner = LsmScanner::new(
+                                base.clone(),
+                                vec![snapshot.clone()],
+                                vec!["id".to_string()],
+                            )
+                            .with_in_memory_memtables(shard_id, in_memory.clone())
+                            .with_memtable_filter_indexes(enabled)
+                            .filter(filter)
+                            .unwrap();
+                            if let Some(columns) = &projection {
+                                scanner = scanner.project(columns).unwrap();
+                            }
+                            let scanner = scanner.limit(limit, offset).unwrap();
+                            async move {
+                                let plan = scanner.create_plan().await.unwrap();
+                                let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                                    .indent(true)
+                                    .to_string();
+                                assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
+                                let ctx = datafusion::prelude::SessionContext::new();
+                                let batches = datafusion::physical_plan::collect(
+                                    plan.clone(),
+                                    ctx.task_ctx(),
+                                )
+                                .await
+                                .unwrap();
+                                let mut out: Vec<(i32, Option<i32>)> = Vec::new();
+                                for batch in &batches {
+                                    let id = batch.column_by_name("id").unwrap();
+                                    let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+                                    let cat = batch.column_by_name("cat").unwrap();
+                                    let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
+                                    for row in 0..batch.num_rows() {
+                                        out.push((
+                                            id.value(row),
+                                            cat.is_valid(row).then(|| cat.value(row)),
+                                        ));
+                                    }
+                                }
+                                out.sort_unstable();
+                                (out, newest_checks(&plan))
+                            }
+                        };
+                        let context = format!(
+                            "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
+                        );
+                        let (full, checks) = read(false).await;
+                        assert_eq!(checks, 0, "{context}: the setting is off");
+                        let (from_indexes, checks) = read(true).await;
+                        if checks > 0 {
+                            index_reads += 1;
+                        }
+                        if limit.is_none() {
+                            assert_eq!(from_indexes, full, "{context}");
+                        } else {
+                            // An unordered limit may return any rows that match,
+                            // each key once.
+                            assert_eq!(from_indexes.len(), full.len(), "{context}");
+                            let mut ids: Vec<i32> = from_indexes.iter().map(|row| row.0).collect();
+                            ids.dedup();
+                            assert_eq!(ids.len(), from_indexes.len(), "{context}: a key twice");
+                            let mut all =
+                                read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
+                            all.sort_unstable();
+                            for row in &from_indexes {
+                                assert!(all.contains(row), "{context}: {row:?} does not match");
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 12 * FILTERS.len() * 2 * 3);
+        assert!(
+            index_reads * 2 > checked,
+            "most reads must take the index route: {index_reads} of {checked}"
+        );
+
+        async fn read_all(
+            base: &Arc<Dataset>,
+            snapshot: &ShardSnapshot,
+            shard_id: Uuid,
+            in_memory: &InMemoryMemTables,
+            filter: &str,
+        ) -> Vec<(i32, Option<i32>)> {
+            let batches: Vec<RecordBatch> =
+                LsmScanner::new(base.clone(), vec![snapshot.clone()], vec!["id".to_string()])
+                    .with_in_memory_memtables(shard_id, in_memory.clone())
+                    .filter(filter)
+                    .unwrap()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+            let mut out = Vec::new();
+            for batch in &batches {
+                let id = batch.column_by_name("id").unwrap();
+                let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+                let cat = batch.column_by_name("cat").unwrap();
+                let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
+                for row in 0..batch.num_rows() {
+                    out.push((id.value(row), cat.is_valid(row).then(|| cat.value(row))));
+                }
+            }
+            out
+        }
     }
 
     #[tokio::test]

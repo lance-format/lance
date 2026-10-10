@@ -51,7 +51,7 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges,
+    IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
     ranges_to_bitmap, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
@@ -64,6 +64,7 @@ use tracing::{Instrument, instrument};
 use crate::Dataset;
 use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
 use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig};
+use crate::dataset::fragment_slice::validate_physical_rows;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
@@ -71,7 +72,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
 type MaterializedReadBatchesFut =
@@ -716,10 +717,7 @@ impl FilteredReadStream {
         options: &FilteredReadOptions,
     ) -> Result<Vec<LoadedFragment>> {
         let io_parallelism = dataset.object_store.io_parallelism();
-        let fragments = options
-            .fragments
-            .clone()
-            .unwrap_or_else(|| dataset.fragments().clone());
+        let fragments = options.selected_fragments(dataset.as_ref());
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
         let frag_futs = fragments
@@ -894,6 +892,20 @@ impl FilteredReadStream {
 
             let mut to_read: Vec<Range<u64>> =
                 Self::full_frag_range(*num_physical_rows, deletion_vector);
+
+            if let Some(rows) = &options.physical_row_addr_prefilter {
+                let fragment_id = fragment.id() as u32;
+                let Some(selection) = rows.get(&fragment_id) else {
+                    continue;
+                };
+                if let RowAddrSelection::Partial(bitmap) = selection {
+                    let requested = bitmap_to_ranges(bitmap);
+                    to_read = Self::intersect_ranges(&to_read, &requested);
+                    if to_read.is_empty() {
+                        continue;
+                    }
+                }
+            }
 
             if let Some(range_before_filter) = &options.scan_range_before_filter {
                 let range_start = range_offset;
@@ -1091,7 +1103,9 @@ impl FilteredReadStream {
                         &index_result.lower,
                         None,
                     );
-                    fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
+                    // Candidates outside the lower bound still need a recheck if
+                    // the guaranteed matches cannot satisfy the requested limit.
+                    fragments_to_read.insert(fragment_id, to_read);
 
                     Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
                     scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
@@ -1743,6 +1757,8 @@ pub struct FilteredReadOptions {
     pub fragment_readahead: Option<usize>,
     /// The fragments to read
     pub fragments: Option<Arc<Vec<Fragment>>>,
+    /// Physical `(fragment_id, row_offset)` allow-list applied before filters.
+    pub(crate) physical_row_addr_prefilter: Option<Arc<RowAddrTreeMap>>,
     /// The projection to use for the scan
     pub projection: Projection,
     /// If there is a scalar index input, and the index result we get from that input is exact,
@@ -1791,6 +1807,7 @@ impl FilteredReadOptions {
             file_reader_options: None,
             fragment_readahead: None,
             fragments: None,
+            physical_row_addr_prefilter: None,
             projection,
             refine_filter: None,
             full_filter: None,
@@ -1841,9 +1858,23 @@ impl FilteredReadOptions {
     /// data as a column `count` that steps from 0 to 1000 and the filter is `count > 200`
     /// and the range is 100..300, then scan will read rows 100..300 and return rows 200..300
     pub fn with_scan_range_before_filter(mut self, scan_range: Range<u64>) -> Result<Self> {
+        if self.physical_row_addr_prefilter.is_some() {
+            return Err(Error::invalid_input(
+                "scan_range_before_filter cannot be combined with physical row selection",
+            ));
+        }
         if self.with_deleted_rows {
             return Err(Error::invalid_input_source(
                 "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
+        }
+        if scan_range.start > scan_range.end {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "scan range start ({}) is greater than its end ({})",
+                    scan_range.start, scan_range.end
+                )
+                .into(),
             ));
         }
         self.scan_range_before_filter = Some(scan_range);
@@ -1864,8 +1895,34 @@ impl FilteredReadOptions {
                 "with_deleted_rows is not supported when there is a scan range".into(),
             ));
         }
+        if scan_range.start > scan_range.end {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "scan range start ({}) is greater than its end ({})",
+                    scan_range.start, scan_range.end
+                )
+                .into(),
+            ));
+        }
         self.scan_range_after_filter = Some(scan_range);
         Ok(self)
+    }
+
+    fn selected_fragments(&self, dataset: &Dataset) -> Arc<Vec<Fragment>> {
+        let fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| dataset.fragments().clone());
+        match &self.physical_row_addr_prefilter {
+            Some(rows) => Arc::new(
+                fragments
+                    .iter()
+                    .filter(|fragment| rows.get(&(fragment.id as u32)).is_some())
+                    .cloned()
+                    .collect(),
+            ),
+            None => fragments,
+        }
     }
 
     /// Specify the fragments to read.
@@ -1873,6 +1930,11 @@ impl FilteredReadOptions {
     /// Scan results will be returned in the order of the fragments given here.
     pub fn with_fragments(mut self, fragments: Arc<Vec<Fragment>>) -> Self {
         self.fragments = Some(fragments);
+        self
+    }
+
+    pub(crate) fn with_physical_row_addr_prefilter(mut self, rows: Arc<RowAddrTreeMap>) -> Self {
+        self.physical_row_addr_prefilter = Some(rows);
         self
     }
 
@@ -1937,6 +1999,8 @@ impl FilteredReadOptions {
 
     /// An alternative to [`Self::with_filter`] to set the filters from a FilterPlan if you already have one
     pub fn with_filter_plan(mut self, filter_plan: FilterPlan) -> Self {
+        // This infallible setter does not validate the refine/full pairing, so
+        // statistics must check for refine filters even without a full filter.
         self.physical_filters.clear();
         self.refine_filter = filter_plan.refine_expr;
         self.full_filter = filter_plan.full_expr;
@@ -2071,6 +2135,8 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
+    /// Cached from the output schema and dataset blob metadata at construction.
+    bytes_per_row: Option<f64>,
     materialization_context: Arc<BlobMaterializationContext>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -2181,6 +2247,14 @@ impl FilteredReadExec {
         options: FilteredReadOptions,
         input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
+        // Validate here as well as in setters: options can be assembled in either order.
+        if options.physical_row_addr_prefilter.is_some()
+            && options.scan_range_before_filter.is_some()
+        {
+            return Err(Error::invalid_input(
+                "scan_range_before_filter cannot be combined with physical row selection",
+            ));
+        }
         if options.materialization_readahead_bytes == Some(0) {
             return Err(Error::invalid_input_source(
                 "materialization_readahead_bytes must be greater than 0, got 0".into(),
@@ -2290,6 +2364,7 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2372,6 +2447,7 @@ impl FilteredReadExec {
             options,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            bytes_per_row,
             input: RowSelector::RowStream(Arc::new(RowStreamSource {
                 plan: input,
                 key_column,
@@ -2444,6 +2520,7 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -2465,6 +2542,7 @@ impl FilteredReadExec {
             ),
             dataset,
             options,
+            bytes_per_row,
             properties,
             running_stream: Arc::new(AsyncMutex::new(None)),
             metrics,
@@ -2520,6 +2598,9 @@ impl FilteredReadExec {
     ) -> Result<&'a FilteredReadInternalPlan> {
         plan_cell
             .get_or_try_init(|| async {
+                if let Some(rows) = &options.physical_row_addr_prefilter {
+                    validate_physical_rows(&dataset, rows).await?;
+                }
                 // Execute index if present
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
@@ -2540,10 +2621,7 @@ impl FilteredReadExec {
 
                 // Load fragments to compute the plan
                 let io_parallelism = dataset.object_store.io_parallelism();
-                let fragments = options
-                    .fragments
-                    .clone()
-                    .unwrap_or_else(|| dataset.fragments().clone());
+                let fragments = options.selected_fragments(dataset.as_ref());
 
                 let with_deleted_rows = options.with_deleted_rows;
                 // A range before filtering is expressed in dataset/fragment order. Planning it
@@ -2798,7 +2876,11 @@ impl FilteredReadExec {
         let metrics = self.metrics.clone();
         let materialization_context = self.materialization_context.clone();
 
+        let options = self.options.clone();
         let lazy_stream = futures::stream::once(async move {
+            if let Some(rows) = &options.physical_row_addr_prefilter {
+                validate_physical_rows(&dataset, rows).await?;
+            }
             let row_stream_read = Arc::new(RowStreamRead::new(
                 dataset,
                 source,
@@ -2808,9 +2890,9 @@ impl FilteredReadExec {
                 partition,
                 materialization_context,
             ));
-            row_stream_read.apply(input_stream)
+            Ok::<_, DataFusionError>(row_stream_read.apply(input_stream))
         })
-        .flatten();
+        .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             lazy_stream,
@@ -2924,6 +3006,7 @@ impl RowStreamRead {
     fn plan_batch_from_addresses(
         addrs: &RowAddrTreeMap,
         fragments: &StreamFragments,
+        physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
     ) -> FilteredReadInternalPlan {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         for (fragment_id, requested) in addrs.iter() {
@@ -2934,6 +3017,16 @@ impl RowStreamRead {
             let requested = match requested {
                 RowAddrSelection::Full => vec![0..fragment.num_physical_rows],
                 RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
+            };
+            let requested = match physical_row_addr_prefilter {
+                Some(allowed) => match allowed.get(fragment_id) {
+                    Some(RowAddrSelection::Full) => requested,
+                    Some(RowAddrSelection::Partial(bitmap)) => {
+                        FilteredReadStream::intersect_ranges(&requested, &bitmap_to_ranges(bitmap))
+                    }
+                    None => continue,
+                },
+                None => requested,
             };
             let valid = FilteredReadStream::full_frag_range(
                 fragment.num_physical_rows,
@@ -2957,6 +3050,7 @@ impl RowStreamRead {
         ids: RowAddrTreeMap,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
         fragments: &StreamFragments,
+        physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
     ) -> FilteredReadInternalPlan {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         let (Some(min_key), Some(max_key)) = (arrow::compute::min(keys), arrow::compute::max(keys))
@@ -2980,13 +3074,24 @@ impl RowStreamRead {
             if offsets.is_empty() {
                 continue;
             }
+            let fragment_id = fragment.fragment.id() as u32;
+            let offsets = match physical_row_addr_prefilter {
+                Some(allowed) => match allowed.get(&fragment_id) {
+                    Some(RowAddrSelection::Full) => offsets,
+                    Some(RowAddrSelection::Partial(bitmap)) => {
+                        FilteredReadStream::intersect_ranges(&offsets, &bitmap_to_ranges(bitmap))
+                    }
+                    None => continue,
+                },
+                None => offsets,
+            };
             let valid = FilteredReadStream::full_frag_range(
                 fragment.num_physical_rows,
                 &fragment.deletion_vector,
             );
             let matched = FilteredReadStream::intersect_ranges(&valid, &offsets);
             if !matched.is_empty() {
-                rows.insert(fragment.fragment.id() as u32, matched);
+                rows.insert(fragment_id, matched);
             }
         }
         FilteredReadInternalPlan {
@@ -3032,12 +3137,26 @@ impl RowStreamRead {
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
+        let physical_row_addr_prefilter = self
+            .source
+            .read_options
+            .physical_row_addr_prefilter
+            .as_deref();
         // Row ids equal row addresses when the dataset does not use stable
         // row ids, so either key resolves directly by position
         if self.source.key_column == ROW_ADDR || !self.dataset.manifest.uses_stable_row_ids() {
-            Ok(Self::plan_batch_from_addresses(&batch_keys, fragments))
+            Ok(Self::plan_batch_from_addresses(
+                &batch_keys,
+                fragments,
+                physical_row_addr_prefilter,
+            ))
         } else {
-            Ok(Self::plan_batch_from_row_ids(batch_keys, keys, fragments))
+            Ok(Self::plan_batch_from_row_ids(
+                batch_keys,
+                keys,
+                fragments,
+                physical_row_addr_prefilter,
+            ))
         }
     }
 
@@ -3397,16 +3516,21 @@ impl ExecutionPlan for FilteredReadExec {
     ) -> datafusion::error::Result<Arc<Statistics>> {
         if let RowSelector::RowStream(source) = &self.input {
             // At most one output row per input row
+            let num_rows = source.plan.partition_statistics(partition)?.num_rows;
+            let num_rows = if self.options.physical_row_addr_prefilter.is_some() {
+                // Row-stream inputs may repeat keys, so bitmap cardinality is not
+                // an output bound. Filtering can only reduce the input estimate.
+                num_rows.to_inexact()
+            } else {
+                num_rows
+            };
             return Ok(Arc::new(Statistics {
-                num_rows: source.plan.partition_statistics(partition)?.num_rows,
+                num_rows,
+                total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
                 ..Statistics::new_unknown(self.schema().as_ref())
             }));
         }
-        let fragments = self
-            .options
-            .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().clone());
+        let fragments = self.options.selected_fragments(&self.dataset);
 
         let total_rows = if self.options.with_deleted_rows {
             if self.options.scan_range_before_filter.is_some()
@@ -3426,6 +3550,12 @@ impl ExecutionPlan for FilteredReadExec {
             }
             fragments.iter().map(|f| f.num_rows().unwrap() as u64).sum()
         };
+        let total_rows = self
+            .options
+            .physical_row_addr_prefilter
+            .as_ref()
+            .and_then(|rows| rows.len())
+            .map_or(total_rows, |selected| total_rows.min(selected));
 
         let Some(filter) = self.options.full_filter.as_ref() else {
             // If there is no filter, we just return the total number of rows (sans any before-filter range)
@@ -3437,6 +3567,16 @@ impl ExecutionPlan for FilteredReadExec {
                     // last of those rows yields the rows up to it, not its full width.
                     let end = scan_range_before_filter.end.min(total_rows);
                     end.saturating_sub(scan_range_before_filter.start)
+                } else {
+                    total_rows
+                };
+
+            // Legal here alongside a row-set input, where it limits what the node
+            // returns from the rows the index selected.
+            let total_rows =
+                if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
+                    let end = scan_range_after_filter.end.min(total_rows);
+                    end.saturating_sub(scan_range_after_filter.start)
                 } else {
                     total_rows
                 };
@@ -3453,8 +3593,20 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
+            // An index search, a refine filter or a row-address prefilter can select
+            // rows without a full filter expression, so the fragment row count is then
+            // only an estimate.
+            let nothing_selects = self.input.row_set_plan().is_none()
+                && self.options.refine_filter.is_none()
+                && self.options.physical_row_addr_prefilter.is_none();
+            let num_rows = if nothing_selects {
+                Precision::Exact(total_rows as usize)
+            } else {
+                Precision::Inexact(total_rows as usize)
+            };
             return Ok(Arc::new(Statistics {
-                num_rows: Precision::Exact(total_rows as usize),
+                num_rows,
+                total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
             }));
         };
@@ -3499,8 +3651,12 @@ impl ExecutionPlan for FilteredReadExec {
         // is applied in the mock input)
         let total_rows =
             if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
+                // Saturating: the setters reject an inverted range, but the field
+                // is public, so the subtraction could still wrap.
                 df_stats.num_rows.min(&Precision::Exact(
-                    scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
+                    scan_range_after_filter
+                        .end
+                        .saturating_sub(scan_range_after_filter.start) as usize,
                 ))
             } else {
                 df_stats.num_rows
@@ -3528,6 +3684,10 @@ impl ExecutionPlan for FilteredReadExec {
                 false
             }
         });
+
+        // Recompute rather than keep what `FilterExec` derived: that figure covers
+        // the filter-only columns we just dropped and predates the range clamp above.
+        df_stats.total_byte_size = estimated_total_byte_size(df_stats.num_rows, self.bytes_per_row);
 
         Ok(Arc::new(df_stats))
     }
@@ -3633,7 +3793,10 @@ impl ExecutionPlan for FilteredReadExec {
             // a scalar-index result) the rows are selected by that input, so a pre-range
             // would apply before selection and keep the wrong rows; leave the limit to a
             // node above the read instead.
-            if self.options.scan_range_before_filter.is_some() || self.index_input().is_some() {
+            if self.options.scan_range_before_filter.is_some()
+                || self.options.physical_row_addr_prefilter.is_some()
+                || self.index_input().is_some()
+            {
                 return None;
             }
             updated_options.scan_range_before_filter = Some(0..(limit as u64));
@@ -4231,6 +4394,47 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::no_limit(None, vec![3, 13, 23, 33])]
+    #[case::limit_fallback(Some(0..10), vec![3, 13, 23, 33])]
+    #[case::offset_fallback(Some(1..10), vec![13, 23, 33])]
+    #[case::limit_pushdown(Some(0..1), vec![3])]
+    #[tokio::test]
+    async fn test_at_least_index_preserves_candidates(
+        #[case] scan_range: Option<Range<u64>>,
+        #[case] expected_values: Vec<u32>,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        // Only row 3 is guaranteed by the index; matches in the other fragments
+        // require a recheck unless that one row satisfies the requested limit.
+        let index_input = index_result_input(
+            IndexExprResult::at_least(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([3]))),
+            dataset.fragments(),
+        );
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value % 10 = 3").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let mut options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap();
+        if let Some(scan_range) = scan_range {
+            options = options.with_scan_range_after_filter(scan_range).unwrap();
+        }
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        assert_eq!(
+            batch["value"]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .as_ref(),
+            expected_values.as_slice()
+        );
+    }
+
     /// An empty result only eliminates fragments covered by the index. Uncovered fragments must
     /// still be scanned for a complete query, while fast search intentionally omits them.
     #[rstest]
@@ -4790,6 +4994,20 @@ mod tests {
         scanner.with_row_id().include_deleted_rows();
         assert_eq!(scanner.count_rows().await.unwrap(), 300);
 
+        let mut selected = RowAddrTreeMap::new();
+        selected.insert_fragment(2);
+        let options = base_options
+            .clone()
+            .with_deleted_rows()
+            .unwrap()
+            .with_physical_row_addr_prefilter(Arc::new(selected));
+        let plan = fixture.make_plan(options.clone()).await;
+        assert_eq!(
+            plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(100)
+        );
+        fixture.test_plan(options, &u32s(vec![200..300])).await;
+
         let filter = fixture.filter_plan("not_indexed >= 250", false).await;
         let options = base_options
             .with_deleted_rows()
@@ -4852,19 +5070,111 @@ mod tests {
         assert_eq!(ranges, vec![0..1]);
     }
 
+    #[rstest]
+    #[case::scan(false)]
+    #[case::row_stream(true)]
+    #[tokio::test]
+    async fn test_physical_selection_execution_validation(#[case] row_stream: bool) {
+        let fixture = TestFixture::new().await;
+        let dataset = fixture.dataset.clone();
+        let mut source_options = FilteredReadOptions::new(dataset.empty_projection());
+        source_options.projection.with_row_addr = true;
+        let source =
+            Arc::new(FilteredReadExec::try_new(dataset.clone(), source_options, None).unwrap());
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_physical_row_addr_prefilter(Arc::new(RowAddrTreeMap::from_iter([999])));
+        let input = row_stream.then_some(source as Arc<dyn ExecutionPlan>);
+        let plan = FilteredReadExec::try_new(dataset, options, input).unwrap();
+        let error = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("physical_row_count"), "{error}");
+    }
+
     #[tokio::test]
     async fn test_statistics() {
         let fixture = Arc::new(TestFixture::new().await);
 
-        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let full_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let full_plan = fixture.make_plan(full_options.clone()).await;
+        // The fixture's utf8 column is seeded from the decoder's estimate, so the
+        // whole row reports a width rather than withdrawing.
+        assert_eq!(
+            full_plan
+                .partition_statistics(None)
+                .unwrap()
+                .total_byte_size,
+            Precision::Inexact(25282)
+        );
+
+        // Exclude the variable-width string. The remaining integers and vector
+        // use 33 bytes per row, including parent and child validity bits.
+        let projection = fixture
+            .dataset
+            .empty_projection()
+            .union_columns(
+                ["fully_indexed", "partly_indexed", "not_indexed", "vector"],
+                OnMissing::Error,
+            )
+            .unwrap();
+        let base_options = full_options.with_projection(projection);
 
         let plan = fixture.make_plan(base_options.clone()).await;
 
         let stats = plan.partition_statistics(None).unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
-        // No filter with range (before or after) is still exact
+        // A physical selection can exclude rows within a fragment, so the
+        // fragment row count is only an upper bound until the read is planned.
+        let mut physical_rows = RowAddrTreeMap::new();
+        physical_rows.insert_range(0..3);
+        let options = base_options
+            .clone()
+            .with_physical_row_addr_prefilter(Arc::new(physical_rows));
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(3));
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(0);
+        let plan = fixture
+            .make_plan(
+                base_options
+                    .clone()
+                    .with_physical_row_addr_prefilter(Arc::new(full_fragment)),
+            )
+            .await;
+        assert_eq!(
+            plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(100)
+        );
+
+        let mut source_options = FilteredReadOptions::new(fixture.dataset.empty_projection());
+        source_options.projection.with_row_addr = true;
+        let source = fixture.make_plan(source_options).await;
+        assert_eq!(
+            source.partition_statistics(None).unwrap().num_rows,
+            Precision::Exact(250)
+        );
+        let stream_plan = FilteredReadExec::try_new(
+            fixture.dataset.clone(),
+            base_options
+                .clone()
+                .with_physical_row_addr_prefilter(Arc::new(RowAddrTreeMap::from_iter([0]))),
+            Some(Arc::new(source)),
+        )
+        .unwrap();
+        assert_eq!(
+            stream_plan.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(250)
+        );
+
+        // An unfiltered scan with a before-filter range still has an exact count.
         let options = base_options
             .clone()
             .with_scan_range_before_filter(25..125)
@@ -4872,6 +5182,58 @@ mod tests {
         let plan = fixture.make_plan(options).await;
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(100));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(3300));
+
+        // A scalar-index input selects rows without any expression being set, so it
+        // reaches the no-filter branch above while producing a subset of what the
+        // fragments hold. The count there is an upper bound, not a promise.
+        let index_filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+        let index_input = fixture
+            .index_input(&base_options.clone().with_filter_plan(index_filter_plan))
+            .await;
+        assert!(index_input.is_some(), "expected a scalar-index input");
+        let plan = FilteredReadExec::try_new(
+            fixture.dataset.clone(),
+            base_options.clone(),
+            index_input.clone(),
+        )
+        .unwrap();
+        assert!(plan.options().full_filter.is_none() && plan.options().refine_filter.is_none());
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(250));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
+
+        // A range also caps an index-selected read without a filter expression.
+        let options = base_options
+            .clone()
+            .with_scan_range_after_filter(0..10)
+            .unwrap();
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(330));
+
+        // `with_deleted_rows` emits the deleted rows as well, so the node produces
+        // the fragments' physical rows (300) and not the live ones (250) that
+        // `Fragment::num_rows` counts. Reporting the live count would under-report
+        // what a join above has to hold.
+        let options = base_options.clone().with_deleted_rows().unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(300));
+        // Keeping deleted rows also adds a nullable row id: 41.125 bytes per row.
+        assert_eq!(stats.total_byte_size, Precision::Inexact(12338));
+
+        // A range that starts past the end leaves nothing at all.
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(300..400)
+            .unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(0));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(0));
 
         // With a filter, we don't know the exact count but DF can make some guesses
 
@@ -4883,6 +5245,7 @@ mod tests {
         let plan = fixture.make_plan(options).await;
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
         // In this case DF doesn't recognize the expression as simple and so it assumes a default
         // selectivity of 0.2
@@ -4892,6 +5255,19 @@ mod tests {
         let plan = fixture.make_plan(options).await;
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(50));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(1650));
+
+        // An after-filter range is a limit: the count has to follow the rows the
+        // limit leaves, not the rows the unlimited scan would have read.
+        let options = base_options
+            .clone()
+            .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await)
+            .with_scan_range_after_filter(0..10)
+            .unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
         // Filter columns not part of projection, make sure statistics using correct input schema
         let options = base_options
@@ -4910,6 +5286,10 @@ mod tests {
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.column_statistics.len(), 1);
+        // Only the vector is projected, so only the vector is billed: 16 bytes of
+        // values, its own validity bit and one per float, or 16.625 a row.
+        // `not_indexed` is read to evaluate the filter but never output.
+        assert_eq!(stats.total_byte_size, Precision::Inexact(4157));
     }
 
     #[test_log::test(tokio::test)]
@@ -5167,6 +5547,75 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
         let actual_values = get_fully_indexed_values(batches).await;
         assert_eq!(actual_values, (10..20).collect::<Vec<_>>());
+    }
+
+    /// Refine-only options must not expose an exact unfiltered row count that
+    /// DataFusion could fold into `COUNT(*)`.
+    #[tokio::test]
+    async fn a_refine_filter_alone_leaves_the_row_count_inexact() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        let unfiltered = fixture.make_plan(base_options.clone()).await;
+        let Precision::Exact(rows) = unfiltered.partition_statistics(None).unwrap().num_rows else {
+            panic!("a read with nothing selecting rows knows how many it returns");
+        };
+
+        // Public fields can bypass the pairing check in `with_filter` and the
+        // proto decoder.
+        let filter_plan = fixture.filter_plan("fully_indexed < 50", false).await;
+        let mut options = base_options;
+        options.refine_filter = filter_plan.full_expr.clone();
+        assert!(options.full_filter.is_none());
+        let plan = fixture.make_plan(options).await;
+        assert!(
+            plan.input.row_set_plan().is_none(),
+            "the refine filter has to be the only thing selecting rows here"
+        );
+
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(rows));
+    }
+
+    /// An inverted range is rejected where it is set, and cannot wrap the
+    /// subtraction that turns an after-filter range into a row cap.
+    #[tokio::test]
+    async fn an_inverted_scan_range_is_rejected_not_wrapped() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        // Built field by field because clippy rejects the literal form.
+        let inverted = Range {
+            start: 100u64,
+            end: 50,
+        };
+
+        for result in [
+            base_options
+                .clone()
+                .with_scan_range_before_filter(inverted.clone()),
+            base_options
+                .clone()
+                .with_scan_range_after_filter(inverted.clone()),
+        ] {
+            let error = result.expect_err("an inverted range is not a window over any rows");
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("(100)") && message.contains("(50)"),
+                "the error should name both bounds, got: {message}"
+            );
+        }
+
+        // The field is public, so the statistics have to hold without the setter.
+        // A filter exercises the separate after-filter subtraction, which must
+        // saturate even when validation was bypassed.
+        let filter_plan = fixture.filter_plan("fully_indexed < 50", false).await;
+        let mut options = base_options.with_filter_plan(filter_plan);
+        options.scan_range_after_filter = Some(inverted);
+        let plan = fixture.make_plan(options).await;
+
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(0));
     }
 
     #[tokio::test]
@@ -6644,6 +7093,75 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::Int32Type>();
             assert_eq!(i_col.value(0), 12);
+        }
+
+        /// A physical selection further narrows row-stream keys within each fragment.
+        #[rstest]
+        #[case::by_row_addr(false, ROW_ADDR)]
+        #[case::by_row_id(false, ROW_ID)]
+        #[case::stable_by_row_addr(true, ROW_ADDR)]
+        #[case::stable_by_row_id(true, ROW_ID)]
+        #[tokio::test]
+        async fn take_intersects_physical_selection(
+            #[case] stable_row_ids: bool,
+            #[case] key: &str,
+        ) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            // Rows 3 and 21 are inside the physical selection. Row 8 is in a
+            // selected fragment but outside its range, and row 15 is in an
+            // unselected fragment.
+            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
+                vec![3, 8, 21, 15]
+            } else {
+                vec![addr(0, 3), addr(0, 8), addr(2, 1), addr(1, 5)]
+            };
+            let input_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("score", DataType::Float32, false),
+                ArrowField::new(key, DataType::UInt64, true),
+            ]));
+            let input = RecordBatch::try_new(
+                input_schema,
+                vec![
+                    Arc::new(Float32Array::from(vec![0.9, 0.8, 0.7, 0.6])),
+                    Arc::new(UInt64Array::from(keys)),
+                ],
+            )
+            .unwrap();
+
+            let mut physical_rows = RowAddrTreeMap::new();
+            physical_rows.insert_range(addr(0, 2)..addr(0, 5));
+            physical_rows.insert_range(addr(2, 0)..addr(2, 2));
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection)
+                    .with_physical_row_addr_prefilter(Arc::new(physical_rows)),
+                Some(rows_input(vec![input])),
+            )
+            .unwrap();
+
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(
+                result
+                    .column_by_name("i")
+                    .unwrap()
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values(),
+                &[3, 21]
+            );
+            assert_eq!(
+                result
+                    .column_by_name("score")
+                    .unwrap()
+                    .as_primitive::<Float32Type>()
+                    .values(),
+                &[0.9, 0.7]
+            );
         }
 
         /// A batch whose keys span the whole id range but hit only two rows:

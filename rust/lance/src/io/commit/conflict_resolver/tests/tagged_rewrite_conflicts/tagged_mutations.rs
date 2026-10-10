@@ -793,8 +793,7 @@ async fn child_index_built_before_a_packed_parent_rewrite_lands_withdrawn() {
 
 /// Patch `column` of the row `w = key` (`w` equals `i` and no index covers
 /// it) to `value` in place: a partial-schema source keyed on an unindexed
-/// column, in `RewriteColumns` mode, so only `column` and the key are
-/// rewritten.
+/// column, in `RewriteColumns` mode, so only `column` is rewritten.
 async fn rewrite_in_place(
     dataset: Dataset,
     column: &str,

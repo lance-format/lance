@@ -41,6 +41,21 @@ use super::memtable::batch_store::{BatchStore, StoredBatch};
 
 /// Key for storing writer epoch in Arrow IPC file schema metadata.
 pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
+/// The memtable generation an entry's batches belong to. Absent in WAL-only
+/// mode.
+pub const GENERATION_KEY: &str = "generation";
+
+/// Metadata keys a WAL entry carries about itself rather than about its batches.
+const RESERVED_ENTRY_KEYS: &[&str] = &[
+    WRITER_EPOCH_KEY,
+    GENERATION_KEY,
+    FENCE_SENTINEL_KEY,
+    TARGET_GENERATION_KEY,
+    TARGET_GENERATION_DIR_KEY,
+    TARGET_DATA_FILE_KEY,
+    TARGET_CREATOR_EPOCH_KEY,
+    TARGET_BATCH_CAPACITY_KEY,
+];
 const TARGET_GENERATION_KEY: &str = "mem_wal_target_generation";
 const TARGET_GENERATION_DIR_KEY: &str = "mem_wal_target_generation_dir";
 const TARGET_DATA_FILE_KEY: &str = "mem_wal_target_data_file";
@@ -880,7 +895,11 @@ impl WalFlusher {
         let start = Instant::now();
         let append_result = self
             .wal_appender
-            .append_for_target(record_batches, batch_store.target())
+            .append_for_target(
+                record_batches,
+                batch_store.target(),
+                Some(batch_store.generation()),
+            )
             .await?;
         let wal_io_duration = start.elapsed();
 
@@ -1098,6 +1117,8 @@ pub struct WalReadEntry {
     /// Replay logic uses this to fence-check against the current epoch.
     pub writer_epoch: u64,
     pub(crate) target: Option<MemTableDataTarget>,
+    /// Generation the batches belong to, when the entry records one.
+    pub(crate) generation: Option<u64>,
     pub batches: Vec<RecordBatch>,
 }
 
@@ -1222,19 +1243,21 @@ impl WalAppender {
 
     /// Append batches as one durable WAL entry.
     pub async fn append(&self, batches: Vec<RecordBatch>) -> Result<WalAppendResult> {
-        self.append_for_target(batches, None).await
+        self.append_for_target(batches, None, None).await
     }
 
     pub(crate) async fn append_for_target(
         &self,
         batches: Vec<RecordBatch>,
         target: Option<&MemTableDataTarget>,
+        generation: Option<u64>,
     ) -> Result<WalAppendResult> {
         validate_appender_batches(&batches)?;
         let wal_data = Bytes::from(serialize_appender_batches(
             &batches,
             self.writer_epoch,
             target,
+            generation,
         )?);
         let wal_bytes = wal_data.len();
         let num_batches = batches.len();
@@ -1458,7 +1481,12 @@ impl WalTailer {
                 path, self.shard_id, e
             ))
         })?;
-        let (writer_epoch, target, batches) = deserialize_appender_batches(bytes)?;
+        let DecodedEntry {
+            writer_epoch,
+            target,
+            generation,
+            batches,
+        } = deserialize_appender_batches(bytes)?;
 
         self.highest_read
             .fetch_max(entry_position, Ordering::Relaxed);
@@ -1468,6 +1496,7 @@ impl WalTailer {
             entry_position,
             writer_epoch,
             target,
+            generation,
             batches,
         }))
     }
@@ -1540,10 +1569,18 @@ fn serialize_appender_batches(
     batches: &[RecordBatch],
     writer_epoch: u64,
     target: Option<&MemTableDataTarget>,
+    generation: Option<u64>,
 ) -> Result<Vec<u8>> {
     let schema = batches[0].schema();
     let mut metadata = schema.metadata().clone();
+    // Only the writer sets these keys. Drop any the caller's schema carries.
+    for reserved in RESERVED_ENTRY_KEYS {
+        metadata.remove(*reserved);
+    }
     metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
+    if let Some(generation) = generation {
+        metadata.insert(GENERATION_KEY.to_string(), generation.to_string());
+    }
     if let Some(target) = target {
         metadata.insert(
             TARGET_GENERATION_KEY.to_string(),
@@ -1608,9 +1645,14 @@ fn serialize_fence_sentinel(writer_epoch: u64) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-fn deserialize_appender_batches(
-    bytes: Bytes,
-) -> Result<(u64, Option<MemTableDataTarget>, Vec<RecordBatch>)> {
+struct DecodedEntry {
+    writer_epoch: u64,
+    target: Option<MemTableDataTarget>,
+    generation: Option<u64>,
+    batches: Vec<RecordBatch>,
+}
+
+fn deserialize_appender_batches(bytes: Bytes) -> Result<DecodedEntry> {
     let cursor = Cursor::new(bytes);
     let reader = StreamReader::try_new(cursor, None)
         .map_err(|e| Error::io(format!("failed to open WAL IPC stream reader: {}", e)))?;
@@ -1627,8 +1669,21 @@ fn deserialize_appender_batches(
             ))
         })?;
     let target = target_from_metadata(schema.metadata())?;
+    let generation = schema
+        .metadata()
+        .get(GENERATION_KEY)
+        .map(|value| {
+            value.parse::<u64>().map_err(|e| {
+                Error::io(format!(
+                    "WAL entry has malformed {} metadata: {}",
+                    GENERATION_KEY, e
+                ))
+            })
+        })
+        .transpose()?;
     let mut clean_metadata = schema.metadata().clone();
     clean_metadata.remove(WRITER_EPOCH_KEY);
+    clean_metadata.remove(GENERATION_KEY);
     clean_metadata.remove(TARGET_GENERATION_KEY);
     clean_metadata.remove(TARGET_GENERATION_DIR_KEY);
     clean_metadata.remove(TARGET_DATA_FILE_KEY);
@@ -1646,7 +1701,12 @@ fn deserialize_appender_batches(
             .map_err(|e| Error::io(format!("failed to strip WAL metadata: {}", e)))?;
         batches.push(clean);
     }
-    Ok((writer_epoch, target, batches))
+    Ok(DecodedEntry {
+        writer_epoch,
+        target,
+        generation,
+        batches,
+    })
 }
 
 fn target_from_metadata(
@@ -2702,7 +2762,7 @@ mod tests {
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
 
         // An HNSW index on `id`, which is an Int32 and not a vector, so every
-        // insert of this batch fails deterministically. `validate_index_configs`
+        // insert of this batch fails deterministically. `validate_index_specs`
         // rejects this at shard open — that is what makes poison-and-replay
         // terminating — so the store has to be built by hand to reach it at all.
         let mut idx = IndexStore::new();
@@ -2811,5 +2871,37 @@ mod tests {
             cursors.check_poisoned().unwrap_err().fence_reason(),
             Some(FenceReason::PersistenceFailure)
         );
+    }
+
+    /// Reserved keys in the caller's schema metadata are ignored; only the
+    /// writer sets them.
+    #[test]
+    fn an_entry_takes_its_generation_from_the_writer_not_the_batch() {
+        // Built from the list so newly reserved keys are covered too.
+        let forged: std::collections::HashMap<String, String> = RESERVED_ENTRY_KEYS
+            .iter()
+            .map(|key| (key.to_string(), "0".to_string()))
+            .collect();
+        let schema = Arc::new(Schema::new_with_metadata(
+            create_test_schema().fields().to_vec(),
+            forged,
+        ));
+        let batch = create_test_batch(&schema, 1);
+
+        let bytes =
+            serialize_appender_batches(std::slice::from_ref(&batch), 7, None, None).unwrap();
+        let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
+        assert_eq!(decoded.generation, None, "the batch cannot supply one");
+        assert_eq!(decoded.writer_epoch, 7, "nor speak for the writer's epoch");
+        assert_eq!(decoded.target, None, "nor hand it a blob payload directory");
+        assert_eq!(
+            decoded.batches.len(),
+            1,
+            "nor pass itself off as a fence sentinel, which carries no batches"
+        );
+
+        let bytes = serialize_appender_batches(&[batch], 7, None, Some(4)).unwrap();
+        let decoded = deserialize_appender_batches(Bytes::from(bytes)).unwrap();
+        assert_eq!(decoded.generation, Some(4));
     }
 }

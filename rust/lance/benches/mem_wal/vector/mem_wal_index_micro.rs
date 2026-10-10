@@ -38,8 +38,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::write::{
-    HnswIndexConfig, IndexStore, MemIndexConfig, MemTable, MemTableFlusher, MemTableScanner,
-    ShardWriterConfig,
+    IndexStore, MemIndexSpec, MemTable, MemTableFlusher, MemTableScanner, ShardWriterConfig,
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore};
 use lance::dataset::{Dataset, WriteParams};
@@ -336,18 +335,16 @@ async fn main() -> lance_core::Result<()> {
 
     // ---- Flush phase (direct flusher; isolates memory→disk cost) ----
     println!("flush phase:");
-    let index_configs = vec![MemIndexConfig::Hnsw(Box::new(
-        HnswIndexConfig::new(
-            VECTOR_INDEX_NAME.to_string(),
-            1,
-            VECTOR_COL.to_string(),
-            DistanceType::L2,
-        )
-        .with_build_params(HnswBuildParams::default()),
-    ))];
+    let index_specs = vec![MemIndexSpec::hnsw_with_params(
+        VECTOR_INDEX_NAME,
+        1,
+        VECTOR_COL,
+        DistanceType::L2,
+        HnswBuildParams::default(),
+    )];
     for &cp in &checkpoints {
         let (elapsed, disk_bytes) =
-            measure_flush(cp, dim, batch_size, &index_configs, prefix.as_deref()).await?;
+            measure_flush(cp, dim, batch_size, &index_specs, prefix.as_deref()).await?;
         println!(
             "[flush] rows={} flush_wall_ms={} throughput_rows_per_sec={:.0} on_disk_bytes={} on_disk_mb={:.1}",
             cp,
@@ -366,13 +363,19 @@ async fn measure_flush(
     cp: usize,
     dim: usize,
     batch_size: usize,
-    index_configs: &[MemIndexConfig],
+    index_specs: &[MemIndexSpec],
     prefix: Option<&str>,
 ) -> lance_core::Result<(Duration, u64)> {
     let s = schema(dim);
     let mut memtable = MemTable::new(s.clone(), 1, vec![]).unwrap();
-    let registry =
-        IndexStore::from_configs(index_configs, cp, cp.div_ceil(batch_size).max(64)).unwrap();
+    let lance_schema = lance_core::datatypes::Schema::try_from(s.as_ref()).unwrap();
+    let registry = IndexStore::from_specs(
+        index_specs,
+        &lance_schema,
+        cp,
+        cp.div_ceil(batch_size).max(64),
+    )
+    .unwrap();
     memtable.set_indexes(registry);
 
     let total_batches = cp.div_ceil(batch_size);
@@ -415,7 +418,7 @@ async fn measure_flush(
         .flush_with_indexes(
             &memtable,
             epoch,
-            index_configs,
+            index_specs,
             covered_wal_entry_position,
             durable,
         )

@@ -58,12 +58,13 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
-use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::dataset::mem_wal::index::FtsMemQuery;
+use crate::dataset::mem_wal::memtable::scanner::{MemTableScanner, local_fts_query};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
@@ -265,6 +266,60 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     visit(&query.query)
 }
 
+/// Bind `query` to the names a generation stores its columns under.
+///
+/// `stored_columns` pairs each table name with its stored name. No limit is
+/// set here; each caller applies its own.
+fn bind_to_stored_columns(
+    query: &FullTextSearchQuery,
+    columns: &[String],
+    stored_columns: &[(String, String)],
+) -> Result<FullTextSearchQuery> {
+    match stored_columns {
+        // No column was renamed: keep each leaf bound to its own column.
+        _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => match columns {
+            [column] => query.clone().with_column(column.clone()),
+            _ => Ok(query.clone()),
+        },
+        // One renamed column: bind the query to its stored name.
+        [(_, stored)] => query.clone().with_column(stored.clone()),
+        // Several columns and one was renamed. `with_column` would bind every
+        // leaf to the same column, so refuse instead of ranking the wrong one.
+        moved => {
+            let renamed: Vec<String> = moved
+                .iter()
+                .filter(|(asked, stored)| asked != stored)
+                .map(|(asked, stored)| format!("{asked} (stored as {stored})"))
+                .collect();
+            Err(Error::invalid_input(format!(
+                "a full-text search over several columns cannot read a generation written \
+                 before one of them was renamed: {}. Wait for the generation to merge into \
+                 base, or search the columns separately",
+                renamed.join(", ")
+            )))
+        }
+    }
+}
+
+/// Whether the active memtable's own indexes answer this search, asked the
+/// question each index will receive.
+fn active_source_answers_fts(source: &LsmDataSource, query: &FullTextSearchQuery) -> bool {
+    let LsmDataSource::ActiveMemTable {
+        batch_store,
+        index_store,
+        ..
+    } = source
+    else {
+        return false;
+    };
+    // A row is visible only once every index holds it.
+    batch_store
+        .max_visible_row(index_store.visible_count())
+        .is_some()
+        && local_fts_query(query.clone(), Some(index_store))
+            .is_ok_and(|local| local.is_answered_by(index_store))
+}
+
 fn active_source_can_execute_fts(
     source: &LsmDataSource,
     column: &str,
@@ -277,8 +332,9 @@ fn active_source_can_execute_fts(
             ..
         } => {
             index_store
-                .get_fts_by_column_and_granularity(column, document_granularity)
-                .is_some_and(|index| !index.is_empty())
+                .index_answering(column, &FtsMemQuery::probe(document_granularity))
+                .is_some()
+                // A row is visible only once every index holds it.
                 && batch_store
                     .max_visible_row(index_store.visible_count())
                     .is_some()
@@ -986,7 +1042,7 @@ impl LsmFtsSearchPlanner {
                         &self.pk_columns,
                         Vec::new(),
                     );
-                    match generation.stored_name(column) {
+                    match generation.stored_fts_name(column) {
                         None => Vec::new(),
                         Some(stored_column) => {
                             if index_params.is_empty() {
@@ -1001,8 +1057,27 @@ impl LsmFtsSearchPlanner {
                         }
                     }
                 }
-                LsmDataSource::ActiveMemTable { index_store, .. } => {
-                    index_store.fts_document_granularities_by_column(column)
+                LsmDataSource::ActiveMemTable {
+                    index_store,
+                    schema,
+                    ..
+                } => {
+                    // A memtable created before a schema change indexes the
+                    // column under its old name, or not at all if it is newer.
+                    if memtable_matches_table(schema, &self.identity_schema) {
+                        index_store.fts_granularities_on(column)
+                    } else {
+                        let generation = GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            Vec::new(),
+                        );
+                        match generation.stored_fts_name(column) {
+                            None => Vec::new(),
+                            Some(stored_column) => index_store.fts_granularities_on(stored_column),
+                        }
+                    }
                 }
             };
             available.extend(granularities.iter().copied());
@@ -1132,7 +1207,7 @@ impl LsmFtsSearchPlanner {
                 // table's name while the file still holds the old one.
                 let mut stored_columns = Vec::with_capacity(columns.len());
                 for column in columns {
-                    let Some(stored) = generation.stored_name(column) else {
+                    let Some(stored) = generation.stored_fts_name(column) else {
                         // Sealed before the column existed, so it has nothing to
                         // match -- and nothing to give a predicate spanning it.
                         return self.empty_plan(target_schema);
@@ -1154,42 +1229,7 @@ impl LsmFtsSearchPlanner {
                     scanner.filter_expr(stored.clone());
                     scanner.prefilter(true);
                 }
-                // Bound here, limited below: this arm's limit rule is not the
-                // one `bind` applies, so only the column binding is taken from
-                // the shape of the set.
-                let bound_query = match stored_columns.as_slice() {
-                    // Every queried column is stored under the name the table
-                    // still uses, so the tree reaches the scanner as the other
-                    // arms get it -- a cross-column predicate keeps its own leaf
-                    // bindings, which rebinding would collapse onto one field.
-                    _ if stored_columns.iter().all(|(asked, stored)| asked == stored) => {
-                        match columns {
-                            [column] => query.clone().with_column(column.clone())?,
-                            _ => query.clone(),
-                        }
-                    }
-                    // One column, moved: bind the whole tree to the name this
-                    // generation stores it under.
-                    [(_, stored)] => query.clone().with_column(stored.clone())?,
-                    // Several columns, at least one of them renamed. Each leaf
-                    // would need its own name and `with_column` rebinds the
-                    // whole tree, collapsing a cross-column predicate onto one
-                    // field -- which answers a different question. Refuse rather
-                    // than rank on the wrong column silently.
-                    moved => {
-                        let renamed: Vec<String> = moved
-                            .iter()
-                            .filter(|(asked, stored)| asked != stored)
-                            .map(|(asked, stored)| format!("{asked} (stored as {stored})"))
-                            .collect();
-                        return Err(Error::invalid_input(format!(
-                            "a full-text search over several columns cannot read a sealed \
-                             generation in which one of them was renamed: {}. Compact the table \
-                             so the generation merges into base, or search the columns separately",
-                            renamed.join(", ")
-                        )));
-                    }
-                };
+                let bound_query = bind_to_stored_columns(query, columns, &stored_columns)?;
                 // A predicate that could not be pushed down runs above the
                 // reconciliation, which is after the search has taken its top-k
                 // by score. Cutting first would drop rows that pass the
@@ -1203,11 +1243,7 @@ impl LsmFtsSearchPlanner {
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -1216,6 +1252,51 @@ impl LsmFtsSearchPlanner {
                 ..
             } => {
                 let document_granularity = query_document_granularity(query)?;
+                // `Some` only for a memtable created before a schema change.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            self.fts_scanner_projection(projection),
+                        )
+                    });
+                // (table name, stored name) for each queried column.
+                let mut stored_columns = Vec::with_capacity(columns.len());
+                for column in columns {
+                    let stored = match &generation {
+                        None => column.clone(),
+                        Some(generation) => match generation.stored_fts_name(column) {
+                            Some(stored) => stored.to_string(),
+                            // Created before the column existed: nothing matches.
+                            None => {
+                                return self.empty_plan(
+                                    &self.canonical_fts_schema(projection, document_granularity)?,
+                                );
+                            }
+                        },
+                    };
+                    stored_columns.push((column.clone(), stored));
+                }
+                let stored_names: Vec<String> = stored_columns
+                    .iter()
+                    .map(|(_, stored)| stored.clone())
+                    .collect();
+                let pk_columns = match &generation {
+                    None => self.pk_columns.clone(),
+                    Some(generation) => generation.stored_pk_columns()?,
+                };
+                // The persisted index's settings are keyed by the table's names.
+                let stored_index_params: HashMap<&str, InvertedIndexParams> = stored_columns
+                    .iter()
+                    .filter_map(|(asked, stored)| {
+                        index_params
+                            .get(asked.as_str())
+                            .map(|params| (stored.as_str(), params.clone()))
+                    })
+                    .collect();
+
                 // A column outside the write spec's maintained set has no
                 // in-memory inverted index, so the memtable cannot be searched
                 // through `index_store`. Build one over the visible prefix for
@@ -1228,19 +1309,18 @@ impl LsmFtsSearchPlanner {
                 // single store, and re-indexing a maintained column costs one
                 // tokenize pass over a memtable that is already paying for the
                 // missing one.
-                let index_store = if columns.iter().all(|column| {
-                    active_source_can_execute_fts(source, column, document_granularity)
-                }) {
+                let asked = bind_to_stored_columns(query, columns, &stored_columns)?;
+                let index_store = if active_source_answers_fts(source, &asked) {
                     index_store.clone()
                 } else {
                     match transient_fts_index_store(
                         batch_store,
                         index_store,
                         schema,
-                        columns,
+                        &stored_names,
                         document_granularity,
-                        &self.pk_columns,
-                        index_params,
+                        &pk_columns,
+                        &stored_index_params,
                     )? {
                         Some(store) => store,
                         None => {
@@ -1253,21 +1333,39 @@ impl LsmFtsSearchPlanner {
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store, schema.clone());
-                let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                if let Some(ref filter) = self.filter {
-                    // Honored inside `plan_fts_search`: the materialized hits are
-                    // masked by the predicate before projection.
-                    scanner.filter_expr(filter.clone());
-                }
                 // The append-only inverted index keeps an updated row's old
                 // postings live, so the memtable FTS exec needs PK columns to
                 // drop stale hits before it applies the query limit.
-                if !self.pk_columns.is_empty() {
-                    scanner.with_pk_columns(self.pk_columns.clone());
+                if !pk_columns.is_empty() {
+                    scanner.with_pk_columns(pk_columns);
                 }
-                scanner.full_text_search(bind(query)?)?;
-                scanner.create_plan().await
+
+                let Some(generation) = generation.as_mut() else {
+                    let cols = self.fts_scanner_projection(projection);
+                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    if let Some(ref filter) = self.filter {
+                        // Honored inside `plan_fts_search`: the materialized hits
+                        // are masked by the predicate before projection.
+                        scanner.filter_expr(filter.clone());
+                    }
+                    scanner.full_text_search(bind(query)?)?;
+                    return scanner.create_plan().await;
+                };
+
+                // If part of the filter runs after the search, don't limit the
+                // search: the limit would drop rows before that filter sees them.
+                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
+                scanner.project(&generation.stored_projection())?;
+                if let Some(stored) = stored_filter {
+                    scanner.filter_expr(stored);
+                }
+                let bound_query = bind_to_stored_columns(query, columns, &stored_columns)?;
+                let bound_query = match limit.filter(|_| above.is_none()) {
+                    Some(limit) => bound_query.limit(Some(limit as i64)),
+                    None => bound_query.limit(None),
+                };
+                scanner.full_text_search(bound_query)?;
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
         }
     }
@@ -3032,9 +3130,7 @@ mod tests {
             .unwrap();
         let indexes = Arc::new(indexes);
         assert!(
-            indexes
-                .fts_document_granularities_by_column("text")
-                .is_empty(),
+            indexes.fts_granularities_on("text").is_empty(),
             "precondition: the memtable maintains no FTS index on the column"
         );
 
@@ -5243,5 +5339,168 @@ mod tests {
             ids.contains(&2),
             "live pk=2 ('alpha foo', only in the frozen gen) must still match; got ids={ids:?}"
         );
+    }
+
+    /// Full-text search on a field inside a list of structs still matches after
+    /// an unrelated column is added to the table.
+    #[tokio::test]
+    async fn a_list_of_struct_fts_still_matches_after_an_unrelated_column_is_added() {
+        let item_fields: arrow_schema::Fields = vec![
+            Arc::new(Field::new("a", DataType::Int64, true)),
+            Arc::new(Field::new("body", DataType::Utf8, true)),
+        ]
+        .into();
+        let item = Arc::new(Field::new(
+            "item",
+            DataType::Struct(item_fields.clone()),
+            true,
+        ));
+        let stored_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tags", DataType::List(item.clone()), true),
+        ]));
+        let values = arrow_array::StructArray::new(
+            item_fields,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10i64])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["lance rocks"])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let tags = arrow_array::ListArray::new(
+            item,
+            arrow_buffer::OffsetBuffer::new(vec![0, 1].into()),
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            stored_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1])), Arc::new(tags)],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("list_fts".to_string(), 3, "tags.body".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        uuid::Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: InMemoryMemTableRef {
+                                batch_store: batch_store.clone(),
+                                index_store: indexes.clone(),
+                                schema: stored_schema.clone(),
+                                generation: 1,
+                            },
+                            frozen: vec![],
+                        },
+                    );
+            let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], table_schema);
+            let plan = planner
+                .plan_search(
+                    FullTextSearchQuery::new("lance".to_string())
+                        .with_column("tags.body".to_string())
+                        .unwrap(),
+                    Some(10),
+                    None,
+                )
+                .await
+                .unwrap();
+            let ctx = datafusion::prelude::SessionContext::new();
+            let batches: Vec<RecordBatch> = plan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+            assert_eq!(
+                count, 1,
+                "the list's text field still matches under its full-text path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nested_fts_still_matches_after_an_unrelated_column_is_added() {
+        let stored_schema = nested_fts_schema();
+        let meta = arrow_array::StructArray::new(
+            nested_meta_fields(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![10i64])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["lance rocks"])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            stored_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["unrelated"])),
+                Arc::new(meta),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("nested_fts".to_string(), 4, "meta.b".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+        let mut fields = stored_schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Int64, true)));
+        let evolved_schema = Arc::new(ArrowSchema::new(fields));
+        for table_schema in [stored_schema.clone(), evolved_schema] {
+            let collector =
+                LsmDataSourceCollector::without_base_table("memory://".to_string(), vec![])
+                    .with_in_memory_memtables(
+                        uuid::Uuid::new_v4(),
+                        InMemoryMemTables {
+                            active: InMemoryMemTableRef {
+                                batch_store: batch_store.clone(),
+                                index_store: indexes.clone(),
+                                schema: stored_schema.clone(),
+                                generation: 1,
+                            },
+                            frozen: vec![],
+                        },
+                    );
+            let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], table_schema);
+            let plan = planner
+                .plan_search(
+                    FullTextSearchQuery::new("lance".to_string())
+                        .with_column("meta.b".to_string())
+                        .unwrap(),
+                    Some(10),
+                    None,
+                )
+                .await
+                .unwrap();
+            let ctx = datafusion::prelude::SessionContext::new();
+            let batches: Vec<RecordBatch> = plan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+            assert_eq!(count, 1, "the unchanged nested text field still matches");
+        }
     }
 }
