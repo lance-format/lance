@@ -1127,7 +1127,7 @@ fn convert_to_java_operation_inner<'local>(
             )?;
             Ok(java_operation)
         }
-        Operation::DataReplacement { replacements } => {
+        Operation::DataReplacement { replacements, .. } => {
             let java_replacements = export_vec(env, &replacements)?;
 
             Ok(env.new_object(
@@ -2069,7 +2069,10 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "replacements", |env, replacement| {
                     replacement.extract_object(env)
                 })?;
-            Operation::DataReplacement { replacements }
+            Operation::DataReplacement {
+                replacements,
+                replaced_offsets: None,
+            }
         }
         "DataOverlay" => {
             let groups = import_vec_from_method(env, java_operation, "getGroups", |env, group| {
