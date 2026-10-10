@@ -42,7 +42,7 @@ use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use tracing::info;
+use tracing::{debug, info};
 use url::Url;
 
 #[cfg(feature = "dynamodb")]
@@ -224,7 +224,13 @@ pub fn write_manifest_file_to_path<'a>(
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
         let res = Writer::shutdown(&mut object_writer).await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string(), size_bytes = res.size, version = manifest.version);
+        debug!(
+            version = manifest.version,
+            size_bytes = res.size,
+            path = path.to_string(),
+            "wrote dataset manifest"
+        );
         Ok(res)
     })
 }
