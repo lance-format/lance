@@ -3,6 +3,7 @@
 
 //! Wraps a Fragment of the dataset.
 
+mod aligned_update;
 pub mod session;
 pub mod write;
 

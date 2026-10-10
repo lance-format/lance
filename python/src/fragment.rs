@@ -20,7 +20,7 @@ use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
 use lance::Error;
-use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::fragment::{FileFragment as LanceFragment, FragmentUpdateColumnsResult};
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
@@ -44,6 +44,29 @@ use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
 type UpdateColumnsResult = (PyLance<Fragment>, Vec<u32>, Option<Vec<u8>>);
+
+fn update_columns_result(
+    result: FragmentUpdateColumnsResult,
+    with_offsets: bool,
+) -> PyResult<UpdateColumnsResult> {
+    let matched_offsets = if with_offsets {
+        let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
+        result
+            .matched_offsets
+            .serialize_into(&mut buf)
+            .map_err(|err| {
+                PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
+            })?;
+        Some(buf)
+    } else {
+        None
+    };
+    Ok((
+        PyLance(result.fragment),
+        result.fields_modified,
+        matched_offsets,
+    ))
+}
 
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
@@ -420,24 +443,25 @@ impl FileFragment {
                     .await
             })?
             .infer_error()?;
+        update_columns_result(result, with_offsets)
+    }
 
-        let matched_offsets = if with_offsets {
-            let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
-            result
-                .matched_offsets
-                .serialize_into(&mut buf)
-                .map_err(|err| {
-                    PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
-                })?;
-            Some(buf)
-        } else {
-            None
-        };
-        Ok((
-            PyLance(result.fragment),
-            result.fields_modified,
-            matched_offsets,
-        ))
+    #[pyo3(signature=(reader, batch_size=None, with_offsets=false))]
+    fn update_columns_from_stream(
+        &self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        batch_size: Option<u32>,
+        with_offsets: bool,
+    ) -> PyResult<UpdateColumnsResult> {
+        let fragment = self.fragment.clone();
+        let result = rt()
+            .spawn(None, async move {
+                fragment
+                    .update_columns_from_stream(reader.0, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+        update_columns_result(result, with_offsets)
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {

@@ -1039,6 +1039,98 @@ def test_fragment_update_columns_error_on_nonexistent_column(tmp_path):
     assert "does not exist" in str(exc_info.value).lower()
 
 
+def _aligned_values(fragment, batch_size):
+    """Yield new values for every live row of ``fragment``, read in scan order."""
+    for batch in fragment.to_batches(
+        columns=["id"], with_row_address=True, batch_size=batch_size
+    ):
+        yield pa.record_batch(
+            {
+                "_rowaddr": batch["_rowaddr"],
+                "value": pc.multiply(batch["id"], 100),
+                "name": pc.binary_join_element_wise(
+                    "new", pc.cast(batch["id"], pa.string()), ""
+                ),
+            }
+        )
+
+
+def test_fragment_update_columns_from_stream(tmp_path):
+    data = pa.table(
+        {
+            "id": list(range(20)),
+            "value": [-1] * 20,
+            "name": [f"old{i}" for i in range(20)],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_from_stream"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+    dataset.delete("id < 3 OR id = 11")
+    fragment = dataset.get_fragment(0)
+
+    schema = pa.schema(
+        [
+            pa.field("_rowaddr", pa.uint64()),
+            pa.field("value", pa.int64()),
+            pa.field("name", pa.string()),
+        ]
+    )
+    reader = pa.RecordBatchReader.from_batches(schema, _aligned_values(fragment, 3))
+    updated_fragment, fields_modified, offsets = fragment.update_columns_from_stream(
+        reader, batch_size=4, with_offsets=True
+    )
+
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri),
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+            update_mode="rewrite_columns",
+            updated_fragment_offsets={updated_fragment.id: offsets},
+        ),
+        read_version=dataset.version,
+    )
+    live = [i for i in range(20) if i >= 3 and i != 11]
+    result = updated_dataset.to_table(
+        columns=["id", "value", "name", "_row_last_updated_at_version"]
+    )
+    assert result["id"].to_pylist() == live
+    assert result["value"].to_pylist() == [i * 100 for i in live]
+    assert result["name"].to_pylist() == [f"new{i}" for i in live]
+    assert set(result["_row_last_updated_at_version"].to_pylist()) == {
+        updated_dataset.version
+    }
+
+
+@pytest.mark.parametrize(
+    "drift", ["swap", "skip", "extra"], ids=["swapped", "missing", "surplus"]
+)
+def test_fragment_update_columns_from_stream_rejects_misaligned_rows(tmp_path, drift):
+    data = pa.table({"id": list(range(6)), "value": [-1] * 6})
+    dataset_uri = tmp_path / "test_dataset_update_columns_from_stream_misaligned"
+    dataset = lance.write_dataset(data, dataset_uri)
+    fragment = dataset.get_fragment(0)
+
+    addrs = fragment.to_table(columns=[], with_row_address=True)["_rowaddr"]
+    addrs = addrs.to_pylist()
+    if drift == "swap":
+        addrs[1], addrs[2] = addrs[2], addrs[1]
+    elif drift == "skip":
+        del addrs[1]
+    else:
+        addrs.append(addrs[-1] + 1)
+    new_values = pa.table(
+        {
+            "_rowaddr": pa.array(addrs, pa.uint64()),
+            "value": pa.array(range(len(addrs)), pa.int64()),
+        }
+    )
+
+    with pytest.raises(ValueError):
+        fragment.update_columns_from_stream(new_values)
+    assert lance.dataset(dataset_uri).to_table()["value"].to_pylist() == [-1] * 6
+
+
 def test_fragment_update_columns_error_on_metadata_column(tmp_path):
     """Test that updating metadata columns raises an error."""
     # Create initial dataset

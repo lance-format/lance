@@ -1020,6 +1020,118 @@ class LanceFragment(pa.dataset.Fragment):
             return metadata, fields_modified, matched_offsets
         return metadata, fields_modified
 
+    @overload
+    def update_columns_from_stream(
+        self,
+        data_obj: ReaderLike,
+        schema: Optional[pa.Schema] = None,
+        *,
+        batch_size: Optional[int] = None,
+        with_offsets: Literal[False] = False,
+    ) -> Tuple[FragmentMetadata, List[int]]: ...
+
+    @overload
+    def update_columns_from_stream(
+        self,
+        data_obj: ReaderLike,
+        schema: Optional[pa.Schema] = None,
+        *,
+        batch_size: Optional[int] = None,
+        with_offsets: Literal[True],
+    ) -> Tuple[FragmentMetadata, List[int], bytes]: ...
+
+    def update_columns_from_stream(
+        self,
+        data_obj: ReaderLike,
+        schema: Optional[pa.Schema] = None,
+        *,
+        batch_size: Optional[int] = None,
+        with_offsets: bool = False,
+    ) -> Union[
+        Tuple[FragmentMetadata, List[int]],
+        Tuple[FragmentMetadata, List[int], bytes],
+    ]:
+        """
+        Overwrite existing columns from data aligned with this fragment's rows.
+
+        Unlike :meth:`update_columns`, there is no join and the current values
+        are never read, so memory is bounded by the size of the batches in
+        ``data_obj`` and by ``batch_size`` rather than by the fragment. The
+        data must supply every live row exactly once, in
+        ascending ``_rowaddr`` order (what an in-order scan of this fragment,
+        the default, returns), and must carry each row's ``_rowaddr``. Every
+        ``_rowaddr`` is checked against the row it lands on, so data that
+        skips, reorders, or adds a row is rejected rather than written onto
+        other rows. The legacy file format is not supported.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The new values: a ``_rowaddr`` column (UInt64) plus the columns to
+            overwrite. Struct columns must be supplied with all their fields,
+            and blob columns as logical blobs (see :func:`lance.blob_array`).
+            Acceptable types are the same as for :meth:`update_columns`.
+        schema: pa.Schema, optional
+            The schema of the data. If not specified, the schema will be inferred.
+        batch_size: int, optional
+            How many rows are processed at a time.
+        with_offsets: bool, default False
+            If True, also return the physical row offsets that were rewritten
+            (every live row), serialized as in :meth:`update_columns`.
+
+        Returns
+        -------
+        Tuple[FragmentMetadata, List[int]]
+            The updated fragment metadata and the modified field IDs, plus the
+            offsets when ``with_offsets`` is True. Commit them with
+            :class:`LanceOperation.Update <lance.LanceOperation.Update>`,
+            ``update_mode="rewrite_columns"`` and the offsets as
+            ``updated_fragment_offsets``, against the version this fragment was
+            read from. Without that mode, a data overlay on a rewritten field
+            keeps overriding the new values; without it or the offsets, a
+            dataset with stable row ids does not advance
+            ``_row_last_updated_at_version``.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(
+        ...     pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}), "aligned"
+        ... )
+        >>> fragment = dataset.get_fragment(0)
+        >>> rows = fragment.to_table(columns=["value"], with_row_address=True)
+        >>> new_values = pa.table({
+        ...     "_rowaddr": rows["_rowaddr"],
+        ...     "value": pa.compute.multiply(rows["value"], 2),
+        ... })
+        >>> metadata, fields_modified, offsets = fragment.update_columns_from_stream(
+        ...     new_values, with_offsets=True
+        ... )
+        >>> dataset = lance.LanceDataset.commit(
+        ...     "aligned",
+        ...     lance.LanceOperation.Update(
+        ...         updated_fragments=[metadata],
+        ...         fields_modified=fields_modified,
+        ...         update_mode="rewrite_columns",
+        ...         updated_fragment_offsets={metadata.id: offsets},
+        ...     ),
+        ...     read_version=dataset.version,
+        ... )
+        >>> dataset.to_table()["value"].to_pylist()
+        [20, 40, 60]
+        """
+        reader = _coerce_reader(data_obj, schema)
+        metadata, fields_modified, matched_offsets = (
+            self._fragment.update_columns_from_stream(
+                reader, batch_size=batch_size, with_offsets=with_offsets
+            )
+        )
+        if matched_offsets is not None:
+            return metadata, fields_modified, matched_offsets
+        return metadata, fields_modified
+
     def merge_columns(
         self,
         value_func: (
