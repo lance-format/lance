@@ -47,10 +47,14 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
-use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
+use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::dataset::rowids::{
+    get_row_id_index, load_spilled_row_lineage, translate_addr_treemap_to_row_ids,
+};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
+use crate::index::scalar_logical::load_named_scalar_segments;
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
@@ -62,7 +66,7 @@ use crate::{
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        Planner, project,
+        Planner, RowAddrMaskFilterExec, project,
         scalar_index::{IndexLookup, MapIndexExec},
         utils::ReplayExec,
     },
@@ -127,7 +131,7 @@ use lance_datafusion::{
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -1337,6 +1341,34 @@ impl MergeInsertJob {
         Ok(unindexed.into_values().collect())
     }
 
+    /// Physical rows whose join-key index entries may be stale due to newer overlays.
+    async fn overlay_stale_rows_for_keys(
+        &self,
+        indexed_keys: &[(String, IndexMetadata)],
+    ) -> Result<RowAddrTreeMap> {
+        let overlaid_frags = overlaid_fragments(self.dataset.fragments());
+        if overlaid_frags.is_empty() {
+            return Ok(RowAddrTreeMap::new());
+        }
+        let mut stale = HashMap::new();
+        for (column, index) in indexed_keys {
+            let segments = load_named_scalar_segments(&self.dataset, column, &index.name).await?;
+            for segment in &segments {
+                collect_overlay_stale_rows_for_segment(
+                    segment,
+                    &overlaid_frags,
+                    &mut stale,
+                    self.dataset.schema(),
+                )?;
+            }
+        }
+        let mut rows = RowAddrTreeMap::new();
+        for (fragment_id, offsets) in stale {
+            rows.insert_bitmap(fragment_id, offsets);
+        }
+        Ok(rows)
+    }
+
     async fn create_indexed_scan_joined_stream(
         &self,
         source: SendableRecordBatchStream,
@@ -1378,11 +1410,25 @@ impl MergeInsertJob {
             .iter()
             .map(|(col, idx)| IndexLookup::new(col.clone(), idx.name.clone()))
             .collect::<Vec<_>>();
-        let index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
+        let overlay_stale_rows = self.overlay_stale_rows_for_keys(&indexed_keys).await?;
+        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
             self.dataset.clone(),
             lookups,
             index_mapper_input,
         ));
+        if !overlay_stale_rows.is_empty() {
+            // The fallback scan below reads these rows using their current keys. Block
+            // old index hits so a row cannot enter the target side of the join twice.
+            let stale_row_ids = if self.dataset.manifest().uses_stable_row_ids() {
+                translate_addr_treemap_to_row_ids(&self.dataset, &overlay_stale_rows).await?
+            } else {
+                overlay_stale_rows.clone()
+            };
+            index_mapper = Arc::new(RowAddrMaskFilterExec::new(
+                index_mapper,
+                Arc::new(RowAddrMask::from_block(stale_row_ids)),
+            ));
+        }
 
         // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
         //     the v1 reader cannot serve a FilteredReadExec)
@@ -1423,25 +1469,32 @@ impl MergeInsertJob {
             .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
             .collect::<Vec<_>>();
 
-        // 5a - We also need to scan any new unindexed data and union it in.
+        // 5a - Scan unindexed fragments and overlay-stale rows using current values.
         //      A row can be reached by the composite index probe only if it
         //      lives in a fragment covered by *every* chosen index, so the
         //      "unindexed" set is the union of fragments missing from any
         //      one of them.
         let unindexed_fragments = self.unindexed_fragments_for_keys(&indexed_keys).await?;
-        if !unindexed_fragments.is_empty() {
+        if !unindexed_fragments.is_empty() || !overlay_stale_rows.is_empty() {
             let mut builder = self.dataset.scan();
             if add_row_addr {
                 builder.with_row_address();
             }
-            let unindexed_data = builder
+            if overlay_stale_rows.is_empty() {
+                builder.with_fragments(unindexed_fragments);
+            } else {
+                let mut fallback_rows = overlay_stale_rows;
+                for fragment in unindexed_fragments {
+                    fallback_rows.insert_fragment(fragment.id as u32);
+                }
+                builder.with_physical_row_addr_prefilter(fallback_rows);
+            }
+            let fallback_data = builder
                 .with_row_id()
-                .with_fragments(unindexed_fragments)
-                .project(&column_names)
-                .unwrap()
+                .project(&column_names)?
                 .create_plan()
                 .await?;
-            let unioned = UnionExec::try_new(vec![target, unindexed_data])?;
+            let unioned = UnionExec::try_new(vec![target, fallback_data])?;
             // Enforce only 1 partition.
             target = Arc::new(RepartitionExec::try_new(
                 unioned,
@@ -3892,6 +3945,7 @@ impl Merger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::WriteDestination;
     use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::write::merge_insert::inserted_rows::{
         KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
@@ -5765,6 +5819,283 @@ mod tests {
             .unwrap();
 
         assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
+    }
+
+    #[rstest::rstest]
+    #[case::single_key(vec!["key".to_string()], Some(1))]
+    #[case::null_key(vec!["key".to_string()], None)]
+    #[case::composite_key(vec!["key".to_string(), "other_key".to_string()], Some(1))]
+    #[tokio::test]
+    async fn test_indexed_merge_insert_overlaid_keys(
+        #[case] on: Vec<String>,
+        #[case] base_key: Option<i32>,
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] use_index: bool,
+    ) {
+        let initial = record_batch!(
+            ("key", Int32, [Some(0), base_key, Some(2), Some(3)]),
+            ("other_key", Int32, [10, 20, 30, 40]),
+            ("tag", Utf8, ["base0", "base1", "base2", "base3"])
+        )
+        .unwrap();
+        let schema = initial.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for column in &on {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let appended = record_batch!(
+            ("key", Int32, [4, 5]),
+            ("other_key", Int32, [50, 60]),
+            ("tag", Utf8, ["base4", "base5"])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(appended)], schema.clone()),
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Deleted offsets must not shift the overlay's physical row selection.
+        dataset.delete("key = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+        let key_schema = dataset
+            .schema()
+            .project_by_ids(&[dataset.schema().field("key").unwrap().id], true);
+        let mut groups = Vec::new();
+        for (fragment_id, offsets, keys) in [
+            (0, vec![1], vec![100]),
+            // The unchanged key must not be returned by both the index and stale-row scan.
+            (1, vec![0, 1], vec![101, 3]),
+            // An overlay on an unindexed fragment must still be scanned only once.
+            (2, vec![0], vec![200]),
+        ] {
+            let row_addrs = offsets
+                .into_iter()
+                .map(|offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+                .collect::<Vec<_>>();
+            let batch =
+                record_batch!(("_rowaddr", UInt64, row_addrs), ("key", Int32, keys)).unwrap();
+            let mut writer = dataset
+                .get_fragment(fragment_id as usize)
+                .unwrap()
+                .write_overlay(&key_schema)
+                .await
+                .unwrap();
+            writer.write_batch(&batch).await.unwrap();
+            groups.push(writer.finish().await.unwrap().unwrap());
+        }
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataOverlay { groups },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("key", Int32, [100, 101, 3, 200, 999]),
+            ("other_key", Int32, [20, 30, 40, 50, 99]),
+            (
+                "tag",
+                Utf8,
+                ["merged", "merged", "merged", "merged", "inserted"]
+            )
+        )
+        .unwrap();
+        let (dataset, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), on)
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(use_index)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source.slice(0, 2)), Ok(source.slice(2, 3))],
+                schema,
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 4);
+        assert_eq!(stats.num_inserted_rows, 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+        for (key, other_key, tag) in [
+            (100, 20, "merged"),
+            (101, 30, "merged"),
+            (3, 40, "merged"),
+            (200, 50, "merged"),
+            (5, 60, "base5"),
+            (999, 99, "inserted"),
+        ] {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!(
+                        "key = {key} AND other_key = {other_key} AND tag = '{tag}'"
+                    )))
+                    .await
+                    .unwrap(),
+                1,
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::first_key("key", false, true)]
+    #[case::second_key("other_key", false, true)]
+    #[case::unindexed_field("value", false, false)]
+    #[case::rebuilt_index("key", true, false)]
+    #[tokio::test]
+    async fn test_indexed_merge_insert_overlay_staleness(
+        #[case] column: &str,
+        #[case] rebuild_index: bool,
+        #[case] is_stale: bool,
+    ) {
+        let initial = record_batch!(
+            ("key", Int32, [0, 1]),
+            ("other_key", Int32, [10, 20]),
+            ("value", Int32, [0, 1])
+        )
+        .unwrap();
+        let schema = initial.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for key in ["key", "other_key"] {
+            dataset
+                .create_index(
+                    &[key],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let dataset = Arc::new(dataset);
+        let overlay_schema = dataset
+            .schema()
+            .project_by_ids(&[dataset.schema().field(column).unwrap().id], true);
+        let batch = record_batch!((ROW_ADDR, UInt64, [1]), (column, Int32, [100])).unwrap();
+        let mut writer = dataset
+            .get_fragment(0)
+            .unwrap()
+            .write_overlay(&overlay_schema)
+            .await
+            .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        let group = writer.finish().await.unwrap().unwrap();
+        let read_version = dataset.version().version;
+        let mut dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        if rebuild_index {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let job = MergeInsertBuilder::try_new(
+            Arc::new(dataset),
+            vec!["key".to_string(), "other_key".to_string()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+        let indexed_keys = job.indexed_join_keys().await.unwrap();
+        let stale_rows = job
+            .overlay_stale_rows_for_keys(&indexed_keys)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_rows,
+            if is_stale {
+                RowAddrTreeMap::from_iter([1u64])
+            } else {
+                RowAddrTreeMap::new()
+            }
+        );
+
+        let source = record_batch!(
+            ("key", Int32, [if column == "key" { 100 } else { 1 }]),
+            (
+                "other_key",
+                Int32,
+                [if column == "other_key" { 100 } else { 20 }]
+            ),
+            ("value", Int32, [999])
+        )
+        .unwrap();
+        let (dataset, stats) = job
+            .execute_reader(Box::new(RecordBatchIterator::new([Ok(source)], schema)))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            dataset
+                .count_rows(Some("value = 999".to_string()))
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     /// Multi-column (composite key) merge_insert when one or more join
