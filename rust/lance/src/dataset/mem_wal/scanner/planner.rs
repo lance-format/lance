@@ -10,6 +10,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::Result;
 use tracing::instrument;
 
@@ -59,6 +60,12 @@ pub struct LsmScanPlanner {
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
 }
+
+/// Source scans (one per base table, flushed generation and memtable) built
+/// at once when planning an LSM read. Each flushed generation costs a
+/// manifest and a schema read against object storage; 16 in flight keeps a
+/// 100-source read in the low hundreds of milliseconds instead of seconds.
+const SOURCE_SCAN_BUILD_CONCURRENCY: usize = 16;
 
 impl LsmScanPlanner {
     /// Create a new planner.
@@ -180,25 +187,47 @@ impl LsmScanPlanner {
         // down safely. The active memtable is in-memory and is never capped.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
 
+        // Building a source's scan opens its dataset: for a flushed
+        // generation that is a manifest read and a schema read against
+        // object storage, ~100 ms each. A store with 20 shards and a modest
+        // backlog has 80-100 such sources, and building them one after
+        // another put every read of it at 8-13 s regardless of how little
+        // data it returned. The opens are independent, so run them with
+        // bounded concurrency and reassemble in source order; everything
+        // after the open (block filter, limit, tagging) is pure and cheap,
+        // so it stays sequential below.
+        // Type-erased, not merely boxed: the `Send` proof recurses through a
+        // boxed future's concrete type but stops at a trait object. An arm
+        // resolves a generation's schema before it scans, which nests deeply
+        // enough to need that. The arms are materialized before streaming so
+        // the stream owns plain trait objects, not a closure over `sources`.
+        let arms: Vec<futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>>> = sources
+            .iter()
+            .map(|source| {
+                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+                let has_block_filter = block_lists
+                    .contains_key(&(source.shard_id(), source.generation()))
+                    && !self.pk_columns.is_empty();
+                let fetch = match (n_needed, is_active, has_block_filter) {
+                    (Some(n), false, false) => Some(n),
+                    _ => None,
+                };
+                Box::pin(self.build_source_scan(source, projection, filter, fetch))
+                    as futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>>
+            })
+            .collect();
+        let scans: Vec<Arc<dyn ExecutionPlan>> = futures::stream::iter(arms)
+            .buffered(SOURCE_SCAN_BUILD_CONCURRENCY)
+            .try_collect()
+            .await?;
+
         let mut source_plans = Vec::new();
-        for source in sources {
+        for (source, scan) in sources.into_iter().zip(scans) {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
             let blocked = block_lists
                 .get(&(source.shard_id(), source.generation()))
                 .cloned();
-            let has_block_filter = blocked.is_some() && !self.pk_columns.is_empty();
-            let fetch = match (n_needed, is_active, has_block_filter) {
-                (Some(n), false, false) => Some(n),
-                _ => None,
-            };
-            // Type-erased, not merely boxed: the `Send` proof recurses
-            // through a boxed future's concrete type but stops at a trait
-            // object. An arm resolves a generation's schema before it
-            // scans, which nests deeply enough to need that.
-            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                Box::pin(self.build_source_scan(&source, projection, filter, fetch));
-            let scan = arm.await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
             // Plain scans refill exactly, so keep the approximate-search
@@ -791,6 +820,77 @@ mod integration_tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Source scans are built with bounded concurrency and reassembled in
+    /// source order. With more generations than the concurrency bound, every
+    /// key's newest version must still win: a misordered zip of sources and
+    /// scans would attach a block list or generation tag to the wrong arm.
+    #[tokio::test]
+    async fn test_lsm_scan_many_generations_keep_newest_per_key() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[1], "base")]).await,
+        );
+        let shard_id = Uuid::new_v4();
+        let gens = super::SOURCE_SCAN_BUILD_CONCURRENCY * 2 + 3;
+        let mut snapshot = ShardSnapshot::new(shard_id).with_current_generation(gens as u64 + 1);
+        for g in 1..=gens {
+            let uri = format!("{}/_mem_wal/{}/gen_{}", base_uri, shard_id, g);
+            // Every generation rewrites key 1 and adds its own key.
+            create_dataset(
+                &uri,
+                vec![create_test_batch(
+                    &schema,
+                    &[1, g as i32 + 1],
+                    &format!("gen{g}"),
+                )],
+            )
+            .await;
+            snapshot = snapshot.with_sstable(g as u64, format!("gen_{g}"));
+        }
+        let scanner = LsmScanner::new(base, vec![snapshot], vec!["id".to_string()]);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert!(
+                    results
+                        .insert(ids.value(i), names.value(i).to_string())
+                        .is_none(),
+                    "key {} returned twice",
+                    ids.value(i)
+                );
+            }
+        }
+        assert_eq!(results.len(), gens + 1);
+        assert_eq!(results.get(&1), Some(&format!("gen{gens}_1")));
+        for g in 1..=gens {
+            assert_eq!(
+                results.get(&(g as i32 + 1)),
+                Some(&format!("gen{g}_{}", g + 1))
+            );
+        }
     }
 
     #[tokio::test]
