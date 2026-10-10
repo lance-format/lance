@@ -83,7 +83,7 @@ use lance_index::{
     scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query as VectorQuery,
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
     },
@@ -124,7 +124,6 @@ pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
@@ -5738,28 +5737,35 @@ fn vector_query_params_from_dict(
         default_k
     };
 
-    let mut minimum_nprobes = DEFAULT_NPROBES;
-    let mut maximum_nprobes: Option<usize> = None;
+    let search_effort = dict
+        .get_item("search_effort")?
+        .filter(|value| !value.is_none())
+        .map(|value| value.extract::<f64>())
+        .transpose()?;
+    let mut probes = ProbeParams {
+        search_effort,
+        ..Default::default()
+    };
 
-    if let Some(nprobes) = dict.get_item("nprobes")?
+    if search_effort.is_none()
+        && let Some(nprobes) = dict.get_item("nprobes")?
         && !nprobes.is_none()
     {
-        let extracted: usize = nprobes.extract()?;
-        minimum_nprobes = extracted;
-        maximum_nprobes = Some(extracted);
+        probes.nprobes = Some(nprobes.extract()?);
     }
 
     if let Some(min_nprobes) = dict.get_item("minimum_nprobes")?
         && !min_nprobes.is_none()
     {
-        minimum_nprobes = min_nprobes.extract()?;
+        probes.minimum_nprobes = Some(min_nprobes.extract()?);
     }
 
     if let Some(max_nprobes) = dict.get_item("maximum_nprobes")?
         && !max_nprobes.is_none()
     {
-        maximum_nprobes = Some(max_nprobes.extract()?);
+        probes.maximum_nprobes = Some(max_nprobes.extract()?);
     }
+    let (minimum_nprobes, maximum_nprobes, search_effort) = probes.resolve();
 
     if let Some(maximum_nprobes_val) = maximum_nprobes
         && minimum_nprobes > maximum_nprobes_val
@@ -5819,11 +5825,6 @@ fn vector_query_params_from_dict(
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
     let approx_mode = vector_query_approx_mode_from_dict(dict)?;
-    let search_effort = dict
-        .get_item("search_effort")?
-        .map(|value| value.extract::<f64>())
-        .transpose()?
-        .unwrap_or(0.5);
 
     Ok((
         column,

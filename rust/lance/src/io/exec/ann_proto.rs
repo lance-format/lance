@@ -425,9 +425,9 @@ mod tests {
         let mut proto = query_to_proto(&query).unwrap();
         proto.maximum_nprobes = proto.minimum_nprobes;
         proto.search_effort = Some(0.75);
-        let error = query_from_proto(proto).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("fixed nprobes"));
+        let back = query_from_proto(proto).unwrap();
+        assert_eq!(back.search_effort, 0.75);
+        assert_eq!(back.maximum_nprobes, Some(back.minimum_nprobes));
 
         let mut proto = query_to_proto(&query).unwrap();
         proto.approx_mode = i32::MAX;

@@ -2952,17 +2952,33 @@ def test_vector_search_effort(
         scan_stats_callback=captured.append,
     ).to_table()
     assert captured[0].all_counts["partitions_searched"] == probes
+    captured.clear()
+    overridden = ds.scanner(
+        columns=["id"],
+        nearest={**nearest, "search_effort": effort, "nprobes": 3},
+        scan_stats_callback=captured.append,
+    ).to_table()
+    assert overridden == actual
+    assert captured[0].all_counts["partitions_searched"] == probes
     exact = ds.to_table(columns=["id"], nearest={**nearest, "use_index": False})
     assert len(set(actual["id"].to_pylist()) & set(exact["id"].to_pylist())) / 8 >= 0.5
     if effort == 0.5:
         assert actual == ds.to_table(columns=["id"], nearest=nearest)
+        assert actual == ds.to_table(
+            columns=["id"], nearest={**nearest, "search_effort": None}
+        )
     if effort == 1:
         assert actual == ds.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
     # Batch queries use the same effort on every per-query search.
     batch_stats = []
     batch = ds.scanner(
         columns=["id"],
-        nearest={**nearest, "q": [centroids[0], centroids[0]], "search_effort": effort},
+        nearest={
+            **nearest,
+            "q": [centroids[0], centroids[0]],
+            "search_effort": effort,
+            "nprobes": 3,
+        },
         scan_stats_callback=batch_stats.append,
     ).to_table()
     assert batch["id"].to_pylist() == actual["id"].to_pylist() * 2
@@ -2970,7 +2986,7 @@ def test_vector_search_effort(
     if metric == "l2" and index_type == "IVF_FLAT":
         captured.clear()
         ds.create_scalar_index("text", "INVERTED")
-        query_filter = VectorSearchQuery(**nearest, search_effort=effort)
+        query_filter = VectorSearchQuery(**nearest, search_effort=effort, nprobes=3)
         filtered = ds.scanner(
             columns=["id"],
             filter=query_filter,
@@ -3027,18 +3043,29 @@ def test_vector_search_effort_invalid(indexed_dataset, effort):
         )
 
 
-@pytest.mark.parametrize("effort", [0, 0.25, 0.75, 1])
-def test_vector_search_effort_fixed_conflict(indexed_dataset, effort):
-    with pytest.raises(ValueError, match="cannot be combined with fixed nprobes"):
-        indexed_dataset.scanner(
-            nearest={
-                "column": "vector",
-                "q": np.ones(128),
-                "k": 10,
-                "nprobes": 2,
-                "search_effort": effort,
-            }
-        )
+@pytest.mark.parametrize("effort", [None, 0, 0.25, 0.5, 0.75, 1])
+def test_vector_search_effort_nprobes_priority(indexed_dataset, effort):
+    nearest = {
+        "column": "vector",
+        "q": np.ones(128),
+        "k": 10,
+        "nprobes": 2,
+        "search_effort": effort,
+    }
+    plan = indexed_dataset.scanner(nearest=nearest).explain_plan()
+    minimum, maximum = (2, "Some(2)") if effort is None else (1, "None")
+    assert f"minimum_nprobes={minimum}" in plan
+    assert f"maximum_nprobes={maximum}" in plan
+    if effort is not None:
+        # An ignored fixed-probe value must not contribute validation errors.
+        plan = indexed_dataset.scanner(nearest={**nearest, "nprobes": 0}).explain_plan()
+        assert "minimum_nprobes=1" in plan
+        assert "maximum_nprobes=None" in plan
+    plan = indexed_dataset.scanner(
+        nearest={**nearest, "minimum_nprobes": 3, "maximum_nprobes": 3}
+    ).explain_plan()
+    assert "minimum_nprobes=3" in plan
+    assert "maximum_nprobes=Some(3)" in plan
 
 
 def test_vector_index_with_nprobes(indexed_dataset):

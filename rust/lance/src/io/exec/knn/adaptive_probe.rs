@@ -469,19 +469,15 @@ mod tests {
     }
 
     #[rstest]
-    fn test_search_effort_fixed_conflict(#[values(0.0, 0.25, 0.75, 1.0)] effort: f64) {
+    fn test_search_effort_equal_explicit_bounds(#[values(0.0, 0.25, 0.5, 0.75, 1.0)] effort: f64) {
         let mut query = query();
         query.minimum_nprobes = 8;
         query.maximum_nprobes = Some(8);
-        query.validate_search_effort().unwrap();
         query.search_effort = effort;
-        let error = query.validate_search_effort().unwrap_err();
-        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("cannot be combined with fixed nprobes=8")
-        );
+        query.validate_search_effort().unwrap();
+        AutoProbePolicy::Fixed.apply(&mut query, &[1.0; 16], DistanceType::L2);
+        assert_eq!(query.minimum_nprobes, 8);
+        assert_eq!(query.maximum_nprobes, Some(8));
     }
 
     #[rstest]

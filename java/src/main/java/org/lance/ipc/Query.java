@@ -28,7 +28,7 @@ public class Query {
   private final int k;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
-  private final double searchEffort;
+  private final Optional<Double> searchEffort;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
@@ -48,16 +48,16 @@ public class Query {
           "Batch query buffer length must be a positive multiple of the query vector dimension");
     }
     this.queryVectorDim = builder.queryVectorDim;
+    Optional<Integer> fixedNprobes =
+        builder.searchEffort.isPresent() ? Optional.empty() : builder.nprobes;
+    this.minimumNprobes = builder.minimumNprobes.orElse(fixedNprobes.orElse(1));
+    this.maximumNprobes = builder.maximumNprobes.or(() -> fixedNprobes);
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
+    Preconditions.checkArgument(minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
-        builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
-    Preconditions.checkArgument(
-        !builder.maximumNprobes.isPresent()
-            || builder.maximumNprobes.get() >= builder.minimumNprobes,
+        !maximumNprobes.isPresent() || maximumNprobes.get() >= minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
-    this.minimumNprobes = builder.minimumNprobes;
-    this.maximumNprobes = builder.maximumNprobes;
     this.searchEffort = builder.searchEffort;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
@@ -97,8 +97,18 @@ public class Query {
     return maximumNprobes;
   }
 
-  /** Returns the initial IVF search effort, default 0.5 (Auto). */
+  /** Returns the resolved initial IVF search effort; absent effort resolves to 0.5. */
   public double getSearchEffort() {
+    return searchEffort.orElse(0.5);
+  }
+
+  /**
+   * Returns the configured effort, or empty when it was omitted.
+   *
+   * <p>An explicit effort, including 0.5, ignores fixed nprobes. For example, {@code new
+   * Query.Builder().setColumn("vector").setKey(vector).build() .getSearchEffortOption()} is empty.
+   */
+  public Optional<Double> getSearchEffortOption() {
     return searchEffort;
   }
 
@@ -143,7 +153,7 @@ public class Query {
         .add("k", k)
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
-        .add("searchEffort", searchEffort)
+        .add("searchEffort", searchEffort.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
@@ -158,9 +168,10 @@ public class Query {
     private float[] key;
     private int queryVectorDim = 0;
     private int k = 10;
-    private int minimumNprobes = 1;
+    private Optional<Integer> nprobes = Optional.empty();
+    private Optional<Integer> minimumNprobes = Optional.empty();
     private Optional<Integer> maximumNprobes = Optional.empty();
-    private double searchEffort = 0.5;
+    private Optional<Double> searchEffort = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
@@ -252,14 +263,14 @@ public class Query {
     /**
      * Sets the number of probes to load and search.
      *
-     * <p>This sets both the minimum and maximum number of probes to the same value.
+     * <p>Used only when search effort is absent. Explicit minimum and maximum bounds override the
+     * corresponding fixed-count bounds, regardless of setter order.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
      */
     public Builder setNprobes(int nprobes) {
-      this.minimumNprobes = nprobes;
-      this.maximumNprobes = Optional.of(nprobes);
+      this.nprobes = Optional.of(nprobes);
       return this;
     }
 
@@ -273,7 +284,7 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setMinimumNprobes(int minimumNprobes) {
-      this.minimumNprobes = minimumNprobes;
+      this.minimumNprobes = Optional.of(minimumNprobes);
       return this;
     }
 
@@ -296,12 +307,13 @@ public class Query {
     /**
      * Sets the initial IVF search effort, a finite value in [0, 1].
      *
-     * <p>The default 0.5 preserves Auto. Zero starts at the caller minimum (at least one available
-     * partition); one starts at all available partitions, subject to the caller maximum.
-     * Intermediate values interpolate geometrically. Later expansion to find enough candidates is
-     * unchanged. This is independent of approximation mode, HNSW ef and refinement, and is not a
-     * recall guarantee. Non-default effort conflicts with fixed nprobes; validation occurs in the
-     * Rust core when the query is executed.
+     * <p>Absent effort resolves to 0.5 and preserves Auto. Zero starts at the caller minimum (at
+     * least one available partition); one starts at all available partitions, subject to the caller
+     * maximum. Intermediate values interpolate geometrically. Later expansion to find enough
+     * candidates is unchanged. This is independent of approximation mode, HNSW ef and refinement,
+     * and is not a recall guarantee. Any explicit effort, including 0.5, ignores fixed nprobes
+     * regardless of setter order. Explicit minimum and maximum bounds remain effective. Effort
+     * validation occurs in the Rust core when the query is executed.
      *
      * <p>Example: {@code new
      * Query.Builder().setColumn("vector").setKey(vector).setSearchEffort(0.75).build()}.
@@ -310,7 +322,7 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setSearchEffort(double searchEffort) {
-      this.searchEffort = searchEffort;
+      this.searchEffort = Optional.of(searchEffort);
       return this;
     }
 

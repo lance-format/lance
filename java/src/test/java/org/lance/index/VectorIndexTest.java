@@ -215,6 +215,7 @@ public class VectorIndexTest {
                 .setKey(key)
                 .setK(5)
                 .setSearchEffort(effort)
+                .setNprobes(1)
                 .build();
         // Each fragment repeats the vectors but has distinct row IDs. Selecting a segment
         // must exclude equally close rows in the other segments and unindexed fragments.

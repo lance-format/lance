@@ -220,13 +220,16 @@ its recall is not assumed to combine independently with FLAT routing recall.
 
 ## Continuous search effort
 
-`search_effort` is a finite value in `[0, 1]`; its default `0.5` preserves the
-current Auto budget exactly. Zero starts at the caller minimum (at least one
-available partition), and one starts at all available partitions, subject to
-`maximum_nprobes`. Intermediate values interpolate geometrically around Auto.
-Later candidate-count expansion is unchanged. Non-default effort conflicts
-with fixed `nprobes`. Approximation mode, refinement and HNSW `ef` remain
-independent, so a larger effort is not a guaranteed recall level.
+`search_effort` is an optional finite value in `[0, 1]`; its default `None`
+resolves to `0.5`, preserving the current Auto budget exactly. Zero starts at the
+caller minimum (at least one available partition), and one starts at all
+available partitions, subject to `maximum_nprobes`. Intermediate values
+interpolate geometrically around Auto.
+Later candidate-count expansion is unchanged. Any explicit effort, including
+`0.5`, ignores fixed `nprobes`; `nprobes` is used only when effort is absent.
+Explicit minimum and maximum bounds remain effective. Approximation mode,
+refinement and HNSW `ef` remain independent, so a larger effort is not a
+guaranteed recall level.
 
 ```python
 result = dataset.to_table(
@@ -260,6 +263,10 @@ query coverage, unique valid IDs and zero measured storage reads.
 operating point, the matched old-binary control, measured partition counts,
 environment and validation. [search-effort-results.csv](search-effort-results.csv)
 contains all 180 groups, including recall and latency distributions.
+
+The published measurements retain their original source and binary identities.
+The later optional-effort API changes parameter precedence without recalibrating
+the underlying Auto profiles or changing the effort interpolation formula.
 
 ## COYO search-effort evaluation
 
