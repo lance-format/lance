@@ -282,7 +282,9 @@ struct V3TermPlan {
     position: u32,
     term_index: u32,
     posting_len: u32,
-    blocks: Vec<V3BlockMeta>,
+    term_idx: usize,
+    block_start: usize,
+    blocks: Arc<Vec<V3BlockSkipMeta>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -290,15 +292,11 @@ struct V3BlockMeta {
     term_idx: usize,
     block_idx: usize,
     block_row: usize,
-    first_doc_id: u32,
-    last_doc_id: u32,
     block_max_score: f32,
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
 struct V3BlockSkipMeta {
-    block_idx: usize,
-    block_row: usize,
     first_doc_id: u32,
     last_doc_id: u32,
     block_max_score: f32,
@@ -2310,7 +2308,7 @@ impl InvertedPartition {
                 let posting_len = self.inverted_list.posting_len_for_token(token_id).await? as u32;
                 let blocks = self
                     .inverted_list
-                    .v3_block_metadata(token_id, term_idx, metrics)
+                    .v3_block_metadata(token_id, metrics)
                     .await?;
                 Ok(V3TermPlan {
                     token_id,
@@ -2318,6 +2316,8 @@ impl InvertedPartition {
                     position,
                     term_index: position,
                     posting_len,
+                    term_idx,
+                    block_start: self.inverted_list.posting_list_range(token_id).start,
                     blocks,
                 })
             })
@@ -2522,7 +2522,7 @@ impl InvertedPartition {
         metrics.record_comparisons(num_comparisons);
         let all_rows = term_plans
             .iter()
-            .flat_map(|term| term.blocks.iter().map(|block| block.block_row))
+            .flat_map(|term| term.block_start..term.block_start + term.blocks.len())
             .collect::<HashSet<_>>();
         metrics.record_fts_blocks_pruned(all_rows.len().saturating_sub(visited_blocks.len()));
 
@@ -3802,9 +3802,8 @@ impl PostingListReader {
     async fn v3_block_metadata(
         &self,
         token_id: u32,
-        term_idx: usize,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<V3BlockMeta>> {
+    ) -> Result<Arc<Vec<V3BlockSkipMeta>>> {
         let skip = self
             .index_cache
             .get_or_insert_with_key(V3BlockMetadataKey { token_id }, || async move {
@@ -3829,17 +3828,7 @@ impl PostingListReader {
             })
             .await?;
 
-        Ok(skip
-            .iter()
-            .map(|block| V3BlockMeta {
-                term_idx,
-                block_idx: block.block_idx,
-                block_row: block.block_row,
-                first_doc_id: block.first_doc_id,
-                last_doc_id: block.last_doc_id,
-                block_max_score: block.block_max_score,
-            })
-            .collect())
+        Ok(skip)
     }
 
     async fn v3_payload_block_batches(
@@ -4176,8 +4165,6 @@ impl PostingListReader {
             }
             previous_last = Some(last_doc_id);
             blocks.push(V3BlockSkipMeta {
-                block_idx: row,
-                block_row: block_range.start + row,
                 first_doc_id,
                 last_doc_id,
                 block_max_score,

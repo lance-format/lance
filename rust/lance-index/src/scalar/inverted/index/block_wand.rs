@@ -4,14 +4,26 @@
 use super::{Operator, V3BlockMeta, V3TermPlan, V3Window};
 
 impl V3TermPlan {
-    pub(super) fn overlapping_blocks(&self, first: u32, last: u32) -> &[V3BlockMeta] {
+    pub(super) fn overlapping_blocks(
+        &self,
+        first: u32,
+        last: u32,
+    ) -> impl Iterator<Item = V3BlockMeta> + '_ {
         let start = self
             .blocks
             .partition_point(|block| block.last_doc_id < first);
         let end = self
             .blocks
             .partition_point(|block| block.first_doc_id <= last);
-        &self.blocks[start..end]
+        self.blocks[start..end]
+            .iter()
+            .enumerate()
+            .map(move |(offset, block)| V3BlockMeta {
+                term_idx: self.term_idx,
+                block_idx: start + offset,
+                block_row: self.block_start + start + offset,
+                block_max_score: block.block_max_score,
+            })
     }
 }
 
@@ -38,7 +50,7 @@ pub(super) fn search_windows(terms: &[V3TermPlan], operator: Operator) -> Vec<V3
         let mut upper_bound = 0.0;
         let mut matching_terms = 0;
         for term in terms {
-            if let Some(block) = term.overlapping_blocks(first, last).first() {
+            if let Some(block) = term.overlapping_blocks(first, last).next() {
                 upper_bound += block.block_max_score;
                 matching_terms += 1;
             }
