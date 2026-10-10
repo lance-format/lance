@@ -29,6 +29,7 @@ mod test {
     use tokio::sync::{Barrier, Mutex};
 
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
     use crate::{
         Dataset,
         dataset::{ReadParams, WriteMode, WriteParams},
@@ -765,6 +766,76 @@ mod test {
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn cleanup_preserves_staging_manifest_selected_by_external_store_fallback() {
+        let external_store = TestExternalManifestStore::new();
+        let manifest_records = external_store.store.clone();
+        let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+        let dataset = Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(WriteParams {
+                commit_handler: Some(handler),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let canonical_manifest = dataset.manifest_location().path.clone();
+        let authoritative_staging_manifest =
+            Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
+        let orphan_staging_manifest =
+            Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
+        dataset
+            .object_store
+            .copy(&canonical_manifest, &authoritative_staging_manifest)
+            .await
+            .unwrap();
+        dataset
+            .object_store
+            .copy(&canonical_manifest, &orphan_staging_manifest)
+            .await
+            .unwrap();
+        manifest_records.lock().await.insert(
+            (dataset.base.to_string(), dataset.version().version),
+            authoritative_staging_manifest.to_string(),
+        );
+
+        cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(chrono::Utc::now())
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .object_store
+                .exists(&authoritative_staging_manifest)
+                .await
+                .unwrap(),
+            "cleanup deleted the manifest selected by the external store"
+        );
+        assert!(
+            !dataset
+                .object_store
+                .exists(&orphan_staging_manifest)
+                .await
+                .unwrap(),
+            "cleanup retained an unrecorded staging manifest"
+        );
     }
 
     /// S3's `CopyObject` API has a hard 5 GB cap on the source object size.

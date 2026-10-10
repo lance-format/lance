@@ -731,6 +731,24 @@ impl CommitHandler for ExternalManifestCommitHandler {
         }
     }
 
+    async fn is_manifest_path_authoritative(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        _object_store: &dyn OSObjectStore,
+    ) -> Result<bool> {
+        match self
+            .external_manifest_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+        {
+            Ok(location) => Ok(location.path == *path),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
