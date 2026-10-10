@@ -27,6 +27,10 @@ use lance_core::Result;
 const NORMALIZE_NAN_SIGN_NAME: &str = "_lance_normalize_nan_sign";
 const RAW_FLOAT_LITERAL_MARKER: &str = "lance:raw-float-comparison";
 
+/// Shared by the comparison rewrite and the Substrait function registry.
+pub static NORMALIZE_NAN_SIGN_UDF: LazyLock<Arc<ScalarUDF>> =
+    LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeNanSign::new())));
+
 /// Clears the sign bit only when a comparison operand is NaN.
 ///
 /// Comparisons against non-NaN literals are rewritten into indexable ranges
@@ -171,9 +175,10 @@ fn normalize_nan_expr(expr: &Expr) -> Expr {
     {
         return expr.clone();
     }
-    static UDF: LazyLock<Arc<ScalarUDF>> =
-        LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeNanSign::new())));
-    Expr::ScalarFunction(ScalarFunction::new_udf(UDF.clone(), vec![expr.clone()]))
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        NORMALIZE_NAN_SIGN_UDF.clone(),
+        vec![expr.clone()],
+    ))
 }
 
 /// Rewrite floating-point comparisons so sign-only encodings have value semantics.
@@ -194,6 +199,9 @@ fn normalize_nan_expr(expr: &Expr) -> Expr {
 /// | `x IN (0, NaN, ..)`        | missing sign encodings are added                |
 ///
 /// The extra NaN range is combined with `AND` for `<`/`<=` and `OR` for `>`/`>=`.
+/// When a deterministic operand has both bounds, the guards cancel and leave a
+/// single indexable range. Volatile operands use one normalized comparison so
+/// the range guard cannot evaluate them a second time.
 /// Equality names both encodings because scalar indices key on the bit pattern.
 /// A comparison without a literal normalizes NaN operands through an internal
 /// physical expression, preserving payload bits and evaluating each operand once.
@@ -378,6 +386,96 @@ fn flatten_chain<'a>(expr: &'a Expr, op: Operator, terms: &mut Vec<&'a Expr>) {
     terms.push(expr);
 }
 
+/// Recognize an implementation-level comparison against a non-NaN float bound.
+fn raw_ordered_comparison(expr: &Expr) -> Option<(&Expr, Operator, &ScalarValue)> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return None;
+    };
+    let Expr::Literal(value, metadata) = right.as_ref() else {
+        return None;
+    };
+    (matches!(
+        op,
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    ) && is_raw_float_literal(metadata.as_ref())
+        && !is_nan(value)
+        && negative_infinity(value).is_some())
+    .then_some((left, *op, value))
+}
+
+/// Recognize `(operand >[=] bound) OR (operand < -inf)` emitted by this rewrite.
+fn guarded_lower_bound(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::BinaryExpr(BinaryExpr {
+        left: primary,
+        op: Operator::Or,
+        right: guard,
+    }) = expr
+    else {
+        return None;
+    };
+    let (operand, op, value) = raw_ordered_comparison(primary)?;
+    let (guard_operand, guard_op, guard_value) = raw_ordered_comparison(guard)?;
+    (matches!(op, Operator::Gt | Operator::GtEq)
+        && guard_op == Operator::Lt
+        && operand == guard_operand
+        && negative_infinity(value).as_ref() == Some(guard_value)
+        && !operand.is_volatile())
+    .then_some((operand, primary))
+}
+
+fn rewrite_boolean_chain(expr: &Expr, op: Operator) -> Option<Expr> {
+    let mut terms = Vec::new();
+    flatten_chain(expr, op, &mut terms);
+    // Discover both bounds before unwrapping lower bounds. An authored
+    // `x >= -inf` must survive; only the separate guard from an upper bound is
+    // redundant. Restrict this to one AND chain, never across an OR branch.
+    let bounded: Vec<&Expr> = if op == Operator::And {
+        terms
+            .iter()
+            .filter_map(|term| guarded_lower_bound(term))
+            .filter(|(operand, _)| {
+                terms.iter().any(|term| {
+                    raw_ordered_comparison(term).is_some_and(|(other, op, _)| {
+                        matches!(op, Operator::Lt | Operator::LtEq) && other == *operand
+                    })
+                })
+            })
+            .map(|(operand, _)| operand)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut rewritten = Vec::with_capacity(terms.len());
+    for mut term in terms.iter().copied() {
+        if raw_ordered_comparison(term).is_some_and(|(operand, op, value)| {
+            op == Operator::GtEq
+                && negative_infinity(value).as_ref() == Some(value)
+                && bounded.contains(&operand)
+        }) {
+            continue;
+        }
+        if let Some((operand, primary)) = guarded_lower_bound(term)
+            && bounded.contains(&operand)
+        {
+            term = primary;
+        }
+        if is_equivalent_pair_over_column(term) && rewritten.contains(&term) {
+            continue;
+        }
+        rewritten.push(term);
+    }
+    if rewritten == terms {
+        return None;
+    }
+    rewritten
+        .into_iter()
+        .cloned()
+        .reduce(|left, right| match op {
+            Operator::Or => left.or(right),
+            _ => left.and(right),
+        })
+}
+
 /// True for the shape this rewrite emits for `=` and `!=`: a column tested
 /// against both sign encodings of a floating point zero or NaN, negated or not.
 /// Only these terms are deduplicated, so an expression the caller wrote twice is
@@ -534,6 +632,13 @@ fn rewrite_ordered_comparison(
     bound: ScalarValue,
     metadata: Option<&FieldMetadata>,
 ) -> Expr {
+    if other.is_volatile() {
+        return comparison(
+            normalize_nan_expr(other),
+            op,
+            raw_float_literal(bound, metadata),
+        );
+    }
     let Some(negative_infinity) = negative_infinity(&bound) else {
         return comparison(other.clone(), op, raw_float_literal(bound, metadata));
     };
@@ -561,22 +666,7 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
         // half. Both halves then produce the same list, and dropping the repeat is
         // what makes the rewrite survive that round trip.
         Expr::BinaryExpr(BinaryExpr { op, .. }) if matches!(op, Operator::Or | Operator::And) => {
-            let mut kept: Vec<&Expr> = Vec::new();
-            flatten_chain(expr, *op, &mut kept);
-            let mut deduped: Vec<&Expr> = Vec::with_capacity(kept.len());
-            for term in kept.iter() {
-                if is_equivalent_pair_over_column(term) && deduped.contains(term) {
-                    continue;
-                }
-                deduped.push(term);
-            }
-            if deduped.len() == kept.len() {
-                return None;
-            }
-            deduped.into_iter().cloned().reduce(|left, right| match op {
-                Operator::Or => left.or(right),
-                _ => left.and(right),
-            })
+            rewrite_boolean_chain(expr, *op)
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             // `resolve_expr` accepts the literal on either side, and the
@@ -715,11 +805,15 @@ fn widen_equivalent_list(list: &[Expr]) -> Option<Vec<Expr>> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow_array::{Array, Float64Array};
+    use arrow_array::{Array, BooleanArray, Float64Array, record_batch};
     use arrow_schema::{Field, Schema};
+    use datafusion::logical_expr::create_udf;
     use datafusion::prelude::{col, lit};
     use rstest::rstest;
+
+    use crate::planner::Planner;
 
     use super::*;
 
@@ -799,6 +893,54 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::bounded("x BETWEEN 1.0 AND 2.0", &[Some(false), Some(false), Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::negative_infinity("x BETWEEN CAST('-inf' AS DOUBLE) AND 2.0", &[Some(false), Some(false), Some(true), Some(true), Some(true), Some(true), None])]
+    #[case::computed("x * 2.0 BETWEEN 2.0 AND 4.0", &[Some(false), Some(false), Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::different_operand("x > 1.0 AND y < 2.0", &[Some(true), Some(true), Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::or_branch("x > 1.0 AND (y < 2.0 OR x < 2.0)", &[Some(true), Some(true), Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::nan_upper("x > 1.0 AND x < CAST('NaN' AS DOUBLE)", &[Some(false), Some(false), Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::not_between("x NOT BETWEEN 1.0 AND 2.0", &[Some(true), Some(true), Some(true), Some(true), Some(false), Some(false), None])]
+    fn bounded_float_filters_preserve_value_semantics(
+        #[case] filter: &str,
+        #[case] expected: &[Option<bool>],
+    ) {
+        let batch = record_batch!(
+            (
+                "x",
+                Float64,
+                [
+                    Some(-f64::NAN),
+                    Some(f64::NAN),
+                    Some(f64::NEG_INFINITY),
+                    Some(0.0),
+                    Some(1.5),
+                    Some(2.0),
+                    None
+                ]
+            ),
+            ("y", Float64, vec![0.0; 7])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let mut expr = planner.parse_filter(filter).unwrap();
+        for _ in 0..3 {
+            expr = planner.optimize_expr(expr).unwrap();
+            let result = planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(
+                result.as_ref(),
+                &BooleanArray::from(expected.to_vec()),
+                "{expr}"
+            );
+        }
+    }
+
     #[test]
     fn computed_literal_comparison_uses_indexable_ranges() {
         let computed = col("x") * lit(2.0);
@@ -812,6 +954,63 @@ mod tests {
             rewrite(computed.gt(lit(1.0))),
             primary.or(negative_nan_range)
         );
+    }
+
+    #[rstest]
+    #[case::lt(Operator::Lt, Some(-1.0), Some(true))]
+    #[case::lt_eq(Operator::LtEq, Some(0.0), Some(true))]
+    #[case::gt(Operator::Gt, Some(1.0), Some(true))]
+    #[case::gt_eq(Operator::GtEq, Some(-0.0), Some(true))]
+    #[case::negative_nan(Operator::Lt, Some(-f64::NAN), Some(false))]
+    #[case::null(Operator::Lt, None, None)]
+    fn volatile_ordered_operand_is_evaluated_once(
+        #[case] op: Operator,
+        #[case] first: Option<f64>,
+        #[case] expected: Option<bool>,
+    ) {
+        let batch = record_batch!(("x", Float64, [0.0])).unwrap();
+        let planner = Planner::new(batch.schema());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let udf = create_udf(
+            "volatile_float",
+            vec![DataType::Float64],
+            DataType::Float64,
+            Volatility::Volatile,
+            Arc::new(move |_| {
+                let value = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first
+                } else {
+                    None
+                };
+                Ok(ColumnarValue::Scalar(Float64(value)))
+            }),
+        );
+        for literal_on_left in [false, true] {
+            let operand = udf.call(vec![col("x")]) + lit(0.0);
+            let mut expr = if literal_on_left {
+                comparison(lit(0.0), op.swap().unwrap(), operand)
+            } else {
+                comparison(operand, op, lit(0.0))
+            };
+            for _ in 0..2 {
+                expr = planner.optimize_expr(expr).unwrap();
+                calls.store(0, Ordering::SeqCst);
+                let result = planner
+                    .create_physical_expr(&expr)
+                    .unwrap()
+                    .evaluate(&batch)
+                    .unwrap()
+                    .into_array(1)
+                    .unwrap();
+                assert_eq!(
+                    result.as_ref(),
+                    &BooleanArray::from(vec![expected]),
+                    "{expr}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{expr}");
+            }
+        }
     }
 
     #[test]
