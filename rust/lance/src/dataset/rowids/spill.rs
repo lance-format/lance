@@ -67,8 +67,8 @@ pub const DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES: usize = 200 * 1024;
 /// rows out of the manifest -- row ids and created-at versions, and at
 /// compaction last-updated-at versions too; an update's last-updated-at
 /// version is the commit's and stays inline. Absent or anything else, every
-/// sequence stays inline however large it grows, which is what every released
-/// build does; a table that never sets it stays readable by them.
+/// sequence stays inline however large it grows. This affects new writes only;
+/// readers still load any sequences the table has already spilled.
 pub const SPILL_ROW_LINEAGE_CONFIG_KEY: &str = "lance.row_lineage.spill";
 
 /// Table config key overriding [`DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES`], as a
@@ -78,17 +78,15 @@ pub const INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY: &str = "lance.row_lineage.inl
 /// The largest encoded lineage sequence `dataset` keeps inline, or `None` when
 /// the table does not spill at all.
 ///
-/// Spilling needs the table's opt-in, a build that understands the feature
-/// flag (a build that does not would write a dataset it then refuses to
-/// open), and v2 data files: the format allows the columns only there, since
-/// a legacy v1 file has no `column_indices` to locate them by.
+/// Spilling needs the table's opt-in and v2 data files: the format allows the
+/// columns only there, since a legacy v1 file has no `column_indices` to locate
+/// them by.
 pub fn inline_row_lineage_max_bytes(dataset: &Dataset) -> Result<Option<usize>> {
     let config = dataset.config();
     let enabled = config
         .get(SPILL_ROW_LINEAGE_CONFIG_KEY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     if !enabled
-        || !lance_table::feature_flags::spilled_row_lineage_enabled()
         || dataset.manifest.data_storage_format.lance_file_format() == ConcreteFileVersion::V1
     {
         return Ok(None);
@@ -764,7 +762,9 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_table::feature_flags::FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    use lance_table::feature_flags::{
+        FLAG_SPILLED_ROW_LINEAGE, frag_reuse_with_stable_row_ids_enabled,
+    };
     use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
     use rstest::rstest;
 
@@ -885,10 +885,20 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::default(None)]
+    #[case::disabled(Some("false"))]
     #[tokio::test]
-    async fn only_the_sequences_over_the_limit_spill() {
+    async fn only_the_sequences_over_the_limit_spill(#[case] spill_config: Option<&str>) {
         let dir = TempStrDir::default();
         let mut dataset = tiny_dataset(dir.as_str()).await;
+        if let Some(value) = spill_config {
+            dataset
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, value)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(inline_row_lineage_max_bytes(&dataset).unwrap(), None);
         // An appended fragment's row ids are a single `Range` and its versions
         // a single run, so they encode to a few dozen bytes and must never
         // leave the manifest, even next to a sequence that does.
@@ -910,6 +920,10 @@ mod tests {
             .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "true")])
             .await
             .unwrap();
+        assert_eq!(
+            inline_row_lineage_max_bytes(&dataset).unwrap(),
+            Some(DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES)
+        );
         let placed = place_row_lineage(&dataset, &lineage).await.unwrap();
         assert!(
             matches!(placed.row_ids, RowIdMeta::Inline(_)),
@@ -1338,12 +1352,12 @@ mod tests {
             assert_eq!(Some(row_ids.len() as usize), metadata.physical_rows);
         }
         assert_ne!(
-            dataset.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            dataset.manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
             0,
             "a spilled sequence must set the reader feature flag"
         );
         assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            dataset.manifest.writer_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
             0,
             "a spilled sequence must set the writer feature flag"
         );
@@ -1446,8 +1460,11 @@ mod tests {
     /// one wrote into the data file. Its scan must not return those columns
     /// with the user data: the task appends the lineage columns itself, and a
     /// second copy would clash by name.
+    #[rstest]
+    #[case::keep_spilling(true)]
+    #[case::disable_spilling(false)]
     #[tokio::test]
-    async fn compact_twice_reads_back_in_file_lineage() {
+    async fn compact_twice_reads_back_in_file_lineage(#[case] keep_spilling: bool) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = appended_dataset(uri, 4, 250).await;
@@ -1455,6 +1472,22 @@ mod tests {
         compact_files(&mut dataset, one_fragment(), None)
             .await
             .unwrap();
+        if !keep_spilling {
+            let before = collect_rows(&dataset).await;
+            dataset
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+                .await
+                .unwrap();
+            // Disabling future spills must not prevent a fresh reader from
+            // opening or loading sequences that are already stored in files.
+            dataset = Dataset::open(uri).await.unwrap();
+            assert_eq!(collect_rows(&dataset).await, before);
+            assert!(dataset.manifest.fragments[0].has_spilled_row_lineage());
+            assert_ne!(
+                dataset.manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
+                0
+            );
+        }
         // Deleting every seventh row makes the compacted fragment compact
         // again on its own, which masks the sequences read back from its file.
         dataset.delete("i % 7 = 0").await.unwrap();
@@ -1470,15 +1503,24 @@ mod tests {
         let metadata = fragments[0].metadata();
         assert_eq!(metadata.physical_rows, Some(before.len()));
         assert_eq!(metadata.files.len(), 1, "{metadata:?}");
-        assert_eq!(
-            metadata.files[0].fields.as_ref(),
-            [
+        let expected_fields: &[i32] = if keep_spilling {
+            &[
                 0,
                 ROW_ID_FIELD_ID,
                 ROW_CREATED_AT_VERSION_FIELD_ID,
-                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
             ]
-        );
+        } else {
+            &[0]
+        };
+        assert_eq!(metadata.files[0].fields.as_ref(), expected_fields);
+        assert_eq!(metadata.has_spilled_row_lineage(), keep_spilling);
+        for flags in [
+            dataset.manifest.reader_feature_flags,
+            dataset.manifest.writer_feature_flags,
+        ] {
+            assert_eq!(flags & FLAG_SPILLED_ROW_LINEAGE != 0, keep_spilling);
+        }
         assert_eq!(collect_rows(&dataset).await, before);
         dataset.validate().await.unwrap();
 
@@ -1870,8 +1912,8 @@ mod tests {
     /// and the commit stamps their last-updated-at version. On an opted-in
     /// table what the update carries over spills at write time -- it is known
     /// before the commit and a retry cannot change it -- while the commit's
-    /// stamp stays inline. Without the opt-in everything stays inline, as
-    /// every release has, and the lineage is the same.
+    /// stamp stays inline. Without the opt-in everything stays inline and the
+    /// lineage is the same.
     #[rstest]
     #[case::opted_in(true)]
     #[case::not_opted_in(false)]
@@ -1930,12 +1972,12 @@ mod tests {
             // The source fragments were plain appends, so this update is the
             // commit that first spills anything and has to raise the flag.
             assert_ne!(
-                updated.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                updated.manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
                 0,
                 "a spilled sequence must set the reader feature flag"
             );
             assert_ne!(
-                updated.manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                updated.manifest.writer_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
                 0,
                 "a spilled sequence must set the writer feature flag"
             );
@@ -2301,7 +2343,8 @@ mod tests {
         /// Compact every candidate fragment into one with `defer_index_remap`.
         /// The rewrite captures the address each row moved from, and when an
         /// index covers a rewritten fragment, the commit records the moves in
-        /// a fragment reuse index rather than remapping the index.
+        /// a fragment reuse index rather than remapping the index. Builds that
+        /// do not support stable row ids with FRI must reject the commit.
         CompactDeferringRemap,
         /// Build a zone map on `j`. It holds row addresses, so a compaction
         /// that defers its remap leaves it to the fragment reuse index.
@@ -2472,7 +2515,23 @@ mod tests {
                         defer_index_remap: true,
                         ..one_fragment()
                     };
-                    compact_files(&mut self.dataset, options, None).await?;
+                    let read_version = self.dataset.version().version;
+                    let result = compact_files(&mut self.dataset, options, None).await;
+                    if !frag_reuse_with_stable_row_ids_enabled() {
+                        // FRI with stable row ids has its own release gate,
+                        // independent of where the row lineage is stored.
+                        let error = result.expect_err("stable row ids with FRI remain gated");
+                        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("stable row IDs and carries a fragment reuse index"),
+                            "{error}"
+                        );
+                        assert_eq!(self.dataset.version().version, read_version);
+                        return Ok(());
+                    }
+                    result?;
                     if self.dataset.load_index_by_name("j_idx").await?.is_some() {
                         assert!(
                             self.dataset
@@ -2719,7 +2778,7 @@ mod tests {
             spilled.manifest.writer_feature_flags,
         ] {
             assert_eq!(
-                flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE != 0,
+                flags & FLAG_SPILLED_ROW_LINEAGE != 0,
                 spills,
                 "the spilled row lineage flag disagrees with the fragments after {step}"
             );
@@ -2748,7 +2807,7 @@ mod tests {
 
     /// Where a sequence lives must not change what any operation does to it.
     /// Each scenario runs on a table that spills every sequence it can and on
-    /// one that keeps them all inline, as every release has. After each step
+    /// one that keeps them all inline. After each step
     /// the two must hold the same rows with the same ids, created-at and
     /// last-updated-at versions, both must validate, rows must come back by
     /// id, and the spilled table must raise the feature flag exactly while a

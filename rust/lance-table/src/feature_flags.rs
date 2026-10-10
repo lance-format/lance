@@ -73,12 +73,19 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// every fragment has them; a writer without it would carry the fragment
 /// forward and drop the sequence. Both must refuse the table.
 ///
-/// Every earlier build has its unknown boundary at or below this bit, so each
-/// already refuses such a dataset without a change of its own. Spilled row
-/// lineage is not yet a released feature: this build understands the bit only
-/// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
-/// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
-pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Supported in every build. Table configuration controls whether a writer
+/// spills sequences; readers must understand existing spilled sequences even
+/// when spilling is disabled for subsequent writes.
+///
+/// ```
+/// use lance_table::feature_flags::{FLAG_SPILLED_ROW_LINEAGE, can_read_dataset};
+///
+/// assert!(can_read_dataset(FLAG_SPILLED_ROW_LINEAGE));
+/// ```
+pub const FLAG_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Deprecated name for [`FLAG_SPILLED_ROW_LINEAGE`].
+#[deprecated(since = "14.0.0", note = "use FLAG_SPILLED_ROW_LINEAGE instead")]
+pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = FLAG_SPILLED_ROW_LINEAGE;
 /// Reserved for fragment trees. Readers and writers reject it until implemented.
 ///
 /// Bit 11 is spilled row lineage, so this takes the next free bit.
@@ -116,7 +123,7 @@ const _: () = assert!(FLAG_NON_REUSABLE_FIELD_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 9);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
-const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_TREE < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
@@ -131,9 +138,14 @@ pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSA
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
 
-/// Environment variable that opts a release build into reading and writing row
-/// lineage sequences spilled to hidden data file columns before the feature is
-/// generally released.
+/// Former opt-in environment variable for spilled row lineage.
+///
+/// Retained for source compatibility. This variable is no longer consulted:
+/// all builds support spilled row lineage, and writers use table configuration.
+#[deprecated(
+    since = "14.0.0",
+    note = "spilled row lineage no longer needs an environment opt-in"
+)]
 pub const ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV: &str =
     "LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE";
 
@@ -216,8 +228,8 @@ pub fn apply_feature_flags(
         .iter()
         .any(|frag| frag.has_spilled_row_lineage());
     if has_spilled_row_lineage {
-        manifest.reader_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
-        manifest.writer_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+        manifest.reader_feature_flags |= FLAG_SPILLED_ROW_LINEAGE;
+        manifest.writer_feature_flags |= FLAG_SPILLED_ROW_LINEAGE;
     }
 
     if disable_transaction_file {
@@ -259,11 +271,12 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
-/// Whether this build understands row lineage sequences spilled to data file
-/// columns: always in debug builds, and in release builds only when
-/// [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set, like data overlay files.
+/// Whether this build supports spilled row lineage. Always returns `true`.
+///
+/// Retained for source compatibility. Spilling remains opt-in per table.
+#[deprecated(since = "14.0.0", note = "spilled row lineage is always supported")]
 pub fn spilled_row_lineage_enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_some()
+    true
 }
 
 /// Debug builds only, with no environment override, until continuous recording
@@ -287,7 +300,6 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// without toggling the build profile or environment.
 fn supported_flags_when(
     overlay_enabled: bool,
-    spilled_row_lineage_enabled: bool,
     frag_reuse_with_stable_row_ids_enabled: bool,
 ) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
@@ -301,11 +313,6 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
-    mark_supported(
-        &mut supported,
-        FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-        spilled_row_lineage_enabled,
-    );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
@@ -315,7 +322,6 @@ fn supported_flags_when(
 fn supported_flags() -> u64 {
     supported_flags_when(
         data_overlay_files_enabled(),
-        spilled_row_lineage_enabled(),
         frag_reuse_with_stable_row_ids_enabled(),
     )
 }
@@ -485,14 +491,13 @@ mod tests {
     fn test_frag_reuse_with_stable_row_ids_flag_release_gating() {
         // v12.0.0's unknown boundary, so every released client refuses it.
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, 512);
-        let without_support = supported_flags_when(true, true, false);
+        let without_support = supported_flags_when(true, false);
         assert_ne!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !without_support, 0);
         assert_eq!(FLAG_STABLE_ROW_IDS & !without_support, 0);
-        let enabled = supported_flags_when(false, false, true);
+        let enabled = supported_flags_when(false, true);
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !enabled, 0);
         for unrelated in [
             FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-            FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
             FLAG_FRAGMENT_TREE,
             FLAG_UNKNOWN,
         ] {
@@ -546,29 +551,32 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false, false, false);
+        let supported = supported_flags_when(false, false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true, false, false);
+        let supported = supported_flags_when(true, false);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 
     #[test]
-    fn test_spilled_row_lineage_flag_release_gating() {
-        // Every earlier build has its unknown boundary at or below this bit
-        // (256 for v11, 512 for the v12 and v13 pre-releases, 2048 on main
-        // before this flag), so each refuses the dataset without a change of
-        // its own.
-        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, 2048);
-        // A build that has not opted in refuses the dataset; one that has
-        // understands it, and either way the other known flags still pass.
-        let supported = supported_flags_when(true, false, false);
-        assert_ne!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
-        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS & !supported, 0);
-        let supported = supported_flags_when(true, true, false);
-        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
+    fn test_spilled_row_lineage_flag_is_stable() {
+        assert_eq!(FLAG_SPILLED_ROW_LINEAGE, 2048);
+        // Support must not depend on enabling unrelated experimental formats.
+        let supported = supported_flags_when(false, false);
+        let flags = FLAG_STABLE_ROW_IDS | FLAG_SPILLED_ROW_LINEAGE;
+        assert_eq!(flags & !supported, 0);
+        assert!(can_read_dataset(flags));
+        assert!(can_write_dataset(flags));
+        for unsupported in [
+            FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+            FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            FLAG_FRAGMENT_TREE,
+            FLAG_UNKNOWN,
+        ] {
+            assert_ne!(unsupported & !supported, 0);
+        }
     }
 
     #[test]
@@ -650,14 +658,8 @@ mod tests {
                 HashMap::new(),
             );
             apply_feature_flags(&mut manifest, true, false).unwrap();
-            assert_ne!(
-                manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-                0
-            );
-            assert_ne!(
-                manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-                0
-            );
+            assert_ne!(manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
+            assert_ne!(manifest.writer_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
         }
 
         // An inline sequence does not, so a table whose sequences all fit in
@@ -671,10 +673,7 @@ mod tests {
             HashMap::new(),
         );
         apply_feature_flags(&mut manifest, true, false).unwrap();
-        assert_eq!(
-            manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-            0
-        );
+        assert_eq!(manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
     }
 
     #[test]

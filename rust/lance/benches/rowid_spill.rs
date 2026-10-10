@@ -54,15 +54,15 @@
 //!
 //! ## Running
 //!
-//! Spilled row lineage is an unstable feature, so a release build -- which is
-//! what `cargo bench` produces -- has to opt in:
+//! Each spilled arm opts in through table configuration. No process-level
+//! environment opt-in is needed:
 //!
 //! ```bash
-//! LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE=1 cargo bench --bench rowid_spill
+//! cargo bench --profile release-with-debug --bench rowid_spill
 //! # A quick run. At this size the deleted table fits the default inline
 //! # budget, so the budget is set to zero to keep something spilling.
 //! BENCH_FRAGMENTS=2 BENCH_ROWS_PER_FRAGMENT=200000 BENCH_INLINE_MAX_BYTES=0 \
-//!   LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE=1 cargo bench --bench rowid_spill
+//!   cargo bench --profile release-with-debug --bench rowid_spill
 //! ```
 //!
 //! ## Configuration
@@ -108,7 +108,6 @@ use lance::dataset::{
 use lance::session::Session;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_io::object_store::ObjectStoreRegistry;
-use lance_table::feature_flags::ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV;
 use lance_table::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
 use lance_table::rowids::version::write_dataset_versions;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -1003,15 +1002,6 @@ fn scenarios_from_env() -> Vec<Scenario> {
 }
 
 fn bench_rowid_spill(_c: &mut Criterion) {
-    if std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_none()
-        && !cfg!(debug_assertions)
-    {
-        panic!(
-            "set {ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV}=1 to run this benchmark: spilled row lineage \
-             are an unstable feature and a release build refuses the dataset without it"
-        );
-    }
-
     let config = Config::from_env();
     let scenarios = scenarios_from_env();
     config.validate(&scenarios);
@@ -1020,10 +1010,9 @@ fn bench_rowid_spill(_c: &mut Criterion) {
     println!("=== Row lineage placement ===");
 
     for scenario in scenarios {
-        // A table that has not opted in reproduces the behavior on main, where
-        // a compacted fragment's sequences always stay inline however large
-        // they grow. Each arm's table is deleted before the next arm builds its
-        // own, so the two never take up disk at the same time.
+        // A table that has not opted in keeps its sequences inline however
+        // large they grow. Each arm's table is deleted before the next arm
+        // builds its own, so the two never take up disk at the same time.
         let run = |spill: bool| {
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_string_lossy().into_owned();
