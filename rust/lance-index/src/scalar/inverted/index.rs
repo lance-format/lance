@@ -286,6 +286,7 @@ struct V3TermPlan {
     block_start: usize,
     blocks: Arc<Vec<V3BlockSkipMeta>>,
     cached_posting: Option<Arc<PostingList>>,
+    refined_blocks: HashMap<usize, Vec<(u32, f32)>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2328,6 +2329,7 @@ impl InvertedPartition {
                     block_start: self.inverted_list.posting_list_range(token_id).start,
                     blocks,
                     cached_posting,
+                    refined_blocks: HashMap::new(),
                 })
             })
             .buffered(16)
@@ -2341,7 +2343,7 @@ impl InvertedPartition {
         params: &FtsSearchParams,
         operator: Operator,
         mask: Arc<RowAddrMask>,
-        term_plans: Vec<V3TermPlan>,
+        mut term_plans: Vec<V3TermPlan>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate>> {
@@ -2356,7 +2358,7 @@ impl InvertedPartition {
         } else {
             operator
         };
-        let mut windows = block_wand::search_windows(&term_plans, candidate_operator);
+        let windows = block_wand::search_windows(&term_plans, candidate_operator);
         let total_blocks = term_plans
             .iter()
             .unique_by(|term| term.token_id)
@@ -2366,14 +2368,6 @@ impl InvertedPartition {
             metrics.record_fts_blocks_pruned(total_blocks);
             return Ok(Vec::new());
         }
-        windows.sort_unstable_by(|left, right| {
-            right
-                .upper_bound
-                .total_cmp(&left.upper_bound)
-                .then_with(|| left.first_doc_id.cmp(&right.first_doc_id))
-                .then_with(|| left.last_doc_id.cmp(&right.last_doc_id))
-        });
-
         let docs = self.docs.docs_for_wand(mask.as_ref()).await?;
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let docs_has_row_ids = docs.has_row_ids();
@@ -2383,6 +2377,9 @@ impl InvertedPartition {
         let mut decoded_positions = HashMap::<usize, V3DecodedPositionBlock>::new();
         let mut visited_blocks = HashSet::new();
         let mut num_comparisons = 0usize;
+        let refinement = block_wand::refinement_blocks(&term_plans);
+        let mut refinement = (!refinement.is_empty()).then_some(refinement);
+        let mut seed_docs = HashSet::new();
         let mut windows = windows.into_iter().peekable();
         while windows.peek().is_some() {
             threshold =
@@ -2411,34 +2408,14 @@ impl InvertedPartition {
                     })
                 })
                 .collect::<Vec<_>>();
-            visited_blocks.extend(batch_blocks.iter().map(|block| block.block_row));
-            // A posting-only prewarm must still load phrase positions lazily,
-            // without fetching the already resident posting payload again.
-            for block in &batch_blocks {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    decoded_blocks.entry(block.block_row)
-                    && let Some(PostingList::Compressed(posting)) =
-                        term_plans[block.term_idx].cached_posting.as_deref()
-                {
-                    let docs_in_block = (posting.length as usize)
-                        .saturating_sub(block.block_idx * BLOCK_SIZE)
-                        .min(BLOCK_SIZE);
-                    entry.insert(PostingListReader::decode_v3_block(
-                        posting.blocks.value(block.block_idx),
-                        docs_in_block,
-                        posting.posting_tail_codec,
-                    )?);
-                }
-            }
-            let block_rows = batch_blocks
-                .iter()
-                .filter(|block| !decoded_blocks.contains_key(&block.block_row))
-                .map(|block| block.block_row)
-                .collect::<Vec<_>>();
-            let block_batches = self
-                .inverted_list
-                .v3_payload_block_batches(&block_rows, metrics)
-                .await?;
+            self.load_v3_blocks(
+                &term_plans,
+                &batch_blocks,
+                &mut decoded_blocks,
+                &mut visited_blocks,
+                metrics,
+            )
+            .await?;
             for window in batch_windows {
                 if candidates.len() >= limit && window.upper_bound <= threshold {
                     continue;
@@ -2449,32 +2426,20 @@ impl InvertedPartition {
                         term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
                     })
                     .collect::<Vec<_>>();
-                for block in &window_blocks {
-                    if decoded_blocks.contains_key(&block.block_row) {
-                        continue;
-                    }
-                    let batch = block_batches.get(&block.block_row).ok_or_else(|| {
-                        Error::internal(format!("missing V3 payload block row {}", block.block_row))
-                    })?;
-                    let decoded = self.inverted_list.decode_v3_payload_block(
-                        term_plans[block.term_idx].token_id,
-                        block.block_idx,
-                        batch,
-                    )?;
-                    decoded_blocks.insert(block.block_row, decoded);
-                }
-
                 let mut docs_in_window = HashMap::<u32, V3DocAccumulator>::new();
                 for block in &window_blocks {
                     let decoded = decoded_blocks.get(&block.block_row).ok_or_else(|| {
                         Error::internal(format!("missing decoded V3 block row {}", block.block_row))
                     })?;
-                    for (doc_offset, (&doc_id, &freq)) in
-                        decoded.doc_ids.iter().zip(decoded.freqs.iter()).enumerate()
-                    {
-                        if doc_id < window.first_doc_id || doc_id > window.last_doc_id {
-                            continue;
-                        }
+                    let start = decoded
+                        .doc_ids
+                        .partition_point(|doc| *doc < window.first_doc_id);
+                    let end = decoded
+                        .doc_ids
+                        .partition_point(|doc| *doc <= window.last_doc_id);
+                    for doc_offset in start..end {
+                        let doc_id = decoded.doc_ids[doc_offset];
+                        let freq = decoded.freqs[doc_offset];
                         docs_in_window
                             .entry(doc_id)
                             .or_insert_with(|| V3DocAccumulator::new(term_plans.len()))
@@ -2485,6 +2450,13 @@ impl InvertedPartition {
                 let mut docs_in_window = docs_in_window.into_iter().collect::<Vec<_>>();
                 docs_in_window.sort_unstable_by_key(|(doc_id, _)| *doc_id);
                 for (doc_id, acc) in docs_in_window {
+                    // Refinement rebuilds the disjoint windows. Documents already
+                    // scored to establish the initial threshold must not reenter.
+                    if refinement.is_some() {
+                        seed_docs.insert(doc_id);
+                    } else if seed_docs.contains(&doc_id) {
+                        continue;
+                    }
                     if !acc.matches_operator(candidate_operator) {
                         continue;
                     }
@@ -2554,6 +2526,45 @@ impl InvertedPartition {
                     }
                 }
             }
+            if windows
+                .peek()
+                .is_some_and(|window| candidates.len() < limit || window.upper_bound > threshold)
+                && let Some(refinement) = refinement.take()
+            {
+                self.load_v3_blocks(
+                    &term_plans,
+                    &refinement,
+                    &mut decoded_blocks,
+                    &mut visited_blocks,
+                    metrics,
+                )
+                .await?;
+                for term in &mut term_plans {
+                    let query_weight = idf(term.posting_len as usize, self.docs.len());
+                    for block_idx in 0..term.blocks.len() {
+                        if let Some(block) = decoded_blocks.get(&(term.block_start + block_idx)) {
+                            term.refined_blocks.insert(
+                                block_idx,
+                                block
+                                    .doc_ids
+                                    .iter()
+                                    .zip(&block.freqs)
+                                    .map(|(&doc, &freq)| {
+                                        (
+                                            doc,
+                                            query_weight
+                                                * scorer.doc_weight(freq, docs.num_tokens(doc)),
+                                        )
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+                windows = block_wand::search_windows(&term_plans, candidate_operator)
+                    .into_iter()
+                    .peekable();
+            }
         }
         metrics.record_comparisons(num_comparisons);
         metrics.record_fts_blocks_pruned(total_blocks.saturating_sub(visited_blocks.len()));
@@ -2573,6 +2584,57 @@ impl InvertedPartition {
                 },
             )
             .collect())
+    }
+
+    async fn load_v3_blocks(
+        &self,
+        terms: &[V3TermPlan],
+        blocks: &[V3BlockMeta],
+        decoded: &mut HashMap<usize, V3DecodedPostingBlock>,
+        visited: &mut HashSet<usize>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        visited.extend(blocks.iter().map(|block| block.block_row));
+        // A posting-only prewarm must still load phrase positions lazily,
+        // without fetching the already resident posting payload again.
+        for block in blocks {
+            if let std::collections::hash_map::Entry::Vacant(entry) = decoded.entry(block.block_row)
+                && let Some(PostingList::Compressed(posting)) =
+                    terms[block.term_idx].cached_posting.as_deref()
+            {
+                let count = (posting.length as usize)
+                    .saturating_sub(block.block_idx * BLOCK_SIZE)
+                    .min(BLOCK_SIZE);
+                entry.insert(PostingListReader::decode_v3_block(
+                    posting.blocks.value(block.block_idx),
+                    count,
+                    posting.posting_tail_codec,
+                )?);
+            }
+        }
+        let rows = blocks
+            .iter()
+            .filter(|block| !decoded.contains_key(&block.block_row))
+            .map(|block| block.block_row)
+            .collect::<Vec<_>>();
+        let batches = self
+            .inverted_list
+            .v3_payload_block_batches(&rows, metrics)
+            .await?;
+        for block in blocks {
+            if let std::collections::hash_map::Entry::Vacant(entry) = decoded.entry(block.block_row)
+            {
+                let batch = batches.get(&block.block_row).ok_or_else(|| {
+                    Error::internal(format!("missing V3 payload block row {}", block.block_row))
+                })?;
+                entry.insert(self.inverted_list.decode_v3_payload_block(
+                    terms[block.term_idx].token_id,
+                    block.block_idx,
+                    batch,
+                )?);
+            }
+        }
+        Ok(())
     }
 
     fn v3_update_threshold(
