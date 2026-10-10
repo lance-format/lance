@@ -4,6 +4,7 @@
 //! Metadata for index
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -19,12 +20,25 @@ use lance_core::cache::{CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 
 /// Metadata about a single file within an index segment.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexFile {
     /// Path relative to the index directory (e.g., "index.idx", "auxiliary.idx")
     pub path: String,
     /// Size of the file in bytes
     pub size_bytes: u64,
+    /// The metadata suffix size in bytes, if known.
+    ///
+    /// The suffix starts at global buffer 0, which holds the `FileDescriptor`,
+    /// and ends at EOF. Readers treat this as an advisory hint and use the file
+    /// footer as authoritative. `None` also represents legacy (0.1) Lance files
+    /// and index files that use another format.
+    pub file_metadata_size_bytes: Option<NonZero<u64>>,
+}
+
+impl DeepSizeOf for IndexFile {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context)
+    }
 }
 
 /// Index metadata
@@ -297,6 +311,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
                     .map(|f| IndexFile {
                         path: f.path,
                         size_bytes: f.size_bytes,
+                        file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                     })
                     .collect(),
             )
@@ -361,6 +376,9 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                     .map(|f| pb::IndexFile {
                         path: f.path.clone(),
                         size_bytes: f.size_bytes,
+                        file_metadata_size_bytes: f
+                            .file_metadata_size_bytes
+                            .map_or(0, NonZero::get),
                     })
                     .collect()
             })
@@ -453,6 +471,7 @@ pub async fn list_index_files_with_sizes(
         files.push(IndexFile {
             path: relative_path,
             size_bytes: meta.size,
+            file_metadata_size_bytes: None,
         });
     }
     Ok(files)
@@ -567,6 +586,7 @@ mod tests {
                 files: Some(vec![IndexFile {
                     path: "index.idx".to_string(),
                     size_bytes: 1024,
+                    file_metadata_size_bytes: NonZero::new(256),
                 }]),
             },
             IndexMetadata {

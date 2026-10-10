@@ -1724,6 +1724,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
         Ok(lance_table::format::IndexFile {
             path: INDEX_AUXILIARY_FILE_NAME.to_string(),
             size_bytes: summary.size_bytes,
+            file_metadata_size_bytes: None,
         })
     } else {
         Err(Error::index(
