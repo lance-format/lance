@@ -88,6 +88,8 @@ use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
+mod block_wand;
+
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
@@ -307,12 +309,6 @@ struct V3Window {
     first_doc_id: u32,
     last_doc_id: u32,
     upper_bound: f32,
-}
-
-#[derive(Debug)]
-struct V3BlockSearchResult {
-    candidates: Vec<DocCandidate>,
-    threshold: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -1578,6 +1574,11 @@ impl InvertedIndex {
         Ok(())
     }
 
+    /// Cache the highest-scoring fraction of blocks for the supplied query terms.
+    ///
+    /// `percent` is a block-count percentage in 1..=100, not a byte budget.
+    /// The session cache capacity still applies. Full posting lists are never
+    /// materialized, and positions are cached only when requested.
     pub async fn prewarm_v3_top_blocks_for_queries(
         &self,
         queries: &[String],
@@ -1609,9 +1610,6 @@ impl InvertedIndex {
             warmed_blocks += part
                 .inverted_list
                 .prewarm_v3_top_blocks(&token_ids, percent, with_position)
-                .await?;
-            part.inverted_list
-                .prewarm_posting_lists_for_tokens(&token_ids, with_position)
                 .await?;
             part.docs.ensure_loaded().await?;
         }
@@ -2219,13 +2217,6 @@ impl InvertedPartition {
         {
             return Ok(None);
         }
-        let top_blocks_cached = self
-            .inverted_list
-            .v3_top_blocks_cached(&cache_token_ids)
-            .await;
-        if !self.v3_should_use_block_executor(&cache_token_ids, params, top_blocks_cached) {
-            return Ok(None);
-        }
 
         let term_plans = self.v3_term_plans(token_ids, metrics.as_ref()).await?;
         if term_plans.is_empty() {
@@ -2242,68 +2233,22 @@ impl InvertedPartition {
             tokens_by_position[term.term_index as usize] = term.token.clone();
         }
 
-        let (search_term_plans, searched_top_rows) = if top_blocks_cached {
-            let Some(top_rows) = self
-                .inverted_list
-                .v3_top_block_row_set(&cache_token_ids)
-                .await
-            else {
-                return Ok(None);
-            };
-            let search_term_plans = term_plans
-                .iter()
-                .cloned()
-                .map(|mut plan| {
-                    plan.blocks
-                        .retain(|block| top_rows.contains(&block.block_row));
-                    plan
-                })
-                .collect::<Vec<_>>();
-            (search_term_plans, Some(top_rows))
-        } else {
-            (term_plans.clone(), None)
-        };
-
         let docs_for_wand = self.docs.docs_for_wand(mask.as_ref()).await?;
-        let search_shared_threshold = if top_blocks_cached {
-            Arc::new(AtomicU32::new(shared_threshold.load(Ordering::Relaxed)))
-        } else {
-            shared_threshold.clone()
-        };
-        let search_result = self
+        let candidates = self
             .bm25_search_v3_blocks(
                 docs_for_wand.as_ref(),
                 params,
                 operator,
                 mask,
-                search_term_plans,
+                term_plans,
                 metrics.as_ref(),
-                search_shared_threshold,
-                top_blocks_cached,
+                shared_threshold,
             )
             .await?;
-        if let Some(top_rows) = searched_top_rows.as_ref()
-            && !self.v3_cached_top_search_is_complete(
-                &term_plans,
-                params,
-                operator,
-                top_rows,
-                search_result.threshold,
-                search_result.candidates.len(),
-            )
-        {
-            return Ok(None);
-        }
-        if top_blocks_cached && search_result.threshold.is_finite() && params.wand_factor > 0.0 {
-            atomic_store_max_f32(
-                &shared_threshold,
-                search_result.threshold / params.wand_factor,
-            );
-        }
         Ok(Some(PartitionCandidates {
             tokens_by_position,
             grouped_expansions: Vec::new(),
-            candidates: search_result.candidates,
+            candidates,
         }))
     }
 
@@ -2355,87 +2300,30 @@ impl InvertedPartition {
         Ok(token_ids)
     }
 
-    fn v3_should_use_block_executor(
-        &self,
-        token_ids: &[u32],
-        params: &FtsSearchParams,
-        top_blocks_cached: bool,
-    ) -> bool {
-        if top_blocks_cached {
-            return true;
-        }
-        let total_blocks = token_ids
-            .iter()
-            .map(|token_id| self.inverted_list.num_v3_blocks_for_token(*token_id))
-            .sum::<usize>();
-        if params.phrase_slop.is_some() {
-            return total_blocks <= 64;
-        }
-        if token_ids.len() == 1 {
-            return total_blocks > 64;
-        }
-        total_blocks <= 64
-    }
-
-    fn v3_cached_top_search_is_complete(
-        &self,
-        full_term_plans: &[V3TermPlan],
-        params: &FtsSearchParams,
-        operator: Operator,
-        searched_rows: &HashSet<usize>,
-        threshold: f32,
-        candidate_count: usize,
-    ) -> bool {
-        let limit = params.limit.unwrap_or(usize::MAX);
-        if limit == 0 {
-            return true;
-        }
-        if candidate_count < limit || !threshold.is_finite() {
-            return false;
-        }
-        let candidate_operator = if params.phrase_slop.is_some() {
-            Operator::And
-        } else {
-            operator
-        };
-        for window in self.v3_search_windows(full_term_plans, candidate_operator) {
-            if window.upper_bound <= threshold {
-                continue;
-            }
-            if self
-                .v3_window_blocks(full_term_plans, window, candidate_operator)
-                .iter()
-                .any(|block| !searched_rows.contains(&block.block_row))
-            {
-                return false;
-            }
-        }
-        true
-    }
-
     async fn v3_term_plans(
         &self,
         token_ids: Vec<(u32, String, u32)>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<V3TermPlan>> {
-        let mut term_plans = Vec::with_capacity(token_ids.len());
-        for (term_idx, (token_id, token, position)) in token_ids.into_iter().enumerate() {
-            let posting_len = self.inverted_list.posting_len_for_token(token_id).await? as u32;
-            let blocks = self
-                .inverted_list
-                .v3_block_metadata(token_id, term_idx, metrics)
-                .await?;
-            term_plans.push(V3TermPlan {
-                token_id,
-                token,
-                position,
-                term_index: position,
-                posting_len,
-                blocks,
-            });
-        }
-
-        Ok(term_plans)
+        stream::iter(token_ids.into_iter().enumerate())
+            .map(|(term_idx, (token_id, token, position))| async move {
+                let posting_len = self.inverted_list.posting_len_for_token(token_id).await? as u32;
+                let blocks = self
+                    .inverted_list
+                    .v3_block_metadata(token_id, term_idx, metrics)
+                    .await?;
+                Ok(V3TermPlan {
+                    token_id,
+                    token,
+                    position,
+                    term_index: position,
+                    posting_len,
+                    blocks,
+                })
+            })
+            .buffered(16)
+            .try_collect()
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2448,14 +2336,10 @@ impl InvertedPartition {
         term_plans: Vec<V3TermPlan>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-        top_blocks_cached: bool,
-    ) -> Result<V3BlockSearchResult> {
+    ) -> Result<Vec<DocCandidate>> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 || term_plans.is_empty() {
-            return Ok(V3BlockSearchResult {
-                candidates: Vec::new(),
-                threshold: f32::INFINITY,
-            });
+            return Ok(Vec::new());
         }
 
         let phrase_slop = params.phrase_slop.map(|slop| slop as i32);
@@ -2464,12 +2348,9 @@ impl InvertedPartition {
         } else {
             operator
         };
-        let mut windows = self.v3_search_windows(&term_plans, candidate_operator);
+        let mut windows = block_wand::search_windows(&term_plans, candidate_operator);
         if windows.is_empty() {
-            return Ok(V3BlockSearchResult {
-                candidates: Vec::new(),
-                threshold: f32::NEG_INFINITY,
-            });
+            return Ok(Vec::new());
         }
         windows.sort_unstable_by(|left, right| {
             right
@@ -2485,278 +2366,181 @@ impl InvertedPartition {
         let mut threshold = f32::NEG_INFINITY;
         let mut decoded_blocks = HashMap::<usize, V3DecodedPostingBlock>::new();
         let mut decoded_positions = HashMap::<usize, V3DecodedPositionBlock>::new();
-        let mut seen_doc_ids = HashSet::new();
+        let mut visited_blocks = HashSet::new();
         let mut num_comparisons = 0usize;
-        let prefetched_payload_batches = if phrase_slop.is_some() && !top_blocks_cached {
-            let block_rows = windows
-                .iter()
-                .flat_map(|window| self.v3_window_blocks(&term_plans, *window, candidate_operator))
-                .map(|block| block.block_row)
-                .collect::<Vec<_>>();
-            self.inverted_list
-                .v3_payload_block_batches(&block_rows, metrics)
-                .await?
-        } else {
-            HashMap::new()
-        };
-
-        for window in windows {
+        let mut windows = windows.into_iter().peekable();
+        while windows.peek().is_some() {
             threshold =
                 threshold.max(self.v3_shared_threshold(params.wand_factor, &shared_threshold));
-            if candidates.len() >= limit && window.upper_bound <= threshold {
-                metrics.record_fts_blocks_pruned(
-                    self.v3_window_blocks(&term_plans, window, candidate_operator)
-                        .len()
-                        .max(1),
-                );
-                continue;
+            // Establish a threshold before widening I/O. Later batches amortize
+            // remote request latency without materializing whole posting lists.
+            let batch_size = if candidates.len() < limit { 1 } else { 16 };
+            let mut batch_windows = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                let Some(window) = windows.peek() else { break };
+                if candidates.len() >= limit && window.upper_bound < threshold {
+                    break;
+                }
+                if let Some(window) = windows.next() {
+                    batch_windows.push(window);
+                }
             }
-
-            let window_blocks = self.v3_window_blocks(&term_plans, window, candidate_operator);
-            if window_blocks.is_empty() {
-                continue;
+            if batch_windows.is_empty() {
+                break;
             }
-            let block_rows = window_blocks
+            let block_rows = batch_windows
                 .iter()
+                .flat_map(|window| {
+                    term_plans.iter().flat_map(move |term| {
+                        term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
+                    })
+                })
+                .filter(|block| !decoded_blocks.contains_key(&block.block_row))
                 .map(|block| block.block_row)
                 .collect::<Vec<_>>();
-            let block_batches = if prefetched_payload_batches.is_empty() {
-                self.inverted_list
-                    .v3_payload_block_batches(&block_rows, metrics)
-                    .await?
-            } else {
-                HashMap::new()
-            };
-            for block in &window_blocks {
-                if decoded_blocks.contains_key(&block.block_row) {
+            visited_blocks.extend(block_rows.iter().copied());
+            let block_batches = self
+                .inverted_list
+                .v3_payload_block_batches(&block_rows, metrics)
+                .await?;
+            for window in batch_windows {
+                if candidates.len() >= limit && window.upper_bound < threshold {
                     continue;
                 }
-                let batch = prefetched_payload_batches
-                    .get(&block.block_row)
-                    .or_else(|| block_batches.get(&block.block_row))
-                    .ok_or_else(|| {
+                let window_blocks = term_plans
+                    .iter()
+                    .flat_map(|term| {
+                        term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
+                    })
+                    .collect::<Vec<_>>();
+                for block in &window_blocks {
+                    if decoded_blocks.contains_key(&block.block_row) {
+                        continue;
+                    }
+                    let batch = block_batches.get(&block.block_row).ok_or_else(|| {
                         Error::internal(format!("missing V3 payload block row {}", block.block_row))
                     })?;
-                let decoded = self.inverted_list.decode_v3_payload_block(
-                    term_plans[block.term_idx].token_id,
-                    block.block_idx,
-                    batch,
-                )?;
-                decoded_blocks.insert(block.block_row, decoded);
-            }
+                    let decoded = self.inverted_list.decode_v3_payload_block(
+                        term_plans[block.term_idx].token_id,
+                        block.block_idx,
+                        batch,
+                    )?;
+                    decoded_blocks.insert(block.block_row, decoded);
+                }
 
-            let mut docs_in_window = HashMap::<u32, V3DocAccumulator>::new();
-            for block in &window_blocks {
-                let decoded = decoded_blocks.get(&block.block_row).ok_or_else(|| {
-                    Error::internal(format!("missing decoded V3 block row {}", block.block_row))
-                })?;
-                for (doc_offset, (&doc_id, &freq)) in
-                    decoded.doc_ids.iter().zip(decoded.freqs.iter()).enumerate()
-                {
-                    if doc_id < window.first_doc_id || doc_id > window.last_doc_id {
+                let mut docs_in_window = HashMap::<u32, V3DocAccumulator>::new();
+                for block in &window_blocks {
+                    let decoded = decoded_blocks.get(&block.block_row).ok_or_else(|| {
+                        Error::internal(format!("missing decoded V3 block row {}", block.block_row))
+                    })?;
+                    for (doc_offset, (&doc_id, &freq)) in
+                        decoded.doc_ids.iter().zip(decoded.freqs.iter()).enumerate()
+                    {
+                        if doc_id < window.first_doc_id || doc_id > window.last_doc_id {
+                            continue;
+                        }
+                        docs_in_window
+                            .entry(doc_id)
+                            .or_insert_with(|| V3DocAccumulator::new(term_plans.len()))
+                            .add(block.term_idx, block.block_row, doc_offset, freq);
+                    }
+                }
+
+                let mut docs_in_window = docs_in_window.into_iter().collect::<Vec<_>>();
+                docs_in_window.sort_unstable_by_key(|(doc_id, _)| *doc_id);
+                for (doc_id, acc) in docs_in_window {
+                    if !acc.matches_operator(candidate_operator) {
                         continue;
                     }
-                    docs_in_window
-                        .entry(doc_id)
-                        .or_insert_with(|| V3DocAccumulator::new(term_plans.len()))
-                        .add(block.term_idx, block.block_row, doc_offset, freq);
-                }
-            }
+                    num_comparisons += 1;
 
-            let mut docs_in_window = docs_in_window.into_iter().collect::<Vec<_>>();
-            docs_in_window.sort_unstable_by_key(|(doc_id, _)| *doc_id);
-            for (doc_id, acc) in docs_in_window {
-                if !seen_doc_ids.insert(doc_id) {
-                    continue;
-                }
-                if !acc.matches_operator(candidate_operator) {
-                    continue;
-                }
-                num_comparisons += 1;
-
-                let addr = if docs_has_row_ids {
-                    let row_id = docs.row_id(doc_id);
-                    if row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id) {
+                    let addr = if docs_has_row_ids {
+                        let row_id = docs.row_id(doc_id);
+                        if row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id) {
+                            continue;
+                        }
+                        CandidateAddr::RowId(row_id)
+                    } else {
+                        CandidateAddr::Pending(doc_id)
+                    };
+                    let doc_length = docs.num_tokens(doc_id);
+                    let score = self.v3_score_candidate(&acc, &term_plans, doc_length, &scorer);
+                    if candidates.len() >= limit && score < threshold {
                         continue;
                     }
-                    CandidateAddr::RowId(row_id)
-                } else {
-                    CandidateAddr::Pending(doc_id)
-                };
-                let doc_length = docs.num_tokens(doc_id);
-                if self.v3_candidate_cannot_beat_threshold(
-                    &acc,
-                    &term_plans,
-                    doc_length,
-                    &scorer,
-                    threshold,
-                ) {
-                    continue;
-                }
-                if let Some(slop) = phrase_slop
-                    && !self
-                        .v3_candidate_matches_phrase(
-                            &term_plans,
-                            &acc,
-                            &decoded_blocks,
-                            &mut decoded_positions,
-                            metrics,
-                            slop,
-                        )
-                        .await?
-                {
-                    continue;
-                }
+                    if let Some(slop) = phrase_slop
+                        && !self
+                            .v3_candidate_matches_phrase(
+                                &term_plans,
+                                &acc,
+                                &decoded_blocks,
+                                &mut decoded_positions,
+                                metrics,
+                                slop,
+                            )
+                            .await?
+                    {
+                        continue;
+                    }
 
-                let score = self.v3_score_candidate(&acc, &term_plans, doc_length, &scorer);
-                let row_id_slot = match &addr {
-                    CandidateAddr::RowId(row_id) => *row_id,
-                    CandidateAddr::Pending(doc_id) => *doc_id as u64,
-                };
-                let term_freqs = acc.term_freqs(&term_plans);
-                if candidates.len() < limit {
-                    candidates.push(Reverse((
-                        ScoredDoc::new(row_id_slot, score),
-                        term_freqs,
-                        doc_length,
-                        doc_id,
-                    )));
-                    if candidates.len() == limit {
+                    let row_id_slot = match &addr {
+                        CandidateAddr::RowId(row_id) => *row_id,
+                        CandidateAddr::Pending(doc_id) => *doc_id as u64,
+                    };
+                    let term_freqs = acc.term_freqs(&term_plans);
+                    if candidates.len() < limit {
+                        candidates.push(Reverse((
+                            ScoredDoc::new(row_id_slot, score),
+                            term_freqs,
+                            doc_length,
+                            doc_id,
+                        )));
+                        if candidates.len() == limit {
+                            threshold = self.v3_update_threshold(
+                                candidates.peek().unwrap().0.0.score.0,
+                                params.wand_factor,
+                                &shared_threshold,
+                            );
+                        }
+                    } else if score > candidates.peek().unwrap().0.0.score.0 {
+                        candidates.pop();
+                        candidates.push(Reverse((
+                            ScoredDoc::new(row_id_slot, score),
+                            term_freqs,
+                            doc_length,
+                            doc_id,
+                        )));
                         threshold = self.v3_update_threshold(
                             candidates.peek().unwrap().0.0.score.0,
                             params.wand_factor,
                             &shared_threshold,
                         );
                     }
-                } else if score > candidates.peek().unwrap().0.0.score.0 {
-                    candidates.pop();
-                    candidates.push(Reverse((
-                        ScoredDoc::new(row_id_slot, score),
-                        term_freqs,
-                        doc_length,
-                        doc_id,
-                    )));
-                    threshold = self.v3_update_threshold(
-                        candidates.peek().unwrap().0.0.score.0,
-                        params.wand_factor,
-                        &shared_threshold,
-                    );
                 }
             }
         }
         metrics.record_comparisons(num_comparisons);
+        let all_rows = term_plans
+            .iter()
+            .flat_map(|term| term.blocks.iter().map(|block| block.block_row))
+            .collect::<HashSet<_>>();
+        metrics.record_fts_blocks_pruned(all_rows.len().saturating_sub(visited_blocks.len()));
 
-        Ok(V3BlockSearchResult {
-            candidates: candidates
-                .into_iter()
-                .map(
-                    |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                        addr: if docs_has_row_ids {
-                            CandidateAddr::RowId(doc.row_id)
-                        } else {
-                            CandidateAddr::Pending(doc.row_id as u32)
-                        },
-                        posting_doc_id: posting_doc_id as u64,
-                        freqs,
-                        doc_length,
+        Ok(candidates
+            .into_iter()
+            .map(
+                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                    addr: if docs_has_row_ids {
+                        CandidateAddr::RowId(doc.row_id)
+                    } else {
+                        CandidateAddr::Pending(doc.row_id as u32)
                     },
-                )
-                .collect(),
-            threshold,
-        })
-    }
-
-    fn v3_search_windows(&self, term_plans: &[V3TermPlan], operator: Operator) -> Vec<V3Window> {
-        let seed_blocks = if operator == Operator::And {
-            term_plans
-                .iter()
-                .min_by_key(|term| (term.posting_len, term.blocks.len() as u32))
-                .map(|term| term.blocks.as_slice())
-                .unwrap_or(&[])
-        } else {
-            &[]
-        };
-        let seed_iter: Box<dyn Iterator<Item = V3BlockMeta> + '_> = if operator == Operator::And {
-            Box::new(seed_blocks.iter().copied())
-        } else {
-            Box::new(
-                term_plans
-                    .iter()
-                    .flat_map(|term| term.blocks.iter().copied()),
+                    posting_doc_id: posting_doc_id as u64,
+                    freqs,
+                    doc_length,
+                },
             )
-        };
-
-        let mut seen = HashSet::new();
-        let mut windows = Vec::new();
-        for seed in seed_iter {
-            if !seen.insert((seed.first_doc_id, seed.last_doc_id)) {
-                continue;
-            }
-            if let Some(upper_bound) = self.v3_window_upper_bound(
-                term_plans,
-                seed.first_doc_id,
-                seed.last_doc_id,
-                operator,
-            ) {
-                windows.push(V3Window {
-                    first_doc_id: seed.first_doc_id,
-                    last_doc_id: seed.last_doc_id,
-                    upper_bound,
-                });
-            }
-        }
-        windows
-    }
-
-    fn v3_window_upper_bound(
-        &self,
-        term_plans: &[V3TermPlan],
-        first_doc_id: u32,
-        last_doc_id: u32,
-        operator: Operator,
-    ) -> Option<f32> {
-        let mut upper_bound = 0.0;
-        for term in term_plans {
-            let term_bound = term
-                .blocks
-                .iter()
-                .filter(|block| {
-                    block.first_doc_id <= last_doc_id && block.last_doc_id >= first_doc_id
-                })
-                .map(|block| block.block_max_score)
-                .max_by(f32::total_cmp);
-            match term_bound {
-                Some(bound) => upper_bound += bound,
-                None if operator == Operator::And => return None,
-                None => {}
-            }
-        }
-        Some(upper_bound)
-    }
-
-    fn v3_window_blocks(
-        &self,
-        term_plans: &[V3TermPlan],
-        window: V3Window,
-        operator: Operator,
-    ) -> Vec<V3BlockMeta> {
-        let mut blocks = Vec::new();
-        for term in term_plans {
-            let start_len = blocks.len();
-            blocks.extend(
-                term.blocks
-                    .iter()
-                    .filter(|block| {
-                        block.first_doc_id <= window.last_doc_id
-                            && block.last_doc_id >= window.first_doc_id
-                    })
-                    .copied(),
-            );
-            if operator == Operator::And && blocks.len() == start_len {
-                return Vec::new();
-            }
-        }
-        blocks
+            .collect())
     }
 
     fn v3_update_threshold(
@@ -2789,20 +2573,6 @@ impl InvertedPartition {
                     * scorer.doc_weight(freq, doc_length)
             })
             .sum()
-    }
-
-    fn v3_candidate_cannot_beat_threshold(
-        &self,
-        acc: &V3DocAccumulator,
-        term_plans: &[V3TermPlan],
-        doc_length: u32,
-        scorer: &IndexBM25Scorer,
-        threshold: f32,
-    ) -> bool {
-        if !threshold.is_finite() {
-            return false;
-        }
-        self.v3_score_candidate(acc, term_plans, doc_length, scorer) <= threshold
     }
 
     async fn v3_candidate_matches_phrase(
@@ -4072,46 +3842,6 @@ impl PostingListReader {
             .collect())
     }
 
-    async fn v3_top_blocks_cached(&self, token_ids: &[u32]) -> bool {
-        if !self.is_v3_block_row_layout() || v3_bypass_posting_list_cache_enabled() {
-            return false;
-        }
-        for &token_id in token_ids {
-            if self
-                .index_cache
-                .get_with_key(&V3TopBlockRowsKey { token_id })
-                .await
-                .is_none()
-            {
-                return false;
-            }
-            if self
-                .index_cache
-                .get_with_key(&V3BlockMetadataKey { token_id })
-                .await
-                .is_none()
-            {
-                return false;
-            }
-        }
-        true
-    }
-
-    async fn v3_top_block_row_set(&self, token_ids: &[u32]) -> Option<HashSet<usize>> {
-        if !self.is_v3_block_row_layout() || v3_bypass_posting_list_cache_enabled() {
-            return None;
-        }
-        let mut rows = HashSet::new();
-        for &token_id in token_ids {
-            let cached_rows = self
-                .index_cache
-                .get_with_key(&V3TopBlockRowsKey { token_id })
-                .await?;
-            rows.extend(cached_rows.iter().copied());
-        }
-        Some(rows)
-    }
-
     async fn v3_payload_block_batches(
         &self,
         rows: &[usize],
@@ -4361,14 +4091,6 @@ impl PostingListReader {
         }
     }
 
-    fn num_v3_blocks_for_token(&self, token_id: u32) -> usize {
-        let PostingMetadata::V3 { block_starts, .. } = &self.metadata else {
-            return 0;
-        };
-        let token_idx = token_id as usize;
-        (block_starts[token_idx + 1] - block_starts[token_idx]) as usize
-    }
-
     fn v3_payload_ranges_from_skip(
         &self,
         block_range: Range<usize>,
@@ -4427,6 +4149,7 @@ impl PostingListReader {
         let last_doc_ids = skip_batch[LAST_DOC_ID_COL].as_primitive::<UInt32Type>();
         let max_scores = skip_batch[BLOCK_MAX_SCORE_COL].as_primitive::<Float32Type>();
         let mut blocks = Vec::with_capacity(skip_batch.num_rows());
+        let mut previous_last = None;
         for row in 0..skip_batch.num_rows() {
             let first_doc_id = first_doc_ids.value(row);
             let last_doc_id = last_doc_ids.value(row);
@@ -4445,6 +4168,13 @@ impl PostingListReader {
                     block_range.start + row
                 )));
             }
+            if previous_last.is_some_and(|previous| previous >= first_doc_id) {
+                return Err(Error::index(format!(
+                    "V3 skip row {} overlaps or precedes the previous block",
+                    block_range.start + row
+                )));
+            }
+            previous_last = Some(last_doc_id);
             blocks.push(V3BlockSkipMeta {
                 block_idx: row,
                 block_row: block_range.start + row,
@@ -4781,9 +4511,6 @@ impl PostingListReader {
             token_rows.sort_unstable();
             token_rows.dedup();
             selected_rows.extend(token_rows.iter().copied());
-            self.index_cache
-                .insert_with_key(&V3TopBlockRowsKey { token_id }, Arc::new(token_rows))
-                .await;
         }
 
         if selected_rows.is_empty() {
@@ -4791,56 +4518,20 @@ impl PostingListReader {
         }
         let mut selected_rows = selected_rows.into_iter().collect::<Vec<_>>();
         selected_rows.sort_unstable();
-        self.cache_v3_payload_rows(&selected_rows, false).await?;
-        if with_position {
-            self.cache_v3_payload_rows(&selected_rows, true).await?;
+        // Use the same cache entries as query execution, including positions.
+        // Chunking bounds transient memory even when the cache is much smaller
+        // than the selected blocks.
+        for rows in selected_rows.chunks(4096) {
+            self.v3_payload_block_batches(rows, &NoOpMetricsCollector)
+                .await?;
+            if with_position {
+                self.v3_position_block_payloads(rows, &NoOpMetricsCollector)
+                    .await?;
+            }
         }
         Ok(selected_rows.len())
     }
 
-    async fn prewarm_posting_lists_for_tokens(
-        &self,
-        token_ids: &[u32],
-        with_position: bool,
-    ) -> Result<()> {
-        stream::iter(token_ids.iter().copied())
-            .map(|token_id| async move {
-                self.posting_list(token_id, with_position, &NoOpMetricsCollector)
-                    .await?;
-                Result::Ok(())
-            })
-            .buffer_unordered(16)
-            .try_collect::<()>()
-            .await
-    }
-
-    async fn cache_v3_payload_rows(
-        &self,
-        sorted_rows: &[usize],
-        with_position: bool,
-    ) -> Result<()> {
-        let selected_ranges = ranges_from_sorted_rows(sorted_rows);
-        let batch = self
-            .read_v3_payload_ranges(&selected_ranges, with_position)
-            .await?;
-        for (offset, row_id) in sorted_rows.iter().enumerate() {
-            let row_batch = batch.slice(offset, 1).shrink_to_fit()?;
-            self.index_cache
-                .insert_with_key(
-                    &V3PostingBlockKey {
-                        block_row: *row_id,
-                        with_position,
-                    },
-                    Arc::new(row_batch),
-                )
-                .await;
-        }
-        Ok(())
-    }
-
-    /// Stream the partition's posting lists into the cache in bounded token-row chunks
-    /// (read -> build -> insert -> drop), so peak resident set is ~one chunk. Returns
-    /// the chunk count (tests assert it split). `chunk_tokens_override` is test-only.
     async fn prewarm_posting_lists_chunked(
         &self,
         with_position: bool,
@@ -5541,23 +5232,6 @@ impl CacheKey for V3BlockMetadataKey {
 
     fn type_name() -> &'static str {
         "V3BlockMetadata"
-    }
-}
-
-#[derive(Debug, Clone)]
-struct V3TopBlockRowsKey {
-    token_id: u32,
-}
-
-impl CacheKey for V3TopBlockRowsKey {
-    type ValueType = Vec<usize>;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!("v3-top-block-rows-{}", self.token_id).into()
-    }
-
-    fn type_name() -> &'static str {
-        "V3TopBlockRows"
     }
 }
 
