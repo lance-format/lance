@@ -21,8 +21,8 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::scalar::OldIndexDataFilter;
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
-    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RQRowLayout, RabitQuantizationMetadata,
+    RabitQueryEstimator, pack_codes, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
@@ -361,6 +361,17 @@ pub async fn init_writer_for_sq(
     Ok(w)
 }
 
+/// The merger reads and writes the column layout only: a plane-row shard, or
+/// plane-row output, is not supported until it handles packed row columns.
+fn reject_plane_rows(rq_meta: &RabitQuantizationMetadata, what: &str) -> Result<()> {
+    if rq_meta.row_layout == RQRowLayout::PlaneRows {
+        return Err(Error::not_supported(format!(
+            "Distributed RQ merge: {what} uses the plane-row layout, which the merger does not support; merge column-layout segments and convert the result"
+        )));
+    }
+    Ok(())
+}
+
 /// Create and initialize a unified writer for RQ storage.
 pub async fn init_writer_for_rq(
     object_store: &lance_io::object_store::ObjectStore,
@@ -369,6 +380,7 @@ pub async fn init_writer_for_rq(
     rq_meta: &RabitQuantizationMetadata,
     format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
+    reject_plane_rows(rq_meta, "the merged auxiliary file")?;
     let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
         rabit_binary_code_field(rq_meta.rotated_dim()),
@@ -1148,6 +1160,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 };
                 let mut rq_meta_parsed: RabitQuantizationMetadata = serde_json::from_str(&rq_json)
                     .map_err(|e| Error::index(format!("RQ metadata parse error: {}", e)))?;
+                reject_plane_rows(&rq_meta_parsed, &format!("source shard {idx}"))?;
                 if rq_meta_parsed.rotation_type == crate::vector::bq::RQRotationType::Matrix
                     && rq_meta_parsed.rotate_mat.is_none()
                     && let Some(buf_idx) = rq_meta_parsed.buffer_index()
@@ -2568,6 +2581,13 @@ mod tests {
             if metadata.layered {
                 columns.push(Arc::new(Float32Array::from(vec![100.; total_rows])));
                 columns.push(Arc::new(Float32Array::from(vec![10.; total_rows])));
+                // The high and full estimator bounds, three floats each.
+                for bound in [1.0f32, 2.0] {
+                    columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![bound; total_rows * 3]),
+                        3,
+                    )?));
+                }
             }
         }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
@@ -2791,6 +2811,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             layered: false,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2924,6 +2945,7 @@ mod tests {
             num_bits: 1,
             packed: true,
             layered: false,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2965,6 +2987,65 @@ mod tests {
         }
     }
 
+    /// The merger handles the column layout only: a shard whose metadata
+    /// declares plane rows is not supported, whether its codes are packed
+    /// or not, and it never writes plane-row metadata over columns.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_ivf_rq_rejects_plane_row_shard(#[values(false, true)] packed: bool) {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_plane_rows");
+        let aux0 = index_dir
+            .clone()
+            .join("partial_0")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 1,
+            packed,
+            layered: false,
+            row_layout: RQRowLayout::PlaneRows,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let writer = init_writer_for_rq(
+            &object_store,
+            &aux0,
+            DistanceType::L2,
+            &rq_meta,
+            ConcreteFileVersion::V2_0,
+        )
+        .await;
+        match writer {
+            Err(Error::NotSupported { .. }) => {}
+            Err(other) => panic!("expected Error::NotSupported, got {other:?}"),
+            Ok(_) => panic!("the merger wrote plane-row metadata over columns"),
+        }
+        // The shard's rows are written in columns; only its metadata matters.
+        write_rq_partial_aux(&object_store, &aux0, &rq_meta, &[2, 1], 0, DistanceType::L2)
+            .await
+            .unwrap();
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            std::slice::from_ref(&aux0),
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::NotSupported { source, .. }) => {
+                let message = source.to_string();
+                assert!(message.contains("source shard 0"), "{message}");
+                assert!(message.contains("plane-row layout"), "{message}");
+            }
+            other => panic!("expected Error::NotSupported for a plane-row shard, got {other:?}"),
+        }
+    }
+
     #[rstest::rstest]
     #[case::single(4, false)]
     #[case::rq5(5, true)]
@@ -2995,6 +3076,7 @@ mod tests {
             num_bits,
             packed: false,
             layered,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -3138,6 +3220,7 @@ mod tests {
             num_bits: 5,
             packed: false,
             layered: false,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         write_rq_partial_aux(&store, &a, &metadata, &[2], 0, DistanceType::L2)

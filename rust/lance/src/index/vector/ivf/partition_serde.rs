@@ -22,7 +22,9 @@ use lance_core::{Error, Result};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::raw_body::{read_raw_batch, write_raw_batch};
-use lance_index::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
+use lance_index::vector::bq::storage::{
+    RQRowLayout, RabitQuantizationMetadata, RabitQueryEstimator,
+};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatMetadata, FlatQuantizer};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::storage::ProductQuantizationMetadata;
@@ -502,6 +504,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
             layered: header.layered,
+            // The storage batch holds one column per field whatever the
+            // index file's layout.
+            row_layout: RQRowLayout::Columns,
             query_estimator,
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
