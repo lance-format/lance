@@ -16,6 +16,7 @@ use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
 use super::versions;
+use super::write::seeds::SeedCollector;
 use super::write::{GenericWriter, cleanup_data_fragments};
 use crate::dataset::FileFragment;
 
@@ -46,6 +47,8 @@ pub struct Updater {
     prefetched_input: Option<RecordBatch>,
 
     writer: Option<Box<dyn GenericWriter>>,
+    /// Write seeds for the columns of the data file being written.
+    seeds: SeedCollector,
 
     /// The final schema of the fragment after the update.
     final_schema: Option<Schema>,
@@ -151,6 +154,7 @@ impl Updater {
             last_input: None,
             prefetched_input: None,
             writer: None,
+            seeds: SeedCollector::disabled(),
             write_schema,
             final_schema,
             allow_external_blob_outside_bases: false,
@@ -258,14 +262,22 @@ impl Updater {
                 .as_ref()
                 .ok_or_else(|| Error::internal("Fragment Updater: missing write schema"))?
                 .clone();
+            self.seeds = SeedCollector::for_write(
+                self.write_version,
+                Some(self.fragment.dataset()),
+                &write_schema,
+                true,
+            )
+            .await?;
             self.writer = Some(self.new_writer(write_schema).await?);
         }
 
         self.writer
             .as_mut()
             .ok_or_else(|| Error::internal("Fragment Updater: missing writer"))?
-            .write(&[batch])
-            .await
+            .write(std::slice::from_ref(&batch))
+            .await?;
+        self.seeds.observe(&batch)
     }
 
     /// Update one batch.
@@ -452,6 +464,7 @@ impl Updater {
         self.finished = true;
 
         if let Some(writer) = self.writer.as_mut() {
+            self.seeds.flush(writer.as_mut()).await?;
             let (_, data_file) = writer.finish().await?;
             self.fragment.metadata.files.push(data_file);
         }

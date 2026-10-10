@@ -67,6 +67,7 @@ use self::write::FragmentCreateBuilder;
 use super::hash_joiner::HashJoiner;
 use super::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
 use super::scanner::Scanner;
+use super::write::seeds::SeedCollector;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
@@ -2706,6 +2707,13 @@ impl FileFragment {
             has_blob_v2,
         )
         .await?;
+        let mut seeds = SeedCollector::for_write(
+            write_version,
+            Some(self.dataset.as_ref()),
+            &writer_schema,
+            true,
+        )
+        .await?;
         let staged_path = {
             let (file_name, _) = writer.data_file_path();
             self.dataset.data_dir().join(file_name)
@@ -2744,7 +2752,9 @@ impl FileFragment {
                     .project_by_schema(&projection_schema)
                     .map_err(|err| self.schema_mismatch(err))?;
                 writer.write(std::slice::from_ref(&batch)).await?;
+                seeds.observe(&batch)?;
             }
+            seeds.flush(writer.as_mut()).await?;
             let (num_rows, data_file) = writer.finish().await?;
             if num_rows as u64 != expected_rows {
                 return Err(Error::invalid_input(format!(
