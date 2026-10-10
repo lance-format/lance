@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::NewColumnTransform;
 use arrow_array::{Decimal128Array, UInt64Array};
 
 const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
@@ -277,6 +278,94 @@ async fn do_test_binary_copy_packed_struct_column_mapping(version: LanceFileVers
     let data_file = &dataset.manifest.fragments[0].files[0];
     assert_eq!(data_file.fields.len(), 2);
     assert_eq!(data_file.column_indices.as_ref(), &[0, 1]);
+}
+
+/// A metadata-only `add_columns` widens the dataset schema without touching the
+/// data files, so the files no longer cover every physical column the schema
+/// describes. Binary copy would still describe the compacted file with the full
+/// schema, registering a column index the file does not have and breaking the
+/// next scan. See https://github.com/lancedb/lance/issues/8281.
+#[tokio::test]
+async fn test_binary_copy_skipped_after_metadata_only_add_column() {
+    for version in NON_LEGACY_VERSIONS {
+        do_test_binary_copy_skipped_after_metadata_only_add_column(version).await;
+    }
+}
+
+async fn do_test_binary_copy_skipped_after_metadata_only_add_column(version: LanceFileVersion) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+        ],
+    )
+    .unwrap();
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                "c",
+                DataType::Int32,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100_000,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+        ..Default::default()
+    };
+    let err = compact_files(&mut dataset, options.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::NotSupported { .. }) && err.to_string().contains("binary copy"),
+        "Error: {}",
+        err
+    );
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            compaction_mode: Some(CompactionMode::TryBinaryCopy),
+            ..options
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(after.num_rows(), 4);
+    assert_eq!(after["a"].as_ref(), &Int32Array::from(vec![1, 2, 3, 4]));
+    // The columns that were already in the data files must survive the
+    // re-encode fallback untouched, not just the one the scan used to trip on.
+    assert_eq!(after["b"].as_ref(), &Int32Array::from(vec![10, 20, 30, 40]));
+    assert_eq!(after["c"].null_count(), 4);
 }
 
 #[tokio::test]
