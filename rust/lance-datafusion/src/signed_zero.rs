@@ -26,8 +26,8 @@ use lance_core::Result;
 /// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
 /// | `x IN (0, ..)`               | the missing encoding is added |
 /// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
-/// | `x IS NOT DISTINCT FROM 0`   | `x IS NOT NULL AND x IN (-0.0, 0.0)` |
-/// | `x IS DISTINCT FROM 0`       | `x IS NULL OR x NOT IN (-0.0, 0.0)` |
+/// | `x IS NOT DISTINCT FROM 0`   | `(x IN (-0.0, 0.0)) IS TRUE`     |
+/// | `x IS DISTINCT FROM 0`       | `(x IN (-0.0, 0.0)) IS NOT TRUE` |
 ///
 /// Equality has to name both encodings because a scalar index keys on the bit
 /// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
@@ -631,9 +631,8 @@ mod tests {
     // bare column, which is also what DataFusion requires before it shortens a
     // list. This case fails if a release ever relaxes that.
     #[case::non_column_probe("abs(value) = 0.0")]
-    // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
-    // it as unsupported SQL; that arm is reachable only from a programmatically
-    // built expression, and `rewriting_twice_changes_nothing` covers it there.
+    #[case::is_not_distinct_from("value IS NOT DISTINCT FROM 0.0")]
+    #[case::is_distinct_from("value IS DISTINCT FROM 0.0")]
     fn optimizing_twice_changes_nothing(#[case] filter: &str) {
         let schema =
             std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
