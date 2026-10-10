@@ -54,6 +54,8 @@ use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
+    datafusion::index_join::{IndexJoinPlanner, IndexJoinRule},
+    datafusion::planning_context::PlanningContext,
     dataset::{
         fragment::FileFragment,
         transaction::{Operation, Transaction, UpdatedFragmentOffsets},
@@ -80,6 +82,7 @@ use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     datasource::MemTable,
     execution::{
+        SessionStateBuilder,
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
     },
@@ -2599,10 +2602,20 @@ impl MergeInsertJob {
             node: Arc::new(write_node),
         });
 
+        let session_state = if self.params.use_index {
+            let context = Arc::new(PlanningContext::collect(&logical_plan).await?);
+            SessionStateBuilder::new_from_existing(session_state)
+                .with_optimizer_rule(Arc::new(IndexJoinRule::new(context)))
+                .build()
+        } else {
+            session_state
+        };
         let logical_plan = session_state.optimize(&logical_plan)?;
 
-        let planner =
-            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {})]);
+        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(MergeInsertPlanner {}),
+            Arc::new(IndexJoinPlanner),
+        ]);
         // This method already does the optimization for us.
         let physical_plan = planner
             .create_physical_plan(&logical_plan, &session_state)
@@ -2694,7 +2707,9 @@ impl MergeInsertJob {
     ///
     /// The fast path is available when:
     /// - `when_matched` is `UpdateAll`, `UpdateIf`, `Fail`, `Delete`, or `DoNothing`
-    /// - Either `use_index` is false OR there's no scalar index on the join key
+    /// - The source covers the full dataset schema, the join is on one column
+    ///   and `when_matched` is not `UpdateIf`/`UpdateIfExpr`, OR `use_index` is
+    ///   false, OR some join key has no scalar index
     /// - The source schema is either (a) the full dataset schema, or (b) a
     ///   subset of it (partial-schema upsert), or (c) just the key columns for
     ///   delete-only operations
@@ -2784,7 +2799,20 @@ impl MergeInsertJob {
                 WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
             );
 
+        // A full-schema merge reads nothing from the target but its key and
+        // row locators, so the v2 plan joins it through the index
+        // (`IndexJoinRule`). An `UpdateIf` condition reads target columns,
+        // which the index cannot supply, and the rule leaves composite keys
+        // to the hash join, which is slower than the legacy indexed path.
+        let index_join_on_v2 = is_full_schema
+            && self.params.on.len() == 1
+            && !matches!(
+                self.params.when_matched,
+                WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            );
+
         let would_use_scalar_index = if self.params.use_index
+            && !index_join_on_v2
             && !is_partial_delete_with_insert
             && !write_mode_needs_v2
             && matches!(
@@ -12598,7 +12626,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert!(plan_str.contains("MergeInsert"));
         assert!(plan_str.contains("HashJoinExec")); // Should use hash join, not index scan
 
-        // Test 2: use_index=true (default) should fail explain_plan with index present
+        // Test 2: use_index=true (default) joins through the index
         let merge_job_with_index =
             MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".to_string()])
                 .unwrap()
@@ -12607,20 +12635,12 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .use_index(true) // Explicitly set to use index (though it's the default)
                 .try_build()
                 .unwrap();
-
-        // With use_index=true and an index present, explain_plan should fail
-        let plan_result = merge_job_with_index.explain_plan(None, false).await;
-        assert!(
-            plan_result.is_err(),
-            "explain_plan should fail with use_index=true when index exists"
-        );
-
-        match plan_result {
-            Err(Error::NotSupported { source, .. }) => {
-                assert!(source.to_string().contains("does not support explain_plan"));
-            }
-            _ => panic!("Expected NotSupported error"),
-        }
+        let plan_str = merge_job_with_index
+            .explain_plan(None, false)
+            .await
+            .unwrap();
+        assert!(plan_str.contains("IndexJoin"), "{plan_str}");
+        assert!(!plan_str.contains("HashJoinExec"), "{plan_str}");
 
         // Test 3: Verify actual execution works without index
         let source = Box::new(RecordBatchIterator::new(
@@ -12637,6 +12657,384 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
         assert_eq!(updated_count, 3);
+    }
+
+    /// A target for index-join tests: an indexed, nullable `id` and an
+    /// unindexed `bucket = id % 4`, over three fragments with a deletion in the
+    /// middle one, plus a fourth fragment appended after the index was built.
+    async fn index_join_target(index_type: IndexType, stable_row_ids: bool) -> Dataset {
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        };
+        let batch = |ids: std::ops::Range<i64>| {
+            RecordBatch::try_new(
+                index_join_schema(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ids.clone())),
+                    Arc::new(Int32Array::from_iter_values(
+                        ids.clone().map(|id| (id % 4) as i32),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        ids.map(|id| format!("old{id}")),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch(0..30))], index_join_schema()),
+            "memory://",
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            index_type,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        ds.delete("id = 13").await.unwrap();
+        ds.append(
+            RecordBatchIterator::new([Ok(batch(30..40))], index_join_schema()),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        ds
+    }
+
+    fn index_join_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("bucket", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]))
+    }
+
+    async fn sorted_rows(ds: &Dataset, columns: &[&str]) -> RecordBatch {
+        let mut scanner = ds.scan();
+        scanner
+            .order_by(Some(
+                columns
+                    .iter()
+                    .map(|column| ColumnOrdering::asc_nulls_first(column.to_string()))
+                    .collect(),
+            ))
+            .unwrap();
+        scanner.try_into_batch().await.unwrap()
+    }
+
+    /// A full-schema merge on an indexed key joins through the index and leaves
+    /// the same table as the hash join: deleted rows and null keys never
+    /// match, and rows in the unindexed fragment are still found.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_index_join_matches_hash_join(
+        #[values(IndexType::BTree, IndexType::Bitmap)] index_type: IndexType,
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(
+            WhenMatched::UpdateAll,
+            WhenMatched::DoNothing,
+            WhenMatched::Delete
+        )]
+        when_matched: WhenMatched,
+        #[values(false, true)] insert: bool,
+    ) {
+        if when_matched == WhenMatched::DoNothing && !insert {
+            return;
+        }
+        // 13 is deleted, 35 is unindexed, and 50 and null are new.
+        let source = RecordBatch::try_new(
+            index_join_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(13),
+                    Some(25),
+                    Some(35),
+                    Some(50),
+                    None,
+                    Some(7),
+                ])),
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(1),
+                    Some(3),
+                    Some(2),
+                    Some(0),
+                    Some(0),
+                ])),
+                Arc::new(StringArray::from_iter_values(
+                    (0..7).map(|row| format!("new{row}")),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let mut results = Vec::new();
+        for use_index in [true, false] {
+            let ds = Arc::new(index_join_target(index_type, stable_row_ids).await);
+            let job = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+                .unwrap()
+                .when_matched(when_matched.clone())
+                .when_not_matched(if insert {
+                    WhenNotMatched::InsertAll
+                } else {
+                    WhenNotMatched::DoNothing
+                })
+                .use_index(use_index)
+                .try_build()
+                .unwrap();
+            let plan = job.explain_plan(None, false).await.unwrap();
+            assert_eq!(plan.contains("IndexJoin"), use_index, "{plan}");
+            let (ds, stats) = job
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+            results.push((
+                sorted_rows(&ds, &["id", "value"]).await,
+                stats.num_updated_rows,
+                stats.num_inserted_rows,
+                stats.num_deleted_rows,
+            ));
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    /// The index join answers matches from the index alone, so a merge into a
+    /// fully indexed table reads none of the table's data files.
+    #[tokio::test]
+    async fn test_index_join_reads_no_target_data() {
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int64Type>())
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let data_files = ds
+            .fragments()
+            .iter()
+            .flat_map(|fragment| &fragment.files)
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let source = record_batch!(
+            ("id", Int64, [5, 150, 1000]),
+            ("value", Int32, [-1, -1, -1])
+        )
+        .unwrap();
+
+        let _ = ds.object_store.io_stats_incremental();
+        let (merged, stats) = MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+        let io = ds.object_store.io_stats_incremental();
+
+        assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (2, 1));
+        assert_eq!(
+            merged.count_rows(Some("value = -1".into())).await.unwrap(),
+            3
+        );
+        let data_reads = io
+            .requests
+            .iter()
+            .filter(|request| {
+                data_files
+                    .iter()
+                    .any(|file| request.path.as_ref().ends_with(file.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert!(data_reads.is_empty(), "{data_reads:?}");
+    }
+
+    /// A data overlay committed after the index changes a row's key. The index
+    /// still holds the old key, so the index join must match the row by its
+    /// current key instead (#9861).
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_index_join_sees_overlaid_keys(#[values(false, true)] stable_row_ids: bool) {
+        use crate::dataset::WriteDestination;
+        use crate::dataset::transaction::DataOverlayGroup;
+        use lance_file::writer::FileWriterOptions;
+        use lance_io::utils::CachedFileSize;
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1])),
+                Arc::new(StringArray::from(vec!["base0", "base1"])),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Overlay `key = 100` onto physical row 1.
+        let key_field_id = ds.schema().field("key").unwrap().id;
+        let overlay_schema = ds.schema().project_by_ids(&[key_field_id], true);
+        let path = ds.base.clone().join("data").join("overlay.lance");
+        let mut writer = lance_file::versions::v2_1::create_writer(
+            ds.object_store.create(&path).await.unwrap(),
+            overlay_schema,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer
+            .write_column(
+                0,
+                Arc::new(UInt32Array::from(vec![100])) as arrow_array::ArrayRef,
+            )
+            .await
+            .unwrap();
+        let summary = writer.finish().await.unwrap();
+        let mut data_file = DataFile::new_unstarted(
+            "overlay.lance".to_string(),
+            lance_file::version::ConcreteFileVersion::V2_1,
+        );
+        data_file.fields = vec![key_field_id].into();
+        data_file.column_indices = vec![0].into();
+        data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+        let ds = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(ds.clone())),
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id: ds.get_fragments()[0].id() as u64,
+                    overlays: vec![DataOverlayFile {
+                        data_file,
+                        coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([1u32])),
+                        committed_version: 0,
+                    }],
+                }],
+            },
+            Some(ds.version().version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ds.count_rows(Some("key = 100".into())).await.unwrap(), 1);
+
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100, 1])),
+                Arc::new(StringArray::from(vec!["merged", "inserted"])),
+            ],
+        )
+        .unwrap();
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let plan = job.explain_plan(None, false).await.unwrap();
+        assert!(plan.contains("overlay_stale_rows=1"), "{plan}");
+        let (merged, stats) = job
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        // Key 1 now lives only in the index, so it is new.
+        assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 1));
+        let rows = sorted_rows(&merged, &["key"]).await;
+        assert_eq!(
+            rows,
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 1, 100])),
+                    Arc::new(StringArray::from(vec!["base0", "inserted", "merged"])),
+                ],
+            )
+            .unwrap()
+        );
+    }
+
+    /// Looking up each column of a composite key materializes every row
+    /// matching each column, so composite keys do not take the index join.
+    /// Fully indexed ones keep the legacy indexed path.
+    #[tokio::test]
+    async fn test_index_join_skips_composite_keys() {
+        let mut ds = index_join_target(IndexType::BTree, false).await;
+        ds.create_index(
+            &["bucket"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let error =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string(), "bucket".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap()
+                .explain_plan(None, false)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(&error, Error::NotSupported { source, .. } if source.to_string().contains("scalar-index execution path")),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
