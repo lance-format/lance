@@ -1617,7 +1617,7 @@ impl InvertedIndex {
                 .inverted_list
                 .prewarm_v3_top_blocks(&token_ids, percent, with_position)
                 .await?;
-            part.docs.ensure_loaded().await?;
+            part.docs.prewarm_scoring().await?;
         }
         Ok(warmed_blocks)
     }

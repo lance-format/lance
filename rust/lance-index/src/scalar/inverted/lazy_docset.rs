@@ -77,6 +77,20 @@ struct DocSetKey {
     with_row_ids: bool,
 }
 
+struct DocRowIdsKey;
+
+impl CacheKey for DocRowIdsKey {
+    type ValueType = Vec<u64>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "docs-row-ids".into()
+    }
+
+    fn type_name() -> &'static str {
+        "FtsDocRowIds"
+    }
+}
+
 impl CacheKey for DocSetKey {
     type ValueType = DocSet;
 
@@ -197,6 +211,15 @@ impl LazyDocSet {
         }
     }
 
+    /// Prewarm forward scoring lookups without the inverse row-to-doc mapping.
+    /// Filtered searches can still obtain a complete DocSet on demand.
+    pub async fn prewarm_scoring(&self) -> Result<()> {
+        match self {
+            Self::Loaded(_) => Ok(()),
+            Self::Deferred(d) => d.prewarm_scoring().await,
+        }
+    }
+
     /// Materialize a DocSet that carries num_tokens but no row_ids.
     /// Used by the deferred-row_id scoring path; the per-partition
     /// caller resolves surviving doc_ids -> row_ids post-wand via
@@ -267,6 +290,27 @@ impl DeferredDocSet {
         Ok(docs)
     }
 
+    async fn prewarm_scoring(&self) -> Result<()> {
+        if self.is_legacy || self.frag_reuse_index.is_some() {
+            self.ensure_loaded().await?;
+            return Ok(());
+        }
+        if self.ensure_num_tokens_loaded().await?.has_row_ids() {
+            return Ok(());
+        }
+        self.cache
+            .get_or_insert_with_key(DocRowIdsKey, || async {
+                let batch = self
+                    .reader()
+                    .await?
+                    .read_range(0..self.num_rows, Some(&[ROW_ID]))
+                    .await?;
+                Ok(batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn ensure_num_tokens_loaded(&self) -> Result<Arc<DocSet>> {
         if let Some(full) = self
             .cache
@@ -306,6 +350,9 @@ impl DeferredDocSet {
             && full.has_row_ids()
         {
             return Ok(doc_ids.iter().map(|&d| full.row_id(d)).collect());
+        }
+        if let Some(row_ids) = self.cache.get_with_key(&DocRowIdsKey).await {
+            return Ok(doc_ids.iter().map(|&d| row_ids[d as usize]).collect());
         }
         let ranges: Vec<std::ops::Range<usize>> = doc_ids
             .iter()
