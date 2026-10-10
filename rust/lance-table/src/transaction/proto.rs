@@ -372,8 +372,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 }
             }
+            // `data_change` is not acted on yet: every replacement is still
+            // applied as a data change.
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement { replacements, .. },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
@@ -679,6 +681,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .iter()
                         .map(pb::transaction::DataReplacementGroup::from)
                         .collect(),
+                    data_change: None,
                 })
             }
             Operation::DataOverlay { groups } => {

@@ -193,7 +193,7 @@ row ids feature is enable, then the rewrite operation is compatible with index c
 that are retryable conflicts with index creation:
 
 - Rewrite (only if overlapping fragments, no stable row ids, and no fragment reuse index)
-- DataReplacement (only if overlapping fragments and the column being replaced is being indexed)
+- DataReplacement (only if the column being replaced is being indexed and `data_change` is not false)
 
 Some indices are special singleton indices. For example, the fragment reuse index and the mem wal index. If a conflict occurs
 between two operations that are modifying the same singleton index, then we must rebase the operation and merge the indexes.
@@ -445,7 +445,36 @@ are the operations that conflict with UpdateConfig:
 
 ### DataReplacement
 
-Replaces data in specific column regions with new data files.
+Replaces the data files backing some fields of existing fragments with new data files, without moving rows. Each
+`DataReplacementGroup` names a target fragment and one new data file for it. A fragment can be the target of several
+groups, one per new file, and different groups can carry different fields.
+
+The groups apply in order, each to the target fragment as it stands when the transaction commits (and as the previous
+groups left it), not to the fragment as the writer read it:
+
+- If one of the fragment's data files lists the same field ids as the new file, in the same order and file version, the
+  new file's path, size and base replace that data file's.
+- If none of the fragment's data files holds any of the new file's fields (for example, a column added as all nulls),
+  the new file is appended.
+- If the fragment's data files hold all of the new file's fields, those fields are replaced with the tombstone id (`-2`)
+  in the files that hold them, and the new file is appended. A data file left with no field of the schema and none of
+  the fragment's spilled row lineage is removed from the fragment. A legacy (V1) data file can't tombstone single
+  fields, so a field a V1 file holds can only be replaced by an exact match.
+- Any other replacement is rejected.
+
+`data_change` says whether the new files change any value. When it is absent, as in every transaction written before
+the field existed, it means true. A replacement that changes data:
+
+- withdraws, from every index on a replaced field, its coverage of the target fragments;
+- tombstones the replaced fields in the target fragments' overlays committed at or before its read version, since the
+  new base values supersede them (see [DataOverlay](#dataoverlay));
+- with stable row IDs, sets the last-updated-at version of every row in the target fragments to the new version.
+
+With `data_change` false, the writer asserts that the new files hold, for every physical row, the same base values the
+fragment's files held for those fields (overlays not applied), only laid out in different files. No value a reader sees
+changes, so none of the above happens: index coverage is kept, overlays keep shadowing the base, and no row's
+last-updated-at version moves. Nor does it count as writing values against a concurrent Project or Merge that may change
+a field's nullability. A compaction that repacks a fragment's columns into fewer files is such a replacement.
 
 <details>
 <summary>DataReplacement protobuf message</summary>
@@ -458,21 +487,26 @@ Replaces data in specific column regions with new data files.
 
 #### DataReplacement Compatibility
 
-A DataReplacement operation only replaces a single column's worth of data. As a result, it can be safer and simpler than Merge
-or Update operations. It rewrites a column file positionally against the fragments it targets, so a concurrent operation only
-conflicts when it removes one of those fragments or invalidates the rows the column file covers. Here are the operations that
-conflict with DataReplacement (non-retryable):
+A DataReplacement operation only replaces the data of the fields its new files carry. As a result, it can be safer and
+simpler than Merge or Update operations. It rewrites column files positionally against the fragments it targets, so a
+concurrent operation conflicts when it removes one of those fragments or one of the replaced fields, moves or rewrites
+the rows the column files cover, or depends on the replaced values. Here are the operations that conflict with
+DataReplacement (non-retryable):
 
 - Overwrite
 - Restore
 - UpdateMemWalState
 - Delete (only if it removes a target fragment outright)
 - Update (only if it removes a target fragment outright)
+- Project (only if it drops a field being replaced)
+
+The last three are retryable instead when `data_change` is false: a replacement that only moves values can be planned
+again against the new version, while one that changes data would need new values from its caller.
 
 The following operations are retryable conflicts with DataReplacement:
 
 - DataReplacement (only if same field and overlapping fragments)
-- CreateIndex (only if the field being replaced is being indexed)
+- CreateIndex (only if the field being replaced is being indexed, and `data_change` is not false)
 - Rewrite (only if overlapping fragments)
 - Update (only if it rewrites rows out of a target fragment, or rewrites one of the replaced fields in place)
 - Merge (always)
@@ -536,7 +570,8 @@ field, it supersedes any older overlay on that field: the writer tombstones the
 overlay's entry for the rewritten field — replacing the field id with the obsolete
 sentinel, as with obsolete base columns — so the fresh base values are not silently
 shadowed. Overlay entries for other fields are preserved, and an overlay left with
-no live fields is dropped.
+no live fields is dropped. A DataReplacement with `data_change` false writes no new
+values, so it tombstones nothing.
 
 ### UpdateMemWalState
 
