@@ -2700,18 +2700,20 @@ impl FileFragment {
         let has_blob_v2 = writer_schema
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
-        let mut writer = versions::open_update_writer(
-            write_version,
-            self.dataset.as_ref(),
-            &writer_schema,
-            has_blob_v2,
-        )
-        .await?;
+        // Resolve the seed writers before the staged file exists, so a failure
+        // here leaves nothing to discard.
         let mut seeds = SeedCollector::for_write(
             write_version,
             Some(self.dataset.as_ref()),
             &writer_schema,
             true,
+        )
+        .await?;
+        let mut writer = versions::open_update_writer(
+            write_version,
+            self.dataset.as_ref(),
+            &writer_schema,
+            has_blob_v2,
         )
         .await?;
         let staged_path = {

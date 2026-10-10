@@ -35,7 +35,8 @@ use crate::dataset::schema_evolution::NewColumnTransform;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::{
-    DATA_DIR, MergeInsertBuilder, MergeInsertWriteMode, WriteDestination, WriteParams,
+    DATA_DIR, MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder, WriteDestination,
+    WriteParams,
 };
 use crate::index::DatasetIndexExt;
 
@@ -476,4 +477,86 @@ async fn test_write_columns_in_batches_seeds_physical_rows() {
         assert_eq!(stored, seed_from_values("val", &physical, 1));
         assert_eq!(stored, seed_from_values("val", &physical, 3));
     }
+}
+
+/// Every fragment that gained a data file carries, in the file serving
+/// `column`, a seed matching that file's physical content.
+async fn assert_new_files_seed_physical_rows(
+    dataset: &Dataset,
+    files_before: &std::collections::HashSet<String>,
+    column: &str,
+) {
+    let field = field_id(dataset, column);
+    let mut checked = 0;
+    for fragment in dataset.fragments().iter() {
+        if fragment
+            .files
+            .iter()
+            .all(|file| files_before.contains(&file.path))
+        {
+            continue;
+        }
+        let file = serving_file(fragment, field);
+        assert!(
+            !files_before.contains(&file.path),
+            "fragment {} keeps its old file",
+            fragment.id
+        );
+        let physical = physical_column(dataset, &file.path, column).await;
+        assert_eq!(physical.len(), fragment.physical_rows.unwrap());
+        let stored = seed_in_file(dataset, &file.path, column)
+            .await
+            .unwrap_or_else(|| panic!("fragment {} has no seed for {column}", fragment.id));
+        assert_eq!(stored, seed_from_values(column, &physical, 1));
+        checked += 1;
+    }
+    assert!(checked > 0, "no fragment gained a data file");
+}
+
+fn data_file_paths(dataset: &Dataset) -> std::collections::HashSet<String> {
+    dataset
+        .fragments()
+        .iter()
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect()
+}
+
+/// `Dataset::update` rewrites matching rows into new data files written in
+/// create mode against the existing dataset; they still get seeds.
+#[tokio::test]
+async fn test_update_rewritten_fragments_get_seeds() {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_val_index(dir.as_str(), true).await;
+    let before = data_file_paths(&dataset);
+    let result = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id >= 10")
+        .unwrap()
+        .set("val", "val + 1000")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let dataset = result.new_dataset.as_ref().clone();
+    assert_new_files_seed_physical_rows(&dataset, &before, "val").await;
+}
+
+/// merge_insert inserting unmatched rows writes new fragments; they get seeds.
+#[tokio::test]
+async fn test_merge_insert_inserted_fragments_get_seeds() {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_val_index(dir.as_str(), true).await;
+    let before = data_file_paths(&dataset);
+    let source = rows(25..45, |i| (i % 6 != 1).then_some(i + 5000));
+    let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new([Ok(source)], schema()));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let dataset = dataset.as_ref().clone();
+    assert_new_files_seed_physical_rows(&dataset, &before, "val").await;
 }

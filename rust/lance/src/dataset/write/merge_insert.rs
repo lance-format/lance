@@ -1849,9 +1849,6 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let mut writer =
-                        versions::open_update_writer(write_version, &dataset, &write_schema, false)
-                            .await?;
                     let mut seeds = SeedCollector::for_write(
                         write_version,
                         Some(&dataset),
@@ -1859,6 +1856,9 @@ impl MergeInsertJob {
                         true,
                     )
                     .await?;
+                    let mut writer =
+                        versions::open_update_writer(write_version, &dataset, &write_schema, false)
+                            .await?;
 
                     // We need to remove rowaddr before writing.
                     batches
