@@ -119,7 +119,7 @@ mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
 lance-index = { workspace = true, features = ["test-oracle"] }
-tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 env_logger.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
