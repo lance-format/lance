@@ -293,7 +293,6 @@ struct V3BlockMeta {
     term_idx: usize,
     block_idx: usize,
     block_row: usize,
-    block_max_score: f32,
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
@@ -2382,30 +2381,45 @@ impl InvertedPartition {
         while windows.peek().is_some() {
             threshold =
                 threshold.max(self.v3_shared_threshold(params.wand_factor, &shared_threshold));
-            // Establish a threshold before widening I/O. Later batches amortize
-            // remote request latency without materializing whole posting lists.
-            let batch_size = if scored_windows.is_empty() { 1 } else { 16 };
-            let mut batch_windows = Vec::with_capacity(batch_size);
-            for _ in 0..batch_size {
+            // Seed the threshold with one window, then budget batches by new
+            // payload blocks. Refined point windows often reuse the same blocks;
+            // counting windows alone causes many tiny sequential remote reads.
+            let max_windows = if scored_windows.is_empty() {
+                1
+            } else if candidates.len() < limit {
+                (limit - candidates.len()).min(16)
+            } else {
+                4096
+            };
+            let mut batch_windows = Vec::new();
+            let mut batch_blocks = Vec::new();
+            let mut missing_rows = HashSet::new();
+            for _ in 0..max_windows {
                 let Some(window) = windows.peek() else { break };
                 if candidates.len() >= limit && window.upper_bound <= threshold {
                     break;
                 }
                 if let Some(window) = windows.next() {
+                    for term in &term_plans {
+                        for block in
+                            term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
+                        {
+                            if !decoded_blocks.contains_key(&block.block_row)
+                                && missing_rows.insert(block.block_row)
+                            {
+                                batch_blocks.push(block);
+                            }
+                        }
+                    }
                     batch_windows.push(window);
+                    if missing_rows.len() >= 128 {
+                        break;
+                    }
                 }
             }
             if batch_windows.is_empty() {
                 break;
             }
-            let batch_blocks = batch_windows
-                .iter()
-                .flat_map(|window| {
-                    term_plans.iter().flat_map(move |term| {
-                        term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
-                    })
-                })
-                .collect::<Vec<_>>();
             self.load_v3_blocks(
                 &term_plans,
                 &batch_blocks,
@@ -3952,6 +3966,7 @@ impl PostingListReader {
             let missing_ranges = ranges_from_sorted_rows(&missing_rows);
             metrics.record_fts_payload_blocks_read(missing_rows.len());
             metrics.record_fts_payload_read_ranges(missing_ranges.len());
+            metrics.record_fts_payload_read_batches(1);
             let missing_batch = self
                 .v3_block_reader()?
                 .read_ranges(&missing_ranges, Some(&[POSTING_COL]))

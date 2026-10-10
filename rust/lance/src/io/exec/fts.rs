@@ -40,8 +40,9 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     FREQS_COLLECTED_METRIC, FTS_BLOCK_METADATA_ROWS_METRIC, FTS_BLOCKS_PRUNED_METRIC,
-    FTS_PAYLOAD_BLOCKS_READ_METRIC, FTS_PAYLOAD_READ_RANGES_METRIC,
-    FTS_POSITION_BLOCKS_READ_METRIC, FTS_REFINEMENT_BATCHES_METRIC, MetricsCollector,
+    FTS_PAYLOAD_BLOCKS_READ_METRIC, FTS_PAYLOAD_READ_BATCHES_METRIC,
+    FTS_PAYLOAD_READ_RANGES_METRIC, FTS_POSITION_BLOCKS_READ_METRIC, FTS_REFINEMENT_BATCHES_METRIC,
+    MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -174,6 +175,7 @@ pub struct FtsIndexMetrics {
     fts_blocks_pruned: Count,
     fts_payload_read_ranges: Count,
     fts_refinement_batches: Count,
+    fts_payload_read_batches: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -193,6 +195,7 @@ impl FtsIndexMetrics {
             fts_blocks_pruned: metrics.new_count(FTS_BLOCKS_PRUNED_METRIC, partition),
             fts_payload_read_ranges: metrics.new_count(FTS_PAYLOAD_READ_RANGES_METRIC, partition),
             fts_refinement_batches: metrics.new_count(FTS_REFINEMENT_BATCHES_METRIC, partition),
+            fts_payload_read_batches: metrics.new_count(FTS_PAYLOAD_READ_BATCHES_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -253,6 +256,10 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_fts_refinement_batches(&self, num_batches: usize) {
         self.fts_refinement_batches.add(num_batches);
+    }
+
+    fn record_fts_payload_read_batches(&self, num_batches: usize) {
+        self.fts_payload_read_batches.add(num_batches);
     }
 }
 

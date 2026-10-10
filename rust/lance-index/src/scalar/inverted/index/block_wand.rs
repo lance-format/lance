@@ -17,29 +17,11 @@ impl V3TermPlan {
         let end = self
             .blocks
             .partition_point(|block| block.first_doc_id <= last);
-        self.blocks[start..end]
-            .iter()
-            .enumerate()
-            .map(move |(offset, block)| V3BlockMeta {
-                term_idx: self.term_idx,
-                block_idx: start + offset,
-                block_row: self.block_start + start + offset,
-                block_max_score: block.block_max_score,
-            })
-    }
-
-    fn window_bound(&self, first: u32, last: u32) -> Option<f32> {
-        let block = self.overlapping_blocks(first, last).next()?;
-        if let Some(points) = self.refined_blocks.get(&block.block_idx) {
-            let start = points.partition_point(|(doc, _)| *doc < first);
-            let end = points.partition_point(|(doc, _)| *doc <= last);
-            points[start..end]
-                .iter()
-                .map(|(_, score)| *score)
-                .reduce(f32::max)
-        } else {
-            Some(block.block_max_score)
-        }
+        (start..end).map(move |block_idx| V3BlockMeta {
+            term_idx: self.term_idx,
+            block_idx,
+            block_row: self.block_start + block_idx,
+        })
     }
 }
 
@@ -47,44 +29,54 @@ impl V3TermPlan {
 /// at most one block to each window. Refined sparse blocks contribute only at
 /// their actual document ids, rather than inflating the bound across gaps.
 pub(super) fn search_windows(terms: &[V3TermPlan], operator: Operator) -> Vec<V3Window> {
-    let mut boundaries = terms
-        .iter()
-        .flat_map(|term| term.blocks.iter())
-        .flat_map(|block| {
-            [
-                u64::from(block.first_doc_id),
-                u64::from(block.last_doc_id) + 1,
-            ]
-        })
-        .collect::<Vec<_>>();
-    for term in terms {
-        boundaries.extend(
-            term.refined_blocks
-                .values()
-                .flatten()
-                .flat_map(|(doc, _)| [u64::from(*doc), u64::from(*doc) + 1]),
-        );
+    let mut events = Vec::new();
+    for (term_idx, term) in terms.iter().enumerate() {
+        for (block_idx, block) in term.blocks.iter().enumerate() {
+            if let Some(points) = term.refined_blocks.get(&block_idx) {
+                for &(doc, score) in points {
+                    events.push((u64::from(doc), term_idx, Some(score)));
+                    events.push((u64::from(doc) + 1, term_idx, None));
+                }
+            } else {
+                events.push((
+                    u64::from(block.first_doc_id),
+                    term_idx,
+                    Some(block.block_max_score),
+                ));
+                events.push((u64::from(block.last_doc_id) + 1, term_idx, None));
+            }
+        }
     }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    let mut windows = Vec::with_capacity(boundaries.len());
-    for interval in boundaries.windows(2) {
-        let first = interval[0] as u32;
-        let last = (interval[1] - 1) as u32;
+    // Sweep each term's changes once. Ends precede starts at the same id, so
+    // adjacent blocks and adjacent refined documents preserve their bounds.
+    events.sort_unstable_by_key(|(doc, term, bound)| (*doc, *term, bound.is_some()));
+    let mut bounds = vec![None; terms.len()];
+    let mut windows = Vec::new();
+    let mut offset = 0;
+    while offset < events.len() {
+        let first = events[offset].0;
+        while offset < events.len() && events[offset].0 == first {
+            let (_, term, bound) = events[offset];
+            bounds[term] = bound;
+            offset += 1;
+        }
+        let Some(&(next, _, _)) = events.get(offset) else {
+            break;
+        };
         let mut upper_bound = 0.0;
         let mut matching_terms = 0;
-        for term in terms {
-            if let Some(bound) = term.window_bound(first, last) {
-                upper_bound += bound;
-                matching_terms += 1;
-            }
+        // Sum in query-term order, matching candidate scoring and avoiding
+        // cumulative rounding error from adding/subtracting event deltas.
+        for bound in bounds.iter().flatten() {
+            upper_bound += bound;
+            matching_terms += 1;
         }
         if matching_terms == 0 || (operator == Operator::And && matching_terms != terms.len()) {
             continue;
         }
         windows.push(V3Window {
-            first_doc_id: first,
-            last_doc_id: last,
+            first_doc_id: first as u32,
+            last_doc_id: (next - 1) as u32,
             upper_bound,
         });
     }
@@ -109,14 +101,16 @@ pub(super) fn refinement_blocks(
     if terms.len() < 2 {
         return Vec::new();
     }
-    let mut active_rows = HashSet::new();
+    let mut windows = windows.collect::<Vec<_>>();
+    windows.sort_unstable_by_key(|window| window.first_doc_id);
+    let mut active_ranges = Vec::<(u32, u32)>::new();
     for window in windows {
-        for term in terms {
-            for block in term.overlapping_blocks(window.first_doc_id, window.last_doc_id) {
-                if !term.refined_blocks.contains_key(&block.block_idx) {
-                    active_rows.insert(block.block_row);
-                }
-            }
+        if let Some((_, last)) = active_ranges.last_mut()
+            && u64::from(window.first_doc_id) <= u64::from(*last) + 1
+        {
+            *last = (*last).max(window.last_doc_id);
+        } else {
+            active_ranges.push((window.first_doc_id, window.last_doc_id));
         }
     }
     let mut terms = terms.iter().collect::<Vec<_>>();
@@ -135,8 +129,12 @@ pub(super) fn refinement_blocks(
             let count = (term.posting_len as usize - block_idx * BLOCK_SIZE).min(BLOCK_SIZE);
             let span = u64::from(block.last_doc_id) - u64::from(block.first_doc_id) + 1;
             let block_row = term.block_start + block_idx;
+            let active_idx = active_ranges.partition_point(|(_, last)| *last < block.first_doc_id);
             if span <= count as u64 * 8
-                || !active_rows.contains(&block_row)
+                || term.refined_blocks.contains_key(&block_idx)
+                || active_ranges
+                    .get(active_idx)
+                    .is_none_or(|(first, _)| *first > block.last_doc_id)
                 || !seen.insert(block_row)
             {
                 continue;
@@ -145,7 +143,6 @@ pub(super) fn refinement_blocks(
                 term_idx: term.term_idx,
                 block_idx,
                 block_row,
-                block_max_score: block.block_max_score,
             });
             if selected.len() == MAX_REFINEMENT_BLOCKS {
                 return selected;
