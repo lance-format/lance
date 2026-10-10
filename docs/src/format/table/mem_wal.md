@@ -130,6 +130,7 @@ For example, position 5 is encoded as:
 
 An SSTable is the immutable result of flushing a MemTable.
 It is stored as a Lance dataset under its shard directory.
+Its table columns carry the base table's field ids as of the MemTable's schema, not ids numbered afresh, since readers and the compactor match them to the base table's columns by field id.
 
 !!! note
     Unlike a classic LSM sorted string table, a MemWAL SSTable is not sorted by key; random access is instead served by its BTree primary-key sidecar. It is called an SSTable because it is an immutable, persisted, indexed run.

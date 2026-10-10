@@ -426,6 +426,130 @@ mod evolve {
         writer.close().await.unwrap();
     }
 
+    /// A generation flushed after a column drop keeps the table's field ids,
+    /// whether or not the table has migrated to non-reusable ids.
+    ///
+    /// The drop leaves a gap in the table's ids. Reads and the merge into base
+    /// resolve a generation's columns by id, so numbering the generation's
+    /// fields afresh would hand one column's values to another.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_a_generation_flushed_after_a_drop_keeps_the_table_field_ids(
+        #[values(false, true)] non_reusable_ids: bool,
+    ) {
+        let (mut dataset, writer, shard_id, _) =
+            evolving_writer("evolve-drop", Some(&["text_fts"])).await;
+        if non_reusable_ids {
+            dataset.migrate_to_non_reusable_field_ids().await.unwrap();
+        }
+        dataset.drop_columns(&["vector"]).await.unwrap();
+        writer.evolve_to(&dataset).await.unwrap();
+        let dropped: ArrowSchema = dataset.schema().into();
+        writer
+            .put(vec![rows_under(&dropped, &[(100, "after the drop")])])
+            .await
+            .unwrap();
+        let generation = writer.active_memtable_ref().await.unwrap().generation;
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        let sstable = manifest
+            .sstables
+            .iter()
+            .find(|s| s.generation == generation)
+            .expect("the sealed generation is flushed");
+        let flushed = Dataset::open(&format!(
+            "{}/_mem_wal/{shard_id}/{}",
+            dataset.uri().trim_end_matches('/'),
+            sstable.path
+        ))
+        .await
+        .unwrap();
+        let ids = |schema: &crate::datatypes::Schema| -> Vec<(String, i32)> {
+            schema
+                .fields_pre_order()
+                .map(|field| (field.name.clone(), field.id))
+                .collect()
+        };
+        let table_ids = ids(dataset.schema());
+        assert!(
+            table_ids.iter().map(|(_, id)| *id).collect::<Vec<_>>()
+                != (0..table_ids.len() as i32).collect::<Vec<_>>(),
+            "the drop leaves a gap in the table's ids: {table_ids:?}"
+        );
+        let generation_ids: Vec<_> = ids(flushed.schema())
+            .into_iter()
+            .filter(|(name, _)| table_ids.iter().any(|(table, _)| table == name))
+            .collect();
+        assert_eq!(generation_ids, table_ids);
+        // The data files carry the same ids, so readers find each column.
+        let file_ids: Vec<i32> = flushed.get_fragments()[0].metadata().files[0]
+            .fields
+            .to_vec();
+        for (name, id) in &table_ids {
+            assert!(
+                file_ids.contains(id),
+                "{name} (id {id}) not in {file_ids:?}"
+            );
+        }
+        assert!(
+            !flushed.manifest.uses_non_reusable_field_ids(),
+            "the generation takes the table's ids without allocating its own"
+        );
+
+        // Read the row back from the flushed generation alone: by scan, by key,
+        // and through the generation's FTS index.
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use datafusion::prelude::{col, lit};
+        let mut snapshot =
+            ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
+        for sstable in &manifest.sstables {
+            snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
+        }
+        let scanner = || {
+            LsmScanner::without_base_table(
+                Arc::new(dropped.clone()),
+                dataset.uri(),
+                vec![snapshot.clone()],
+                vec!["id".to_string()],
+            )
+            .with_identity_schema(writer_schema_of(&dataset))
+        };
+        let rows = |batch: RecordBatch| -> Vec<(i64, String)> {
+            let ids = batch["id"].as_primitive::<Int64Type>();
+            let texts = batch["text"].as_string::<i32>();
+            (0..batch.num_rows())
+                .map(|i| (ids.value(i), texts.value(i).to_string()))
+                .collect()
+        };
+        let expected = vec![(100, "after the drop".to_string())];
+        assert_eq!(rows(scanner().try_into_batch().await.unwrap()), expected);
+        let by_key = scanner()
+            .filter_expr(col("id").eq(lit(100i64)))
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(rows(by_key), expected);
+        let by_text = scanner()
+            .full_text_search(
+                FullTextSearchQuery::new("drop".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            by_text["id"].as_primitive::<Int64Type>().values().to_vec(),
+            vec![100]
+        );
+        writer.close().await.unwrap();
+    }
+
     /// When the table maintains every index (an empty name list), a schema
     /// change keeps them all.
     #[tokio::test]
