@@ -699,13 +699,20 @@ impl RabitQuantizationStorage {
             super::layered::RQLayout::try_new(metadata.num_bits)?;
         } else if metadata.layered {
             super::layered::RQLayout::try_new(metadata.num_bits)?;
-            for name in [
+            // The bounds columns are loaded only for the scans that prune
+            // with them. Full precision prunes with the error factors when
+            // the file has them; a High scan of a store without the high
+            // bounds scores every row (see
+            // `distance_calculator_from_parts_with_ex`).
+            let mut required = vec![
                 RABIT_BLOCKED_EX_CODE_LO_COLUMN,
                 super::layered::HIGH_ADD_FACTORS_COLUMN,
                 super::layered::HIGH_SCALE_FACTORS_COLUMN,
-                super::layered::HIGH_BOUNDS_COLUMN,
-                super::layered::FULL_BOUNDS_COLUMN,
-            ] {
+            ];
+            if error_factors.is_none() {
+                required.push(super::layered::FULL_BOUNDS_COLUMN);
+            }
+            for name in required {
                 if batch.column_by_name(name).is_none() {
                     return Err(Error::invalid_input(format!(
                         "RabitQ layered index missing column {name}"
@@ -1068,6 +1075,11 @@ impl RabitQuantizationStorage {
                     query_factors.centered_query,
                     self.distance_type,
                 );
+            } else if rq_precision == super::layered::RQPrecision::High {
+                // A layered store loaded for full precision may leave the
+                // high bounds out. The error factors bound only the
+                // full-precision estimator, so fail closed: score every row.
+                calculator.error_factors = None;
             }
         }
         calculator
@@ -1708,7 +1720,9 @@ impl<'a> RabitDistCalculator<'a> {
                 .min(1.0)
         };
         let errors = values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .enumerate()
             .map(|(row, b)| {
                 let add_scale = f64::from(self.add_factor_scale).abs();
@@ -3609,8 +3623,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
     }
 
     /// Load only the sign plane (row ids, packed sign codes, binary and error
-    /// factors, bound columns) of a layered multi-bit partition. The result
-    /// supports [`RabitDistCalculator::full_sign_stage_with_scratch`] and, with
+    /// factors, and the bounds columns when it holds them) of a layered
+    /// multi-bit partition. The result supports
+    /// [`RabitDistCalculator::full_sign_stage_with_scratch`] and, with
     /// gathered rows, [`RabitQuantizationStorage::dist_calculator_with_ex_rows`];
     /// it never scores rows through the eager top-k scans.
     fn try_from_sign_plane_for_full(

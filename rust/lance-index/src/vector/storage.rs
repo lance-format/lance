@@ -4,18 +4,20 @@
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
 use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
-use crate::vector::bq::layered::{PlaneBatch, PlaneKey, RQLayout};
+use crate::vector::bq::layered::{PlaneBatch, PlaneKey, RQLayout, SIGN_BOUNDS_PLANE, SignBounds};
 use crate::vector::bq::layered_stats;
+use crate::vector::bq::resident::{ResidentColumnStore, is_resident};
+use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array, cast::AsArray,
-    types::UInt8Type,
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array, UInt64Array,
+    cast::AsArray, types::UInt8Type,
 };
 use arrow_schema::SchemaRef;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
-use lance_core::cache::WeakLanceCache;
+use lance_core::cache::{CacheTier, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
@@ -23,6 +25,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
 use lance_io::ReadBatchParams;
+use lance_io::object_store::{DEFAULT_CLOUD_IO_PARALLELISM, ObjectStore};
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
@@ -31,9 +34,10 @@ use std::{
     any::Any,
     borrow::Cow,
     collections::{BinaryHeap, HashMap, HashSet},
+    hash::Hash,
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::{Arc, LazyLock, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex, OnceLock, Weak},
     time::Instant,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -57,6 +61,11 @@ use super::pairwise::{
 };
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
+
+pub use crate::vector::bq::resident::{
+    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, resident_columns_bytes,
+    resident_store_charge, resident_store_count, resident_store_is_live,
+};
 
 /// Coalesce source-index reads independently of the scoring vector batch size.
 const PAIRWISE_READ_BATCH_SIZE: usize = 8192;
@@ -626,13 +635,82 @@ impl DeepSizeOf for PlaneAccess {
     }
 }
 
+/// Identifies an index file across the process: the index's UUID, and the
+/// prefix of the object store that holds the file (its scheme and bucket, or
+/// whatever else tells the store apart; see [`ObjectStore::store_prefix`])
+/// with the file's path in that store. Every open of the file binds to the
+/// runtime handles registered under it, so that indexes opened at once, a
+/// re-open while an older index still runs, and a state read back from a
+/// persistent cache tier share them: the resident store
+/// ([`ResidentColumns::in_index_cache`]) and the lazy scan's far gather
+/// permits ([`IvfQuantizationStorage::with_index_file`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexFileKey(Arc<IndexFileLocation>);
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct IndexFileLocation {
+    index_uuid: String,
+    store_prefix: String,
+    path: String,
+}
+
+impl IndexFileKey {
+    /// The file at `path` in the object store with prefix `store_prefix`,
+    /// of the index with UUID `index_uuid`.
+    pub fn new(index_uuid: &str, store_prefix: &str, path: &str) -> Self {
+        Self(Arc::new(IndexFileLocation {
+            index_uuid: index_uuid.to_owned(),
+            store_prefix: store_prefix.to_owned(),
+            path: path.to_owned(),
+        }))
+    }
+
+    /// The UUID of the index the file belongs to.
+    pub(crate) fn index_uuid(&self) -> &str {
+        &self.0.index_uuid
+    }
+
+    /// The prefix of the object store that holds the file.
+    pub(crate) fn store_prefix(&self) -> &str {
+        &self.0.store_prefix
+    }
+
+    /// The file's path in its object store.
+    pub(crate) fn path(&self) -> &str {
+        &self.0.path
+    }
+}
+
+/// Values shared process-wide by key and held weakly: a value lives while
+/// anything outside the registry holds it.
+pub(crate) type WeakRegistry<K, V> = Mutex<HashMap<K, Weak<V>>>;
+
+/// The value `registry` holds for `key` while anything else still holds it,
+/// else the one `create` makes, registered for the next caller. Entries of
+/// dropped values are pruned whenever a value is registered.
+pub(crate) fn shared_by_key<K: Eq + Hash + Clone, V>(
+    registry: &LazyLock<WeakRegistry<K, V>>,
+    key: &K,
+    create: impl FnOnce() -> Arc<V>,
+) -> Arc<V> {
+    let mut values = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = values.get(key).and_then(Weak::upgrade) {
+        return value;
+    }
+    let value = create();
+    values.retain(|_, held| held.strong_count() > 0);
+    values.insert(key.clone(), Arc::downgrade(&value));
+    value
+}
+
 /// Runtime promotion history shared by reconstructions of the same cached index.
 /// This contains no readers or object-store handles and is not persisted to disk.
 #[derive(Debug, Clone, Default)]
 pub struct PlaneAccessTracker {
     /// Cascade candidate reads, see [`PLANE_PROMOTION_READS`].
     accesses: Arc<Mutex<HashMap<(usize, u8), PlaneAccess>>>,
-    /// Background promotions of the lazy full-precision scan.
+    /// Background promotions and far gather permits of the lazy
+    /// full-precision scan.
     lazy: Arc<LazyPromotionState>,
 }
 
@@ -654,6 +732,9 @@ struct LazyPromotionState {
     history: Mutex<LazyPromotionHistory>,
     /// Bounds concurrent promotions; sized by the first promoting query's config.
     permits: OnceLock<Arc<Semaphore>>,
+    /// Bounds the lazy scan's gathers in flight beyond the ordinary window
+    /// across queries; see [`IvfQuantizationStorage::lazy_far_permits`].
+    far_permits: Mutex<Option<LazyFarPermits>>,
 }
 
 impl DeepSizeOf for LazyPromotionState {
@@ -686,6 +767,78 @@ impl Drop for LazyPromotionTicket {
     }
 }
 
+/// The lazy far gather pools of the open index files, by file and pool size;
+/// see [`LazyFarPermits::for_file`].
+static FAR_PERMIT_POOLS: LazyLock<WeakRegistry<(IndexFileKey, usize), Semaphore>> =
+    LazyLock::new(Default::default);
+
+/// The permits of an index's lazy gathers issued beyond the ordinary window
+/// ([`LAZY_FAR_WINDOW_ENV`]), shared by the index's queries and by the
+/// reconstructions of its cached state, and by every open of its file once
+/// bound to it ([`IvfQuantizationStorage::with_index_file`]). A gather holds
+/// its permit until its reads return; dropping the permit, also when the
+/// gather is cancelled, returns it to the pool.
+#[derive(Debug, Clone)]
+pub struct LazyFarPermits {
+    semaphore: Arc<Semaphore>,
+    /// Permits the pool holds while none is taken.
+    size: usize,
+}
+
+impl LazyFarPermits {
+    /// A pool of `size` permits, at most [`Semaphore::MAX_PERMITS`].
+    pub fn try_new(size: usize) -> Result<Self> {
+        if size > Semaphore::MAX_PERMITS {
+            return Err(Error::invalid_input(format!(
+                "a lazy far gather pool of {size} permits exceeds the {} a pool can hold",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        Ok(Self {
+            semaphore: Arc::new(Semaphore::new(size)),
+            size,
+        })
+    }
+
+    /// The pool of `size` permits that every open of index file `file` in
+    /// the process shares: the live one while an index, a cached state or a
+    /// taken permit holds it, else a new one. Keyed by size too, so that an
+    /// index whose config sets another size (tests replace it) never draws
+    /// from a pool of the old size.
+    fn for_file(file: &IndexFileKey, size: usize) -> Result<Self> {
+        let new = Self::try_new(size)?;
+        let semaphore = shared_by_key(&FAR_PERMIT_POOLS, &(file.clone(), size), || new.semaphore);
+        Ok(Self { semaphore, size })
+    }
+
+    /// A permit, if one is free now.
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    /// Wait until a permit is free and take it. Dropping the future before
+    /// then takes none.
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+        self.semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::internal("the lazy far gather permit pool was closed"))
+    }
+
+    /// Permits the pool holds while none is taken.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Permits taken now, i.e. gathers issued beyond the ordinary window
+    /// whose reads have not returned.
+    pub fn in_flight(&self) -> usize {
+        // Permits only return to the pool when dropped, so at most `size` are free.
+        self.size - self.semaphore.available_permits()
+    }
+}
+
 /// Enables the lazy layered full-precision scan (`0` or `1`).
 pub const LAZY_FULL_ENV: &str = "LANCE_RQ_LAZY_FULL";
 /// Staleness window W: a gather may be issued while up to W earlier probes are unscored.
@@ -696,8 +849,13 @@ pub const LAZY_DENSE_ENV: &str = "LANCE_RQ_LAZY_DENSE";
 pub const LAZY_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_MAX_RUNS";
 /// Aligned sparse bytes, as a fraction of the plane, from which a whole read is cheaper.
 pub const LAZY_DENSE_BYTES_FRACTION_ENV: &str = "LANCE_RQ_LAZY_DENSE_BYTES_FRACTION";
-/// Background promotion policy: `off` or `bg:N` (promote after N sparse
-/// gathers). Backends that gate plane admission never promote.
+/// Background promotion policy: `off` (default), `auto` or `bg:N` (promote
+/// after N sparse gathers). `auto` is `off` for an
+/// [`OriginLatencyClass::High`] origin and `bg:1` otherwise, resolved when an
+/// index opens (see [`LazyPromotion::resolve`]). The default is `off` on every
+/// origin because the V10 workload measured no gain from promotions on local
+/// NVMe either, at the cost of extra plane reads. Backends that gate plane
+/// admission never promote.
 pub const LAZY_PROMOTE_ENV: &str = "LANCE_RQ_LAZY_PROMOTE";
 /// Most background promotions running at once.
 pub const LAZY_PROMOTE_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_PROMOTE_INFLIGHT";
@@ -710,30 +868,62 @@ pub const LAZY_INLINE_ROWS_ENV: &str = "LANCE_RQ_LAZY_INLINE_ROWS";
 /// dense anyway (large `k`), or when the heap is still not full after the
 /// probes that hold `k` rows were scored (filters), where waiting would issue
 /// the gathers one probe at a time. `0` is an ablation knob: such gathers
-/// wait for the heap to fill or for every earlier probe to be scored. With
-/// [`LAZY_DENSE_TO_EAGER_ENV`] on, the large-`k` probes of the queries it
-/// routes are scored eagerly instead and never gathered.
+/// wait for the heap to fill or for every earlier probe to be scored. The
+/// large-`k` probes that [`LAZY_DENSE_TO_EAGER_ENV`] routes are scored
+/// eagerly instead and never gathered.
 pub const LAZY_EAGER_BEFORE_FULL_ENV: &str = "LANCE_RQ_LAZY_EAGER_BEFORE_FULL";
-/// Whether a probe that `k` and the partition sizes predict to be gathered
-/// whole is loaded and scored by the eager scan instead (`0` or `1`, default
-/// `1`): a probe scored before the probes ahead of it can hold `k` rows,
-/// whose gather selects every row, and every probe when the gathers issued
-/// once the heap fills are expected to read whole planes (large `k`). The
-/// eager load reads the partition's planes together (all at once on backends
-/// that do not gate plane admission), with as many probes in flight as the
-/// eager scan prepares, instead of the sign plane at staging and the ex
-/// planes a round trip later within the gather window. Only queries without
-/// a prefilter (deletions included) or upper distance bound are routed: a
-/// gather with an infinite threshold selects only the accepted rows below
-/// the bound, which the probe's sign plane tells. The `sparse` gather policy
-/// ([`LAZY_DENSE_ENV`]) never reads a whole plane and routes no probe. `0` is
-/// an ablation knob: such probes take the lazy pipeline.
+/// Which probes that `k` and the partition sizes predict to be gathered
+/// whole are loaded and scored by the eager scan instead: `off`, `origin`
+/// (default) or `all` (see [`DenseToEager`]; the flag's former `0` and `1`
+/// mean `off` and `all`). A probe is predicted dense when it is scored
+/// before the probes ahead of it can hold `k` rows, so its gather selects
+/// every row, and every probe is when the gathers issued once the heap fills
+/// are expected to read whole planes (large `k`). The eager load reads the
+/// partition's planes together (all at once on backends that do not gate
+/// plane admission), with as many probes in flight as the eager scan
+/// prepares, instead of the sign plane at staging and the ex planes a round
+/// trip later within the gather window. Only queries without a prefilter
+/// (deletions included) or upper distance bound are routed: a gather with an
+/// infinite threshold selects only the accepted rows below the bound, which
+/// the probe's sign plane tells. The `sparse` gather policy
+/// ([`LAZY_DENSE_ENV`]) never reads a whole plane and routes no probe.
 pub const LAZY_DENSE_TO_EAGER_ENV: &str = "LANCE_RQ_LAZY_DENSE_TO_EAGER";
 /// Most coalesced row runs a sparse gather reads from the origin file when the
 /// persistent tier does not hold the plane; with more, it loads (and admits)
 /// the whole plane instead. Unlimited by default, and ignored by backends that
 /// gate plane admission, which would not admit the plane.
 pub const LAZY_ORIGIN_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_MAX_RUNS";
+/// Largest gap in bytes between the row runs of a sparse gather that reads the
+/// origin file, because the persistent tier does not hold the plane, that one
+/// request still spans: `auto` (default) or a byte count. Each run is cut back
+/// out of the request before decoding, so only the requests and the bytes
+/// read change, not the rows returned. `auto` is
+/// [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] for an [`OriginLatencyClass::High`]
+/// origin and the object store's block size, the gap of every other read,
+/// otherwise (see [`LazyOriginGap`]).
+pub const LAZY_ORIGIN_GAP_BYTES_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_GAP_BYTES";
+/// The gap `auto` gives the sparse origin reads of an
+/// [`OriginLatencyClass::High`] origin. S3 latency per request is about flat
+/// from 60 KiB to 700 KiB, so merging runs up to 256 KiB apart makes about a
+/// third fewer S3 requests than the 64 KiB block size. Lazy scans on S3 were
+/// faster with it than with 1 MiB, which makes fewer requests but reads more
+/// bytes between the runs.
+pub const HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES: u64 = 256 * 1024;
+/// Staleness window of the gathers of probes that read an ex plane from an
+/// [`OriginLatencyClass::High`] origin, because no cache tier held their high
+/// or low plane when they were staged (default 64): such a gather may be
+/// issued while up to this many earlier probes are unscored, instead of
+/// [`LAZY_WINDOW_ENV`]'s. A gather issued beyond the ordinary window holds a
+/// permit of the index's pool ([`LAZY_FAR_INFLIGHT_ENV`]) until its reads
+/// return; when none is free it waits for a permit or for the ordinary
+/// window, whichever comes first, so it is never issued later than without
+/// this window. A value no larger than [`LAZY_WINDOW_ENV`]'s turns it off, and
+/// it never applies to a low-latency origin. Results are the same either way.
+pub const LAZY_FAR_WINDOW_ENV: &str = "LANCE_RQ_LAZY_FAR_WINDOW";
+/// Most gathers of one index, over all its queries, issued beyond the
+/// ordinary window under [`LAZY_FAR_WINDOW_ENV`] whose reads have not
+/// returned (default 64, at least 1). The pool is sized once per index.
+pub const LAZY_FAR_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_FAR_INFLIGHT";
 /// Benchmark knob (`0` or `1`, default `0`): `1` loads a layered partition's
 /// sign plane before its ex planes on backends that do not gate plane
 /// admission too, as gated backends always do, instead of loading all three
@@ -747,6 +937,12 @@ const DEFAULT_LAZY_PROMOTE_READS: u32 = 1;
 const DEFAULT_LAZY_PROMOTE_INFLIGHT: usize = 4;
 /// About the rows one ~100µs CPU dispatch would score.
 const DEFAULT_LAZY_INLINE_ROWS: usize = 512;
+/// Every probe of a 64-probe query. On S3, a window of 64 for every gather
+/// cut mean latency to 0.69–0.81x of the ordinary window's at k=100 and
+/// k=1000, while 32 gave MS MARCO no gain.
+const DEFAULT_LAZY_FAR_WINDOW: usize = 64;
+/// As many as Lance's default I/O parallelism for cloud object stores.
+const DEFAULT_LAZY_FAR_INFLIGHT: usize = DEFAULT_CLOUD_IO_PARALLELISM;
 
 /// [`SEQUENTIAL_PLANE_LOADS_ENV`], read once per process.
 static SEQUENTIAL_PLANE_LOADS: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
@@ -766,6 +962,316 @@ fn sequential_plane_loads_from(value: Option<&str>) -> Result<bool> {
     value.map_or(Ok(false), |value| {
         parse_flag(SEQUENTIAL_PLANE_LOADS_ENV, value)
     })
+}
+
+/// Latency class of an IVF_RQ index's origin reads, those that no cache tier
+/// serves: `auto` (default), `low` or `high`. `auto` takes the class the
+/// session opening the index declares, and without one the class of its
+/// object store: high for a cloud object store ([`ObjectStore::is_cloud`]) and
+/// low for local files and memory. A process whose object store is wrapped in
+/// a local cache that also caches index files declares `low` on its session
+/// instead, since the wrapper hides that from the store's scheme; `low` or
+/// `high` here overrides every session. Read once per process; the class is
+/// resolved when an index opens, see [`OriginLatencyClass::resolve_with_hint`].
+pub const ORIGIN_LATENCY_ENV: &str = "LANCE_RQ_ORIGIN_LATENCY";
+
+/// How slow an index's origin reads are. Reader policies that trade extra
+/// bytes or background work for fewer origin requests default to on only for
+/// [`Self::High`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum OriginLatencyClass {
+    /// Local files and memory.
+    #[default]
+    Low,
+    /// Cloud object stores, where every request costs a network round trip.
+    High,
+}
+
+impl OriginLatencyClass {
+    /// The class `auto` resolves to for an index read from `object_store`.
+    pub fn of_store(object_store: &ObjectStore) -> Self {
+        if object_store.is_cloud() {
+            Self::High
+        } else {
+            Self::Low
+        }
+    }
+
+    /// The class of an index read from `object_store` under `setting`, the
+    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, when no session
+    /// declares one.
+    pub fn resolve(setting: Option<Self>, object_store: &ObjectStore) -> Self {
+        Self::resolve_with_hint(setting, None, object_store)
+    }
+
+    /// The class of an index read from `object_store` under `setting`, the
+    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, opened by a
+    /// session that declares `hint` for the indexes it opens (`None` when it
+    /// declares none). An explicit setting wins over the hint, and the hint
+    /// over the store's own class ([`Self::of_store`]): only the serving
+    /// process knows whether a wrapper around the store serves index reads
+    /// from a local cache.
+    pub fn resolve_with_hint(
+        setting: Option<Self>,
+        hint: Option<Self>,
+        object_store: &ObjectStore,
+    ) -> Self {
+        setting
+            .or(hint)
+            .unwrap_or_else(|| Self::of_store(object_store))
+    }
+
+    /// The knob's spelling of the class: `low` or `high`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+        }
+    }
+
+    /// Whether reading planes that the index cache holds in `tiers` makes a
+    /// request to a slow origin: this class is [`Self::High`] and some plane
+    /// is [`CacheTier::Absent`]. A lazy probe whose ex planes are such is
+    /// counted in `s3_bound_probes`.
+    pub fn reads_slow_origin(self, tiers: &[CacheTier]) -> bool {
+        self == Self::High && tiers.contains(&CacheTier::Absent)
+    }
+}
+
+impl std::fmt::Display for OriginLatencyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`ORIGIN_LATENCY_ENV`], read once per process.
+static ORIGIN_LATENCY: LazyLock<std::result::Result<Option<OriginLatencyClass>, String>> =
+    LazyLock::new(|| {
+        origin_latency_from(std::env::var(ORIGIN_LATENCY_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The class [`ORIGIN_LATENCY_ENV`] sets, `None` for `auto`. The variable is
+/// read once per process; an invalid value fails here and every IVF_RQ index
+/// open.
+pub fn origin_latency_setting() -> Result<Option<OriginLatencyClass>> {
+    ORIGIN_LATENCY.clone().map_err(Error::invalid_input)
+}
+
+fn origin_latency_from(value: Option<&str>) -> Result<Option<OriginLatencyClass>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim() {
+        "auto" => Ok(None),
+        "low" => Ok(Some(OriginLatencyClass::Low)),
+        "high" => Ok(Some(OriginLatencyClass::High)),
+        _ => Err(Error::invalid_input(format!(
+            "{ORIGIN_LATENCY_ENV}={value:?} is invalid, expected auto, low or high"
+        ))),
+    }
+}
+
+/// Where a layered index's cache keeps the estimator bounds columns:
+/// `lazy` (default) in their own plane entry, read only by High precision and
+/// by full precision on a file without error factors, or `eager` in the sign
+/// plane, which every scan reads (see [`SignBounds`]). Results are the same
+/// either way. Read once per process; the placement is resolved when a
+/// layered index opens.
+pub const SIGN_BOUNDS_ENV: &str = "LANCE_RQ_SIGN_BOUNDS";
+
+/// [`SIGN_BOUNDS_ENV`], read once per process.
+static SIGN_BOUNDS: LazyLock<std::result::Result<SignBounds, String>> = LazyLock::new(|| {
+    sign_bounds_from(std::env::var(SIGN_BOUNDS_ENV).ok().as_deref()).map_err(|err| err.to_string())
+});
+
+/// The bounds placement [`SIGN_BOUNDS_ENV`] sets. The variable is read once
+/// per process; an invalid value fails here and every layered IVF_RQ index
+/// open.
+pub fn sign_bounds_setting() -> Result<SignBounds> {
+    SIGN_BOUNDS.clone().map_err(Error::invalid_input)
+}
+
+fn sign_bounds_from(value: Option<&str>) -> Result<SignBounds> {
+    let Some(value) = value else {
+        return Ok(SignBounds::default());
+    };
+    match value.trim() {
+        "lazy" => Ok(SignBounds::Lazy),
+        "eager" => Ok(SignBounds::Eager),
+        _ => Err(Error::invalid_input(format!(
+            "{SIGN_BOUNDS_ENV}={value:?} is invalid, expected lazy or eager"
+        ))),
+    }
+}
+
+/// Whether an IVF_RQ index, native or layered, keeps the small columns of its
+/// storage file (row ids and factors) in memory, so that partition and plane
+/// reads fetch only the code and bounds columns from the file: `auto`
+/// (default), `on` or `off`. `auto` is on for [`OriginLatencyClass::High`],
+/// where each column read is a request, when the cache can admit the store
+/// (see [`ResidentColumnsSetting::admits`]). The store is an entry of the
+/// index cache, charged in its budget and kept in RAM while an index of the
+/// file is live (see [`ResidentColumns`]); [`resident_columns_bytes`] gives
+/// its size without I/O. Results are the same either way. Read once per
+/// process; resolved when an index opens.
+pub const RESIDENT_COLUMNS_ENV: &str = "LANCE_RQ_RESIDENT_COLUMNS";
+
+/// The size of an IVF_RQ storage file's resident store, known without
+/// reading it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResidentStoreSize {
+    /// Bytes of values the store holds ([`resident_columns_bytes`]).
+    pub bytes: u64,
+    /// Bytes an index cache charges for the loaded store
+    /// ([`resident_store_charge`]).
+    pub charge: u64,
+}
+
+/// Whether a resident store an index cache charges `charge` bytes for fits
+/// the largest entry the cache admits, `max_entry_bytes`
+/// ([`lance_core::cache::CacheBackend::max_entry_bytes`]; `None`: the backend reports no limit). Live index handles keep their allocation even when
+/// the cache evicts the entry, so this is not a bound on process memory.
+pub fn resident_store_fits(charge: u64, max_entry_bytes: Option<u64>) -> bool {
+    max_entry_bytes.is_none_or(|max| charge <= max)
+}
+
+/// The value of [`RESIDENT_COLUMNS_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentColumnsSetting {
+    /// On for an index whose origin reads are [`OriginLatencyClass::High`].
+    #[default]
+    Auto,
+    /// On whatever the origin.
+    On,
+    /// Off: reads fetch every column they return from the file.
+    Off,
+}
+
+impl ResidentColumnsSetting {
+    /// Whether an index whose origin reads are `class` keeps its small
+    /// columns resident, before [`Self::admits`] sizes the store.
+    pub fn resolve(self, class: OriginLatencyClass) -> bool {
+        match self {
+            Self::Auto => class == OriginLatencyClass::High,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    /// Whether a resident store of `store`'s size may be kept in an index
+    /// cache whose largest admissible entry is `max_entry_bytes`: never when
+    /// `off`, and only a store with some columns otherwise; `auto` also
+    /// requires the bytes the cache charges for it to fit its entry limit
+    /// ([`resident_store_fits`]). An index keeps its small columns resident
+    /// when both this and [`Self::resolve`] hold.
+    pub fn admits(self, store: ResidentStoreSize, max_entry_bytes: Option<u64>) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => store.bytes > 0,
+            Self::Auto => store.bytes > 0 && resident_store_fits(store.charge, max_entry_bytes),
+        }
+    }
+
+    /// The knob's spelling of the setting: `auto`, `on` or `off`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentColumnsSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`RESIDENT_COLUMNS_ENV`], read once per process.
+static RESIDENT_COLUMNS: LazyLock<std::result::Result<ResidentColumnsSetting, String>> =
+    LazyLock::new(|| {
+        resident_columns_from(std::env::var(RESIDENT_COLUMNS_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The setting of [`RESIDENT_COLUMNS_ENV`]. The variable is read once per
+/// process; an invalid value fails here and every IVF_RQ index open.
+pub fn resident_columns_setting() -> Result<ResidentColumnsSetting> {
+    RESIDENT_COLUMNS.clone().map_err(Error::invalid_input)
+}
+
+fn resident_columns_from(value: Option<&str>) -> Result<ResidentColumnsSetting> {
+    let Some(value) = value else {
+        return Ok(ResidentColumnsSetting::default());
+    };
+    match value.trim() {
+        "auto" => Ok(ResidentColumnsSetting::Auto),
+        "on" => Ok(ResidentColumnsSetting::On),
+        "off" => Ok(ResidentColumnsSetting::Off),
+        _ => Err(Error::invalid_input(format!(
+            "{RESIDENT_COLUMNS_ENV}={value:?} is invalid, expected auto, on or off"
+        ))),
+    }
+}
+
+/// How long an IVF_RQ index file's resident store is kept in RAM: `index`
+/// (default) or `process`. Read once per process; an invalid value fails
+/// every IVF_RQ index open.
+pub const RESIDENT_LIFETIME_ENV: &str = "LANCE_RQ_RESIDENT_LIFETIME";
+
+/// The value of [`RESIDENT_LIFETIME_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentLifetime {
+    /// Held by the live indexes of the file and by an ordinary cache entry.
+    /// Eviction frees the store after its last index handle drops.
+    #[default]
+    Index,
+    /// Also held by a process-wide strong reference after loading. The
+    /// cache entry remains evictable; process ownership is outside its budget.
+    Process,
+}
+
+impl ResidentLifetime {
+    /// The knob's spelling of the lifetime: `index` or `process`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Process => "process",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentLifetime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`RESIDENT_LIFETIME_ENV`], read once per process.
+static RESIDENT_LIFETIME: LazyLock<std::result::Result<ResidentLifetime, String>> =
+    LazyLock::new(|| {
+        resident_lifetime_from(std::env::var(RESIDENT_LIFETIME_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The setting of [`RESIDENT_LIFETIME_ENV`].
+pub fn resident_lifetime_setting() -> Result<ResidentLifetime> {
+    RESIDENT_LIFETIME.clone().map_err(Error::invalid_input)
+}
+
+fn resident_lifetime_from(value: Option<&str>) -> Result<ResidentLifetime> {
+    let Some(value) = value else {
+        return Ok(ResidentLifetime::default());
+    };
+    match value.trim() {
+        "index" => Ok(ResidentLifetime::Index),
+        "process" => Ok(ResidentLifetime::Process),
+        _ => Err(Error::invalid_input(format!(
+            "{RESIDENT_LIFETIME_ENV}={value:?} is invalid, expected index or process"
+        ))),
+    }
 }
 
 /// Parse a `0`/`1` (or `false`/`true`) environment flag.
@@ -804,13 +1310,129 @@ pub enum DenseGatherMode {
 }
 
 /// Whether sparse gathers promote whole planes into RAM in the background.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LazyPromotion {
+    /// [`Self::Off`] for an [`OriginLatencyClass::High`] origin and `bg:1`
+    /// otherwise; see [`Self::resolve`]. An index resolves it when it opens,
+    /// so a scan never sees it (and would promote nothing).
+    Auto,
     /// Only whole-plane gathers admit planes.
+    #[default]
     Off,
     /// Promote a plane after this many sparse gathers of it while not
     /// resident, on backends that do not gate plane admission.
     Background { reads: u32 },
+}
+
+impl LazyPromotion {
+    /// The policy of an index whose origin is `class`: [`Self::Auto`]
+    /// resolves, an explicit policy applies whatever the origin.
+    ///
+    /// A promotion reads the whole plane again, from the origin when no
+    /// cache tier holds it, and its admission evicts sign planes that later
+    /// queries then miss. On S3 that costs more origin requests than the
+    /// promoted planes save: without promotions the lazy scan of MS MARCO at
+    /// k=100 made 175 instead of 235 requests per query and read 12.0
+    /// instead of 21.6 MiB.
+    pub fn resolve(self, class: OriginLatencyClass) -> Self {
+        match (self, class) {
+            (Self::Auto, OriginLatencyClass::High) => Self::Off,
+            (Self::Auto, OriginLatencyClass::Low) => Self::Background {
+                reads: DEFAULT_LAZY_PROMOTE_READS,
+            },
+            (policy, _) => policy,
+        }
+    }
+}
+
+/// The knob's spelling of the policy: `auto`, `off` or `bg:N`.
+impl std::fmt::Display for LazyPromotion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Off => f.write_str("off"),
+            Self::Background { reads } => write!(f, "bg:{reads}"),
+        }
+    }
+}
+
+/// The value of [`LAZY_DENSE_TO_EAGER_ENV`]: which probes predicted to be
+/// gathered whole, of non-empty partitions whose high and low planes are not
+/// both resident, the eager scan loads and scores instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum DenseToEager {
+    /// None: every such probe takes the lazy pipeline.
+    Off,
+    /// Those whose high or low plane no cache tier holds on an
+    /// [`OriginLatencyClass::High`] origin, where the eager load saves a
+    /// round trip to the origin (see
+    /// [`OriginLatencyClass::reads_slow_origin`]). Where the planes are
+    /// local, loading them eagerly saves little and delays scoring: routing
+    /// every such probe on NVMe raised the p99 of Coyo k=10000 queries from
+    /// 68.4 to 90.5 ms.
+    #[default]
+    Origin,
+    /// Every one, wherever its planes are.
+    All,
+}
+
+impl DenseToEager {
+    /// Whether a predicted-dense probe of a non-empty partition whose high
+    /// and low planes are in `tiers`, not both resident, is loaded and
+    /// scored by the eager scan on an origin of `class`.
+    pub fn routes(self, class: OriginLatencyClass, tiers: &[CacheTier]) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Origin => class.reads_slow_origin(tiers),
+            Self::All => true,
+        }
+    }
+
+    /// The knob's spelling of the mode: `off`, `origin` or `all`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Origin => "origin",
+            Self::All => "all",
+        }
+    }
+}
+
+impl std::fmt::Display for DenseToEager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The value of [`LAZY_ORIGIN_GAP_BYTES_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LazyOriginGap {
+    /// [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] for an
+    /// [`OriginLatencyClass::High`] origin, where every request is a round
+    /// trip; the object store's block size otherwise.
+    #[default]
+    Auto,
+    /// This many bytes, whatever the origin.
+    Bytes(u64),
+}
+
+impl LazyOriginGap {
+    /// The gap within which the sparse origin reads of an index whose origin
+    /// is `class` merge row runs into one request, or `None` for the object
+    /// store's block size, which every other read of the file uses.
+    pub fn coalesce_gap(self, class: OriginLatencyClass) -> Option<u64> {
+        match (self, class) {
+            (Self::Bytes(bytes), _) => Some(bytes),
+            (Self::Auto, OriginLatencyClass::High) => Some(HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES),
+            (Self::Auto, OriginLatencyClass::Low) => None,
+        }
+    }
+
+    /// The gap in bytes for an origin of `class` whose object store merges
+    /// ranges within `block_size` bytes by default.
+    pub fn resolve(self, class: OriginLatencyClass, block_size: u64) -> u64 {
+        self.coalesce_gap(class).unwrap_or(block_size)
+    }
 }
 
 /// Settings of the lazy layered full-precision scan, which bounds every row
@@ -818,11 +1440,13 @@ pub enum LazyPromotion {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayeredLazyConfig {
     pub enabled: bool,
-    /// Probes a gather may run ahead of scoring; see [`LAZY_WINDOW_ENV`].
+    /// Probes a gather may run ahead of scoring; see [`LAZY_WINDOW_ENV`],
+    /// and [`Self::far_window`] for gathers that read a slow origin.
     pub window: usize,
     pub dense: DenseGatherMode,
     pub max_runs: usize,
     pub dense_bytes_fraction: f64,
+    /// See [`LAZY_PROMOTE_ENV`]; an index holds it resolved for its origin.
     pub promote: LazyPromotion,
     pub promote_inflight: usize,
     pub inline_rows: usize,
@@ -830,8 +1454,14 @@ pub struct LayeredLazyConfig {
     pub eager_before_full: bool,
     /// See [`LAZY_ORIGIN_MAX_RUNS_ENV`]; `usize::MAX` never falls back.
     pub origin_max_runs: usize,
+    /// See [`LAZY_ORIGIN_GAP_BYTES_ENV`].
+    pub origin_gap: LazyOriginGap,
     /// See [`LAZY_DENSE_TO_EAGER_ENV`].
-    pub dense_to_eager: bool,
+    pub dense_to_eager: DenseToEager,
+    /// See [`LAZY_FAR_WINDOW_ENV`] and [`Self::active_far_window`].
+    pub far_window: usize,
+    /// See [`LAZY_FAR_INFLIGHT_ENV`].
+    pub far_inflight: usize,
 }
 
 impl Default for LayeredLazyConfig {
@@ -842,14 +1472,15 @@ impl Default for LayeredLazyConfig {
             dense: DenseGatherMode::Cost,
             max_runs: DEFAULT_LAZY_MAX_RUNS,
             dense_bytes_fraction: DEFAULT_LAZY_DENSE_BYTES_FRACTION,
-            promote: LazyPromotion::Background {
-                reads: DEFAULT_LAZY_PROMOTE_READS,
-            },
+            promote: LazyPromotion::Off,
             promote_inflight: DEFAULT_LAZY_PROMOTE_INFLIGHT,
             inline_rows: DEFAULT_LAZY_INLINE_ROWS,
             eager_before_full: true,
             origin_max_runs: usize::MAX,
-            dense_to_eager: true,
+            origin_gap: LazyOriginGap::Auto,
+            dense_to_eager: DenseToEager::Origin,
+            far_window: DEFAULT_LAZY_FAR_WINDOW,
+            far_inflight: DEFAULT_LAZY_FAR_INFLIGHT,
         }
     }
 }
@@ -910,13 +1541,16 @@ impl LayeredLazyConfig {
         }
         if let Some(value) = lookup(LAZY_PROMOTE_ENV) {
             config.promote = match value.trim() {
+                "auto" => LazyPromotion::Auto,
                 "off" => LazyPromotion::Off,
                 other => other
                     .strip_prefix("bg:")
                     .and_then(|reads| reads.parse::<u32>().ok())
                     .filter(|reads| *reads > 0)
                     .map(|reads| LazyPromotion::Background { reads })
-                    .ok_or_else(|| invalid(LAZY_PROMOTE_ENV, &value, "off or bg:N with N >= 1"))?,
+                    .ok_or_else(|| {
+                        invalid(LAZY_PROMOTE_ENV, &value, "auto, off or bg:N with N >= 1")
+                    })?,
             };
         }
         config.promote_inflight = count(LAZY_PROMOTE_INFLIGHT_ENV, config.promote_inflight, 1)?;
@@ -925,10 +1559,59 @@ impl LayeredLazyConfig {
             config.eager_before_full = parse_flag(LAZY_EAGER_BEFORE_FULL_ENV, &value)?;
         }
         config.origin_max_runs = count(LAZY_ORIGIN_MAX_RUNS_ENV, config.origin_max_runs, 0)?;
+        if let Some(value) = lookup(LAZY_ORIGIN_GAP_BYTES_ENV) {
+            config.origin_gap = match value.trim() {
+                "auto" => LazyOriginGap::Auto,
+                bytes => bytes
+                    .parse::<u64>()
+                    .map(LazyOriginGap::Bytes)
+                    .map_err(|_| {
+                        invalid(LAZY_ORIGIN_GAP_BYTES_ENV, &value, "auto or a byte count")
+                    })?,
+            };
+        }
         if let Some(value) = lookup(LAZY_DENSE_TO_EAGER_ENV) {
-            config.dense_to_eager = parse_flag(LAZY_DENSE_TO_EAGER_ENV, &value)?;
+            // `0`, `1` and their `false`/`true` spellings are the values of
+            // the former on/off flag.
+            config.dense_to_eager = match value.trim() {
+                "off" | "0" | "false" => DenseToEager::Off,
+                "origin" => DenseToEager::Origin,
+                "all" | "1" | "true" => DenseToEager::All,
+                _ => {
+                    return Err(invalid(
+                        LAZY_DENSE_TO_EAGER_ENV,
+                        &value,
+                        "off, origin or all",
+                    ));
+                }
+            };
+        }
+        config.far_window = count(LAZY_FAR_WINDOW_ENV, config.far_window, 0)?;
+        if let Some(value) = lookup(LAZY_FAR_INFLIGHT_ENV) {
+            // A permit pool holds at most `Semaphore::MAX_PERMITS`.
+            config.far_inflight = value
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|permits| (1..=Semaphore::MAX_PERMITS).contains(permits))
+                .ok_or_else(|| {
+                    invalid(
+                        LAZY_FAR_INFLIGHT_ENV,
+                        &value,
+                        &format!("an integer from 1 to {}", Semaphore::MAX_PERMITS),
+                    )
+                })?;
         }
         Ok(config)
+    }
+
+    /// The staleness window of the gathers of probes that read an ex plane
+    /// from an origin of `class`, [`Self::far_window`] when it applies, or
+    /// `None` when they keep [`Self::window`]: the origin is not
+    /// [`OriginLatencyClass::High`], or the far window is no wider.
+    pub fn active_far_window(&self, class: OriginLatencyClass) -> Option<usize> {
+        (class == OriginLatencyClass::High && self.far_window > self.window)
+            .then_some(self.far_window)
     }
 }
 
@@ -1084,10 +1767,24 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     plane_access: PlaneAccessTracker,
+    /// See [`Self::origin_latency`].
+    origin_latency: OriginLatencyClass,
+    /// See [`Self::sign_bounds`].
+    sign_bounds: SignBounds,
+    /// See [`Self::resident_columns`].
+    resident_columns: ResidentColumns,
+    /// See [`Self::resident_columns_enabled`].
+    resident_columns_enabled: bool,
+    /// The file the storage reads, when bound to the runtime handles every
+    /// open of it shares; see [`Self::with_index_file`]. `None` keeps the
+    /// far gather pools to the plane access tracker.
+    index_file: Option<IndexFileKey>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // The resident store is charged as its own entry of the index cache
+        // (`ResidentColumnsEntry`), not with every storage reading it.
         self.metadata.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.plane_access.deep_size_of_children(context)
@@ -1172,6 +1869,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             frag_reuse_index,
             batch_remapper: None,
             plane_access: Default::default(),
+            origin_latency: OriginLatencyClass::default(),
+            sign_bounds: SignBounds::default(),
+            resident_columns: ResidentColumns::default(),
+            resident_columns_enabled: false,
+            index_file: None,
         })
     }
 
@@ -1205,6 +1907,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             frag_reuse_index,
             batch_remapper: None,
             plane_access: Default::default(),
+            origin_latency: OriginLatencyClass::default(),
+            sign_bounds: SignBounds::default(),
+            resident_columns: ResidentColumns::default(),
+            resident_columns_enabled: false,
+            index_file: None,
         }
     }
 
@@ -1228,6 +1935,147 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     pub fn with_plane_access_tracker(mut self, tracker: PlaneAccessTracker) -> Self {
         self.plane_access = tracker;
         self
+    }
+
+    /// Set the latency class of reads from this storage's file, resolved
+    /// when the index opened.
+    pub fn with_origin_latency(mut self, class: OriginLatencyClass) -> Self {
+        self.origin_latency = class;
+        self
+    }
+
+    /// The latency class of reads from this storage's file, see
+    /// [`ORIGIN_LATENCY_ENV`]. [`OriginLatencyClass::Low`] unless the index
+    /// set it with [`Self::with_origin_latency`].
+    pub fn origin_latency(&self) -> OriginLatencyClass {
+        self.origin_latency
+    }
+
+    /// Set where the index cache keeps a layered index's bounds columns,
+    /// resolved when the index opened.
+    pub fn with_sign_bounds(mut self, sign_bounds: SignBounds) -> Self {
+        self.sign_bounds = sign_bounds;
+        self
+    }
+
+    /// Where the index cache keeps a layered index's bounds columns, see
+    /// [`SIGN_BOUNDS_ENV`]. [`SignBounds::Lazy`] unless the index set it with
+    /// [`Self::with_sign_bounds`].
+    pub fn sign_bounds(&self) -> SignBounds {
+        self.sign_bounds
+    }
+
+    /// This storage's handle on the resident store of its file, which owns
+    /// the store while the storage lives. It loads only while
+    /// [`Self::resident_columns_enabled`].
+    pub fn resident_columns(&self) -> &ResidentColumns {
+        &self.resident_columns
+    }
+
+    /// Read the small columns through `store`, the handle an open binds to
+    /// the store every live index of the file shares
+    /// ([`ResidentColumns::in_index_cache`]), so that the store loads once.
+    pub fn with_resident_columns(mut self, store: ResidentColumns) -> Self {
+        self.resident_columns = store;
+        self
+    }
+
+    /// Bind the lazy scan's far gathers to the permit pools that every open
+    /// of index file `file` in the process shares, one per pool size, so that
+    /// indexes of the file opened at once, a re-open and a state read back
+    /// from a persistent cache tier bound their far gathers together. An
+    /// index binds when it opens and when it is reconstructed.
+    pub fn with_index_file(mut self, file: IndexFileKey) -> Self {
+        self.index_file = Some(file);
+        self
+    }
+
+    /// Set whether reads take the file's small columns from the resident
+    /// store, resolved when the index opened.
+    pub fn with_resident_columns_enabled(mut self, enabled: bool) -> Self {
+        self.resident_columns_enabled = enabled;
+        self
+    }
+
+    /// Whether reads take the file's small columns from the resident store,
+    /// see [`RESIDENT_COLUMNS_ENV`], and fetch only the others from the file.
+    /// `false` unless the index set it with
+    /// [`Self::with_resident_columns_enabled`].
+    pub fn resident_columns_enabled(&self) -> bool {
+        self.resident_columns_enabled
+    }
+
+    /// Bytes the resident store holds for this storage's file, loaded or
+    /// not; see [`resident_columns_bytes`].
+    pub fn resident_columns_bytes(&self) -> u64 {
+        resident_columns_bytes(&self.schema(), self.num_rows())
+    }
+
+    /// The size of the resident store of this storage's file, loaded or
+    /// not, and what an index cache charges for it. It reads nothing.
+    pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
+        let bytes = self.resident_columns_bytes();
+        if bytes == 0 {
+            return Ok(ResidentStoreSize::default());
+        }
+        Ok(ResidentStoreSize {
+            bytes,
+            charge: resident_store_charge(&self.reader)?,
+        })
+    }
+
+    /// The cache key of plane `plane` of `partition` under this storage's
+    /// bounds placement.
+    pub fn plane_key(&self, partition: usize, plane: u8) -> PlaneKey {
+        PlaneKey {
+            partition,
+            plane,
+            sign_bounds: self.sign_bounds,
+        }
+    }
+
+    /// The tier the index cache would serve plane `plane` of `partition`
+    /// from, checked without reading the plane or counting as an access.
+    /// [`CacheTier::Absent`] means a read goes to this storage's file, whose
+    /// latency is [`Self::origin_latency`].
+    pub async fn plane_tier(
+        &self,
+        partition: usize,
+        plane: u8,
+        cache: &WeakLanceCache,
+    ) -> CacheTier {
+        cache
+            .peek_tier_with_key(&self.plane_key(partition, plane))
+            .await
+    }
+
+    /// The permits of the lazy scan's gathers issued beyond the ordinary
+    /// window ([`LAZY_FAR_WINDOW_ENV`]), `config.far_inflight` of them,
+    /// shared by every query of this index and by the reconstructions of its
+    /// cached state, and, once bound to its file ([`Self::with_index_file`]),
+    /// by every open of the file in the process. The plane access tracker
+    /// keeps the pool, so a cached state holds it. An index's config is
+    /// fixed when it opens, so it keeps one pool; a config of another size
+    /// (tests replace it) takes another pool, and gathers holding the old
+    /// one's permits return them there.
+    pub fn lazy_far_permits(&self, config: &LayeredLazyConfig) -> Result<LazyFarPermits> {
+        let size = config.far_inflight;
+        let mut pool = self
+            .plane_access
+            .lazy
+            .far_permits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match pool.as_ref() {
+            Some(permits) if permits.size() == size => Ok(permits.clone()),
+            _ => {
+                let permits = match &self.index_file {
+                    Some(file) => LazyFarPermits::for_file(file, size)?,
+                    None => LazyFarPermits::try_new(size)?,
+                };
+                Ok(pool.insert(permits).clone())
+            }
+        }
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -1275,21 +2123,25 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// scheduler also records into the sink (a cheap clone that shares all
     /// cached metadata, so no file is re-opened).  When `None`, the normal
     /// uninstrumented reader is used.
+    ///
+    /// With [`Self::resident_columns_enabled`], only the code and bounds
+    /// columns are read from the file.
     pub async fn load_partition(
         &self,
         part_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
+        let schema: SchemaRef = Arc::new(self.reader.schema().as_ref().into());
         let batch = if range.is_empty() {
-            let schema = self.reader.schema();
-            let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
-            RecordBatch::new_empty(Arc::new(arrow_schema))
+            RecordBatch::new_empty(schema)
+        } else if let Some(store) = self.resident_store(&schema, io_stats.as_ref()).await? {
+            let params = ReadBatchParams::Range(range.clone());
+            let reader = self.file_reader(io_stats.as_ref(), None);
+            self.read_with_resident_columns(store, schema, range, None, params, &reader)
+                .await?
         } else {
-            let reader = match &io_stats {
-                Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
-                None => Cow::Borrowed(&self.reader),
-            };
+            let reader = self.file_reader(io_stats.as_ref(), None);
             let batches = reader
                 .read_stream(
                     ReadBatchParams::Range(range),
@@ -1300,7 +2152,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .await?
                 .try_collect::<Vec<_>>()
                 .await?;
-            let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
         if let Some(remapping) = &self.batch_remapper {
@@ -1326,60 +2177,50 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         )
     }
 
-    /// Warm every plane entry. Backend admission enforces its byte budget.
+    /// Warm every plane entry a full-precision scan reads. Backend admission
+    /// enforces its byte budget.
     ///
     /// A backend that gates lower planes on their sign plane is warmed plane
-    /// by plane: all sign planes first, then the high and low planes of
-    /// partitions whose sign plane stayed resident. Other backends admit plane
-    /// entries like any entry, so they are warmed partition by partition,
-    /// which loads (and persists) every plane whatever fits in RAM, as the
-    /// native partition prewarm does.
+    /// by plane: all sign planes first, then the other planes of partitions
+    /// whose sign plane stayed resident. Other backends admit plane entries
+    /// like any entry, so they are warmed partition by partition, which loads
+    /// (and persists) every plane whatever fits in RAM, as the native
+    /// partition prewarm does.
     pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
+        use super::bq::layered::RQPrecision;
+        let planes: Vec<u8> = std::iter::once(0)
+            .chain(self.planes_after_sign(RQPrecision::Full))
+            .collect();
         if !cache.plane_admission_gated() {
             for part_id in 0..self.num_partitions() {
-                for plane in 0..=2 {
+                for &plane in &planes {
                     cache
-                        .get_or_insert_with_key(
-                            PlaneKey {
-                                partition: part_id,
-                                plane,
-                            },
-                            || async {
-                                Ok(PlaneBatch(
-                                    self.read_plane(part_id, plane, None, None).await?,
-                                ))
-                            },
-                        )
+                        .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
+                            Ok(PlaneBatch(
+                                self.read_plane(part_id, plane, None, None).await?,
+                            ))
+                        })
                         .await?;
                 }
             }
             return Ok(());
         }
-        for plane in 0..=2 {
+        for &plane in &planes {
             for part_id in 0..self.num_partitions() {
                 if plane > 0
                     && cache
-                        .get_resident_with_key(&PlaneKey {
-                            partition: part_id,
-                            plane: 0,
-                        })
+                        .get_resident_with_key(&self.plane_key(part_id, 0))
                         .await
                         .is_none()
                 {
                     continue;
                 }
                 cache
-                    .get_or_insert_with_key(
-                        PlaneKey {
-                            partition: part_id,
-                            plane,
-                        },
-                        || async {
-                            Ok(PlaneBatch(
-                                self.read_plane(part_id, plane, None, None).await?,
-                            ))
-                        },
-                    )
+                    .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
+                        Ok(PlaneBatch(
+                            self.read_plane(part_id, plane, None, None).await?,
+                        ))
+                    })
                     .await?;
             }
         }
@@ -1389,6 +2230,28 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Whether this loader owns an opt-in layered RaBitQ index.
     pub fn is_layered_rq(&self) -> bool {
         matches!(self.quantizer(), Ok(Quantizer::Rabit(rq)) if rq.metadata_ref().layered)
+    }
+
+    /// The planes a layered partition load at `precision` reads besides the
+    /// sign plane, in the order the eager bounds placement assembles its
+    /// columns: the bounds plane when the scan prunes with the bounds and the
+    /// sign plane leaves them out, then the ex planes the precision scores.
+    /// High precision prunes with the high bounds; full precision prunes
+    /// with the error factors, or with the full bounds on a file without them.
+    fn planes_after_sign(&self, precision: super::bq::layered::RQPrecision) -> Vec<u8> {
+        use super::bq::layered::RQPrecision;
+        let has_error_factors = self.reader.schema().field(ERROR_FACTORS_COLUMN).is_some();
+        let (reads_bounds, last_ex_plane) = match precision {
+            RQPrecision::Sign => (false, 0),
+            RQPrecision::High => (true, 1),
+            RQPrecision::Full => (!has_error_factors, 2),
+        };
+        let mut planes = Vec::with_capacity(usize::from(last_ex_plane) + 1);
+        if reads_bounds && self.sign_bounds == SignBounds::Lazy {
+            planes.push(SIGN_BOUNDS_PLANE);
+        }
+        planes.extend(1..=last_ex_plane);
+        planes
     }
 
     /// Read independent plane entries through the existing persistent cache.
@@ -1408,23 +2271,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             }
             return self.load_partition(part_id, io_stats).await;
         }
-        let last = match precision {
-            RQPrecision::Sign => 0,
-            RQPrecision::High => 1,
-            RQPrecision::Full => 2,
-        };
+        let after_sign = self.planes_after_sign(precision);
         let load_plane = |plane| self.load_plane_entry(part_id, plane, cache, io_stats.clone());
         let planes = if sequential_plane_loads()? || cache.plane_admission_gated() {
-            // Admit the sign dependency first. The high and low reads can then
+            // Admit the sign dependency first. The other reads can then
             // overlap without changing admission policy or assembled column order.
             let sign = load_plane(0).await?;
-            let ex = futures::future::try_join_all((1..=last).map(load_plane)).await?;
-            std::iter::once(sign).chain(ex).collect()
+            let rest =
+                futures::future::try_join_all(after_sign.iter().copied().map(load_plane)).await?;
+            std::iter::once(sign).chain(rest).collect()
         } else {
             // Admission does not depend on the sign plane's residency, so a
             // missed partition reads its planes in one round trip.
-            // `try_join_all` returns them in plane order.
-            futures::future::try_join_all((0..=last).map(load_plane)).await?
+            // `try_join_all` returns them in the order requested.
+            futures::future::try_join_all(std::iter::once(0).chain(after_sign).map(load_plane))
+                .await?
         };
         let mut fields = Vec::new();
         let mut columns = Vec::new();
@@ -1471,10 +2332,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         cache: &WeakLanceCache,
         io_stats: Option<IoStats>,
     ) -> Result<Arc<PlaneBatch>> {
-        let key = PlaneKey {
-            partition: part_id,
-            plane,
-        };
+        let key = self.plane_key(part_id, plane);
         if !cache.plane_admission_gated() {
             return cache
                 .get_or_insert_with_key(key, || async {
@@ -1487,10 +2345,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
         let sign_resident = plane == 0
             || cache
-                .get_resident_with_key(&PlaneKey {
-                    partition: part_id,
-                    plane: 0,
-                })
+                .get_resident_with_key(&self.plane_key(part_id, 0))
                 .await
                 .is_some();
         let batch = if sign_resident {
@@ -1665,10 +2520,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Result<FetchedPlane> {
         let stats = layered_stats::counters();
         let started = Instant::now();
-        let key = PlaneKey {
-            partition: part_id,
-            plane,
-        };
+        let key = self.plane_key(part_id, plane);
         if source == PlaneSource::Resident
             && let Some(batch) = cache.get_resident_with_key(&key).await
         {
@@ -1686,7 +2538,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 let (batch, from_origin) = match persisted {
                     Some(batch) => (batch.0.clone(), false),
                     None => (
-                        self.read_plane(part_id, plane, Some(rows.to_vec()), io_stats)
+                        self.read_origin_rows(part_id, plane, rows, config, io_stats.as_ref())
                             .await?,
                         true,
                     ),
@@ -1798,25 +2650,26 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ));
         }
         let indices = arrow_array::UInt32Array::from(rows.clone());
-        // The three planes are independent. Overlap their cache/origin reads,
+        // The planes are independent. Overlap their cache/origin reads,
         // while preserving plane order when assembling the full row schema.
-        let batches = futures::future::try_join_all((0..=2).map(|plane| {
+        let planes = std::iter::once(0).chain(self.planes_after_sign(RQPrecision::Full));
+        let batches = futures::future::try_join_all(planes.map(|plane| {
             let rows = &rows;
             let indices = &indices;
             let io_stats = io_stats.clone();
             async move {
-                let key = PlaneKey {
-                    partition: part_id,
-                    plane,
-                };
+                let key = self.plane_key(part_id, plane);
                 let resident = cache.get_resident_with_key(&key).await;
                 let was_resident = resident.is_some();
-                let cached = if plane == 0 && resident.is_none() {
+                // Sign codes and bounds keep an IPC body, which has no row
+                // directory, so their persisted entries are read whole.
+                let row_addressable = plane != 0 && plane != SIGN_BOUNDS_PLANE;
+                let cached = if !row_addressable && resident.is_none() {
                     cache.get_without_promotion_with_key(&key).await
                 } else {
                     resident
                 };
-                let selected_cached = if plane > 0 && cached.is_none() {
+                let selected_cached = if row_addressable && cached.is_none() {
                     cache.get_rows_with_key(&key, rows).await
                 } else {
                     None
@@ -1851,10 +2704,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 if plane > 0
                     && !was_resident
                     && cache
-                        .get_resident_with_key(&PlaneKey {
-                            partition: part_id,
-                            plane: 0,
-                        })
+                        .get_resident_with_key(&self.plane_key(part_id, 0))
                         .await
                         .is_some()
                 {
@@ -1884,18 +2734,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     };
                     if promote {
                         cache
-                            .get_or_insert_with_key(
-                                PlaneKey {
-                                    partition: part_id,
-                                    plane,
-                                },
-                                || async {
-                                    Ok(super::bq::layered::PlaneBatch(
-                                        self.read_plane(part_id, plane, None, io_stats.clone())
-                                            .await?,
-                                    ))
-                                },
-                            )
+                            .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
+                                Ok(super::bq::layered::PlaneBatch(
+                                    self.read_plane(part_id, plane, None, io_stats.clone())
+                                        .await?,
+                                ))
+                            })
                             .await?;
                     }
                 }
@@ -1920,6 +2764,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// Read only selected rows of a plane; sorted indices are coalesced by the reader.
+    /// With [`Self::resident_columns_enabled`], only the plane's code (or
+    /// bounds) column is read from the file.
     pub async fn read_plane(
         &self,
         part_id: usize,
@@ -1927,19 +2773,103 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         rows: Option<Vec<u32>>,
         io_stats: Option<IoStats>,
     ) -> Result<RecordBatch> {
+        self.read_plane_with_coalesce_gap(part_id, plane, rows, io_stats, None)
+            .await
+    }
+
+    /// [`Self::read_plane`], reading the file through
+    /// [`FileReader::with_coalesce_gap`] when `coalesce_gap` is set: the
+    /// ranges of the selected rows that are at most that many bytes apart
+    /// share one request, instead of those within the object store's block
+    /// size. The batch is the same for every gap; only the requests and the
+    /// bytes read differ.
+    pub async fn read_plane_with_coalesce_gap(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: Option<Vec<u32>>,
+        io_stats: Option<IoStats>,
+        coalesce_gap: Option<u64>,
+    ) -> Result<RecordBatch> {
+        self.read_plane_with_stats(
+            part_id,
+            plane,
+            rows,
+            coalesce_gap,
+            io_stats.as_ref(),
+            io_stats.as_ref(),
+        )
+        .await
+    }
+
+    /// Read the sorted partition offsets `rows` of ex plane `plane` from the
+    /// origin file for a sparse gather, merging row runs within `config`'s
+    /// origin gap for the index's origin, and count the read's requests and
+    /// bytes after coalescing and the rows it gathers. A first-use load of the
+    /// resident store that the read starts is not counted; its I/O, like the
+    /// read's, is added to `io_stats`.
+    async fn read_origin_rows(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: &[u32],
+        config: &LayeredLazyConfig,
+        io_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
+        let origin = IoStats::new();
+        let batch = self
+            .read_plane_with_stats(
+                part_id,
+                plane,
+                Some(rows.to_vec()),
+                config.origin_gap.coalesce_gap(self.origin_latency),
+                Some(&origin),
+                io_stats,
+            )
+            .await;
+        let read = origin.snapshot();
+        let stats = layered_stats::counters();
+        stats.origin_sparse_requests.add(read.iops);
+        stats.origin_sparse_bytes.add(read.bytes_read);
+        stats.origin_sparse_rows.add(rows.len() as u64);
+        if let Some(io_stats) = io_stats {
+            io_stats.add_scan_stats(&read);
+        }
+        batch
+    }
+
+    /// [`Self::read_plane_with_coalesce_gap`], recording the plane's reads
+    /// from the file into `read_stats` and a first-use load of the resident
+    /// store into `load_stats`, so that a caller can count them apart.
+    async fn read_plane_with_stats(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: Option<Vec<u32>>,
+        coalesce_gap: Option<u64>,
+        read_stats: Option<&IoStats>,
+        load_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
+        let columns = super::bq::layered::plane_columns(plane, self.sign_bounds);
+        if columns.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "a layered partition has no plane {plane} with {} bounds",
+                self.sign_bounds
+            )));
+        }
         let projection = lance_file::versions::reader_projection_from_column_names(
             self.reader.metadata().version(),
             self.reader.schema(),
-            super::bq::layered::plane_columns(plane),
+            columns,
         )?;
         let schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
         let range = self.ivf.row_range(part_id);
         if range.is_empty() || rows.as_ref().is_some_and(Vec::is_empty) {
             return Ok(RecordBatch::new_empty(schema));
         }
-        let params = if let Some(rows) = rows {
+        let params = if let Some(rows) = &rows {
             let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
-            for row in rows {
+            for &row in rows {
                 if row as usize >= range.len() {
                     return Err(Error::invalid_input(
                         "candidate offset exceeds partition length",
@@ -1956,12 +2886,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             }
             ReadBatchParams::Ranges(ranges.into())
         } else {
-            ReadBatchParams::Range(range)
+            ReadBatchParams::Range(range.clone())
         };
-        let reader = match &io_stats {
-            Some(stats) => Cow::Owned(self.reader.with_io_stats(stats.recorder())),
-            None => Cow::Borrowed(&self.reader),
-        };
+        let reader = self.file_reader(read_stats, coalesce_gap);
+        if let Some(store) = self.resident_store(&schema, load_stats).await? {
+            return self
+                .read_with_resident_columns(store, schema, range, rows.as_deref(), params, &reader)
+                .await;
+        }
         let batches = reader
             .read_stream_projected(
                 params,
@@ -1974,6 +2906,112 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .try_collect::<Vec<_>>()
             .await?;
         concat_batches(&schema, batches.iter()).map_err(Into::into)
+    }
+
+    /// This storage's file reader, also recording its I/O into `io_stats`,
+    /// and merging requested ranges at most `coalesce_gap` bytes apart
+    /// instead of those within the object store's block size.
+    fn file_reader(
+        &self,
+        io_stats: Option<&IoStats>,
+        coalesce_gap: Option<u64>,
+    ) -> Cow<'_, FileReader> {
+        let reader = match io_stats {
+            Some(stats) => Cow::Owned(self.reader.with_io_stats(stats.recorder())),
+            None => Cow::Borrowed(&self.reader),
+        };
+        match coalesce_gap {
+            Some(gap) => Cow::Owned(reader.with_coalesce_gap(gap)),
+            None => reader,
+        }
+    }
+
+    /// The resident store, when [`Self::resident_columns_enabled`] and it
+    /// keeps some of `schema`'s columns. The first read loads it, and the
+    /// load's I/O is added to that read's `io_stats`.
+    async fn resident_store(
+        &self,
+        schema: &arrow_schema::Schema,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Option<&ResidentColumnStore>> {
+        let reads_resident = schema.fields().iter().any(|field| is_resident(field));
+        if !self.resident_columns_enabled || !reads_resident {
+            return Ok(None);
+        }
+        self.resident_columns
+            .get_or_load(&self.reader, io_stats)
+            .await
+            .map(Some)
+    }
+
+    /// Read `schema`'s columns at the file rows `range` of a partition,
+    /// either every row or the sorted partition offsets `rows`, as `params`
+    /// selects them. Columns `store` keeps are copies of its rows, and only
+    /// the others are read from the file, through `reader`, so the batch is
+    /// the one a read of every column from the file returns.
+    async fn read_with_resident_columns(
+        &self,
+        store: &ResidentColumnStore,
+        schema: SchemaRef,
+        range: std::ops::Range<usize>,
+        rows: Option<&[u32]>,
+        params: ReadBatchParams,
+        reader: &FileReader,
+    ) -> Result<RecordBatch> {
+        if range.end as u64 > store.num_rows() {
+            return Err(Error::invalid_input(format!(
+                "partition rows {range:?} exceed the {} rows of the storage file",
+                store.num_rows()
+            )));
+        }
+        let file_columns: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .filter(|name| store.column(name).is_none())
+            .collect();
+        let file_batch = if file_columns.is_empty() {
+            None
+        } else {
+            let projection = lance_file::versions::reader_projection_from_column_names(
+                self.reader.metadata().version(),
+                self.reader.schema(),
+                &file_columns,
+            )?;
+            let file_schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
+            let batches = reader
+                .read_stream_projected(
+                    params,
+                    u32::MAX,
+                    1,
+                    projection,
+                    FilterExpression::no_filter(),
+                )
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            Some(concat_batches(&file_schema, batches.iter())?)
+        };
+        let start = range.start as u64;
+        let file_rows = match rows {
+            Some(rows) => {
+                UInt64Array::from_iter_values(rows.iter().map(|&row| start + u64::from(row)))
+            }
+            None => UInt64Array::from_iter_values(start..range.end as u64),
+        };
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let column = match store.column(field.name()) {
+                Some(column) => column.copy_rows(&file_rows)?,
+                None => file_batch
+                    .as_ref()
+                    .and_then(|batch| batch.column_by_name(field.name()))
+                    .cloned()
+                    .ok_or_else(|| Error::internal(format!("unread column {}", field.name())))?,
+            };
+            columns.push(column);
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
     }
 
     /// Read only `columns` of the given rows; the batch keeps file schema order.
@@ -2296,19 +3334,30 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DenseGatherMode, LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_DENSE_TO_EAGER_ENV,
-        LAZY_EAGER_BEFORE_FULL_ENV, LAZY_FULL_ENV, LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV,
+        DenseGatherMode, DenseToEager, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES, IndexFileKey,
+        LAZY_DENSE_BYTES_FRACTION_ENV, LAZY_DENSE_ENV, LAZY_DENSE_TO_EAGER_ENV,
+        LAZY_EAGER_BEFORE_FULL_ENV, LAZY_FAR_INFLIGHT_ENV, LAZY_FAR_WINDOW_ENV, LAZY_FULL_ENV,
+        LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV, LAZY_ORIGIN_GAP_BYTES_ENV,
         LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV,
-        LayeredLazyConfig, LazyPromotion, PlaneSource, QueryScratchCapacity, QueryScratchPool,
-        SEQUENTIAL_PLANE_LOADS_ENV, compact_prewarm_batches, origin_reads_whole_plane,
-        plan_plane_gather, sequential_plane_loads, sequential_plane_loads_from,
-        spawn_prewarm_materialization,
+        LayeredLazyConfig, LazyFarPermits, LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV,
+        OriginLatencyClass, PlaneSource, QueryScratchCapacity, QueryScratchPool,
+        RESIDENT_COLUMNS_ENV, RESIDENT_LIFETIME_ENV, ResidentColumnsSetting, ResidentLifetime,
+        ResidentStoreSize, SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds,
+        compact_prewarm_batches, origin_latency_from, origin_latency_setting,
+        origin_reads_whole_plane, plan_plane_gather, resident_columns_from,
+        resident_columns_setting, resident_lifetime_from, resident_lifetime_setting,
+        resident_store_fits, sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from,
+        sign_bounds_setting, spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
+    use futures::FutureExt;
     use lance_core::Error;
+    use lance_core::cache::CacheTier;
     use lance_core::deepsize::DeepSizeOf;
+    use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn test_prewarm_materialization_uses_cpu_pool() {
@@ -2451,7 +3500,10 @@ mod tests {
             (LAZY_INLINE_ROWS_ENV, "0"),
             (LAZY_EAGER_BEFORE_FULL_ENV, "0"),
             (LAZY_ORIGIN_MAX_RUNS_ENV, "5"),
+            (LAZY_ORIGIN_GAP_BYTES_ENV, " 65536 "),
             (LAZY_DENSE_TO_EAGER_ENV, "0"),
+            (LAZY_FAR_WINDOW_ENV, "8"),
+            (LAZY_FAR_INFLIGHT_ENV, " 2 "),
         ]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
@@ -2469,7 +3521,10 @@ mod tests {
                 inline_rows: 0,
                 eager_before_full: false,
                 origin_max_runs: 5,
-                dense_to_eager: false,
+                origin_gap: LazyOriginGap::Bytes(65536),
+                dense_to_eager: DenseToEager::Off,
+                far_window: 8,
+                far_inflight: 2,
             }
         );
         assert_eq!(
@@ -2479,9 +3534,14 @@ mod tests {
         assert!(!LayeredLazyConfig::default().enabled);
         assert!(LayeredLazyConfig::default().eager_before_full);
         assert_eq!(LayeredLazyConfig::default().origin_max_runs, usize::MAX);
-        assert!(LayeredLazyConfig::default().dense_to_eager);
+        assert_eq!(LayeredLazyConfig::default().promote, LazyPromotion::Off);
+        assert_eq!(
+            LayeredLazyConfig::default().dense_to_eager,
+            DenseToEager::Origin
+        );
         // The origin run cap does not depend on the eager-before-full switch,
-        // and dense probes go to the eager scan unless switched off.
+        // and dense probes whose planes are on a slow origin go to the eager
+        // scan unless set otherwise.
         let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_ORIGIN_MAX_RUNS_ENV, "2")]);
         let config =
             LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
@@ -2492,7 +3552,7 @@ mod tests {
                 config.origin_max_runs,
                 config.dense_to_eager
             ),
-            (true, 2, true)
+            (true, 2, DenseToEager::Origin)
         );
         let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_DENSE_TO_EAGER_ENV, "false")]);
         let config =
@@ -2502,7 +3562,7 @@ mod tests {
             config,
             LayeredLazyConfig {
                 enabled: true,
-                dense_to_eager: false,
+                dense_to_eager: DenseToEager::Off,
                 ..Default::default()
             }
         );
@@ -2514,12 +3574,18 @@ mod tests {
         for (name, value) in [
             (LAZY_DENSE_ENV, "dense"),
             (LAZY_PROMOTE_ENV, "bg:0"),
+            (LAZY_PROMOTE_ENV, "on"),
             (LAZY_PROMOTE_INFLIGHT_ENV, "0"),
             (LAZY_DENSE_BYTES_FRACTION_ENV, "-1"),
             (LAZY_WINDOW_ENV, "many"),
             (LAZY_EAGER_BEFORE_FULL_ENV, "on"),
             (LAZY_ORIGIN_MAX_RUNS_ENV, "-1"),
+            (LAZY_ORIGIN_GAP_BYTES_ENV, "1MiB"),
+            (LAZY_ORIGIN_GAP_BYTES_ENV, "-1"),
             (LAZY_DENSE_TO_EAGER_ENV, "2"),
+            (LAZY_DENSE_TO_EAGER_ENV, "on"),
+            (LAZY_FAR_WINDOW_ENV, "wide"),
+            (LAZY_FAR_INFLIGHT_ENV, "0"),
         ] {
             let enabled = |key: &str| -> Option<String> {
                 if key == LAZY_FULL_ENV {
@@ -2622,6 +3688,270 @@ mod tests {
     }
 
     #[test]
+    fn test_lazy_origin_gap_knob() {
+        let parse = |gap: &str| {
+            LayeredLazyConfig::from_lookup(|key| match key {
+                LAZY_FULL_ENV => Some("1".to_string()),
+                LAZY_ORIGIN_GAP_BYTES_ENV => Some(gap.to_string()),
+                _ => None,
+            })
+            .map(|config| config.origin_gap)
+        };
+        let defaults = LayeredLazyConfig::default();
+        assert_eq!(defaults.origin_gap, LazyOriginGap::Auto);
+        assert_eq!(parse(" auto ").unwrap(), LazyOriginGap::Auto);
+        for bytes in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
+            assert_eq!(
+                parse(&bytes.to_string()).unwrap(),
+                LazyOriginGap::Bytes(bytes)
+            );
+        }
+        for value in ["max", "AUTO", "64k", "256k", "-1", ""] {
+            let error = parse(value).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(LAZY_ORIGIN_GAP_BYTES_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+        // `auto` widens the gap only where every request is a round trip and
+        // keeps the object store's block size elsewhere; a byte count is the
+        // gap whatever the origin.
+        let block_size = 4096;
+        let classes = [OriginLatencyClass::Low, OriginLatencyClass::High];
+        assert_eq!(
+            classes.map(|class| LazyOriginGap::Auto.coalesce_gap(class)),
+            [None, Some(HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES)]
+        );
+        assert_eq!(
+            classes.map(|class| LazyOriginGap::Auto.resolve(class, block_size)),
+            [block_size, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES]
+        );
+        for bytes in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
+            let gap = LazyOriginGap::Bytes(bytes);
+            assert_eq!(
+                classes.map(|class| gap.coalesce_gap(class)),
+                [Some(bytes); 2]
+            );
+            assert_eq!(
+                classes.map(|class| gap.resolve(class, block_size)),
+                [bytes; 2]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lazy_promote_knob() {
+        let parse = |promote: &str| {
+            LayeredLazyConfig::from_lookup(|key| match key {
+                LAZY_FULL_ENV => Some("1".to_string()),
+                LAZY_PROMOTE_ENV => Some(promote.to_string()),
+                _ => None,
+            })
+            .map(|config| config.promote)
+        };
+        assert_eq!(LayeredLazyConfig::default().promote, LazyPromotion::Off);
+        for (value, expected) in [
+            (" auto ", LazyPromotion::Auto),
+            ("off", LazyPromotion::Off),
+            ("bg:1", LazyPromotion::Background { reads: 1 }),
+            ("bg:3", LazyPromotion::Background { reads: 3 }),
+        ] {
+            assert_eq!(parse(value).unwrap(), expected, "{value:?}");
+        }
+        for value in ["AUTO", "on", "bg:", "bg:0", "bg:-1", ""] {
+            let error = parse(value).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(LAZY_PROMOTE_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+        // `auto` promotes after one sparse gather unless every origin read
+        // is a round trip; an explicit policy applies whatever the origin.
+        let classes = [OriginLatencyClass::Low, OriginLatencyClass::High];
+        assert_eq!(
+            classes.map(|class| LazyPromotion::Auto.resolve(class)),
+            [LazyPromotion::Background { reads: 1 }, LazyPromotion::Off]
+        );
+        for policy in [LazyPromotion::Off, LazyPromotion::Background { reads: 2 }] {
+            assert_eq!(classes.map(|class| policy.resolve(class)), [policy; 2]);
+        }
+        for (policy, spelling) in [
+            (LazyPromotion::Auto, "auto"),
+            (LazyPromotion::Off, "off"),
+            (LazyPromotion::Background { reads: 2 }, "bg:2"),
+        ] {
+            assert_eq!(policy.to_string(), spelling);
+            assert_eq!(parse(spelling).unwrap(), policy);
+        }
+    }
+
+    #[test]
+    fn test_lazy_dense_to_eager_knob() {
+        let parse = |mode: &str| {
+            LayeredLazyConfig::from_lookup(|key| match key {
+                LAZY_FULL_ENV => Some("1".to_string()),
+                LAZY_DENSE_TO_EAGER_ENV => Some(mode.to_string()),
+                _ => None,
+            })
+            .map(|config| config.dense_to_eager)
+        };
+        for (value, expected) in [
+            ("off", DenseToEager::Off),
+            (" origin ", DenseToEager::Origin),
+            ("all", DenseToEager::All),
+            // The former flag's values keep their meaning.
+            ("0", DenseToEager::Off),
+            ("false", DenseToEager::Off),
+            ("1", DenseToEager::All),
+            ("true", DenseToEager::All),
+        ] {
+            assert_eq!(parse(value).unwrap(), expected, "{value:?}");
+        }
+        for mode in [DenseToEager::Off, DenseToEager::Origin, DenseToEager::All] {
+            assert_eq!(mode.to_string(), mode.as_str());
+            assert_eq!(parse(mode.as_str()).unwrap(), mode);
+        }
+        for value in ["2", "ORIGIN", "on", "auto", ""] {
+            let error = parse(value).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(LAZY_DENSE_TO_EAGER_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+
+        // Tiers of the high and low planes of probes whose planes are not
+        // both resident: some plane on no cache tier, or every plane local.
+        let (resident, local, absent) = (CacheTier::Resident, CacheTier::Local, CacheTier::Absent);
+        let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
+        let slow = [[resident, absent], [absent, local], [absent, absent]];
+        let local_only = [[resident, local], [local, resident], [local, local]];
+        for tiers in slow {
+            assert!(high.reads_slow_origin(&tiers), "{tiers:?}");
+            assert!(!low.reads_slow_origin(&tiers), "{tiers:?}");
+            assert!(DenseToEager::Origin.routes(high, &tiers), "{tiers:?}");
+            assert!(!DenseToEager::Origin.routes(low, &tiers), "{tiers:?}");
+        }
+        for tiers in local_only {
+            for class in [low, high] {
+                let context = format!("{class} {tiers:?}");
+                assert!(!class.reads_slow_origin(&tiers), "{context}");
+                assert!(!DenseToEager::Origin.routes(class, &tiers), "{context}");
+            }
+        }
+        for tiers in slow.iter().chain(&local_only) {
+            for class in [low, high] {
+                let context = format!("{class} {tiers:?}");
+                assert!(!DenseToEager::Off.routes(class, tiers), "{context}");
+                assert!(DenseToEager::All.routes(class, tiers), "{context}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lazy_far_window_knob() {
+        let parse = |window: Option<&str>, inflight: Option<&str>| {
+            LayeredLazyConfig::from_lookup(|key| match key {
+                LAZY_FULL_ENV => Some("1".to_string()),
+                LAZY_FAR_WINDOW_ENV => window.map(String::from),
+                LAZY_FAR_INFLIGHT_ENV => inflight.map(String::from),
+                _ => None,
+            })
+        };
+        let defaults = LayeredLazyConfig::default();
+        assert_eq!((defaults.far_window, defaults.far_inflight), (64, 64));
+        let config = parse(Some(" 0 "), Some("1")).unwrap();
+        assert_eq!((config.far_window, config.far_inflight), (0, 1));
+        let most = Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(
+            parse(None, Some(most.as_str())).unwrap().far_inflight,
+            Semaphore::MAX_PERMITS
+        );
+        // A pool cannot hold more permits, and a pool without any would
+        // never issue a gather beyond the ordinary window.
+        let too_many = (Semaphore::MAX_PERMITS + 1).to_string();
+        for (name, window, inflight) in [
+            (LAZY_FAR_WINDOW_ENV, Some("wide"), None),
+            (LAZY_FAR_WINDOW_ENV, Some("-1"), None),
+            (LAZY_FAR_INFLIGHT_ENV, None, Some("0")),
+            (LAZY_FAR_INFLIGHT_ENV, None, Some(too_many.as_str())),
+            (LAZY_FAR_INFLIGHT_ENV, None, Some("")),
+        ] {
+            let error = parse(window, inflight).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            let value = window.or(inflight).unwrap();
+            assert!(message.contains(name), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+
+        // The far window applies only where every origin read is a round
+        // trip, and only when wider than the ordinary window.
+        let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
+        assert_eq!(defaults.active_far_window(low), None);
+        assert_eq!(defaults.active_far_window(high), Some(64));
+        for (window, far_window, expected) in [
+            (16, 17, Some(17)),
+            (16, 16, None),
+            (16, 8, None),
+            (0, usize::MAX, Some(usize::MAX)),
+        ] {
+            let config = LayeredLazyConfig {
+                window,
+                far_window,
+                ..defaults
+            };
+            let context = format!("window={window} far_window={far_window}");
+            assert_eq!(config.active_far_window(high), expected, "{context}");
+            assert_eq!(config.active_far_window(low), None, "{context}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_far_permits_count_permits_in_flight() {
+        let error = LazyFarPermits::try_new(Semaphore::MAX_PERMITS + 1).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let permits = LazyFarPermits::try_new(2).unwrap();
+        let shared = permits.clone();
+        assert_eq!((permits.size(), permits.in_flight()), (2, 0));
+        let first = permits.try_acquire().unwrap();
+        let second = shared.try_acquire().unwrap();
+        // Clones share one pool.
+        assert!(permits.try_acquire().is_none());
+        assert_eq!(shared.in_flight(), 2);
+        // A wait abandoned before a permit frees up takes none.
+        assert!(permits.acquire().now_or_never().is_none());
+        drop(first);
+        assert_eq!(permits.in_flight(), 1);
+        let third = permits.acquire().await.unwrap();
+        assert_eq!(shared.in_flight(), 2);
+        drop((second, third));
+        assert_eq!(permits.in_flight(), 0);
+    }
+
+    /// Every open of an index file draws its far gathers from one pool per
+    /// size, which lives while an open or a taken permit holds it. The same
+    /// path in another bucket is another file.
+    #[test]
+    fn test_lazy_far_permits_shared_per_index_file() {
+        let path = "t.lance/_indices/far-permits-test/auxiliary.idx";
+        let file = IndexFileKey::new("far-permits-test", "s3$bucket", path);
+        let pool = LazyFarPermits::for_file(&file, 2).unwrap();
+        let held = pool.try_acquire().unwrap();
+        let shared = LazyFarPermits::for_file(&file, 2).unwrap();
+        assert_eq!((shared.size(), shared.in_flight()), (2, 1));
+        assert_eq!(LazyFarPermits::for_file(&file, 3).unwrap().in_flight(), 0);
+        let other = IndexFileKey::new("far-permits-test", "s3$other", path);
+        assert_eq!(LazyFarPermits::for_file(&other, 2).unwrap().in_flight(), 0);
+        // The taken permit keeps the pool once no open holds it.
+        drop((pool, shared));
+        assert_eq!(LazyFarPermits::for_file(&file, 2).unwrap().in_flight(), 1);
+        drop(held);
+        assert_eq!(LazyFarPermits::for_file(&file, 2).unwrap().in_flight(), 0);
+        let error = LazyFarPermits::for_file(&file, Semaphore::MAX_PERMITS + 1).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
+    #[test]
     fn test_sequential_plane_loads_flag() {
         // The accessor reports the process environment's value.
         let process = std::env::var(SEQUENTIAL_PLANE_LOADS_ENV).ok();
@@ -2639,6 +3969,234 @@ mod tests {
             error.to_string().contains(SEQUENTIAL_PLANE_LOADS_ENV),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_origin_latency_knob() {
+        // The accessor reports the process environment's value.
+        let process = std::env::var(ORIGIN_LATENCY_ENV).ok();
+        assert_eq!(
+            origin_latency_setting().ok(),
+            origin_latency_from(process.as_deref()).ok()
+        );
+        assert_eq!(origin_latency_from(None).unwrap(), None);
+        assert_eq!(origin_latency_from(Some("auto")).unwrap(), None);
+        assert_eq!(
+            origin_latency_from(Some("low")).unwrap(),
+            Some(OriginLatencyClass::Low)
+        );
+        assert_eq!(
+            origin_latency_from(Some(" high ")).unwrap(),
+            Some(OriginLatencyClass::High)
+        );
+        for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
+            assert_eq!(
+                origin_latency_from(Some(class.as_str())).unwrap(),
+                Some(class)
+            );
+            assert_eq!(class.to_string(), class.as_str());
+        }
+        assert_eq!(OriginLatencyClass::default(), OriginLatencyClass::Low);
+        for value in ["cloud", "HIGH", "1", ""] {
+            let error = origin_latency_from(Some(value)).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(ORIGIN_LATENCY_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    /// An explicit setting wins over a session's hint, and the hint over the
+    /// class of the store, low for local files and memory; without a hint the
+    /// class resolves as [`OriginLatencyClass::resolve`] resolves it. Lance's
+    /// IVF tests cover a cloud store, which needs a URL to build.
+    #[test]
+    fn test_origin_latency_resolve_with_hint() {
+        let classes = [
+            None,
+            Some(OriginLatencyClass::Low),
+            Some(OriginLatencyClass::High),
+        ];
+        for store in [ObjectStore::local(), ObjectStore::memory()] {
+            let scheme = store.scheme().to_string();
+            let auto = OriginLatencyClass::of_store(&store);
+            assert_eq!(auto, OriginLatencyClass::Low, "{scheme}");
+            for setting in classes {
+                assert_eq!(
+                    OriginLatencyClass::resolve_with_hint(setting, None, &store),
+                    OriginLatencyClass::resolve(setting, &store),
+                    "{scheme} setting={setting:?}"
+                );
+                for hint in classes {
+                    let expected = match (setting, hint) {
+                        (Some(class), _) | (None, Some(class)) => class,
+                        (None, None) => auto,
+                    };
+                    assert_eq!(
+                        OriginLatencyClass::resolve_with_hint(setting, hint, &store),
+                        expected,
+                        "{scheme} setting={setting:?} hint={hint:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sign_bounds_knob() {
+        // The accessor reports the process environment's value.
+        let process = std::env::var(SIGN_BOUNDS_ENV).ok();
+        assert_eq!(
+            sign_bounds_setting().ok(),
+            sign_bounds_from(process.as_deref()).ok()
+        );
+        assert_eq!(sign_bounds_from(None).unwrap(), SignBounds::Lazy);
+        assert_eq!(
+            sign_bounds_from(Some(" eager ")).unwrap(),
+            SignBounds::Eager
+        );
+        for sign_bounds in [SignBounds::Lazy, SignBounds::Eager] {
+            assert_eq!(
+                sign_bounds_from(Some(sign_bounds.as_str())).unwrap(),
+                sign_bounds
+            );
+            assert_eq!(sign_bounds.to_string(), sign_bounds.as_str());
+        }
+        assert_eq!(SignBounds::default(), SignBounds::Lazy);
+        for value in ["auto", "EAGER", "1", ""] {
+            let error = sign_bounds_from(Some(value)).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(SIGN_BOUNDS_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_resident_columns_knob() {
+        // The accessor reports the process environment's value.
+        let process = std::env::var(RESIDENT_COLUMNS_ENV).ok();
+        assert_eq!(
+            resident_columns_setting().ok(),
+            resident_columns_from(process.as_deref()).ok()
+        );
+        assert_eq!(
+            resident_columns_from(None).unwrap(),
+            ResidentColumnsSetting::Auto
+        );
+        assert_eq!(
+            resident_columns_from(Some(" on ")).unwrap(),
+            ResidentColumnsSetting::On
+        );
+        let settings = [
+            ResidentColumnsSetting::Auto,
+            ResidentColumnsSetting::On,
+            ResidentColumnsSetting::Off,
+        ];
+        for setting in settings {
+            assert_eq!(
+                resident_columns_from(Some(setting.as_str())).unwrap(),
+                setting
+            );
+            assert_eq!(setting.to_string(), setting.as_str());
+        }
+        assert_eq!(
+            ResidentColumnsSetting::default(),
+            ResidentColumnsSetting::Auto
+        );
+        // `auto` keeps the columns resident only when every column read is
+        // a round trip to a slow origin.
+        let classes = [OriginLatencyClass::Low, OriginLatencyClass::High];
+        for (setting, expected) in [
+            (ResidentColumnsSetting::Auto, [false, true]),
+            (ResidentColumnsSetting::On, [true, true]),
+            (ResidentColumnsSetting::Off, [false, false]),
+        ] {
+            assert_eq!(
+                classes.map(|class| setting.resolve(class)),
+                expected,
+                "{setting}"
+            );
+        }
+        for value in ["1", "ON", "true", ""] {
+            let error = resident_columns_from(Some(value)).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(RESIDENT_COLUMNS_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
+    }
+
+    /// `off` never keeps a store; `on` keeps any store with columns, however
+    /// large; `auto` keeps one whose charge fits the entry limit of the
+    /// cache's largest admissible entry, whatever its values'
+    /// bytes, and any size on a cache without that limit.
+    #[test]
+    fn admits_follows_setting_charge_and_entry_limit() {
+        const MAX_ENTRY: u64 = (1 << 20) + 1;
+        let cap = MAX_ENTRY;
+        let size = |bytes, charge| ResidentStoreSize { bytes, charge };
+        let cases = [
+            (size(0, 0), Some(MAX_ENTRY)),
+            (size(1, 100), Some(MAX_ENTRY)),
+            (size(cap - 100, cap), Some(MAX_ENTRY)),
+            // Values at the cap, charged past it.
+            (size(cap, cap + 100), Some(MAX_ENTRY)),
+            (size(cap - 100, cap + 1), Some(MAX_ENTRY)),
+            (size(MAX_ENTRY + 1, MAX_ENTRY + 100), Some(MAX_ENTRY)),
+            (size(1, 100), Some(0)),
+            (size(u64::MAX, u64::MAX), None),
+            (size(0, 0), None),
+        ];
+        for (setting, expected) in [
+            (
+                ResidentColumnsSetting::Auto,
+                [false, true, true, false, false, false, false, true, false],
+            ),
+            (
+                ResidentColumnsSetting::On,
+                [false, true, true, true, true, true, true, true, false],
+            ),
+            (ResidentColumnsSetting::Off, [false; 9]),
+        ] {
+            let admitted = cases.map(|(store, max)| setting.admits(store, max));
+            assert_eq!(admitted, expected, "{setting}");
+        }
+        assert!(resident_store_fits(cap, Some(MAX_ENTRY)));
+        assert!(!resident_store_fits(cap + 1, Some(MAX_ENTRY)));
+        assert!(resident_store_fits(u64::MAX, None));
+    }
+
+    #[test]
+    fn resident_lifetime_parses_and_rejects_unknown() {
+        let process = std::env::var(RESIDENT_LIFETIME_ENV).ok();
+        assert_eq!(
+            resident_lifetime_setting().ok(),
+            resident_lifetime_from(process.as_deref()).ok()
+        );
+        assert_eq!(
+            resident_lifetime_from(None).unwrap(),
+            ResidentLifetime::Index
+        );
+        assert_eq!(ResidentLifetime::default(), ResidentLifetime::Index);
+        for lifetime in [ResidentLifetime::Index, ResidentLifetime::Process] {
+            assert_eq!(
+                resident_lifetime_from(Some(lifetime.as_str())).unwrap(),
+                lifetime
+            );
+            assert_eq!(lifetime.to_string(), lifetime.as_str());
+        }
+        assert_eq!(
+            resident_lifetime_from(Some(" process ")).unwrap(),
+            ResidentLifetime::Process
+        );
+        for value in ["query", "PROCESS", "1", ""] {
+            let error = resident_lifetime_from(Some(value)).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains(RESIDENT_LIFETIME_ENV), "{error}");
+            assert!(message.contains(&format!("{value:?}")), "{error}");
+        }
     }
 
     #[test]

@@ -490,7 +490,7 @@ fn select_prefix_kernel<const H: u8>() -> ExDotLayeredFn {
 
 fn prefix_scalar<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
     let mut sum = 0.0;
-    for (block, query) in q.chunks_exact(64).enumerate() {
+    for (block, query) in q.as_chunks::<64>().0.iter().enumerate() {
         let mut high = [0; 64];
         let mut low = [0; 64];
         unpack_group(2, &lo[block * 16..(block + 1) * 16], &mut low);
@@ -566,7 +566,7 @@ fn ex_dot_layered_scalar(ex_query: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
     let mut sum = 0.0f32;
     let mut hi_codes = [0u8; 64];
     let mut lo_codes = [0u8; 64];
-    for (group, query) in ex_query.chunks_exact(16).enumerate() {
+    for (group, query) in ex_query.as_chunks::<16>().0.iter().enumerate() {
         let start = group * LAYERED_GROUP_BYTES;
         if start + LAYERED_GROUP_BYTES > hi.len() {
             break;

@@ -33,30 +33,46 @@
 //! whether or not the producer is polling the buffer that holds it; see
 //! `spawn_scan_step`.
 //!
+//! On a high-latency origin, a probe whose high or low plane no cache tier
+//! held when it was staged reads it from the origin, a round trip that the
+//! ordinary window cannot hide. Its gather may be issued up to
+//! `LANCE_RQ_LAZY_FAR_WINDOW` probes ahead of scoring instead, which only
+//! takes an older threshold. A gather beyond the ordinary window holds a
+//! permit from a pool shared by the index's queries until its reads return;
+//! one that finds no free permit is issued at the ordinary window at the
+//! latest. No gather is therefore issued later than without the far window,
+//! and the next probe to score, always within the ordinary window, never
+//! waits for a permit.
+//!
 //! Probes whose ex planes are both resident, probes that cannot gate on the
 //! lower bound, and probes that `k` and the partition sizes predict to be
 //! gathered whole (`LANCE_RQ_LAZY_DENSE_TO_EAGER`, only for queries without a
 //! prefilter or upper distance bound, see `LazyDenseForecast`) are scored by
-//! the eager scan in their probe position. A predicted-dense probe is loaded
-//! at staging as the eager scan loads it, with its planes read together and
-//! as many probes in flight as the eager scan prepares, instead of its sign
-//! plane first and its ex planes within the gather window.
+//! the eager scan in their probe position. By default a predicted-dense probe
+//! is routed only when the index's origin is high latency and no cache tier
+//! holds one of its ex planes; staging tells from one tier check per probe.
+//! A routed probe is loaded at staging as the eager scan loads it, with its
+//! planes read together and as many probes in flight as the eager scan
+//! prepares, instead of its sign plane first and its ex planes within the
+//! gather window.
 
 use std::collections::BinaryHeap;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use futures::StreamExt;
 use futures::prelude::stream;
+use lance_core::cache::CacheTier;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 use lance_index::metrics::{IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
-use lance_index::vector::bq::layered::{PlaneKey, RQPrecision};
+use lance_index::vector::bq::layered::RQPrecision;
 use lance_index::vector::bq::layered_stats;
 use lance_index::vector::bq::storage::{
     ExRows, RabitQuantizationStorage, SignStage, StagePruneCounts, SurvivorRow,
@@ -65,13 +81,14 @@ use lance_index::vector::bq::storage::{
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::storage::{
-    DenseGatherMode, DistanceCalculatorOptions, ExIndex, GatherPlan, GatheredEx, LayeredExLayout,
-    LayeredLazyConfig, LazyPromotionTicket, PlaneSource, QueryScratchPool, RabitRawQueryContext,
-    VectorStore, origin_reads_whole_plane, plan_plane_gather,
+    DenseGatherMode, DenseToEager, DistanceCalculatorOptions, ExIndex, GatherPlan, GatheredEx,
+    LayeredExLayout, LayeredLazyConfig, LazyFarPermits, LazyPromotionTicket, OriginLatencyClass,
+    PlaneSource, QueryScratchPool, RabitRawQueryContext, VectorStore, origin_reads_whole_plane,
+    plan_plane_gather,
 };
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{ApproxMode, Query};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 
 use super::{
     GLOBAL_TOPK_INLINE_HEAP_LEN, IVFIndex, LAYERED_LAZY_CONFIG, PartitionEntry,
@@ -121,6 +138,9 @@ struct LazySignProbe<S: IvfSubIndex, Q: Quantization> {
     stage: SignStage,
     /// Prefilter acceptance by partition offset; `None` accepts every row.
     accept: Option<Vec<bool>>,
+    /// Where the cache held the high and low planes when the probe was
+    /// staged; see `ex_plane_tiers`.
+    tiers: [CacheTier; 2],
     _in_flight: PreparedPartitionGuard,
 }
 
@@ -159,8 +179,8 @@ struct LazyDenseForecast {
     /// Whether the gathers issued once the heap fills are expected to read
     /// whole planes anyway, so issuing them before it fills reads no more.
     dense_at_fill: bool,
-    /// Whether probes predicted to read their ex planes whole are loaded and
-    /// scored by the eager scan instead; see [`Self::new`].
+    /// Whether probes predicted to read their ex planes whole may be loaded
+    /// and scored by the eager scan instead; see [`Self::new`].
     route_dense: bool,
 }
 
@@ -207,7 +227,7 @@ impl LazyDenseForecast {
         Self {
             fill_rank,
             dense_at_fill,
-            route_dense: config.dense_to_eager
+            route_dense: config.dense_to_eager != DenseToEager::Off
                 && every_row_candidate
                 && config.dense != DenseGatherMode::Sparse,
         }
@@ -220,16 +240,65 @@ impl LazyDenseForecast {
         rank < self.fill_rank
     }
 
-    /// Whether the probe at `rank` is loaded and scored by the eager scan
-    /// because it is expected to read its ex planes whole: it is certain to
-    /// be dense, or every gather is expected to be dense once the heap fills.
-    fn routes_to_eager(&self, rank: usize) -> bool {
+    /// Whether the probe at `rank` may be loaded and scored by the eager
+    /// scan because it is expected to read its ex planes whole: it is
+    /// certain to be dense, or every gather is expected to be dense once the
+    /// heap fills. Staging routes it when `LANCE_RQ_LAZY_DENSE_TO_EAGER` does
+    /// for its planes' tiers ([`DenseToEager::routes`]).
+    fn routable(&self, rank: usize) -> bool {
         self.route_dense && (self.certain_dense(rank) || self.dense_at_fill)
+    }
+}
+
+/// How far the gathers of probes that read an ex plane from a high-latency
+/// origin may run ahead of scoring; see `LANCE_RQ_LAZY_FAR_WINDOW`.
+struct LazyFarIssue {
+    /// Their staleness window, wider than the ordinary one.
+    window: usize,
+    /// Permits of the index's gathers beyond the ordinary window.
+    permits: LazyFarPermits,
+}
+
+impl LazyFarIssue {
+    /// Wait until the gather of the probe at `rank`, beyond the ordinary
+    /// `window` and without a free permit, may be issued: with the first
+    /// permit that frees up, which it then holds, or without one once
+    /// scoring brings the probe within the ordinary window, whichever comes
+    /// first. It is thus never issued later than without the far window.
+    /// Returns the progress then, the latest to prune against: the heap's
+    /// top never increases, so it prunes at least as many rows as the
+    /// progress at the far gate.
+    async fn wait_for_permit_or_window(
+        &self,
+        progress: &mut watch::Receiver<LazyProgress>,
+        window: usize,
+        rank: usize,
+    ) -> Result<(LazyProgress, Option<OwnedSemaphorePermit>)> {
+        let within_window =
+            |progress: &LazyProgress| progress.scored.saturating_add(window) >= rank;
+        // The window goes first: within it the gather needs no permit.
+        let permit = tokio::select! {
+            biased;
+            gate = progress.wait_for(within_window) => {
+                gate.map_err(|_| scan_cancelled())?;
+                None
+            }
+            permit = self.permits.acquire() => Some(permit?),
+        };
+        Ok((*progress.borrow(), permit))
     }
 }
 
 /// Query-wide inputs of the gathers.
 struct LazyFetchContext {
+    /// When the scan started, which its chain timings count from.
+    started: Instant,
+    /// Whether a gather that waits on scoring progress was issued; the first
+    /// times `lazy_first_gather_issue_ns`.
+    first_gather_issued: AtomicBool,
+    /// `None` when every gather keeps the ordinary window: the index's origin
+    /// is low latency, or the far window is no wider.
+    far: Option<LazyFarIssue>,
     config: LayeredLazyConfig,
     forecast: LazyDenseForecast,
     upper_bound: Option<f32>,
@@ -256,6 +325,25 @@ struct LazyScorer {
     scratch_pool: Arc<QueryScratchPool>,
     metrics: Arc<dyn MetricsCollector>,
     progress: Arc<watch::Sender<LazyProgress>>,
+    /// When the scan started, which its chain timings count from.
+    started: Instant,
+}
+
+impl LazyScorer {
+    /// Publish scoring progress to the gathers. The scan's first publish
+    /// comes from its first probe, once scored or once its rows fill the
+    /// heap, and is the earliest a gather waiting for the threshold or its
+    /// turn can be released; it is timed before any gather can see it.
+    fn publish(&self, update: impl FnOnce(&mut LazyProgress)) {
+        self.progress.send_modify(|progress| {
+            if progress.scored == 0 && !progress.full {
+                let stats = layered_stats::counters();
+                stats.lazy_rank0_scored_queries.incr();
+                stats.lazy_rank0_scored_ns.add_elapsed(self.started);
+            }
+            update(progress);
+        });
+    }
 }
 
 /// Aborts a task of the scan when its owner is dropped: the producer when the
@@ -302,19 +390,28 @@ fn spawn_scan_step<T: Send + 'static>(
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
-    /// The lazy scan settings for a newly opened index. Only layered indexes
-    /// read (and validate) the environment.
-    pub(super) fn layered_lazy_config_at_open(layered_rq: bool) -> Result<LayeredLazyConfig> {
-        if !layered_rq {
-            return Ok(LayeredLazyConfig::default());
-        }
-        LAYERED_LAZY_CONFIG.clone().map_err(Error::invalid_input)
+    /// The lazy scan settings for a newly opened index whose origin is
+    /// `origin_latency`, with the background promotion policy resolved for
+    /// it. Only layered indexes read (and validate) the environment.
+    pub(super) fn layered_lazy_config_at_open(
+        layered_rq: bool,
+        origin_latency: OriginLatencyClass,
+    ) -> Result<LayeredLazyConfig> {
+        let mut config = if layered_rq {
+            LAYERED_LAZY_CONFIG.clone().map_err(Error::invalid_input)?
+        } else {
+            LayeredLazyConfig::default()
+        };
+        config.promote = config.promote.resolve(origin_latency);
+        Ok(config)
     }
 
     /// Replace this index's lazy scan settings, avoiding the process-wide
-    /// environment in concurrent tests.
+    /// environment in concurrent tests. The promotion policy resolves for the
+    /// index's origin as it does at open.
     #[cfg(test)]
-    pub(crate) fn set_layered_lazy_config_for_test(&self, config: LayeredLazyConfig) {
+    pub(crate) fn set_layered_lazy_config_for_test(&self, mut config: LayeredLazyConfig) {
+        config.promote = config.promote.resolve(self.origin_latency);
         *self
             .layered_lazy
             .lock()
@@ -450,8 +547,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             scratch_pool: self.scratch_pool.clone(),
             metrics: metrics.clone(),
             progress: Arc::new(progress_tx),
+            started,
         };
+        let far = match config.active_far_window(self.origin_latency) {
+            Some(window) => Some(LazyFarIssue {
+                window,
+                permits: self.storage.lazy_far_permits(&config)?,
+            }),
+            None => None,
+        };
+        // Room for every gather the widest window lets run ahead of scoring.
+        let fetch_slots = far
+            .as_ref()
+            .map_or(config.window, |far| far.window)
+            .saturating_add(LAZY_FETCH_EXTRA_SLOTS);
         let fetch_context = Arc::new(LazyFetchContext {
+            started,
+            first_gather_issued: AtomicBool::new(false),
+            far,
             config,
             forecast,
             upper_bound: query.upper_bound,
@@ -467,6 +580,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         let stage_index = self.clone();
         let fetch_index = self.clone();
         let probe_start = probes.start;
+        let dense_to_eager = config.dense_to_eager;
         let result_metrics = metrics.clone();
         let producer = tokio::spawn(async move {
             // `map` spawns a step only when `buffered` pulls it, so at most
@@ -477,11 +591,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                     let rank = idx - probe_start;
                     let mut query = query.clone();
                     query.dist_q_c = q_c_dists.value(idx);
+                    let dense_to_eager = if forecast.routable(rank) {
+                        dense_to_eager
+                    } else {
+                        DenseToEager::Off
+                    };
                     spawn_scan_step(stage_index.clone().lazy_stage_probe(
                         rank,
                         partitions.value(idx) as usize,
                         query,
-                        forecast.routes_to_eager(rank),
+                        dense_to_eager,
                         pre_filter.clone(),
                         metrics.clone(),
                         raw_query_context.clone(),
@@ -493,7 +612,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                     let context = fetch_context.clone();
                     spawn_scan_step(async move { index.lazy_fetch(staged?, &context).await })
                 })
-                .buffered(config.window.saturating_add(LAZY_FETCH_EXTRA_SLOTS));
+                .buffered(fetch_slots);
             futures::pin_mut!(fetched);
             while let Some(probe) = fetched.next().await {
                 let failed = probe.is_err();
@@ -565,28 +684,38 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
     }
 
     /// Load a probe's sign plane and run stage 1, or prepare it for the eager
-    /// scan when both ex planes are resident or when it is predicted to be
-    /// gathered whole (`dense_to_eager`).
+    /// scan when both ex planes are resident or when `dense_to_eager` routes
+    /// it for its planes' tiers. `dense_to_eager` is [`DenseToEager::Off`]
+    /// for a probe the forecast does not predict to be gathered whole.
     #[allow(clippy::too_many_arguments)]
     async fn lazy_stage_probe(
         self: Arc<Self>,
         rank: usize,
         partition_id: usize,
         query: Query,
-        dense_to_eager: bool,
+        dense_to_eager: DenseToEager,
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<LazyStaged<S, Q>> {
         let stats = layered_stats::counters();
-        let eager = if self.ex_planes_resident(partition_id).await {
-            Some(if self.storage.partition_size(partition_id) == 0 {
-                &stats.empty
-            } else {
-                &stats.eager_resident
-            })
+        let (tiers, eager) = if self.storage.partition_size(partition_id) == 0 {
+            // No ex rows to gather, so the planes need no check; see
+            // `ex_planes_resident`.
+            ([CacheTier::Resident; 2], Some(&stats.empty))
         } else {
-            dense_to_eager.then_some(&stats.dense_to_eager)
+            let tiers = self.ex_plane_tiers(partition_id).await;
+            if self.origin_latency.reads_slow_origin(&tiers) {
+                stats.s3_bound_probes.incr(rank);
+            }
+            let eager = if tiers == [CacheTier::Resident; 2] {
+                Some(&stats.eager_resident)
+            } else {
+                dense_to_eager
+                    .routes(self.origin_latency, &tiers)
+                    .then_some(&stats.dense_to_eager)
+            };
+            (tiers, eager)
         };
         if let Some(counter) = eager {
             counter.incr(rank);
@@ -658,8 +787,41 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             entry,
             stage,
             accept,
+            tiers,
             _in_flight: in_flight,
         })))
+    }
+
+    /// Where the cache holds a non-empty partition's high and low planes,
+    /// checked without reading them or counting as accesses. Only a
+    /// high-latency origin tells [`CacheTier::Local`] from
+    /// [`CacheTier::Absent`]: every read of a low-latency origin is local,
+    /// from a cache tier or the origin file, so only RAM residency is checked
+    /// there and a plane outside RAM is recorded as `Local`.
+    async fn ex_plane_tiers(&self, partition: usize) -> [CacheTier; 2] {
+        let classifying = Instant::now();
+        let mut tiers = [CacheTier::Resident; 2];
+        for (slot, plane) in [1u8, 2].into_iter().enumerate() {
+            tiers[slot] = match self.origin_latency {
+                OriginLatencyClass::High => {
+                    self.storage
+                        .plane_tier(partition, plane, &self.index_cache)
+                        .await
+                }
+                OriginLatencyClass::Low => {
+                    let key = self.storage.plane_key(partition, plane);
+                    if self.index_cache.peek_resident_with_key(&key).await {
+                        CacheTier::Resident
+                    } else {
+                        CacheTier::Local
+                    }
+                }
+            };
+        }
+        layered_stats::counters()
+            .tier_peek_ns
+            .add_elapsed(classifying);
+        tiers
     }
 
     /// Whether a partition's high and low planes are in RAM, checked without
@@ -674,7 +836,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         for plane in [1, 2] {
             if !self
                 .index_cache
-                .peek_resident_with_key(&PlaneKey { partition, plane })
+                .peek_resident_with_key(&self.storage.plane_key(partition, plane))
                 .await
             {
                 return false;
@@ -769,19 +931,33 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         };
         let stats = layered_stats::counters();
         let rank = probe.rank;
+        // Only a gather that reads an ex plane from a slow origin runs further ahead.
+        let far = context
+            .far
+            .as_ref()
+            .filter(|_| self.origin_latency.reads_slow_origin(&probe.tiers));
         let gating = Instant::now();
         let mut progress = context.progress.clone();
         let forecast = &context.forecast;
-        let issue = if forecast.certain_dense(rank) {
+        let (issue, far_permit) = if forecast.certain_dense(rank) {
             // The earlier probes cannot fill the heap, so the threshold is +inf at scoring.
             stats.certain_dense.incr(rank);
-            *progress.borrow()
+            (*progress.borrow(), None)
         } else {
             let window = context.config.window;
+            let gate_window = far.map_or(window, |far| far.window);
+            let within_gate =
+                |progress: &LazyProgress| progress.scored.saturating_add(gate_window) >= rank;
+            let window_closed = !within_gate(&progress.borrow());
+            let windowing = Instant::now();
             let gate = *progress
-                .wait_for(|progress| progress.scored.saturating_add(window) >= rank)
+                .wait_for(within_gate)
                 .await
                 .map_err(|_| scan_cancelled())?;
+            if window_closed {
+                stats.lazy_window_waits.incr();
+                stats.lazy_window_wait_ns.add_elapsed(windowing);
+            }
             // An infinite threshold gathers every accepted row, so wait for a
             // finite one, or for this probe's turn. With eager-before-full,
             // stop waiting where it saves no reads: when the gathers after the
@@ -799,19 +975,52 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 gate
             } else {
                 stats.deferred_issues.incr();
+                let releasing = Instant::now();
                 let issue = *progress
                     .wait_for(released)
                     .await
                     .map_err(|_| scan_cancelled())?;
+                stats.lazy_release_wait_ns.add_elapsed(releasing);
                 if !issue.full && issue.scored >= rank {
                     stats.serial_waits.incr();
                 }
                 issue
             };
+            // A gather beyond the ordinary window needs a permit.
+            let (issue, far_permit) = match far {
+                Some(far) if issue.scored.saturating_add(window) < rank => {
+                    let (issue, permit) = match far.permits.try_acquire() {
+                        Some(permit) => (issue, Some(permit)),
+                        None => {
+                            stats.far_permit_waits.incr();
+                            let waiting = Instant::now();
+                            let waited = far
+                                .wait_for_permit_or_window(&mut progress, window, rank)
+                                .await?;
+                            stats.far_permit_wait_ns.add_elapsed(waiting);
+                            waited
+                        }
+                    };
+                    if permit.is_some() {
+                        stats.far_early_issues.incr();
+                        stats
+                            .far_in_flight_max
+                            .observe(far.permits.in_flight() as u64);
+                    }
+                    (issue, permit)
+                }
+                _ => (issue, None),
+            };
             if !issue.full && issue.scored < rank {
                 stats.eager_before_full.incr();
             }
-            issue
+            if !context.first_gather_issued.swap(true, Ordering::Relaxed) {
+                stats.lazy_first_gather_issue_queries.incr();
+                stats
+                    .lazy_first_gather_issue_ns
+                    .add_elapsed(context.started);
+            }
+            (issue, far_permit)
         };
         stats.gate_wait_ns.add_elapsed(gating);
         let staleness = rank.saturating_sub(issue.scored) as u64;
@@ -846,10 +1055,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             let row_bytes = context.layout.row_bytes[slot];
             plan.planes[slot] = if self
                 .index_cache
-                .peek_resident_with_key(&PlaneKey {
-                    partition: probe.partition_id,
-                    plane,
-                })
+                .peek_resident_with_key(&self.storage.plane_key(probe.partition_id, plane))
                 .await
             {
                 PlaneSource::Resident
@@ -870,6 +1076,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 context.metrics.io_stats(),
             )
             .await?;
+        // The permit bounds the far gathers' reads, not their scoring.
+        drop(far_permit);
         record_gather_sources(rank, &gathered);
         stats.origin_row_reads.add(gathered.origin_row_reads as u64);
         for ticket in std::mem::take(&mut gathered.promotions) {
@@ -900,10 +1108,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                         .add(batch.as_ref().deep_size_of() as u64);
                     let resident = index
                         .index_cache
-                        .peek_resident_with_key(&PlaneKey {
-                            partition: ticket.partition,
-                            plane: ticket.plane,
-                        })
+                        .peek_resident_with_key(
+                            &index.storage.plane_key(ticket.partition, ticket.plane),
+                        )
                         .await;
                     if resident {
                         stats.promotions_completed.incr();
@@ -955,7 +1162,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                 .then(|| heap.peek().map(|node| node.dist.0))
                 .flatten();
             let scored = *scored;
-            scorer.progress.send_modify(|progress| {
+            scorer.publish(|progress| {
                 progress.scored = scored;
                 if let Some(top) = top {
                     progress.full = true;
@@ -1120,7 +1327,11 @@ fn record_gather_sources(rank: usize, gathered: &GatheredEx) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DenseGatherMode, LayeredLazyConfig, LazyDenseForecast, count_missing};
+    use super::{
+        DenseGatherMode, DenseToEager, LayeredLazyConfig, LazyDenseForecast, LazyFarIssue,
+        LazyFarPermits, LazyProgress, count_missing,
+    };
+    use tokio::sync::watch;
 
     #[test]
     fn dense_forecast_follows_k_and_partition_sizes() {
@@ -1132,7 +1343,7 @@ mod tests {
         let rows = [100, 0, 50, 200];
         let predicted = |forecast: LazyDenseForecast| {
             (0..rows.len())
-                .map(|rank| (forecast.certain_dense(rank), forecast.routes_to_eager(rank)))
+                .map(|rank| (forecast.certain_dense(rank), forecast.routable(rank)))
                 .collect::<Vec<_>>()
         };
 
@@ -1189,9 +1400,23 @@ mod tests {
                 let config = LayeredLazyConfig { dense, ..config };
                 let forecast = LazyDenseForecast::new(rows, k, true, &config);
                 assert_eq!(forecast.dense_at_fill, dense_at_fill, "{dense:?} k={k}");
-                let routed = (0..rows.len()).all(|rank| forecast.routes_to_eager(rank));
+                let routed = (0..rows.len()).all(|rank| forecast.routable(rank));
                 assert_eq!(routed, dense == DenseGatherMode::Whole, "{dense:?} k={k}");
             }
+        }
+
+        // Either routing mode lets staging route the predicted-dense probes,
+        // whose planes' tiers then decide.
+        for dense_to_eager in [DenseToEager::Origin, DenseToEager::All] {
+            let config = LayeredLazyConfig {
+                dense_to_eager,
+                ..config
+            };
+            assert_eq!(
+                LazyDenseForecast::new(rows, 120, true, &config),
+                large,
+                "{dense_to_eager}"
+            );
         }
 
         // No probe is routed under the sparse policy, which never reads a
@@ -1207,7 +1432,7 @@ mod tests {
             ..config
         };
         let off = LayeredLazyConfig {
-            dense_to_eager: false,
+            dense_to_eager: DenseToEager::Off,
             ..config
         };
         for k in [10, 120, 1000] {
@@ -1224,6 +1449,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A gather beyond the ordinary window without a free permit waits for
+    /// whichever comes first: scoring bringing it within the ordinary
+    /// window, where it needs no permit, or a freed permit, which it then
+    /// holds. Either way it prunes against the latest progress.
+    #[tokio::test]
+    async fn far_gather_waits_for_a_permit_or_the_ordinary_window() {
+        const WINDOW: usize = 1;
+        let far = LazyFarIssue {
+            window: 8,
+            permits: LazyFarPermits::try_new(1).unwrap(),
+        };
+        let (progress_tx, mut progress) = watch::channel(LazyProgress {
+            scored: 0,
+            full: true,
+            threshold: 1.0,
+        });
+        let held = far.permits.try_acquire().unwrap();
+
+        {
+            let waiting = far.wait_for_permit_or_window(&mut progress, WINDOW, 5);
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            progress_tx.send_modify(|progress| {
+                progress.scored = 4;
+                progress.threshold = 0.5;
+            });
+            let (issue, permit) = waiting.await.unwrap();
+            assert_eq!((issue.scored, issue.threshold), (4, 0.5));
+            assert!(permit.is_none());
+            assert_eq!(far.permits.in_flight(), 1);
+        }
+
+        {
+            let waiting = far.wait_for_permit_or_window(&mut progress, WINDOW, 9);
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(held);
+            let (issue, permit) = waiting.await.unwrap();
+            assert_eq!(issue.scored, 4);
+            assert!(permit.is_some());
+            assert_eq!(far.permits.in_flight(), 1);
+        }
+        assert_eq!(far.permits.in_flight(), 0);
     }
 
     #[test]
