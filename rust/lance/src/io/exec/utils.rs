@@ -1,28 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::datatypes::Field as LanceField;
+use crate::datatypes::Schema as LanceSchema;
 use lance_datafusion::utils::{
     BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_CACHE_HITS_METRIC,
     INDEX_CACHE_MISSES_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
     PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
-use lance_index::metrics::MetricsCollector;
+use lance_encoding::decoder::estimate_bytes_per_row;
+use lance_index::metrics::{IndexTiming, MetricsCollector};
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
+use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::runtime::SpawnedTask;
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, Time,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
@@ -33,6 +38,7 @@ use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::future::{BoxFuture, Shared};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use lance_arrow::DataTypeExt as _;
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
@@ -91,6 +97,8 @@ struct SharedPreFilterEntry {
 /// Entries are keyed by task-context identity and partition. This prevents a
 /// reused physical plan from carrying a mask into a later query and keeps an
 /// accidental multi-partition execution from sharing across input partitions.
+/// It relies on every execution running under its own task context, as
+/// `execute_plan` guarantees.
 /// The mutex is held only while installing or cloning a future; prefilter
 /// execution never runs under it.
 struct SharedPreFilterMaterialization {
@@ -201,6 +209,7 @@ impl ExecutionPlan for SharedPreFilterExec {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct PreFilterMasks {
     pub overlay_block: Option<RowAddrMask>,
     pub external_mask: Option<Arc<RowAddrMask>>,
@@ -335,7 +344,9 @@ fn shared_prefilter_future(
                                 if is_scalar_index_query {
                                     Box::new(SelectionVectorToPrefilter(stream)).load().await
                                 } else {
-                                    Box::new(FilteredRowIdsToPrefilter(stream)).load().await
+                                    Box::new(FilteredRowIdsToPrefilter::new(stream))
+                                        .load()
+                                        .await
                                 }
                             }
                             .await;
@@ -365,14 +376,19 @@ fn shared_prefilter_future(
     .boxed()
 }
 
-pub(crate) fn build_prefilter(
+/// Resolve a prefilter source into the future that yields its mask, ANDing in
+/// the external row-address mask when the scan carries one.
+///
+/// The external mask restricts index-side scoring to the masked rows (mirroring
+/// the ANN path). It is independent of `overlay_block`, which the prefilter
+/// applies separately to drop index entries staled by a data overlay.
+fn prefilter_mask_future(
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
     prefilter_source: &PreFilterSource,
-    ds: Arc<Dataset>,
-    index_meta: &[IndexMetadata],
-    masks: PreFilterMasks,
-) -> Result<Arc<DatasetPreFilter>> {
+    external_mask: Option<Arc<RowAddrMask>>,
+    metrics: &ExecutionPlanMetricsSet,
+) -> Result<Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -387,7 +403,11 @@ pub(crate) fn build_prefilter(
                 None
             } else {
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+                // Attribute physical materialization to this FTS node. Shared loaders
+                // need a separate owner so racing consumers do not receive arbitrary metrics.
+                Some(Box::new(
+                    FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition),
+                ) as Box<dyn FilterLoader>)
             }
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
@@ -407,12 +427,8 @@ pub(crate) fn build_prefilter(
         }
         PreFilterSource::None => None,
     };
-    // Combine the external row-address mask (logical AND) with whatever the
-    // filter produced, so an FTS prefilter restricts BM25 scoring to masked rows
-    // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
-    // applies separately to drop index entries staled by a data overlay.
-    let mut prefilter = if let Some(shared_filter) = shared_filter {
-        let shared_filter = match masks.external_mask {
+    if let Some(shared_filter) = shared_filter {
+        let shared_filter = match external_mask {
             Some(mask) => async move {
                 Ok(Arc::new(
                     mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
@@ -421,39 +437,153 @@ pub(crate) fn build_prefilter(
             .boxed(),
             None => shared_filter,
         };
-        DatasetPreFilter::new_with_filter_future(ds, index_meta, Some(shared_filter))
-    } else {
-        let prefilter_loader = match masks.external_mask {
-            Some(mask) => {
-                Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
-            }
-            None => prefilter_loader,
-        };
-        DatasetPreFilter::new(ds, index_meta, prefilter_loader)
+        return Ok(Some(shared_filter));
+    }
+    let prefilter_loader = match external_mask {
+        Some(mask) => {
+            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+        }
+        None => prefilter_loader,
     };
+    Ok(prefilter_loader.map(|loader| {
+        async move { loader.load().await.map(Arc::new) }
+            .in_current_span()
+            .boxed()
+    }))
+}
+
+pub(crate) fn build_prefilter(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[IndexMetadata],
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+    )?;
+    let mut prefilter = DatasetPreFilter::new_with_filter_future(ds, index_meta, filter);
     if let Some(overlay_block) = masks.overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))
 }
 
-// Utility to convert an input (containing row ids) into a prefilter
-pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
+/// Build a prefilter restricted to `fragments` rather than to the union of
+/// `index_meta`'s fragment bitmaps. See
+/// [`DatasetPreFilter::new_restricted_to_fragments`].
+pub(crate) fn build_prefilter_restricted_to_fragments(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    fragments: RoaringBitmap,
+    masks: PreFilterMasks,
+    metrics: &ExecutionPlanMetricsSet,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(
+        context,
+        partition,
+        prefilter_source,
+        masks.external_mask,
+        metrics,
+    )?;
+    let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
+    if let Some(overlay_block) = masks.overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
+}
+
+struct RowIdPrefilterMetrics {
+    loads: Count,
+    input_rows: Count,
+    input_batches: Count,
+    row_ids: Count,
+    load_time: Time,
+    input_time: Time,
+    build_time: Time,
+}
+
+// Utility to convert an input (containing row ids) into a prefilter.
+pub(crate) struct FilteredRowIdsToPrefilter {
+    stream: SendableRecordBatchStream,
+    metrics: Option<RowIdPrefilterMetrics>,
+}
+
+impl FilteredRowIdsToPrefilter {
+    pub(crate) fn new(stream: SendableRecordBatchStream) -> Self {
+        Self {
+            stream,
+            metrics: None,
+        }
+    }
+
+    // Count physical loader executions: batch ANN shares one loader, whereas
+    // multi-vector ANN can materialize one per query node.
+    pub(crate) fn with_metrics(
+        mut self,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> Self {
+        self.metrics = Some(RowIdPrefilterMetrics {
+            loads: metrics.new_count("prefilter_loads", partition),
+            input_rows: metrics.new_count("prefilter_input_rows", partition),
+            input_batches: metrics.new_count("prefilter_input_batches", partition),
+            row_ids: metrics.new_count("prefilter_row_ids", partition),
+            load_time: metrics.new_time("prefilter_load_time", partition),
+            input_time: metrics.new_time("prefilter_input_time", partition),
+            build_time: metrics.new_time("prefilter_build_time", partition),
+        });
+        self
+    }
+}
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+        let metrics = self.metrics.as_ref();
+        let _load_timer = metrics.map(|m| m.load_time.timer());
+        if let Some(metrics) = metrics {
+            metrics.loads.add(1);
+        }
         let mut allow_list = RowAddrTreeMap::new();
-        while let Some(batch) = self.0.next().await {
+        loop {
+            // Input polling can include I/O, decoding and scheduling. Keep it separate
+            // from set insertion, and time batches rather than individual row IDs.
+            let batch = {
+                let _input_timer = metrics.map(|m| m.input_time.timer());
+                self.stream.next().await
+            };
+            let Some(batch) = batch else { break };
             let batch = batch?;
             let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::internal("input batch missing row id column even though it is in the schema for the stream"))?;
             let row_ids = row_ids
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.iter().flatten())
+                .ok_or_else(|| {
+                    Error::internal("row id column in prefilter input must be UInt64")
+                })?;
+            if let Some(metrics) = metrics {
+                metrics.input_batches.add(1);
+                metrics.input_rows.add(row_ids.len() - row_ids.null_count());
+            }
+            let _build_timer = metrics.map(|m| m.build_time.timer());
+            allow_list.extend(row_ids.iter().flatten());
         }
-        Ok(RowAddrMask::from_allowed(allow_list))
+        let mask = RowAddrMask::from_allowed(allow_list);
+        if let Some(metrics) = metrics
+            && let Some(row_ids) = mask.max_len()
+        {
+            metrics.row_ids.add(row_ids as usize);
+        }
+        Ok(mask)
     }
 }
 
@@ -879,6 +1009,7 @@ impl IoMetrics {
 
 #[derive(Clone)]
 pub struct IndexMetrics {
+    timings: [Time; IndexTiming::ALL.len()],
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
@@ -895,6 +1026,7 @@ pub struct IndexMetrics {
 impl IndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
+            timings: IndexTiming::ALL.map(|stage| metrics.new_time(stage.name(), partition)),
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
@@ -915,6 +1047,10 @@ impl IndexMetrics {
 }
 
 impl MetricsCollector for IndexMetrics {
+    fn record_timing(&self, stage: IndexTiming, duration: std::time::Duration) {
+        self.timings[stage as usize].add_duration(duration);
+    }
+
     fn record_parts_loaded(&self, num_shards: usize) {
         self.parts_loaded.add(num_shards);
     }
@@ -935,35 +1071,297 @@ impl MetricsCollector for IndexMetrics {
     }
 }
 
+/// Minimum estimated row width, matching DataFusion's default collect thresholds:
+/// 1 MiB / 128 Ki rows = 8 bytes per row. DataFusion uses the byte threshold instead
+/// of the row threshold whenever a byte estimate is available. This floor keeps
+/// narrow schemas from admitting more rows than the default row threshold allows.
+///
+/// Custom threshold ratios can break that agreement. This is a planning estimate,
+/// not a bound on runtime memory, which also includes allocation and join overhead.
+const MIN_BYTES_PER_ROW: f64 = 8.0;
+
+/// Whether the columns a node emits include a materialized blob payload.
+///
+/// A payload has no schema-determined width and is not bounded by the row count,
+/// so a node carrying one reports no size at all.
+///
+/// Decided from what the node emits, matched against the dataset's own fields,
+/// because the public output schema strips the blob marker and a projection's blob
+/// mode describes what it fetches rather than what it carries. Descriptors remain
+/// eligible for estimation, including a seeded width for any URI field.
+fn carries_blob_payload(emitted: &arrow_schema::Fields, dataset: &[LanceField]) -> bool {
+    emitted.iter().any(|field| {
+        let Some(lance) = dataset.iter().find(|f| f.name == *field.name()) else {
+            return false;
+        };
+        carried(field.data_type(), lance)
+    })
+}
+
+/// Whether `emitted` holds a blob payload described by `lance`, at any nesting.
+fn carried(emitted: &DataType, lance: &LanceField) -> bool {
+    match emitted {
+        DataType::Binary | DataType::LargeBinary => lance.is_blob(),
+        DataType::Struct(children) => carries_blob_payload(children, &lance.children),
+        // A list's payload is its child's. The dataset field nests the same way, so
+        // the child is matched positionally rather than by name.
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::ListView(child)
+        | DataType::LargeListView(child)
+        | DataType::FixedSizeList(child, _) => lance
+            .children
+            .first()
+            .is_some_and(|lance_child| carried(child.data_type(), lance_child)),
+        DataType::Map(entries, _) => lance
+            .children
+            .first()
+            .is_some_and(|lance_child| carried(entries.data_type(), lance_child)),
+        _ => false,
+    }
+}
+
+/// The average list length [`estimate_bytes_per_row`] assumes when it sizes a
+/// list's values. Mirrored here so a list's child buffers are counted as many
+/// times as its values are.
+const ASSUMED_LIST_LENGTH: f64 = 5.0;
+
+/// Values per row the decoder's estimate would charge, with dictionaries counted
+/// as their keys rather than expanded to what they decode to.
+///
+/// Unlike the decoder's estimate, this charges only dictionary keys. Shared
+/// dictionary values are omitted because their cardinality and size are unknown.
+fn seeded_value_bytes_per_row(data_type: &DataType) -> f64 {
+    match data_type {
+        DataType::Dictionary(key, _) => key.byte_width_opt().unwrap_or(1) as f64,
+        DataType::List(child) | DataType::LargeList(child) => {
+            ASSUMED_LIST_LENGTH * seeded_value_bytes_per_row(child.data_type())
+        }
+        DataType::FixedSizeList(child, dim) => {
+            *dim as f64 * seeded_value_bytes_per_row(child.data_type())
+        }
+        DataType::Map(entries, _) => {
+            ASSUMED_LIST_LENGTH * seeded_value_bytes_per_row(entries.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| seeded_value_bytes_per_row(field.data_type()))
+            .sum(),
+        other => estimate_bytes_per_row(other),
+    }
+}
+
+/// Bytes per row of the Arrow buffers that hold no values: validity bitmaps and
+/// offsets. [`seeded_value_bytes_per_row`] covers the values, so the two are summed.
+///
+/// Allocation padding and per-array object size are omitted; the schema describes
+/// neither buffer capacities nor batch counts.
+fn arrow_overhead_bytes_per_row(field: &arrow_schema::Field) -> f64 {
+    let validity = if field.is_nullable() { 1.0 / 8.0 } else { 0.0 };
+    // Variable-width types carry `n + 1` offsets; the extra one is a per-batch
+    // constant this ignores.
+    let buffers = match field.data_type() {
+        DataType::Utf8 | DataType::Binary => 4.0,
+        DataType::LargeUtf8 | DataType::LargeBinary => 8.0,
+        DataType::List(child) => 4.0 + ASSUMED_LIST_LENGTH * arrow_overhead_bytes_per_row(child),
+        DataType::Map(entries, _) => {
+            4.0 + ASSUMED_LIST_LENGTH * arrow_overhead_bytes_per_row(entries)
+        }
+        DataType::LargeList(child) => {
+            8.0 + ASSUMED_LIST_LENGTH * arrow_overhead_bytes_per_row(child)
+        }
+        DataType::FixedSizeList(child, dim) => *dim as f64 * arrow_overhead_bytes_per_row(child),
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| arrow_overhead_bytes_per_row(field))
+            .sum(),
+        // Keys are already charged; the shared dictionary values are omitted.
+        DataType::Dictionary(_, _) => 0.0,
+        _ => 0.0,
+    };
+    validity + buffers
+}
+
+/// Estimated Arrow bytes per row of one field.
+///
+/// Uses schema widths for fixed-size values and assumes a validity bitmap for
+/// nullable fields. Dictionary values, allocation padding, and per-batch overhead
+/// are omitted. Variable-width values use decoder seeds, such as 64 bytes for a
+/// string and five items for a list, rather than measured sizes.
+fn arrow_bytes_per_row(field: &arrow_schema::Field) -> f64 {
+    // A `NullArray` is a row count and nothing else: no values buffer and no
+    // validity bitmap whatever the field's nullability says.
+    if matches!(field.data_type(), DataType::Null) {
+        return 0.0;
+    }
+    let validity = if field.is_nullable() { 1.0 / 8.0 } else { 0.0 };
+    match field.data_type() {
+        DataType::Boolean => validity + 1.0 / 8.0,
+        DataType::Struct(fields) => {
+            validity
+                + fields
+                    .iter()
+                    .map(|field| arrow_bytes_per_row(field))
+                    .sum::<f64>()
+        }
+        // Fixed-size lists store child values without an offset buffer.
+        DataType::FixedSizeList(child, dim) => validity + *dim as f64 * arrow_bytes_per_row(child),
+        // Count one key per row. The shared values buffer can be substantial,
+        // but its size and cardinality are not described by the schema.
+        DataType::Dictionary(key, _) => validity + key.byte_width_opt().unwrap_or(1) as f64,
+        // Arrow covers fixed-width types missing from `byte_width_opt`.
+        other => match other.byte_width_opt().or_else(|| other.primitive_width()) {
+            Some(width) => validity + width as f64,
+            // `arrow_overhead_bytes_per_row` carries the validity term for these.
+            None => seeded_value_bytes_per_row(other) + arrow_overhead_bytes_per_row(field),
+        },
+    }
+}
+
+/// Estimated Arrow bytes per row, floored at [`MIN_BYTES_PER_ROW`].
+///
+/// Returns `None` for a carried blob payload or a nonpositive estimated width.
+/// Uses schema widths where available and decoder seeds otherwise. Callers cache
+/// this at construction; dataset metadata identifies blobs in the output schema.
+pub(crate) fn estimated_bytes_per_row(
+    schema: &arrow_schema::Schema,
+    dataset_schema: &LanceSchema,
+) -> Option<f64> {
+    if carries_blob_payload(schema.fields(), &dataset_schema.fields) {
+        return None;
+    }
+    let bytes_per_row: f64 = schema
+        .fields()
+        .iter()
+        .map(|field| arrow_bytes_per_row(field))
+        .sum();
+    if bytes_per_row <= 0.0 {
+        return None;
+    }
+    Some(bytes_per_row.max(MIN_BYTES_PER_ROW))
+}
+
+/// A row count scaled by a width from [`estimated_bytes_per_row`], always inexact.
+///
+/// Returns `Absent` when either the row count or width is unavailable.
+pub(crate) fn estimated_total_byte_size(
+    num_rows: Precision<usize>,
+    bytes_per_row: Option<f64>,
+) -> Precision<usize> {
+    let (Some(rows), Some(bytes_per_row)) = (num_rows.get_value(), bytes_per_row) else {
+        return Precision::Absent;
+    };
+    // A float-to-int cast saturates at `usize::MAX` rather than wrapping, so a
+    // huge row count degrades to an enormous estimate instead of a tiny one.
+    Precision::Inexact((*rows as f64 * bytes_per_row).ceil() as usize)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::LanceField;
+    use super::LanceSchema;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
 
+    use lance_index::metrics::{IndexTiming, LocalMetricsCollector, MetricsCollector};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
-    use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use arrow_array::{
+        ArrayRef, RecordBatch, RecordBatchReader, UInt64Array,
+        cast::AsArray,
+        types::{UInt32Type, UInt64Type},
+    };
+    use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, SortOptions};
     use datafusion::common::NullEquality;
+    use datafusion::common::stats::Precision;
+    use datafusion::config::ConfigOptions;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
         physical_plan::{
-            ExecutionPlan, joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter,
+            ExecutionPlan, SendableRecordBatchStream, joins::SortMergeJoinExec,
+            stream::RecordBatchStreamAdapter,
         },
     };
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::{ROW_ID, utils::futures::Capacity};
-    use lance_datafusion::exec::OneShotExec;
+    use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::prefilter::FilterLoader;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use super::{
-        InstrumentedChildInputStream, PreFilterSource, ReplayExec, SharedPreFilterExec,
-        SharedPreFilterMaterialization, shared_prefilter_future,
+        FilteredRowIdsToPrefilter, InstrumentedChildInputStream, PreFilterSource, ReplayExec,
+        SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
+        shared_prefilter_future,
     };
+
+    #[test]
+    fn test_index_stage_timings() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let collector = super::IndexMetrics::new(&metrics, 0);
+        let local = LocalMetricsCollector::default();
+        for stage in IndexTiming::ALL {
+            local.record_timing(stage, Duration::from_nanos(7));
+            collector
+                .clone()
+                .record_timing(stage, Duration::from_nanos(11));
+        }
+        local.dump_into(&collector);
+        for stage in IndexTiming::ALL {
+            assert_eq!(
+                metrics
+                    .clone_inner()
+                    .sum_by_name(stage.name())
+                    .unwrap()
+                    .as_usize(),
+                18
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_row_id_prefilter_metrics() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "_rowid",
+            Arc::new(UInt64Array::from(vec![Some(1), None, Some(2), Some(1)])) as ArrayRef,
+        )])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let loader = FilteredRowIdsToPrefilter::new(stream).with_metrics(&metrics, 0);
+        let mask = Box::new(loader).load().await.unwrap();
+        assert_eq!(mask.max_len(), Some(2));
+        assert!(mask.selected(1));
+        assert!(!mask.selected(3));
+        let collected = metrics.clone_inner();
+        for (name, expected) in [
+            ("prefilter_loads", 1),
+            ("prefilter_input_rows", 3),
+            ("prefilter_input_batches", 1),
+            ("prefilter_row_ids", 2),
+        ] {
+            assert_eq!(collected.sum_by_name(name).unwrap().as_usize(), expected);
+        }
+        for name in [
+            "prefilter_load_time",
+            "prefilter_input_time",
+            "prefilter_build_time",
+        ] {
+            assert!(collected.sum_by_name(name).unwrap().as_usize() > 0);
+        }
+    }
 
     fn prefilter_source(is_scalar_index_query: bool, is_empty: bool) -> PreFilterSource {
         let mask = if is_empty {
@@ -1241,6 +1639,151 @@ mod tests {
         assert!(materialization.queries.lock().unwrap().is_empty());
     }
 
+    /// A row-id prefilter source whose first execution fails, like a transient
+    /// object store error.
+    #[derive(Debug)]
+    struct FlakyRowIdSource {
+        schema: SchemaRef,
+        executions: AtomicUsize,
+    }
+
+    impl PartitionStream for FlakyRowIdSource {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batch = if self.executions.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(DataFusionError::Execution(
+                    "transient prefilter failure".to_string(),
+                ))
+            } else {
+                RecordBatch::try_new(
+                    self.schema.clone(),
+                    vec![Arc::new(UInt64Array::from_iter_values(0_u64..4))],
+                )
+                .map_err(DataFusionError::from)
+            };
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                stream::iter([batch]),
+            ))
+        }
+    }
+
+    /// Stands in for the FTS leaves of one MultiMatch: every execution loads
+    /// each field's prefilter under the task context it executes with and
+    /// reports how many rows the mask allows.
+    #[derive(Debug)]
+    struct MultiMatchPrefilterConsumer {
+        field_sources: Vec<PreFilterSource>,
+        schema: SchemaRef,
+    }
+
+    impl PartitionStream for MultiMatchPrefilterConsumer {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let masks = self
+                .field_sources
+                .iter()
+                .map(|source| {
+                    prefilter_mask_future(
+                        ctx.clone(),
+                        0,
+                        source,
+                        None,
+                        &ExecutionPlanMetricsSet::new(),
+                    )
+                    .map(|mask| mask.expect("a filtered MultiMatch field loads a prefilter"))
+                })
+                .collect::<lance_core::Result<Vec<_>>>();
+            let schema = self.schema.clone();
+            let batch = async move {
+                let masks = futures::future::try_join_all(masks?).await?;
+                let allowed_rows = masks[0].allow_list().and_then(|rows| rows.len());
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(UInt64Array::from(vec![allowed_rows]))],
+                )
+                .map_err(DataFusionError::from)
+            };
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                stream::once(batch),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_multimatch_prefilter_reruns_source_for_each_execution() {
+        let row_id_schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]));
+        let source = Arc::new(FlakyRowIdSource {
+            schema: row_id_schema.clone(),
+            executions: AtomicUsize::new(0),
+        });
+        let source_plan = StreamingTableExec::try_new(
+            row_id_schema,
+            vec![source.clone() as Arc<dyn PartitionStream>],
+            None,
+            [],
+            false,
+            None,
+        )
+        .unwrap();
+        let field_sources =
+            PreFilterSource::FilteredRowIds(Arc::new(source_plan)).shared_for_multimatch_fields(2);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "allowed_rows",
+            DataType::UInt64,
+            true,
+        )]));
+        let consumer = Arc::new(MultiMatchPrefilterConsumer {
+            field_sources,
+            schema: output_schema.clone(),
+        });
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            StreamingTableExec::try_new(
+                output_schema,
+                vec![consumer as Arc<dyn PartitionStream>],
+                None,
+                [],
+                false,
+                None,
+            )
+            .unwrap(),
+        );
+
+        // A reused plan must load its prefilter again on every execution
+        // instead of replaying the failure of an earlier one.
+        let failure = execute_plan(plan.clone(), LanceExecutionOptions::default())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("transient prefilter failure"),
+            "{failure}"
+        );
+        let batches = execute_plan(plan, LanceExecutionOptions::default())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0]["allowed_rows"].as_primitive::<UInt64Type>(),
+            &UInt64Array::from(vec![4])
+        );
+        // Both fields of one execution still share a single source execution.
+        assert_eq!(source.executions.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn instrumented_child_input_stream_excludes_child_poll_time() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1450,5 +1993,234 @@ mod tests {
                 "partition {partition}: MarkerError not found in source chain: {err}"
             );
         }
+    }
+
+    #[rstest]
+    // The estimate is inexact whatever the row count's precision.
+    #[case::exact_row_count(Precision::Exact(10), Some(72.0), Precision::Inexact(720))]
+    #[case::inexact_row_count(Precision::Inexact(10), Some(72.0), Precision::Inexact(720))]
+    #[case::no_row_count(Precision::Absent, Some(72.0), Precision::Absent)]
+    #[case::no_width(Precision::Exact(1_000_000_000), None, Precision::Absent)]
+    fn estimated_byte_size_needs_both_a_row_count_and_a_width(
+        #[case] num_rows: Precision<usize>,
+        #[case] bytes_per_row: Option<f64>,
+        #[case] expected: Precision<usize>,
+    ) {
+        assert_eq!(
+            super::estimated_total_byte_size(num_rows, bytes_per_row),
+            expected
+        );
+    }
+
+    #[test]
+    fn row_width_combines_fixed_and_seeded_fields() {
+        let blobless = LanceSchema::default();
+        let mut fields = vec![
+            Arc::new(Field::new("a", DataType::UInt32, false)),
+            Arc::new(Field::new("b", DataType::Float64, false)),
+        ];
+        assert_eq!(
+            super::estimated_bytes_per_row(&Schema::new(fields.clone()), &blobless),
+            Some(12.0)
+        );
+
+        // Empty and null-only schemas have no value or validity buffers.
+        assert_eq!(
+            super::estimated_bytes_per_row(&Schema::empty(), &blobless),
+            None
+        );
+        assert_eq!(
+            super::estimated_bytes_per_row(
+                &Schema::new(vec![Field::new("null", DataType::Null, true)]),
+                &blobless
+            ),
+            None
+        );
+
+        // A partly measurable schema is seeded rather than withdrawn: 12 bytes of
+        // fixed width, plus 64 of string, 4 of offset and a validity bit.
+        fields.push(Arc::new(Field::new("note", DataType::Utf8, true)));
+        assert_eq!(
+            super::estimated_bytes_per_row(&Schema::new(fields), &blobless),
+            Some(80.125)
+        );
+    }
+
+    /// Nested blob payloads must suppress the whole output estimate.
+    #[test]
+    fn a_blob_nested_in_a_list_is_still_carried() {
+        let emitted = Schema::new(vec![Field::new(
+            "blobs",
+            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
+            true,
+        )]);
+        let mut dataset = LanceSchema::try_from(&emitted).unwrap();
+        dataset.fields[0].children[0]
+            .metadata
+            .insert(BLOB_META_KEY.to_string(), "true".to_string());
+
+        assert_eq!(super::estimated_bytes_per_row(&emitted, &dataset), None);
+    }
+
+    /// The guard keys on what a node emits, matched against the dataset's fields.
+    /// A v1 blob carries `BLOB_META_KEY` and no v2 extension name, so a v2-only
+    /// check misses it and bills an unbounded payload the seed width.
+    #[rstest]
+    #[case::v2_payload(ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME, DataType::LargeBinary, true)]
+    #[case::v1_payload(BLOB_META_KEY, "true", DataType::LargeBinary, true)]
+    // A descriptor is a fixed-width column, not a payload, so it stays measurable.
+    #[case::v1_descriptor(
+        BLOB_META_KEY,
+        "true",
+        DataType::Struct(Fields::from(vec![
+            Field::new("position", DataType::UInt64, false),
+            Field::new("size", DataType::UInt64, false),
+        ])),
+        false
+    )]
+    // An ordinary binary column that is not a blob is measurable.
+    #[case::plain_binary("unrelated-key", "true", DataType::LargeBinary, false)]
+    fn a_carried_blob_payload_is_recognised_whatever_marked_it(
+        #[case] key: &str,
+        #[case] value: &str,
+        #[case] emitted: DataType,
+        #[case] expected: bool,
+    ) {
+        let mut lance =
+            LanceField::try_from(&Field::new("blob", DataType::LargeBinary, true)).unwrap();
+        lance.metadata.insert(key.to_string(), value.to_string());
+        let emitted = Schema::new(vec![Field::new("blob", emitted, true)]);
+
+        assert_eq!(
+            super::carries_blob_payload(emitted.fields(), std::slice::from_ref(&lance)),
+            expected
+        );
+    }
+
+    /// Covers schema widths, nullable overhead, and variable-width seeds.
+    #[rstest]
+    #[case::fixed_width(Field::new("a", DataType::Int64, false), 8.0)]
+    // A nullable field pays one validity bit a row.
+    #[case::fixed_width_nullable(Field::new("a", DataType::Int64, true), 8.125)]
+    // Boolean values are a bit a row as well, so validity doubles the column.
+    #[case::boolean_nullable(Field::new("a", DataType::Boolean, true), 0.25)]
+    #[case::fixed_size_binary(Field::new("a", DataType::FixedSizeBinary(12), false), 12.0)]
+    // Children pay their own validity once per value, not once per row: a 4-dim
+    // vector of nullable floats carries four bits a row.
+    #[case::fixed_size_list(
+        Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        ),
+        16.5
+    )]
+    #[case::nested_struct(
+        Field::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int64, true),
+                Field::new("y", DataType::Float32, false),
+            ])),
+            false,
+        ),
+        12.125
+    )]
+    #[case::null(Field::new("a", DataType::Null, true), 0.0)]
+    // Below: everything whose per-row cost the schema is silent about, seeded from
+    // the decoder's estimate plus the buffers around it.
+    // 64 bytes of value and 4 of offset.
+    #[case::utf8(Field::new("a", DataType::Utf8, false), 68.0)]
+    // 64 and an 8-byte offset.
+    #[case::large_binary(Field::new("a", DataType::LargeBinary, false), 72.0)]
+    // The decoder's catch-all, with no offset buffer of its own.
+    #[case::utf8_view(Field::new("a", DataType::Utf8View, false), 64.0)]
+    #[case::list(
+        Field::new(
+            "a",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ),
+        // Five 8-byte items, a 4-byte offset, and a validity bit for the list and
+        // each assumed item.
+        44.75
+    )]
+    // One Int8 key a row; shared dictionary values are omitted.
+    #[case::dictionary(
+        Field::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+        1.0
+    )]
+    // Nested dictionaries use keys too: five keys plus a four-byte list offset.
+    #[case::nested_dictionary(
+        Field::new(
+            "a",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                false,
+            ))),
+            false,
+        ),
+        9.0
+    )]
+    // A fixed-width type `byte_width_opt` does not enumerate still reports exactly,
+    // via Arrow's own width rather than the 64-byte seed.
+    #[case::decimal64(Field::new("a", DataType::Decimal64(18, 2), false), 8.0)]
+    // A struct sums its children, seeded child included.
+    #[case::struct_with_a_string(
+        Field::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int64, false),
+                Field::new("y", DataType::Utf8, false),
+            ])),
+            false,
+        ),
+        76.0
+    )]
+    fn width_includes_schema_sizes_and_seeds(#[case] field: Field, #[case] expected: f64) {
+        assert_eq!(super::arrow_bytes_per_row(&field), expected);
+    }
+
+    /// The floor reaches the default byte threshold at the default row threshold.
+    #[test]
+    fn a_narrow_row_is_floored_to_the_row_guard() {
+        // Read DataFusion's guards rather than copy them. The floor is derived from
+        // both, so an upgrade that moves either default has to fail here instead of
+        // leaving behind a floor that no longer reproduces the row cap.
+        let optimizer = ConfigOptions::default().optimizer;
+        let collect_bytes = optimizer.hash_join_single_partition_threshold;
+        let collect_rows = optimizer.hash_join_single_partition_threshold_rows;
+        assert_eq!(
+            super::MIN_BYTES_PER_ROW,
+            collect_bytes as f64 / collect_rows as f64,
+            "the floor is the byte guard spread across the row guard"
+        );
+
+        // A quarter byte a row: a bit of value and a bit of validity. Unfloored,
+        // four million rows of this would still pass for less than 1 MiB.
+        let narrow = Schema::new(vec![Field::new("flag", DataType::Boolean, true)]);
+
+        let width = super::estimated_bytes_per_row(&narrow, &LanceSchema::default());
+        assert_eq!(width, Some(super::MIN_BYTES_PER_ROW), "the floor applies");
+
+        let under = super::estimated_total_byte_size(Precision::Exact(collect_rows - 1), width);
+        assert!(
+            under
+                .get_value()
+                .is_some_and(|bytes| *bytes < collect_bytes),
+            "a row short of the row guard has to stay under the byte guard: {under:?}"
+        );
+
+        let over = super::estimated_total_byte_size(Precision::Exact(collect_rows), width);
+        assert!(
+            over.get_value()
+                .is_some_and(|bytes| *bytes >= collect_bytes),
+            "the row count the row guard rejects has to fail the byte guard too: {over:?}"
+        );
     }
 }

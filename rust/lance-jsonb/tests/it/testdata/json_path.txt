@@ -1,0 +1,1417 @@
+---------- Input ----------
+$
+---------- Output ---------
+$
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+    ],
+}
+
+
+---------- Input ----------
+$.*
+---------- Output ---------
+$.*
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotWildcard,
+    ],
+}
+
+
+---------- Input ----------
+$.**
+---------- Output ---------
+$.**
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        RecursiveDotWildcard(
+            None,
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.**{2 to last}
+---------- Output ---------
+$.**{2 to last}
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        RecursiveDotWildcard(
+            Some(
+                RecursiveLevel {
+                    start: 2,
+                    end: Some(
+                        Last,
+                    ),
+                },
+            ),
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$[*]
+---------- Output ---------
+$[*]
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        BracketWildcard,
+    ],
+}
+
+
+---------- Input ----------
+5 + 5
+---------- Output ---------
+5 + 5
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Add,
+                left: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+10 - 5
+---------- Output ---------
+10 - 5
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Subtract,
+                left: Value(
+                    Number(
+                        UInt64(
+                            10,
+                        ),
+                    ),
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+10 * 5
+---------- Output ---------
+10 * 5
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Multiply,
+                left: Value(
+                    Number(
+                        UInt64(
+                            10,
+                        ),
+                    ),
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+10 / 5
+---------- Output ---------
+10 / 5
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Divide,
+                left: Value(
+                    Number(
+                        UInt64(
+                            10,
+                        ),
+                    ),
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+10 % 5
+---------- Output ---------
+10 % 5
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Modulo,
+                left: Value(
+                    Number(
+                        UInt64(
+                            10,
+                        ),
+                    ),
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[*].*
+---------- Output ---------
+$.store.book[*].*
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        BracketWildcard,
+        DotWildcard,
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[0].price
+---------- Output ---------
+$.store.book[0].price
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    Index(
+                        0,
+                    ),
+                ),
+            ],
+        ),
+        DotField(
+            "price",
+        ),
+    ],
+}
+
+
+---------- Input ----------
++$.store.book[0].price
+---------- Output ---------
++$.store.book[0].price
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            UnaryOp {
+                op: Add,
+                operand: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "store",
+                        ),
+                        DotField(
+                            "book",
+                        ),
+                        ArrayIndices(
+                            [
+                                Index(
+                                    Index(
+                                        0,
+                                    ),
+                                ),
+                            ],
+                        ),
+                        DotField(
+                            "price",
+                        ),
+                    ],
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+-$.store.book[0].price
+---------- Output ---------
+-$.store.book[0].price
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            UnaryOp {
+                op: Subtract,
+                operand: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "store",
+                        ),
+                        DotField(
+                            "book",
+                        ),
+                        ArrayIndices(
+                            [
+                                Index(
+                                    Index(
+                                        0,
+                                    ),
+                                ),
+                            ],
+                        ),
+                        DotField(
+                            "price",
+                        ),
+                    ],
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[0].price + 5
+---------- Output ---------
+$.store.book[0].price + 5
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Add,
+                left: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "store",
+                        ),
+                        DotField(
+                            "book",
+                        ),
+                        ArrayIndices(
+                            [
+                                Index(
+                                    Index(
+                                        0,
+                                    ),
+                                ),
+                            ],
+                        ),
+                        DotField(
+                            "price",
+                        ),
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            5,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[last].isbn
+---------- Output ---------
+$.store.book[last].isbn
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    LastIndex(
+                        0,
+                    ),
+                ),
+            ],
+        ),
+        DotField(
+            "isbn",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[last].test_key\uD83D\uDC8E测试
+---------- Output ---------
+$.store.book[last].test_key💎测试
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    LastIndex(
+                        0,
+                    ),
+                ),
+            ],
+        ),
+        DotField(
+            "test_key💎测试",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[0,1, last - 2].price
+---------- Output ---------
+$.store.book[0, 1, last-2].price
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    Index(
+                        0,
+                    ),
+                ),
+                Index(
+                    Index(
+                        1,
+                    ),
+                ),
+                Index(
+                    LastIndex(
+                        -2,
+                    ),
+                ),
+            ],
+        ),
+        DotField(
+            "price",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book[0,1 to last-1]
+---------- Output ---------
+$.store.book[0, 1 to last-1]
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    Index(
+                        0,
+                    ),
+                ),
+                Slice(
+                    (
+                        Index(
+                            1,
+                        ),
+                        LastIndex(
+                            -1,
+                        ),
+                    ),
+                ),
+            ],
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$."store"."book"
+---------- Output ---------
+$.store.book
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$."st\"ore"."book\uD83D\uDC8E"
+---------- Output ---------
+$.st"ore.book💎
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "st\"ore",
+        ),
+        DotField(
+            "book💎",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$[*].book.price ? (@ == 10)
+---------- Output ---------
+$[*].book.price?(@ == 10)
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        BracketWildcard,
+        DotField(
+            "book",
+        ),
+        DotField(
+            "price",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: Eq,
+                left: Paths(
+                    [
+                        Current,
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            10,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(@.price > 10).title
+---------- Output ---------
+$.store.book?(@.price > 10).title
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: Gt,
+                left: Paths(
+                    [
+                        Current,
+                        DotField(
+                            "price",
+                        ),
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            10,
+                        ),
+                    ),
+                ),
+            },
+        ),
+        DotField(
+            "title",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(@.price < $.expensive).price
+---------- Output ---------
+$.store.book?(@.price < $.expensive).price
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: Lt,
+                left: Paths(
+                    [
+                        Current,
+                        DotField(
+                            "price",
+                        ),
+                    ],
+                ),
+                right: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "expensive",
+                        ),
+                    ],
+                ),
+            },
+        ),
+        DotField(
+            "price",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(@.price < 10 && @.category == "fiction")
+---------- Output ---------
+$.store.book?(@.price < 10 && @.category == "fiction")
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: And,
+                left: BinaryOp {
+                    op: Lt,
+                    left: Paths(
+                        [
+                            Current,
+                            DotField(
+                                "price",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        Number(
+                            UInt64(
+                                10,
+                            ),
+                        ),
+                    ),
+                },
+                right: BinaryOp {
+                    op: Eq,
+                    left: Paths(
+                        [
+                            Current,
+                            DotField(
+                                "category",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        String(
+                            "fiction",
+                        ),
+                    ),
+                },
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(@.price > 10 || @.category == "reference")
+---------- Output ---------
+$.store.book?(@.price > 10 || @.category == "reference")
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: Or,
+                left: BinaryOp {
+                    op: Gt,
+                    left: Paths(
+                        [
+                            Current,
+                            DotField(
+                                "price",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        Number(
+                            UInt64(
+                                10,
+                            ),
+                        ),
+                    ),
+                },
+                right: BinaryOp {
+                    op: Eq,
+                    left: Paths(
+                        [
+                            Current,
+                            DotField(
+                                "category",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        String(
+                            "reference",
+                        ),
+                    ),
+                },
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(@.price > 20 && (@.category == "reference" || @.category == "fiction"))
+---------- Output ---------
+$.store.book?(@.price > 20 && (@.category == "reference" || @.category == "fiction"))
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: And,
+                left: BinaryOp {
+                    op: Gt,
+                    left: Paths(
+                        [
+                            Current,
+                            DotField(
+                                "price",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        Number(
+                            UInt64(
+                                20,
+                            ),
+                        ),
+                    ),
+                },
+                right: BinaryOp {
+                    op: Or,
+                    left: BinaryOp {
+                        op: Eq,
+                        left: Paths(
+                            [
+                                Current,
+                                DotField(
+                                    "category",
+                                ),
+                            ],
+                        ),
+                        right: Value(
+                            String(
+                                "reference",
+                            ),
+                        ),
+                    },
+                    right: BinaryOp {
+                        op: Eq,
+                        left: Paths(
+                            [
+                                Current,
+                                DotField(
+                                    "category",
+                                ),
+                            ],
+                        ),
+                        right: Value(
+                            String(
+                                "fiction",
+                            ),
+                        ),
+                    },
+                },
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+[1][2]
+---------- Output ---------
+[1][2]
+---------- AST ------------
+JsonPath {
+    paths: [
+        ArrayIndices(
+            [
+                Index(
+                    Index(
+                        1,
+                    ),
+                ),
+            ],
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    Index(
+                        2,
+                    ),
+                ),
+            ],
+        ),
+    ],
+}
+
+
+---------- Input ----------
+["k1"]["k2"]
+---------- Output ---------
+["k1"]["k2"]
+---------- AST ------------
+JsonPath {
+    paths: [
+        ObjectField(
+            "k1",
+        ),
+        ObjectField(
+            "k2",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+k1.k2:k3
+---------- Output ---------
+.k1.k2:k3
+---------- AST ------------
+JsonPath {
+    paths: [
+        DotField(
+            "k1",
+        ),
+        DotField(
+            "k2",
+        ),
+        ColonField(
+            "k3",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+k1["k2"][1]
+---------- Output ---------
+.k1["k2"][1]
+---------- AST ------------
+JsonPath {
+    paths: [
+        DotField(
+            "k1",
+        ),
+        ObjectField(
+            "k2",
+        ),
+        ArrayIndices(
+            [
+                Index(
+                    Index(
+                        1,
+                    ),
+                ),
+            ],
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$ > 1
+---------- Output ---------
+$ > 1
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Gt,
+                left: Paths(
+                    [
+                        Root,
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            1,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.* == 0
+---------- Output ---------
+$.* == 0
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Eq,
+                left: Paths(
+                    [
+                        Root,
+                        DotWildcard,
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            0,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$[*] > 1
+---------- Output ---------
+$[*] > 1
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Gt,
+                left: Paths(
+                    [
+                        Root,
+                        BracketWildcard,
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            1,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.a > $.b
+---------- Output ---------
+$.a > $.b
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Gt,
+                left: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "a",
+                        ),
+                    ],
+                ),
+                right: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "b",
+                        ),
+                    ],
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.price > 10 || $.category == "reference"
+---------- Output ---------
+$.price > 10 || $.category == "reference"
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Or,
+                left: BinaryOp {
+                    op: Gt,
+                    left: Paths(
+                        [
+                            Root,
+                            DotField(
+                                "price",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        Number(
+                            UInt64(
+                                10,
+                            ),
+                        ),
+                    ),
+                },
+                right: BinaryOp {
+                    op: Eq,
+                    left: Paths(
+                        [
+                            Root,
+                            DotField(
+                                "category",
+                            ),
+                        ],
+                    ),
+                    right: Value(
+                        String(
+                            "reference",
+                        ),
+                    ),
+                },
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(exists(@.price?(@ > 20)))
+---------- Output ---------
+$.store.book?(exists(@.price?(@ > 20)))
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            ExistsFunc(
+                [
+                    Current,
+                    DotField(
+                        "price",
+                    ),
+                    FilterExpr(
+                        BinaryOp {
+                            op: Gt,
+                            left: Paths(
+                                [
+                                    Current,
+                                ],
+                            ),
+                            right: Value(
+                                Number(
+                                    UInt64(
+                                        20,
+                                    ),
+                                ),
+                            ),
+                        },
+                    ),
+                ],
+            ),
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store?(exists(@.book?(exists(@.category?(@ == "fiction")))))
+---------- Output ---------
+$.store?(exists(@.book?(exists(@.category?(@ == "fiction")))))
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        FilterExpr(
+            ExistsFunc(
+                [
+                    Current,
+                    DotField(
+                        "book",
+                    ),
+                    FilterExpr(
+                        ExistsFunc(
+                            [
+                                Current,
+                                DotField(
+                                    "category",
+                                ),
+                                FilterExpr(
+                                    BinaryOp {
+                                        op: Eq,
+                                        left: Paths(
+                                            [
+                                                Current,
+                                            ],
+                                        ),
+                                        right: Value(
+                                            String(
+                                                "fiction",
+                                            ),
+                                        ),
+                                    },
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.store.book?(@ starts with "Nigel")
+---------- Output ---------
+$.store.book?(@ starts with "Nigel")
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        DotField(
+            "store",
+        ),
+        DotField(
+            "book",
+        ),
+        FilterExpr(
+            BinaryOp {
+                op: StartsWith,
+                left: Paths(
+                    [
+                        Current,
+                    ],
+                ),
+                right: Value(
+                    String(
+                        "Nigel",
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$[*] ? (@.job == null) .name
+---------- Output ---------
+$[*]?(@.job == null).name
+---------- AST ------------
+JsonPath {
+    paths: [
+        Root,
+        BracketWildcard,
+        FilterExpr(
+            BinaryOp {
+                op: Eq,
+                left: Paths(
+                    [
+                        Current,
+                        DotField(
+                            "job",
+                        ),
+                    ],
+                ),
+                right: Value(
+                    Null,
+                ),
+            },
+        ),
+        DotField(
+            "name",
+        ),
+    ],
+}
+
+
+---------- Input ----------
+$.phones[0].number + 3
+---------- Output ---------
+$.phones[0].number + 3
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Add,
+                left: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "phones",
+                        ),
+                        ArrayIndices(
+                            [
+                                Index(
+                                    Index(
+                                        0,
+                                    ),
+                                ),
+                            ],
+                        ),
+                        DotField(
+                            "number",
+                        ),
+                    ],
+                ),
+                right: Value(
+                    Number(
+                        UInt64(
+                            3,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+7 - $[0]
+---------- Output ---------
+7 - $[0]
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            BinaryOp {
+                op: Subtract,
+                left: Value(
+                    Number(
+                        UInt64(
+                            7,
+                        ),
+                    ),
+                ),
+                right: Paths(
+                    [
+                        Root,
+                        ArrayIndices(
+                            [
+                                Index(
+                                    Index(
+                                        0,
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            },
+        ),
+    ],
+}
+
+
+---------- Input ----------
+- $.phones[0].number
+---------- Output ---------
+-$.phones[0].number
+---------- AST ------------
+JsonPath {
+    paths: [
+        Expr(
+            UnaryOp {
+                op: Subtract,
+                operand: Paths(
+                    [
+                        Root,
+                        DotField(
+                            "phones",
+                        ),
+                        ArrayIndices(
+                            [
+                                Index(
+                                    Index(
+                                        0,
+                                    ),
+                                ),
+                            ],
+                        ),
+                        DotField(
+                            "number",
+                        ),
+                    ],
+                ),
+            },
+        ),
+    ],
+}
+
+

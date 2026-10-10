@@ -24,6 +24,7 @@ pub mod layered;
 pub mod layered_stats;
 #[cfg(test)]
 mod lazy_tests;
+pub(crate) mod pairwise;
 mod plane_cache;
 pub mod prune;
 pub mod rotation;
@@ -72,8 +73,9 @@ impl BinaryQuantization {
 ///
 /// Use the sign bit of the float vector to represent the binary vector.
 fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
-    let iter = data.chunks_exact(8);
-    iter.clone()
+    let (chunks, remainder) = data.as_chunks::<8>();
+    chunks
+        .iter()
         .map(|c| {
             // Auto vectorized.
             // Before changing this code, please check the assembly output.
@@ -85,7 +87,7 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
         })
         .chain(once(0).map(move |_| {
             let mut bits: u8 = 0;
-            iter.remainder().iter().enumerate().for_each(|(idx, v)| {
+            remainder.iter().enumerate().for_each(|(idx, v)| {
                 bits |= (v.is_sign_positive() as u8) << idx;
             });
             bits

@@ -4,12 +4,13 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 mod bounded_partition_stream;
 pub mod builder;
+pub mod dedup;
 pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
@@ -21,10 +22,12 @@ mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
 use arrow_array::Array;
+use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Schema};
 use builder::{IvfIndexBuilder, VectorIndexBuildSummary};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::TryStreamExt;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
@@ -505,6 +508,169 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+/// Whether `column` holds at least `minimum` vectors to train a quantizer from.
+///
+/// The metadata-only row total settles anything already short of the floor, so
+/// the validity count runs only where its answer can change the verdict.
+pub async fn has_vectors_to_train(dataset: &Dataset, column: &str, minimum: usize) -> Result<bool> {
+    let total = dataset.count_rows(None).await?;
+    if total < minimum && !is_multivector(dataset, column)? {
+        return Ok(false);
+    }
+    Ok(count_trainable_vectors(dataset, column, total, minimum).await? >= minimum)
+}
+
+/// Vectors in `column` available to train from.
+///
+/// A multivector row holds a list, so its rows bound the vectors from neither
+/// side — ten rows can carry a thousand, and an empty list carries none. Those
+/// are summed from the lists themselves; everything else counts the rows that
+/// hold a vector. Both callers compare the count with a threshold, so `enough`
+/// stops the walk as soon as the answer is settled.
+pub(crate) async fn count_trainable_vectors(
+    dataset: &Dataset,
+    column: &str,
+    total_rows: usize,
+    enough: usize,
+) -> Result<usize> {
+    let is_multivector = is_multivector(dataset, column)?;
+    if !is_multivector
+        && dataset
+            .schema()
+            .field(column)
+            .is_some_and(|field| !field.nullable)
+    {
+        return Ok(total_rows);
+    }
+    if enough == 0 {
+        return Ok(0);
+    }
+
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    // These callers need a threshold, not a full count. Bound prefetch so a
+    // small training floor does not schedule reads from the rest of the table.
+    // Keep batches large enough to also scan sparse or all-null inputs efficiently.
+    scanner
+        .batch_size(1024)
+        .batch_readahead(1)
+        .fragment_readahead(1);
+    let mut batches = scanner.try_into_stream().await?;
+    let mut vectors = 0_usize;
+    while let Some(batch) = batches.try_next().await? {
+        let array = utils::get_column_from_batch(&batch, column)?;
+        if is_multivector {
+            let lists = array.as_list::<i32>();
+            for row in 0..lists.len() {
+                if lists.is_null(row) {
+                    continue;
+                }
+                // Null vectors inside a non-null list cannot be trained on.
+                let row_vectors = lists.value(row);
+                vectors = vectors.saturating_add(row_vectors.len() - row_vectors.null_count());
+            }
+        } else {
+            vectors = vectors.saturating_add(array.len() - array.null_count());
+        }
+        if vectors >= enough {
+            return Ok(vectors);
+        }
+    }
+    Ok(vectors)
+}
+
+fn is_multivector(dataset: &Dataset, column: &str) -> Result<bool> {
+    let (vector_type, _) = get_vector_type(dataset.schema(), column)?;
+    Ok(matches!(vector_type, DataType::List(_)))
+}
+
+/// The partition count a whole-table build can train.
+///
+/// A partition's centroid is what search ranks to choose partitions, so one
+/// built from a handful of vectors prunes nothing while still paying the
+/// quantizer's precision loss. The vectors available therefore cap the count,
+/// at `vectors_per_partition` each.
+async fn supported_num_partitions(
+    dataset: &Dataset,
+    column: &str,
+    stages: &[StageParams],
+    requested: usize,
+    mode: &str,
+) -> Result<usize> {
+    let total = dataset.count_rows(None).await?;
+    let enough = vectors_for_partitions(stages, requested);
+    let vectors = count_trainable_vectors(dataset, column, total, enough).await?;
+    if vectors >= enough {
+        return Ok(requested);
+    }
+
+    let supported = match vectors_per_partition(stages) {
+        Some(target) => requested.min(recommended_num_partitions(vectors, target)),
+        None => requested.min(vectors).max(1),
+    };
+    if supported < requested {
+        log::warn!(
+            "{mode}: training {supported} of the {requested} requested IVF partitions; \
+             column '{column}' holds {vectors} vectors"
+        );
+    }
+    Ok(supported)
+}
+
+/// Vectors needed before `partitions` can each train a quantizer of their own.
+///
+/// The upper edge of the reduced-partition band: below this a build trains
+/// fewer partitions than asked for.
+fn vectors_for_partitions(stages: &[StageParams], partitions: usize) -> usize {
+    partitions.saturating_mul(vectors_per_partition(stages).unwrap_or(1))
+}
+
+/// The vectors one partition's centroid should be fitted on, or `None` when the
+/// index stores vectors uncompressed.
+///
+/// A codebook's precision loss is paid on every vector, so a centroid fitted on
+/// a handful prunes nothing and still costs it. Without a codebook there is no
+/// precision to lose, and KMeans needing a vector per centroid is the only
+/// limit.
+fn vectors_per_partition(stages: &[StageParams]) -> Option<usize> {
+    vector_quantizer_minimum_rows(stages)?;
+    // IVF training fits each centroid on `sample_rate` vectors, which is also
+    // where KMeans starts warning (`k * 256` at the default rate). That number
+    // belongs to the IVF stage: an 8-bit codebook holds the same 256 entries by
+    // coincidence, and a 4-bit one asking only 16 vectors per partition would
+    // train centroids that prune nothing.
+    Some(
+        stages
+            .iter()
+            .find_map(|stage| match stage {
+                StageParams::Ivf(ivf) => Some(ivf.sample_rate),
+                _ => None,
+            })
+            .unwrap_or_else(|| IvfBuildParams::default().sample_rate)
+            .max(1),
+    )
+}
+
+/// Rows a PQ codebook needs before it can be trained.
+///
+/// One row per code, which is `2^num_bits` — 256 at the default 8 bits, and not
+/// 256 at any other setting. `None` when the width does not fit a `usize`.
+pub fn pq_quantizer_minimum_rows(num_bits: usize) -> Option<usize> {
+    1_usize.checked_shl(num_bits as u32)
+}
+
+/// Rows a vector index's quantizer needs before it can be trained.
+///
+/// `None` for an index type whose stages name no quantizer with a row floor.
+pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<usize> {
+    stages.iter().find_map(|stage| match stage {
+        // A supplied codebook is what training would have produced, so the
+        // build needs no vectors to fit one.
+        StageParams::PQ(pq) if pq.codebook.is_none() => pq_quantizer_minimum_rows(pq.num_bits),
+        _ => None,
+    })
+}
+
 /// Prepare the shared build inputs used by both direct local builds and
 /// staged shard builds.
 ///
@@ -577,7 +743,18 @@ async fn prepare_vector_segment_build(
                 centroids.len()
             )));
         }
-        (Some(num_partitions), _) => num_partitions,
+        (Some(num_partitions), Some(_)) => num_partitions,
+        // A partition's centroid is what search ranks to choose partitions, so
+        // one built from a handful of vectors prunes nothing and still costs
+        // the quantizer's precision. So the vectors available cap how many
+        // partitions a whole-table build trains, at the IVF sample rate each.
+        //
+        // A fragment subset keeps the count it was given: the segments of one
+        // logical index have to agree on it.
+        (Some(requested), None) if fragment_ids.is_none() => {
+            supported_num_partitions(dataset, column, stages, requested, mode).await?
+        }
+        (Some(num_partitions), None) => num_partitions,
         (None, Some(centroids)) => centroids.len(),
         (None, None) => {
             let num_rows = match fragment_ids {
@@ -1041,6 +1218,15 @@ async fn build_vector_index_impl(
         )
         .await?;
     let stages = &params.stages;
+
+    // RaBitQ encodes against L2 or dot residuals, and its transform rejects
+    // anything else, but only after the IVF model has been trained on a sample.
+    if index_type == IndexType::IvfRq && params.metric_type == DistanceType::Hamming {
+        return Err(Error::index(format!(
+            "Build Vector Index: {} does not support the {} metric",
+            index_type, params.metric_type
+        )));
+    }
 
     match index_type {
         IndexType::IvfFlat => match element_type {
@@ -1563,25 +1749,20 @@ pub(crate) async fn build_vector_index_incremental(
     }
 }
 
-/// Build an empty vector index without training on data
+/// Create a vector index that carries its definition and no data.
+///
+/// The parameters live in the index's `index_details` and the fragment bitmap
+/// is empty, so it covers no rows and has no file to open. `optimize_indices`
+/// trains it once the column holds enough vectors.
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn build_empty_vector_index(
     _dataset: &Dataset,
-    column: &str,
-    name: &str,
+    _column: &str,
+    _name: &str,
     _uuid: Uuid,
     _params: &VectorIndexParams,
 ) -> Result<Vec<IndexFile>> {
-    // For now, return a NotImplementedError to indicate this functionality
-    // is still being developed
-    Err(Error::not_supported_source(
-        format!(
-            "Creating empty vector indices with train=False is not yet implemented. \
-        Index '{}' for column '{}' cannot be created without training.",
-            name, column
-        )
-        .into(),
-    ))
+    Ok(Vec::new())
 }
 
 #[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string()))]
@@ -1591,7 +1772,7 @@ pub(crate) async fn remap_vector_index(
     old_uuid: &Uuid,
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
-    mapping: &RowAddrRemap,
+    mapping: &RowAddrTranslator,
 ) -> Result<Vec<IndexFile>> {
     let old_index = dataset
         .open_vector_index(column, old_uuid, &NoOpMetricsCollector)
@@ -2203,17 +2384,268 @@ pub(crate) fn fresh_vector_segment_params(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::Dataset;
+    use crate::dataset::{Dataset, WriteParams};
     use crate::index::DatasetIndexExt;
-    use arrow_array::Array;
-    use arrow_array::RecordBatch;
     use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+    };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
+
+    #[tokio::test]
+    async fn test_nullable_vector_count_stops_at_threshold() {
+        const ROWS: usize = 16 * 1024;
+        const DIM: usize = 16;
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..ROWS * DIM).map(|i| i as f32)),
+            DIM as i32,
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            vectors.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1024,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 16);
+
+        dataset.object_store.io_stats_incremental();
+        let counted = count_trainable_vectors(&dataset, "vec", ROWS, 256)
+            .await
+            .unwrap();
+        let bounded_reads = dataset.object_store.io_stats_incremental();
+        assert!((256..ROWS).contains(&counted), "counted {counted}");
+
+        assert_eq!(
+            count_trainable_vectors(&dataset, "vec", ROWS, usize::MAX)
+                .await
+                .unwrap(),
+            ROWS
+        );
+        let full_reads = dataset.object_store.io_stats_incremental();
+        assert!(
+            bounded_reads.read_bytes < full_reads.read_bytes / 2,
+            "threshold check read {} bytes; full count read {} bytes",
+            bounded_reads.read_bytes,
+            full_reads.read_bytes
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::all_valid(64, 1)]
+    #[case::sparse(64, 4)]
+    #[case::all_null(64, 0)]
+    #[case::empty(0, 1)]
+    #[tokio::test]
+    async fn test_nullable_vector_count_nulls_and_deletions(
+        #[case] rows: usize,
+        #[case] valid_every: usize,
+    ) {
+        let valid: Vec<bool> = (0..rows)
+            .map(|i| valid_every != 0 && i % valid_every == 0)
+            .collect();
+        let vectors = FixedSizeListArray::new(
+            Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+            2,
+            Arc::new(Float32Array::from_iter_values(
+                (0..rows * 2).map(|i| i as f32),
+            )),
+            Some(NullBuffer::from(valid.clone())),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("vec", vectors.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if rows > 0 {
+            dataset.delete("id % 5 = 0").await.unwrap();
+        }
+        let expected = valid
+            .iter()
+            .enumerate()
+            .filter(|(i, valid)| **valid && i % 5 != 0)
+            .count();
+        let total = dataset.count_rows(None).await.unwrap();
+        for enough in [0, 1, 8, usize::MAX] {
+            let count = count_trainable_vectors(&dataset, "vec", total, enough)
+                .await
+                .unwrap();
+            if expected < enough {
+                assert_eq!(count, expected);
+            } else {
+                assert!(count >= enough && count <= expected);
+            }
+            assert_eq!(
+                has_vectors_to_train(&dataset, "vec", enough).await.unwrap(),
+                expected >= enough
+            );
+        }
+    }
+
+    /// IVF_RQ encodes residuals under L2 or dot; the RQ transform rejects other
+    /// metrics, but only once the IVF model has been trained, so the build spends
+    /// the training pass before failing. Hamming is also contradictory for RQ,
+    /// which requires float vectors while Hamming is a binary-vector metric.
+    #[tokio::test]
+    async fn test_build_rejects_hamming_for_rq() {
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        use lance_index::vector::bq::RQBuildParams;
+
+        let dim = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(dim)),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(256))
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::Hamming,
+            IvfBuildParams::new(2),
+            RQBuildParams::default(),
+        );
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IVF_RQ does not support the hamming metric"),
+            "expected the up-front metric rejection, got: {err}"
+        );
+    }
+
+    /// A build that was handed its codebook has nothing to fit, so the rows
+    /// that fitting would have needed are not required of it.
+    ///
+    /// Without this a caller who supplies both the centroids and the codebook
+    /// -- a fully specified index, needing no training data at all -- has the
+    /// build deferred and gets an empty index back.
+    #[test]
+    fn a_supplied_codebook_needs_no_rows_to_train_on() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_index::vector::pq::PQBuildParams;
+
+        let eight_bit = PQBuildParams {
+            num_bits: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            vector_quantizer_minimum_rows(&[StageParams::PQ(eight_bit.clone())]),
+            Some(256),
+            "fitting an 8-bit codebook needs a row per code"
+        );
+
+        let values = Float32Array::from(vec![0.0_f32; 2 * 256 * 4]);
+        let codebook = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let supplied = PQBuildParams {
+            codebook: Some(Arc::new(codebook)),
+            ..eight_bit
+        };
+        assert_eq!(
+            vector_quantizer_minimum_rows(&[StageParams::PQ(supplied)]),
+            None,
+            "a supplied codebook is the fit, so no rows are needed for it"
+        );
+    }
+
+    /// A null vector inside a multivector row is not one to train on.
+    ///
+    /// The row's list length counts it, so counting lengths reports more
+    /// trainable vectors than exist -- and this count decides whether there is
+    /// enough data to train at all, so erring high is the direction that
+    /// trains an index it should have deferred.
+    #[tokio::test]
+    async fn a_null_vector_inside_a_multivector_row_is_not_trainable() {
+        use arrow_array::RecordBatchIterator;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
+
+        const DIM: i32 = 2;
+        let item = Arc::new(Field::new("item", ArrowDataType::Float32, true));
+        let vector = Arc::new(Field::new(
+            "item",
+            ArrowDataType::FixedSizeList(item, DIM),
+            true,
+        ));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vec",
+            ArrowDataType::List(vector),
+            true,
+        )]));
+
+        // Three rows: two vectors, then one vector and one null, then a null
+        // list. Four elements are present; three of them are trainable.
+        let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), DIM));
+        for row in [
+            vec![Some([1.0, 2.0]), Some([3.0, 4.0])],
+            vec![Some([5.0, 6.0]), None],
+        ] {
+            for cell in row {
+                match cell {
+                    Some(v) => {
+                        builder.values().values().append_slice(&v);
+                        builder.values().append(true);
+                    }
+                    None => {
+                        builder.values().values().append_slice(&[0.0; DIM as usize]);
+                        builder.values().append(false);
+                    }
+                }
+            }
+            builder.append(true);
+        }
+        builder.append(false);
+        let array = builder.finish();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, dir.as_str(), None).await.unwrap();
+
+        let counted = count_trainable_vectors(&dataset, "vec", 3, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted, 3,
+            "the null vector in the second row must not be counted"
+        );
+    }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
     /// back to a HEAD for older indices that did not record sizes. A HEAD is
@@ -2342,11 +2774,11 @@ mod tests {
         let source_uri = format!("{}/source", test_dir.as_str());
         let target_uri = format!("{}/target", test_dir.as_str());
 
-        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        // Ten partitions, each needing a codebook's worth of vectors.
         let source_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
             .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+            .into_reader_rows(RowCount::from(2560), BatchCount::from(1));
         let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
             .await
             .unwrap();

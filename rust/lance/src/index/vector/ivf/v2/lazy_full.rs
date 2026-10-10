@@ -54,7 +54,7 @@ use futures::prelude::stream;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::bq::layered::{PlaneKey, RQPrecision};
 use lance_index::vector::bq::layered_stats;
@@ -467,6 +467,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         let stage_index = self.clone();
         let fetch_index = self.clone();
         let probe_start = probes.start;
+        let result_metrics = metrics.clone();
         let producer = tokio::spawn(async move {
             // `map` spawns a step only when `buffered` pulls it, so at most
             // `prepare_parallelism` probes are staged or held staged, and the
@@ -552,9 +553,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
             )));
         }
         if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
-            Self::global_heap_to_batch(heap)
+            Self::global_heap_to_batch(heap, result_metrics.as_ref())
         } else {
-            spawn_cpu(move || Self::global_heap_to_batch(heap)).await
+            let queued = Instant::now();
+            spawn_cpu(move || {
+                result_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+                Self::global_heap_to_batch(heap, result_metrics.as_ref())
+            })
+            .await
         }
     }
 
