@@ -215,6 +215,7 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
 serial_test = "3"
+sha2 = "0.10"
 snafu = "0.9"
 syn = { version = "2.0.37", features = ["full"] }
 lindera = { version = "3.0.7" }
