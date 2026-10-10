@@ -44,6 +44,10 @@ impl OpendalStore {
 #[async_trait]
 impl DirectoryOperations for OpendalStore {
     async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()> {
+        let has_native_listing = store
+            .directory_operations
+            .as_ref()
+            .is_some_and(|operations| operations.has_native_listing(&store.inner));
         let prefix = format!("{}/", opendal::raw::percent_decode_path(path.as_ref()));
         store.io_tracker.record_read("list", path.clone(), 0, None);
         let metrics = store.io_tracker.begin_io("list");
@@ -60,8 +64,11 @@ impl DirectoryOperations for OpendalStore {
                 .await
                 .map_err(|error| Error::io(format!("Failed to list directory {path}: {error}")))?
             {
+                let location = normalize_location(&Path::from(entry.path()), Some(path))?;
                 if entry.metadata().is_dir() {
-                    locations.insert(normalize_location(&Path::from(entry.path()), Some(path))?);
+                    locations.insert(location);
+                } else if has_native_listing {
+                    store.inner.delete(&location).await?;
                 }
             }
             Ok(locations)
@@ -70,15 +77,20 @@ impl DirectoryOperations for OpendalStore {
         metrics.record(&listing, 0);
         let directory_locations = listing?;
         // Keep the wrapped listing authoritative: wrappers may hide or reject paths.
-        let mut entries = store.inner.list(Some(path));
-        let mut directories = Vec::new();
-        while let Some(entry) = entries.try_next().await? {
-            if directory_locations.contains(&entry.location) {
-                directories.push(entry.location);
-            } else {
-                store.inner.delete(&entry.location).await?;
+        let mut directories = if has_native_listing {
+            directory_locations.into_iter().collect::<Vec<_>>()
+        } else {
+            let mut entries = store.inner.list(Some(path));
+            let mut directories = Vec::new();
+            while let Some(entry) = entries.try_next().await? {
+                if directory_locations.contains(&entry.location) {
+                    directories.push(entry.location);
+                } else {
+                    store.inner.delete(&entry.location).await?;
+                }
             }
-        }
+            directories
+        };
         // Hierarchical buckets return directories before their contents and reject
         // deletion while any child file or directory remains.
         directories.sort_unstable_by_key(|directory| std::cmp::Reverse(directory.as_ref().len()));

@@ -3,12 +3,12 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-#[cfg(any(windows, test))]
-use crate::object_store::DirectoryOperations;
 use crate::object_store::{
     DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
+#[cfg(any(windows, test))]
+use crate::object_store::{DirectoryOperations, DirectoryRemoval};
 use lance_core::Error;
 use lance_core::error::Result;
 use object_store::{local::LocalFileSystem, path::Path};
@@ -119,7 +119,10 @@ impl ObjectStoreProvider for FileStoreProvider {
                 };
                 (
                     inner,
-                    Some(Arc::new(operations) as Arc<dyn DirectoryOperations>),
+                    Some(DirectoryRemoval {
+                        operations: Arc::new(operations),
+                        native_listing_store: None,
+                    }),
                 )
             }
             None => (LocalFileSystem::new(), None),
@@ -197,7 +200,10 @@ mod tests {
         });
         ObjectStore {
             inner: Arc::new(inner),
-            directory_operations: Some(directory_operations),
+            directory_operations: Some(DirectoryRemoval {
+                operations: directory_operations,
+                native_listing_store: None,
+            }),
             scheme: "file".to_owned(),
             block_size: DEFAULT_LOCAL_BLOCK_SIZE,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

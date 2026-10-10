@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use ::tracing::{Span, field::Empty, instrument};
@@ -172,6 +172,22 @@ pub(super) trait DirectoryOperations: std::fmt::Debug + Send + Sync {
     async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()>;
 }
 
+#[derive(Clone)]
+pub(super) struct DirectoryRemoval {
+    operations: Arc<dyn DirectoryOperations>,
+    // Only this exact store may use native listing metadata without consulting a wrapper.
+    native_listing_store: Option<Weak<dyn OSObjectStore>>,
+}
+
+impl DirectoryRemoval {
+    fn has_native_listing(&self, store: &Arc<dyn OSObjectStore>) -> bool {
+        self.native_listing_store
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|native| Arc::ptr_eq(&native, store))
+    }
+}
+
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     fn read_dir_all<'a, 'b>(
@@ -204,7 +220,7 @@ pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
     // Provider-owned operations that preserve native directory semantics.
-    directory_operations: Option<Arc<dyn DirectoryOperations>>,
+    directory_operations: Option<DirectoryRemoval>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -1523,7 +1539,10 @@ impl ObjectStore {
         let path = Path::parse(&path)?;
 
         if let Some(directory_operations) = &self.directory_operations {
-            return directory_operations.remove_dir_all(&path, self).await;
+            return directory_operations
+                .operations
+                .remove_dir_all(&path, self)
+                .await;
         }
         if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.

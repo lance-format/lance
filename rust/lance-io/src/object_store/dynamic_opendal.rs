@@ -268,6 +268,7 @@ mod tests {
     use opendal::{Operator, services::Memory};
 
     use super::*;
+    use crate::object_store::DirectoryRemoval;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
 
     #[tokio::test]
@@ -307,7 +308,10 @@ mod tests {
         let (mut object_store, _) = ObjectStore::from_uri("memory://").await.unwrap();
         let object_store_mut = Arc::get_mut(&mut object_store).unwrap();
         object_store_mut.inner = dynamic.clone();
-        object_store_mut.directory_operations = Some(dynamic);
+        object_store_mut.directory_operations = Some(DirectoryRemoval {
+            operations: dynamic,
+            native_listing_store: Some(Arc::downgrade(&object_store_mut.inner)),
+        });
         first
             .put(
                 &Path::from("dataset/file"),
