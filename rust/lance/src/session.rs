@@ -11,6 +11,8 @@ use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::spill::{LocalSpillStore, SpillStore};
 
+pub use lance_index::vector::storage::OriginLatencyClass;
+
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
 use crate::session::index_caches::GlobalIndexCache;
@@ -74,6 +76,11 @@ pub struct Session {
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
+
+    /// The origin latency class the process declares for the IVF_RQ indexes
+    /// this session opens; see [`Self::with_index_origin_latency`]. `None`
+    /// leaves each index the class of its object store.
+    index_origin_latency: Option<OriginLatencyClass>,
 }
 
 impl DeepSizeOf for Session {
@@ -104,6 +111,7 @@ impl std::fmt::Debug for Session {
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field("index_origin_latency", &self.index_origin_latency)
             .finish()
     }
 }
@@ -138,6 +146,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            index_origin_latency: None,
         }
     }
 
@@ -159,6 +168,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            index_origin_latency: None,
         }
     }
 
@@ -177,6 +187,37 @@ impl Session {
     pub fn with_spill_store(mut self, store: Arc<dyn SpillStore>) -> Self {
         self.spill_store = store;
         self
+    }
+
+    /// Declare the origin latency class of the IVF_RQ indexes this session
+    /// opens: how slow reads are that no Lance cache tier serves. `None` (the
+    /// default) leaves each index the class of its object store, high for a
+    /// cloud object store and low for local files and memory.
+    ///
+    /// Declare it when the object store is wrapped in something the store's
+    /// scheme does not show, such as a local page cache that also caches index
+    /// files in front of a cloud object store (declare
+    /// [`OriginLatencyClass::Low`]). The class sets reader policies that trade
+    /// bytes or background work for fewer origin requests; results do not
+    /// depend on it. Other index types ignore it, and `LANCE_RQ_ORIGIN_LATENCY`
+    /// set to `low` or `high` overrides it.
+    ///
+    /// ```rust,no_run
+    /// # use lance::session::{OriginLatencyClass, Session};
+    /// let session =
+    ///     Session::default().with_index_origin_latency(Some(OriginLatencyClass::Low));
+    /// assert_eq!(session.index_origin_latency(), Some(OriginLatencyClass::Low));
+    /// ```
+    pub fn with_index_origin_latency(mut self, class: Option<OriginLatencyClass>) -> Self {
+        self.index_origin_latency = class;
+        self
+    }
+
+    /// The origin latency class this session declares for the IVF_RQ indexes
+    /// it opens, `None` when it declares none; see
+    /// [`Self::with_index_origin_latency`].
+    pub fn index_origin_latency(&self) -> Option<OriginLatencyClass> {
+        self.index_origin_latency
     }
 
     /// Return a reference to the session's spill store.
@@ -238,6 +279,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            index_origin_latency: None,
         }
     }
 
@@ -563,6 +605,46 @@ mod tests {
         lance_io::traits::Writer::shutdown(writer.as_mut())
             .await
             .unwrap();
+    }
+
+    /// A session declares no origin latency class unless built with one,
+    /// whichever constructor built it; its clones keep the class, and its
+    /// debug output shows it.
+    #[test]
+    fn test_index_origin_latency_hint() {
+        let sessions = [
+            Session::default(),
+            Session::new(0, 0, Default::default()),
+            Session::with_index_cache_backend(
+                Arc::new(QuickCacheBackend::with_capacity(0)),
+                0,
+                Default::default(),
+            ),
+            Session::with_cache_backends(
+                CacheSpec::Default,
+                CacheSpec::Default,
+                Default::default(),
+            ),
+        ];
+        for session in sessions {
+            assert_eq!(session.index_origin_latency(), None);
+            assert!(
+                format!("{session:?}").contains("index_origin_latency: None"),
+                "{session:?}"
+            );
+            for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
+                let hinted = session.clone().with_index_origin_latency(Some(class));
+                assert_eq!(hinted.index_origin_latency(), Some(class));
+                assert_eq!(hinted.clone().index_origin_latency(), Some(class));
+                assert!(
+                    format!("{hinted:?}")
+                        .contains(&format!("index_origin_latency: Some({class:?})")),
+                    "{hinted:?}"
+                );
+                let cleared = hinted.with_index_origin_latency(None);
+                assert_eq!(cleared.index_origin_latency(), None);
+            }
+        }
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ mod lazy_tests;
 pub(crate) mod pairwise;
 mod plane_cache;
 pub mod prune;
+pub mod resident;
 pub mod rotation;
 pub mod storage;
 pub mod transform;
