@@ -63,11 +63,8 @@ pub struct RabitQuantizer {
 pub(crate) struct RabitQuantizedBatch {
     pub binary_codes: ArrayRef,
     pub ex_codes: Option<ArrayRef>,
-    #[cfg(test)]
     pub ex_res_dot_dists: Option<Vec<f32>>,
-    #[cfg(test)]
     pub rotated_residuals: Option<Vec<f32>>,
-    #[cfg(test)]
     pub ex_code_values: Option<Vec<u8>>,
 }
 
@@ -542,11 +539,8 @@ impl RabitQuantizer {
             } else {
                 None
             },
-            #[cfg(test)]
             rotated_residuals: None,
-            #[cfg(test)]
             ex_code_values: None,
-            #[cfg(test)]
             ex_res_dot_dists: None,
         })
     }
@@ -583,6 +577,7 @@ impl RabitQuantizer {
                     code_dim: code_dim as u32,
                     num_bits,
                     packed: false,
+                    layered: false,
                     query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
@@ -594,6 +589,7 @@ impl RabitQuantizer {
                 code_dim: code_dim as u32,
                 num_bits,
                 packed: false,
+                layered: false,
                 query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
@@ -1035,11 +1031,8 @@ impl RabitQuantizer {
                         .map(|array| Arc::new(array) as ArrayRef)
                 })
                 .transpose()?,
-            #[cfg(test)]
             ex_res_dot_dists,
-            #[cfg(test)]
             rotated_residuals: Some(rotated_residuals),
-            #[cfg(test)]
             ex_code_values,
         })
     }
@@ -1056,6 +1049,9 @@ impl Quantization for RabitQuantizer {
         params: &Self::BuildParams,
     ) -> Result<Self> {
         validate_rq_num_bits(params.num_bits)?;
+        if params.layered {
+            super::layered::RQLayout::try_new(params.num_bits)?;
+        }
 
         let dim = data.as_fixed_size_list().value_length() as usize;
         if !dim.is_multiple_of(u8::BITS as usize) {
@@ -1063,11 +1059,12 @@ impl Quantization for RabitQuantizer {
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
         }
-        if let Some(q) = Self::from_supplied_rotation(params, dim)? {
+        if let Some(mut q) = Self::from_supplied_rotation(params, dim)? {
+            q.metadata.layered = params.layered;
             return Ok(q);
         }
 
-        let q = match data.as_fixed_size_list().value_type() {
+        let mut q = match data.as_fixed_size_list().value_type() {
             DataType::Float16 => Self::new_with_rotation::<Float16Type>(
                 params.num_bits,
                 data.as_fixed_size_list().value_length(),
@@ -1090,6 +1087,7 @@ impl Quantization for RabitQuantizer {
                 )));
             }
         };
+        q.metadata.layered = params.layered;
         Ok(q)
     }
 
@@ -1152,6 +1150,14 @@ impl Quantization for RabitQuantizer {
         _: lance_linalg::distance::DistanceType,
     ) -> Result<Quantizer> {
         validate_rq_num_bits(metadata.num_bits)?;
+        if metadata.layered {
+            super::layered::RQLayout::try_new(metadata.num_bits)?;
+            if metadata.query_estimator != RabitQueryEstimator::RawQuery {
+                return Err(Error::invalid_input(
+                    "layered IVF_RQ requires the raw-query estimator",
+                ));
+            }
+        }
         Ok(Quantizer::Rabit(Self {
             metadata: metadata.clone(),
         }))
@@ -1165,6 +1171,10 @@ impl Quantization for RabitQuantizer {
         let mut fields = vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()];
         if self.metadata.query_estimator == RabitQueryEstimator::RawQuery {
             fields.push(ERROR_FACTORS_FIELD.clone());
+        }
+        if self.metadata.layered {
+            return super::layered::storage_fields(self.code_dim(), self.metadata.num_bits, fields)
+                .expect("layered layout validated at build");
         }
         if let Some(ex_code_field) = rabit_ex_code_field(self.code_dim(), self.metadata.num_bits)
             .expect("RabitQ num_bits should be validated")

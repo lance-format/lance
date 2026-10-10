@@ -268,6 +268,8 @@ async fn test_vector_filter_fts_search() {
 
     let query_vector = Arc::new(Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]));
     let vector_query = Query {
+        rq_cascade_factor: None,
+        rq_precision: Default::default(),
         column: "vector".to_string(),
         key: query_vector,
         k: 5,

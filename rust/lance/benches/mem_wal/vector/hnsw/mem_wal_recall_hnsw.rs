@@ -581,6 +581,8 @@ async fn run_checkpoint(
                 let q_vec = &queries[q * DIM..(q + 1) * DIM];
                 let bf_set = &gt_sets[q];
                 let query = Query {
+                    rq_cascade_factor: None,
+                    rq_precision: Default::default(),
                     column: VECTOR_COL.to_string(),
                     key: Arc::new(Float32Array::from(q_vec.to_vec())),
                     k,
