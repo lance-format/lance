@@ -239,7 +239,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params,
             target_bases_info,
-            Vec::new(),
+            crate::dataset::write::seeds::SeedCollector::disabled(),
             None,
             None,
         )

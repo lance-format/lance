@@ -43,6 +43,7 @@ use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
+use super::seeds::SeedCollector;
 use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
@@ -50,6 +51,7 @@ use super::{
 use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
@@ -1848,20 +1850,29 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
+                    let mut seeds = SeedCollector::for_write(
+                        write_version,
+                        Some(&dataset),
+                        &write_schema,
+                        true,
+                    )
+                    .await?;
                     let mut writer =
                         versions::open_update_writer(write_version, &dataset, &write_schema, false)
                             .await?;
 
-                    // We need to remove rowaddr before writing.
-                    batches
-                        .iter_mut()
-                        .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
-                            Ok(b) => {
-                                *batch = b;
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        })?;
+                    // We need to remove rowaddr before writing. The data file
+                    // writer and the seed collector must then see the same
+                    // representation: a Utf8View or BinaryView source is stored
+                    // as its classic offset type, and the writer's own
+                    // conversion never reaches these batches, so normalize once
+                    // here for both.
+                    batches.iter_mut().try_for_each(|batch| {
+                        let without_addr = batch.drop_column(ROW_ADDR)?;
+                        *batch = SchemaAdapter::new(without_addr.schema())
+                            .to_physical_batch(without_addr)?;
+                        Ok::<_, Error>(())
+                    })?;
 
                     let source_version = metadata
                         .referenced_lance_files()
@@ -1883,12 +1894,20 @@ impl MergeInsertJob {
                         ));
                         let mut stream = chunk_stream(stream, batch_size as usize);
                         while let Some(chunk) = stream.next().await {
-                            writer.write(&chunk?).await?;
+                            let chunk = chunk?;
+                            writer.write(&chunk).await?;
+                            for batch in &chunk {
+                                seeds.observe(batch)?;
+                            }
                         }
                     } else {
                         writer.write(batches.as_slice()).await?;
+                        for batch in &batches {
+                            seeds.observe(batch)?;
+                        }
                     }
 
+                    seeds.flush(writer.as_mut()).await?;
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
