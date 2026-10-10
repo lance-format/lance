@@ -458,15 +458,17 @@ async fn test_partial_update_of_fragment_with_deletions_seeds_physical_rows() {
     }
 }
 
-/// `write_columns` fed several batches on a fragment with deleted rows: the
-/// seed is the same as from one batch, and matches the physical file.
+/// `write_columns` fed several batches on a fragment with deleted rows. Ten
+/// rows in four batches put batch edges at rows 3, 6 and 9, so with four-row
+/// zones every zone but the last spans two batches. The seed is the same as
+/// from one batch, and matches the physical file.
 #[tokio::test]
 async fn test_write_columns_in_batches_seeds_physical_rows() {
     let dir = TempStrDir::default();
     let mut dataset = dataset_with_val_index(dir.as_str(), true).await;
     dataset.delete("id % 3 = 0").await.unwrap();
     let dataset =
-        replace_column_in_batches(dataset, "val", |id| id >= 1, replacement_value, 3).await;
+        replace_column_in_batches(dataset, "val", |id| id >= 1, replacement_value, 4).await;
 
     let val = field_id(&dataset, "val");
     for fragment in &dataset.fragments()[1..] {
@@ -475,7 +477,7 @@ async fn test_write_columns_in_batches_seeds_physical_rows() {
         assert_eq!(physical.len(), fragment.physical_rows.unwrap());
         let stored = seed_in_file(&dataset, &file.path, "val").await.unwrap();
         assert_eq!(stored, seed_from_values("val", &physical, 1));
-        assert_eq!(stored, seed_from_values("val", &physical, 3));
+        assert_eq!(stored, seed_from_values("val", &physical, 4));
     }
 }
 
