@@ -440,6 +440,31 @@ impl ShardManifestStore {
     // Epoch-based Writer Fencing
     // ========================================================================
 
+    fn validate_claimable(
+        &self,
+        manifest: &ShardManifest,
+        incoming_shard_spec_id: u32,
+    ) -> Result<()> {
+        // A `Sealed` manifest is the drop-table 2PC in-doubt marker.
+        // Sophon's reconcile uses the "sealed" marker to distinguish this
+        // state from an ordinary epoch fence or invalid writer configuration.
+        if manifest.status == ShardStatus::Sealed {
+            return Err(Error::invalid_input(format!(
+                "shard {} is sealed; refusing claim (drop in flight)",
+                self.shard_id
+            )));
+        }
+
+        if manifest.shard_spec_id != incoming_shard_spec_id {
+            return Err(Error::invalid_input(format!(
+                "cannot claim shard {} with incoming shard_spec_id {}; \
+                 stored shard_spec_id {} is immutable",
+                self.shard_id, incoming_shard_spec_id, manifest.shard_spec_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Claim a shard by incrementing its writer epoch.
     ///
     /// This establishes single-writer semantics by:
@@ -464,9 +489,10 @@ impl ShardManifestStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if another writer claimed an equal-or-higher
-    /// epoch than our target, or if the manifest stays contended past
-    /// the retry budget.
+    /// Returns an error without claiming or mutating the manifest if the shard
+    /// is sealed or the incoming shard spec conflicts with its stored identity.
+    /// Also returns an error if another writer claimed an equal-or-higher epoch
+    /// than our target, or if the manifest stays contended past the retry budget.
     #[instrument(name = "manifest_claim_epoch", level = "info", skip_all, fields(shard_id = %self.shard_id, shard_spec_id))]
     pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
         const MAX_CLAIM_RETRIES: usize = 16;
@@ -476,19 +502,8 @@ impl ShardManifestStore {
             // writer's epoch, and the tip it finds is what our write builds on.
             let current = self.refresh_latest().await?;
 
-            // A sealed shard is mid-drop (drop-table 2PC). Refuse the claim
-            // with a distinguishable error rather than minting a new epoch,
-            // so a caller that skips its own status check still cannot
-            // resurrect a shard being dropped. Sophon's reconcile keys on
-            // the "sealed" marker in this message to tell it apart from an
-            // ordinary epoch fence.
-            if let Some(m) = &current
-                && m.status == ShardStatus::Sealed
-            {
-                return Err(Error::invalid_input(format!(
-                    "shard {} is sealed; refusing claim (drop in flight)",
-                    self.shard_id
-                )));
+            if let Some(manifest) = &current {
+                self.validate_claimable(manifest, shard_spec_id)?;
             }
 
             let (next_version, next_epoch, base_manifest) = match current {
@@ -526,11 +541,13 @@ impl ShardManifestStore {
                     return Ok((next_epoch, new_manifest));
                 }
                 Err(write_err) => {
-                    let latest_epoch = self
-                        .refresh_latest()
-                        .await?
-                        .map(|m| m.writer_epoch)
-                        .unwrap_or(0);
+                    // Refresh uncached: a claim must see another process's
+                    // write, and the tip it finds is what the retry builds on.
+                    let latest = self.refresh_latest().await?;
+                    if let Some(manifest) = &latest {
+                        self.validate_claimable(manifest, shard_spec_id)?;
+                    }
+                    let latest_epoch = latest.map(|m| m.writer_epoch).unwrap_or(0);
                     if latest_epoch >= next_epoch {
                         return Err(Error::io(format!(
                             "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
@@ -709,6 +726,40 @@ mod tests {
             sstables: vec![],
             status: ShardStatus::Active,
         }
+    }
+
+    /// Arm a store policy that lands `sneaked` on disk the instant a writer
+    /// tries to publish the same version: a local `put_if_absent` stages the
+    /// object first, so the policy fires on that staging PUT — after the
+    /// writer's read, before its conditional rename — and the rename then
+    /// finds the version already taken.
+    ///
+    /// The destination is derived from the store's temp dir, not by
+    /// reconstructing a filesystem path from the intercepted object-store
+    /// path: the mapping between the two differs by platform, while the
+    /// on-disk layout (`mem_wal_path` / `shard_manifest_path`) is fixed.
+    fn arm_version_sneak(
+        policy: &Arc<Mutex<ProxyObjectStorePolicy>>,
+        sneaked: &ShardManifest,
+        store_root: &std::path::Path,
+    ) {
+        let sneaked_filename = manifest_filename(sneaked.version);
+        let sneaked_bytes = pb::ShardManifest::from(sneaked).encode_to_vec();
+        let destination = store_root.join(format!(
+            "_mem_wal/{}/manifest/{}",
+            sneaked.shard_id.as_hyphenated(),
+            sneaked_filename
+        ));
+        policy.lock().unwrap().set_before_policy(
+            "sneak-peer-manifest",
+            Arc::new(move |method: &str, path: &Path| {
+                if method == "put" && path.as_ref().contains(sneaked_filename.as_str()) {
+                    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                    std::fs::write(&destination, sneaked_bytes.clone()).unwrap();
+                }
+                Ok(())
+            }),
+        );
     }
 
     /// A warm cache must not hide a successor's claim from `check_fenced`.
@@ -995,6 +1046,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_claim_epoch_preserves_matching_shard_spec() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let (first_epoch, first) = manifest_store.claim_epoch(1).await.unwrap();
+        assert_eq!(first_epoch, 1);
+        assert_eq!(first.version, 1);
+        assert_eq!(first.shard_spec_id, 1);
+
+        let (second_epoch, second) = manifest_store.claim_epoch(1).await.unwrap();
+        assert_eq!(second_epoch, 2);
+        assert_eq!(second.version, 2);
+        assert_eq!(second.shard_spec_id, 1);
+    }
+
+    #[rstest::rstest]
+    #[case::manual_shard(0, 1)]
+    #[case::configured_shard_rejects_manual_claim(1, 0)]
+    #[tokio::test]
+    async fn test_claim_epoch_rejects_mismatched_shard_spec(
+        #[case] stored_shard_spec_id: u32,
+        #[case] incoming_shard_spec_id: u32,
+    ) {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let initial = manifest_store
+            .initialize_shard(stored_shard_spec_id, HashMap::new())
+            .await
+            .unwrap();
+
+        let error = manifest_store
+            .claim_epoch(incoming_shard_spec_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(&shard_id.to_string())
+                && message.contains(&format!("incoming shard_spec_id {incoming_shard_spec_id}"))
+                && message.contains(&format!("stored shard_spec_id {stored_shard_spec_id}")),
+            "error must include the shard id and both shard spec ids, got: {error}"
+        );
+
+        let after = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(
+            after, initial,
+            "a rejected claim must not change the manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_claims_reject_mismatched_shard_spec() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let (first, second) =
+            tokio::join!(manifest_store.claim_epoch(0), manifest_store.claim_epoch(1));
+        let (winners, losers): (Vec<_>, Vec<_>) =
+            [first, second].into_iter().partition(Result::is_ok);
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one claim must succeed, got: {winners:?} / {losers:?}"
+        );
+        let claimed = winners.into_iter().next().unwrap().unwrap();
+        let error = losers.into_iter().next().unwrap().unwrap_err();
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(&shard_id.to_string())
+                && message.contains("incoming shard_spec_id")
+                && message.contains("stored shard_spec_id"),
+            "error must include the shard id and both shard spec ids, got: {error}"
+        );
+
+        let latest = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(latest, claimed.1);
+        assert_eq!(latest.version, 1);
+        assert_eq!(latest.writer_epoch, claimed.0);
+        assert_eq!(manifest_store.list_versions().await.unwrap(), vec![1]);
+    }
+
+    /// A claim whose write loses the version race must re-validate whatever
+    /// actually landed before it can retry: the re-read in the conflict path
+    /// is the last chance to notice a peer claimed with a different shard
+    /// spec, or a drop's `Sealed` marker slid in between our read and write.
+    ///
+    /// The peer's manifest is sneaked in between the claim's read and its
+    /// conditional rename (see [`arm_version_sneak`]), so this test loses
+    /// that race deterministically where the concurrent test above only
+    /// usually does.
+    #[rstest::rstest]
+    #[case::different_shard_spec(
+        0,
+        1,
+        ShardStatus::Active,
+        vec!["incoming shard_spec_id 0", "stored shard_spec_id 1"]
+    )]
+    #[case::sealed_by_concurrent_drop(0, 0, ShardStatus::Sealed, vec!["sealed"])]
+    #[tokio::test]
+    async fn test_claim_epoch_revalidates_after_write_conflict(
+        #[case] incoming_shard_spec_id: u32,
+        #[case] sneaked_shard_spec_id: u32,
+        #[case] sneaked_status: ShardStatus,
+        #[case] expected_fragments: Vec<&'static str>,
+    ) {
+        let (store, base_path, temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        // The peer takes version 1 with our target epoch, so the spec/sealed
+        // rejection must fire even where an epoch war would also apply.
+        let mut sneaked = create_test_manifest(shard_id, 1, 1);
+        sneaked.shard_spec_id = sneaked_shard_spec_id;
+        sneaked.status = sneaked_status;
+
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        arm_version_sneak(&policy, &sneaked, temp_dir.path());
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let manifest_store = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+
+        let error = manifest_store
+            .claim_epoch(incoming_shard_spec_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(&shard_id.to_string()),
+            "error must name the shard, got: {error}"
+        );
+        for fragment in expected_fragments {
+            assert!(
+                message.contains(fragment),
+                "error must contain {fragment:?}, got: {error}"
+            );
+        }
+
+        let after = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(
+            after, sneaked,
+            "a rejected claim must not change the manifest"
+        );
+        assert_eq!(manifest_store.list_versions().await.unwrap(), vec![1]);
+    }
+
+    /// The conflict path a claim must survive: a peer's `initialize_shard`
+    /// (same spec, epoch 0) lands between our read and our write. The
+    /// revalidation passes, the peer's epoch does not beat our target, and
+    /// the retry builds on the version that won the race.
+    #[tokio::test]
+    async fn test_claim_epoch_retries_past_benign_version_bump() {
+        let (store, base_path, temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        let mut sneaked = create_test_manifest(shard_id, 1, 0);
+        sneaked.shard_spec_id = 7;
+        sneaked.wal_entry_position_last_seen = 42;
+
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        arm_version_sneak(&policy, &sneaked, temp_dir.path());
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let manifest_store = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+
+        let (epoch, claimed) = manifest_store.claim_epoch(7).await.unwrap();
+        assert_eq!(epoch, 1, "an epoch-0 bump is not a real claimant");
+        assert_eq!(claimed.version, 2);
+        assert_eq!(claimed.shard_spec_id, 7);
+        assert_eq!(
+            claimed.wal_entry_position_last_seen, 42,
+            "the retry must build on the version that won the race"
+        );
+        assert_eq!(
+            manifest_store.list_versions().await.unwrap(),
+            vec![1, 2],
+            "the peer's version and ours must both be durable"
+        );
+    }
+
+    /// Writes that keep failing with no manifest on disk must exhaust the
+    /// retry budget: the conflict revalidation has nothing to check, so the
+    /// claim surfaces the contention error instead of spinning forever.
+    #[tokio::test]
+    async fn test_claim_epoch_exhausts_retries_when_writes_keep_failing() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let v1_filename = manifest_filename(1);
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "503",
+            Arc::new(move |method: &str, path: &Path| {
+                if method == "put" && path.as_ref().contains(v1_filename.as_str()) {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "503 slow down".into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let manifest_store = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+
+        let error = manifest_store.claim_epoch(0).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "got: {error}");
+        assert!(
+            error.to_string().contains("after 16 retries"),
+            "expected the contention error, got: {error}"
+        );
+        assert!(manifest_store.latest().await.unwrap().is_none());
+        assert!(manifest_store.list_versions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_claim_epoch_refuses_sealed_manifest() {
         // A `Sealed` manifest is the drop-table 2PC in-doubt marker:
         // `claim_epoch` must refuse it with a distinguishable error rather
@@ -1018,7 +1291,7 @@ mod tests {
 
         // The claim is refused with the distinguishable "sealed" error —
         // and the manifest is left untouched (no new epoch minted).
-        let err = manifest_store.claim_epoch(0).await.unwrap_err();
+        let err = manifest_store.claim_epoch(1).await.unwrap_err();
         assert!(
             err.to_string().contains("sealed"),
             "expected a distinguishable sealed-refusal error, got: {err}"
