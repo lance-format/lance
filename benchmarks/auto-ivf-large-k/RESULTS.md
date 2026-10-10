@@ -1,7 +1,8 @@
 # OSS-2254: adaptive IVF probing through k=1000
 
-This change extends the calibrated initial probe budget from k <= 100 to k <= 1000
-for finite Float32 IVF_FLAT queries using L2, cosine, or dot. Three new buckets
+This original IVF_FLAT campaign measures the extension of the calibrated initial
+probe budget from k <= 100 to k <= 1000 at runtime source `0bcc82431`, using
+finite Float32 queries with L2, cosine, or dot. Three new buckets
 end at k=200, 500, and 1000. Caller minimums can exceed the initial cap;
 late probing remains available when filters or deletions leave too few results.
 

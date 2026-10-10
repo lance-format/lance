@@ -1,6 +1,8 @@
 # Auto IVF probing for k > 100
 
 This experiment extends Auto's centroid-gap probing profiles beyond k=100.
+The profiles apply to IVF partition selection across index types; IVF_FLAT
+isolates routing recall from quantization and partition-local search losses.
 [PROTOCOL.md](PROTOCOL.md) is the evaluation contract frozen before
 calibration; [RESULTS.md](RESULTS.md) has the measurements and the decisions
 they support.
@@ -178,3 +180,27 @@ values, with 128 serial timings and 32 matched baseline queries. The remaining
 384 queries contribute recall and counters. Keep these populations distinct
 from the full-query, all-k routing simulations. The experimental patch preserves
 historical-index behavior and does not change the defaults in this PR.
+
+## IVF_RQ 5bit recall
+
+[RQ5_PROTOCOL.md](RQ5_PROTOCOL.md) freezes the comparison of FLAT Auto, RQ5
+Auto, RQ5 full-partition search and the original RQ probing heuristic. The
+default Auto profiles are unchanged. RQ5 indices reuse the original centroids
+and exact row-to-partition assignments in separate shallow clones. Their
+complete membership is verified before measurement.
+
+After building and validating the candidate runtime, record its native-library
+SHA256 in `$RQ5_STUDY/candidate-binary.sha256` and the preserved pre-change PR
+runtime hash in `$RQ5_STUDY/baseline-binary.sha256`. Use the same repository
+environment and `release-with-debug` profile described above:
+
+```bash
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/rq5.py prepare "$RQ5_STUDY" all --source "$LARGE_STUDY"
+taskset -c 0-15 uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/rq5.py measure "$RQ5_STUDY" all --baseline-runtime "$PR_BASELINE_RUNTIME"
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/rq5.py audit "$RQ5_STUDY" all
+```
+
+The 512-query held-out matrix covers k=1, 10, 100, 200, 500 and 1000. Recall
+collection uses concurrent workers and does not establish latency benefits.
+The full-partition RQ5 arm includes normal-mode quantized scoring and pruning;
+its recall is not assumed to combine independently with FLAT routing recall.

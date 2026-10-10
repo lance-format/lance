@@ -181,6 +181,94 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
         assert partitions <= 2 * segments
 
 
+@pytest.mark.parametrize(
+    "index_type,index_options",
+    [
+        ("IVF_FLAT", {}),
+        ("IVF_PQ", {"num_sub_vectors": 16, "num_bits": 4}),
+        ("IVF_SQ", {}),
+        ("IVF_RQ", {"num_bits": 5}),
+        ("IVF_HNSW_FLAT", {}),
+        ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}),
+        ("IVF_HNSW_SQ", {}),
+    ],
+)
+@pytest.mark.parametrize("segments", [1, 2])
+def test_auto_probe_index_types(
+    tmp_path, monkeypatch, index_type, index_options, segments
+):
+    centroids = 4 * np.eye(16, dtype=np.float32)
+    vectors = np.tile(np.repeat(centroids, 16, axis=0), (segments, 1))
+    vectors *= np.tile(np.linspace(1, 1.1875, 16, dtype=np.float32), 16 * segments)[
+        :, None
+    ]
+    vectors += (
+        np.random.default_rng(2254).normal(0, 0.0001, vectors.shape).astype(np.float32)
+    )
+    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    dataset = lance.write_dataset(table, tmp_path / "ds.lance", max_rows_per_file=64)
+    if "PQ" in index_type:
+        # Keep this routing regression independent of stochastic PQ training.
+        codewords = np.arange(16, dtype=np.float32) * 0.05
+        index_options = {
+            **index_options,
+            "pq_codebook": np.tile(codewords[None, :, None], (16, 1, 1)),
+        }
+    fragments = [fragment.fragment_id for fragment in dataset.get_fragments()]
+    index_segments = _build_segments(
+        dataset,
+        "vector",
+        index_type,
+        [fragments[start : start + 4] for start in range(0, len(fragments), 4)],
+        metric="l2",
+        num_partitions=16,
+        ivf_centroids=centroids,
+        max_iters=2,
+        **index_options,
+    )
+    dataset = dataset.commit_existing_index_segments(
+        "vector_idx", "vector", index_segments
+    )
+    assert dataset.stats.index_stats("vector_idx")["num_segments"] == segments
+    query = centroids[0] * 1.03
+    nearest = {"column": "vector", "q": query, "k": 10, "metric": "l2"}
+    expected = set(np.argsort(np.sum((vectors - query) ** 2, axis=1))[:10].tolist())
+
+    def search(nearest, **options):
+        captured = []
+        result = dataset.scanner(
+            columns=["id"],
+            nearest=nearest,
+            scan_stats_callback=captured.append,
+            **options,
+        ).to_table()
+        return set(result["id"].to_pylist()), captured[0].all_counts[
+            "partitions_searched"
+        ]
+
+    default_ids, _ = search(nearest)
+    assert len(default_ids & expected) / 10 >= 0.5
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "2")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "2")
+    auto_ids, partitions = search(nearest)
+    fixed_ids, fixed_partitions = search({**nearest, "nprobes": 2})
+    assert auto_ids == fixed_ids
+    assert len(auto_ids & expected) / 10 >= 0.5
+    assert partitions == fixed_partitions == 2 * segments
+
+    filtered_ids, partitions = search(nearest, filter="id % 256 >= 224", prefilter=True)
+    assert len(filtered_ids) == 10
+    assert all(row_id % 256 >= 224 for row_id in filtered_ids)
+    assert partitions > 2 * segments
+
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        search(nearest)
+    # Explicit budgets still bypass Auto's overrides for every index type.
+    assert search({**nearest, "nprobes": 2}) == (fixed_ids, fixed_partitions)
+
+
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:

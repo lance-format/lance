@@ -13,9 +13,11 @@
 //! The caller minimum takes precedence over the learned cap, while the caller
 //! maximum and available candidate count limit the final initial budget.
 //! Explicit fixed nprobes bypasses both the heuristic and these overrides.
-//! Only ordinary Float32 IVF_FLAT queries using L2, cosine, or dot with k <= 1000
-//! use these profiles. Larger k, Hamming, other index types, and explicitly bounded
-//! Auto queries retain their existing heuristic and ignore these overrides.
+//! Ordinary Float32 queries using L2, cosine, or dot with k <= 1000 use these
+//! profiles across IVF index types. The policy selects partitions from centroid
+//! distances independently of quantization or the search within each partition.
+//! Larger k, Hamming, and explicitly bounded Auto queries retain their existing
+//! heuristic and ignore these overrides.
 //! Dot uses the magnitude of the best centroid inner product to scale its gap,
 //! rather than the signed `1 - dot` distance. Corpus and query norms are preserved.
 //! No extra index statistics or file-format changes are needed.
@@ -25,9 +27,7 @@ use std::env;
 use arrow_array::{Array, cast::AsArray};
 use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use lance_index::vector::{
-    Query, VectorIndex, quantizer::QuantizationType, v3::subindex::SubIndexType,
-};
+use lance_index::vector::{Query, VectorIndex};
 use lance_linalg::distance::DistanceType;
 
 const MARGIN_ENV: &str = "LANCE_AUTO_PROBE_MARGIN";
@@ -60,20 +60,11 @@ impl AutoProbePolicy {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(Self::Fixed);
         }
-        // Legacy IVF indices do not expose sub-index metadata. Keep their
-        // original probing without calling those unsupported methods.
-        if !index.supports_prepared_partition_search() {
-            return Ok(Self::Legacy);
-        }
         if query.maximum_nprobes.is_some()
             || query.key.data_type() != &DataType::Float32
             || query.key.null_count() != 0
             || !matches!(vector_type, DataType::FixedSizeList(item, dimension)
                 if item.data_type() == &DataType::Float32 && *dimension as usize == query.key.len())
-            || !matches!(
-                index.sub_index_type(),
-                (SubIndexType::Flat, QuantizationType::Flat)
-            )
             || !matches!(
                 index.metric_type(),
                 DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
