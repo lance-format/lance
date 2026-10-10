@@ -6,8 +6,6 @@ use std::str;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
@@ -19,6 +17,7 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
+use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
@@ -40,7 +39,7 @@ use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
-    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -74,7 +73,8 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::writer::FileWriterOptions;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
-    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator,
+    PhraseQuery,
 };
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
@@ -95,6 +95,7 @@ use lance_linalg::distance::MetricType;
 use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+use lance_table::transaction::resolve_arrow_field_ids;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -875,6 +876,7 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         transaction_files_removed: stats.transaction_files_removed,
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
+        failed_deletes: stats.failed_deletes,
     }
 }
 
@@ -918,6 +920,18 @@ fn cleanup_explanation(
             .collect(),
         warnings: explanation.warnings,
     }
+}
+
+fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("version", version.version)?;
+    dict.set_item(
+        "timestamp",
+        version.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+    )?;
+    let tup: Vec<(&String, &String)> = version.metadata.iter().collect();
+    dict.set_item("metadata", tup.into_py_dict(py)?)?;
+    dict.into_py_any(py)
 }
 
 #[pymethods]
@@ -1227,7 +1241,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1263,6 +1277,7 @@ impl Dataset {
         substrait_aggregate: Option<Vec<u8>>,
         row_addr_allowlist: Option<Vec<u8>>,
         row_addr_blocklist: Option<Vec<u8>>,
+        minhash_query: Option<&Bound<PyDict>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -1408,7 +1423,7 @@ impl Dataset {
         )
         .infer_error()?
         {
-            scanner.with_row_addr_prefilter(mask);
+            scanner.with_row_id_prefilter(mask);
         }
 
         scanner
@@ -1543,17 +1558,21 @@ impl Dataset {
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
-                DataType::UInt8
-                    if !matches!(
-                        q.data_type(),
-                        DataType::List(_) | DataType::FixedSizeList(_, _)
-                    ) =>
-                {
-                    let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
+                DataType::UInt8 => {
+                    let query_type = match q.data_type() {
+                        DataType::List(field) => DataType::List(Arc::new(
+                            field.as_ref().clone().with_data_type(DataType::UInt8),
+                        )),
+                        DataType::FixedSizeList(field, dimension) => DataType::FixedSizeList(
+                            Arc::new(field.as_ref().clone().with_data_type(DataType::UInt8)),
+                            *dimension,
+                        ),
+                        _ => DataType::UInt8,
+                    };
+                    let q = arrow::compute::cast(&q, &query_type).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
-                    let q = q.as_primitive::<UInt8Type>();
-                    scanner.nearest(&column, q, k)
+                    scanner.nearest(&column, q.as_ref(), k)
                 }
                 _ => scanner.nearest(&column, &q, k),
             };
@@ -1621,6 +1640,25 @@ impl Dataset {
         if let Some(aggregate_bytes) = substrait_aggregate {
             scanner
                 .aggregate(AggregateExpr::substrait(aggregate_bytes))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(minhash_query) = minhash_query {
+            let column: String = minhash_query
+                .get_item("column")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify a column"))?
+                .extract()?;
+            let text: String = minhash_query
+                .get_item("text")?
+                .ok_or_else(|| PyKeyError::new_err("MinHash query must specify text"))?
+                .extract()?;
+            if limit.is_none() {
+                // Same default as the vector `nearest` path when no limit is given
+                scanner
+                    .limit(Some(10), offset)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            scanner
+                .minhash_search(MinHashQuery::new(text, column))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         let scan = Arc::new(scanner);
@@ -1981,11 +2019,20 @@ impl Dataset {
     fn delete(
         &mut self,
         py: Python<'_>,
-        predicate: String,
+        predicate: &Bound<'_, PyAny>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
     ) -> PyResult<Py<PyAny>> {
-        let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
+        let mut builder = if let Ok(sql) = predicate.cast::<PyString>() {
+            DeleteBuilder::new(self.ds.clone(), sql.to_str()?)
+        } else if let Ok(bytes) = predicate.cast::<PyBytes>() {
+            let expr = ExprFilter::Substrait(bytes.as_bytes().to_vec())
+                .to_datafusion(self.ds.schema(), self.ds.schema())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            DeleteBuilder::from_expr(self.ds.clone(), expr)
+        } else {
+            return Err(PyTypeError::new_err("predicate must be a string or bytes"));
+        };
 
         if let Some(retries) = conflict_retries {
             builder = builder.conflict_retries(retries);
@@ -2008,16 +2055,24 @@ impl Dataset {
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
-        predicate: Option<&str>,
+        predicate: Option<&Bound<'_, PyAny>>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
         data_storage_version: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
-            builder = builder
-                .update_where(predicate)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            builder = if let Ok(sql) = predicate.cast::<PyString>() {
+                builder.update_where(sql.to_str()?)
+            } else if let Ok(bytes) = predicate.cast::<PyBytes>() {
+                let expr = ExprFilter::Substrait(bytes.as_bytes().to_vec())
+                    .to_datafusion(self.ds.schema(), self.ds.schema())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                builder.update_where_expr(expr)
+            } else {
+                return Err(PyTypeError::new_err("predicate must be a string or bytes"));
+            }
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
         if let Some(retries) = conflict_retries {
@@ -2085,20 +2140,15 @@ impl Dataset {
         let versions = self_.list_versions()?;
         let pyvers: Vec<Py<PyAny>> = versions
             .iter()
-            .map(|v| {
-                let dict = PyDict::new(py);
-                dict.set_item("version", v.version).unwrap();
-                dict.set_item(
-                    "timestamp",
-                    v.timestamp.timestamp_nanos_opt().unwrap_or_default(),
-                )
-                .unwrap();
-                let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
-                dict.set_item("metadata", tup.into_py_dict(py)?).unwrap();
-                dict.into_py_any(py)
-            })
+            .map(|v| version_to_py(py, v))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    /// Fetches the currently checked out version of the dataset, with its
+    /// timestamp and the summary of its manifest.
+    fn current_version(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        version_to_py(py, &self.ds.version())
     }
 
     fn version_refs(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
@@ -3048,7 +3098,7 @@ impl Dataset {
     #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit(
         dest: PyWriteDest,
-        operation: PyLance<Operation>,
+        operation: &Bound<'_, PyAny>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
@@ -3062,18 +3112,22 @@ impl Dataset {
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
-        let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
+        let transaction = operation
+            .py()
+            .import(intern!(operation.py(), "lance"))?
+            .getattr("Transaction")?
+            .call1((read_version.unwrap_or_default(), operation))?;
 
         if let Some(commit_message) = commit_message {
-            transaction.transaction_properties = Some(Arc::new(HashMap::from([(
-                LANCE_COMMIT_MESSAGE_KEY.to_string(),
-                commit_message,
-            )])));
+            transaction.setattr(
+                "transaction_properties",
+                HashMap::from([(LANCE_COMMIT_MESSAGE_KEY.to_string(), commit_message)]),
+            )?;
         }
 
         Self::commit_transaction(
             dest,
-            PyLance(transaction),
+            &transaction,
             commit_lock,
             storage_options,
             enable_v2_manifest_paths,
@@ -3093,7 +3147,7 @@ impl Dataset {
     #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit_transaction(
         dest: PyWriteDest,
-        transaction: PyLance<Transaction>,
+        transaction: &Bound<'_, PyAny>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
@@ -3105,6 +3159,16 @@ impl Dataset {
         namespace_client_managed_versioning: bool,
         commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
+        let mut rust_transaction = transaction.extract::<PyLance<Transaction>>()?.0;
+        let operation = transaction.getattr("operation")?;
+        let input_schema = match &rust_transaction.operation {
+            Operation::Overwrite { .. } => Some(operation.getattr("new_schema")?),
+            Operation::Merge { .. } | Operation::Project { .. } => {
+                Some(operation.getattr("schema")?)
+            }
+            _ => None,
+        };
+        let is_arrow = input_schema.is_some_and(|schema| !schema.is_instance_of::<LanceSchema>());
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
 
@@ -3148,7 +3212,55 @@ impl Dataset {
                 None
             };
 
-        let mut builder = CommitBuilder::new(dest.as_dest())
+        // Resolve Arrow IDs while the Python input type is still available.
+        // The core commit path receives only ordinary Lance operations.
+        let read_dataset = if is_arrow {
+            rt().block_on(Some(transaction.py()), async {
+                let dataset = match &dest {
+                    PyWriteDest::Dataset(dataset) => Some(dataset.ds.clone()),
+                    PyWriteDest::Uri(uri) => {
+                        match DatasetBuilder::from_uri(&**uri)
+                            .with_read_params(ReadParams {
+                                store_options: object_store_params.clone(),
+                                commit_handler: commit_handler.clone(),
+                                ..Default::default()
+                            })
+                            .load()
+                            .await
+                        {
+                            Ok(dataset) => Some(Arc::new(dataset)),
+                            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => None,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
+                let dataset = match dataset {
+                    Some(dataset)
+                        if rust_transaction.read_version != 0
+                            && dataset.version().version != rust_transaction.read_version =>
+                    {
+                        Some(Arc::new(
+                            dataset
+                                .checkout_version(rust_transaction.read_version)
+                                .await?,
+                        ))
+                    }
+                    dataset => dataset,
+                };
+                resolve_arrow_field_ids(
+                    dataset.as_ref().map(|dataset| dataset.manifest()),
+                    &mut rust_transaction.operation,
+                )?;
+                Ok::<_, Error>(dataset)
+            })?
+            .infer_error()?
+        } else {
+            None
+        };
+        let destination = read_dataset
+            .map(WriteDestination::Dataset)
+            .unwrap_or_else(|| dest.as_dest());
+        let mut builder = CommitBuilder::new(destination)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20))
@@ -3169,7 +3281,7 @@ impl Dataset {
         let ds = rt()
             .block_on(
                 commit_lock.map(|cl| cl.py()),
-                builder.execute(transaction.0),
+                builder.execute(rust_transaction),
             )?
             .io_or_timeout_error()?;
 
@@ -3354,6 +3466,79 @@ impl Dataset {
             stream,
         )));
         Ok(PyArrowType(reader))
+    }
+
+    #[pyo3(signature = (column, distance_threshold, *, memory_limit=None, max_concurrency=None))]
+    fn find_duplicate_pairs(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        distance_threshold: f32,
+        memory_limit: Option<usize>,
+        max_concurrency: Option<usize>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let mut options = lance::index::vector::dedup::DuplicatePairsOptions::default();
+        if let Some(size) = memory_limit {
+            options = options.with_memory_limit(size);
+        }
+        if let Some(concurrency) = max_concurrency {
+            options = options.with_max_concurrency(concurrency);
+        }
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs_with_options(
+                    self.ds.clone(),
+                    column,
+                    distance_threshold,
+                    options,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
+    #[pyo3(signature = (column, segment_id, partition_id, distance_threshold, *, memory_limit=None, max_concurrency=None))]
+    // Keep the binding aligned with the Python utility's keyword-only controls.
+    #[allow(clippy::too_many_arguments)]
+    fn find_duplicate_pairs_in_partition(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        segment_id: &str,
+        partition_id: usize,
+        distance_threshold: f32,
+        memory_limit: Option<usize>,
+        max_concurrency: Option<usize>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let mut options = lance::index::vector::dedup::DuplicatePairsOptions::default();
+        if let Some(size) = memory_limit {
+            options = options.with_memory_limit(size);
+        }
+        if let Some(concurrency) = max_concurrency {
+            options = options.with_max_concurrency(concurrency);
+        }
+        let segment_id = uuid::Uuid::parse_str(segment_id).map_err(|err| {
+            PyValueError::new_err(format!("invalid segment_id '{segment_id}': {err}"))
+        })?;
+        let stream = rt()
+            .block_on(
+                Some(py),
+                lance::index::vector::dedup::find_duplicate_pairs_in_partition_with_options(
+                    self.ds.clone(),
+                    column,
+                    segment_id,
+                    partition_id,
+                    distance_threshold,
+                    options,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
     }
 
     #[pyo3(signature = (*, min_version=None, progress=None))]
@@ -3742,7 +3927,6 @@ impl Dataset {
             stats_log_interval_ms,
             hnsw_params,
         )?;
-        let maintained_indexes = maintained_indexes.unwrap_or_default();
 
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
@@ -3756,7 +3940,11 @@ impl Dataset {
                 } else if unsharded {
                     builder = builder.unsharded();
                 }
-                builder = builder.maintained_indexes(maintained_indexes);
+                // Flattening `None` to an empty list here would ask for no
+                // index at all rather than every one.
+                if let Some(maintained_indexes) = maintained_indexes {
+                    builder = builder.maintained_indexes(maintained_indexes);
+                }
                 if let Some(config) = writer_config {
                     builder = builder.writer_config_defaults(config);
                 }
@@ -3772,7 +3960,11 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `writer_config_defaults`, and `sharding_specs`.
+    /// `maintain_all_indexes`, `writer_config_defaults`, and `sharding_specs`.
+    ///
+    /// `maintain_all_indexes` is what distinguishes maintaining every index
+    /// the table has from maintaining none: both leave `maintained_indexes`
+    /// empty.
     fn mem_wal_index_details<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3787,6 +3979,7 @@ impl Dataset {
         let dict = PyDict::new(py);
         dict.set_item("num_shards", details.num_shards)?;
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
+        dict.set_item("maintain_all_indexes", details.maintain_all_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
 
         let specs = PyList::empty(py);
@@ -5472,6 +5665,31 @@ impl PyFullTextQuery {
         operator: &str,
     ) -> PyResult<Self> {
         let q = MultiMatchQuery::try_new(query, columns)
+            .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
+        let q = if let Some(boosts) = boosts {
+            q.try_with_boosts(boosts)
+                .map_err(|e| PyValueError::new_err(format!("Invalid boosts: {}", e)))?
+        } else {
+            q
+        };
+
+        let op = Operator::try_from(operator)
+            .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?;
+
+        Ok(Self {
+            inner: q.with_operator(op).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (query, columns, boosts=None, operator="OR"))]
+    fn combined_fields_query(
+        query: String,
+        columns: Vec<String>,
+        boosts: Option<Vec<f32>>,
+        operator: &str,
+    ) -> PyResult<Self> {
+        let q = CombinedFieldsQuery::try_new(query, columns)
             .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
         let q = if let Some(boosts) = boosts {
             q.try_with_boosts(boosts)

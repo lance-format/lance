@@ -410,7 +410,7 @@ async fn open_pk_index(
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
     let index = plugin
-        .load_index(store.clone(), &details, None, &index_cache)
+        .load_index(store.clone(), &details, 0, None, &index_cache)
         .await?;
     plugin
         .put_in_cache(store, &index_cache, index.clone())
@@ -766,6 +766,69 @@ mod tests {
         assert!(blocks(&sets, 20).await); // gen 2, batch 0
         assert!(!blocks(&sets, 21).await); // gen 2, batch 1 — past the watermark
         assert!(!blocks(&sets, 100).await); // gen 3 — after the snapshot
+    }
+
+    /// Regression: a row indexed twice in the memtable (WAL replay re-indexes
+    /// batches the flusher already indexed) used to produce a PK sidecar page
+    /// with a repeated row id. Loading that page builds a `RoaringBitmap` via
+    /// `from_sorted_iter`, which rejects the repeat, so every probe of the
+    /// generation failed with "from_sorted_iter called with non-sorted input"
+    /// and any LSM scan over the store returned 500 (observed in production:
+    /// one 2-row generation broke reads of a 54k-row store for weeks).
+    #[tokio::test]
+    async fn sidecar_from_doubly_indexed_memtable_is_probeable() {
+        use crate::dataset::mem_wal::util::pk_index_path;
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::{RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::cache::LanceCache;
+        use lance_index::scalar::btree::train_btree_index;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_io::object_store::ObjectStore;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["item:a", "item:b"]))],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = format!("{}/gen2", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        Dataset::write(reader, &path, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        // Index the same batch twice at the same offset, as the flusher +
+        // a replay would, then train the sidecar from that index.
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        index.insert(&batch, 0).unwrap();
+        index.insert(&batch, 0).unwrap();
+        let training = index.pk_training_batches(8192).unwrap();
+        let (object_store, base_path) = ObjectStore::from_uri(&path).await.unwrap();
+        let store = LanceIndexStore::new(
+            object_store,
+            pk_index_path(&base_path),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            training[0].schema(),
+            futures::stream::iter(training.into_iter().map(Ok)),
+        ));
+        train_btree_index(stream, &store, 8192, None, None)
+            .await
+            .unwrap();
+
+        let membership =
+            GenMembership::OnDisk(open_pk_index(&path, None, None, None).await.unwrap());
+        let keys: Vec<ScalarValue> = ["item:a", "item:b", "item:zzz"]
+            .iter()
+            .map(|k| ScalarValue::Utf8(Some(k.to_string())))
+            .collect();
+        let hits = membership.contains_keys(&keys).await.unwrap();
+        assert_eq!(hits, vec![true, true, false]);
     }
 
     /// An SSTable at or above the active generation was produced by a

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, hint::black_box, sync::Arc};
 
-use arrow_array::{ArrayRef, BooleanArray, ListArray, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, ListArray, RecordBatch, StringArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use lance_encoding::encoder::{EncodingOptions, encode_batch};
 
 pub mod common;
@@ -162,17 +162,90 @@ fn bench_encode_structural_pages(c: &mut Criterion) {
     });
 }
 
+fn bench_variable_offsets(c: &mut Criterion) {
+    const NUM_ROWS: usize = 262_144;
+    let metadata = HashMap::from([
+        (
+            "lance-encoding:structural-encoding".to_string(),
+            "miniblock".to_string(),
+        ),
+        (
+            "lance-encoding:dict-divisor".to_string(),
+            "100000".to_string(),
+        ),
+        ("lance-encoding:compression".to_string(), "none".to_string()),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("variable_offsets");
+    group.throughput(Throughput::Elements(NUM_ROWS as u64));
+    let corpora: [(&str, ArrayRef); 2] = [
+        (
+            "range",
+            Arc::new(StringArray::from_iter_values(
+                (0..NUM_ROWS).map(|index| format!("row_{index:012}")),
+            )),
+        ),
+        (
+            "delta",
+            Arc::new(StringArray::from_iter_values(
+                (0..NUM_ROWS).map(|index| "x".repeat(4 + index % 64)),
+            )),
+        ),
+    ];
+    for (workload, array) in corpora {
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        for (version, encoding) in [
+            ("v2.2", BenchEncoding::StructuralU32),
+            ("v2.3", BenchEncoding::StructuralSparse),
+        ] {
+            let strategy = encoding_strategy(encoding);
+            let options = EncodingOptions::default();
+            let encoded_bytes = runtime
+                .block_on(encode_batch(
+                    &batch,
+                    lance_schema.clone(),
+                    strategy.as_ref(),
+                    &options,
+                ))
+                .unwrap()
+                .data
+                .len();
+            group.bench_function(
+                format!("{workload}/{version}/{encoded_bytes}B"),
+                |bencher| {
+                    bencher.iter(|| {
+                        black_box(
+                            runtime
+                                .block_on(encode_batch(
+                                    &batch,
+                                    lance_schema.clone(),
+                                    strategy.as_ref(),
+                                    &options,
+                                ))
+                                .unwrap(),
+                        )
+                    })
+                },
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets = bench_encode_compressed, bench_encode_structural_pages);
+    targets = bench_encode_compressed, bench_encode_structural_pages, bench_variable_offsets);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_encode_compressed, bench_encode_structural_pages);
+    targets = bench_encode_compressed, bench_encode_structural_pages, bench_variable_offsets);
 
 criterion_main!(benches);

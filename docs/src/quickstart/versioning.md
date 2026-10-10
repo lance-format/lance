@@ -105,6 +105,8 @@ For advanced tag operations (e.g., tagging versions on specific branches), see [
 
 Branches manage parallel lines of dataset evolution. You can create branches from existing versions or tags, read and write to them independently, and checkout different branches.
 
+`main` refers to the default branch in checkout and reference APIs, but it is reserved and cannot be used as the name of a new branch.
+
 ```python
 # Create branch from current latest version
 experiment_branch = ds.create_branch("experiment")

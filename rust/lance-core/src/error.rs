@@ -1058,10 +1058,19 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 /// Wrap an error in a new error type that implements Clone
 ///
 /// This is useful when two threads/streams share a common fallible source
-/// Definite not-found errors preserve typed source-chain detection and their
-/// human-readable representation. Timeout and I/O errors preserve their error
-/// categories. Other cloned results use Error::Cloned with the string
-/// representation of the base error.
+/// The variants whose meaning callers read through an accessor rather than
+/// through the message survive the clone: definite not-found errors keep typed
+/// source-chain detection (`is_not_found`), fenced errors keep their
+/// [`FenceReason`] (`fence_reason`), backpressure stays backpressure
+/// (`is_backpressure`), and an unknown commit outcome keeps its version
+/// (`is_commit_status_unknown`) with the typed source degraded to its message.
+/// Timeout and I/O errors preserve their categories. Everything else becomes
+/// `Error::Cloned` carrying the string representation.
+///
+/// One gap: [`Error::External`] is not preserved, because its source is not
+/// cloneable and rebuilding it from a message would leave `external_source`
+/// returning `Some` while the downcast the caller wants fails. After a clone,
+/// `external_source` and `into_external` no longer recover the original error.
 pub struct CloneableError(pub Error);
 
 struct DisplayError(Error);
@@ -1087,6 +1096,20 @@ impl std::error::Error for DisplayError {
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
+        // Same reasoning for `is_commit_status_unknown`, but its typed source is
+        // not cloneable, so the rebuild keeps the version and carries the
+        // source's own message, as the `NotFound` arm does.
+        if let Error::Wrapped { error, .. } = &self.0
+            && let Some(unknown) = error.downcast_ref::<CommitStatusUnknownError>()
+        {
+            let source = std::error::Error::source(unknown)
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| unknown.to_string());
+            return Self(Error::commit_status_unknown_source(
+                unknown.version(),
+                box_error(DisplayError(Error::cloned(source))),
+            ));
+        }
         match &self.0 {
             Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
                 Error::not_found(uri.clone()),
@@ -1096,6 +1119,19 @@ impl Clone for CloneableError {
             )))),
             Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
             Error::IO { source, .. } => Self(Error::io(source.to_string())),
+            // Callers react to these via `fence_reason` / `is_backpressure`
+            // rather than the message; collapsing them into a cloned string
+            // would silently drop that signal across the clone boundary.
+            Error::Fenced {
+                reason, message, ..
+            } => Self(
+                FencedSnafu {
+                    reason: *reason,
+                    message: message.clone(),
+                }
+                .build(),
+            ),
+            Error::Backpressure { message, .. } => Self(Error::backpressure(message.clone())),
             error => Self(Error::cloned(error.to_string())),
         }
     }
@@ -1115,6 +1151,44 @@ mod test {
     use super::*;
     use std::error::Error as _;
     use std::fmt;
+
+    /// The variants whose meaning lives in an accessor rather than in the
+    /// message: collapsing them into a cloned string drops the signal.
+    #[test]
+    fn cloneable_error_preserves_accessor_contracts() {
+        // Both reasons, because carrying `reason` through is the arm's whole job.
+        for (original, expected) in [
+            (
+                Error::fenced_by_peer("peer claimed epoch 7"),
+                FenceReason::PeerClaimedEpoch,
+            ),
+            (
+                Error::writer_poisoned("wal flush failed"),
+                FenceReason::PersistenceFailure,
+            ),
+        ] {
+            let original = CloneableError(original);
+            assert_eq!(original.0.fence_reason(), Some(expected));
+            assert_eq!(original.clone().0.fence_reason(), Some(expected));
+        }
+
+        let original = CloneableError(Error::backpressure("writer at memory ceiling"));
+        let cloned = original.clone();
+        assert!(original.0.is_backpressure());
+        assert!(cloned.0.is_backpressure());
+
+        let original = CloneableError(Error::commit_status_unknown_source(
+            7,
+            box_error(DisplayError(Error::timeout("put timed out"))),
+        ));
+        let cloned = original.clone();
+        // Cloning the clone must not degrade it further.
+        let twice = cloned.clone();
+        assert!(original.0.is_commit_status_unknown());
+        assert!(cloned.0.is_commit_status_unknown());
+        assert!(!cloned.0.is_not_found());
+        assert!(twice.0.is_commit_status_unknown());
+    }
 
     #[test]
     fn cloneable_error_preserves_not_found_contract() {

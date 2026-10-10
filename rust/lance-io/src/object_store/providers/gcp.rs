@@ -25,7 +25,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
+    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
@@ -280,7 +280,10 @@ impl GcsStoreProvider {
 
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            crate::object_store::metrics_base(&store_prefix, base_path),
+        ));
 
         Ok(Arc::new(builder.build()?))
     }
@@ -303,12 +306,10 @@ impl ObjectStoreProvider for GcsStoreProvider {
 
         let accessor = params.get_accessor();
 
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let throttle_state = if throttle_config.is_disabled() {
-            None
-        } else {
-            Some(AimdThrottleState::new(throttle_config)?)
-        };
+        // Keyed like the registry cache so per-dataset stores share the bucket's budget.
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
             // OpenDAL GCS intentionally uses static/environment-backed configuration only.
@@ -355,36 +356,46 @@ impl ObjectStoreProvider for GcsStoreProvider {
 }
 
 impl StorageOptions {
-    /// Add values from the environment to storage options
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
     pub fn with_env_gcs(&mut self) {
+        self.merge_env_options(std::env::vars_os(), |key| {
+            GoogleConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
+        // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token.
+        let token_key = "google_storage_token";
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                let lowercase_key = key.to_ascii_lowercase();
-                let token_key = "google_storage_token";
-
-                if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase_key) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
-                // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token
-                else if lowercase_key == token_key && !self.0.contains_key(token_key) {
-                    self.0.insert(token_key.to_string(), value.to_string());
-                }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && key.eq_ignore_ascii_case(token_key)
+                && !self.0.contains_key(token_key)
+            {
+                self.0.insert(token_key.to_string(), value.to_string());
             }
         }
     }
 
-    /// Subset of options relevant for gcs storage
+    /// Return options recognized by [`GoogleConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as
+    /// `google_service_account`) wins, followed by case variants of that name.
+    /// Remaining ties use the lexicographically smallest original key. Empty
+    /// values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::gcp::GoogleConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("service_account".into(), "alias.json".into()),
+    ///     ("google_service_account".into(), "canonical.json".into()),
+    /// ]));
+    /// assert_eq!(options.as_gcs_options()[&GoogleConfigKey::ServiceAccount], "canonical.json");
+    /// ```
     pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let gcs_key = GoogleConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((gcs_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 }
 
@@ -400,6 +411,37 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[rstest::rstest]
+    #[case::canonical("google_service_account", "service_account")]
+    #[case::canonical_over_case_variant("google_service_account", "GOOGLE_SERVICE_ACCOUNT")]
+    #[case::canonical_case_tie("GOOGLE_SERVICE_ACCOUNT", "Google_Service_Account")]
+    #[case::case_variant_over_alias("GOOGLE_SERVICE_ACCOUNT", "service_account_path")]
+    #[case::lexical_alias("service_account", "service_account_path")]
+    #[case::case_alias("SERVICE_ACCOUNT", "service_account")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_gcs_options(),
+                HashMap::from([(GoogleConfigKey::ServiceAccount, preferred_value.to_string())])
+            );
+        }
+    }
 
     fn external_account_storage_options(
         temp_dir: &TempDir,

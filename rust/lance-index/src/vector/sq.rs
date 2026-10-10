@@ -21,6 +21,7 @@ use super::SQ_CODE_COLUMN;
 use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
 
 pub mod builder;
+pub(crate) mod pairwise;
 pub mod storage;
 pub mod transform;
 

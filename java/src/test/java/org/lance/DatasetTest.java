@@ -2089,6 +2089,69 @@ public class DatasetTest {
                     assertEquals(2, branch2V4New.version());
                     assertEquals(5, branch2V4New.countRows()); // A(5)
                   }
+
+                  // Step 8. open the dataset directly at a reference
+                  mainV2.tags().create("main_tag", Ref.ofMain(2));
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofBranch("branch1"))) {
+                    assertEquals(3, opened.version());
+                    assertEquals(8, opened.countRows()); // A(5) + B(3)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  try (Dataset opened =
+                      openAt(allocator, datasetPath, Ref.ofBranch("branch1", 2))) {
+                    assertEquals(2, opened.version());
+                    assertEquals(5, opened.countRows()); // A(5)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  // main has no version 3, only branch1 does.
+                  try (Dataset opened =
+                      openAt(allocator, datasetPath, Ref.ofBranch("branch1", 3))) {
+                    assertEquals(3, opened.version());
+                    assertEquals(8, opened.countRows()); // A(5) + B(3)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofMain(1))) {
+                    assertEquals(1, opened.version());
+                    assertEquals(0, opened.countRows());
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofMain())) {
+                    assertEquals(2, opened.version());
+                    assertEquals(5, opened.countRows()); // A(5)
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofBranch("main", 1))) {
+                    assertEquals(1, opened.version());
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofTag("main_tag"))) {
+                    assertEquals(2, opened.version());
+                    assertEquals(5, opened.countRows()); // A(5)
+                    assertFalse(opened.uri().contains("tree/"), opened.uri());
+                  }
+                  // "tag" points at branch1:3, so it opens branch1, not version 3 of main.
+                  try (Dataset opened = openAt(allocator, datasetPath, Ref.ofTag("tag"))) {
+                    assertEquals(3, opened.version());
+                    assertEquals(8, opened.countRows()); // A(5) + B(3)
+                    assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
+                  }
+                  IOException missing =
+                      assertThrows(
+                          IOException.class,
+                          () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
+                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  RuntimeException missingTag =
+                      assertThrows(
+                          RuntimeException.class,
+                          () -> openAt(allocator, datasetPath, Ref.ofTag("no_such_tag")));
+                  assertTrue(
+                      missingTag.getMessage().contains("no_such_tag"), missingTag.getMessage());
+                  IllegalArgumentException missingVersion =
+                      assertThrows(
+                          IllegalArgumentException.class,
+                          () -> openAt(allocator, datasetPath, Ref.ofBranch("branch1", 99)));
+                  assertTrue(
+                      missingVersion.getMessage().contains("branch1"), missingVersion.getMessage());
                 }
               }
             }
@@ -2096,6 +2159,25 @@ public class DatasetTest {
         }
       }
     }
+  }
+
+  private static Dataset openAt(BufferAllocator allocator, String path, Ref ref) {
+    return Dataset.open(allocator, path, new ReadOptions.Builder().setRef(ref).build());
+  }
+
+  @Test
+  void testReadOptionsRejectsConflictingRef() {
+    ReadOptions.Builder withVersion =
+        new ReadOptions.Builder().setVersion(1).setRef(Ref.ofBranch("branch1"));
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class, withVersion::build);
+    assertTrue(e.getMessage().contains("both version (1) and ref"), e.getMessage());
+
+    ReadOptions.Builder withManifest =
+        new ReadOptions.Builder()
+            .setSerializedManifest(ByteBuffer.allocateDirect(1))
+            .setRef(Ref.ofBranch("branch1"));
+    e = assertThrows(IllegalArgumentException.class, withManifest::build);
+    assertTrue(e.getMessage().contains("serialized manifest and ref"), e.getMessage());
   }
 
   @Test
@@ -2227,6 +2309,69 @@ public class DatasetTest {
       byte[] allData = blobFile.read();
       assertArrayEquals(allData, combined);
       blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadUpToFillsAcrossReadAheadBoundary(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadUpToFillsAcrossReadAheadBoundary").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 16L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(4);
+      assertEquals(4, first.length);
+      byte[] second = blobFile.readUpTo(20);
+      assertEquals(20, second.length);
+      assertEquals(24L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 4), first);
+      assertArrayEquals(Arrays.copyOfRange(all, 4, 24), second);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testSetReadBufferSizeZeroStillReadsPayload(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeZeroStillReadsPayload").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 0L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(64);
+      byte[] rest = blobFile.read();
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      byte[] combined = new byte[first.length + rest.length];
+      System.arraycopy(first, 0, combined, 0, first.length);
+      System.arraycopy(rest, 0, combined, first.length, rest.length);
+      assertArrayEquals(all, combined);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testTakeBlobsRejectsNegativeBufferSizeForEmptySelection(@TempDir Path tempDir)
+      throws Exception {
+    String base =
+        tempDir.resolve("testTakeBlobsRejectsNegativeBufferSizeForEmptySelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobsByIndices(Collections.emptyList(), "blobs", -1L));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobs(Collections.emptyList(), "blobs", -1L));
+    }
+  }
+
+  @Test
+  void testSetReadBufferSizeFailureClosesOpenedHandles(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeFailureClosesOpenedHandles").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Arrays.asList(0L, 1L), "blobs");
+      blobs.get(1).close();
+      assertThrows(RuntimeException.class, () -> Dataset.setBlobReadBufferSize(blobs, 1024L));
+      assertThrows(RuntimeException.class, () -> blobs.get(0).readUpTo(1));
     }
   }
 

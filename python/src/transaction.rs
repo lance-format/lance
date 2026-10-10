@@ -11,7 +11,7 @@ use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
-use lance::datatypes::Schema;
+use lance::datatypes::{Field, Schema};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
@@ -542,6 +542,21 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 let op = Operation::Restore { version };
                 Ok(Self(op))
             }
+            "Clone" => {
+                let is_shallow = ob.getattr("is_shallow")?.extract()?;
+                let ref_name = ob.getattr("ref_name")?.extract()?;
+                let ref_version = ob.getattr("ref_version")?.extract()?;
+                let ref_path = ob.getattr("ref_path")?.extract()?;
+                let branch_name = ob.getattr("branch_name")?.extract()?;
+                let op = Operation::Clone {
+                    is_shallow,
+                    ref_name,
+                    ref_version,
+                    ref_path,
+                    branch_name,
+                };
+                Ok(Self(op))
+            }
             "Rewrite" => {
                 let groups = extract_vec(&ob.getattr("groups")?)?;
                 let rewritten_indices = extract_vec(&ob.getattr("rewritten_indices")?)?;
@@ -780,6 +795,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Restore class");
                 cls.call1((version,))
             }
+            Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+                branch_name,
+            } => {
+                let cls = namespace
+                    .getattr("Clone")
+                    .expect("Failed to get Clone class");
+                cls.call1((is_shallow, ref_name, ref_version, ref_path, branch_name))
+            }
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
@@ -866,7 +893,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            _ => todo!(),
+            unsupported => Err(PyValueError::new_err(format!(
+                "Unsupported operation: {}",
+                unsupported.name()
+            ))),
         }
     }
 }
@@ -1060,11 +1090,18 @@ fn extract_schema(schema: &Bound<'_, PyAny>) -> PyResult<Schema> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
-    // Note: the field ids here are wrong.
-    Schema::try_from(arrow_schema).map_err(|e| {
-        PyValueError::new_err(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
-        ))
+    let fields = arrow_schema
+        .fields
+        .iter()
+        .map(|field| Field::try_from(field.as_ref()))
+        .collect::<lance_core::Result<_>>()
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {e}"
+            ))
+        })?;
+    Ok(Schema {
+        fields,
+        metadata: arrow_schema.metadata.clone(),
     })
 }

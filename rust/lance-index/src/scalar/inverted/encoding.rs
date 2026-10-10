@@ -394,7 +394,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     let num_positions = positions.len() as u32;
     builder.append_value(num_positions.to_le_bytes().as_ref());
 
-    let position_chunks = positions.chunks_exact(BLOCK_SIZE);
+    let (position_chunks, _) = positions.as_chunks::<BLOCK_SIZE>();
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     for position_chunk in position_chunks {
         // delta encoding + bitpacking for positions
@@ -842,7 +842,13 @@ pub(super) fn seek_packed_doc_positions(
         Ok(())
     };
 
-    for index in delta_range.start..delta_range.end.min(packed_deltas_end) {
+    // Group-outer / position-inner: the group only changes once every
+    // BLOCK_SIZE positions, so hoisting the group check out of the inner loop
+    // removes a load-compare and a division from every single position. The
+    // per-position inner loop then only decodes and accumulates.
+    let full_end = delta_range.end.min(packed_deltas_end);
+    let mut index = delta_range.start;
+    while index < full_end {
         let group = index / BLOCK_SIZE;
         if *unpacked_group_idx != Some(group) {
             let offset = *group_offsets.get(group).ok_or_else(|| {
@@ -855,7 +861,13 @@ pub(super) fn seek_packed_doc_positions(
             BitPacker4x::new().decompress(payload, unpacked_group, num_bits);
             *unpacked_group_idx = Some(group);
         }
-        push_delta(unpacked_group[index % BLOCK_SIZE], dst)?;
+        let group_end = ((group + 1) * BLOCK_SIZE).min(full_end);
+        let first_in_group = index % BLOCK_SIZE;
+        let run = &unpacked_group[first_in_group..first_in_group + (group_end - index)];
+        for delta in run {
+            push_delta(*delta, dst)?;
+        }
+        index = group_end;
     }
 
     if delta_range.end > packed_deltas_end {
@@ -1193,8 +1205,8 @@ fn decompress_block_with<P: BitPacker>(
 }
 
 pub fn decompress_raw_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
-    for bytes in compressed.chunks_exact(4).take(n) {
-        let data = u32::from_le_bytes(bytes.try_into().unwrap());
+    for bytes in compressed.as_chunks::<4>().0.iter().take(n) {
+        let data = u32::from_le_bytes(*bytes);
         dest.push(data);
     }
 }

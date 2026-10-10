@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>13.0.0-beta.4</version>
+    <version>14.0.0-beta.10</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -121,7 +121,7 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
-            <version>2.15.2</version>
+            <version>2.18.10</version>
         </dependency>
         <dependency>
             <groupId>io.opentelemetry</groupId>
@@ -505,7 +505,7 @@
                     <plugin>
                         <groupId>org.sonatype.central</groupId>
                         <artifactId>central-publishing-maven-plugin</artifactId>
-                        <version>0.8.0</version>
+                        <version>0.11.0</version>
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>ossrh</publishingServerId>

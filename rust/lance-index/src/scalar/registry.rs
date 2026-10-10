@@ -20,6 +20,7 @@ use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+use lance_index_core::remapping::BatchRowIdRemapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
@@ -157,13 +158,57 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// The index details should match the details that were returned when the index was
     /// originally trained.
+    ///
+    /// `index_version` is this segment's own persisted format version (its
+    /// `IndexMetadata::index_version`), not [`Self::version`] (the plugin's
+    /// current maximum). Most plugins have only ever had one on-disk format and
+    /// can ignore it; a plugin that has changed its on-disk format over time
+    /// (e.g. which domain a stored row identifier is in) uses it to read an
+    /// older segment correctly instead of reinterpreting it under the newest
+    /// format.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Whether this plugin can await batch row-ID translation while loading its data.
+    ///
+    /// Returning `true` requires overriding
+    /// [`load_index_with_remapping`](Self::load_index_with_remapping).
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        false
+    }
+
+    /// Load under a mapping whose payload may require asynchronous reads.
+    ///
+    /// This entry point is additive; the legacy [`load_index`](Self::load_index)
+    /// path never routes through it.
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if remapping.is_some() {
+            debug_assert!(
+                !self.supports_batch_row_id_remapping(),
+                "{} advertises batch row-ID remapping but does not override load_index_with_remapping",
+                self.name()
+            );
+            return Err(lance_core::Error::not_supported(format!(
+                "{} does not support asynchronous row-ID remapping",
+                self.name()
+            )));
+        }
+        self.load_index(index_store, index_details, index_version, None, cache)
+            .await
+    }
 
     /// Look up a previously-opened index in the cache.
     ///
@@ -246,6 +291,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
+
+    /// Validate that new segments can join the segments of the same logical
+    /// index.
+    ///
+    /// Called before segments are committed next to `existing` segments (empty
+    /// for a new index) and before segments are merged. Plugins whose segments
+    /// are only compatible under identical parameters (for example shared hash
+    /// functions) override this to reject drift; the default accepts any mix.
+    fn validate_new_segments_against_existing(
+        &self,
+        _existing: &[&prost_types::Any],
+        _incoming: &[&prost_types::Any],
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Returns a JSON string representation of the provided index details
     ///
@@ -349,7 +409,8 @@ where
     from_state(state)
 }
 
-pub(crate) async fn single_flight_store_bound_open<Rebind, RebindFuture>(
+/// Coalesce index loading, rebinding cached state when supported by the caller.
+pub async fn single_flight_store_bound_open<Rebind, RebindFuture>(
     index_store: Arc<dyn IndexStore>,
     cache: &LanceCache,
     load: ScalarIndexLoad<'_>,

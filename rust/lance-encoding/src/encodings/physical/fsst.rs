@@ -315,6 +315,10 @@ impl FsstMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
+    fn num_buffers(&self) -> usize {
+        self.inner_decompressor.num_buffers()
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding

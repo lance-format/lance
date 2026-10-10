@@ -201,7 +201,7 @@ async fn load_counted_v2_index(
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for i in 0..num_tokens {
-        builder.tokens.add(format!("t{}", i));
+        builder.tokens.get_or_add(&format!("t{}", i));
         let mut pl = PostingListBuilder::new(false);
         pl.add(i as u32, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -331,6 +331,53 @@ async fn test_bm25_stats_for_terms_reuses_posting_metadata_cache() {
     );
 }
 
+/// Row-granularity statistics must not cost the posting file any extra IO
+/// when a partition's documents already map one-to-one onto rows, which is
+/// every V3 index and every V1/V2 index that is not a legacy list index. The
+/// deduplicating branch reads posting lists, so it has to stay behind the
+/// duplicate-row-id check rather than run for every legacy-format index.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_keeps_the_lazy_posting_metadata_path() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
+    // A V3 index would take the delegating early return, which proves nothing
+    // about the legacy branch this test exists for.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string()];
+    let documents = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(documents, (100, 100, vec![1]));
+    let metadata_rows = counter.metadata_rows_read();
+    let rows = counter.rows_read();
+    assert_eq!(metadata_rows, 1);
+
+    assert_eq!(
+        index
+            .bm25_row_stats_for_terms(&terms, None, None)
+            .await
+            .unwrap(),
+        documents,
+        "one document per row leaves the two granularities identical",
+    );
+    assert_eq!(
+        counter.metadata_rows_read() - metadata_rows,
+        1,
+        "row statistics should read one metadata row per (term, partition)",
+    );
+    assert_eq!(
+        counter.rows_read() - rows,
+        1,
+        "row statistics must not read the posting list itself (got {} extra rows)",
+        counter.rows_read() - rows,
+    );
+}
+
 #[tokio::test]
 async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
     let cache = LanceCache::with_capacity(1024 * 1024);
@@ -356,6 +403,48 @@ async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
         .await
         .unwrap();
     assert_eq!(warm_stats, cold_stats);
+    assert_eq!(warm.index_cache_misses(), 0);
+    assert_eq!(warm.index_cache_hits(), terms.len());
+}
+
+/// Row-granularity statistics go through `InvertedPartition::row_stats_for_terms`
+/// on a V1/V2 index, and its posting-metadata lookups must reach the caller's
+/// collector too: the cross-field scorer build is the only consumer, and it
+/// runs under an `ExecutionPlan` whose cache counters would otherwise miss
+/// them entirely.
+#[tokio::test]
+async fn test_bm25_row_stats_for_terms_records_metadata_cache_stats() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (index, _counter, _tmpdir) = load_counted_v2_index(100, cache.clone()).await;
+    // A V3 index would delegate to the document-granularity path, which
+    // already has its own coverage.
+    assert!(
+        matches!(
+            index.format_version(),
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ),
+        "expected a legacy format version, got {:?}",
+        index.format_version(),
+    );
+
+    let terms = ["t0".to_string(), "t1".to_string(), "t2".to_string()];
+    let cold = LocalMetricsCollector::default();
+    let cold_stats = index
+        .bm25_row_stats_for_terms(&terms, None, Some(&cold))
+        .await
+        .unwrap();
+    assert_eq!(cold_stats, (100, 100, vec![1, 1, 1]));
+    assert_eq!(cold.index_cache_misses(), terms.len());
+    assert_eq!(cold.index_cache_hits(), 0);
+
+    let warm = LocalMetricsCollector::default();
+    assert_eq!(
+        index
+            .bm25_row_stats_for_terms(&terms, None, Some(&warm))
+            .await
+            .unwrap(),
+        cold_stats,
+    );
     assert_eq!(warm.index_cache_misses(), 0);
     assert_eq!(warm.index_cache_hits(), terms.len());
 }
@@ -406,8 +495,17 @@ async fn test_loaded_bm25_stats_are_all_or_nothing_and_preserve_oov() {
         .unwrap()
         .unwrap();
     let asynchronous = index.bm25_stats_for_terms(&terms, None).await.unwrap();
-    assert_eq!(loaded, (10, 10, vec![1, 0, 1]));
-    assert_eq!(loaded, asynchronous);
+    assert_eq!(loaded.stats, (10, 10, vec![1, 0, 1]));
+    assert_eq!(loaded.stats, asynchronous);
+    let dictionary = &index.partitions[0].tokens;
+    assert_eq!(
+        loaded.token_ids.as_ref(),
+        terms
+            .iter()
+            .map(|term| dictionary.get(term))
+            .collect::<Vec<_>>(),
+        "recorded ids must be the partition dictionary's ids, with None for OOV terms"
+    );
 }
 
 #[tokio::test]
@@ -874,7 +972,7 @@ async fn load_v2_index_with_grouped_postings(
     let num_docs = num_tokens * docs_per_token;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for token_id in 0..num_tokens {
-        builder.tokens.add(format!("t{token_id}"));
+        builder.tokens.get_or_add(&format!("t{token_id}"));
         let mut pl = PostingListBuilder::new(false);
         for d in 0..docs_per_token {
             let doc_id = (token_id * docs_per_token + d) as u32;
@@ -980,6 +1078,15 @@ async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
         packed_size * 4 < materialized_size * 3,
         "packed group deep_size_of {packed_size}B should be at least 25% smaller than the \
              {materialized_size}B materialized graph for {posting_count} postings"
+    );
+    // Prewarm caches a group per 128 dictionary rows of every partition, and
+    // each is resident and charged at its inline size on top of its buffers,
+    // so a group keeps only the buffers every posting view reads, not an
+    // Arrow array (100+ bytes) per column.
+    let inline_size = std::mem::size_of_val(group.as_ref());
+    assert!(
+        inline_size <= 320,
+        "packed group holds {inline_size}B inline"
     );
 }
 

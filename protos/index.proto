@@ -6,6 +6,7 @@ syntax = "proto3";
 package lance.index.pb;
 
 import "google/protobuf/any.proto";
+import "index_old.proto";
 
 // The type of an index.
 enum IndexType {
@@ -246,12 +247,137 @@ message HnswParameters {
   uint32 max_level = 3;
 }
 
+/* The data type a JSON index extracted its values as, before handing them to
+ * the target index.
+ *
+ * A JSON value has no fixed type, so a JSON index decodes the value at its path
+ * into a single Arrow type and trains the target index on that. The supported
+ * variants map from the JSONB type tags: a JSON boolean becomes BOOLEAN, a
+ * JSON integer INT64, a JSON float FLOAT64, and a JSON string UTF8.
+ */
+enum JsonTargetDataType {
+  /* The type this index was trained on is not recorded here. An index built
+   * before this field existed carries UNSPECIFIED, and so does one whose type
+   * a later rewrite of these details could not recover.
+   *
+   * A reader that needs the type must first ask the target index: some target
+   * types retain the Arrow type they were trained on, and that answer is
+   * authoritative. Only a target that cannot report one leaves the type to be
+   * inferred by decoding the data again, reading the type tag of the first
+   * non-null value at the path and falling back to UTF8 when every value is
+   * null. Inference depends on which rows are read -- inferring over a
+   * different row set, or over disjoint subsets in separate workers, can
+   * produce a different type than the original index -- which is the
+   * inconsistency this field exists to prevent, so it is the last resort
+   * rather than the defined behavior for UNSPECIFIED.
+   *
+   * Because UNSPECIFIED records no type, there is nothing for a rewrite to
+   * preserve, and it is the one value the preservation rule on field 3 does
+   * not cover: an implementation rewriting these details may replace
+   * UNSPECIFIED with a type it recovered authoritatively, and should, so the
+   * index stops being ambiguous. It must not replace it with an inferred type,
+   * which would persist a row-dependent guess as though it were recorded fact.
+   *
+   * A build that understands this field always records it when training a new
+   * index, so UNSPECIFIED is only ever a legacy or unrecoverable state.
+   */
+  JSON_TARGET_DATA_TYPE_UNSPECIFIED = 0;
+  JSON_TARGET_DATA_TYPE_BOOLEAN = 1;
+  JSON_TARGET_DATA_TYPE_INT64 = 2;
+  JSON_TARGET_DATA_TYPE_FLOAT64 = 3;
+  JSON_TARGET_DATA_TYPE_UTF8 = 4;
+  /* Deprecated. A JSON array or object, stored as its re-serialized JSONB
+   * value. No query can be served by an index of this type, so writers should
+   * not produce it, and future versions may reject it at index creation.
+   */
+  JSON_TARGET_DATA_TYPE_LARGE_BINARY = 5;
+}
+
 message JsonIndexDetails {
+  // The JSON path whose value is indexed, e.g. `$.user.id`.
   string path = 1;
+  // Details of the index built over the extracted values.
   google.protobuf.Any target_details = 2;
+  /* The type the extracted values were decoded to, which is also the type the
+   * target index was trained on.
+   *
+   * Recording it closes the type gap: rebuilding from these details reproduces
+   * the original type instead of re-inferring it from whatever rows the
+   * rebuild happens to see. See JSON_TARGET_DATA_TYPE_UNSPECIFIED for how to
+   * recover the type when it is absent.
+   *
+   * This completes the description of the extracted values only. These details
+   * still do not record the target index's format version, so they are not a
+   * general, lossless description of the index and must not be read as one.
+   *
+   * An implementation that rewrites these details without retraining the target
+   * index -- compacting or updating it -- must preserve a recorded type
+   * exactly. Every value other than JSON_TARGET_DATA_TYPE_UNSPECIFIED is
+   * copied through unchanged, including one the implementation does not
+   * recognize; otherwise a variant added by a later revision is erased by any
+   * older reader that touches the index.
+   *
+   * JSON_TARGET_DATA_TYPE_UNSPECIFIED is the sole exception, because it
+   * records no type to preserve. See its own documentation for when a rewrite
+   * may replace it.
+   */
+  JsonTargetDataType target_data_type = 3;
 }
 message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
 
 message FMIndexDetails {}
+
+/* Details of a MinHash LSH index (near-duplicate search over text).
+ *
+ * EXPERIMENTAL: this index is an experimental format feature. This message
+ * and the index files may change incompatibly without a separate vote, in
+ * which case the index must be rebuilt (the data is never rewritten), and
+ * the feature is removed if its stabilization vote does not pass. Datasets
+ * that do not use the index are not affected either way.
+ *
+ * The message identifies every input of signature generation: the
+ * parameters, the tokenizer and the version of the procedure. All segments
+ * of one logical index carry identical details, so their signatures and the
+ * query signature are comparable; both index files repeat the serialized
+ * message in their schema metadata so that a file which does not belong to
+ * the details is detected. A reader validates every field against the ranges
+ * below before it allocates memory or reads an index file.
+ */
+message MinHashLshIndexDetails {
+  /* Number of MinHash values per signature (k): in [1, 4096] and a multiple
+   * of `num_bands`.
+   */
+  uint32 num_hashes = 1;
+
+  /* Number of LSH bands (b), in [1, 256]. Each band covers
+   * `num_hashes / num_bands` consecutive signature values.
+   */
+  uint32 num_bands = 2;
+
+  /* Number of consecutive tokens joined into one shingle; at least 1. A text
+   * with fewer tokens forms one shingle of all of them.
+   */
+  uint32 shingle_size = 3;
+
+  /* The tokenizer, recorded as a full text search index records it and
+   * rebuilt from this message alone at query time. Required. Fields that only
+   * shape full text search postings (`with_position`, `block_size`,
+   * `posting_format_version`, `document_granularity`) are carried unchanged
+   * and ignored. The details must identify the tokenizer completely, so
+   * settings the message cannot record (custom stop words, document-level
+   * text extraction) and tokenizers that load data from outside Lance (the
+   * jieba and lindera dictionaries) are rejected.
+   */
+  lance.table.InvertedIndexDetails tokenizer = 4;
+
+  /* Version of the signature procedure: the token streams of the tokenizers
+   * that ship with Lance, shingling, hashing, the permutation coefficients
+   * and their seed, compression and band keys. Bumped whenever any of them
+   * changes in a way that makes old and new signatures incomparable; a reader
+   * rejects a version it does not implement. Independent of the index file
+   * format version.
+   */
+  uint32 signature_version = 5;
+}
