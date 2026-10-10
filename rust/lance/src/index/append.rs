@@ -338,6 +338,10 @@ pub async fn build_per_segment_filters(
 
 /// Attempt to read seed buffers for `column_name` from `fragments`' data files.
 ///
+/// A seed is written into the data file that holds the column, which after a
+/// `column_groups` compaction need not be the fragment's first file, so each
+/// fragment's file is found by `field_id`.
+///
 /// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
 /// if any fragment is missing a seed or its data file cannot be opened.
 /// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
@@ -346,6 +350,7 @@ async fn try_harvest_seeds(
     dataset: &Dataset,
     fragments: &[Fragment],
     column_name: &str,
+    field_id: i32,
 ) -> Result<Option<Vec<FragmentSeed>>> {
     if fragments.is_empty() {
         return Ok(Some(Vec::new()));
@@ -360,7 +365,11 @@ async fn try_harvest_seeds(
     );
 
     for fragment in fragments {
-        let Some(data_file) = fragment.files.first() else {
+        let Some(data_file) = fragment
+            .files
+            .iter()
+            .find(|file| file.fields.contains(&field_id))
+        else {
             return Ok(None);
         };
 
@@ -668,7 +677,13 @@ async fn merge_scalar_indices<'a>(
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
         let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+            if let Some(seeds) = try_harvest_seeds(
+                dataset.as_ref(),
+                unindexed,
+                column_name,
+                reference_idx.fields[0],
+            )
+            .await?
             {
                 plugin
                     .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
@@ -5676,5 +5691,63 @@ mod tests {
                 "bitmap merge returned stale rows for cat = {cat}"
             );
         }
+    }
+
+    /// A `column_groups` compaction writes an indexed column's seed into that
+    /// column's group file, which need not be the fragment's first file; the
+    /// harvest has to find it there.
+    #[tokio::test]
+    async fn test_harvest_seeds_from_column_group_file() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values(0..20)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["a"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        // {b} is unclaimed and becomes the first file; {a} is the second.
+        let options = CompactionOptions {
+            column_groups: vec![vec!["a".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments: Vec<Fragment> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        let a_id = dataset.schema().field("a").unwrap().id;
+        assert!(
+            !fragments[0].files[0].fields.contains(&a_id),
+            "the indexed column is not in the first file: {:?}",
+            fragments[0].files
+        );
+        let seeds = try_harvest_seeds(&dataset, &fragments, "a", a_id)
+            .await
+            .unwrap();
+        assert!(seeds.is_some(), "the seed in the group file is found");
     }
 }

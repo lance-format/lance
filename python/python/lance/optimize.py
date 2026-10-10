@@ -121,6 +121,28 @@ class CompactionOptions(TypedDict, total=False):
     are not combined into the same task. Duplicate and unknown IDs are
     ignored. (default: None)
     """
+    max_data_files_per_fragment: Optional[int]
+    """
+    Maximum number of data files a fragment may hold columns in before its
+    columns are repacked into fewer files. Each ``add_columns`` backfill adds
+    one file per fragment. A repack rewrites only the columns that move and
+    keeps rows, fragment ids and indices as they are. (default: None, no
+    file-count trigger)
+    """
+    column_groups: Optional[list[list[str]]]
+    """
+    Top-level columns to keep in their own data files. Each inner list becomes
+    one data file per fragment; the columns no group names share one file.
+    Fragments the compaction rewrites are written this way, and the others
+    have their columns repacked to match. Names that are not top-level
+    columns are ignored. (default: None, one file per fragment)
+    """
+    scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]]
+    """
+    Which tasks to plan: ``"rewrite_fragments"`` only rewrites fragments,
+    ``"repack_columns"`` only repacks columns, ``"all"`` does both.
+    (default: "all")
+    """
     data_storage_version: Optional[str]
     """
     Output data file version, such as "2.2", "stable", or "next". If omitted,

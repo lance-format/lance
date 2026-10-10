@@ -583,8 +583,12 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             }
             "DataReplacement" => {
                 let replacements = extract_vec(&ob.getattr("replacements")?)?;
+                let data_change = ob.getattr("data_change")?.extract::<bool>()?;
 
-                let op = Operation::DataReplacement { replacements };
+                let op = Operation::DataReplacement {
+                    replacements,
+                    data_change,
+                };
 
                 Ok(Self(op))
             }
@@ -751,12 +755,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragment_offsets,
                 ))
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => {
                 let replacements = export_vec(py, replacements.as_slice())?;
                 let cls = namespace
                     .getattr("DataReplacement")
                     .expect("Failed to get DataReplacement class");
-                cls.call1((replacements,))
+                cls.call1((replacements, *data_change))
             }
             Operation::DataOverlay { groups } => {
                 let groups = export_vec(py, groups.as_slice())?;

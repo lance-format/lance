@@ -147,6 +147,7 @@ use tracing::{info, warn};
 
 pub(super) mod binary_copy;
 pub mod remapping;
+mod repack;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -317,6 +318,31 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
+    /// Maximum number of data files a fragment may hold columns in before its
+    /// columns are repacked into fewer files. Each `add_columns` backfill adds
+    /// one file per fragment; a large, deletion-free fragment never qualifies
+    /// for a rewrite, so this is the trigger that collapses those files. The
+    /// repack rewrites only the columns that move and keeps rows, fragment ids
+    /// and indices as they are (see [`CompactionTaskKind::RepackColumns`]).
+    /// The count is [`FragmentColumnLayoutStats::live_file_count`]. Only
+    /// files the repack empties are merged, at least two at a time. A file
+    /// stays when it holds a blob column, a column only partly in the
+    /// fragment's files, or spilled row lineage, or shares a column with a
+    /// file holding spilled row lineage; without `column_groups`, when every
+    /// file holding a column could go, at least one stays (the largest when
+    /// some merge leaves it) unless the limit is 1. So a fragment can stay above the limit; so can one with
+    /// more `column_groups` than the limit allows.
+    /// The repack writes each new file whole, with no `max_bytes_per_file`
+    /// split. Not planned under `ForceBinaryCopy`, since a repack reencodes.
+    ///
+    /// Defaults to `None` (no file-count trigger). Must be at least 1.
+    ///
+    /// [`FragmentColumnLayoutStats::live_file_count`]: crate::dataset::compaction_stats::FragmentColumnLayoutStats::live_file_count
+    #[serde(default)]
+    pub max_data_files_per_fragment: Option<usize>,
+    /// Which kinds of task this run plans. Defaults to [`CompactionScope::All`].
+    #[serde(default)]
+    pub scope: CompactionScope,
     /// Exact data file version for compacted output.
     ///
     /// If omitted, use the dataset's default write version without changing it.
@@ -332,6 +358,26 @@ pub struct CompactionOptions {
     /// };
     /// ```
     pub data_storage_version: Option<LanceFileVersion>,
+    /// Top-level columns to keep in their own data files.
+    ///
+    /// Each inner list becomes one data file per fragment holding exactly
+    /// those columns. Empty (the default) means no groups.
+    ///
+    /// A fragment a compaction rewrites gets one file per group plus one
+    /// shared file for the columns no group names. A fragment it leaves alone has a
+    /// group repacked into a file of its own when no single file holds
+    /// exactly that group's columns (see [`CompactionTaskKind::RepackColumns`]),
+    /// unless `scope` is [`CompactionScope::RewriteFragments`]; the columns no
+    /// group names are merged only when the fragment is over
+    /// `max_data_files_per_fragment`. A group holding a blob column is left
+    /// as it is. A name that is not a top-level column of the dataset (say,
+    /// one dropped or renamed since the groups were configured) is ignored
+    /// with a warning. Binary copy is disabled when groups are set
+    /// (`ForceBinaryCopy` is rejected), and `max_bytes_per_file` is ignored so
+    /// every group's files split at the same rows. Set from dataset config
+    /// with `lance.compaction.column_groups` (see [`Self::from_dataset_config`]).
+    #[serde(default)]
+    pub column_groups: Vec<Vec<String>>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -365,7 +411,10 @@ impl Default for CompactionOptions {
             max_source_bytes: None,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
+            max_data_files_per_fragment: None,
+            scope: CompactionScope::All,
             data_storage_version: None,
+            column_groups: Vec::new(),
             transaction_properties: None,
         }
     }
@@ -395,7 +444,12 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
+    /// - `lance.compaction.max_data_files_per_fragment`
     /// - `lance.compaction.data_storage_version`
+    /// - `lance.compaction.column_groups`: groups separated by `;`, columns in
+    ///   a group by `,`, surrounding whitespace trimmed (`"b, c; d"` is
+    ///   `[["b", "c"], ["d"]]`). A column whose name contains `,` or `;`, or
+    ///   starts or ends with whitespace, cannot be named this way.
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -543,6 +597,28 @@ impl CompactionOptions {
                         })?),
                     };
                 }
+                "max_data_files_per_fragment" => {
+                    self.max_data_files_per_fragment = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a positive integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "column_groups" => {
+                    self.column_groups = value
+                        .split(';')
+                        .map(|group| {
+                            group
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|column| !column.is_empty())
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|group| !group.is_empty())
+                        .collect();
+                }
                 _ => {
                     warn!("Ignoring unknown compaction config key: {}", key);
                 }
@@ -555,6 +631,32 @@ impl CompactionOptions {
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
+        }
+
+        self.column_groups.retain(|group| !group.is_empty());
+        let mut seen = HashSet::new();
+        for column in self.column_groups.iter().flatten() {
+            if !seen.insert(column.as_str()) {
+                return Err(Error::invalid_input(format!(
+                    "CompactionOptions::column_groups lists column \"{column}\" more than once"
+                )));
+            }
+        }
+        if !self.column_groups.is_empty()
+            && matches!(self.compaction_mode(), CompactionMode::ForceBinaryCopy)
+        {
+            return Err(Error::invalid_input(
+                "CompactionOptions::column_groups cannot be combined with \
+                 compaction_mode=ForceBinaryCopy: binary copy keeps each fragment's \
+                 file layout, so it cannot split columns into groups",
+            ));
+        }
+
+        if self.max_data_files_per_fragment == Some(0) {
+            return Err(Error::invalid_input(
+                "CompactionOptions::max_data_files_per_fragment must be at least 1 \
+                 (use None for no limit)",
+            ));
         }
 
         for (name, value) in [
@@ -620,6 +722,10 @@ async fn can_use_binary_copy(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
+    if !options.column_groups.is_empty() {
+        log::debug!("Binary copy disabled: column_groups splits each fragment across files");
+        return false;
+    }
     let version = options.write_version(dataset);
     versions::can_use_binary_copy(version, dataset, options, fragments)
         .await
@@ -757,8 +863,9 @@ pub struct CompactionMetrics {
     pub fragments_added: usize,
     /// The number of files that have been removed, including deletion files.
     pub files_removed: usize,
-    /// The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// The number of data files that have been added: one per new fragment for
+    /// a fragment rewrite (one per group with `column_groups`), and one per new
+    /// file for a column repack.
     pub files_added: usize,
 }
 
@@ -796,6 +903,9 @@ pub trait CompactionPlanner: Send + Sync {
 /// tasks may contain a single fragment when that fragment has deletions that
 /// are being materialized and doesn't have any neighbors that need to be
 /// compacted.
+///
+/// Fragments no rewrite task takes are then checked for a column repack
+/// against [`Dataset::column_layout_stats`], one task per fragment.
 #[derive(Debug, Clone, Default)]
 pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
@@ -821,8 +931,53 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             dataset.manifest.data_storage_format.lance_file_format(),
             write_version,
         )?;
+        // Warned about once here; the tasks skip the stale names silently.
+        for column in self.options.column_groups.iter().flatten() {
+            if !dataset
+                .schema()
+                .fields
+                .iter()
+                .any(|field| &field.name == column)
+            {
+                warn!(
+                    "Ignoring column_groups entry \"{column}\": it is not a top-level column \
+                     of the dataset"
+                );
+            }
+        }
+        if !self.options.column_groups.is_empty() {
+            // Surface a bad column-group config here rather than mid-write.
+            column_group_schemas(dataset.schema(), &self.options.column_groups)?;
+        }
         reject_deferred_remap_with_row_id_indices(dataset, &self.options).await?;
 
+        let mut all_tasks = if self.options.scope == CompactionScope::RepackColumns {
+            Vec::new()
+        } else {
+            self.plan_rewrites(dataset).await?
+        };
+        if self.options.scope != CompactionScope::RewriteFragments {
+            let rewritten: HashSet<u64> = all_tasks
+                .iter()
+                .flat_map(|(task, _)| task.fragments.iter().map(|fragment| fragment.id))
+                .collect();
+            all_tasks.extend(self.plan_repacks(dataset, &rewritten)?);
+        }
+
+        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+
+        let mut options = self.options.clone();
+        options.data_storage_version = Some(write_version.to_selector());
+        let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
+        compaction_plan.extend_tasks(tasks);
+
+        Ok(compaction_plan)
+    }
+}
+
+impl DefaultCompactionPlanner {
+    /// The tasks that rewrite fragments, each with its live row count.
+    async fn plan_rewrites(&self, dataset: &Dataset) -> Result<Vec<(TaskData, usize)>> {
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
         let fragments = dataset.get_fragments();
@@ -995,23 +1150,76 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| {
                 let live_rows = bin.row_counts.iter().sum();
-                (
-                    TaskData {
-                        fragments: bin.fragments,
-                    },
-                    live_rows,
-                )
+                (TaskData::rewrite_fragments(bin.fragments), live_rows)
             })
             .collect();
+        Ok(all_tasks)
+    }
 
-        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
-
-        let mut options = self.options.clone();
-        options.data_storage_version = Some(write_version.to_selector());
-        let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
-        compaction_plan.extend_tasks(tasks);
-
-        Ok(compaction_plan)
+    /// The tasks that repack the columns of a fragment not in `rewritten`,
+    /// each with its live row count. A fragment is repacked when its files
+    /// do not match `column_groups`, or when it holds columns in more than
+    /// `max_data_files_per_fragment` files, as
+    /// [`Dataset::column_layout_stats`] counts them.
+    fn plan_repacks(
+        &self,
+        dataset: &Dataset,
+        rewritten: &HashSet<u64>,
+    ) -> Result<Vec<(TaskData, usize)>> {
+        let groups = if self.options.column_groups.is_empty() {
+            None
+        } else {
+            Some(claimed_column_ids(
+                dataset.schema(),
+                &self.options.column_groups,
+            ))
+        };
+        let max_files = self.options.max_data_files_per_fragment;
+        if groups.is_none() && max_files.is_none() {
+            return Ok(Vec::new());
+        }
+        // A repack reencodes the columns it moves. `validate()` already
+        // rejects `column_groups` with ForceBinaryCopy.
+        if matches!(
+            self.options.compaction_mode(),
+            CompactionMode::ForceBinaryCopy
+        ) {
+            log::info!(
+                "not planning column repacks: compaction_mode=ForceBinaryCopy does not \
+                 reencode, and a repack does"
+            );
+            return Ok(Vec::new());
+        }
+        let stats = dataset.column_layout_stats();
+        let tasks = dataset
+            .manifest
+            .fragments
+            .iter()
+            .zip(stats)
+            .filter(|(fragment, _)| {
+                !rewritten.contains(&fragment.id)
+                    && !u32::try_from(fragment.id)
+                        .is_ok_and(|id| self.excluded_fragment_ids.contains(id))
+            })
+            .filter_map(|(fragment, stats)| {
+                let files = repack::plan_fragment_repack(
+                    dataset.schema(),
+                    fragment,
+                    stats.live_file_count,
+                    groups.as_deref(),
+                    max_files,
+                )?;
+                let live_rows = fragment.num_rows().unwrap_or_default();
+                Some((
+                    TaskData {
+                        fragments: vec![fragment.clone()],
+                        kind: CompactionTaskKind::RepackColumns { files },
+                    },
+                    live_rows,
+                ))
+            })
+            .collect();
+        Ok(tasks)
     }
 }
 
@@ -1021,6 +1229,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 ///  * Removes deleted rows from fragments.
 ///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
+///
+/// With [`CompactionOptions::max_data_files_per_fragment`] or
+/// [`CompactionOptions::column_groups`] set, it also repacks the columns of a
+/// fragment spread over too many data files, or laid out other than the
+/// groups ask, into new files without moving its rows. A run that both
+/// rewrites fragments and repacks columns commits two versions (see
+/// [`commit_compaction`]). [`CompactionOptions::scope`] limits a run to one
+/// kind of task.
 ///
 /// This method tries to preserve the insertion order of rows in the dataset.
 ///
@@ -1032,7 +1248,7 @@ pub async fn compact_files(
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     let planner = DefaultCompactionPlanner::new(options)?;
-    compact_files_with_planner(dataset, remap_options, &planner).await
+    Box::pin(compact_files_with_planner(dataset, remap_options, &planner)).await
 }
 
 pub async fn compact_files_with_planner(
@@ -1046,8 +1262,14 @@ pub async fn compact_files_with_planner(
     // tagged entry, which only the deferred-remap commit path does; eager
     // remapping would rewrite provenance the tagged reader depends on.
     // Checked before any file is rewritten (commit_compaction re-checks for
-    // callers that commit externally planned results).
-    if !compaction_plan.options.defer_index_remap
+    // callers that commit externally planned results). A repack moves no row,
+    // so only a plan that rewrites fragments is refused.
+    let rewrites_fragments = compaction_plan
+        .tasks
+        .iter()
+        .any(|task| task.kind == CompactionTaskKind::RewriteFragments);
+    if rewrites_fragments
+        && !compaction_plan.options.defer_index_remap
         && dataset.manifest.writer_feature_flags
             & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
             != 0
@@ -1068,28 +1290,21 @@ pub async fn compact_files_with_planner(
         return Ok(CompactionMetrics::default());
     }
 
-    let dataset_ref = &dataset.clone();
-
-    let result_stream = futures::stream::iter(compaction_plan.tasks)
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
-        .buffer_unordered(
-            compaction_plan
-                .options
-                .num_threads
-                .unwrap_or_else(get_num_compute_intensive_cpus),
-        );
-
-    let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
+    let concurrency = compaction_plan
+        .options
+        .num_threads
+        .unwrap_or_else(get_num_compute_intensive_cpus);
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(
-        dataset,
-        completed_tasks,
-        remap_options,
-        &compaction_plan.options,
-    )
-    .await?;
-
-    Ok(metrics)
+    let options = &compaction_plan.options;
+    // Execute against an immutable snapshot; the commit takes `&mut dataset`
+    // once every task has finished.
+    let snapshot = &dataset.clone();
+    let results: Vec<RewriteResult> = futures::stream::iter(compaction_plan.compaction_tasks())
+        .map(|task| async move { task.execute(snapshot).await })
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+    commit_compaction(dataset, results, remap_options, options).await
 }
 
 /// Information about a fragment used to decide its fate in compaction
@@ -1205,7 +1420,8 @@ fn limit_tasks_to_source_budget(
         total_fragments += task.fragments.len();
         total_rows = total_rows.saturating_add(live_rows);
         if options.max_source_bytes.is_some() {
-            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+            total_bytes =
+                total_bytes.saturating_add(task_source_bytes(&task, schema, &schema_field_ids)?);
         }
 
         let over_budget = options
@@ -1241,19 +1457,44 @@ fn limit_tasks_to_source_budget(
 ///
 /// Files whose fields are all absent from `schema_field_ids` only back
 /// dropped columns; compaction does not read them, so they are neither
-/// counted nor required to have a recorded size.
+/// counted nor required to have a recorded size. A column repack reads only
+/// the files holding the columns it moves, and no overlay, so only those
+/// files count.
 /// Only sizes recorded in the manifest are used: a missing size is an error
 /// rather than a metadata request against object storage, which would turn
 /// planning into one round trip per file. Deletion files are not counted.
-fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+fn task_source_bytes(
+    task: &TaskData,
+    schema: &lance_core::datatypes::Schema,
+    schema_field_ids: &HashSet<i32>,
+) -> Result<u64> {
+    // The field ids a task reads: every schema field, or a repack's columns.
+    let read_ids: Cow<'_, HashSet<i32>> = match &task.kind {
+        CompactionTaskKind::RewriteFragments => Cow::Borrowed(schema_field_ids),
+        CompactionTaskKind::RepackColumns { files } => {
+            let columns: Vec<i32> = files.iter().flatten().copied().collect();
+            Cow::Owned(
+                schema
+                    .project_by_ids(&columns, true)
+                    .field_ids()
+                    .into_iter()
+                    .collect(),
+            )
+        }
+    };
+    let reads_overlays = task.kind == CompactionTaskKind::RewriteFragments;
     let mut total_bytes = 0_u64;
     for fragment in &task.fragments {
-        let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
+        let overlay_files = fragment
+            .overlays
+            .iter()
+            .filter(|_| reads_overlays)
+            .map(|overlay| &overlay.data_file);
         for data_file in fragment.files.iter().chain(overlay_files) {
             if !data_file
                 .fields
                 .iter()
-                .any(|field_id| schema_field_ids.contains(field_id))
+                .any(|field_id| read_ids.contains(field_id))
             {
                 continue;
             }
@@ -2135,6 +2376,65 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+    /// What the task does with them. Absent in a task serialized before
+    /// repacking existed, which rewrote its fragments.
+    #[serde(default)]
+    pub kind: CompactionTaskKind,
+}
+
+impl TaskData {
+    /// A task that rewrites `fragments` into new fragments.
+    pub fn rewrite_fragments(fragments: Vec<Fragment>) -> Self {
+        Self {
+            fragments,
+            kind: CompactionTaskKind::RewriteFragments,
+        }
+    }
+}
+
+/// What a compaction task does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionTaskKind {
+    /// Rewrite the task's fragments into new fragments, merging small ones,
+    /// dropping deleted rows and materializing overlays. Moves rows, so
+    /// indices covering the fragments are remapped.
+    #[default]
+    RewriteFragments,
+    /// Rewrite some columns of the task's one fragment into new data files,
+    /// leaving the fragment id, rows, deletions, overlays and index coverage
+    /// as they are. Each entry of `files` is one new file, given as the field
+    /// ids of the top-level columns it holds. The files the columns leave
+    /// keep their other columns; a file left with none is dropped.
+    RepackColumns { files: Vec<Vec<i32>> },
+}
+
+/// Which kinds of task a compaction plans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionScope {
+    /// Rewrite the fragments that need it and repack the columns of the
+    /// others.
+    #[default]
+    All,
+    /// Only rewrite fragments.
+    RewriteFragments,
+    /// Only repack columns.
+    RepackColumns,
+}
+
+impl TryFrom<&str> for CompactionScope {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "rewrite_fragments" => Ok(Self::RewriteFragments),
+            "repack_columns" => Ok(Self::RepackColumns),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid compaction scope \"{}\". Valid values: \"all\", \"rewrite_fragments\", \"repack_columns\"",
+                value
+            ))),
+        }
+    }
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -2147,7 +2447,10 @@ pub struct CompactionTask {
 }
 
 impl CompactionTask {
-    /// Run the compaction task and return the result.
+    /// Run the compaction task and return the result. A
+    /// [`CompactionTaskKind::RewriteFragments`] task rewrites its fragments
+    /// into new ones; a [`CompactionTaskKind::RepackColumns`] task writes new
+    /// data files for its fragment.
     ///
     /// This result should be later passed to [commit_compaction()] to commit
     /// the changes to the dataset.
@@ -2161,7 +2464,15 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(dataset, self.task.clone(), &self.options).await
+        let task = self.task.clone();
+        match task.kind {
+            CompactionTaskKind::RewriteFragments => {
+                rewrite_files(dataset, task, &self.options).await
+            }
+            CompactionTaskKind::RepackColumns { .. } => {
+                repack::execute_repack(&dataset, task, &self.options).await
+            }
+        }
     }
 }
 
@@ -2449,6 +2760,19 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// The new data files of a [`CompactionTaskKind::RepackColumns`] task.
+    /// `new_fragments` and `original_fragments` are then empty.
+    #[serde(default)]
+    pub repacked_files: Option<RepackedFiles>,
+}
+
+/// The data files a column repack wrote for one fragment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepackedFiles {
+    /// The fragment the files belong to.
+    pub fragment_id: u64,
+    /// The new files, empty when the fragment had no rows to write.
+    pub files: Vec<lance_table::format::DataFile>,
 }
 
 /// Returns the version the reservation committed at; `dataset` is not moved to it.
@@ -2488,6 +2812,241 @@ async fn reserve_fragment_ids(
     Ok(manifest.version)
 }
 
+/// The schema of each data file a compacted fragment gets when column groups
+/// are configured: the columns no group claims first (when any), then one
+/// schema per group. Columns keep the dataset's order within each file.
+///
+/// A name that is not a top-level column is skipped: the groups usually come
+/// from table config, which `drop_columns` and a rename leave as they are, and
+/// a stale name must not stop every later compaction. The planner warns about
+/// it.
+fn column_group_schemas(
+    schema: &lance_core::datatypes::Schema,
+    groups: &[Vec<String>],
+) -> Result<Vec<lance_core::datatypes::Schema>> {
+    let names = || schema.fields.iter().map(|field| field.name.as_str());
+    let mut seen = HashSet::new();
+    for column in groups.iter().flatten() {
+        // Checked here as well as in `validate()`: a custom planner or a
+        // hand-built `CompactionTask` reaches `rewrite_files` without it, and a
+        // column in two groups would be written to two files.
+        if !seen.insert(column.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "column_groups lists column \"{column}\" more than once"
+            )));
+        }
+    }
+    let claimed = |name: &str| groups.iter().flatten().any(|column| column == name);
+    let rest: Vec<&str> = names().filter(|name| !claimed(name)).collect();
+    std::iter::once(rest)
+        .chain(groups.iter().map(|group| {
+            names()
+                .filter(|name| group.iter().any(|column| column == name))
+                .collect()
+        }))
+        .filter(|columns: &Vec<&str>| !columns.is_empty())
+        .map(|columns| schema.project(&columns))
+        .collect()
+}
+
+/// The field ids of each group's top-level columns, without the columns no
+/// group names. A name that is not a top-level column is skipped, and so is a
+/// group left empty.
+fn claimed_column_ids(
+    schema: &lance_core::datatypes::Schema,
+    groups: &[Vec<String>],
+) -> Vec<Vec<i32>> {
+    groups
+        .iter()
+        .map(|group| {
+            schema
+                .fields
+                .iter()
+                .filter(|field| group.contains(&field.name))
+                .map(|field| field.id)
+                .collect::<Vec<_>>()
+        })
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+/// Compaction's grouped write: fan one read of the merged rows out to one
+/// writer per column group, so each output fragment gets one data file per
+/// group instead of one file holding every column. All writers break at the
+/// same `file_row_counts`, so their fragments line up one-to-one and merge by
+/// appending each later group's files onto the first group's fragments. Index
+/// seeds go to whichever group holds the indexed column.
+async fn write_column_group_fragments(
+    write_version: ConcreteFileVersion,
+    dataset: &Dataset,
+    group_schemas: Vec<lance_core::datatypes::Schema>,
+    mut reader: SendableRecordBatchStream,
+    mut params: WriteParams,
+    file_row_counts: Vec<usize>,
+) -> Result<Vec<Fragment>> {
+    use futures::SinkExt;
+
+    // `file_row_counts` is authoritative for the grouped write: every group must
+    // break at the same rows so the fragments merge one-to-one. A byte cap would
+    // roll an extra file in a wide group only (write.rs re-plans the remainder on
+    // a byte-driven close), leaving groups misaligned, so disable it here.
+    params.max_bytes_per_file = usize::MAX;
+
+    let arrow_schema = reader.schema();
+    let projections = group_schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .fields
+                .iter()
+                .map(|field| arrow_schema.index_of(&field.name))
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let group_arrow_schemas = projections
+        .iter()
+        .map(|projection| arrow_schema.project(projection).map(Arc::new))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // One bounded channel per group; the forwarder projects each read batch to
+    // every group. Bound 1 keeps a slow writer from letting the others buffer
+    // the whole scan ahead of it in memory.
+    let (mut senders, group_streams): (Vec<_>, Vec<_>) = group_arrow_schemas
+        .into_iter()
+        .map(|group_arrow| {
+            let (tx, rx) =
+                futures::channel::mpsc::channel::<datafusion::error::Result<RecordBatch>>(1);
+            let stream: SendableRecordBatchStream =
+                Box::pin(RecordBatchStreamAdapter::new(group_arrow, rx));
+            (tx, stream)
+        })
+        .unzip();
+
+    // Blob-check each group, then seed the scalar indexes once and route each
+    // seed to the group holding its column. Every dataset column lands in
+    // exactly one group (the unclaimed columns form the first group), so no seed
+    // is created only to be dropped, and each index is seeded exactly once.
+    for group_schema in &group_schemas {
+        versions::validate_write_schema(write_version, group_schema)?;
+    }
+    let mut per_group_seeds: Vec<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> =
+        group_schemas.iter().map(|_| Vec::new()).collect();
+    for seed in versions::create_seed_writers(write_version, Some(dataset), &params).await? {
+        match group_schemas
+            .iter()
+            .position(|schema| schema.field(seed.column_name()).is_some())
+        {
+            Some(index) => per_group_seeds[index].push(seed),
+            // `column_group_schemas` partitions every top-level column, so an
+            // index's keyed column always lands in exactly one group. Guard the
+            // invariant rather than silently dropping the seed, which would
+            // rebuild the index from incomplete data.
+            None => {
+                return Err(Error::internal(format!(
+                    "column groups do not cover indexed column \"{}\"",
+                    seed.column_name()
+                )));
+            }
+        }
+    }
+
+    // Returns which writer stopped reading first, if one did: a writer that
+    // fails closes its receiver, and its error is the one to report.
+    let forward = async move {
+        while let Some(batch) = reader.next().await {
+            let batch = batch?;
+            for (index, (sender, projection)) in senders.iter_mut().zip(&projections).enumerate() {
+                if sender.send(Ok(batch.project(projection)?)).await.is_err() {
+                    return Ok(Some(index));
+                }
+            }
+        }
+        Ok::<Option<usize>, Error>(None)
+    };
+    let writers = group_streams
+        .into_iter()
+        .zip(group_schemas)
+        .zip(per_group_seeds)
+        .map(|((group_stream, group_schema), seed_writers)| {
+            let params = params.clone();
+            let file_row_counts = file_row_counts.clone();
+            async move {
+                versions::write_fragments_direct(
+                    write_version,
+                    Some(dataset),
+                    dataset.object_store.clone(),
+                    &dataset.base,
+                    &group_schema,
+                    group_stream,
+                    params,
+                    None,
+                    seed_writers,
+                    Some(file_row_counts),
+                    None,
+                )
+                .await
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Run every writer to completion rather than dropping the others on the
+    // first error: a writer cleans up its own files only when it fails, so a
+    // group that finished must be cleaned up here if the write as a whole fails.
+    let (forwarded, per_group) = futures::join!(forward, futures::future::join_all(writers));
+    let mut written = Vec::with_capacity(per_group.len());
+    let mut errors = Vec::new();
+    for (index, result) in per_group.into_iter().enumerate() {
+        match result {
+            Ok(fragments) => written.push(fragments),
+            Err(err) => errors.push((index, err)),
+        }
+    }
+    let failure = match forwarded {
+        // The read failed; the writers' errors follow from it.
+        Err(err) => Some(err),
+        Ok(Some(stopped)) => Some(
+            match errors.into_iter().find(|(index, _)| *index == stopped) {
+                Some((_, err)) => err,
+                // Not expected: a writer only finishes once its input ends,
+                // which needs the forwarder to have dropped every sender.
+                None => Error::internal(format!(
+                    "column group writer {stopped} stopped reading before the compacted rows ended"
+                )),
+            },
+        ),
+        Ok(None) => errors.into_iter().next().map(|(_, err)| err),
+    };
+    let misaligned = written.iter().skip(1).any(|group| {
+        group.len() != written[0].len()
+            || written[0]
+                .iter()
+                .zip(group)
+                .any(|(a, b)| a.physical_rows != b.physical_rows)
+    });
+    let failure = failure.or_else(|| {
+        misaligned.then(|| {
+            Error::internal(
+                "column group writers did not split the compacted rows at the same fragments",
+            )
+        })
+    });
+    if let Some(err) = failure {
+        for fragments in &written {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, fragments).await;
+        }
+        return Err(err);
+    }
+
+    let mut written = written.into_iter();
+    let mut fragments = written.next().unwrap_or_default();
+    for group in written {
+        for (fragment, other) in fragments.iter_mut().zip(group) {
+            fragment.files.extend(other.files);
+        }
+    }
+    Ok(fragments)
+}
+
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
@@ -2510,6 +3069,7 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            repacked_files: None,
         });
     }
 
@@ -2727,60 +3287,77 @@ async fn rewrite_files(
         None
     } else {
         let mut stream = reader.expect("reader must be prepared for non-binary-copy path");
-        let mut write_schema = dataset.schema().clone();
-        // On a table that can spill, the output fragments' lineage is computed
-        // before anything is written: the row ids and versions carry over from
-        // the inputs, so a sequence that leaves the manifest can ride along as
-        // a hidden column of the file being written rather than need a file of
-        // its own. Every other table carries its lineage over after the write,
-        // cut at the row counts actually written, and holds none of it while
-        // writing. Binary copy cannot add columns to the files it copies, so
-        // it always takes that path.
-        let spill_budget = if dataset.manifest.uses_stable_row_ids() {
-            inline_row_lineage_max_bytes(dataset.as_ref())?
-        } else {
-            None
-        };
-        let lineage_plan = match spill_budget {
-            Some(limit) => {
-                let planned_rows = file_row_counts
-                    .iter()
-                    .map(|rows| *rows as u64)
-                    .collect::<Vec<_>>();
-                let mut lineages =
-                    compute_row_lineage(dataset.as_ref(), &fragments, &planned_rows).await?;
-                let plan = plan_row_lineage_spill(limit, &lineages);
-                if let RowLineagePlan::InFile(spill) = plan
-                    && spill.any()
-                {
-                    let fields = spill.schema_fields()?;
-                    let columns = spill.take_columns(&mut lineages);
-                    stream = append_row_lineage_columns(stream, &fields, columns);
-                    // The writer stores only the columns its schema lists.
-                    write_schema.fields.extend(fields);
+        if options.column_groups.is_empty() {
+            let mut write_schema = dataset.schema().clone();
+            // On a table that can spill, the output fragments' lineage is computed
+            // before anything is written: the row ids and versions carry over from
+            // the inputs, so a sequence that leaves the manifest can ride along as
+            // a hidden column of the file being written rather than need a file of
+            // its own. Every other table carries its lineage over after the write,
+            // cut at the row counts actually written, and holds none of it while
+            // writing. Binary copy cannot add columns to the files it copies, so
+            // it always takes that path.
+            let spill_budget = if dataset.manifest.uses_stable_row_ids() {
+                inline_row_lineage_max_bytes(dataset.as_ref())?
+            } else {
+                None
+            };
+            let lineage_plan = match spill_budget {
+                Some(limit) => {
+                    let planned_rows = file_row_counts
+                        .iter()
+                        .map(|rows| *rows as u64)
+                        .collect::<Vec<_>>();
+                    let mut lineages =
+                        compute_row_lineage(dataset.as_ref(), &fragments, &planned_rows).await?;
+                    let plan = plan_row_lineage_spill(limit, &lineages);
+                    if let RowLineagePlan::InFile(spill) = plan
+                        && spill.any()
+                    {
+                        let fields = spill.schema_fields()?;
+                        let columns = spill.take_columns(&mut lineages);
+                        stream = append_row_lineage_columns(stream, &fields, columns);
+                        // The writer stores only the columns its schema lists.
+                        write_schema.fields.extend(fields);
+                    }
+                    Some(PlannedRowLineage {
+                        lineages,
+                        planned_rows,
+                        plan,
+                    })
                 }
-                Some(PlannedRowLineage {
-                    lineages,
-                    planned_rows,
-                    plan,
-                })
-            }
-            None => None,
-        };
-        let (frags, _) = write_fragments_internal_with_file_row_counts(
-            write_version,
-            Some(dataset.as_ref()),
-            dataset.object_store.clone(),
-            &dataset.base,
-            write_schema,
-            stream,
-            params,
-            None,
-            Some(file_row_counts),
-        )
-        .await?;
-        new_fragments = frags;
-        lineage_plan
+                None => None,
+            };
+            let (frags, _) = write_fragments_internal_with_file_row_counts(
+                write_version,
+                Some(dataset.as_ref()),
+                dataset.object_store.clone(),
+                &dataset.base,
+                write_schema,
+                stream,
+                params,
+                None,
+                Some(file_row_counts),
+            )
+            .await?;
+            new_fragments = frags;
+            lineage_plan
+        } else {
+            // column_groups repacks columns into one file per group and does not
+            // yet carry the in-file row-lineage spill; stable row ids are
+            // rechunked after the write instead (lineage_plan stays None).
+            let group_schemas = column_group_schemas(dataset.schema(), &options.column_groups)?;
+            new_fragments = write_column_group_fragments(
+                write_version,
+                dataset.as_ref(),
+                group_schemas,
+                stream,
+                params,
+                file_row_counts,
+            )
+            .await?;
+            None
+        }
     };
 
     log::info!("Compaction task {}: file written", task_id);
@@ -2860,6 +3437,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        repacked_files: None,
     })
 }
 
@@ -3224,7 +3802,44 @@ fn append_row_lineage_columns(
 /// they can be omitted and the successful tasks can be committed. However, once
 /// some of the tasks have been committed, the remainder of the tasks will not
 /// be able to be committed and should be considered cancelled.
+///
+/// Fragment rewrites commit as one `Operation::Rewrite`; column repacks then
+/// commit as one `Operation::DataReplacement` that moves values without
+/// changing them, so a run with both kinds of task makes two versions. A
+/// fragment in both kinds of task is rejected before either commit. If the second
+/// commit fails, the first stays committed and the error is returned; the
+/// repacks can be planned again.
 pub async fn commit_compaction(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+) -> Result<CompactionMetrics> {
+    let (repacks, rewrites): (Vec<_>, Vec<_>) = completed_tasks
+        .into_iter()
+        .partition(|task| task.repacked_files.is_some());
+    // Otherwise the rewrite commits and the repack then conflicts with it.
+    let rewritten: HashSet<u64> = rewrites
+        .iter()
+        .flat_map(|task| task.original_fragments.iter().map(|fragment| fragment.id))
+        .collect();
+    if let Some(fragment_id) = repacks
+        .iter()
+        .filter_map(|task| task.repacked_files.as_ref())
+        .map(|repacked| repacked.fragment_id)
+        .find(|id| rewritten.contains(id))
+    {
+        return Err(Error::invalid_input(format!(
+            "fragment {fragment_id} is both rewritten and repacked by this compaction; \
+             a plan may put a fragment in one kind of task only"
+        )));
+    }
+    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, remap_options, options)).await?;
+    metrics += repack::commit_repacked_files(dataset, repacks, options).await?;
+    Ok(metrics)
+}
+
+async fn commit_rewrites(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
     remap_options: Arc<dyn IndexRemapperOptions>,
@@ -3750,6 +4365,7 @@ mod tests {
 
     mod binary_copy;
     mod concurrent_reindex;
+    mod repack;
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::WriteDestination;
@@ -10400,18 +11016,95 @@ mod tests {
         assert!(checked > 0, "expected to check at least one stored vector");
     }
 
-    /// Build an `id` + `vec` dataset, create the given IVF vector index,
-    /// optionally delete rows, then run deferred compaction (which materializes
-    /// the deletions into the fragment-reuse index) and assert that KNN over
-    /// surviving vectors during the FRI window (a) never returns a deleted row
-    /// and (b) stays consistent with the pre-compaction answer.
-    ///
-    /// The deletion path is the interesting one: materialized deletions drop
-    /// rows from the quantization storage at load time, which shifts storage
-    /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
-    /// fine, but the HNSW graph addresses storage positionally and is not
-    /// frag-reuse aware, so a desync would surface here as recall collapse or a
-    /// resurrected/again-deleted row.
+    /// A column repack moves no row, so a vector index over the repacked
+    /// column keeps its uuid and coverage and answers the same.
+    #[tokio::test]
+    async fn repack_columns_preserves_vector_index() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float32Type, Int32Type};
+        use lance_datagen::Dimension;
+
+        const DIM: u32 = 32;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(256))
+            .await
+            .unwrap();
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            small_ivf(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let before = dataset
+            .load_index_by_name("vec_idx")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A query taken from a real row, and its answer before the rewrite.
+        let query = {
+            let mut scanner = dataset.scan();
+            scanner.project(&["vec"]).unwrap();
+            scanner.limit(Some(1), None).unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            batch["vec"]
+                .as_fixed_size_list()
+                .value(0)
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec()
+        };
+        let knn_before = vector_knn_ids(&dataset, &query, 5).await;
+
+        repack_columns(&mut dataset, vec![vec!["vec".into()]]).await;
+        for fragment in dataset.get_fragments() {
+            assert_eq!(fragment.metadata().files.len(), 2, "vec is split out");
+        }
+
+        let after = dataset
+            .load_index_by_name("vec_idx")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.uuid, before.uuid, "index must not be rebuilt");
+        assert_eq!(
+            after.fragment_bitmap, before.fragment_bitmap,
+            "index coverage must be unchanged"
+        );
+        assert_eq!(
+            vector_knn_ids(&dataset, &query, 5).await,
+            knn_before,
+            "search must return the same rows"
+        );
+        let qa = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &qa, 5).unwrap();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfPartition"),
+            "the search uses the index: {plan}"
+        );
+        dataset.validate().await.unwrap();
+    }
+
     /// Top-k `id`s for a KNN query against the `vec` column.
     async fn vector_knn_ids(dataset: &Dataset, query: &[f32], k: usize) -> Vec<i32> {
         use arrow_array::cast::AsArray;
@@ -10434,6 +11127,18 @@ mod tests {
         ids
     }
 
+    /// Build an `id` + `vec` dataset, create the given IVF vector index,
+    /// optionally delete rows, then run deferred compaction (which materializes
+    /// the deletions into the fragment-reuse index) and assert that KNN over
+    /// surviving vectors during the FRI window (a) never returns a deleted row
+    /// and (b) stays consistent with the pre-compaction answer.
+    ///
+    /// The deletion path is the interesting one: materialized deletions drop
+    /// rows from the quantization storage at load time, which shifts storage
+    /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
+    /// fine, but the HNSW graph addresses storage positionally and is not
+    /// frag-reuse aware, so a desync would surface here as recall collapse or a
+    /// resurrected/again-deleted row.
     async fn check_vector_defer_compaction(
         params: VectorIndexParams,
         delete_predicate: Option<&str>,
@@ -13625,5 +14330,288 @@ mod tests {
                 .num_deleted_rows,
             Some(4)
         );
+    }
+
+    /// Three-column dataset in two 10-row fragments, all columns in one file.
+    async fn column_group_dataset() -> (Dataset, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values((0..20).map(|v| v * 10))),
+                Arc::new(Int32Array::from_iter_values((0..20).map(|v| v * 100))),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let before = dataset.scan().try_into_batch().await.unwrap();
+        (dataset, before)
+    }
+
+    #[tokio::test]
+    async fn compaction_column_groups_write_one_file_per_group() {
+        let (mut dataset, before) = column_group_dataset().await;
+
+        // Merge the two small fragments; column_groups splits the output columns
+        // into their own files: {a} unclaimed, then {b} and {c}.
+        let options = CompactionOptions {
+            column_groups: vec![vec!["b".into()], vec!["c".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1, "the two fragments merged into one");
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![vec![0], vec![1], vec![2]],
+            "one data file per column group"
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_column_groups_ignore_unknown_column() {
+        // A configured group can outlive the column it names (drop_columns and
+        // renames leave the config as it is), so the name is skipped and the
+        // rest of the groups still apply.
+        let (mut dataset, before) = column_group_dataset().await;
+        let options = CompactionOptions {
+            column_groups: vec![vec!["nonexistent".into(), "c".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(groups, vec![vec![0, 1], vec![2]]);
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn compaction_column_groups_ignore_byte_limit() {
+        let (mut dataset, before) = column_group_dataset().await;
+        // A tiny byte cap plus groups of different widths ({b,c} vs {a}) would,
+        // if honored, roll the wider group into more files and leave the groups
+        // misaligned. column_groups splits by planned row counts only, so the
+        // compaction succeeds and still yields one file per group.
+        let options = CompactionOptions {
+            column_groups: vec![vec!["b".into(), "c".into()]],
+            max_bytes_per_file: Some(64),
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1, "the two fragments merged into one");
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![vec![0], vec![1, 2]],
+            "one file for {{a}}, one for the {{b, c}} group"
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_column_groups_preserve_scalar_index() {
+        let (mut dataset, before) = column_group_dataset().await;
+        // ZoneMap is the scalar index that writes an index seed, so it actually
+        // drives the seed-routing loop in `write_column_group_fragments` (BTree
+        // writes no seed and would leave that path untested).
+        // ZoneMap only writes an index seed when `use_seeds` is enabled (for a
+        // fixed-width column it defaults off), and the seed is what drives the
+        // routing loop in `write_column_group_fragments`.
+        let index_params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::ZoneMap,
+                Some("a_idx".into()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        // Split the indexed column into its own file group: its seed must be
+        // routed to the group holding "a" (a miss would trip the
+        // `Error::internal` guard and fail the compaction).
+        let options = CompactionOptions {
+            column_groups: vec![vec!["a".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        // The grouped write ran the seed-routing loop (ZoneMap writes a seed,
+        // unlike BTree) and produced the requested split without corrupting the
+        // index metadata or the values.
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1, "the two fragments merged into one");
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![vec![0], vec![1, 2]],
+            "\"a\" split into its own file, {{b, c}} in another"
+        );
+        assert!(
+            dataset.load_index_by_name("a_idx").await.unwrap().is_some(),
+            "the ZoneMap index survives compaction"
+        );
+        let filtered = dataset
+            .scan()
+            .filter("a >= 15")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 5, "a >= 15 matches five rows (15..20)");
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    /// Run only the column repacks `column_groups` calls for.
+    async fn repack_columns(dataset: &mut Dataset, column_groups: Vec<Vec<String>>) {
+        let options = CompactionOptions {
+            column_groups,
+            scope: CompactionScope::RepackColumns,
+            ..Default::default()
+        };
+        compact_files(dataset, options, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn column_groups_preserve_repacked_split_across_compaction() {
+        let (mut dataset, before) = column_group_dataset().await;
+        // Split column c into its own file per fragment.
+        repack_columns(&mut dataset, vec![vec!["c".into()]]).await;
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment.metadata().files.len(),
+                2,
+                "c is split into its own file"
+            );
+        }
+        // Vertical compaction with a matching group keeps c split instead of
+        // folding it back into one file — the feature's core promise.
+        let options = CompactionOptions {
+            column_groups: vec![vec!["c".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1, "the two fragments merged");
+        let mut groups: Vec<Vec<i32>> = fragments[0]
+            .metadata()
+            .files
+            .iter()
+            .map(|file| file.fields.to_vec())
+            .collect();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec![vec![0, 1], vec![2]],
+            "layout stays split: {{a, b}} and {{c}}"
+        );
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+        dataset.validate().await.unwrap();
+    }
+
+    #[test]
+    fn compaction_column_groups_parse_from_config() {
+        let config = std::collections::HashMap::from([(
+            "lance.compaction.column_groups".to_string(),
+            "b, c ; d".to_string(),
+        )]);
+        let options = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(
+            options.column_groups,
+            vec![
+                vec!["b".to_string(), "c".to_string()],
+                vec!["d".to_string()]
+            ],
+            "';' splits groups, ',' splits columns, whitespace trimmed"
+        );
+    }
+
+    #[test]
+    fn compaction_column_groups_validate_rejects_duplicate() {
+        let mut options = CompactionOptions {
+            column_groups: vec![vec!["b".into()], vec!["b".into()]],
+            ..Default::default()
+        };
+        let err = options.validate().unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    }
+
+    /// `rewrite_files` builds its group schemas without `validate()` (a custom
+    /// planner or a hand-built `CompactionTask`), so the duplicate check has to
+    /// hold there too.
+    #[test]
+    fn column_group_schemas_reject_duplicate() {
+        let schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let err = column_group_schemas(&schema, &[vec!["b".into()], vec!["b".into()]]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn compaction_column_groups_validate_rejects_force_binary_copy() {
+        let mut options = CompactionOptions {
+            column_groups: vec![vec!["b".into()]],
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        };
+        let err = options.validate().unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("ForceBinaryCopy"), "{err}");
     }
 }

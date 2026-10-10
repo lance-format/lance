@@ -220,6 +220,7 @@ async fn replace_column(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,

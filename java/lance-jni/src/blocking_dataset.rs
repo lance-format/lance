@@ -10,9 +10,9 @@ use crate::namespace::{
 use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
-    build_compaction_options, extract_base_store_params, extract_storage_options,
-    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
-    to_rust_map,
+    apply_repack_options, build_compaction_options, extract_base_store_params,
+    extract_storage_options, extract_write_params, get_scalar_index_params,
+    get_vector_index_params, to_java_map, to_rust_map,
 };
 use crate::{block_on, traits::IntoJava};
 use arrow::array::RecordBatchReader;
@@ -1965,6 +1965,86 @@ fn inner_get_fragment_statistics<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetColumnLayoutStatistics<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_column_layout_statistics(&mut env, jdataset))
+}
+
+/// `Dataset::column_layout_stats` as parallel Java arrays.
+fn inner_get_column_layout_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let stats = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.column_layout_stats()
+    };
+    let to_int = |value: usize| {
+        i32::try_from(value)
+            .map_err(|_| Error::runtime_error(format!("{value} does not fit in a Java int")))
+    };
+    let len = to_int(stats.len())?;
+    let fragment_ids: Vec<i64> = stats.iter().map(|s| s.fragment_id as i64).collect();
+    let live_file_counts = stats
+        .iter()
+        .map(|s| to_int(s.live_file_count))
+        .collect::<Result<Vec<_>>>()?;
+    let ratios: Vec<f64> = stats.iter().map(|s| s.tombstoned_field_ratio).collect();
+    let overlay_counts = stats
+        .iter()
+        .map(|s| to_int(s.overlay_count))
+        .collect::<Result<Vec<_>>>()?;
+
+    let jfragment_ids = env.new_long_array(len)?;
+    let jlive_file_counts = env.new_int_array(len)?;
+    let jratios = env.new_double_array(len)?;
+    let joverlay_counts = env.new_int_array(len)?;
+    env.set_long_array_region(&jfragment_ids, 0, &fragment_ids)?;
+    env.set_int_array_region(&jlive_file_counts, 0, &live_file_counts)?;
+    env.set_double_array_region(&jratios, 0, &ratios)?;
+    env.set_int_array_region(&joverlay_counts, 0, &overlay_counts)?;
+
+    let jfile_sizes = env.new_object_array(len, "[J", JObject::null())?;
+    let jfields_per_file = env.new_object_array(len, "[I", JObject::null())?;
+    for (index, s) in stats.iter().enumerate() {
+        let sizes: Vec<i64> = s
+            .file_sizes
+            .iter()
+            .map(|size| size.map_or(-1, |size| size as i64))
+            .collect();
+        let fields = s
+            .fields_per_file
+            .iter()
+            .map(|count| to_int(*count))
+            .collect::<Result<Vec<_>>>()?;
+        let jsizes = env.new_long_array(to_int(sizes.len())?)?;
+        env.set_long_array_region(&jsizes, 0, &sizes)?;
+        env.set_object_array_element(&jfile_sizes, index as i32, &jsizes)?;
+        env.delete_local_ref(jsizes)?;
+        let jfields = env.new_int_array(to_int(fields.len())?)?;
+        env.set_int_array_region(&jfields, 0, &fields)?;
+        env.set_object_array_element(&jfields_per_file, index as i32, &jfields)?;
+        env.delete_local_ref(jfields)?;
+    }
+
+    Ok(env.new_object(
+        "org/lance/ColumnLayoutStatistics",
+        "([J[I[[J[[I[D[I)V",
+        &[
+            JValue::Object(&jfragment_ids),
+            JValue::Object(&jlive_file_counts),
+            JValue::Object(&jfile_sizes),
+            JValue::Object(&jfields_per_file),
+            JValue::Object(&jratios),
+            JValue::Object(&joverlay_counts),
+        ],
+    )?)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_getFragmentNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
@@ -3628,7 +3708,22 @@ fn convert_java_compaction_options_to_rust(
         )?
         .l()?;
 
-    build_compaction_options(
+    let max_data_files_per_fragment = env
+        .call_method(
+            &java_options,
+            "getMaxDataFilesPerFragment",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let column_groups = env
+        .call_method(&java_options, "getColumnGroups", "()Ljava/util/List;", &[])?
+        .l()?;
+    let scope = env
+        .call_method(&java_options, "getScope", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    let mut options = build_compaction_options(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,
@@ -3646,7 +3741,15 @@ fn convert_java_compaction_options_to_rust(
         &excluded_fragment_ids,
         &data_storage_version,
         config,
-    )
+    )?;
+    apply_repack_options(
+        env,
+        &mut options,
+        &max_data_files_per_fragment,
+        &column_groups,
+        &scope,
+    )?;
+    Ok(options)
 }
 
 #[unsafe(no_mangle)]

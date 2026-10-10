@@ -208,14 +208,18 @@ fn may_alter_nullability(operation: &Operation) -> bool {
 /// Whether `operation` can commit rows that falsify such a change: by writing
 /// a null into a scanned field, or by omitting a required column entirely (a
 /// stale append's fragments read as null for columns they predate). `Delete`
-/// only removes rows and `Rewrite` preserves the values it moves; `Project`
-/// already conflicts with projections and merges elsewhere.
+/// only removes rows, and `Rewrite` and a `DataReplacement` without
+/// `data_change` preserve the values they move; `Project` already conflicts
+/// with projections and merges elsewhere.
 fn supplies_values(operation: &Operation) -> bool {
     matches!(
         operation,
         Operation::Append { .. }
             | Operation::Update { .. }
-            | Operation::DataReplacement { .. }
+            | Operation::DataReplacement {
+                data_change: true,
+                ..
+            }
             | Operation::DataOverlay { .. }
     )
 }
@@ -387,7 +391,7 @@ impl<'a> TransactionRebase<'a> {
                     staged_replay: false,
                 })
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 let modified_fragment_ids =
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
@@ -491,6 +495,19 @@ impl<'a> TransactionRebase<'a> {
         )
     }
 
+    /// Whether this transaction is a replacement whose values only moved
+    /// (compaction). Losing its target to a concurrent drop or delete costs
+    /// nothing a fresh plan cannot redo, so it retries rather than fails.
+    fn only_moves_values(&self) -> bool {
+        matches!(
+            self.transaction.operation,
+            Operation::DataReplacement {
+                data_change: false,
+                ..
+            }
+        )
+    }
+
     #[track_caller]
     fn data_replacement_target_removed_err(
         &self,
@@ -498,6 +515,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Error {
+        if self.only_moves_values() {
+            return self.retryable_conflict_err(other_transaction, other_version);
+        }
         Error::incompatible_transaction_source(
             format!(
                 "DataReplacement target fragment {} was removed by concurrent {} at version {}.",
@@ -515,6 +535,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Error {
+        if self.only_moves_values() {
+            return self.retryable_conflict_err(other_transaction, other_version);
+        }
         Error::incompatible_transaction_source(
             format!(
                 "DataReplacement target field {} in fragment {} was dropped by concurrent {} at version {}.",
@@ -1477,7 +1500,12 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
-                Operation::DataReplacement { replacements } => {
+                // Values that only moved to new files leave what the index
+                // was built from unchanged.
+                Operation::DataReplacement {
+                    data_change: false, ..
+                } => Ok(()),
+                Operation::DataReplacement { replacements, .. } => {
                     // A data replacement only conflicts if it is updating a field the
                     // index depends on -- whether keyed on or merely carried, since
                     // `fields` lists both (see `IndexMetadata::covering_fields`).
@@ -1656,7 +1684,7 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::DataReplacement { replacements } => {
+                Operation::DataReplacement { replacements, .. } => {
                     // These conflict if the rewrite touches any of the fragments being replaced.
                     for replacement in replacements {
                         for group in groups {
@@ -1902,7 +1930,7 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if let Operation::DataReplacement { replacements } = &self.transaction.operation {
+        if let Operation::DataReplacement { replacements, .. } = &self.transaction.operation {
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
@@ -2001,6 +2029,12 @@ impl<'a> TransactionRebase<'a> {
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
                     // this would introduce fragment bitmaps with holes which may not be well tested
                     // yet.  For now, we don't allow this case.
+                    //
+                    // Values that only moved still match what the index was
+                    // built from, so those never conflict.
+                    if self.only_moves_values() {
+                        return Ok(());
+                    }
                     let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
@@ -2033,6 +2067,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::DataReplacement {
                     replacements: other_replacements,
+                    ..
                 } => {
                     // These conflict if there is overlap in fragment id && fields.
                     for replacement in replacements {
@@ -4755,6 +4790,7 @@ mod tests {
                         1,
                         DataFile::new_legacy_from_fields("r.lance", vec![0], None),
                     )],
+                    data_change: true,
                 },
                 Compatible,
             ),
@@ -5163,6 +5199,7 @@ mod tests {
                 "replacement",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, file())],
+                    data_change: true,
                 },
             ),
             (
@@ -6407,11 +6444,38 @@ mod tests {
                     .map(|f| f.id)
                     .chain(removed_fragment_ids.iter().copied()),
             ),
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 Box::new(replacements.iter().map(|r| r.0))
             }
             Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
             Operation::Unknown { .. } => unimplemented!("modified_fragment_ids for {operation}"),
+        }
+    }
+
+    /// A schema with fields 0, 2, and 3: field 1 was dropped.
+    fn project_schema_without_field_1() -> lance_core::datatypes::Schema {
+        let arrow_schema = Schema::new(
+            ["a", "b", "c", "d"]
+                .map(|name| Field::new(name, DataType::Int32, true))
+                .to_vec(),
+        );
+        let schema = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
+        schema.project_by_ids(&[0, 2, 3], true)
+    }
+
+    fn index_on_fields(fields: Vec<i32>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "idx".to_string(),
+            fields,
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
         }
     }
 
@@ -6434,9 +6498,11 @@ mod tests {
                 "Different fragments",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(1, data_file_frag1_fields01)],
+                    data_change: true,
                 },
                 Compatible,
             ),
@@ -6444,9 +6510,11 @@ mod tests {
                 "Same fragment, different fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields23)],
+                    data_change: true,
                 },
                 Compatible,
             ),
@@ -6454,9 +6522,11 @@ mod tests {
                 "Same fragment, same fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Retryable,
             ),
@@ -6464,12 +6534,14 @@ mod tests {
                 "Same fragment, overlapping fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(
                         0,
                         DataFile::new_legacy_from_fields("path0_12", vec![1, 2], None),
                     )],
+                    data_change: true,
                 },
                 Retryable,
             ),
@@ -6477,6 +6549,7 @@ mod tests {
                 "DataReplacement vs Rewrite on same fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -6492,6 +6565,7 @@ mod tests {
                 "DataReplacement vs Rewrite on different fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -6510,6 +6584,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) on a different field",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -6529,6 +6604,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) with inserts on a different field",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -6547,6 +6623,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) that rewrote one of our fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -6565,6 +6642,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteRows) that moved our rows",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -6583,6 +6661,7 @@ mod tests {
                 "DataReplacement vs Update that removed our fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Update {
                     updated_fragments: vec![],
@@ -6601,6 +6680,7 @@ mod tests {
                 "DataReplacement vs Update (RewriteRows) that moved a different fragment's rows",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(1)],
@@ -6619,6 +6699,7 @@ mod tests {
                 "DataReplacement vs Delete (deletion-vector only) on same fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Delete {
                     deleted_fragment_ids: vec![],
@@ -6631,6 +6712,7 @@ mod tests {
                 "DataReplacement vs Delete that removes the fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Delete {
                     deleted_fragment_ids: vec![0],
@@ -6643,7 +6725,8 @@ mod tests {
             (
                 "DataReplacement vs Merge",
                 Operation::DataReplacement {
-                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
                 },
                 Operation::Merge {
                     fragments: vec![Fragment::new(0)],
@@ -6684,6 +6767,129 @@ mod tests {
                         0,
                         DataFile::new_legacy_from_fields("path0_3", vec![3], None),
                     )],
+                    data_change: true,
+                },
+                Retryable,
+            ),
+            // A replacement whose values only moved (compaction) retries where
+            // a data-changing one fails, and never conflicts with an index.
+            (
+                "Moved DataReplacement vs Delete that removes the fragment",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::Delete {
+                    deleted_fragment_ids: vec![0],
+                    updated_fragments: vec![],
+                    predicate: "a > 0".to_string(),
+                },
+                Retryable,
+            ),
+            (
+                "Moved DataReplacement vs Project that dropped one of its fields",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::Project {
+                    schema: project_schema_without_field_1(),
+                    preserves_nullability: true,
+                },
+                Retryable,
+            ),
+            (
+                "DataReplacement vs Project that dropped one of its fields",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: true,
+                },
+                Operation::Project {
+                    schema: project_schema_without_field_1(),
+                    preserves_nullability: true,
+                },
+                NotCompatible,
+            ),
+            (
+                "Moved DataReplacement vs CreateIndex on one of its fields",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::CreateIndex {
+                    new_indices: vec![index_on_fields(vec![1])],
+                    removed_indices: vec![],
+                },
+                Compatible,
+            ),
+            (
+                // op1 is CreateIndex for the same reason as the case above.
+                "CreateIndex on a field vs moved DataReplacement of that field",
+                Operation::CreateIndex {
+                    new_indices: vec![index_on_fields(vec![1])],
+                    removed_indices: vec![],
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Compatible,
+            ),
+            // A moved replacement still retries against anything that wrote
+            // new values into a field it moves: committed over them, it would
+            // publish the values it read before they changed.
+            (
+                "Moved DataReplacement vs DataReplacement of an overlapping field",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("path0_1", vec![1], None),
+                    )],
+                    data_change: true,
+                },
+                Retryable,
+            ),
+            (
+                "Moved DataReplacement vs Update (RewriteColumns) that rewrote one of its fields",
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    data_change: false,
+                },
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![1],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Retryable,
+            ),
+            (
+                // op1 is the Update: committed after the move, it would put
+                // back the fragment's files as it read them.
+                "Update (RewriteColumns) of a field vs moved DataReplacement of that field",
+                Operation::Update {
+                    updated_fragments: vec![Fragment::new(0)],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![1],
+                    compacted_sstables: Vec::new(),
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    data_change: false,
                 },
                 Retryable,
             ),

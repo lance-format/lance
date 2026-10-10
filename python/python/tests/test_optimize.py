@@ -157,6 +157,153 @@ def test_compact_files_max_source_fragments(tmp_path: Path):
     assert len(dataset.get_fragments()) == 7
 
 
+def _backfilled(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(8), "b": range(8)}),
+        tmp_path / "dataset",
+        max_rows_per_file=4,
+    )
+    dataset.add_columns({"c": "a + 1"})
+    dataset.add_columns({"d": "a + 2"})
+    return dataset
+
+
+def _files_per_fragment(dataset):
+    return [len(fragment.metadata.files) for fragment in dataset.get_fragments()]
+
+
+def test_compact_files_repacks_columns(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+    assert _files_per_fragment(dataset) == [3, 3]
+    stats = dataset.stats.column_layout_stats()
+    assert [s["fragment_id"] for s in stats] == [0, 1]
+    for s in stats:
+        assert s["live_file_count"] == 3
+        assert s["fields_per_file"] == [2, 1, 1]
+        assert all(size is not None for size in s["file_sizes"])
+        assert s["tombstoned_field_ratio"] == 0.0
+        assert s["overlay_count"] == 0
+
+    metrics = dataset.optimize.compact_files(
+        max_data_files_per_fragment=1, scope="repack_columns"
+    )
+
+    assert metrics.files_added == 2
+    assert metrics.fragments_added == 0
+    assert _files_per_fragment(dataset) == [1, 1]
+    stats = dataset.stats.column_layout_stats()
+    assert [s["live_file_count"] for s in stats] == [1, 1]
+    assert [s["fields_per_file"] for s in stats] == [[4], [4]]
+    assert dataset.to_table() == expected
+    assert [f.fragment_id for f in dataset.get_fragments()] == [0, 1]
+
+
+def test_distributed_repack(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+
+    # c and d sit in separate files, so the group moves them into one.
+    plan = Compaction.plan(
+        dataset, options=dict(column_groups=[["c", "d"]], scope="repack_columns")
+    )
+    assert [task.kind for task in plan.tasks] == ["repack_columns"] * 2
+    results = [
+        pickle.loads(pickle.dumps(pickle.loads(pickle.dumps(task)).execute(dataset)))
+        for task in plan.tasks
+    ]
+    Compaction.commit(dataset, results)
+
+    dataset = lance.dataset(dataset.uri)
+    assert _files_per_fragment(dataset) == [2, 2]
+    assert dataset.to_table() == expected
+
+
+@pytest.mark.parametrize(
+    "config, files",
+    [
+        ({"lance.compaction.max_data_files_per_fragment": "1"}, [1, 1]),
+        # c and d sit in separate files; the group moves them into one.
+        ({"lance.compaction.column_groups": "c, d"}, [2, 2]),
+    ],
+)
+def test_repack_options_come_from_dataset_config(tmp_path: Path, config, files):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+    dataset.update_config(config)
+
+    dataset.optimize.compact_files(scope="repack_columns")
+
+    assert _files_per_fragment(dataset) == files
+    assert dataset.to_table() == expected
+
+
+def test_repack_options_override_dataset_config(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    dataset.update_config({"lance.compaction.max_data_files_per_fragment": "2"})
+
+    dataset.optimize.compact_files(
+        max_data_files_per_fragment=1, scope="repack_columns"
+    )
+
+    assert _files_per_fragment(dataset) == [1, 1]
+
+
+def test_repack_rejects_bad_options(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    with pytest.raises(ValueError, match="Invalid compaction scope"):
+        dataset.optimize.compact_files(scope="nonsense")
+
+    dataset.update_config({"lance.compaction.max_data_files_per_fragment": "lots"})
+    with pytest.raises(ValueError, match="expected a positive integer"):
+        dataset.optimize.compact_files(scope="repack_columns")
+
+
+def test_compact_files_repacks_column_groups(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+
+    # c and d sit in separate files; the group moves them into one.
+    dataset.optimize.compact_files(column_groups=[["c", "d"]], scope="repack_columns")
+
+    assert _files_per_fragment(dataset) == [2, 2]
+    assert dataset.to_table() == expected
+
+
+def test_repack_keeps_vector_index(tmp_path: Path):
+    rows, dim = 512, 16
+    vectors = np.random.default_rng(0).standard_normal((rows, dim)).astype(np.float32)
+    table = vec_to_table(vectors).append_column("id", pa.array(range(rows)))
+    dataset = lance.write_dataset(table, tmp_path / "dataset")
+    dataset.add_columns({"tag": "id * 2"})
+    dataset.create_index("vector", "IVF_PQ", num_partitions=4, num_sub_vectors=4)
+    assert _files_per_fragment(dataset) == [2]
+    nearest = {"column": "vector", "q": vectors[123], "k": 10}
+
+    def segments(dataset):
+        return [
+            (segment.uuid, sorted(segment.fragment_ids))
+            for index in dataset.describe_indices()
+            for segment in index.segments
+        ]
+
+    before = segments(dataset)
+    assert len(before) == 1 and before[0][1] == [0]
+    ids = dataset.to_table(nearest=nearest)["id"].to_pylist()
+    addrs = dataset.to_table(columns=["id"], with_row_address=True)
+
+    # Merges the vector column's file with the backfilled one.
+    dataset.optimize.compact_files(
+        max_data_files_per_fragment=1, scope="repack_columns"
+    )
+
+    assert _files_per_fragment(dataset) == [1]
+    assert segments(dataset) == before
+    assert dataset.to_table(nearest=nearest)["id"].to_pylist() == ids
+    assert dataset.to_table(columns=["id"], with_row_address=True) == addrs
+    assert "ANNIvfPartition" in dataset.scanner(nearest=nearest).explain_plan(True)
+
+
 def test_blob_compaction(tmp_path: Path):
     base_dir = tmp_path / "blob_dataset"
     blob_field = pa.field(

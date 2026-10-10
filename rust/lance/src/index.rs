@@ -14829,6 +14829,7 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                kind: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -14943,9 +14944,9 @@ mod tests {
         // fragment 2 when the remap is missing, which would leave this nothing
         // to ask about and hide whether the guard is sensitive on its own.
         let plan = CompactionPlan {
-            tasks: vec![TaskData {
-                fragments: dataset.fragments().as_ref().clone(),
-            }],
+            tasks: vec![TaskData::rewrite_fragments(
+                dataset.fragments().as_ref().clone(),
+            )],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
         };

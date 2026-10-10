@@ -14,6 +14,7 @@
 package org.lance.compaction;
 
 import org.lance.FragmentMetadata;
+import org.lance.fragment.DataFile;
 
 import javax.annotation.Nullable;
 
@@ -25,6 +26,10 @@ import java.util.List;
  * committed later.
  */
 public class RewriteResult implements Serializable {
+  // Pinned to the UID generated before the repack fields were added, so that results produced by
+  // older workers still deserialize during a rolling upgrade.
+  private static final long serialVersionUID = 4501818269828675274L;
+
   private final CompactionMetrics metrics;
   private final List<FragmentMetadata> newFragments;
   private final List<FragmentMetadata> originalFragments;
@@ -34,17 +39,54 @@ public class RewriteResult implements Serializable {
   // null for stable row IDs.
   @Nullable private final byte[] rowAddrs;
 
+  // Set only for a column repack: the fragment it repacked and the data files it wrote.
+  @Nullable private final Long repackedFragmentId;
+  @Nullable private final List<DataFile> repackedFiles;
+
   public RewriteResult(
       CompactionMetrics metrics,
       List<FragmentMetadata> newFragments,
       List<FragmentMetadata> originalFragments,
       long readVersion,
       byte[] rowAddrs) {
+    this(metrics, newFragments, originalFragments, readVersion, rowAddrs, null, null);
+  }
+
+  public RewriteResult(
+      CompactionMetrics metrics,
+      List<FragmentMetadata> newFragments,
+      List<FragmentMetadata> originalFragments,
+      long readVersion,
+      byte[] rowAddrs,
+      @Nullable Long repackedFragmentId,
+      @Nullable List<DataFile> repackedFiles) {
     this.metrics = metrics;
     this.newFragments = newFragments;
     this.originalFragments = originalFragments;
     this.readVersion = readVersion;
     this.rowAddrs = rowAddrs;
+    this.repackedFragmentId = repackedFragmentId;
+    this.repackedFiles = repackedFiles;
+  }
+
+  /**
+   * The fragment a column repack wrote new data files for.
+   *
+   * @return null for the result of a fragment rewrite
+   */
+  @Nullable
+  public Long getRepackedFragmentId() {
+    return repackedFragmentId;
+  }
+
+  /**
+   * The data files a column repack wrote, empty when the fragment had no rows to write.
+   *
+   * @return null for the result of a fragment rewrite
+   */
+  @Nullable
+  public List<DataFile> getRepackedFiles() {
+    return repackedFiles;
   }
 
   public long getReadVersion() {
