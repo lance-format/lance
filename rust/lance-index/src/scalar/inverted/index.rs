@@ -2233,10 +2233,8 @@ impl InvertedPartition {
             tokens_by_position[term.term_index as usize] = term.token.clone();
         }
 
-        let docs_for_wand = self.docs.docs_for_wand(mask.as_ref()).await?;
         let candidates = self
             .bm25_search_v3_blocks(
-                docs_for_wand.as_ref(),
                 params,
                 operator,
                 mask,
@@ -2340,7 +2338,6 @@ impl InvertedPartition {
     #[allow(clippy::too_many_arguments)]
     async fn bm25_search_v3_blocks(
         &self,
-        docs: &DocSet,
         params: &FtsSearchParams,
         operator: Operator,
         mask: Arc<RowAddrMask>,
@@ -2360,7 +2357,13 @@ impl InvertedPartition {
             operator
         };
         let mut windows = block_wand::search_windows(&term_plans, candidate_operator);
+        let total_blocks = term_plans
+            .iter()
+            .unique_by(|term| term.token_id)
+            .map(|term| term.blocks.len())
+            .sum::<usize>();
         if windows.is_empty() {
+            metrics.record_fts_blocks_pruned(total_blocks);
             return Ok(Vec::new());
         }
         windows.sort_unstable_by(|left, right| {
@@ -2371,6 +2374,7 @@ impl InvertedPartition {
                 .then_with(|| left.last_doc_id.cmp(&right.last_doc_id))
         });
 
+        let docs = self.docs.docs_for_wand(mask.as_ref()).await?;
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let docs_has_row_ids = docs.has_row_ids();
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
@@ -2552,11 +2556,7 @@ impl InvertedPartition {
             }
         }
         metrics.record_comparisons(num_comparisons);
-        let all_rows = term_plans
-            .iter()
-            .flat_map(|term| term.block_start..term.block_start + term.blocks.len())
-            .collect::<HashSet<_>>();
-        metrics.record_fts_blocks_pruned(all_rows.len().saturating_sub(visited_blocks.len()));
+        metrics.record_fts_blocks_pruned(total_blocks.saturating_sub(visited_blocks.len()));
 
         Ok(candidates
             .into_iter()
