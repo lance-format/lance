@@ -41,7 +41,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
+use super::{AnyQuery, IndexFile, IndexStore, LookupMatches, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
     btree::{OrderableScalarValue, filter_keeps_nothing},
@@ -1084,6 +1084,62 @@ impl ScalarIndex for BitmapIndex {
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
         Ok(SearchResult::Exact(selection))
+    }
+
+    async fn lookup(
+        &self,
+        keys: &dyn Array,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<LookupMatches> {
+        if keys.data_type() != &self.value_type {
+            return Err(Error::invalid_input(format!(
+                "bitmap lookup keys have type {} but the index has type {}",
+                keys.data_type(),
+                self.value_type
+            )));
+        }
+        if u32::try_from(keys.len()).is_err() {
+            return Err(Error::invalid_input(format!(
+                "bitmap lookup takes at most {} keys per call, got {}",
+                u32::MAX,
+                keys.len()
+            )));
+        }
+        metrics.record_comparisons(keys.len());
+
+        // Group repeated keys so each bitmap is loaded once.
+        let mut key_positions: BTreeMap<OrderableScalarValue, Vec<u32>> = BTreeMap::new();
+        for idx in (0..keys.len()).filter(|idx| keys.is_valid(*idx)) {
+            let key = OrderableScalarValue(ScalarValue::try_from_array(keys, idx)?);
+            if self.index_map.contains_key(&key) {
+                key_positions.entry(key).or_default().push(idx as u32);
+            }
+        }
+
+        let matches: Vec<LookupMatches> = stream::iter(key_positions.into_iter().map(
+            |(key, positions)| async move {
+                let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+                let row_ids = bitmap
+                    .row_addrs()
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "bitmap for value {key} covers whole fragments, so its row ids cannot be listed"
+                        ))
+                    })?
+                    .map(u64::from)
+                    .collect::<Vec<_>>();
+                let key_indices = positions
+                    .iter()
+                    .flat_map(|&position| std::iter::repeat_n(position, row_ids.len()))
+                    .collect::<Vec<_>>();
+                let row_ids = row_ids.repeat(positions.len());
+                LookupMatches::new(key_indices.into(), row_ids.into())
+            },
+        ))
+        .buffer_unordered(get_num_compute_intensive_cpus())
+        .try_collect()
+        .await?;
+        Ok(LookupMatches::concat(matches))
     }
 
     fn can_remap(&self) -> bool {
@@ -3616,6 +3672,57 @@ mod tests {
         assert_eq!(
             streamed,
             vec![(None, frag_3(2)), (Some("a".to_string()), frag_3(0)),]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_lookup() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // Row id -> value: 10 -> null, 0/3 -> "a", 1 -> "b", 2 -> "c".
+        let batch = record_batch!(
+            (
+                "value",
+                Utf8,
+                [None, Some("a"), Some("a"), Some("b"), Some("c")]
+            ),
+            ("_rowid", UInt64, [10, 0, 3, 1, 2])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store, None, &cache).await.unwrap();
+
+        // Repeated, null (never matches the null row), and absent keys.
+        let keys = StringArray::from(vec![Some("a"), None, Some("c"), Some("z"), Some("a")]);
+        let matches = index.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
+        let mut pairs = matches
+            .key_indices
+            .values()
+            .iter()
+            .copied()
+            .zip(matches.row_ids.values().iter().copied())
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(0, 0), (0, 3), (2, 2), (4, 0), (4, 3)]);
+
+        let err = index
+            .lookup(&UInt64Array::from(vec![1]), &NoOpMetricsCollector)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bitmap lookup keys have type UInt64 but the index has type Utf8"),
+            "{err}"
         );
     }
 
