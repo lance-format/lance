@@ -1683,6 +1683,7 @@ def test_explain_cleanup_old_versions(tmp_path):
         older_than=(datetime.now() - moment),
         include_files=True,
         max_files=1000,
+        delete_concurrency=2,
     )
 
     assert explanation.read_version == dataset.version
@@ -1972,6 +1973,26 @@ def test_enable_disable_auto_cleanup(tmp_path):
     assert len(ds.versions()) == 7
 
 
+@pytest.mark.parametrize(
+    "method, value, error",
+    [
+        ("cleanup_old_versions", 0, OSError),
+        ("explain_cleanup_old_versions", 0, OSError),
+        ("cleanup_old_versions", 2**63 - 1, OSError),
+        ("cleanup_old_versions", -1, OverflowError),
+        ("cleanup_old_versions", 2**128, OverflowError),
+    ],
+)
+def test_cleanup_invalid_delete_concurrency(tmp_path, method, value, error):
+    dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+    with pytest.raises(error) as exc:
+        getattr(dataset, method)(delete_concurrency=value)
+    if error is OSError:
+        assert "delete_concurrency" in str(exc.value)
+        assert str(value) in str(exc.value)
+    assert len(dataset.versions()) == 1
+
+
 def test_cleanup_with_rate_limit(tmp_path):
     """Test that cleanup_old_versions works with delete_rate_limit parameter."""
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
@@ -1993,7 +2014,9 @@ def test_cleanup_with_rate_limit(tmp_path):
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+        older_than=(now - latest_version_timestamp),
+        delete_rate_limit=1,
+        delete_concurrency=2,
     )
     finished = time.time_ns()
 

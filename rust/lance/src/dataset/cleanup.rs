@@ -298,9 +298,16 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     Path::from_iter(relative_parts.unwrap())
 }
 
+#[derive(Debug)]
+struct DeleteExecution {
+    concurrency: usize,
+    permits: Option<tokio::sync::Semaphore>,
+    limiter: Option<tokio::sync::Mutex<tokio::time::Interval>>,
+}
+
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
-    delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
+    delete_execution: Arc<DeleteExecution>,
     dataset: &'a Dataset,
     policy: CleanupPolicy,
     action: CleanupAction,
@@ -433,7 +440,7 @@ impl<'a> CleanupOperation<'a> {
             CleanupAction::Explain {
                 max_candidate_files: self.max_candidate_files,
             },
-        );
+        )?;
         let read_version = cleanup.read_version;
         let result = cleanup.run().await?;
         let warnings = if result.candidate_files_truncated {
@@ -458,17 +465,15 @@ impl<'a> CleanupOperation<'a> {
     /// Execute cleanup by re-evaluating the current dataset state.
     pub async fn execute(&self) -> Result<RemovalStats> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
-        let cleanup = CleanupTask::new(self.dataset, self.policy.clone(), CleanupAction::Execute);
+        let cleanup = CleanupTask::new(self.dataset, self.policy.clone(), CleanupAction::Execute)?;
         Ok(cleanup.run().await?.stats)
     }
 }
 
 impl<'a> CleanupTask<'a> {
-    fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
+    fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Result<Self> {
         let track_removed_manifests = policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
-        let delete_limiter =
-            create_delete_limiter(policy.delete_rate_limit.filter(|_| action.deletes_files()));
         Self::new_with_ignored_manifests(
             dataset,
             policy,
@@ -476,21 +481,40 @@ impl<'a> CleanupTask<'a> {
             HashSet::new(),
             track_removed_manifests,
             include_referenced_branches,
-            delete_limiter,
+            None,
         )
     }
 
     fn new_with_ignored_manifests(
         dataset: &'a Dataset,
-        policy: CleanupPolicy,
+        mut policy: CleanupPolicy,
         action: CleanupAction,
         ignored_manifests: HashSet<Path>,
         track_removed_manifests: bool,
         include_referenced_branches: bool,
-        delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
-    ) -> Self {
-        Self {
-            delete_limiter,
+        delete_execution: Option<Arc<DeleteExecution>>,
+    ) -> Result<Self> {
+        let delete_execution = match delete_execution {
+            Some(execution) => execution,
+            None => {
+                let concurrency = policy
+                    .delete_concurrency
+                    .unwrap_or_else(|| dataset.object_store.io_parallelism());
+                policy.delete_concurrency = Some(concurrency);
+                policy.validate()?;
+                Arc::new(DeleteExecution {
+                    concurrency,
+                    permits: action
+                        .deletes_files()
+                        .then(|| tokio::sync::Semaphore::new(concurrency)),
+                    limiter: create_delete_limiter(
+                        policy.delete_rate_limit.filter(|_| action.deletes_files()),
+                    ),
+                })
+            }
+        };
+        Ok(Self {
+            delete_execution,
             dataset,
             policy,
             action,
@@ -498,7 +522,7 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
-        }
+        })
     }
 
     async fn run(self) -> Result<CleanupRunResult> {
@@ -1075,10 +1099,21 @@ impl<'a> CleanupTask<'a> {
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
             let store = &self.dataset.object_store;
+            let execution = &self.delete_execution;
             all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
-                    if let Some(limiter) = &self.delete_limiter {
+                    // Acquire concurrency before QPS so queued deletes cannot spend
+                    // rate permits early and then start together when a slot opens.
+                    let _permit = match &execution.permits {
+                        Some(permits) => Some(permits.acquire().await.map_err(|error| {
+                            Error::invalid_input(format!(
+                                "cleanup delete semaphore closed: {error}"
+                            ))
+                        })?),
+                        None => None,
+                    };
+                    if let Some(limiter) = &execution.limiter {
                         let mut ticker = limiter.lock().await;
                         ticker.tick().await;
                     }
@@ -1092,7 +1127,7 @@ impl<'a> CleanupTask<'a> {
                     };
                     Ok::<_, Error>((file, outcome))
                 })
-                .buffer_unordered(self.dataset.object_store.io_parallelism())
+                .buffer_unordered(execution.concurrency)
                 .try_for_each(|(file, outcome)| {
                     let mut result = cleanup_result.lock().unwrap();
                     match outcome {
@@ -1581,16 +1616,19 @@ impl<'a> CleanupTask<'a> {
                             .await?;
                         let ignored_manifests =
                             final_result.lock().unwrap().removed_manifests.clone();
-                        if let Some(policy) =
-                            build_cleanup_policy(&branch_dataset, branch_dataset.manifest.as_ref())
-                                .await?
+                        if let Some(policy) = build_cleanup_policy_inner(
+                            &branch_dataset,
+                            branch_dataset.manifest.as_ref(),
+                            true,
+                        )
+                        .await?
                         {
                             let result = cleanup_cascade_branch_run(
                                 &branch_dataset,
                                 policy,
                                 action,
                                 ignored_manifests,
-                                self.delete_limiter.clone(),
+                                Some(self.delete_execution.clone()),
                             )
                             .await?;
                             final_result
@@ -1917,13 +1955,11 @@ async fn expired_manifest_size(
     }
 }
 
-fn create_delete_limiter(
-    rate: Option<u64>,
-) -> Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>> {
+fn create_delete_limiter(rate: Option<u64>) -> Option<tokio::sync::Mutex<tokio::time::Interval>> {
     rate.map(|rate| {
         let mut ticker = interval(calculate_duration(rate));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        Arc::new(tokio::sync::Mutex::new(ticker))
+        tokio::sync::Mutex::new(ticker)
     })
 }
 
@@ -1965,9 +2001,27 @@ pub struct CleanupPolicy {
     /// The budget is shared by this cleanup and all cascaded branches, ignoring
     /// their own rate settings. `None` leaves the entire operation unthrottled.
     pub delete_rate_limit: Option<u64>,
+    /// Maximum in-flight file deletes shared by this cleanup and all cascaded branches.
+    /// Must be in `1..=tokio::sync::Semaphore::MAX_PERMITS`. `None` uses the initiating
+    /// dataset's object store I/O parallelism. Cascaded branches ignore their own
+    /// concurrency and rate settings, including invalid values. Independent cleanup
+    /// calls do not share limits. This does not limit listing or manifest reads.
+    pub delete_concurrency: Option<usize>,
 }
 
 impl CleanupPolicy {
+    fn validate(&self) -> Result<()> {
+        if let Some(value) = self.delete_concurrency
+            && !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&value)
+        {
+            return Err(Error::invalid_input(format!(
+                "delete_concurrency must be between 1 and {}, got {value}",
+                tokio::sync::Semaphore::MAX_PERMITS,
+            )));
+        }
+        Ok(())
+    }
+
     pub fn should_clean(&self, manifest: &Manifest) -> bool {
         let mut should_clean = true;
         if let Some(before_timestamp) = self.before_timestamp {
@@ -1993,6 +2047,7 @@ impl Default for CleanupPolicy {
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
             delete_rate_limit: None,
+            delete_concurrency: None,
         }
     }
 }
@@ -2092,6 +2147,24 @@ impl CleanupPolicyBuilder {
         Ok(self)
     }
 
+    /// Set the maximum in-flight file deletes shared with cascaded branches, independently of QPS.
+    ///
+    /// If unset, the initiating dataset's object store I/O parallelism is used.
+    /// Returns an invalid-input error outside `1..=tokio::sync::Semaphore::MAX_PERMITS`.
+    ///
+    /// ```
+    /// # use lance::dataset::cleanup::CleanupPolicyBuilder;
+    /// let policy = CleanupPolicyBuilder::default()
+    ///     .delete_concurrency(32)?
+    ///     .build();
+    /// # Ok::<(), lance::Error>(())
+    /// ```
+    pub fn delete_concurrency(mut self, delete_concurrency: usize) -> Result<Self> {
+        self.policy.delete_concurrency = Some(delete_concurrency);
+        self.policy.validate()?;
+        Ok(self)
+    }
+
     pub fn build(self) -> CleanupPolicy {
         self.policy
     }
@@ -2141,13 +2214,12 @@ pub async fn cleanup_cascade_branch(
     let Some(policy) = build_cleanup_policy(dataset, manifest).await? else {
         return Ok(None);
     };
-    let delete_limiter = create_delete_limiter(policy.delete_rate_limit);
     let result = cleanup_cascade_branch_run(
         dataset,
         policy,
         CleanupAction::Execute,
         HashSet::new(),
-        delete_limiter,
+        None,
     )
     .await?;
     Ok(Some(result.stats))
@@ -2158,7 +2230,7 @@ async fn cleanup_cascade_branch_run(
     mut policy: CleanupPolicy,
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
-    delete_limiter: Option<Arc<tokio::sync::Mutex<tokio::time::Interval>>>,
+    delete_execution: Option<Arc<DeleteExecution>>,
 ) -> Result<CleanupRunResult> {
     policy.clean_referenced_branches = false;
     policy.error_if_tagged_old_versions = false;
@@ -2172,8 +2244,8 @@ async fn cleanup_cascade_branch_run(
         ignored_manifests,
         true,
         false,
-        delete_limiter,
-    )
+        delete_execution,
+    )?
     .run()
     .await
 }
@@ -2181,6 +2253,14 @@ async fn cleanup_cascade_branch_run(
 pub async fn build_cleanup_policy(
     dataset: &Dataset,
     manifest: &Manifest,
+) -> Result<Option<CleanupPolicy>> {
+    build_cleanup_policy_inner(dataset, manifest, false).await
+}
+
+async fn build_cleanup_policy_inner(
+    dataset: &Dataset,
+    manifest: &Manifest,
+    cascade: bool,
 ) -> Result<Option<CleanupPolicy>> {
     if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
         let interval: u64 = match interval.parse() {
@@ -2248,7 +2328,9 @@ pub async fn build_cleanup_policy(
         builder = builder.clean_referenced_branches(clean_referenced);
     }
 
-    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+    if !cascade
+        && let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit")
+    {
         let rate: u64 = match delete_rate_limit.parse() {
             Ok(r) => r,
             Err(e) => {
@@ -2264,6 +2346,15 @@ pub async fn build_cleanup_policy(
             Ok(b) => b,
             Err(e) => return Err(e),
         };
+    }
+
+    if !cascade && let Some(value) = manifest.config.get("lance.auto_cleanup.delete_concurrency") {
+        let concurrency = value.parse::<usize>().map_err(|error| Error::Cleanup {
+            message: format!(
+                "Error encountered while parsing lance.auto_cleanup.delete_concurrency={value:?} as usize: {error}"
+            ),
+        })?;
+        builder = builder.delete_concurrency(concurrency)?;
     }
 
     Ok(Some(builder.build()))
@@ -2305,7 +2396,9 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::dataset::{InsertBuilder, WriteDestination};
     use crate::index::DatasetIndexExt;
+    use crate::utils::test::ThrottledStoreWrapper;
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
@@ -2329,8 +2422,315 @@ mod tests {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
+    use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case::default(None, None)]
+    #[case::serial(Some(1), None)]
+    #[case::override_default(Some(4), None)]
+    #[case::with_rate_limit(Some(4), Some(2))]
+    #[tokio::test]
+    async fn test_delete_concurrency(
+        #[case] concurrency: Option<usize>,
+        #[case] rate: Option<u64>,
+    ) {
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 2.into())
+        };
+        let delete_latency = Duration::from_secs(1);
+        let mut dataset = Dataset::write(
+            data(),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(ThrottledStoreWrapper {
+                        config: ThrottleConfig {
+                            wait_delete_per_call: delete_latency,
+                            ..Default::default()
+                        },
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.append(data(), None).await.unwrap();
+        dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute_stream(Box::new(data()) as Box<dyn RecordBatchReader + Send>)
+            .await
+            .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+        // A small store default exercises explicit windows both below and above it.
+        dataset.object_store = Arc::new(ObjectStore::new(
+            dataset.object_store.inner.clone(),
+            url::Url::parse("memory://").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            2,
+            0,
+            None,
+        ));
+        tokio::time::pause();
+        let policy = CleanupPolicy {
+            before_version: Some(dataset.version().version),
+            delete_concurrency: concurrency,
+            delete_rate_limit: rate,
+            delete_unverified: true,
+            ..Default::default()
+        };
+        let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
+        let window = concurrency.unwrap_or_else(|| dataset.object_store.io_parallelism());
+        let candidate_count = explanation.candidate_files.len();
+        if concurrency.is_some() {
+            assert!(candidate_count >= window);
+        }
+        let expected_duration = delete_latency * candidate_count.div_ceil(window) as u32;
+        let start = tokio::time::Instant::now();
+        let stats = dataset.cleanup_with_policy(policy).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(stats.old_versions, 2);
+        assert_eq!(stats.bytes_removed, explanation.stats.bytes_removed);
+        assert_eq!(
+            stats.data_files_removed,
+            explanation.stats.data_files_removed
+        );
+        assert!(stats.data_files_removed > 0);
+        assert_eq!(stats.failed_deletes, 0);
+        assert!(elapsed >= expected_duration);
+        if let Some(rate) = rate {
+            assert!(
+                elapsed
+                    >= Duration::from_secs_f64((candidate_count - 1) as f64 / rate as f64)
+                        + delete_latency
+            );
+        } else {
+            // Bound both sides of the expected batch duration so serial execution
+            // and an ignored override cannot pass. Allow timer rounding only.
+            assert!(elapsed < expected_duration + Duration::from_millis(50));
+        }
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::execute(false)]
+    #[case::explain(true)]
+    #[tokio::test]
+    async fn test_invalid_delete_concurrency(
+        #[case] explain: bool,
+        #[values(0, tokio::sync::Semaphore::MAX_PERMITS + 1)] value: usize,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let policy = CleanupPolicy {
+            delete_concurrency: Some(value),
+            ..Default::default()
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_requests",
+            Arc::new(move |_, _| {
+                request_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        let operation = dataset.cleanup(policy);
+        let error = if explain {
+            operation.explain().await.unwrap_err()
+        } else {
+            operation.execute().await.unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert_contains!(
+            error.to_string(),
+            "delete_concurrency must be between 1 and"
+        );
+        let error = CleanupPolicyBuilder::default()
+            .delete_concurrency(value)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert_contains!(error.to_string(), "delete_concurrency");
+        assert_contains!(error.to_string(), value.to_string());
+        assert_contains!(
+            error.to_string(),
+            tokio::sync::Semaphore::MAX_PERMITS.to_string()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[rstest]
+    #[case::unset(None, true)]
+    #[case::positive(Some("4"), true)]
+    #[case::zero(Some("0"), false)]
+    #[case::negative(Some("-1"), false)]
+    #[case::invalid(Some("abc"), false)]
+    #[case::overflow(Some("18446744073709551616"), false)]
+    #[case::above_semaphore_limit(Some("9223372036854775807"), false)]
+    #[tokio::test]
+    async fn test_auto_cleanup_delete_concurrency(
+        #[case] value: Option<&str>,
+        #[case] valid: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "0".into());
+        if let Some(value) = value {
+            manifest
+                .config
+                .insert("lance.auto_cleanup.delete_concurrency".into(), value.into());
+        }
+        let result = build_cleanup_policy(&dataset, &manifest).await;
+        if valid {
+            assert_eq!(
+                result.unwrap().unwrap().delete_concurrency,
+                value.map(|_| 4)
+            );
+        } else {
+            let error = result.unwrap_err();
+            let value = value.unwrap();
+            if value.parse::<usize>().is_err() {
+                assert!(matches!(error, Error::Cleanup { .. }));
+                assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
+                assert_contains!(error.to_string(), value);
+                assert_contains!(error.to_string(), "usize");
+            } else {
+                let Error::InvalidInput { source, .. } = error else {
+                    panic!("expected builder's InvalidInput, got {error}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    format!(
+                        "delete_concurrency must be between 1 and {}, got {value}",
+                        tokio::sync::Semaphore::MAX_PERMITS,
+                    )
+                );
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::serial(1, true, "64")]
+    #[case::parallel(2, true, "0")]
+    #[case::invalid_child(2, true, "invalid")]
+    #[case::disabled(2, false, "invalid")]
+    #[tokio::test]
+    async fn test_cascade_delete_concurrency(
+        #[case] concurrency: usize,
+        #[case] enabled: bool,
+        #[case] child_concurrency: &str,
+    ) {
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 2.into())
+        };
+        let mut parent = Dataset::write(
+            data(),
+            "memory://cleanup",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(ThrottledStoreWrapper {
+                        config: ThrottleConfig {
+                            wait_delete_per_call: Duration::from_secs(1),
+                            ..Default::default()
+                        },
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut children = Vec::new();
+        for name in ["first", "second"] {
+            let mut child = parent
+                .create_branch(name, (None, None), None)
+                .await
+                .unwrap();
+            let mut config = vec![
+                ("lance.auto_cleanup.retain_versions", "1"),
+                ("lance.auto_cleanup.delete_concurrency", child_concurrency),
+                ("lance.auto_cleanup.delete_rate_limit", "invalid"),
+            ];
+            if enabled {
+                config.push(("lance.auto_cleanup.interval", "1"));
+            }
+            child.update_config(config).await.unwrap();
+            for _ in 0..2 {
+                child = InsertBuilder::new(WriteDestination::Dataset(Arc::new(child)))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        max_rows_per_file: 2,
+                        skip_auto_cleanup: true,
+                        ..Default::default()
+                    })
+                    .execute_stream(Box::new(data()) as Box<dyn RecordBatchReader + Send>)
+                    .await
+                    .unwrap();
+            }
+            let version_count = child.versions().await.unwrap().len();
+            let expected = child.scan().try_into_batch().await.unwrap();
+            children.push((child, version_count, expected));
+            // Different source versions give the branches independently scheduled lineages.
+            parent.append(data(), None).await.unwrap();
+        }
+        tokio::time::pause();
+        let policy = CleanupPolicyBuilder::default()
+            .clean_referenced_branches(true)
+            .retain_n_versions(&parent, 1)
+            .await
+            .unwrap()
+            .delete_concurrency(concurrency)
+            .unwrap()
+            .build();
+        let operation = parent.cleanup(policy);
+        let before_explain = tokio::time::Instant::now();
+        let explanation = operation.explain().await.unwrap();
+        assert_eq!(before_explain.elapsed(), Duration::ZERO);
+        let count = explanation.candidate_files.len();
+        let start = tokio::time::Instant::now();
+        let stats = operation.execute().await.unwrap();
+        assert_eq!(stats, explanation.stats);
+        assert!(start.elapsed() >= Duration::from_secs(count.div_ceil(concurrency) as u64));
+        if enabled && concurrency > 1 {
+            assert!(start.elapsed() < Duration::from_secs(count as u64));
+        }
+        for (child, previous_count, expected) in children {
+            assert_eq!(
+                child.versions().await.unwrap().len(),
+                if enabled { 1 } else { previous_count }
+            );
+            assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
+        }
+    }
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -2931,7 +3331,8 @@ mod tests {
         if keep_old {
             // Both views are retained and share the physical file. Scanning the
             // narrower view first must not hide the old view's second column.
-            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute)
+                .unwrap();
             let inspection = Mutex::new(CleanupInspection::default());
             task.inspect_managed_blobs(&dataset, true, &inspection)
                 .await
@@ -3004,7 +3405,8 @@ mod tests {
                 Ok(())
             }),
         );
-        let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+        let task =
+            CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute).unwrap();
         // Warm the session's file metadata cache, then measure one descriptor scan.
         for _ in 0..2 {
             reads.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -3168,7 +3570,8 @@ mod tests {
             &dataset,
             CleanupPolicyBuilder::default().build(),
             CleanupAction::Execute,
-        );
+        )
+        .unwrap();
         cleanup
             .process_manifest_file(
                 old_manifest,
@@ -4126,7 +4529,8 @@ mod tests {
                 .before_timestamp(utc_now())
                 .build(),
             CleanupAction::Execute,
-        );
+        )
+        .unwrap();
         let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
         // Queue the branch root for removal on both sides; rescuing the
         // manifest must rescue its store record with it.
@@ -4225,7 +4629,8 @@ mod tests {
                 .before_timestamp(utc_now())
                 .build(),
             CleanupAction::Execute,
-        );
+        )
+        .unwrap();
         let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
         let kept: HashSet<&Path> = inspection
             .referenced_files
@@ -4806,6 +5211,8 @@ mod tests {
             .cleanup_with_policy(
                 CleanupPolicyBuilder::default()
                     .versions(vec![1, 2])
+                    .unwrap()
+                    .delete_concurrency(2)
                     .unwrap()
                     .build(),
             )
@@ -6414,11 +6821,12 @@ mod tests {
         let operation = parent.cleanup(policy);
         let start = tokio::time::Instant::now();
         if matches!(child_rate, Some("invalid" | "0")) {
-            let error = operation.execute().await.unwrap_err();
+            let child = parent.checkout_version(("first", None)).await.unwrap();
+            let error = build_cleanup_policy(&child, child.manifest.as_ref())
+                .await
+                .unwrap_err();
             assert!(matches!(error, Error::Cleanup { .. }));
             assert_contains!(error.to_string(), "delete_rate_limit");
-            assert!(requests.lock().unwrap().is_empty());
-            return;
         }
         let explanation = operation.explain().await.unwrap();
         assert_eq!(start.elapsed(), Duration::ZERO);
@@ -7033,7 +7441,8 @@ mod tests {
                 files: None,
             };
 
-            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute)
+                .unwrap();
             let mut inspection = CleanupInspection::default();
             inspection
                 .frag_reuse_entries

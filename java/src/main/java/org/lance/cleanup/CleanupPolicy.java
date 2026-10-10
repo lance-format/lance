@@ -32,6 +32,7 @@ public class CleanupPolicy {
   private final Optional<Boolean> errorIfTaggedOldVersions;
   private final Optional<Boolean> cleanReferencedBranches;
   private final Optional<Long> deleteRateLimit;
+  private final Optional<Long> deleteConcurrency;
 
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
@@ -40,7 +41,8 @@ public class CleanupPolicy {
       Optional<Boolean> deleteUnverified,
       Optional<Boolean> errorIfTaggedOldVersions,
       Optional<Boolean> cleanReferencedBranches,
-      Optional<Long> deleteRateLimit) {
+      Optional<Long> deleteRateLimit,
+      Optional<Long> deleteConcurrency) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
     this.versions = versions;
@@ -48,6 +50,7 @@ public class CleanupPolicy {
     this.errorIfTaggedOldVersions = errorIfTaggedOldVersions;
     this.cleanReferencedBranches = cleanReferencedBranches;
     this.deleteRateLimit = deleteRateLimit;
+    this.deleteConcurrency = deleteConcurrency;
   }
 
   public static Builder builder() {
@@ -78,6 +81,14 @@ public class CleanupPolicy {
     return cleanReferencedBranches;
   }
 
+  /**
+   * Maximum in-flight deletes shared with cascaded branches; empty uses object store I/O
+   * parallelism.
+   */
+  public Optional<Long> getDeleteConcurrency() {
+    return deleteConcurrency;
+  }
+
   public Optional<Long> getDeleteRateLimit() {
     return deleteRateLimit;
   }
@@ -91,6 +102,7 @@ public class CleanupPolicy {
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
     private Optional<Boolean> cleanReferencedBranches = Optional.empty();
     private Optional<Long> deleteRateLimit = Optional.empty();
+    private Optional<Long> deleteConcurrency = Optional.empty();
 
     private Builder() {}
 
@@ -130,9 +142,22 @@ public class CleanupPolicy {
       return this;
     }
 
-    /** Set the maximum number of delete operations per second. */
+    /** Set the maximum delete operations per second shared with all cascaded branches. */
     public Builder withDeleteRateLimit(long deleteRateLimit) {
       this.deleteRateLimit = Optional.of(deleteRateLimit);
+      return this;
+    }
+
+    /**
+     * Set the maximum in-flight file deletes shared with all cascaded branches, independently of
+     * QPS. Cascaded branches ignore their own concurrency and QPS settings, including invalid
+     * values. Separate cleanup calls do not share limits. For example: {@code
+     * CleanupPolicy.builder().withDeleteConcurrency(32).build()}. Omission uses the initiating
+     * dataset's object store I/O parallelism. Must be between 1 and Tokio's semaphore limit (2^61 -
+     * 1 on 64-bit platforms). Validated when cleanup executes or is explained.
+     */
+    public Builder withDeleteConcurrency(long deleteConcurrency) {
+      this.deleteConcurrency = Optional.of(deleteConcurrency);
       return this;
     }
 
@@ -144,7 +169,8 @@ public class CleanupPolicy {
           deleteUnverified,
           errorIfTaggedOldVersions,
           cleanReferencedBranches,
-          deleteRateLimit);
+          deleteRateLimit,
+          deleteConcurrency);
     }
   }
 }

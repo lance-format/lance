@@ -594,6 +594,27 @@ dataset.cleanup_old_versions(
     is **extremely dangerous** — if any other operation is in-progress at all,
     its data files may be deleted, leading to dataset corruption.
 
+Use `delete_concurrency` to set a positive maximum number of in-flight file
+deletions for a cleanup task. If omitted, cleanup uses object store I/O
+parallelism (including `LANCE_IO_THREADS`). An explicit value overrides that
+default without changing listing or manifest-read concurrency. This is independent
+of `delete_rate_limit`, which controls delete operations per second:
+
+```python
+dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
+```
+
+The initiating cleanup and all cascaded branches share one deletion concurrency
+budget and one `delete_rate_limit` budget. Cascaded branches ignore their own
+concurrency and QPS settings, including invalid values. Branch cleanup eligibility
+and retention still use each branch's own automatic cleanup settings. Cleaning a
+branch independently uses and validates its own settings. Separate cleanup calls
+do not share limits.
+
+`delete_concurrency` must be between 1 and Tokio's `Semaphore::MAX_PERMITS`
+(`2**61 - 1` on 64-bit platforms). Values outside this range return an error,
+including when explaining cleanup without executing it.
+
 ### Automatic cleanup
 
 Instead of calling `cleanup_old_versions` manually, you can configure Lance to
@@ -643,6 +664,7 @@ Auto cleanup parameters can also be set directly via dataset config keys:
 ds.update_config({
     "lance.auto_cleanup.interval": "20",
     "lance.auto_cleanup.older_than": "3600s",
+    "lance.auto_cleanup.delete_concurrency": "32",
 })
 ```
 

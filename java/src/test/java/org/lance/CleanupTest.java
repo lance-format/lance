@@ -22,6 +22,8 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -36,6 +38,32 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
+  @ParameterizedTest
+  @ValueSource(longs = {0, -1, Long.MAX_VALUE})
+  public void testInvalidDeleteConcurrency(long concurrency, @TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("cleanup").toString());
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                    dataset.cleanupWithPolicy(
+                        CleanupPolicy.builder().withDeleteConcurrency(concurrency).build()));
+        assertTrue(error.getMessage().contains("delete_concurrency"));
+        assertTrue(error.getMessage().contains(Long.toString(concurrency)));
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset
+                    .cleanup(CleanupPolicy.builder().withDeleteConcurrency(concurrency).build())
+                    .explain());
+        assertEquals(1, dataset.listVersions().size());
+      }
+    }
+  }
+
   @Test
   public void testCleanupBeforeVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
@@ -98,7 +126,8 @@ public class CleanupTest {
       testDataset.write(2, 10).close();
 
       try (Dataset dataset = testDataset.write(3, 10)) {
-        CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
+        CleanupPolicy policy =
+            CleanupPolicy.builder().withBeforeVersion(3L).withDeleteConcurrency(2L).build();
         CleanupOperation cleanup = dataset.cleanup(policy);
         CleanupExplanation explanation = cleanup.explain();
 
@@ -237,6 +266,7 @@ public class CleanupTest {
                 CleanupPolicy.builder()
                     .withBeforeTimestampMillis(beforeTimestampMillis)
                     .withDeleteRateLimit(1L)
+                    .withDeleteConcurrency(2L)
                     .build());
         long elapsed = System.nanoTime() - start;
 

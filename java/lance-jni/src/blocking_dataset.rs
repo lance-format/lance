@@ -3753,6 +3753,15 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
         .unwrap_or(false);
 
     let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
+    let delete_concurrency =
+        env.get_optional_from_method(jpolicy, "getDeleteConcurrency", |env, obj| {
+            let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+            usize::try_from(value).map_err(|_| {
+                Error::input_error(format!(
+                    "delete_concurrency must fit usize and be positive, got {value}"
+                ))
+            })
+        })?;
 
     Ok(CleanupPolicy {
         before_timestamp,
@@ -3762,6 +3771,7 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
         error_if_tagged_old_versions,
         clean_referenced_branches,
         delete_rate_limit,
+        delete_concurrency,
     })
 }
 
