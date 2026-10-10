@@ -204,3 +204,7 @@ workspace = true
 [[bench]]
 name = "inverted_request_cache"
 harness = false
+
+[[bench]]
+name = "minhash_lsh"
+harness = false
